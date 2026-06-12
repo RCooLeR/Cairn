@@ -342,6 +342,60 @@ func TestClientObjectEventsAreCoalesced(t *testing.T) {
 	}
 }
 
+func TestClientContainerLifecycleMethods(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	seedFakeObjects(api)
+
+	eventBus := bus.New()
+	defer eventBus.Close()
+	changed := eventBus.Subscribe(ctx, bus.TopicObjectsChanged, 8)
+
+	client := New(fakeDockerProvider{}, eventBus)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	if err := client.StartContainer(ctx, fakeContainerID); err != nil {
+		t.Fatalf("StartContainer() error = %v", err)
+	}
+	if len(api.started) != 1 || api.started[0] != fakeContainerID {
+		t.Fatalf("started = %#v", api.started)
+	}
+	waitObjectsChangedKind(t, ctx, changed, objectKindContainer, fakeContainerID, time.Second)
+
+	paused := api.containerInspects[fakeContainerID]
+	paused.State.Paused = true
+	api.containerInspects[fakeContainerID] = paused
+	if err := client.StartContainer(ctx, fakeContainerID); err != nil {
+		t.Fatalf("StartContainer(paused) error = %v", err)
+	}
+	if len(api.unpaused) != 1 || api.unpaused[0] != fakeContainerID {
+		t.Fatalf("unpaused = %#v", api.unpaused)
+	}
+
+	if err := client.StopContainer(ctx, fakeContainerID, 3); err != nil {
+		t.Fatalf("StopContainer() error = %v", err)
+	}
+	if err := client.RestartContainer(ctx, fakeContainerID, 4); err != nil {
+		t.Fatalf("RestartContainer() error = %v", err)
+	}
+	if err := client.KillContainer(ctx, fakeContainerID); err != nil {
+		t.Fatalf("KillContainer() error = %v", err)
+	}
+	if err := client.RemoveContainer(ctx, fakeContainerID, models.RemoveContainerOptions{Force: true, RemoveVolumes: true}); err != nil {
+		t.Fatalf("RemoveContainer() error = %v", err)
+	}
+	if len(api.stopped) != 1 || len(api.restarted) != 1 || len(api.killed) != 1 || len(api.removed) != 1 {
+		t.Fatalf("lifecycle calls stopped=%#v restarted=%#v killed=%#v removed=%#v", api.stopped, api.restarted, api.killed, api.removed)
+	}
+	if api.killed[0] != fakeContainerID+":KILL" {
+		t.Fatalf("killed = %#v", api.killed)
+	}
+}
+
 func TestClientRealDockerIntegration(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("real Docker integration runs only on Linux")
@@ -936,6 +990,12 @@ type fakeAPI struct {
 	networkRaw        map[string][]byte
 	events            chan events.Message
 	eventErrs         chan error
+	started           []string
+	stopped           []string
+	restarted         []string
+	killed            []string
+	removed           []string
+	unpaused          []string
 	closed            bool
 }
 
@@ -993,6 +1053,48 @@ func (a *fakeAPI) ContainerInspectWithRaw(_ context.Context, id string, _ bool) 
 		}
 	}
 	return container.InspectResponse{}, nil, cerrdefs.ErrNotFound.WithMessage(fmt.Sprintf("no such container: %s", id))
+}
+
+func (a *fakeAPI) ContainerStart(_ context.Context, id string, _ container.StartOptions) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.started = append(a.started, id)
+	return nil
+}
+
+func (a *fakeAPI) ContainerStop(_ context.Context, id string, _ container.StopOptions) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.stopped = append(a.stopped, id)
+	return nil
+}
+
+func (a *fakeAPI) ContainerRestart(_ context.Context, id string, _ container.StopOptions) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.restarted = append(a.restarted, id)
+	return nil
+}
+
+func (a *fakeAPI) ContainerKill(_ context.Context, id string, signal string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.killed = append(a.killed, id+":"+signal)
+	return nil
+}
+
+func (a *fakeAPI) ContainerRemove(_ context.Context, id string, _ container.RemoveOptions) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.removed = append(a.removed, id)
+	return nil
+}
+
+func (a *fakeAPI) ContainerUnpause(_ context.Context, id string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.unpaused = append(a.unpaused, id)
+	return nil
 }
 
 func (a *fakeAPI) ImageList(context.Context, image.ListOptions) ([]image.Summary, error) {

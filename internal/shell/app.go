@@ -9,6 +9,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/bus"
 	dockercore "github.com/RCooLeR/Cairn/internal/docker"
 	"github.com/RCooLeR/Cairn/internal/providers"
+	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/services"
 	"github.com/RCooLeR/Cairn/internal/store"
 	"github.com/wailsapp/wails/v3/pkg/application"
@@ -41,6 +42,8 @@ func Run(assets fs.FS) error {
 
 	providerSet := defaultProviderSet()
 	providerManager := providers.NewManager(db.Providers(), db.Settings(), providerSet)
+	auditRepo := db.Audit()
+	containerPlans := security.NewPlanStore(nil)
 	var dockerClient *dockercore.Client
 	if len(providerSet) > 0 {
 		dockerClient = dockercore.New(providerSet[0], eventBus)
@@ -57,7 +60,7 @@ func Run(assets fs.FS) error {
 		MarshalError: apperror.Marshal,
 		Services: []application.Service{
 			application.NewService(&services.ProviderService{Manager: providerManager}),
-			application.NewService(&services.DockerService{Client: dockerClient}),
+			application.NewService(&services.DockerService{Client: dockerClient, Audit: auditRepo, Plans: containerPlans}),
 			application.NewService(&services.ProjectService{}),
 			application.NewService(&services.ComposeService{}),
 			application.NewService(&services.MetricsService{}),
@@ -67,7 +70,7 @@ func Run(assets fs.FS) error {
 			application.NewService(&services.ImageLineageService{}),
 			application.NewService(&services.BackupService{}),
 			application.NewService(&services.RegistryService{}),
-			application.NewService(&services.SettingsService{}),
+			application.NewService(&services.SettingsService{Audit: auditRepo}),
 		},
 		OnShutdown: func() {
 			cancel()

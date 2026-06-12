@@ -41,7 +41,9 @@ InspectContainerRaw(id string) (string, error)      // raw JSON for Inspect view
 StartContainer(id string) error
 StopContainer(id string, timeoutSeconds int) error
 RestartContainer(id string, timeoutSeconds int) error
-KillContainer(id string) error                      // risk: needs_confirmation
+KillContainer(id string) error                      // returns E_CONFIRMATION_REQUIRED; use plan/apply
+PlanKillContainer(id string) (*CommandPlan, error)  // required confirmation preview for KillContainer
+ApplyContainerPlan(planID string, typedName string) error
 RenameContainer(id string, newName string) error
 RunImage(req RunImageRequest) (string /*containerID*/, error)
 // RunImageRequest{ImageRef, Name, Ports []PortMapping, Env []EnvVar, Volumes []MountSpec,

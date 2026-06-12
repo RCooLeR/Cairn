@@ -47,6 +47,12 @@ type APIClient interface {
 	DiskUsage(context.Context, dockertypes.DiskUsageOptions) (dockertypes.DiskUsage, error)
 	ContainerList(context.Context, container.ListOptions) ([]container.Summary, error)
 	ContainerInspectWithRaw(context.Context, string, bool) (container.InspectResponse, []byte, error)
+	ContainerStart(context.Context, string, container.StartOptions) error
+	ContainerStop(context.Context, string, container.StopOptions) error
+	ContainerRestart(context.Context, string, container.StopOptions) error
+	ContainerKill(context.Context, string, string) error
+	ContainerRemove(context.Context, string, container.RemoveOptions) error
+	ContainerUnpause(context.Context, string) error
 	ImageList(context.Context, image.ListOptions) ([]image.Summary, error)
 	ImageInspectWithRaw(context.Context, string) (image.InspectResponse, []byte, error)
 	VolumeList(context.Context, volume.ListOptions) (volume.ListResponse, error)
@@ -326,6 +332,9 @@ func mapDockerError(action string, err error) error {
 	}
 	if cerrdefs.IsNotFound(err) {
 		return apperror.Wrap(apperror.NotFound, action+" not found", err, apperror.WithDetail(err.Error()))
+	}
+	if cerrdefs.IsConflict(err) {
+		return apperror.Wrap(apperror.Conflict, action+" conflicted", err, apperror.WithDetail(err.Error()))
 	}
 	if errors.Is(err, context.Canceled) {
 		return apperror.Wrap(apperror.Cancelled, action+" cancelled", err)

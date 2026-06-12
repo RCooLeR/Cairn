@@ -4,11 +4,13 @@ import (
 	"context"
 	"runtime"
 	"runtime/debug"
+	"time"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
-	dockercore "github.com/RCooLeR/Cairn/internal/docker"
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
+	"github.com/RCooLeR/Cairn/internal/security"
+	"github.com/RCooLeR/Cairn/internal/store"
 )
 
 var (
@@ -20,8 +22,33 @@ var (
 type ProviderService struct {
 	Manager *providers.Manager
 }
+
+type DockerClient interface {
+	ProviderID() string
+	Ping(context.Context) error
+	Info(context.Context) (*models.DockerInfo, error)
+	Version(context.Context) (*models.DockerVersion, error)
+	DiskUsage(context.Context) (*models.DiskUsage, error)
+	ListContainers(context.Context, models.ContainerListOptions) ([]models.ContainerSummary, error)
+	GetContainer(context.Context, string) (*models.ContainerDetail, error)
+	InspectContainerRaw(context.Context, string) (string, error)
+	StartContainer(context.Context, string) error
+	StopContainer(context.Context, string, int) error
+	RestartContainer(context.Context, string, int) error
+	KillContainer(context.Context, string) error
+	RemoveContainer(context.Context, string, models.RemoveContainerOptions) error
+	ListImages(context.Context) ([]models.ImageSummary, error)
+	GetImage(context.Context, string) (*models.ImageDetail, error)
+	ListVolumes(context.Context) ([]models.VolumeSummary, error)
+	GetVolume(context.Context, string) (*models.VolumeDetail, error)
+	ListNetworks(context.Context) ([]models.NetworkSummary, error)
+	GetNetwork(context.Context, string) (*models.NetworkDetail, error)
+}
+
 type DockerService struct {
-	Client *dockercore.Client
+	Client DockerClient
+	Audit  *store.AuditRepository
+	Plans  *security.PlanStore
 }
 type ProjectService struct{}
 type ComposeService struct{}
@@ -32,7 +59,9 @@ type UpdateService struct{}
 type ImageLineageService struct{}
 type BackupService struct{}
 type RegistryService struct{}
-type SettingsService struct{}
+type SettingsService struct {
+	Audit *store.AuditRepository
+}
 
 func notReady() error {
 	return apperror.New(
@@ -169,20 +198,24 @@ func (s *DockerService) InspectContainerRaw(ctx context.Context, id string) (str
 	return "", notReady()
 }
 
-func (s *DockerService) StartContainer(_ context.Context, id string) error {
-	return notReady()
+func (s *DockerService) StartContainer(ctx context.Context, id string) error {
+	return s.runContainerAction(ctx, security.ContainerActionStart, id, 0, models.RemoveContainerOptions{})
 }
 
-func (s *DockerService) StopContainer(_ context.Context, id string, timeoutSeconds int) error {
-	return notReady()
+func (s *DockerService) StopContainer(ctx context.Context, id string, timeoutSeconds int) error {
+	return s.runContainerAction(ctx, security.ContainerActionStop, id, timeoutSeconds, models.RemoveContainerOptions{})
 }
 
-func (s *DockerService) RestartContainer(_ context.Context, id string, timeoutSeconds int) error {
-	return notReady()
+func (s *DockerService) RestartContainer(ctx context.Context, id string, timeoutSeconds int) error {
+	return s.runContainerAction(ctx, security.ContainerActionRestart, id, timeoutSeconds, models.RemoveContainerOptions{})
 }
 
 func (s *DockerService) KillContainer(_ context.Context, id string) error {
-	return notReady()
+	return apperror.New(
+		apperror.ConfirmationRequired,
+		"Kill container requires a confirmed plan",
+		apperror.WithDetail("Call PlanKillContainer and ApplyContainerPlan."),
+	)
 }
 
 func (s *DockerService) RenameContainer(_ context.Context, id string, newName string) error {
@@ -193,12 +226,163 @@ func (s *DockerService) RunImage(_ context.Context, req models.RunImageRequest) 
 	return "", notReady()
 }
 
-func (s *DockerService) PlanRemoveContainer(_ context.Context, id string, opts models.RemoveContainerOptions) (*models.CommandPlan, error) {
-	return nil, notReady()
+func (s *DockerService) PlanKillContainer(ctx context.Context, id string) (*models.CommandPlan, error) {
+	return s.planContainerAction(ctx, security.ContainerActionKill, []string{id}, 0, models.RemoveContainerOptions{})
 }
 
-func (s *DockerService) BulkContainerAction(_ context.Context, ids []string, action string) (*models.BulkResult, error) {
-	return nil, notReady()
+func (s *DockerService) PlanRemoveContainer(ctx context.Context, id string, opts models.RemoveContainerOptions) (*models.CommandPlan, error) {
+	return s.planContainerAction(ctx, security.ContainerActionRemove, []string{id}, 0, opts)
+}
+
+func (s *DockerService) ApplyContainerPlan(ctx context.Context, planID string, typedName string) error {
+	if s.Client == nil {
+		return notReady()
+	}
+	plans := s.planStore()
+	plan, err := plans.Take(ctx, planID, typedName)
+	if err != nil {
+		return err
+	}
+	for _, id := range plan.IDs {
+		if err := s.runContainerAction(ctx, plan.Action, id, plan.TimeoutSeconds, plan.RemoveOptions); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *DockerService) BulkContainerAction(ctx context.Context, ids []string, action string) (*models.BulkResult, error) {
+	if s.Client == nil {
+		return nil, notReady()
+	}
+	switch action {
+	case security.ContainerActionStart, security.ContainerActionStop, security.ContainerActionRestart:
+	default:
+		return nil, apperror.New(apperror.Conflict, "Unsupported bulk container action", apperror.WithDetail(action))
+	}
+	result := &models.BulkResult{Total: len(ids), Items: make([]models.BulkItemResult, 0, len(ids))}
+	for _, id := range ids {
+		err := s.runContainerAction(ctx, action, id, 0, models.RemoveContainerOptions{})
+		item := models.BulkItemResult{ID: id, OK: err == nil}
+		if err != nil {
+			item.Error = err.Error()
+			result.Failed++
+		} else {
+			result.Succeeded++
+		}
+		result.Items = append(result.Items, item)
+	}
+	return result, nil
+}
+
+func (s *DockerService) planContainerAction(ctx context.Context, action string, ids []string, timeoutSeconds int, opts models.RemoveContainerOptions) (*models.CommandPlan, error) {
+	if s.Client == nil {
+		return nil, notReady()
+	}
+	containers := make([]models.ContainerSummary, 0, len(ids))
+	for _, id := range ids {
+		detail, err := s.Client.GetContainer(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		containers = append(containers, detail.Summary)
+	}
+	plan, err := security.NewContainerActionPlan(action, containers, timeoutSeconds, opts, time.Now().UTC())
+	if err != nil {
+		return nil, err
+	}
+	s.planStore().Save(plan)
+	return &plan.Plan, nil
+}
+
+func (s *DockerService) runContainerAction(ctx context.Context, action string, id string, timeoutSeconds int, opts models.RemoveContainerOptions) error {
+	if s.Client == nil {
+		return notReady()
+	}
+	detail, err := s.Client.GetContainer(ctx, id)
+	if err != nil {
+		return err
+	}
+	plan, err := security.NewContainerActionPlan(action, []models.ContainerSummary{detail.Summary}, timeoutSeconds, opts, time.Now().UTC())
+	if err != nil {
+		return err
+	}
+	command := ""
+	if len(plan.Plan.Commands) > 0 {
+		command = plan.Plan.Commands[0].Command
+	}
+	started := time.Now().UTC()
+	if err := s.recordContainerAudit(ctx, detail.Summary, action, command, plan.Plan.Risk, "started", 0, nil); err != nil {
+		return err
+	}
+
+	err = s.executeContainerAction(ctx, action, id, timeoutSeconds, opts)
+	duration := time.Since(started)
+	if err != nil {
+		_ = s.recordContainerAudit(ctx, detail.Summary, action, command, plan.Plan.Risk, "failed", duration, err)
+		return err
+	}
+	if err := s.recordContainerAudit(ctx, detail.Summary, action, command, plan.Plan.Risk, "success", duration, nil); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *DockerService) executeContainerAction(ctx context.Context, action string, id string, timeoutSeconds int, opts models.RemoveContainerOptions) error {
+	switch action {
+	case security.ContainerActionStart:
+		return s.Client.StartContainer(ctx, id)
+	case security.ContainerActionStop:
+		return s.Client.StopContainer(ctx, id, timeoutSeconds)
+	case security.ContainerActionRestart:
+		return s.Client.RestartContainer(ctx, id, timeoutSeconds)
+	case security.ContainerActionKill:
+		return s.Client.KillContainer(ctx, id)
+	case security.ContainerActionRemove:
+		return s.Client.RemoveContainer(ctx, id, opts)
+	default:
+		return apperror.New(apperror.Conflict, "Unsupported container action", apperror.WithDetail(action))
+	}
+}
+
+func (s *DockerService) recordContainerAudit(ctx context.Context, container models.ContainerSummary, action string, command string, risk models.Risk, status string, duration time.Duration, actionErr error) error {
+	if s.Audit == nil {
+		return nil
+	}
+	var exitCode *int
+	if status == "success" {
+		code := 0
+		exitCode = &code
+	}
+	message := ""
+	if actionErr != nil {
+		message = actionErr.Error()
+	}
+	_, err := s.Audit.Insert(ctx, store.AuditRecord{
+		Action:     "container." + action,
+		TargetType: "container",
+		TargetID:   container.ID,
+		ProviderID: s.Client.ProviderID(),
+		ProjectID:  container.ProjectID,
+		Command:    command,
+		Risk:       risk,
+		Status:     status,
+		ExitCode:   exitCode,
+		Duration:   duration,
+		Error:      message,
+		CreatedAt:  time.Now().UTC(),
+	})
+	if err != nil {
+		return apperror.Wrap(apperror.Internal, "Record audit entry failed", err)
+	}
+	return nil
+}
+
+func (s *DockerService) planStore() *security.PlanStore {
+	if s.Plans == nil {
+		s.Plans = security.NewPlanStore(nil)
+	}
+	return s.Plans
 }
 
 func (s *DockerService) ListImages(ctx context.Context) ([]models.ImageSummary, error) {
@@ -553,7 +737,10 @@ func (s *SettingsService) SetSetting(_ context.Context, key string, value any) e
 	return notReady()
 }
 
-func (s *SettingsService) GetAuditLog(_ context.Context, filter models.AuditFilter) ([]models.AuditEntry, error) {
+func (s *SettingsService) GetAuditLog(ctx context.Context, filter models.AuditFilter) ([]models.AuditEntry, error) {
+	if s.Audit != nil {
+		return s.Audit.List(ctx, filter)
+	}
 	return []models.AuditEntry{}, nil
 }
 

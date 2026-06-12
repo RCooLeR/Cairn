@@ -1,12 +1,13 @@
-import { fireEvent, render, screen, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { InventorySnapshot } from './api/inventory';
 import type {
+  CommandPlan,
   DiskUsageCategory,
   ProviderStatus,
 } from '../bindings/github.com/RCooLeR/Cairn/internal/models/models.js';
-import { HealthStatus, UpdateStatus } from '../bindings/github.com/RCooLeR/Cairn/internal/models/models.js';
+import { HealthStatus, Risk, UpdateStatus } from '../bindings/github.com/RCooLeR/Cairn/internal/models/models.js';
 
 import App from './App';
 import { useAppStore } from './state/appStore';
@@ -25,6 +26,12 @@ const dockerServiceMock = vi.hoisted(() => ({
   GetImage: vi.fn(),
   GetNetwork: vi.fn(),
   GetVolume: vi.fn(),
+  StartContainer: vi.fn(),
+  StopContainer: vi.fn(),
+  RestartContainer: vi.fn(),
+  BulkContainerAction: vi.fn(),
+  PlanKillContainer: vi.fn(),
+  ApplyContainerPlan: vi.fn(),
 }));
 
 vi.mock('./api/app', () => ({
@@ -66,12 +73,18 @@ vi.mock('@wailsio/runtime', () => ({
 describe('App inventory shell', () => {
   beforeEach(() => {
     vi.useRealTimers();
+    vi.clearAllMocks();
     inventoryMock.getInventorySnapshot.mockReset();
-    runtimeMock.on.mockClear();
     dockerServiceMock.InspectContainerRaw.mockResolvedValue('{"Id":"container-1"}');
     dockerServiceMock.GetImage.mockResolvedValue(null);
     dockerServiceMock.GetNetwork.mockResolvedValue(null);
     dockerServiceMock.GetVolume.mockResolvedValue(null);
+    dockerServiceMock.StartContainer.mockResolvedValue(undefined);
+    dockerServiceMock.StopContainer.mockResolvedValue(undefined);
+    dockerServiceMock.RestartContainer.mockResolvedValue(undefined);
+    dockerServiceMock.BulkContainerAction.mockResolvedValue({ total: 1, succeeded: 1, failed: 0, items: [] });
+    dockerServiceMock.PlanKillContainer.mockResolvedValue(killPlan());
+    dockerServiceMock.ApplyContainerPlan.mockResolvedValue(undefined);
 
     useAppStore.setState({
       version: null,
@@ -132,6 +145,45 @@ describe('App inventory shell', () => {
     fireEvent.change(screen.getByLabelText('Search inventory'), { target: { value: 'does-not-exist' } });
 
     expect(screen.getByText('No containers match')).toBeInTheDocument();
+  });
+
+  it('runs safe container actions directly and refreshes inventory', async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+
+    await screen.findByText('Docker Engine - Running');
+    fireEvent.click(
+      within(screen.getByRole('navigation', { name: 'Main navigation' })).getByRole('button', {
+        name: /Containers/,
+      }),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Stop web' }));
+
+    expect(dockerServiceMock.StopContainer).toHaveBeenCalledWith('container-1', 10);
+    await waitFor(() => expect(inventoryMock.getInventorySnapshot).toHaveBeenCalledTimes(2));
+  });
+
+  it('previews and confirms kill through the command-plan pipeline', async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+
+    await screen.findByText('Docker Engine - Running');
+    fireEvent.click(
+      within(screen.getByRole('navigation', { name: 'Main navigation' })).getByRole('button', {
+        name: /Containers/,
+      }),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Kill web' }));
+
+    expect(dockerServiceMock.PlanKillContainer).toHaveBeenCalledWith('container-1');
+    expect(await screen.findByRole('dialog', { name: 'Kill web' })).toBeInTheDocument();
+    expect(screen.getByText('docker kill web')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
+
+    await waitFor(() => expect(dockerServiceMock.ApplyContainerPlan).toHaveBeenCalledWith('plan-kill-web', ''));
   });
 
   it('renders empty states when the daemon has no objects', async () => {
@@ -267,6 +319,24 @@ function seededSnapshot(): InventorySnapshot {
       },
     },
     degradedReason: null,
+  };
+}
+
+function killPlan(): CommandPlan {
+  return {
+    planID: 'plan-kill-web',
+    title: 'Kill web',
+    risk: Risk.RiskNeedsConfirmation,
+    commands: [
+      {
+        order: 1,
+        command: 'docker kill web',
+        risk: Risk.RiskNeedsConfirmation,
+        explanation: 'Immediately sends SIGKILL to the selected container.',
+      },
+    ],
+    effects: ['web: Immediately sends SIGKILL to the selected container.'],
+    expiresAt: '2026-06-13T08:10:00Z',
   };
 }
 

@@ -9,6 +9,10 @@ import { Call as $Call, CancellablePromise as $CancellablePromise, Create as $Cr
 // @ts-ignore: Unused imports
 import * as models$0 from "../models/models.js";
 
+export function ApplyContainerPlan(planID: string, typedName: string): $CancellablePromise<void> {
+    return $Call.ByID(2719469876, planID, typedName);
+}
+
 export function BulkContainerAction(ids: string[], action: string): $CancellablePromise<models$0.BulkResult | null> {
     return $Call.ByID(169789409, ids, action).then(($result: any) => {
         return $$createType1($result);
@@ -101,6 +105,12 @@ export function LoadImage(srcPath: string): $CancellablePromise<string> {
 
 export function Ping(): $CancellablePromise<void> {
     return $Call.ByID(1987249976);
+}
+
+export function PlanKillContainer(id: string): $CancellablePromise<models$0.CommandPlan | null> {
+    return $Call.ByID(795801790, id).then(($result: any) => {
+        return $$createType25($result);
+    });
 }
 
 export function PlanPrune(kind: string): $CancellablePromise<models$0.CommandPlan | null> {

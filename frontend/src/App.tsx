@@ -1,5 +1,6 @@
 import type { LucideIcon } from 'lucide-react';
 import type {
+  CommandPlan,
   ContainerSummary,
   ImageDetail,
   ImageSummary,
@@ -22,9 +23,13 @@ import {
   Gauge,
   HardDrive,
   Network,
+  Play,
   RefreshCw,
+  RotateCw,
   Search,
   Server,
+  Skull,
+  Square,
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
@@ -70,6 +75,17 @@ type InspectState = {
   error?: string;
 };
 
+type ContainerAction = 'start' | 'stop' | 'restart' | 'kill';
+
+type ConfirmState = {
+  open: boolean;
+  plan: CommandPlan | null;
+  targetName: string;
+  typedName: string;
+  busy: boolean;
+  error?: string;
+};
+
 const navItems: NavItem[] = [
   { id: 'overview', label: 'Overview', icon: Gauge },
   { id: 'containers', label: 'Containers', icon: Container },
@@ -82,6 +98,14 @@ const emptyInspect: InspectState = {
   open: false,
   title: '',
   rows: [],
+};
+
+const emptyConfirm: ConfirmState = {
+  open: false,
+  plan: null,
+  targetName: '',
+  typedName: '',
+  busy: false,
 };
 
 function App() {
@@ -110,6 +134,10 @@ function App() {
   const [imageFilter, setImageFilter] = useState<FilterID>('all');
   const [volumeFilter, setVolumeFilter] = useState<FilterID>('all');
   const [inspect, setInspect] = useState<InspectState>(emptyInspect);
+  const [confirm, setConfirm] = useState<ConfirmState>(emptyConfirm);
+  const [selectedContainerIDs, setSelectedContainerIDs] = useState(() => new Set<string>());
+  const [busyActionIDs, setBusyActionIDs] = useState(() => new Set<string>());
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const navigate = useCallback((page: PageID) => {
     setActivePage(page);
@@ -172,6 +200,113 @@ function App() {
   const statusLabel = dockerRunning ? 'Running' : 'Stopped';
 
   const imageUseCounts = useMemo(() => imageUsageCounts(containers), [containers]);
+
+  const setActionBusy = useCallback((key: string, busy: boolean) => {
+    setBusyActionIDs((current) => {
+      const next = new Set(current);
+      if (busy) {
+        next.add(key);
+      } else {
+        next.delete(key);
+      }
+      return next;
+    });
+  }, []);
+
+  const refreshAfterAction = useCallback(async () => {
+    await refreshInventory();
+  }, [refreshInventory]);
+
+  const runContainerAction = useCallback(async (action: ContainerAction, container: ContainerSummary) => {
+    const key = `${action}:${container.id}`;
+    setActionError(null);
+    setActionBusy(key, true);
+    try {
+      if (action === 'start') {
+        await DockerService.StartContainer(container.id);
+      } else if (action === 'stop') {
+        await DockerService.StopContainer(container.id, 10);
+      } else if (action === 'restart') {
+        await DockerService.RestartContainer(container.id, 10);
+      } else {
+        const plan = await DockerService.PlanKillContainer(container.id);
+        if (!plan) {
+          throw new Error('Kill plan was empty');
+        }
+        setConfirm({
+          open: true,
+          plan,
+          targetName: container.name,
+          typedName: '',
+          busy: false,
+        });
+        return;
+      }
+      setSelectedContainerIDs((current) => {
+        const next = new Set(current);
+        next.delete(container.id);
+        return next;
+      });
+      await refreshAfterAction();
+    } catch (error: unknown) {
+      setActionError(error instanceof Error ? error.message : 'Container action failed');
+    } finally {
+      setActionBusy(key, false);
+    }
+  }, [refreshAfterAction, setActionBusy]);
+
+  const runBulkContainerAction = useCallback(async (action: Exclude<ContainerAction, 'kill'>) => {
+    const ids = Array.from(selectedContainerIDs);
+    if (ids.length === 0) {
+      return;
+    }
+    const key = `bulk:${action}`;
+    setActionError(null);
+    setActionBusy(key, true);
+    try {
+      const result = await DockerService.BulkContainerAction(ids, action);
+      setSelectedContainerIDs(new Set<string>());
+      await refreshAfterAction();
+      if (result && result.failed > 0) {
+        setActionError(`${result.failed} of ${result.total} container actions failed`);
+      }
+    } catch (error: unknown) {
+      setActionError(error instanceof Error ? error.message : 'Bulk container action failed');
+    } finally {
+      setActionBusy(key, false);
+    }
+  }, [refreshAfterAction, selectedContainerIDs, setActionBusy]);
+
+  const applyConfirmedPlan = useCallback(async () => {
+    if (!confirm.plan) {
+      return;
+    }
+    setConfirm((current) => ({ ...current, busy: true, error: undefined }));
+    try {
+      await DockerService.ApplyContainerPlan(confirm.plan.planID, confirm.typedName);
+      setConfirm(emptyConfirm);
+      setSelectedContainerIDs(new Set<string>());
+      await refreshAfterAction();
+    } catch (error: unknown) {
+      setConfirm((current) => ({
+        ...current,
+        busy: false,
+        error: error instanceof Error ? error.message : 'Unable to apply plan',
+      }));
+    }
+  }, [confirm.plan, confirm.typedName, refreshAfterAction]);
+
+  const toggleContainerSelection = useCallback((id: string) => {
+    setSelectedContainerIDs((current) => {
+      const next = new Set(current);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  }, []);
 
   const openContainerInspect = useCallback((container: ContainerSummary) => {
     setInspect({
@@ -307,12 +442,17 @@ function App() {
       case 'containers':
         return (
           <ContainersPage
+            actionBusyIDs={busyActionIDs}
             containers={containers}
             filter={containerFilter}
             loading={inventoryStatus === 'loading'}
+            onAction={runContainerAction}
+            onBulkAction={runBulkContainerAction}
             onFilterChange={setContainerFilter}
             onInspect={openContainerInspect}
+            onToggleSelection={toggleContainerSelection}
             search={search}
+            selectedIDs={selectedContainerIDs}
           />
         );
       case 'images':
@@ -454,12 +594,25 @@ function App() {
               Docker is not reachable
             </div>
           ) : null}
+          {actionError ? (
+            <div className="border-b border-border bg-error/10 px-6 py-3 text-sm text-error">
+              {actionError}
+            </div>
+          ) : null}
 
           <div className="min-h-0 flex-1 overflow-auto p-6">{content}</div>
         </section>
       </div>
 
       <InspectModal inspect={inspect} onClose={() => setInspect(emptyInspect)} />
+      <ConfirmPlanModal
+        confirm={confirm}
+        onApply={() => {
+          void applyConfirmedPlan();
+        }}
+        onChangeTypedName={(typedName) => setConfirm((current) => ({ ...current, typedName }))}
+        onClose={() => setConfirm(emptyConfirm)}
+      />
     </main>
   );
 }
@@ -580,11 +733,28 @@ type ContainersPageProps = {
   filter: FilterID;
   search: string;
   loading: boolean;
+  selectedIDs: Set<string>;
+  actionBusyIDs: Set<string>;
+  onAction: (action: ContainerAction, container: ContainerSummary) => void;
+  onBulkAction: (action: Exclude<ContainerAction, 'kill'>) => void;
   onFilterChange: (filter: FilterID) => void;
   onInspect: (container: ContainerSummary) => void;
+  onToggleSelection: (id: string) => void;
 };
 
-function ContainersPage({ containers, filter, loading, onFilterChange, onInspect, search }: ContainersPageProps) {
+function ContainersPage({
+  actionBusyIDs,
+  containers,
+  filter,
+  loading,
+  onAction,
+  onBulkAction,
+  onFilterChange,
+  onInspect,
+  onToggleSelection,
+  search,
+  selectedIDs,
+}: ContainersPageProps) {
   const filtered = useMemo(
     () => filterContainers(containers, search, filter),
     [containers, filter, search],
@@ -671,14 +841,16 @@ function ContainersPage({ containers, filter, loading, onFilterChange, onInspect
             id: 'actions',
             header: '',
             render: (container) => (
-              <RowActions
-                id={container.id}
-                label={container.name}
-                onInspect={() => onInspect(container)}
+              <ContainerRowActions
+                busyIDs={actionBusyIDs}
+                container={container}
+                onAction={onAction}
+                onInspect={onInspect}
               />
             ),
           },
         ]}
+        bulkActions={<ContainerBulkActions busyIDs={actionBusyIDs} onAction={onBulkAction} />}
         empty={
           <EmptyState
             body="Run your first container or import a Compose project."
@@ -687,7 +859,9 @@ function ContainersPage({ containers, filter, loading, onFilterChange, onInspect
           />
         }
         getRowID={(container) => container.id}
+        onToggleRow={onToggleSelection}
         rows={filtered}
+        selectedIDs={selectedIDs}
       />
     </div>
   );
@@ -1019,6 +1193,98 @@ function RowActions({ id, label, onInspect }: { id: string; label: string; onIns
   );
 }
 
+function ContainerRowActions({
+  busyIDs,
+  container,
+  onAction,
+  onInspect,
+}: {
+  busyIDs: Set<string>;
+  container: ContainerSummary;
+  onAction: (action: ContainerAction, container: ContainerSummary) => void;
+  onInspect: (container: ContainerSummary) => void;
+}) {
+  const canStop = container.state === 'running' || container.state === 'paused' || container.state === 'restarting';
+  const canStart = container.state !== 'running' && container.state !== 'restarting';
+  return (
+    <div className="flex justify-end gap-1">
+      <Tooltip label={canStart ? 'Start' : 'Stop'}>
+        <Button
+          aria-label={`${canStart ? 'Start' : 'Stop'} ${container.name}`}
+          disabled={busyIDs.has(`${canStart ? 'start' : 'stop'}:${container.id}`)}
+          icon={canStart ? <Play size={15} /> : <Square size={15} />}
+          onClick={() => onAction(canStart ? 'start' : 'stop', container)}
+          size="icon"
+          variant="ghost"
+        />
+      </Tooltip>
+      <Tooltip label="Restart">
+        <Button
+          aria-label={`Restart ${container.name}`}
+          disabled={!canStop || busyIDs.has(`restart:${container.id}`)}
+          disabledReason="Container is not running"
+          icon={<RotateCw size={15} />}
+          onClick={() => onAction('restart', container)}
+          size="icon"
+          variant="ghost"
+        />
+      </Tooltip>
+      <Tooltip label="Kill">
+        <Button
+          aria-label={`Kill ${container.name}`}
+          disabled={!canStop || busyIDs.has(`kill:${container.id}`)}
+          disabledReason="Container is not running"
+          icon={<Skull size={15} />}
+          onClick={() => onAction('kill', container)}
+          size="icon"
+          variant="ghost"
+        />
+      </Tooltip>
+      <RowActions id={container.id} label={container.name} onInspect={() => onInspect(container)} />
+    </div>
+  );
+}
+
+function ContainerBulkActions({
+  busyIDs,
+  onAction,
+}: {
+  busyIDs: Set<string>;
+  onAction: (action: Exclude<ContainerAction, 'kill'>) => void;
+}) {
+  return (
+    <div className="flex items-center gap-1">
+      <Button
+        icon={<Play size={15} />}
+        loading={busyIDs.has('bulk:start')}
+        onClick={() => onAction('start')}
+        size="sm"
+        variant="secondary"
+      >
+        Start
+      </Button>
+      <Button
+        icon={<Square size={15} />}
+        loading={busyIDs.has('bulk:stop')}
+        onClick={() => onAction('stop')}
+        size="sm"
+        variant="secondary"
+      >
+        Stop
+      </Button>
+      <Button
+        icon={<RotateCw size={15} />}
+        loading={busyIDs.has('bulk:restart')}
+        onClick={() => onAction('restart')}
+        size="sm"
+        variant="secondary"
+      >
+        Restart
+      </Button>
+    </div>
+  );
+}
+
 function InspectModal({ inspect, onClose }: { inspect: InspectState; onClose: () => void }) {
   return (
     <Modal open={inspect.open} onClose={onClose} size="lg" title={inspect.title || 'Inspect'}>
@@ -1056,6 +1322,87 @@ function InspectModal({ inspect, onClose }: { inspect: InspectState; onClose: ()
             {inspect.raw}
           </pre>
         </details>
+      ) : null}
+    </Modal>
+  );
+}
+
+function ConfirmPlanModal({
+  confirm,
+  onApply,
+  onChangeTypedName,
+  onClose,
+}: {
+  confirm: ConfirmState;
+  onApply: () => void;
+  onChangeTypedName: (value: string) => void;
+  onClose: () => void;
+}) {
+  const plan = confirm.plan;
+  const typedName = plan?.requiresTypedName ?? '';
+  const typedReady = !typedName || confirm.typedName === typedName;
+  return (
+    <Modal
+      busy={confirm.busy}
+      danger={plan?.risk === 'destructive' || plan?.risk === 'dangerous'}
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button disabled={confirm.busy} onClick={onClose} variant="secondary">
+            Cancel
+          </Button>
+          <Button disabled={!typedReady} loading={confirm.busy} onClick={onApply} variant="danger">
+            Confirm
+          </Button>
+        </div>
+      }
+      onClose={onClose}
+      open={confirm.open}
+      size="lg"
+      title={plan?.title ?? 'Confirm action'}
+    >
+      {plan ? (
+        <div className="space-y-4">
+          <div className="flex items-center gap-2">
+            <Badge tone={riskTone(plan.risk)}>{plan.risk}</Badge>
+            <span className="text-text-muted">Plan expires {formatDate(plan.expiresAt)}</span>
+          </div>
+          <div>
+            <div className="mb-2 text-sm font-medium text-text-primary">Effects</div>
+            <ul className="space-y-2">
+              {plan.effects?.map((effect) => (
+                <li className="rounded-control border border-border bg-bg-inset p-3" key={effect}>
+                  {effect}
+                </li>
+              ))}
+            </ul>
+          </div>
+          <div>
+            <div className="mb-2 text-sm font-medium text-text-primary">Commands</div>
+            <div className="space-y-2">
+              {plan.commands?.map((command) => (
+                <div className="rounded-control border border-border bg-bg-inset p-3" key={`${command.order}-${command.command}`}>
+                  <div className="font-mono text-xs text-text-primary">{command.command}</div>
+                  <div className="mt-2 text-xs text-text-muted">{command.explanation}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+          {typedName ? (
+            <label className="block">
+              <span className="text-sm font-medium text-text-primary">Type {typedName} to confirm</span>
+              <input
+                className="mt-2 h-9 w-full rounded-control border border-border bg-bg-inset px-3 font-mono text-sm text-text-primary outline-none focus:border-accent"
+                onChange={(event) => onChangeTypedName(event.target.value)}
+                value={confirm.typedName}
+              />
+            </label>
+          ) : null}
+          {confirm.error ? (
+            <div className="rounded-control border border-error/30 bg-error/10 p-3 text-error">
+              {confirm.error}
+            </div>
+          ) : null}
+        </div>
       ) : null}
     </Modal>
   );
@@ -1246,6 +1593,20 @@ function updateTone(status?: string): BadgeTone {
     return 'error';
   }
   return 'warn';
+}
+
+function riskTone(risk?: string): BadgeTone {
+  switch (risk) {
+    case 'dangerous':
+    case 'destructive':
+      return 'error';
+    case 'needs_confirmation':
+      return 'warn';
+    case 'safe':
+      return 'ok';
+    default:
+      return 'neutral';
+  }
 }
 
 function formatBytes(value?: number) {
