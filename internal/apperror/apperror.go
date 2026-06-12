@@ -1,6 +1,7 @@
 package apperror
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 )
@@ -99,4 +100,21 @@ func CodeOf(err error) (Code, bool) {
 		return "", false
 	}
 	return appErr.Code, true
+}
+
+func Marshal(err error) []byte {
+	if err == nil {
+		return nil
+	}
+
+	var appErr *AppError
+	if !errors.As(err, &appErr) {
+		appErr = New(Internal, "Internal error")
+	}
+
+	out, marshalErr := json.Marshal(appErr)
+	if marshalErr != nil {
+		return []byte(`{"code":"E_INTERNAL","message":"Internal error"}`)
+	}
+	return out
 }

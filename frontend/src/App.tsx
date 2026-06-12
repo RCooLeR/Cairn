@@ -14,8 +14,12 @@ import {
   Settings,
   SquareTerminal,
 } from 'lucide-react';
+import { useEffect } from 'react';
 
 import type { LucideIcon } from 'lucide-react';
+
+import { getAppVersion } from './api/app';
+import { useAppStore } from './state/appStore';
 
 const logoUrl = '/cairn-logo.png';
 
@@ -51,6 +55,39 @@ function StatusDot() {
 }
 
 function App() {
+  const version = useAppStore((state) => state.version);
+  const setVersion = useAppStore((state) => state.setVersion);
+  const setVersionError = useAppStore((state) => state.setVersionError);
+  const setVersionLoading = useAppStore((state) => state.setVersionLoading);
+
+  useEffect(() => {
+    let active = true;
+    setVersionLoading(true);
+
+    getAppVersion()
+      .then((nextVersion) => {
+        if (active) {
+          setVersion(nextVersion);
+        }
+      })
+      .catch((error: unknown) => {
+        if (active) {
+          setVersionError(error instanceof Error ? error.message : 'Unable to load app version');
+        }
+      })
+      .finally(() => {
+        if (active) {
+          setVersionLoading(false);
+        }
+      });
+
+    return () => {
+      active = false;
+    };
+  }, [setVersion, setVersionError, setVersionLoading]);
+
+  const versionLabel = version?.version ? `v${version.version}` : 'v1.0 workspace';
+
   return (
     <main className="min-h-screen bg-bg-app text-text-primary">
       <div className="grid min-h-screen grid-cols-[220px_1fr]">
@@ -59,7 +96,7 @@ function App() {
             <img src={logoUrl} alt="Cairn" className="h-9 w-9 rounded-lg" />
             <div>
               <div className="text-sm font-semibold">Cairn</div>
-              <div className="text-xs text-text-muted">v1.0 workspace</div>
+              <div className="text-xs text-text-muted">{versionLabel}</div>
             </div>
           </div>
 

@@ -3,6 +3,8 @@ package shell
 import (
 	"io/fs"
 
+	"github.com/RCooLeR/Cairn/internal/apperror"
+	"github.com/RCooLeR/Cairn/internal/services"
 	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
@@ -17,9 +19,24 @@ func Run(assets fs.FS) error {
 	icon, _ := fs.ReadFile(assets, "assets/cairn-icon.png")
 
 	app := application.New(application.Options{
-		Name:        appName,
-		Description: appDescription,
-		Icon:        icon,
+		Name:         appName,
+		Description:  appDescription,
+		Icon:         icon,
+		MarshalError: apperror.Marshal,
+		Services: []application.Service{
+			application.NewService(&services.ProviderService{}),
+			application.NewService(&services.DockerService{}),
+			application.NewService(&services.ProjectService{}),
+			application.NewService(&services.ComposeService{}),
+			application.NewService(&services.MetricsService{}),
+			application.NewService(&services.LogsService{}),
+			application.NewService(&services.TerminalService{}),
+			application.NewService(&services.UpdateService{}),
+			application.NewService(&services.ImageLineageService{}),
+			application.NewService(&services.BackupService{}),
+			application.NewService(&services.RegistryService{}),
+			application.NewService(&services.SettingsService{}),
+		},
 		Assets: application.AssetOptions{
 			Handler:        application.AssetFileServerFS(assets),
 			DisableLogging: true,

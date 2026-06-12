@@ -50,6 +50,13 @@ jobs:
         working-directory: frontend
         run: npm run audit
 
+      - name: Generate Wails bindings
+        run: go run github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha.99 generate bindings -clean=true -ts
+
+      - name: Verify generated bindings are committed
+        shell: bash
+        run: git diff --exit-code -- frontend/bindings
+
       - name: Frontend lint
         working-directory: frontend
         run: npm run lint

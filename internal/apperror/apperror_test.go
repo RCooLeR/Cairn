@@ -1,6 +1,7 @@
 package apperror
 
 import (
+	"encoding/json"
 	"errors"
 	"testing"
 )
@@ -33,5 +34,35 @@ func TestCodeHelpersIgnorePlainErrors(t *testing.T) {
 	}
 	if code, ok := CodeOf(err); ok || code != "" {
 		t.Fatalf("CodeOf plain error = %q, %v; want empty, false", code, ok)
+	}
+}
+
+func TestMarshalProducesContractJSON(t *testing.T) {
+	err := New(PermissionDenied, "permission denied", WithRepairHints("Fix permissions"))
+
+	var payload map[string]any
+	if marshalErr := json.Unmarshal(Marshal(err), &payload); marshalErr != nil {
+		t.Fatalf("Marshal returned invalid JSON: %v", marshalErr)
+	}
+
+	if payload["code"] != string(PermissionDenied) {
+		t.Fatalf("code = %#v, want %s", payload["code"], PermissionDenied)
+	}
+	if payload["message"] != "permission denied" {
+		t.Fatalf("message = %#v, want permission denied", payload["message"])
+	}
+}
+
+func TestMarshalPlainErrorBecomesInternal(t *testing.T) {
+	var payload map[string]any
+	if marshalErr := json.Unmarshal(Marshal(errors.New("secret raw error")), &payload); marshalErr != nil {
+		t.Fatalf("Marshal returned invalid JSON: %v", marshalErr)
+	}
+
+	if payload["code"] != string(Internal) {
+		t.Fatalf("code = %#v, want %s", payload["code"], Internal)
+	}
+	if _, ok := payload["detail"]; ok {
+		t.Fatalf("plain error detail leaked: %#v", payload["detail"])
 	}
 }
