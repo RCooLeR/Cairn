@@ -264,6 +264,9 @@ func TestClientRealDockerRestartIntegration(t *testing.T) {
 		t.Fatalf("stop Docker daemon: %v", err)
 	}
 	stopped = true
+	if err := waitDockerCLIDown(ctx, 10*time.Second); err != nil {
+		t.Fatalf("Docker daemon remained reachable after stop: %v", err)
+	}
 	if _, err := waitDisconnected(ctx, disconnected, 20*time.Second); err != nil {
 		t.Fatalf("docker:disconnected event after daemon stop: %v", err)
 	}
@@ -403,11 +406,31 @@ func waitDockerCLI(ctx context.Context) error {
 	}
 }
 
-func controlDockerService(ctx context.Context, action string) error {
-	commands := [][]string{
-		{"sudo", "systemctl", action, "docker"},
-		{"sudo", "service", "docker", action},
+func waitDockerCLIDown(ctx context.Context, timeout time.Duration) error {
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	var lastOutput string
+	for {
+		infoCtx, infoCancel := context.WithTimeout(waitCtx, 2*time.Second)
+		cmd := exec.CommandContext(infoCtx, "docker", "info")
+		output, err := cmd.CombinedOutput()
+		infoCancel()
+		lastOutput = strings.TrimSpace(string(output))
+		if err != nil {
+			return nil
+		}
+		select {
+		case <-waitCtx.Done():
+			return fmt.Errorf("%w; last docker info output: %s", waitCtx.Err(), lastOutput)
+		case <-ticker.C:
+		}
 	}
+}
+
+func controlDockerService(ctx context.Context, action string) error {
+	commands := dockerControlCommands(action)
 	errs := make([]error, 0, len(commands))
 	for _, command := range commands {
 		if _, err := exec.LookPath(command[0]); err != nil {
@@ -422,4 +445,22 @@ func controlDockerService(ctx context.Context, action string) error {
 		errs = append(errs, fmt.Errorf("%s: %w: %s", strings.Join(command, " "), err, strings.TrimSpace(string(output))))
 	}
 	return errors.Join(errs...)
+}
+
+func dockerControlCommands(action string) [][]string {
+	if action == "stop" {
+		return [][]string{
+			{"sudo", "systemctl", "stop", "docker.socket", "docker.service"},
+			{"sudo", "systemctl", "stop", "docker.service"},
+			{"sudo", "service", "docker", "stop"},
+		}
+	}
+	if action == "start" {
+		return [][]string{
+			{"sudo", "systemctl", "start", "docker.socket", "docker.service"},
+			{"sudo", "systemctl", "start", "docker.service"},
+			{"sudo", "service", "docker", "start"},
+		}
+	}
+	return [][]string{{"sudo", "systemctl", action, "docker.service"}}
 }
