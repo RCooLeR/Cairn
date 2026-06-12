@@ -1,0 +1,127 @@
+version: '3'
+
+vars:
+  APP_NAME: "cairn"
+  BIN_DIR: "bin"
+  PACKAGE_MANAGER: '{{.PACKAGE_MANAGER | default "npm"}}'
+  VITE_PORT: '{{.WAILS_VITE_PORT | default 9245}}'
+
+includes:
+  common: ./build/Taskfile.yml
+  windows: ./build/windows/Taskfile.yml
+  darwin: ./build/darwin/Taskfile.yml
+  linux: ./build/linux/Taskfile.yml
+
+tasks:
+  env:check:
+    summary: Verifies pinned local toolchain versions
+    cmds:
+      - go version
+      - node --version
+      - npm --version
+
+  assets:sync:
+    summary: Syncs Cairn source artwork into Wails build inputs
+    cmds:
+      - powershell -NoProfile -Command "Copy-Item -LiteralPath assets/cairn-icon.png -Destination build/appicon.png -Force; Copy-Item -LiteralPath assets/cairn-logo.png,assets/cairn-icon.png -Destination frontend/public -Force"
+
+  frontend:install:
+    summary: Installs frontend dependencies
+    dir: frontend
+    cmds:
+      - "{{.PACKAGE_MANAGER}} install"
+
+  frontend:lint:
+    summary: Runs frontend lint
+    dir: frontend
+    cmds:
+      - "{{.PACKAGE_MANAGER}} run lint"
+
+  frontend:test:
+    summary: Runs frontend unit tests
+    dir: frontend
+    cmds:
+      - "{{.PACKAGE_MANAGER}} test"
+
+  frontend:build:
+    summary: Builds the frontend
+    dir: frontend
+    cmds:
+      - "{{.PACKAGE_MANAGER}} run build"
+
+  go:test:
+    summary: Runs Go unit tests
+    cmds:
+      - go test . ./internal/...
+
+  go:lint:
+    summary: Runs baseline Go static checks
+    cmds:
+      - go vet . ./internal/...
+
+  lint:
+    summary: Runs all linters
+    cmds:
+      - task: frontend:lint
+      - task: go:lint
+
+  test:
+    summary: Runs all unit tests
+    cmds:
+      - task: frontend:test
+      - task: go:test
+
+  ci:
+    summary: Runs the Phase 0.1 CI checks locally
+    cmds:
+      - task: assets:sync
+      - task: frontend:lint
+      - task: frontend:test
+      - task: frontend:build
+      - task: go:lint
+      - task: go:test
+
+  build:
+    summary: Builds the application
+    cmds:
+      - task: "{{OS}}:build"
+
+  package:
+    summary: Packages a production build of the application
+    cmds:
+      - task: "{{OS}}:package"
+
+  run:
+    summary: Runs the application
+    cmds:
+      - task: "{{OS}}:run"
+
+  dev:
+    summary: Runs the application in development mode
+    cmds:
+      - wails3 dev -config ./build/config.yml -port {{.VITE_PORT}}
+
+  setup:docker:
+    summary: Builds Docker image for cross-compilation (~800MB download)
+    cmds:
+      - task: common:setup:docker
+
+  build:server:
+    summary: Builds the application in server mode (no GUI, HTTP server only)
+    cmds:
+      - task: common:build:server
+
+  run:server:
+    summary: Runs the application in server mode
+    cmds:
+      - task: common:run:server
+
+  build:docker:
+    summary: Builds a Docker image for server mode deployment
+    cmds:
+      - task: common:build:docker
+
+  run:docker:
+    summary: Builds and runs the Docker image
+    cmds:
+      - task: common:run:docker
