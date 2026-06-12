@@ -3,8 +3,11 @@ package docker
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -206,6 +209,80 @@ func TestClientRealDockerIntegration(t *testing.T) {
 	}
 }
 
+func TestClientRealDockerRestartIntegration(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("real Docker restart integration runs only on Linux")
+	}
+	if os.Getenv("CAIRN_REAL_DOCKER_RESTART") != "1" {
+		t.Skip("set CAIRN_REAL_DOCKER_RESTART=1 to stop/start the local Docker daemon")
+	}
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skipf("docker CLI unavailable: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := waitDockerCLI(ctx); err != nil {
+		t.Fatalf("Docker daemon was not ready before restart test: %v", err)
+	}
+
+	provider := providers.NewLinuxNative(providers.LinuxNativeOptions{})
+	eventBus := bus.New()
+	defer eventBus.Close()
+	connected := eventBus.Subscribe(ctx, bus.TopicDockerConnected, 8)
+	disconnected := eventBus.Subscribe(ctx, bus.TopicDockerDisconnected, 8)
+
+	client := New(provider, eventBus)
+	client.unaryTimeout = 2 * time.Second
+	client.pingInterval = 250 * time.Millisecond
+	client.backoffMin = 250 * time.Millisecond
+	client.backoffMax = time.Second
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	defer func() {
+		_ = client.Close()
+	}()
+	if _, err := waitConnected(ctx, connected, 5*time.Second); err != nil {
+		t.Fatalf("initial docker:connected event: %v", err)
+	}
+
+	client.StartHealthLoop(ctx)
+
+	stopped := false
+	t.Cleanup(func() {
+		if !stopped {
+			return
+		}
+		startCtx, startCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer startCancel()
+		_ = controlDockerService(startCtx, "start")
+		_ = waitDockerCLI(startCtx)
+	})
+
+	if err := controlDockerService(ctx, "stop"); err != nil {
+		t.Fatalf("stop Docker daemon: %v", err)
+	}
+	stopped = true
+	if _, err := waitDisconnected(ctx, disconnected, 20*time.Second); err != nil {
+		t.Fatalf("docker:disconnected event after daemon stop: %v", err)
+	}
+
+	if err := controlDockerService(ctx, "start"); err != nil {
+		t.Fatalf("start Docker daemon: %v", err)
+	}
+	if err := waitDockerCLI(ctx); err != nil {
+		t.Fatalf("Docker daemon did not become ready after start: %v", err)
+	}
+	stopped = false
+	if _, err := waitConnected(ctx, connected, 45*time.Second); err != nil {
+		t.Fatalf("docker:connected event after daemon restart: %v", err)
+	}
+	if err := client.Ping(ctx); err != nil {
+		t.Fatalf("Ping() after reconnect error = %v", err)
+	}
+}
+
 type fakeDockerProvider struct{}
 
 func (fakeDockerProvider) DockerHost(context.Context) (string, error) {
@@ -262,4 +339,87 @@ func (a *fakeAPI) Close() error {
 	defer a.mu.Unlock()
 	a.closed = true
 	return nil
+}
+
+func waitConnected(ctx context.Context, events <-chan bus.Event, timeout time.Duration) (ConnectedPayload, error) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ConnectedPayload{}, ctx.Err()
+		case <-timer.C:
+			return ConnectedPayload{}, context.DeadlineExceeded
+		case event, ok := <-events:
+			if !ok {
+				return ConnectedPayload{}, errors.New("event subscription closed")
+			}
+			payload, ok := event.Payload.(ConnectedPayload)
+			if ok {
+				return payload, nil
+			}
+		}
+	}
+}
+
+func waitDisconnected(ctx context.Context, events <-chan bus.Event, timeout time.Duration) (DisconnectedPayload, error) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return DisconnectedPayload{}, ctx.Err()
+		case <-timer.C:
+			return DisconnectedPayload{}, context.DeadlineExceeded
+		case event, ok := <-events:
+			if !ok {
+				return DisconnectedPayload{}, errors.New("event subscription closed")
+			}
+			payload, ok := event.Payload.(DisconnectedPayload)
+			if ok {
+				return payload, nil
+			}
+		}
+	}
+}
+
+func waitDockerCLI(ctx context.Context) error {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	var lastErr error
+	for {
+		infoCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		cmd := exec.CommandContext(infoCtx, "docker", "info")
+		lastErr = cmd.Run()
+		cancel()
+		if lastErr == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%w; last docker info error: %v", ctx.Err(), lastErr)
+		case <-ticker.C:
+		}
+	}
+}
+
+func controlDockerService(ctx context.Context, action string) error {
+	commands := [][]string{
+		{"sudo", "systemctl", action, "docker"},
+		{"sudo", "service", "docker", action},
+	}
+	errs := make([]error, 0, len(commands))
+	for _, command := range commands {
+		if _, err := exec.LookPath(command[0]); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		cmd := exec.CommandContext(ctx, command[0], command[1:]...)
+		output, err := cmd.CombinedOutput()
+		if err == nil {
+			return nil
+		}
+		errs = append(errs, fmt.Errorf("%s: %w: %s", strings.Join(command, " "), err, strings.TrimSpace(string(output))))
+	}
+	return errors.Join(errs...)
 }
