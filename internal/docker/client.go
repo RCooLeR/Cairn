@@ -1,0 +1,318 @@
+package docker
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/RCooLeR/Cairn/internal/apperror"
+	"github.com/RCooLeR/Cairn/internal/bus"
+	"github.com/RCooLeR/Cairn/internal/models"
+	dockertypes "github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/system"
+	dockerclient "github.com/docker/docker/client"
+)
+
+const (
+	minimumAPIVersion = "1.41"
+	defaultTimeout    = 10 * time.Second
+	defaultPingEvery  = 10 * time.Second
+	defaultBackoffMin = time.Second
+	defaultBackoffMax = 30 * time.Second
+)
+
+type Provider interface {
+	DockerHost(context.Context) (string, error)
+	DockerContext(context.Context) (string, error)
+}
+
+type APIClient interface {
+	Ping(context.Context) (dockertypes.Ping, error)
+	Info(context.Context) (system.Info, error)
+	ServerVersion(context.Context) (dockertypes.Version, error)
+	DiskUsage(context.Context, dockertypes.DiskUsageOptions) (dockertypes.DiskUsage, error)
+	Close() error
+}
+
+type ConnectedPayload struct {
+	Host    string `json:"host"`
+	Context string `json:"context"`
+}
+
+type DisconnectedPayload struct {
+	Reason string `json:"reason"`
+}
+
+type Client struct {
+	provider Provider
+	bus      bus.Bus
+	now      func() time.Time
+	factory  func(string) (APIClient, error)
+
+	mu            sync.RWMutex
+	api           APIClient
+	host          string
+	contextName   string
+	unaryTimeout  time.Duration
+	pingInterval  time.Duration
+	backoffMin    time.Duration
+	backoffMax    time.Duration
+	connectedOnce bool
+}
+
+func New(provider Provider, eventBus bus.Bus) *Client {
+	return &Client{
+		provider:     provider,
+		bus:          eventBus,
+		now:          func() time.Time { return time.Now().UTC() },
+		factory:      newSDKClient,
+		unaryTimeout: defaultTimeout,
+		pingInterval: defaultPingEvery,
+		backoffMin:   defaultBackoffMin,
+		backoffMax:   defaultBackoffMax,
+	}
+}
+
+func (c *Client) Connect(ctx context.Context) error {
+	host, err := c.provider.DockerHost(ctx)
+	if err != nil {
+		return mapDockerError("resolve Docker host", err)
+	}
+	contextName, _ := c.provider.DockerContext(ctx)
+
+	api, err := c.factory(host)
+	if err != nil {
+		return mapDockerError("create Docker client", err)
+	}
+
+	pingCtx, cancel := c.withTimeout(ctx)
+	defer cancel()
+	ping, err := api.Ping(pingCtx)
+	if err != nil {
+		_ = api.Close()
+		return mapDockerError("ping Docker daemon", err)
+	}
+	if !apiAtLeast(ping.APIVersion, minimumAPIVersion) {
+		_ = api.Close()
+		return apperror.New(
+			apperror.DockerUnreachable,
+			"Docker Engine API version is too old",
+			apperror.WithDetail(fmt.Sprintf("daemon API %s, minimum %s", ping.APIVersion, minimumAPIVersion)),
+		)
+	}
+
+	c.mu.Lock()
+	old := c.api
+	c.api = api
+	c.host = host
+	c.contextName = contextName
+	c.connectedOnce = true
+	c.mu.Unlock()
+	if old != nil {
+		_ = old.Close()
+	}
+
+	c.publish(bus.TopicDockerConnected, ConnectedPayload{Host: host, Context: contextName})
+	return nil
+}
+
+func (c *Client) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.api == nil {
+		return nil
+	}
+	err := c.api.Close()
+	c.api = nil
+	return err
+}
+
+func (c *Client) Ping(ctx context.Context) error {
+	api, err := c.ensureConnected(ctx)
+	if err != nil {
+		return err
+	}
+	callCtx, cancel := c.withTimeout(ctx)
+	defer cancel()
+	ping, err := api.Ping(callCtx)
+	if err != nil {
+		return mapDockerError("ping Docker daemon", err)
+	}
+	if !apiAtLeast(ping.APIVersion, minimumAPIVersion) {
+		return apperror.New(apperror.DockerUnreachable, "Docker Engine API version is too old")
+	}
+	return nil
+}
+
+func (c *Client) Info(ctx context.Context) (*models.DockerInfo, error) {
+	api, err := c.ensureConnected(ctx)
+	if err != nil {
+		return nil, err
+	}
+	callCtx, cancel := c.withTimeout(ctx)
+	defer cancel()
+	info, err := api.Info(callCtx)
+	if err != nil {
+		return nil, mapDockerError("read Docker info", err)
+	}
+	return mapInfo(info), nil
+}
+
+func (c *Client) Version(ctx context.Context) (*models.DockerVersion, error) {
+	api, err := c.ensureConnected(ctx)
+	if err != nil {
+		return nil, err
+	}
+	callCtx, cancel := c.withTimeout(ctx)
+	defer cancel()
+	version, err := api.ServerVersion(callCtx)
+	if err != nil {
+		return nil, mapDockerError("read Docker version", err)
+	}
+	return mapVersion(version), nil
+}
+
+func (c *Client) DiskUsage(ctx context.Context) (*models.DiskUsage, error) {
+	api, err := c.ensureConnected(ctx)
+	if err != nil {
+		return nil, err
+	}
+	callCtx, cancel := c.withTimeout(ctx)
+	defer cancel()
+	usage, err := api.DiskUsage(callCtx, dockertypes.DiskUsageOptions{})
+	if err != nil {
+		return nil, mapDockerError("read Docker disk usage", err)
+	}
+	return mapDiskUsage(usage), nil
+}
+
+func (c *Client) StartHealthLoop(ctx context.Context) {
+	go c.healthLoop(ctx)
+}
+
+func (c *Client) healthLoop(ctx context.Context) {
+	timer := time.NewTimer(c.pingInterval)
+	defer timer.Stop()
+	backoff := c.backoffMin
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+
+		if err := c.Ping(ctx); err == nil {
+			backoff = c.backoffMin
+			timer.Reset(c.pingInterval)
+			continue
+		} else {
+			c.disconnect(err)
+		}
+
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
+
+			if err := c.Connect(ctx); err == nil {
+				backoff = c.backoffMin
+				timer.Reset(c.pingInterval)
+				break
+			}
+			backoff *= 2
+			if backoff > c.backoffMax {
+				backoff = c.backoffMax
+			}
+		}
+	}
+}
+
+func (c *Client) ensureConnected(ctx context.Context) (APIClient, error) {
+	c.mu.RLock()
+	api := c.api
+	c.mu.RUnlock()
+	if api != nil {
+		return api, nil
+	}
+	if err := c.Connect(ctx); err != nil {
+		return nil, err
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	if c.api == nil {
+		return nil, apperror.New(apperror.DockerUnreachable, "Docker client is not connected")
+	}
+	return c.api, nil
+}
+
+func (c *Client) disconnect(err error) {
+	c.mu.Lock()
+	api := c.api
+	c.api = nil
+	reason := err.Error()
+	c.mu.Unlock()
+	if api != nil {
+		_ = api.Close()
+	}
+	c.publish(bus.TopicDockerDisconnected, DisconnectedPayload{Reason: reason})
+}
+
+func (c *Client) publish(topic bus.Topic, payload any) {
+	if c.bus == nil {
+		return
+	}
+	c.bus.Publish(bus.Event{Topic: topic, TS: c.now(), Payload: payload})
+}
+
+func (c *Client) withTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	timeout := c.unaryTimeout
+	if timeout <= 0 {
+		timeout = defaultTimeout
+	}
+	return context.WithTimeout(ctx, timeout)
+}
+
+func newSDKClient(host string) (APIClient, error) {
+	return dockerclient.NewClientWithOpts(
+		dockerclient.WithHost(host),
+		dockerclient.WithAPIVersionNegotiation(),
+	)
+}
+
+func mapDockerError(action string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.Canceled) {
+		return apperror.Wrap(apperror.Cancelled, action+" cancelled", err)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return apperror.Wrap(apperror.Timeout, action+" timed out", err)
+	}
+	return apperror.Wrap(apperror.DockerUnreachable, action+" failed", err, apperror.WithDetail(err.Error()))
+}
+
+func apiAtLeast(actual, minimum string) bool {
+	actualParts := apiVersionParts(actual)
+	minimumParts := apiVersionParts(minimum)
+	if actualParts[0] != minimumParts[0] {
+		return actualParts[0] > minimumParts[0]
+	}
+	return actualParts[1] >= minimumParts[1]
+}
+
+func apiVersionParts(value string) [2]int {
+	var parts [2]int
+	raw := strings.SplitN(value, ".", 3)
+	for i := 0; i < len(raw) && i < 2; i++ {
+		n, _ := strconv.Atoi(raw[i])
+		parts[i] = n
+	}
+	return parts
+}

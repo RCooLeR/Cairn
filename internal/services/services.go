@@ -6,6 +6,7 @@ import (
 	"runtime/debug"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
+	dockercore "github.com/RCooLeR/Cairn/internal/docker"
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
 )
@@ -19,7 +20,9 @@ var (
 type ProviderService struct {
 	Manager *providers.Manager
 }
-type DockerService struct{}
+type DockerService struct {
+	Client *dockercore.Client
+}
 type ProjectService struct{}
 type ComposeService struct{}
 type MetricsService struct{}
@@ -117,19 +120,31 @@ func (s *ProviderService) SetDockerContext(_ context.Context, name string) error
 	return notReady()
 }
 
-func (s *DockerService) Ping(_ context.Context) error {
+func (s *DockerService) Ping(ctx context.Context) error {
+	if s.Client != nil {
+		return s.Client.Ping(ctx)
+	}
 	return notReady()
 }
 
-func (s *DockerService) Info(_ context.Context) (*models.DockerInfo, error) {
+func (s *DockerService) Info(ctx context.Context) (*models.DockerInfo, error) {
+	if s.Client != nil {
+		return s.Client.Info(ctx)
+	}
 	return nil, notReady()
 }
 
-func (s *DockerService) Version(_ context.Context) (*models.DockerVersion, error) {
+func (s *DockerService) Version(ctx context.Context) (*models.DockerVersion, error) {
+	if s.Client != nil {
+		return s.Client.Version(ctx)
+	}
 	return nil, notReady()
 }
 
-func (s *DockerService) DiskUsage(_ context.Context) (*models.DiskUsage, error) {
+func (s *DockerService) DiskUsage(ctx context.Context) (*models.DiskUsage, error) {
+	if s.Client != nil {
+		return s.Client.DiskUsage(ctx)
+	}
 	return nil, notReady()
 }
 
