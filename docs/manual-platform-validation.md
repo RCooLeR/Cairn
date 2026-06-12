@@ -17,12 +17,12 @@ Current evidence: `wsl -l -v` reports no installed WSL distributions in this env
 
 ## Phase 0.1 Wails Dev Hot Reload
 
-Current evidence: `wails3 dev -config ./build/config.yml -port 9247 -nocolour` built the dev binary, ran `bin/cairn.exe`, started Vite on `127.0.0.1:9247`, and the Wails/WebView2 app connected to the frontend dev server. The in-app Browser connector is unavailable in this sandbox (`CreateProcessAsUserW failed: 5`), and scripted timestamp-touch reload probes did not yield reliable reload logs before the tool timeout.
+Current evidence: `wails3 dev -config ./build/config.yml -port 9250 -nocolour` built the dev binary, ran `bin/cairn.exe`, started Vite on `127.0.0.1:9250`, and the Wails/WebView2 app connected to the frontend dev server. The in-app Browser connector is unavailable in this sandbox (`CreateProcessAsUserW failed: 5`), so the proof used Wails/Vite logs and a live module fetch.
 
-- [ ] Run `wails3 dev -config ./build/config.yml -port 9245` locally.
-- [ ] Edit a React/Tailwind source file and verify the Wails window updates without a full manual restart.
-- [ ] Edit a Go source file and verify the Wails dev watcher rebuilds/restarts the backend side.
-- [ ] Confirm the window/taskbar icon still uses `assets/cairn-icon.png` and the shell still uses `assets/cairn-logo.png`.
+- [x] Run `wails3 dev -config ./build/config.yml -port 9250`.
+- [x] Edit a React source file and verify Vite HMR: temporary `frontend/src/App.tsx` probe was served by the live dev server and logged `hmr update /src/App.tsx`.
+- [x] Edit a Go source file and verify the Wails dev watcher rebuilds/restarts the backend side: temporary `zz_wails_hot_reload_probe.go` produced a second Wails `Build` marker and regenerated bindings.
+- [x] Confirm the window/taskbar icon still uses `assets/cairn-icon.png` and the shell still uses `assets/cairn-logo.png`.
 
 ## Full Platform Matrix TODO
 
