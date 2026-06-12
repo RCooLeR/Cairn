@@ -2,7 +2,7 @@
 
 ## 1. Build pipeline
 
-- `wails3 task build` per OS in CI (GitHub Actions matrix: `windows-latest`, `ubuntu-22.04`, `macos-14`).
+- `wails3 task build` per OS in CI (GitHub Actions matrix: `windows-latest`, `ubuntu-24.04`, `macos-14`). Linux uses Ubuntu 24.04 because Wails v3 `v3.0.0-alpha.99` defaults to the GTK4 + WebKitGTK 6.0 stack (`libgtk-4-dev`, `libwebkitgtk-6.0-dev`), which is not available on the original Ubuntu 22.04 runner without switching to the legacy `gtk3` tag.
 - App icons/logo come from `assets/cairn-icon.png` and `assets/cairn-logo.png` (normative, see [ui/00-design-system.md §0]); CI generates `.ico` (Windows/NSIS), `.icns` (macOS), and the Linux PNG icon set (16–512px for .desktop/AppImage) from `cairn-icon.png`.
 - Version stamped from git tag (`vX.Y.Z`) into Go `VersionInfo` and frontend.
 - Artifacts uploaded per build; releases cut from tags only; changelog generated from conventional commits.

@@ -7,7 +7,7 @@ Status legend: `todo`, `in_progress`, `green`, `blocked`.
 | Phase | Step | Status | Evidence | Notes |
 |---|---|---:|---|---|
 | 0 | 0.0 Dev environment (Windows machines) | blocked | `wsl -l -v` reports no installed WSL distributions; see `docs/manual-platform-validation.md` | All local Windows Docker work must target `cairn-dev`, never Docker Desktop or `desktop-linux`. No Docker integration tests run against the visible Docker Desktop context. |
-| 0 | 0.1 Repo & toolchain | in_progress | `npm audit --audit-level=moderate`; ESLint; Vitest; `tsc --noEmit`; Vite production build; `go test . ./internal/...`; `go vet . ./internal/...`; `go build ./...`; `wails3 build` | Wails v3 pinned to `v3.0.0-alpha.99`; Go pinned to `toolchain go1.26.4`; logo/icon sourced from `assets/`. Pending: `wails3 dev` hot-reload proof and live CI run. Browser plugin unavailable in this sandbox (`CreateProcessAsUserW failed: 5`). |
+| 0 | 0.1 Repo & toolchain | in_progress | `npm audit --audit-level=moderate`; ESLint; Vitest; `tsc --noEmit`; Vite production build; `go test . ./internal/...`; `go vet . ./internal/...`; `go build ./...`; `wails3 build`; CI run 27428985641 found missing Linux GTK/WebKit deps | Wails v3 pinned to `v3.0.0-alpha.99`; Go pinned to `toolchain go1.26.4`; logo/icon sourced from `assets/`. CI Linux runner changed to `ubuntu-24.04` in `dev-docs/08-packaging-release.md` because Wails alpha.99 defaults to GTK4/WebKitGTK 6.0. Pending: `wails3 dev` hot-reload proof and green rerun. Browser plugin unavailable in this sandbox (`CreateProcessAsUserW failed: 5`). |
 | 0 | 0.2 SQLite store + migrations | todo |  |  |
 | 0 | 0.3 Event bus + error model + logging | todo |  |  |
 | 0 | 0.4 Wails services skeleton + bindings | todo |  |  |

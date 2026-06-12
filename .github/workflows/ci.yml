@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, windows-latest, macos-14]
+        os: [ubuntu-24.04, windows-latest, macos-14]
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -33,6 +33,14 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Linux Wails dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config gcc \
+            libgtk-4-dev libwebkitgtk-6.0-dev libsoup-3.0-dev
 
       - name: Install frontend dependencies
         working-directory: frontend
