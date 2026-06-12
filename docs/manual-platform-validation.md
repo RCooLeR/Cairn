@@ -15,6 +15,15 @@ Current evidence: `wsl -l -v` reports no installed WSL distributions in this env
 - [ ] Verify Windows `docker context ls` still shows Docker Desktop contexts untouched.
 - [ ] Set development settings `windows.wsl_distro = cairn-dev` before Windows provider integration tests.
 
+## Phase 0.1 Wails Dev Hot Reload
+
+Current evidence: `wails3 dev -config ./build/config.yml -port 9247 -nocolour` built the dev binary, ran `bin/cairn.exe`, started Vite on `127.0.0.1:9247`, and the Wails/WebView2 app connected to the frontend dev server. The in-app Browser connector is unavailable in this sandbox (`CreateProcessAsUserW failed: 5`), and scripted timestamp-touch reload probes did not yield reliable reload logs before the tool timeout.
+
+- [ ] Run `wails3 dev -config ./build/config.yml -port 9245` locally.
+- [ ] Edit a React/Tailwind source file and verify the Wails window updates without a full manual restart.
+- [ ] Edit a Go source file and verify the Wails dev watcher rebuilds/restarts the backend side.
+- [ ] Confirm the window/taskbar icon still uses `assets/cairn-icon.png` and the shell still uses `assets/cairn-logo.png`.
+
 ## Full Platform Matrix TODO
 
 - [ ] Windows 11 x64: WSL present/absent, Ubuntu present/absent/multiple, Docker in Ubuntu present/absent, systemd on/off.
