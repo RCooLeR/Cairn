@@ -2,7 +2,6 @@ import {
   Activity,
   Bell,
   Box,
-  ChevronLeft,
   Container,
   Database,
   Gauge,
@@ -19,6 +18,7 @@ import { useEffect } from 'react';
 import type { LucideIcon } from 'lucide-react';
 
 import { getAppVersion } from './api/app';
+import { Badge, Button, Card, CardBody, CardHeader, StatusDot, Tooltip } from './components/ui';
 import { useAppStore } from './state/appStore';
 
 const logoUrl = '/cairn-logo.png';
@@ -49,10 +49,6 @@ const metricCards = [
   { label: 'Images', value: '0', hint: 'Cache empty' },
   { label: 'Volumes', value: '0', hint: 'Cache empty' },
 ];
-
-function StatusDot() {
-  return <span className="h-2 w-2 rounded-full bg-neutral" aria-hidden="true" />;
-}
 
 function App() {
   const version = useAppStore((state) => state.version);
@@ -93,7 +89,7 @@ function App() {
       <div className="grid min-h-screen grid-cols-[220px_1fr]">
         <aside className="flex min-h-screen flex-col border-r border-border bg-bg-panel">
           <div className="flex h-16 items-center gap-3 border-b border-border px-4">
-            <img src={logoUrl} alt="Cairn" className="h-9 w-9 rounded-lg" />
+            <img src={logoUrl} alt="Cairn" className="h-9 max-w-32 object-contain" />
             <div>
               <div className="text-sm font-semibold">Cairn</div>
               <div className="text-xs text-text-muted">{versionLabel}</div>
@@ -109,18 +105,14 @@ function App() {
                   className={[
                     'flex h-10 w-full items-center gap-3 rounded-control px-3 text-left text-sm transition',
                     item.active
-                      ? 'bg-accent/12 text-accent shadow-[inset_3px_0_0_rgb(45_212_167)]'
+                      ? 'bg-accent/10 text-accent shadow-[inset_3px_0_0_rgb(45_212_167)]'
                       : 'text-text-secondary hover:bg-bg-card hover:text-text-primary',
                   ].join(' ')}
                   type="button"
                 >
                   <Icon size={18} strokeWidth={1.8} />
                   <span className="flex-1 truncate">{item.label}</span>
-                  {item.badge ? (
-                    <span className="rounded-full border border-border bg-bg-inset px-1.5 text-xs text-text-muted">
-                      {item.badge}
-                    </span>
-                  ) : null}
+                  {item.badge ? <Badge>{item.badge}</Badge> : null}
                 </button>
               );
             })}
@@ -129,18 +121,14 @@ function App() {
           <div className="border-t border-border p-3">
             <div className="rounded-card border border-border bg-bg-inset p-3">
               <div className="flex items-center gap-2 text-sm">
-                <StatusDot />
+                <StatusDot tone="neutral" />
                 <span className="font-medium">Docker Engine</span>
                 <span className="ml-auto text-xs text-text-muted">Stopped</span>
               </div>
               <div className="mt-2 truncate font-mono text-xs text-text-muted">No provider selected</div>
-              <button
-                type="button"
-                className="mt-3 inline-flex h-8 items-center justify-center gap-2 rounded-control border border-border px-3 text-xs text-text-secondary hover:border-border-strong hover:text-text-primary"
-              >
-                <ChevronLeft size={14} />
+              <Button className="mt-3" size="sm" variant="secondary">
                 Repair
-              </button>
+              </Button>
             </div>
           </div>
         </aside>
@@ -152,20 +140,17 @@ function App() {
               <p className="text-sm text-text-muted">Provider state and Docker inventory</p>
             </div>
             <div className="flex items-center gap-2">
-              <button
-                type="button"
-                className="inline-flex h-9 w-9 items-center justify-center rounded-control border border-border text-text-secondary hover:border-border-strong hover:text-text-primary"
-                aria-label="Search"
-              >
-                <Search size={17} />
-              </button>
-              <button
-                type="button"
-                className="inline-flex h-9 w-9 items-center justify-center rounded-control border border-border text-text-secondary hover:border-border-strong hover:text-text-primary"
-                aria-label="Notifications"
-              >
-                <Bell size={17} />
-              </button>
+              <Tooltip label="Search">
+                <Button aria-label="Search" icon={<Search size={17} />} size="icon" variant="secondary" />
+              </Tooltip>
+              <Tooltip label="Notifications">
+                <Button
+                  aria-label="Notifications"
+                  icon={<Bell size={17} />}
+                  size="icon"
+                  variant="secondary"
+                />
+              </Tooltip>
             </div>
           </header>
 
@@ -176,43 +161,39 @@ function App() {
           <div className="space-y-6 p-6">
             <section className="grid grid-cols-4 gap-4" aria-label="Docker object counts">
               {metricCards.map((card) => (
-                <article key={card.label} className="rounded-card border border-border bg-bg-card p-4">
-                  <div className="text-sm text-text-secondary">{card.label}</div>
-                  <div className="mt-3 text-2xl font-semibold">{card.value}</div>
-                  <div className="mt-2 text-xs text-text-muted">{card.hint}</div>
-                </article>
+                <Card key={card.label}>
+                  <CardBody>
+                    <div className="text-sm text-text-secondary">{card.label}</div>
+                    <div className="mt-3 text-2xl font-semibold">{card.value}</div>
+                    <div className="mt-2 text-xs text-text-muted">{card.hint}</div>
+                  </CardBody>
+                </Card>
               ))}
             </section>
 
             <section className="grid grid-cols-[1.2fr_0.8fr] gap-4">
-              <article className="rounded-card border border-border bg-bg-card">
-                <div className="flex items-center justify-between border-b border-border px-4 py-3">
-                  <h2 className="text-sm font-semibold">Provider Health</h2>
-                  <span className="rounded-full bg-neutral/15 px-2 py-1 text-xs text-text-muted">Unknown</span>
-                </div>
+              <Card>
+                <CardHeader status={<Badge>Unknown</Badge>} title="Provider Health" />
                 <div className="grid grid-cols-3 gap-3 p-4">
                   {['Docker', 'Compose', 'Buildx'].map((item) => (
                     <div key={item} className="rounded-control border border-border bg-bg-inset p-3">
                       <div className="flex items-center gap-2 text-sm">
-                        <StatusDot />
+                        <StatusDot tone="neutral" />
                         <span>{item}</span>
                       </div>
                       <div className="mt-2 font-mono text-xs text-text-muted">not detected</div>
                     </div>
                   ))}
                 </div>
-              </article>
+              </Card>
 
-              <article className="rounded-card border border-border bg-bg-card">
-                <div className="flex items-center justify-between border-b border-border px-4 py-3">
-                  <h2 className="text-sm font-semibold">Disk Usage</h2>
-                  <HardDrive size={16} className="text-text-muted" />
-                </div>
-                <div className="p-4">
+              <Card>
+                <CardHeader actions={<HardDrive size={16} className="text-text-muted" />} title="Disk Usage" />
+                <CardBody>
                   <div className="h-32 rounded-control border border-dashed border-border bg-bg-inset" />
                   <div className="mt-3 text-xs text-text-muted">No samples</div>
-                </div>
-              </article>
+                </CardBody>
+              </Card>
             </section>
           </div>
         </section>

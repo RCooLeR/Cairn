@@ -26,6 +26,7 @@ coverage.out
 coverage/
 *.test
 .gocache/
+.golangci-cache/
 .gomodcache/
 .gopath/
 .tools/
