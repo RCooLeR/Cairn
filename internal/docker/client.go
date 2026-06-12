@@ -12,20 +12,30 @@ import (
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/bus"
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/store"
+	cerrdefs "github.com/containerd/errdefs"
 	dockertypes "github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/events"
+	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/system"
+	"github.com/docker/docker/api/types/volume"
 	dockerclient "github.com/docker/docker/client"
 )
 
 const (
-	minimumAPIVersion = "1.41"
-	defaultTimeout    = 10 * time.Second
-	defaultPingEvery  = 10 * time.Second
-	defaultBackoffMin = time.Second
-	defaultBackoffMax = 30 * time.Second
+	minimumAPIVersion       = "1.41"
+	defaultTimeout          = 10 * time.Second
+	defaultPingEvery        = 10 * time.Second
+	defaultReconcileEvery   = time.Minute
+	defaultEventBatchWindow = 250 * time.Millisecond
+	defaultBackoffMin       = time.Second
+	defaultBackoffMax       = 30 * time.Second
 )
 
 type Provider interface {
+	ID() string
 	DockerHost(context.Context) (string, error)
 	DockerContext(context.Context) (string, error)
 }
@@ -35,6 +45,15 @@ type APIClient interface {
 	Info(context.Context) (system.Info, error)
 	ServerVersion(context.Context) (dockertypes.Version, error)
 	DiskUsage(context.Context, dockertypes.DiskUsageOptions) (dockertypes.DiskUsage, error)
+	ContainerList(context.Context, container.ListOptions) ([]container.Summary, error)
+	ContainerInspectWithRaw(context.Context, string, bool) (container.InspectResponse, []byte, error)
+	ImageList(context.Context, image.ListOptions) ([]image.Summary, error)
+	ImageInspectWithRaw(context.Context, string) (image.InspectResponse, []byte, error)
+	VolumeList(context.Context, volume.ListOptions) (volume.ListResponse, error)
+	VolumeInspectWithRaw(context.Context, string) (volume.Volume, []byte, error)
+	NetworkList(context.Context, network.ListOptions) ([]network.Summary, error)
+	NetworkInspectWithRaw(context.Context, string, network.InspectOptions) (network.Inspect, []byte, error)
+	Events(context.Context, events.ListOptions) (<-chan events.Message, <-chan error)
 	Close() error
 }
 
@@ -47,34 +66,50 @@ type DisconnectedPayload struct {
 	Reason string `json:"reason"`
 }
 
+type ObjectsChangedPayload struct {
+	Kind string   `json:"kind"`
+	IDs  []string `json:"ids"`
+}
+
 type Client struct {
 	provider Provider
 	bus      bus.Bus
+	cache    *store.ObjectCacheRepository
 	now      func() time.Time
 	factory  func(string) (APIClient, error)
 
-	mu            sync.RWMutex
-	api           APIClient
-	host          string
-	contextName   string
-	unaryTimeout  time.Duration
-	pingInterval  time.Duration
-	backoffMin    time.Duration
-	backoffMax    time.Duration
-	connectedOnce bool
+	mu             sync.RWMutex
+	api            APIClient
+	host           string
+	contextName    string
+	unaryTimeout   time.Duration
+	pingInterval   time.Duration
+	reconcileEvery time.Duration
+	eventBatch     time.Duration
+	backoffMin     time.Duration
+	backoffMax     time.Duration
+	connectedOnce  bool
 }
 
 func New(provider Provider, eventBus bus.Bus) *Client {
 	return &Client{
-		provider:     provider,
-		bus:          eventBus,
-		now:          func() time.Time { return time.Now().UTC() },
-		factory:      newSDKClient,
-		unaryTimeout: defaultTimeout,
-		pingInterval: defaultPingEvery,
-		backoffMin:   defaultBackoffMin,
-		backoffMax:   defaultBackoffMax,
+		provider:       provider,
+		bus:            eventBus,
+		now:            func() time.Time { return time.Now().UTC() },
+		factory:        newSDKClient,
+		unaryTimeout:   defaultTimeout,
+		pingInterval:   defaultPingEvery,
+		reconcileEvery: defaultReconcileEvery,
+		eventBatch:     defaultEventBatchWindow,
+		backoffMin:     defaultBackoffMin,
+		backoffMax:     defaultBackoffMax,
 	}
+}
+
+func (c *Client) SetObjectCache(cache *store.ObjectCacheRepository) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.cache = cache
 }
 
 func (c *Client) Connect(ctx context.Context) error {
@@ -289,6 +324,9 @@ func mapDockerError(action string, err error) error {
 	if err == nil {
 		return nil
 	}
+	if cerrdefs.IsNotFound(err) {
+		return apperror.Wrap(apperror.NotFound, action+" not found", err, apperror.WithDetail(err.Error()))
+	}
 	if errors.Is(err, context.Canceled) {
 		return apperror.Wrap(apperror.Cancelled, action+" cancelled", err)
 	}
@@ -296,6 +334,13 @@ func mapDockerError(action string, err error) error {
 		return apperror.Wrap(apperror.Timeout, action+" timed out", err)
 	}
 	return apperror.Wrap(apperror.DockerUnreachable, action+" failed", err, apperror.WithDetail(err.Error()))
+}
+
+func (c *Client) providerID() string {
+	if c.provider == nil {
+		return ""
+	}
+	return c.provider.ID()
 }
 
 func apiAtLeast(actual, minimum string) bool {

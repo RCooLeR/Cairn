@@ -148,15 +148,24 @@ func (s *DockerService) DiskUsage(ctx context.Context) (*models.DiskUsage, error
 	return nil, notReady()
 }
 
-func (s *DockerService) ListContainers(_ context.Context, opts models.ContainerListOptions) ([]models.ContainerSummary, error) {
+func (s *DockerService) ListContainers(ctx context.Context, opts models.ContainerListOptions) ([]models.ContainerSummary, error) {
+	if s.Client != nil {
+		return s.Client.ListContainers(ctx, opts)
+	}
 	return nil, notReady()
 }
 
-func (s *DockerService) GetContainer(_ context.Context, id string) (*models.ContainerDetail, error) {
+func (s *DockerService) GetContainer(ctx context.Context, id string) (*models.ContainerDetail, error) {
+	if s.Client != nil {
+		return s.Client.GetContainer(ctx, id)
+	}
 	return nil, notReady()
 }
 
-func (s *DockerService) InspectContainerRaw(_ context.Context, id string) (string, error) {
+func (s *DockerService) InspectContainerRaw(ctx context.Context, id string) (string, error) {
+	if s.Client != nil {
+		return s.Client.InspectContainerRaw(ctx, id)
+	}
 	return "", notReady()
 }
 
@@ -192,11 +201,17 @@ func (s *DockerService) BulkContainerAction(_ context.Context, ids []string, act
 	return nil, notReady()
 }
 
-func (s *DockerService) ListImages(_ context.Context) ([]models.ImageSummary, error) {
+func (s *DockerService) ListImages(ctx context.Context) ([]models.ImageSummary, error) {
+	if s.Client != nil {
+		return s.Client.ListImages(ctx)
+	}
 	return nil, notReady()
 }
 
-func (s *DockerService) GetImage(_ context.Context, id string) (*models.ImageDetail, error) {
+func (s *DockerService) GetImage(ctx context.Context, id string) (*models.ImageDetail, error) {
+	if s.Client != nil {
+		return s.Client.GetImage(ctx, id)
+	}
 	return nil, notReady()
 }
 
@@ -232,11 +247,17 @@ func (s *DockerService) PlanPrune(_ context.Context, kind string) (*models.Comma
 	return nil, notReady()
 }
 
-func (s *DockerService) ListVolumes(_ context.Context) ([]models.VolumeSummary, error) {
+func (s *DockerService) ListVolumes(ctx context.Context) ([]models.VolumeSummary, error) {
+	if s.Client != nil {
+		return s.Client.ListVolumes(ctx)
+	}
 	return nil, notReady()
 }
 
-func (s *DockerService) GetVolume(_ context.Context, name string) (*models.VolumeDetail, error) {
+func (s *DockerService) GetVolume(ctx context.Context, name string) (*models.VolumeDetail, error) {
+	if s.Client != nil {
+		return s.Client.GetVolume(ctx, name)
+	}
 	return nil, notReady()
 }
 
@@ -248,11 +269,17 @@ func (s *DockerService) PlanRemoveVolume(_ context.Context, name string, force b
 	return nil, notReady()
 }
 
-func (s *DockerService) ListNetworks(_ context.Context) ([]models.NetworkSummary, error) {
+func (s *DockerService) ListNetworks(ctx context.Context) ([]models.NetworkSummary, error) {
+	if s.Client != nil {
+		return s.Client.ListNetworks(ctx)
+	}
 	return nil, notReady()
 }
 
-func (s *DockerService) GetNetwork(_ context.Context, id string) (*models.NetworkDetail, error) {
+func (s *DockerService) GetNetwork(ctx context.Context, id string) (*models.NetworkDetail, error) {
+	if s.Client != nil {
+		return s.Client.GetNetwork(ctx, id)
+	}
 	return nil, notReady()
 }
 
