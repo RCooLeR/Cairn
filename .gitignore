@@ -54,6 +54,7 @@ fyne-cross/
 frontend/node_modules/
 frontend/dist/*
 !frontend/dist/.gitkeep
+!frontend/dist/embed-placeholder.txt
 *.db
 *.db-shm
 *.db-wal

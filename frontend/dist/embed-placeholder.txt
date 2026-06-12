@@ -1,0 +1,1 @@
+placeholder for Go embed before the Vite build writes production assets

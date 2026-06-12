@@ -7,6 +7,7 @@ import (
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/providers"
 )
 
 var (
@@ -15,7 +16,9 @@ var (
 	BuildDate = ""
 )
 
-type ProviderService struct{}
+type ProviderService struct {
+	Manager *providers.Manager
+}
 type DockerService struct{}
 type ProjectService struct{}
 type ComposeService struct{}
@@ -36,23 +39,38 @@ func notReady() error {
 	)
 }
 
-func (s *ProviderService) ListProviders(_ context.Context) ([]models.ProviderSummary, error) {
+func (s *ProviderService) ListProviders(ctx context.Context) ([]models.ProviderSummary, error) {
+	if s.Manager != nil {
+		return s.Manager.ListProviders(ctx)
+	}
 	return nil, notReady()
 }
 
-func (s *ProviderService) GetProvider(_ context.Context, providerID string) (*models.ProviderDetail, error) {
+func (s *ProviderService) GetProvider(ctx context.Context, providerID string) (*models.ProviderDetail, error) {
+	if s.Manager != nil {
+		return s.Manager.GetProvider(ctx, providerID)
+	}
 	return nil, notReady()
 }
 
-func (s *ProviderService) Detect(_ context.Context, providerID string) (*models.ProviderStatus, error) {
+func (s *ProviderService) Detect(ctx context.Context, providerID string) (*models.ProviderStatus, error) {
+	if s.Manager != nil {
+		return s.Manager.Detect(ctx, providerID)
+	}
 	return nil, notReady()
 }
 
-func (s *ProviderService) DetectAll(_ context.Context) (map[string]*models.ProviderStatus, error) {
+func (s *ProviderService) DetectAll(ctx context.Context) (map[string]*models.ProviderStatus, error) {
+	if s.Manager != nil {
+		return s.Manager.DetectAll(ctx)
+	}
 	return nil, notReady()
 }
 
-func (s *ProviderService) PlanInstall(_ context.Context, providerID string, opts models.InstallOptions) (*models.CommandPlan, error) {
+func (s *ProviderService) PlanInstall(ctx context.Context, providerID string, opts models.InstallOptions) (*models.CommandPlan, error) {
+	if s.Manager != nil {
+		return s.Manager.PlanInstall(ctx, providerID, opts)
+	}
 	return nil, notReady()
 }
 
@@ -60,23 +78,38 @@ func (s *ProviderService) ApplyInstall(_ context.Context, planID string) (*model
 	return nil, notReady()
 }
 
-func (s *ProviderService) Start(_ context.Context, providerID string) error {
+func (s *ProviderService) Start(ctx context.Context, providerID string) error {
+	if s.Manager != nil {
+		return s.Manager.Start(ctx, providerID)
+	}
 	return notReady()
 }
 
-func (s *ProviderService) Stop(_ context.Context, providerID string) error {
+func (s *ProviderService) Stop(ctx context.Context, providerID string) error {
+	if s.Manager != nil {
+		return s.Manager.Stop(ctx, providerID)
+	}
 	return notReady()
 }
 
-func (s *ProviderService) Restart(_ context.Context, providerID string) error {
+func (s *ProviderService) Restart(ctx context.Context, providerID string) error {
+	if s.Manager != nil {
+		return s.Manager.Restart(ctx, providerID)
+	}
 	return notReady()
 }
 
-func (s *ProviderService) SetActiveProvider(_ context.Context, providerID string) error {
+func (s *ProviderService) SetActiveProvider(ctx context.Context, providerID string) error {
+	if s.Manager != nil {
+		return s.Manager.SetActiveProvider(ctx, providerID)
+	}
 	return notReady()
 }
 
-func (s *ProviderService) ListDockerContexts(_ context.Context) ([]models.DockerContextInfo, error) {
+func (s *ProviderService) ListDockerContexts(ctx context.Context) ([]models.DockerContextInfo, error) {
+	if s.Manager != nil {
+		return s.Manager.ListDockerContexts(ctx)
+	}
 	return nil, notReady()
 }
 
