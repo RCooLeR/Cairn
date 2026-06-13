@@ -38,6 +38,7 @@ const (
 
 	WarningSystemdMissing = "SYSTEMD_MISSING"
 	WarningBrewMissing    = "BREW_MISSING"
+	WarningUnencryptedTCP = "UNENCRYPTED_TCP_CONTEXT"
 )
 
 type CommandResult struct {

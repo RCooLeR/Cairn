@@ -95,6 +95,21 @@ Current evidence: parser/unit tests cover `colima status --json`, `docker contex
 - [ ] macOS Apple Silicon VM: rerun the Phase 1-3 Docker integration suite against Colima.
 - [ ] macOS Intel best-effort: repeat healthy detection/start/stop and project import.
 
+## Phase 6.2 Existing Docker Context Provider
+
+Current evidence: unit tests cover existing-context healthy detection, missing-context failure mapping, unencrypted `tcp://` warning data, context-scoped Compose command construction with workdir/env passthrough, and manager `ListDockerContexts`/`SetDockerContext` creating an active `ctx:<name>` provider without running `docker context use`. Local gates passed: `go test ./internal/providers`, `go test . ./internal/...`, `go vet . ./internal/...`, `go build . ./internal/...`, `golangci-lint v2.12.2 run --timeout=5m`, frontend ESLint, Vitest, TypeScript, and audit. Real third-party context providers are not available in this environment, so the context matrix below remains manual TODOs.
+
+- [x] Unit-test line-delimited Docker context JSON parsing.
+- [x] Unit-test `ctx:<name>` provider detection and daemon ping through `docker --context`.
+- [x] Unit-test unencrypted `tcp://` context warning data.
+- [x] Unit-test `SetDockerContext` active-provider selection without mutating the user's global Docker context.
+- [ ] Windows: Docker Desktop context lists, pings, and can become Cairn's active `ctx:<name>` provider without changing `docker context show`.
+- [ ] macOS: Docker Desktop context lists, pings, and can become Cairn's active `ctx:<name>` provider without changing `docker context show`.
+- [ ] macOS: OrbStack context lists, pings, and Compose project import works through `--context`.
+- [ ] Linux: remote SSH Docker context lists, pings, and Compose commands run through `--context`.
+- [ ] Linux: unencrypted `tcp://` context shows the permanent warning chip in Settings.
+- [ ] Cross-platform E2E: switch Colima -> Desktop/remote context and back without app restart.
+
 ## Full Platform Matrix TODO
 
 - [ ] Windows 11 x64: WSL present/absent, Ubuntu present/absent/multiple, Docker in Ubuntu present/absent, systemd on/off.

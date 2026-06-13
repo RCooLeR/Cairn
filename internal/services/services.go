@@ -323,7 +323,10 @@ func (s *ProviderService) ListDockerContexts(ctx context.Context) ([]models.Dock
 	return nil, notReady()
 }
 
-func (s *ProviderService) SetDockerContext(_ context.Context, name string) error {
+func (s *ProviderService) SetDockerContext(ctx context.Context, name string) error {
+	if s.Manager != nil {
+		return s.Manager.SetDockerContext(ctx, name)
+	}
 	return notReady()
 }
 

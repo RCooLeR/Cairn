@@ -22,6 +22,7 @@ type Manager struct {
 	providers map[string]PlatformProvider
 	order     []string
 	now       func() time.Time
+	runner    CommandRunner
 
 	mu           sync.RWMutex
 	activeID     string
@@ -59,6 +60,7 @@ func NewManager(repo *store.ProviderRepository, settings *store.SettingsReposito
 		providers:    providersByID,
 		order:        order,
 		now:          func() time.Time { return time.Now().UTC() },
+		runner:       ExecRunner{},
 		installPlans: map[string]installPlanRecord{},
 	}
 }
@@ -183,6 +185,12 @@ func (m *Manager) GetProvider(ctx context.Context, providerID string) (*models.P
 }
 
 func (m *Manager) SetActiveProvider(ctx context.Context, providerID string) error {
+	if strings.HasPrefix(providerID, existingContextIDPrefix) {
+		contextName := strings.TrimPrefix(providerID, existingContextIDPrefix)
+		if err := m.ensureExistingContextProvider(ctx, contextName); err != nil {
+			return err
+		}
+	}
 	if _, ok := m.providers[providerID]; !ok {
 		return apperror.New(apperror.NotFound, "Provider was not found")
 	}
@@ -298,8 +306,31 @@ func (m *Manager) Restart(ctx context.Context, providerID string) error {
 	return provider.Restart(ctx)
 }
 
-func (m *Manager) ListDockerContexts(context.Context) ([]models.DockerContextInfo, error) {
-	return []models.DockerContextInfo{}, nil
+func (m *Manager) ListDockerContexts(ctx context.Context) ([]models.DockerContextInfo, error) {
+	contexts, ok := listDockerContexts(ctx, m.contextRunner())
+	if !ok {
+		return nil, apperror.New(apperror.ProviderNotReady, "Docker contexts are not available")
+	}
+	return contexts, nil
+}
+
+func (m *Manager) SetDockerContext(ctx context.Context, name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return apperror.New(apperror.Conflict, "Docker context name is required")
+	}
+	if err := m.ensureExistingContextProvider(ctx, name); err != nil {
+		return err
+	}
+	providerID := ExistingContextProviderID(name)
+	status, err := m.Detect(ctx, providerID)
+	if err != nil {
+		return err
+	}
+	if status == nil || !status.Healthy {
+		return apperror.New(apperror.ProviderNotReady, "Docker context is not reachable")
+	}
+	return m.SetActiveProvider(ctx, providerID)
 }
 
 func (m *Manager) ensureProviderRecords(ctx context.Context) error {
@@ -319,6 +350,35 @@ func (m *Manager) ensureProviderRecord(ctx context.Context, provider PlatformPro
 		DisplayName: provider.DisplayName(),
 		Enabled:     true,
 	})
+}
+
+func (m *Manager) ensureExistingContextProvider(ctx context.Context, contextName string) error {
+	contextName = strings.TrimSpace(contextName)
+	if contextName == "" {
+		return apperror.New(apperror.Conflict, "Docker context name is required")
+	}
+	contexts, ok := listDockerContexts(ctx, m.contextRunner())
+	if !ok {
+		return apperror.New(apperror.ProviderNotReady, "Docker contexts are not available")
+	}
+	found := false
+	for _, dockerContext := range contexts {
+		if dockerContext.Name == contextName {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return apperror.New(apperror.NotFound, "Docker context was not found")
+	}
+	provider := NewExistingContext(ExistingContextOptions{ContextName: contextName, Runner: m.contextRunner()})
+	m.mu.Lock()
+	if _, exists := m.providers[provider.ID()]; !exists {
+		m.providers[provider.ID()] = provider
+		m.order = append(m.order, provider.ID())
+	}
+	m.mu.Unlock()
+	return m.ensureProviderRecord(ctx, provider)
 }
 
 func (m *Manager) updateActiveAfterDetect(ctx context.Context, statuses map[string]*models.ProviderStatus) {
@@ -375,6 +435,13 @@ func (m *Manager) applyProviderSettings(ctx context.Context, provider PlatformPr
 		}
 		configurable.SetColimaConfig(profile, cpu, memoryGB, diskGB)
 	}
+}
+
+func (m *Manager) contextRunner() CommandRunner {
+	if m.runner != nil {
+		return m.runner
+	}
+	return ExecRunner{}
 }
 
 func plannedCommandText(plan *models.CommandPlan) string {
