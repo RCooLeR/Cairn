@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
@@ -89,13 +90,92 @@ func TestDockerServiceLifecycleAuditsAndPlans(t *testing.T) {
 	}
 }
 
+func TestDockerServiceObjectCreationAudits(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "cairn.db"))
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	client := newFakeDockerClient()
+	service := &DockerService{Client: client, Audit: db.Audit()}
+	if id, err := service.RunImage(ctx, models.RunImageRequest{
+		ImageRef: "alpine:latest",
+		Name:     "demo",
+		Env:      []models.EnvVar{{Name: "API_TOKEN", Value: "secret-value"}},
+		Detach:   true,
+	}); err != nil || id != "container-created" {
+		t.Fatalf("RunImage() id=%q err=%v", id, err)
+	}
+	if err := service.RenameContainer(ctx, "container-1", "web2"); err != nil {
+		t.Fatalf("RenameContainer() error = %v", err)
+	}
+	if _, err := service.PullImage(ctx, "alpine:latest"); err != nil {
+		t.Fatalf("PullImage() error = %v", err)
+	}
+	if _, err := service.SaveImage(ctx, []string{"alpine:latest"}, "/tmp/alpine.tar"); err != nil {
+		t.Fatalf("SaveImage() error = %v", err)
+	}
+	if _, err := service.LoadImage(ctx, "/tmp/alpine.tar"); err != nil {
+		t.Fatalf("LoadImage() error = %v", err)
+	}
+	if _, err := service.CreateVolume(ctx, models.CreateVolumeRequest{Name: "demo_data", Driver: "local"}); err != nil {
+		t.Fatalf("CreateVolume() error = %v", err)
+	}
+	if _, err := service.CreateNetwork(ctx, models.CreateNetworkRequest{Name: "demo_net", Driver: "bridge", Attachable: true}); err != nil {
+		t.Fatalf("CreateNetwork() error = %v", err)
+	}
+	results, err := service.SearchHub(ctx, "alpine", 5)
+	if err != nil {
+		t.Fatalf("SearchHub() error = %v", err)
+	}
+	if len(results) != 1 || client.searchTerm != "alpine" {
+		t.Fatalf("SearchHub results=%#v term=%q", results, client.searchTerm)
+	}
+
+	entries, err := (&SettingsService{Audit: db.Audit()}).GetAuditLog(ctx, models.AuditFilter{Limit: 30})
+	if err != nil {
+		t.Fatalf("GetAuditLog() error = %v", err)
+	}
+	if len(entries) != 14 {
+		t.Fatalf("audit entries count = %d, want 14: %#v", len(entries), entries)
+	}
+	var sawRun bool
+	for _, entry := range entries {
+		if entry.Action == "container.run" && entry.Result == "success" {
+			sawRun = true
+			command, _ := entry.Metadata["command"].(string)
+			if strings.Contains(command, "secret-value") || !strings.Contains(command, "API_TOKEN=********") {
+				t.Fatalf("run command was not redacted: %q", command)
+			}
+		}
+	}
+	if !sawRun {
+		t.Fatalf("missing successful container.run audit in %#v", entries)
+	}
+}
+
 type fakeDockerClient struct {
-	container models.ContainerSummary
-	started   []string
-	stopped   []string
-	restarted []string
-	killed    []string
-	removed   []string
+	container  models.ContainerSummary
+	started    []string
+	stopped    []string
+	restarted  []string
+	killed     []string
+	removed    []string
+	renamed    []string
+	runImages  []models.RunImageRequest
+	pulled     []string
+	saved      []string
+	loaded     []string
+	volumes    []models.CreateVolumeRequest
+	networks   []models.CreateNetworkRequest
+	searchTerm string
 }
 
 func newFakeDockerClient() *fakeDockerClient {
@@ -167,12 +247,42 @@ func (f *fakeDockerClient) RemoveContainer(_ context.Context, id string, _ model
 	return nil
 }
 
+func (f *fakeDockerClient) RenameContainer(_ context.Context, id string, name string) error {
+	f.renamed = append(f.renamed, id+":"+name)
+	return nil
+}
+
+func (f *fakeDockerClient) RunImage(_ context.Context, req models.RunImageRequest) (string, error) {
+	f.runImages = append(f.runImages, req)
+	return "container-created", nil
+}
+
 func (f *fakeDockerClient) ListImages(context.Context) ([]models.ImageSummary, error) {
 	return nil, nil
 }
 
 func (f *fakeDockerClient) GetImage(context.Context, string) (*models.ImageDetail, error) {
 	return nil, nil
+}
+
+func (f *fakeDockerClient) PullImage(_ context.Context, ref string) (string, error) {
+	f.pulled = append(f.pulled, ref)
+	return "pull-stream", nil
+}
+
+func (f *fakeDockerClient) SaveImage(_ context.Context, refs []string, destPath string) (string, error) {
+	f.saved = append(f.saved, strings.Join(refs, ",")+"->"+destPath)
+	return "save-job", nil
+}
+
+func (f *fakeDockerClient) LoadImage(_ context.Context, srcPath string) (string, error) {
+	f.loaded = append(f.loaded, srcPath)
+	return "load-job", nil
+}
+
+func (f *fakeDockerClient) SearchHub(_ context.Context, query string, _ int) ([]models.HubSearchResult, error) {
+	f.searchTerm = query
+	return []models.HubSearchResult{{Name: "library/" + query, Stars: 1, Official: true}}, nil
 }
 
 func (f *fakeDockerClient) ListVolumes(context.Context) ([]models.VolumeSummary, error) {
@@ -183,10 +293,20 @@ func (f *fakeDockerClient) GetVolume(context.Context, string) (*models.VolumeDet
 	return nil, nil
 }
 
+func (f *fakeDockerClient) CreateVolume(_ context.Context, req models.CreateVolumeRequest) (*models.VolumeSummary, error) {
+	f.volumes = append(f.volumes, req)
+	return &models.VolumeSummary{Name: req.Name, Driver: req.Driver}, nil
+}
+
 func (f *fakeDockerClient) ListNetworks(context.Context) ([]models.NetworkSummary, error) {
 	return nil, nil
 }
 
 func (f *fakeDockerClient) GetNetwork(context.Context, string) (*models.NetworkDetail, error) {
 	return nil, nil
+}
+
+func (f *fakeDockerClient) CreateNetwork(_ context.Context, req models.CreateNetworkRequest) (*models.NetworkSummary, error) {
+	f.networks = append(f.networks, req)
+	return &models.NetworkSummary{ID: "network-created", Name: req.Name, Driver: req.Driver, Attachable: req.Attachable}, nil
 }

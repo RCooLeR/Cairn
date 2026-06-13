@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,9 +20,11 @@ import (
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/api/types/system"
 	"github.com/docker/docker/api/types/volume"
 	dockerclient "github.com/docker/docker/client"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
 const (
@@ -53,12 +56,20 @@ type APIClient interface {
 	ContainerKill(context.Context, string, string) error
 	ContainerRemove(context.Context, string, container.RemoveOptions) error
 	ContainerUnpause(context.Context, string) error
+	ContainerCreate(context.Context, *container.Config, *container.HostConfig, *network.NetworkingConfig, *ocispec.Platform, string) (container.CreateResponse, error)
+	ContainerRename(context.Context, string, string) error
 	ImageList(context.Context, image.ListOptions) ([]image.Summary, error)
 	ImageInspectWithRaw(context.Context, string) (image.InspectResponse, []byte, error)
+	ImagePull(context.Context, string, image.PullOptions) (io.ReadCloser, error)
+	ImageSave(context.Context, []string, ...dockerclient.ImageSaveOption) (io.ReadCloser, error)
+	ImageLoad(context.Context, io.Reader, ...dockerclient.ImageLoadOption) (image.LoadResponse, error)
+	ImageSearch(context.Context, string, registry.SearchOptions) ([]registry.SearchResult, error)
 	VolumeList(context.Context, volume.ListOptions) (volume.ListResponse, error)
 	VolumeInspectWithRaw(context.Context, string) (volume.Volume, []byte, error)
+	VolumeCreate(context.Context, volume.CreateOptions) (volume.Volume, error)
 	NetworkList(context.Context, network.ListOptions) ([]network.Summary, error)
 	NetworkInspectWithRaw(context.Context, string, network.InspectOptions) (network.Inspect, []byte, error)
+	NetworkCreate(context.Context, string, network.CreateOptions) (network.CreateResponse, error)
 	Events(context.Context, events.ListOptions) (<-chan events.Message, <-chan error)
 	Close() error
 }

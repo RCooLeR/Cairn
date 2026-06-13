@@ -47,7 +47,7 @@ ApplyContainerPlan(planID string, typedName string) error
 RenameContainer(id string, newName string) error
 RunImage(req RunImageRequest) (string /*containerID*/, error)
 // RunImageRequest{ImageRef, Name, Ports []PortMapping, Env []EnvVar, Volumes []MountSpec,
-//                 NetworkID, RestartPolicy, Command?, Detach=true, PullIfMissing bool}
+//                 NetworkID, RestartPolicy, Command?, User?, Detach=true, PullIfMissing bool}
 // backs the run-image wizard; validates name/port collisions before create
 PlanRemoveContainer(id string, opts RemoveContainerOptions) (*CommandPlan, error)
 BulkContainerAction(ids []string, action string) (*BulkResult, error) // start|stop|restart

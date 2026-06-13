@@ -2,8 +2,10 @@ package services
 
 import (
 	"context"
+	"fmt"
 	"runtime"
 	"runtime/debug"
+	"strings"
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
@@ -37,12 +39,20 @@ type DockerClient interface {
 	RestartContainer(context.Context, string, int) error
 	KillContainer(context.Context, string) error
 	RemoveContainer(context.Context, string, models.RemoveContainerOptions) error
+	RenameContainer(context.Context, string, string) error
+	RunImage(context.Context, models.RunImageRequest) (string, error)
 	ListImages(context.Context) ([]models.ImageSummary, error)
 	GetImage(context.Context, string) (*models.ImageDetail, error)
+	PullImage(context.Context, string) (string, error)
+	SaveImage(context.Context, []string, string) (string, error)
+	LoadImage(context.Context, string) (string, error)
+	SearchHub(context.Context, string, int) ([]models.HubSearchResult, error)
 	ListVolumes(context.Context) ([]models.VolumeSummary, error)
 	GetVolume(context.Context, string) (*models.VolumeDetail, error)
+	CreateVolume(context.Context, models.CreateVolumeRequest) (*models.VolumeSummary, error)
 	ListNetworks(context.Context) ([]models.NetworkSummary, error)
 	GetNetwork(context.Context, string) (*models.NetworkDetail, error)
+	CreateNetwork(context.Context, models.CreateNetworkRequest) (*models.NetworkSummary, error)
 }
 
 type DockerService struct {
@@ -218,12 +228,48 @@ func (s *DockerService) KillContainer(_ context.Context, id string) error {
 	)
 }
 
-func (s *DockerService) RenameContainer(_ context.Context, id string, newName string) error {
-	return notReady()
+func (s *DockerService) RenameContainer(ctx context.Context, id string, newName string) error {
+	if s.Client == nil {
+		return notReady()
+	}
+	detail, err := s.Client.GetContainer(ctx, id)
+	if err != nil {
+		return err
+	}
+	command := dockerRenameCommand(detail.Summary.Name, newName)
+	started := time.Now().UTC()
+	if err := s.recordAudit(ctx, "container.rename", "container", detail.Summary.ID, detail.Summary.ProjectID, command, models.RiskSafe, "started", 0, nil); err != nil {
+		return err
+	}
+	err = s.Client.RenameContainer(ctx, id, newName)
+	duration := time.Since(started)
+	if err != nil {
+		_ = s.recordAudit(ctx, "container.rename", "container", detail.Summary.ID, detail.Summary.ProjectID, command, models.RiskSafe, "failed", duration, err)
+		return err
+	}
+	return s.recordAudit(ctx, "container.rename", "container", detail.Summary.ID, detail.Summary.ProjectID, command, models.RiskSafe, "success", duration, nil)
 }
 
-func (s *DockerService) RunImage(_ context.Context, req models.RunImageRequest) (string, error) {
-	return "", notReady()
+func (s *DockerService) RunImage(ctx context.Context, req models.RunImageRequest) (string, error) {
+	if s.Client == nil {
+		return "", notReady()
+	}
+	command := dockerRunCommand(req)
+	targetID := strings.TrimSpace(req.Name)
+	if targetID == "" {
+		targetID = strings.TrimSpace(req.ImageRef)
+	}
+	started := time.Now().UTC()
+	if err := s.recordAudit(ctx, "container.run", "container", targetID, "", command, models.RiskSafe, "started", 0, nil); err != nil {
+		return "", err
+	}
+	id, err := s.Client.RunImage(ctx, req)
+	duration := time.Since(started)
+	if err != nil {
+		_ = s.recordAudit(ctx, "container.run", "container", targetID, "", command, models.RiskSafe, "failed", duration, err)
+		return "", err
+	}
+	return id, s.recordAudit(ctx, "container.run", "container", id, "", command, models.RiskSafe, "success", duration, nil)
 }
 
 func (s *DockerService) PlanKillContainer(ctx context.Context, id string) (*models.CommandPlan, error) {
@@ -346,6 +392,10 @@ func (s *DockerService) executeContainerAction(ctx context.Context, action strin
 }
 
 func (s *DockerService) recordContainerAudit(ctx context.Context, container models.ContainerSummary, action string, command string, risk models.Risk, status string, duration time.Duration, actionErr error) error {
+	return s.recordAudit(ctx, "container."+action, "container", container.ID, container.ProjectID, command, risk, status, duration, actionErr)
+}
+
+func (s *DockerService) recordAudit(ctx context.Context, action string, targetType string, targetID string, projectID string, command string, risk models.Risk, status string, duration time.Duration, actionErr error) error {
 	if s.Audit == nil {
 		return nil
 	}
@@ -359,11 +409,11 @@ func (s *DockerService) recordContainerAudit(ctx context.Context, container mode
 		message = actionErr.Error()
 	}
 	_, err := s.Audit.Insert(ctx, store.AuditRecord{
-		Action:     "container." + action,
-		TargetType: "container",
-		TargetID:   container.ID,
+		Action:     action,
+		TargetType: targetType,
+		TargetID:   targetID,
 		ProviderID: s.Client.ProviderID(),
-		ProjectID:  container.ProjectID,
+		ProjectID:  projectID,
 		Command:    command,
 		Risk:       risk,
 		Status:     status,
@@ -399,8 +449,22 @@ func (s *DockerService) GetImage(ctx context.Context, id string) (*models.ImageD
 	return nil, notReady()
 }
 
-func (s *DockerService) PullImage(_ context.Context, imageRef string) (string, error) {
-	return "", notReady()
+func (s *DockerService) PullImage(ctx context.Context, imageRef string) (string, error) {
+	if s.Client == nil {
+		return "", notReady()
+	}
+	command := "docker pull " + quoteArg(imageRef)
+	started := time.Now().UTC()
+	if err := s.recordAudit(ctx, "image.pull", "image", imageRef, "", command, models.RiskSafe, "started", 0, nil); err != nil {
+		return "", err
+	}
+	streamID, err := s.Client.PullImage(ctx, imageRef)
+	duration := time.Since(started)
+	if err != nil {
+		_ = s.recordAudit(ctx, "image.pull", "image", imageRef, "", command, models.RiskSafe, "failed", duration, err)
+		return "", err
+	}
+	return streamID, s.recordAudit(ctx, "image.pull", "image", imageRef, "", command, models.RiskSafe, "success", duration, nil)
 }
 
 func (s *DockerService) TagImage(_ context.Context, imageID string, newRef string) error {
@@ -411,15 +475,47 @@ func (s *DockerService) PushImage(_ context.Context, imageRef string) (string, e
 	return "", notReady()
 }
 
-func (s *DockerService) SaveImage(_ context.Context, imageRefs []string, destPath string) (string, error) {
-	return "", notReady()
+func (s *DockerService) SaveImage(ctx context.Context, imageRefs []string, destPath string) (string, error) {
+	if s.Client == nil {
+		return "", notReady()
+	}
+	command := dockerSaveCommand(imageRefs, destPath)
+	targetID := strings.Join(imageRefs, ",")
+	started := time.Now().UTC()
+	if err := s.recordAudit(ctx, "image.save", "image", targetID, "", command, models.RiskSafe, "started", 0, nil); err != nil {
+		return "", err
+	}
+	jobID, err := s.Client.SaveImage(ctx, imageRefs, destPath)
+	duration := time.Since(started)
+	if err != nil {
+		_ = s.recordAudit(ctx, "image.save", "image", targetID, "", command, models.RiskSafe, "failed", duration, err)
+		return "", err
+	}
+	return jobID, s.recordAudit(ctx, "image.save", "image", targetID, "", command, models.RiskSafe, "success", duration, nil)
 }
 
-func (s *DockerService) LoadImage(_ context.Context, srcPath string) (string, error) {
-	return "", notReady()
+func (s *DockerService) LoadImage(ctx context.Context, srcPath string) (string, error) {
+	if s.Client == nil {
+		return "", notReady()
+	}
+	command := "docker load -i " + quoteArg(srcPath)
+	started := time.Now().UTC()
+	if err := s.recordAudit(ctx, "image.load", "image", srcPath, "", command, models.RiskSafe, "started", 0, nil); err != nil {
+		return "", err
+	}
+	jobID, err := s.Client.LoadImage(ctx, srcPath)
+	duration := time.Since(started)
+	if err != nil {
+		_ = s.recordAudit(ctx, "image.load", "image", srcPath, "", command, models.RiskSafe, "failed", duration, err)
+		return "", err
+	}
+	return jobID, s.recordAudit(ctx, "image.load", "image", srcPath, "", command, models.RiskSafe, "success", duration, nil)
 }
 
-func (s *DockerService) SearchHub(_ context.Context, query string, limit int) ([]models.HubSearchResult, error) {
+func (s *DockerService) SearchHub(ctx context.Context, query string, limit int) ([]models.HubSearchResult, error) {
+	if s.Client != nil {
+		return s.Client.SearchHub(ctx, query, limit)
+	}
 	return nil, notReady()
 }
 
@@ -445,8 +541,22 @@ func (s *DockerService) GetVolume(ctx context.Context, name string) (*models.Vol
 	return nil, notReady()
 }
 
-func (s *DockerService) CreateVolume(_ context.Context, req models.CreateVolumeRequest) (*models.VolumeSummary, error) {
-	return nil, notReady()
+func (s *DockerService) CreateVolume(ctx context.Context, req models.CreateVolumeRequest) (*models.VolumeSummary, error) {
+	if s.Client == nil {
+		return nil, notReady()
+	}
+	command := dockerVolumeCreateCommand(req)
+	started := time.Now().UTC()
+	if err := s.recordAudit(ctx, "volume.create", "volume", req.Name, "", command, models.RiskSafe, "started", 0, nil); err != nil {
+		return nil, err
+	}
+	summary, err := s.Client.CreateVolume(ctx, req)
+	duration := time.Since(started)
+	if err != nil {
+		_ = s.recordAudit(ctx, "volume.create", "volume", req.Name, "", command, models.RiskSafe, "failed", duration, err)
+		return nil, err
+	}
+	return summary, s.recordAudit(ctx, "volume.create", "volume", summary.Name, "", command, models.RiskSafe, "success", duration, nil)
 }
 
 func (s *DockerService) PlanRemoveVolume(_ context.Context, name string, force bool) (*models.CommandPlan, error) {
@@ -467,8 +577,22 @@ func (s *DockerService) GetNetwork(ctx context.Context, id string) (*models.Netw
 	return nil, notReady()
 }
 
-func (s *DockerService) CreateNetwork(_ context.Context, req models.CreateNetworkRequest) (*models.NetworkSummary, error) {
-	return nil, notReady()
+func (s *DockerService) CreateNetwork(ctx context.Context, req models.CreateNetworkRequest) (*models.NetworkSummary, error) {
+	if s.Client == nil {
+		return nil, notReady()
+	}
+	command := dockerNetworkCreateCommand(req)
+	started := time.Now().UTC()
+	if err := s.recordAudit(ctx, "network.create", "network", req.Name, "", command, models.RiskSafe, "started", 0, nil); err != nil {
+		return nil, err
+	}
+	summary, err := s.Client.CreateNetwork(ctx, req)
+	duration := time.Since(started)
+	if err != nil {
+		_ = s.recordAudit(ctx, "network.create", "network", req.Name, "", command, models.RiskSafe, "failed", duration, err)
+		return nil, err
+	}
+	return summary, s.recordAudit(ctx, "network.create", "network", summary.ID, "", command, models.RiskSafe, "success", duration, nil)
 }
 
 func (s *DockerService) PlanRemoveNetwork(_ context.Context, id string) (*models.CommandPlan, error) {
@@ -762,6 +886,153 @@ func (s *SettingsService) OpenPath(_ context.Context, path string) error {
 
 func (s *SettingsService) AppVersion(_ context.Context) (*models.VersionInfo, error) {
 	return versionInfo(), nil
+}
+
+func dockerRunCommand(req models.RunImageRequest) string {
+	args := []string{"docker", "run", "-d"}
+	if req.Name != "" {
+		args = append(args, "--name", req.Name)
+	}
+	for _, port := range req.Ports {
+		containerPort := strings.TrimSpace(port.ContainerPort)
+		if containerPort == "" {
+			continue
+		}
+		protocol := strings.TrimSpace(port.Protocol)
+		if protocol == "" {
+			protocol = "tcp"
+		}
+		host := strings.TrimSpace(port.HostPort)
+		if port.HostIP != "" || host != "" {
+			host = strings.TrimSpace(port.HostIP) + ":" + host
+		}
+		args = append(args, "-p", strings.TrimPrefix(host+":"+containerPort+"/"+protocol, ":"))
+	}
+	for _, env := range req.Env {
+		name := strings.TrimSpace(env.Name)
+		if name == "" {
+			continue
+		}
+		value := env.Value
+		if secretLike(name) {
+			value = "********"
+		}
+		args = append(args, "-e", name+"="+value)
+	}
+	for _, mount := range req.Volumes {
+		target := strings.TrimSpace(mount.Target)
+		if target == "" {
+			continue
+		}
+		source := strings.TrimSpace(mount.Source)
+		mountType := strings.TrimSpace(mount.Type)
+		if mountType == "" {
+			mountType = "volume"
+		}
+		if mountType == "volume" && mount.VolumeName != "" {
+			source = strings.TrimSpace(mount.VolumeName)
+		}
+		if source == "" {
+			continue
+		}
+		mode := "rw"
+		if mount.ReadOnly {
+			mode = "ro"
+		}
+		args = append(args, "--mount", fmt.Sprintf("type=%s,source=%s,target=%s,%s", mountType, source, target, mode))
+	}
+	if req.NetworkID != "" {
+		args = append(args, "--network", req.NetworkID)
+	}
+	if req.RestartPolicy != "" && req.RestartPolicy != "no" {
+		args = append(args, "--restart", req.RestartPolicy)
+	}
+	if req.User != "" {
+		args = append(args, "--user", req.User)
+	}
+	args = append(args, req.ImageRef)
+	args = append(args, req.Command...)
+	return joinCommand(args)
+}
+
+func dockerRenameCommand(oldName string, newName string) string {
+	return joinCommand([]string{"docker", "rename", oldName, newName})
+}
+
+func dockerSaveCommand(imageRefs []string, destPath string) string {
+	args := []string{"docker", "save", "-o", destPath}
+	args = append(args, imageRefs...)
+	return joinCommand(args)
+}
+
+func dockerVolumeCreateCommand(req models.CreateVolumeRequest) string {
+	args := []string{"docker", "volume", "create"}
+	if req.Driver != "" {
+		args = append(args, "--driver", req.Driver)
+	}
+	for key, value := range req.DriverOpts {
+		args = append(args, "--opt", key+"="+value)
+	}
+	for key, value := range req.Labels {
+		args = append(args, "--label", key+"="+value)
+	}
+	args = append(args, req.Name)
+	return joinCommand(args)
+}
+
+func dockerNetworkCreateCommand(req models.CreateNetworkRequest) string {
+	args := []string{"docker", "network", "create"}
+	if req.Driver != "" {
+		args = append(args, "--driver", req.Driver)
+	}
+	if req.Subnet != "" {
+		args = append(args, "--subnet", req.Subnet)
+	}
+	if req.Gateway != "" {
+		args = append(args, "--gateway", req.Gateway)
+	}
+	if req.Internal {
+		args = append(args, "--internal")
+	}
+	if req.Attachable {
+		args = append(args, "--attachable")
+	}
+	for key, value := range req.Labels {
+		args = append(args, "--label", key+"="+value)
+	}
+	args = append(args, req.Name)
+	return joinCommand(args)
+}
+
+func joinCommand(args []string) string {
+	quoted := make([]string, 0, len(args))
+	for _, arg := range args {
+		if strings.TrimSpace(arg) == "" {
+			continue
+		}
+		quoted = append(quoted, quoteArg(arg))
+	}
+	return strings.Join(quoted, " ")
+}
+
+func quoteArg(arg string) string {
+	if arg == "" {
+		return `""`
+	}
+	if strings.ContainsAny(arg, " \t\r\n\"'") {
+		return `"` + strings.ReplaceAll(arg, `"`, `\"`) + `"`
+	}
+	return arg
+}
+
+func secretLike(name string) bool {
+	lower := strings.ToLower(name)
+	for _, marker := range []string{"pass", "password", "token", "secret", "key", "auth"} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func versionInfo() *models.VersionInfo {

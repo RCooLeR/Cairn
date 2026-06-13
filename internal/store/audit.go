@@ -61,7 +61,8 @@ func (r *AuditRepository) List(ctx context.Context, filter models.AuditFilter) (
 		limit = 100
 	}
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, action, COALESCE(target_id, ''), status, COALESCE(error, ''), created_at
+		SELECT id, action, COALESCE(target_id, ''), status, COALESCE(error, ''), created_at,
+		       COALESCE(command, ''), COALESCE(risk, ''), COALESCE(provider_id, ''), COALESCE(project_id, '')
 		FROM audit_log
 		WHERE (? = '' OR action LIKE ? || '%')
 		ORDER BY created_at DESC, id DESC
@@ -78,13 +79,49 @@ func (r *AuditRepository) List(ctx context.Context, filter models.AuditFilter) (
 	for rows.Next() {
 		var entry models.AuditEntry
 		var createdAt string
-		if err := rows.Scan(&entry.ID, &entry.Action, &entry.Target, &entry.Result, &entry.Error, &createdAt); err != nil {
+		var command string
+		var risk string
+		var providerID string
+		var projectID string
+		if err := rows.Scan(
+			&entry.ID,
+			&entry.Action,
+			&entry.Target,
+			&entry.Result,
+			&entry.Error,
+			&createdAt,
+			&command,
+			&risk,
+			&providerID,
+			&projectID,
+		); err != nil {
 			return nil, err
 		}
 		if createdAt != "" {
 			entry.TS, _ = time.Parse(time.RFC3339Nano, createdAt)
 		}
+		entry.Metadata = auditMetadata(command, risk, providerID, projectID)
 		entries = append(entries, entry)
 	}
 	return entries, rows.Err()
+}
+
+func auditMetadata(command string, risk string, providerID string, projectID string) map[string]any {
+	values := map[string]any{}
+	if command != "" {
+		values["command"] = command
+	}
+	if risk != "" {
+		values["risk"] = risk
+	}
+	if providerID != "" {
+		values["providerID"] = providerID
+	}
+	if projectID != "" {
+		values["projectID"] = projectID
+	}
+	if len(values) == 0 {
+		return nil
+	}
+	return values
 }

@@ -1,11 +1,14 @@
 package docker
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/bus"
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
@@ -28,9 +32,11 @@ import (
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
+	"github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/api/types/strslice"
 	"github.com/docker/docker/api/types/system"
 	"github.com/docker/docker/api/types/volume"
+	dockerclient "github.com/docker/docker/client"
 	dockerspec "github.com/moby/docker-image-spec/specs-go/v1"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
@@ -396,6 +402,170 @@ func TestClientContainerLifecycleMethods(t *testing.T) {
 	}
 }
 
+func TestClientRunImageRenameAndCreateObjects(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	seedFakeObjects(api)
+
+	eventBus := bus.New()
+	defer eventBus.Close()
+	changed := eventBus.Subscribe(ctx, bus.TopicObjectsChanged, 8)
+
+	client := New(fakeDockerProvider{}, eventBus)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	containerID, err := client.RunImage(ctx, models.RunImageRequest{
+		ImageRef:      "example/web:latest",
+		Name:          "new-web",
+		Ports:         []models.PortMapping{{HostPort: "0", ContainerPort: "80", Protocol: "tcp"}},
+		Env:           []models.EnvVar{{Name: "MODE", Value: "test"}},
+		Volumes:       []models.MountSpec{{Type: "volume", VolumeName: "demo_data", Target: "/data", ReadOnly: true}},
+		NetworkID:     "demo_default",
+		RestartPolicy: "unless-stopped",
+		Command:       []string{"sleep", "60"},
+		User:          "1000",
+		Detach:        true,
+	})
+	if err != nil {
+		t.Fatalf("RunImage() error = %v", err)
+	}
+	if containerID != "created-new-web" {
+		t.Fatalf("containerID = %q", containerID)
+	}
+	if len(api.createdContainers) != 1 {
+		t.Fatalf("created containers = %#v", api.createdContainers)
+	}
+	call := api.createdContainers[0]
+	if call.Name != "new-web" || call.Config.Image != "example/web:latest" || call.Config.User != "1000" {
+		t.Fatalf("create call config = %#v", call)
+	}
+	if got := call.Config.Env; len(got) != 1 || got[0] != "MODE=test" {
+		t.Fatalf("env = %#v", got)
+	}
+	if got := call.HostConfig.RestartPolicy.Name; got != container.RestartPolicyUnlessStopped {
+		t.Fatalf("restart policy = %q", got)
+	}
+	if len(call.HostConfig.Mounts) != 1 || call.HostConfig.Mounts[0].Source != "demo_data" || !call.HostConfig.Mounts[0].ReadOnly {
+		t.Fatalf("mounts = %#v", call.HostConfig.Mounts)
+	}
+	if call.NetworkingConfig.EndpointsConfig["demo_default"] == nil {
+		t.Fatalf("networking config = %#v", call.NetworkingConfig)
+	}
+	if len(api.started) != 1 || api.started[0] != containerID {
+		t.Fatalf("started = %#v", api.started)
+	}
+	waitObjectsChangedKind(t, ctx, changed, objectKindContainer, containerID, time.Second)
+
+	if err := client.RenameContainer(ctx, fakeContainerID, "web-renamed"); err != nil {
+		t.Fatalf("RenameContainer() error = %v", err)
+	}
+	if len(api.renamed) != 1 || api.renamed[0] != fakeContainerID+":web-renamed" {
+		t.Fatalf("renamed = %#v", api.renamed)
+	}
+
+	volumeSummary, err := client.CreateVolume(ctx, models.CreateVolumeRequest{
+		Name:       "cairn_data",
+		Driver:     "local",
+		DriverOpts: map[string]string{"type": "none"},
+		Labels:     map[string]string{"app": "cairn"},
+	})
+	if err != nil {
+		t.Fatalf("CreateVolume() error = %v", err)
+	}
+	if volumeSummary.Name != "cairn_data" || volumeSummary.Driver != "local" {
+		t.Fatalf("volume summary = %#v", volumeSummary)
+	}
+
+	networkSummary, err := client.CreateNetwork(ctx, models.CreateNetworkRequest{
+		Name:       "cairn_net",
+		Driver:     "bridge",
+		Subnet:     "172.30.0.0/16",
+		Gateway:    "172.30.0.1",
+		Attachable: true,
+		Labels:     map[string]string{"app": "cairn"},
+	})
+	if err != nil {
+		t.Fatalf("CreateNetwork() error = %v", err)
+	}
+	if networkSummary.Name != "cairn_net" || !networkSummary.Attachable {
+		t.Fatalf("network summary = %#v", networkSummary)
+	}
+	if got := api.createdNetworks[0].Options.IPAM.Config[0].Subnet; got != "172.30.0.0/16" {
+		t.Fatalf("network subnet = %q", got)
+	}
+}
+
+func TestClientImagePullSaveLoadAndSearch(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	seedFakeObjects(api)
+
+	eventBus := bus.New()
+	defer eventBus.Close()
+	pullEvents := eventBus.Subscribe(ctx, bus.TopicImagePullProgress, 8)
+	jobDone := eventBus.Subscribe(ctx, bus.TopicJobDone, 8)
+
+	client := New(fakeDockerProvider{}, eventBus)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	streamID, err := client.PullImage(ctx, "alpine:latest")
+	if err != nil {
+		t.Fatalf("PullImage() error = %v", err)
+	}
+	if streamID == "" || len(api.pulled) != 1 || api.pulled[0] != "alpine:latest" {
+		t.Fatalf("streamID=%q pulled=%#v", streamID, api.pulled)
+	}
+	if got := waitImageProgress(t, ctx, pullEvents, time.Second); got.StreamID != streamID {
+		t.Fatalf("pull progress = %#v, want stream %q", got, streamID)
+	}
+
+	dest := filepath.Join(t.TempDir(), "image.tar")
+	jobID, err := client.SaveImage(ctx, []string{"example/web:latest"}, dest)
+	if err != nil {
+		t.Fatalf("SaveImage() error = %v", err)
+	}
+	if jobID == "" || len(api.saved) != 1 || api.saved[0][0] != "example/web:latest" {
+		t.Fatalf("jobID=%q saved=%#v", jobID, api.saved)
+	}
+	if data, err := os.ReadFile(dest); err != nil || string(data) != "fake image tar" {
+		t.Fatalf("saved archive data=%q err=%v", string(data), err)
+	}
+	if got := waitJobDone(t, ctx, jobDone, time.Second); got.JobID != jobID || got.Error != "" {
+		t.Fatalf("save job done = %#v", got)
+	}
+
+	src := filepath.Join(t.TempDir(), "load.tar")
+	if err := os.WriteFile(src, []byte("load-me"), 0o644); err != nil {
+		t.Fatalf("write load archive: %v", err)
+	}
+	loadJobID, err := client.LoadImage(ctx, src)
+	if err != nil {
+		t.Fatalf("LoadImage() error = %v", err)
+	}
+	if loadJobID == "" || len(api.loadedBytes) != 1 || api.loadedBytes[0] != len("load-me") {
+		t.Fatalf("loadJobID=%q loadedBytes=%#v", loadJobID, api.loadedBytes)
+	}
+	if got := waitJobDone(t, ctx, jobDone, time.Second); got.JobID != loadJobID || !strings.Contains(got.Result, "loaded:latest") {
+		t.Fatalf("load job done = %#v", got)
+	}
+
+	results, err := client.SearchHub(ctx, "alpine", 5)
+	if err != nil {
+		t.Fatalf("SearchHub() error = %v", err)
+	}
+	if len(results) != 1 || results[0].Name != "library/alpine" || !results[0].Official {
+		t.Fatalf("hub results = %#v", results)
+	}
+}
+
 func TestClientRealDockerIntegration(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("real Docker integration runs only on Linux")
@@ -539,6 +709,7 @@ func seedFakeObjects(api *fakeAPI) {
 		},
 		RootFS: image.RootFS{Layers: []string{"sha256:layer1"}},
 	}
+	api.imageInspects["example/web:latest"] = api.imageInspects["sha256:image1"]
 
 	api.volumes = []*volume.Volume{{
 		Name:       "demo_data",
@@ -654,11 +825,81 @@ func waitObjectsChangedKind(t *testing.T, ctx context.Context, events <-chan bus
 	}
 }
 
+func waitImageProgress(t *testing.T, ctx context.Context, events <-chan bus.Event, timeout time.Duration) ImageProgressPayload {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatalf("context done waiting for image progress: %v", ctx.Err())
+		case <-timer.C:
+			t.Fatal("timed out waiting for image progress")
+		case event, ok := <-events:
+			if !ok {
+				t.Fatal("image progress subscription closed")
+			}
+			payload, ok := event.Payload.(ImageProgressPayload)
+			if ok {
+				return payload
+			}
+		}
+	}
+}
+
+func waitJobDone(t *testing.T, ctx context.Context, events <-chan bus.Event, timeout time.Duration) JobDonePayload {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatalf("context done waiting for job done: %v", ctx.Err())
+		case <-timer.C:
+			t.Fatal("timed out waiting for job done")
+		case event, ok := <-events:
+			if !ok {
+				t.Fatal("job done subscription closed")
+			}
+			payload, ok := event.Payload.(JobDonePayload)
+			if ok {
+				return payload
+			}
+		}
+	}
+}
+
 func writeDockerfile(t *testing.T, path string) {
 	t.Helper()
 	content := "FROM scratch\nLABEL org.opencontainers.image.title=\"cairn object test\"\nCMD [\"/cairn-noop\"]\n"
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("write Dockerfile: %v", err)
+	}
+}
+
+func writeSleeperImageContext(t *testing.T, dir string) {
+	t.Helper()
+	source := filepath.Join(dir, "sleeper.go")
+	binary := filepath.Join(dir, "sleeper")
+	if err := os.WriteFile(source, []byte(`package main
+
+import "time"
+
+func main() {
+	time.Sleep(time.Hour)
+}
+`), 0o644); err != nil {
+		t.Fatalf("write sleeper source: %v", err)
+	}
+	cmd := exec.Command("go", "build", "-o", binary, source)
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+runtime.GOARCH)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("build sleeper: %v: %s", err, strings.TrimSpace(string(output)))
+	}
+	dockerfile := "FROM scratch\nCOPY sleeper /sleeper\nEXPOSE 8080\nCMD [\"/sleeper\"]\n"
+	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte(dockerfile), 0o644); err != nil {
+		t.Fatalf("write sleeper Dockerfile: %v", err)
 	}
 }
 
@@ -878,6 +1119,167 @@ func TestClientRealDockerObjectsIntegration(t *testing.T) {
 	}
 }
 
+func TestClientRealDockerCreateRunSaveLoadIntegration(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("real Docker create/run integration runs only on Linux")
+	}
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skipf("docker CLI unavailable: %v", err)
+	}
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skipf("go CLI unavailable: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := waitDockerCLI(ctx); err != nil {
+		t.Fatalf("Docker daemon is not ready: %v", err)
+	}
+
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
+	imageRef := "cairn-test-run:" + suffix
+	containerName := "cairn-test-run-" + suffix
+	renamedContainer := containerName + "-renamed"
+	volumeName := "cairn_test_run_" + suffix
+	networkName := "cairn_test_run_" + suffix
+	archivePath := filepath.Join(t.TempDir(), "image.tar")
+
+	buildDir := t.TempDir()
+	writeSleeperImageContext(t, buildDir)
+	runDockerCommand(t, ctx, "build", "-q", "-t", imageRef, buildDir)
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cleanupCancel()
+		_ = dockerCommand(cleanupCtx, "rm", "-f", containerName, renamedContainer)
+		_ = dockerCommand(cleanupCtx, "network", "rm", networkName)
+		_ = dockerCommand(cleanupCtx, "volume", "rm", "-f", volumeName)
+		_ = dockerCommand(cleanupCtx, "rmi", "-f", imageRef)
+	})
+
+	eventBus := bus.New()
+	defer eventBus.Close()
+	provider := providers.NewLinuxNative(providers.LinuxNativeOptions{})
+	client := New(provider, eventBus)
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = client.Close()
+	})
+
+	volumeSummary, err := client.CreateVolume(ctx, models.CreateVolumeRequest{
+		Name:   volumeName,
+		Driver: "local",
+		Labels: map[string]string{"cairn.test.run": suffix},
+	})
+	if err != nil {
+		t.Fatalf("CreateVolume() error = %v", err)
+	}
+	if volumeSummary.Name != volumeName {
+		t.Fatalf("volume summary = %#v", volumeSummary)
+	}
+	if _, err := client.GetVolume(ctx, volumeName); err != nil {
+		t.Fatalf("GetVolume(created) error = %v", err)
+	}
+
+	networkSummary, err := client.CreateNetwork(ctx, models.CreateNetworkRequest{
+		Name:       networkName,
+		Driver:     "bridge",
+		Attachable: true,
+		Labels:     map[string]string{"cairn.test.run": suffix},
+	})
+	if err != nil {
+		t.Fatalf("CreateNetwork() error = %v", err)
+	}
+	if networkSummary.Name != networkName {
+		t.Fatalf("network summary = %#v", networkSummary)
+	}
+	if _, err := client.GetNetwork(ctx, networkName); err != nil {
+		t.Fatalf("GetNetwork(created) error = %v", err)
+	}
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("reserve test port: %v", err)
+	}
+	conflictPort := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
+	if _, err := client.RunImage(ctx, models.RunImageRequest{
+		ImageRef: imageRef,
+		Name:     containerName + "-conflict",
+		Ports:    []models.PortMapping{{HostIP: "127.0.0.1", HostPort: conflictPort, ContainerPort: "8080", Protocol: "tcp"}},
+		Detach:   true,
+	}); !apperror.IsCode(err, apperror.Conflict) {
+		_ = listener.Close()
+		t.Fatalf("RunImage(port conflict) error = %v, want E_CONFLICT", err)
+	}
+	_ = listener.Close()
+
+	containerID, err := client.RunImage(ctx, models.RunImageRequest{
+		ImageRef:  imageRef,
+		Name:      containerName,
+		Ports:     []models.PortMapping{{HostIP: "127.0.0.1", HostPort: "0", ContainerPort: "8080", Protocol: "tcp"}},
+		Env:       []models.EnvVar{{Name: "MODE", Value: "integration"}},
+		Volumes:   []models.MountSpec{{Type: "volume", VolumeName: volumeName, Target: "/data"}},
+		NetworkID: networkName,
+		Detach:    true,
+	})
+	if err != nil {
+		t.Fatalf("RunImage() error = %v", err)
+	}
+	detail, err := client.GetContainer(ctx, containerID)
+	if err != nil {
+		t.Fatalf("GetContainer(run) error = %v", err)
+	}
+	if detail.Summary.Name != containerName || envValue(detail.Env, "MODE") != "integration" {
+		t.Fatalf("container detail = %#v", detail)
+	}
+	if len(detail.Summary.Ports) == 0 || detail.Summary.Ports[0].ContainerPort != "8080" {
+		t.Fatalf("container ports = %#v", detail.Summary.Ports)
+	}
+	if len(detail.Mounts) != 1 || detail.Mounts[0].Target != "/data" || detail.Mounts[0].VolumeName != volumeName {
+		t.Fatalf("container mounts = %#v", detail.Mounts)
+	}
+	if len(detail.Networks) != 1 || detail.Networks[0] != networkName {
+		t.Fatalf("container networks = %#v", detail.Networks)
+	}
+
+	if err := client.RenameContainer(ctx, containerID, renamedContainer); err != nil {
+		t.Fatalf("RenameContainer() error = %v", err)
+	}
+	renamed, err := client.GetContainer(ctx, renamedContainer)
+	if err != nil {
+		t.Fatalf("GetContainer(renamed) error = %v", err)
+	}
+	if renamed.Summary.Name != renamedContainer {
+		t.Fatalf("renamed container = %#v", renamed.Summary)
+	}
+
+	imageDetail, err := client.GetImage(ctx, imageRef)
+	if err != nil {
+		t.Fatalf("GetImage(before save) error = %v", err)
+	}
+	originalImageID := imageDetail.Summary.ID
+	if _, err := client.SaveImage(ctx, []string{imageRef}, archivePath); err != nil {
+		t.Fatalf("SaveImage() error = %v", err)
+	}
+	if stat, err := os.Stat(archivePath); err != nil || stat.Size() == 0 {
+		t.Fatalf("archive stat = %#v err=%v", stat, err)
+	}
+
+	runDockerCommand(t, ctx, "rm", "-f", renamedContainer)
+	runDockerCommand(t, ctx, "rmi", "-f", imageRef)
+	if _, err := client.LoadImage(ctx, archivePath); err != nil {
+		t.Fatalf("LoadImage() error = %v", err)
+	}
+	loadedDetail, err := client.GetImage(ctx, imageRef)
+	if err != nil {
+		t.Fatalf("GetImage(after load) error = %v", err)
+	}
+	if loadedDetail.Summary.ID != originalImageID {
+		t.Fatalf("loaded image ID = %q, want %q", loadedDetail.Summary.ID, originalImageID)
+	}
+}
+
 func TestClientRealDockerRestartIntegration(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("real Docker restart integration runs only on Linux")
@@ -996,7 +1398,27 @@ type fakeAPI struct {
 	killed            []string
 	removed           []string
 	unpaused          []string
+	createdContainers []createdContainerCall
+	renamed           []string
+	pulled            []string
+	saved             [][]string
+	loadedBytes       []int
+	searches          []string
+	createdVolumes    []volume.CreateOptions
+	createdNetworks   []networkCreateCall
 	closed            bool
+}
+
+type createdContainerCall struct {
+	Name             string
+	Config           *container.Config
+	HostConfig       *container.HostConfig
+	NetworkingConfig *network.NetworkingConfig
+}
+
+type networkCreateCall struct {
+	Name    string
+	Options network.CreateOptions
 }
 
 func newFakeAPI() *fakeAPI {
@@ -1097,6 +1519,46 @@ func (a *fakeAPI) ContainerUnpause(_ context.Context, id string) error {
 	return nil
 }
 
+func (a *fakeAPI) ContainerCreate(_ context.Context, config *container.Config, hostConfig *container.HostConfig, networkingConfig *network.NetworkingConfig, _ *ocispec.Platform, name string) (container.CreateResponse, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	id := "created-" + name
+	if name == "" {
+		id = "created-container"
+	}
+	a.createdContainers = append(a.createdContainers, createdContainerCall{
+		Name:             name,
+		Config:           config,
+		HostConfig:       hostConfig,
+		NetworkingConfig: networkingConfig,
+	})
+	a.containerInspects[id] = container.InspectResponse{
+		ContainerJSONBase: &container.ContainerJSONBase{
+			ID:      id,
+			Name:    "/" + name,
+			Image:   "sha256:image1",
+			Created: time.Now().UTC().Format(time.RFC3339Nano),
+			State:   &container.State{Status: "created"},
+		},
+		Config: config,
+	}
+	a.containers = append(a.containers, container.Summary{
+		ID:      id,
+		Names:   []string{"/" + name},
+		Image:   config.Image,
+		ImageID: "sha256:image1",
+		State:   "created",
+	})
+	return container.CreateResponse{ID: id}, nil
+}
+
+func (a *fakeAPI) ContainerRename(_ context.Context, id string, name string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.renamed = append(a.renamed, id+":"+name)
+	return nil
+}
+
 func (a *fakeAPI) ImageList(context.Context, image.ListOptions) ([]image.Summary, error) {
 	return append([]image.Summary(nil), a.images...), nil
 }
@@ -1108,6 +1570,55 @@ func (a *fakeAPI) ImageInspectWithRaw(_ context.Context, id string) (image.Inspe
 		}
 	}
 	return image.InspectResponse{}, nil, cerrdefs.ErrNotFound.WithMessage(fmt.Sprintf("no such image: %s", id))
+}
+
+func (a *fakeAPI) ImagePull(_ context.Context, ref string, _ image.PullOptions) (io.ReadCloser, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.pulled = append(a.pulled, ref)
+	a.imageInspects[ref] = image.InspectResponse{
+		ID:           "sha256:pulled",
+		RepoTags:     []string{ref},
+		Created:      time.Now().UTC().Format(time.RFC3339Nano),
+		Architecture: "amd64",
+		Os:           "linux",
+	}
+	return io.NopCloser(strings.NewReader(`{"status":"pulling","id":"layer","progressDetail":{"current":1,"total":2}}` + "\n" + `{"status":"done"}` + "\n")), nil
+}
+
+func (a *fakeAPI) ImageSave(_ context.Context, imageIDs []string, _ ...dockerclient.ImageSaveOption) (io.ReadCloser, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.saved = append(a.saved, append([]string(nil), imageIDs...))
+	return io.NopCloser(bytes.NewReader([]byte("fake image tar"))), nil
+}
+
+func (a *fakeAPI) ImageLoad(_ context.Context, input io.Reader, _ ...dockerclient.ImageLoadOption) (image.LoadResponse, error) {
+	body, err := io.ReadAll(input)
+	if err != nil {
+		return image.LoadResponse{}, err
+	}
+	a.mu.Lock()
+	a.loadedBytes = append(a.loadedBytes, len(body))
+	a.imageInspects["loaded:latest"] = image.InspectResponse{
+		ID:       "sha256:loaded",
+		RepoTags: []string{"loaded:latest"},
+		Created:  time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	a.mu.Unlock()
+	return image.LoadResponse{Body: io.NopCloser(strings.NewReader(`{"stream":"Loaded image: loaded:latest"}`))}, nil
+}
+
+func (a *fakeAPI) ImageSearch(_ context.Context, term string, _ registry.SearchOptions) ([]registry.SearchResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.searches = append(a.searches, term)
+	return []registry.SearchResult{{
+		Name:        "library/" + term,
+		Description: "test result",
+		StarCount:   42,
+		IsOfficial:  true,
+	}}, nil
 }
 
 func (a *fakeAPI) VolumeList(context.Context, volume.ListOptions) (volume.ListResponse, error) {
@@ -1123,6 +1634,23 @@ func (a *fakeAPI) VolumeInspectWithRaw(_ context.Context, name string) (volume.V
 	return volume.Volume{}, nil, cerrdefs.ErrNotFound.WithMessage(fmt.Sprintf("no such volume: %s", name))
 }
 
+func (a *fakeAPI) VolumeCreate(_ context.Context, options volume.CreateOptions) (volume.Volume, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.createdVolumes = append(a.createdVolumes, options)
+	created := volume.Volume{
+		Name:       options.Name,
+		Driver:     options.Driver,
+		Mountpoint: "/var/lib/docker/volumes/" + options.Name + "/_data",
+		Labels:     options.Labels,
+		Options:    options.DriverOpts,
+		CreatedAt:  time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	a.volumes = append(a.volumes, &created)
+	a.volumeInspects[options.Name] = created
+	return created, nil
+}
+
 func (a *fakeAPI) NetworkList(context.Context, network.ListOptions) ([]network.Summary, error) {
 	return append([]network.Summary(nil), a.networks...), nil
 }
@@ -1134,6 +1662,28 @@ func (a *fakeAPI) NetworkInspectWithRaw(_ context.Context, id string, _ network.
 		}
 	}
 	return network.Inspect{}, nil, cerrdefs.ErrNotFound.WithMessage(fmt.Sprintf("no such network: %s", id))
+}
+
+func (a *fakeAPI) NetworkCreate(_ context.Context, name string, options network.CreateOptions) (network.CreateResponse, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	id := "net-" + name
+	a.createdNetworks = append(a.createdNetworks, networkCreateCall{Name: name, Options: options})
+	created := network.Inspect{
+		ID:         id,
+		Name:       name,
+		Driver:     options.Driver,
+		Scope:      "local",
+		Internal:   options.Internal,
+		Attachable: options.Attachable,
+		Labels:     options.Labels,
+	}
+	if options.IPAM != nil {
+		created.IPAM = *options.IPAM
+	}
+	a.networks = append(a.networks, created)
+	a.networkInspects[id] = created
+	return network.CreateResponse{ID: id}, nil
 }
 
 func (a *fakeAPI) Events(context.Context, events.ListOptions) (<-chan events.Message, <-chan error) {

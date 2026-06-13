@@ -2,12 +2,16 @@ import type { LucideIcon } from 'lucide-react';
 import type {
   CommandPlan,
   ContainerSummary,
+  HubSearchResult,
   ImageDetail,
   ImageSummary,
+  MountSpec,
   NetworkDetail,
   NetworkSummary,
+  PortMapping,
   PortBinding,
   ProviderSummary,
+  RunImageRequest,
   VolumeDetail,
   VolumeSummary,
 } from '../bindings/github.com/RCooLeR/Cairn/internal/models/models.js';
@@ -18,10 +22,14 @@ import {
   Container,
   Copy,
   Database,
+  Download,
   Eye,
   FileJson,
   Gauge,
   HardDrive,
+  PackagePlus,
+  Pencil,
+  Plus,
   Network,
   Play,
   RefreshCw,
@@ -30,6 +38,7 @@ import {
   Server,
   Skull,
   Square,
+  Upload,
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
@@ -86,6 +95,87 @@ type ConfirmState = {
   error?: string;
 };
 
+type RenameState = {
+  open: boolean;
+  container: ContainerSummary | null;
+  name: string;
+  busy: boolean;
+  error?: string;
+};
+
+type RunImageState = {
+  open: boolean;
+  step: 1 | 2;
+  imageRef: string;
+  imageLocked: boolean;
+  name: string;
+  pullIfMissing: boolean;
+  portsText: string;
+  envText: string;
+  volumesText: string;
+  networkID: string;
+  restartPolicy: string;
+  commandText: string;
+  user: string;
+  hubQuery: string;
+  hubResults: HubSearchResult[];
+  hubLoading: boolean;
+  hubError?: string;
+  busy: boolean;
+  error?: string;
+};
+
+type PullImageState = {
+  open: boolean;
+  ref: string;
+  tag: string;
+  query: string;
+  results: HubSearchResult[];
+  loadingResults: boolean;
+  searchError?: string;
+  busy: boolean;
+  error?: string;
+};
+
+type SaveImageState = {
+  open: boolean;
+  refsText: string;
+  destPath: string;
+  busy: boolean;
+  error?: string;
+};
+
+type LoadImageState = {
+  open: boolean;
+  srcPath: string;
+  busy: boolean;
+  error?: string;
+};
+
+type CreateVolumeState = {
+  open: boolean;
+  name: string;
+  driver: string;
+  driverOptsText: string;
+  labelsText: string;
+  busy: boolean;
+  error?: string;
+};
+
+type CreateNetworkState = {
+  open: boolean;
+  name: string;
+  driver: string;
+  customDriver: string;
+  subnet: string;
+  gateway: string;
+  internal: boolean;
+  attachable: boolean;
+  labelsText: string;
+  busy: boolean;
+  error?: string;
+};
+
 const navItems: NavItem[] = [
   { id: 'overview', label: 'Overview', icon: Gauge },
   { id: 'containers', label: 'Containers', icon: Container },
@@ -105,6 +195,78 @@ const emptyConfirm: ConfirmState = {
   plan: null,
   targetName: '',
   typedName: '',
+  busy: false,
+};
+
+const emptyRename: RenameState = {
+  open: false,
+  container: null,
+  name: '',
+  busy: false,
+};
+
+const emptyRunImage: RunImageState = {
+  open: false,
+  step: 1,
+  imageRef: '',
+  imageLocked: false,
+  name: '',
+  pullIfMissing: true,
+  portsText: '',
+  envText: '',
+  volumesText: '',
+  networkID: '',
+  restartPolicy: 'no',
+  commandText: '',
+  user: '',
+  hubQuery: '',
+  hubResults: [],
+  hubLoading: false,
+  busy: false,
+};
+
+const emptyPullImage: PullImageState = {
+  open: false,
+  ref: '',
+  tag: 'latest',
+  query: '',
+  results: [],
+  loadingResults: false,
+  busy: false,
+};
+
+const emptySaveImage: SaveImageState = {
+  open: false,
+  refsText: '',
+  destPath: '',
+  busy: false,
+};
+
+const emptyLoadImage: LoadImageState = {
+  open: false,
+  srcPath: '',
+  busy: false,
+};
+
+const emptyCreateVolume: CreateVolumeState = {
+  open: false,
+  name: '',
+  driver: 'local',
+  driverOptsText: '',
+  labelsText: '',
+  busy: false,
+};
+
+const emptyCreateNetwork: CreateNetworkState = {
+  open: false,
+  name: '',
+  driver: 'bridge',
+  customDriver: '',
+  subnet: '',
+  gateway: '',
+  internal: false,
+  attachable: false,
+  labelsText: '',
   busy: false,
 };
 
@@ -135,6 +297,13 @@ function App() {
   const [volumeFilter, setVolumeFilter] = useState<FilterID>('all');
   const [inspect, setInspect] = useState<InspectState>(emptyInspect);
   const [confirm, setConfirm] = useState<ConfirmState>(emptyConfirm);
+  const [rename, setRename] = useState<RenameState>(emptyRename);
+  const [runImage, setRunImage] = useState<RunImageState>(emptyRunImage);
+  const [pullImage, setPullImage] = useState<PullImageState>(emptyPullImage);
+  const [saveImage, setSaveImage] = useState<SaveImageState>(emptySaveImage);
+  const [loadImage, setLoadImage] = useState<LoadImageState>(emptyLoadImage);
+  const [createVolume, setCreateVolume] = useState<CreateVolumeState>(emptyCreateVolume);
+  const [createNetwork, setCreateNetwork] = useState<CreateNetworkState>(emptyCreateNetwork);
   const [selectedContainerIDs, setSelectedContainerIDs] = useState(() => new Set<string>());
   const [busyActionIDs, setBusyActionIDs] = useState(() => new Set<string>());
   const [actionError, setActionError] = useState<string | null>(null);
@@ -187,6 +356,64 @@ function App() {
       off();
     };
   }, [refreshInventory]);
+
+  useEffect(() => {
+    const query = pullImage.query.trim();
+    if (!pullImage.open || query.length < 3) {
+      setPullImage((current) => ({ ...current, results: [], loadingResults: false, searchError: undefined }));
+      return undefined;
+    }
+    const timer = window.setTimeout(() => {
+      setPullImage((current) => ({ ...current, loadingResults: true, searchError: undefined }));
+      DockerService.SearchHub(query, 10)
+        .then((results) => {
+          setPullImage((current) => ({
+            ...current,
+            loadingResults: false,
+            results,
+            searchError: undefined,
+          }));
+        })
+        .catch((error: unknown) => {
+          setPullImage((current) => ({
+            ...current,
+            loadingResults: false,
+            results: [],
+            searchError: error instanceof Error ? error.message : 'Docker Hub search is offline',
+          }));
+        });
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [pullImage.open, pullImage.query]);
+
+  useEffect(() => {
+    const query = runImage.hubQuery.trim();
+    if (!runImage.open || query.length < 3) {
+      setRunImage((current) => ({ ...current, hubResults: [], hubLoading: false, hubError: undefined }));
+      return undefined;
+    }
+    const timer = window.setTimeout(() => {
+      setRunImage((current) => ({ ...current, hubLoading: true, hubError: undefined }));
+      DockerService.SearchHub(query, 10)
+        .then((results) => {
+          setRunImage((current) => ({
+            ...current,
+            hubLoading: false,
+            hubResults: results,
+            hubError: undefined,
+          }));
+        })
+        .catch((error: unknown) => {
+          setRunImage((current) => ({
+            ...current,
+            hubLoading: false,
+            hubResults: [],
+            hubError: error instanceof Error ? error.message : 'Docker Hub search is offline',
+          }));
+        });
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [runImage.hubQuery, runImage.open]);
 
   const activeProvider = useMemo(() => activeProviderSummary(providers), [providers]);
   const runningContainers = containers.filter((container) => container.state === 'running').length;
@@ -295,6 +522,160 @@ function App() {
       }));
     }
   }, [confirm.plan, confirm.typedName, refreshAfterAction]);
+
+  const openRunImageModal = useCallback((image?: ImageSummary) => {
+    const ref = image ? primaryImageRef(image) : '';
+    setRunImage({
+      ...emptyRunImage,
+      open: true,
+      imageRef: ref,
+      imageLocked: Boolean(image),
+      name: ref ? suggestContainerName(ref) : '',
+      hubQuery: ref ? '' : '',
+    });
+  }, []);
+
+  const submitRunImage = useCallback(async () => {
+    setRunImage((current) => ({ ...current, busy: true, error: undefined }));
+    try {
+      const req = buildRunImageRequest(runImage);
+      await DockerService.RunImage(req);
+      setRunImage(emptyRunImage);
+      await refreshAfterAction();
+      setActivePage('containers');
+    } catch (error: unknown) {
+      setRunImage((current) => ({
+        ...current,
+        busy: false,
+        error: error instanceof Error ? error.message : 'Unable to run image',
+      }));
+    }
+  }, [refreshAfterAction, runImage]);
+
+  const openRenameModal = useCallback((container: ContainerSummary) => {
+    setRename({
+      ...emptyRename,
+      open: true,
+      container,
+      name: container.name,
+    });
+  }, []);
+
+  const submitRename = useCallback(async () => {
+    if (!rename.container) {
+      return;
+    }
+    setRename((current) => ({ ...current, busy: true, error: undefined }));
+    try {
+      await DockerService.RenameContainer(rename.container.id, rename.name);
+      setRename(emptyRename);
+      await refreshAfterAction();
+    } catch (error: unknown) {
+      setRename((current) => ({
+        ...current,
+        busy: false,
+        error: error instanceof Error ? error.message : 'Unable to rename container',
+      }));
+    }
+  }, [refreshAfterAction, rename.container, rename.name]);
+
+  const submitPullImage = useCallback(async () => {
+    const ref = imageRefWithTag(pullImage.ref, pullImage.tag);
+    setPullImage((current) => ({ ...current, busy: true, error: undefined }));
+    try {
+      await DockerService.PullImage(ref);
+      setPullImage(emptyPullImage);
+      await refreshAfterAction();
+    } catch (error: unknown) {
+      setPullImage((current) => ({
+        ...current,
+        busy: false,
+        error: error instanceof Error ? error.message : 'Unable to pull image',
+      }));
+    }
+  }, [pullImage.ref, pullImage.tag, refreshAfterAction]);
+
+  const openSaveImageModal = useCallback((image: ImageSummary) => {
+    const ref = primaryImageRef(image);
+    setSaveImage({
+      ...emptySaveImage,
+      open: true,
+      refsText: ref,
+      destPath: `${ref.replace(/[/:@]/g, '_') || 'image'}.tar`,
+    });
+  }, []);
+
+  const submitSaveImage = useCallback(async () => {
+    setSaveImage((current) => ({ ...current, busy: true, error: undefined }));
+    try {
+      await DockerService.SaveImage(splitRefs(saveImage.refsText), saveImage.destPath);
+      setSaveImage(emptySaveImage);
+    } catch (error: unknown) {
+      setSaveImage((current) => ({
+        ...current,
+        busy: false,
+        error: error instanceof Error ? error.message : 'Unable to save image',
+      }));
+    }
+  }, [saveImage.destPath, saveImage.refsText]);
+
+  const submitLoadImage = useCallback(async () => {
+    setLoadImage((current) => ({ ...current, busy: true, error: undefined }));
+    try {
+      await DockerService.LoadImage(loadImage.srcPath);
+      setLoadImage(emptyLoadImage);
+      await refreshAfterAction();
+    } catch (error: unknown) {
+      setLoadImage((current) => ({
+        ...current,
+        busy: false,
+        error: error instanceof Error ? error.message : 'Unable to load image',
+      }));
+    }
+  }, [loadImage.srcPath, refreshAfterAction]);
+
+  const submitCreateVolume = useCallback(async () => {
+    setCreateVolume((current) => ({ ...current, busy: true, error: undefined }));
+    try {
+      await DockerService.CreateVolume({
+        name: createVolume.name,
+        driver: createVolume.driver,
+        driverOpts: parseKeyValueLines(createVolume.driverOptsText),
+        labels: parseKeyValueLines(createVolume.labelsText),
+      });
+      setCreateVolume(emptyCreateVolume);
+      await refreshAfterAction();
+    } catch (error: unknown) {
+      setCreateVolume((current) => ({
+        ...current,
+        busy: false,
+        error: error instanceof Error ? error.message : 'Unable to create volume',
+      }));
+    }
+  }, [createVolume.driver, createVolume.driverOptsText, createVolume.labelsText, createVolume.name, refreshAfterAction]);
+
+  const submitCreateNetwork = useCallback(async () => {
+    setCreateNetwork((current) => ({ ...current, busy: true, error: undefined }));
+    try {
+      await DockerService.CreateNetwork({
+        name: createNetwork.name,
+        driver: createNetwork.driver === 'custom' ? createNetwork.customDriver : createNetwork.driver,
+        subnet: createNetwork.subnet,
+        gateway: createNetwork.gateway,
+        internal: createNetwork.internal,
+        attachable: createNetwork.attachable,
+        labels: parseKeyValueLines(createNetwork.labelsText),
+      });
+      setCreateNetwork(emptyCreateNetwork);
+      await refreshAfterAction();
+    } catch (error: unknown) {
+      setCreateNetwork((current) => ({
+        ...current,
+        busy: false,
+        error: error instanceof Error ? error.message : 'Unable to create network',
+      }));
+    }
+  }, [createNetwork, refreshAfterAction]);
 
   const toggleContainerSelection = useCallback((id: string) => {
     setSelectedContainerIDs((current) => {
@@ -450,6 +831,7 @@ function App() {
             onBulkAction={runBulkContainerAction}
             onFilterChange={setContainerFilter}
             onInspect={openContainerInspect}
+            onRename={openRenameModal}
             onToggleSelection={toggleContainerSelection}
             search={search}
             selectedIDs={selectedContainerIDs}
@@ -464,6 +846,10 @@ function App() {
             loading={inventoryStatus === 'loading'}
             onFilterChange={setImageFilter}
             onInspect={openImageInspect}
+            onLoad={() => setLoadImage({ ...emptyLoadImage, open: true })}
+            onPull={() => setPullImage({ ...emptyPullImage, open: true })}
+            onRun={openRunImageModal}
+            onSave={openSaveImageModal}
             search={search}
           />
         );
@@ -472,6 +858,7 @@ function App() {
           <VolumesPage
             filter={volumeFilter}
             loading={inventoryStatus === 'loading'}
+            onCreate={() => setCreateVolume({ ...emptyCreateVolume, open: true })}
             onFilterChange={setVolumeFilter}
             onInspect={openVolumeInspect}
             search={search}
@@ -485,6 +872,7 @@ function App() {
             loading={inventoryStatus === 'loading'}
             networkDetails={networkDetails}
             networks={networks}
+            onCreate={() => setCreateNetwork({ ...emptyCreateNetwork, open: true })}
             onInspect={openNetworkInspect}
             search={search}
           />
@@ -613,6 +1001,86 @@ function App() {
         onChangeTypedName={(typedName) => setConfirm((current) => ({ ...current, typedName }))}
         onClose={() => setConfirm(emptyConfirm)}
       />
+      <RenameContainerModal
+        onChange={(name) => setRename((current) => ({ ...current, name }))}
+        onClose={() => setRename(emptyRename)}
+        onSubmit={() => {
+          void submitRename();
+        }}
+        state={rename}
+      />
+      <RunImageModal
+        networks={networks}
+        onAddAutoPort={() => setRunImage((current) => ({ ...current, portsText: appendLine(current.portsText, '0:80/tcp') }))}
+        onBack={() => setRunImage((current) => ({ ...current, step: 1 }))}
+        onChange={(patch) => setRunImage((current) => ({ ...current, ...patch }))}
+        onClose={() => setRunImage(emptyRunImage)}
+        onSelectHubResult={(result) =>
+          setRunImage((current) => ({
+            ...current,
+            imageRef: `${result.name}:latest`,
+            name: current.name || suggestContainerName(result.name),
+            hubQuery: result.name,
+            hubResults: [],
+          }))
+        }
+        onSubmit={() => {
+          if (runImage.step === 1) {
+            setRunImage((current) => ({ ...current, step: 2, error: undefined }));
+            return;
+          }
+          void submitRunImage();
+        }}
+        state={runImage}
+      />
+      <PullImageModal
+        onChange={(patch) => setPullImage((current) => ({ ...current, ...patch }))}
+        onClose={() => setPullImage(emptyPullImage)}
+        onSelectResult={(result) =>
+          setPullImage((current) => ({
+            ...current,
+            ref: result.name,
+            query: result.name,
+            results: [],
+          }))
+        }
+        onSubmit={() => {
+          void submitPullImage();
+        }}
+        state={pullImage}
+      />
+      <SaveImageModal
+        onChange={(patch) => setSaveImage((current) => ({ ...current, ...patch }))}
+        onClose={() => setSaveImage(emptySaveImage)}
+        onSubmit={() => {
+          void submitSaveImage();
+        }}
+        state={saveImage}
+      />
+      <LoadImageModal
+        onChange={(patch) => setLoadImage((current) => ({ ...current, ...patch }))}
+        onClose={() => setLoadImage(emptyLoadImage)}
+        onSubmit={() => {
+          void submitLoadImage();
+        }}
+        state={loadImage}
+      />
+      <CreateVolumeModal
+        onChange={(patch) => setCreateVolume((current) => ({ ...current, ...patch }))}
+        onClose={() => setCreateVolume(emptyCreateVolume)}
+        onSubmit={() => {
+          void submitCreateVolume();
+        }}
+        state={createVolume}
+      />
+      <CreateNetworkModal
+        onChange={(patch) => setCreateNetwork((current) => ({ ...current, ...patch }))}
+        onClose={() => setCreateNetwork(emptyCreateNetwork)}
+        onSubmit={() => {
+          void submitCreateNetwork();
+        }}
+        state={createNetwork}
+      />
     </main>
   );
 }
@@ -739,6 +1207,7 @@ type ContainersPageProps = {
   onBulkAction: (action: Exclude<ContainerAction, 'kill'>) => void;
   onFilterChange: (filter: FilterID) => void;
   onInspect: (container: ContainerSummary) => void;
+  onRename: (container: ContainerSummary) => void;
   onToggleSelection: (id: string) => void;
 };
 
@@ -751,6 +1220,7 @@ function ContainersPage({
   onBulkAction,
   onFilterChange,
   onInspect,
+  onRename,
   onToggleSelection,
   search,
   selectedIDs,
@@ -846,6 +1316,7 @@ function ContainersPage({
                 container={container}
                 onAction={onAction}
                 onInspect={onInspect}
+                onRename={onRename}
               />
             ),
           },
@@ -875,26 +1346,55 @@ type ImagesPageProps = {
   loading: boolean;
   onFilterChange: (filter: FilterID) => void;
   onInspect: (image: ImageSummary) => void;
+  onLoad: () => void;
+  onPull: () => void;
+  onRun: (image?: ImageSummary) => void;
+  onSave: (image: ImageSummary) => void;
 };
 
-function ImagesPage({ filter, imageUseCounts, images, loading, onFilterChange, onInspect, search }: ImagesPageProps) {
+function ImagesPage({
+  filter,
+  imageUseCounts,
+  images,
+  loading,
+  onFilterChange,
+  onInspect,
+  onLoad,
+  onPull,
+  onRun,
+  onSave,
+  search,
+}: ImagesPageProps) {
   const filtered = useMemo(() => filterImages(images, imageUseCounts, search, filter), [filter, imageUseCounts, images, search]);
   if (loading && images.length === 0) {
     return <TableSkeleton />;
   }
   return (
     <div className="space-y-4">
-      <FilterChips
-        active={filter}
-        items={[
-          ['all', 'All', images.length],
-          ['in-use', 'In use', images.filter((image) => (imageUseCounts[image.id] ?? 0) > 0 || image.inUse).length],
-          ['unused', 'Unused', images.filter((image) => (imageUseCounts[image.id] ?? 0) === 0 && !image.inUse).length],
-          ['dangling', 'Dangling', imageDanglingCount(images)],
-          ['updates', 'Update available', images.filter((image) => image.updateStatus && image.updateStatus !== 'unknown').length],
-        ]}
-        onChange={onFilterChange}
-      />
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <FilterChips
+          active={filter}
+          items={[
+            ['all', 'All', images.length],
+            ['in-use', 'In use', images.filter((image) => (imageUseCounts[image.id] ?? 0) > 0 || image.inUse).length],
+            ['unused', 'Unused', images.filter((image) => (imageUseCounts[image.id] ?? 0) === 0 && !image.inUse).length],
+            ['dangling', 'Dangling', imageDanglingCount(images)],
+            ['updates', 'Update available', images.filter((image) => image.updateStatus && image.updateStatus !== 'unknown').length],
+          ]}
+          onChange={onFilterChange}
+        />
+        <div className="flex items-center gap-2">
+          <Button icon={<Download size={15} />} onClick={onPull} variant="secondary">
+            Pull image
+          </Button>
+          <Button icon={<Upload size={15} />} onClick={onLoad} variant="secondary">
+            Load tar
+          </Button>
+          <Button icon={<PackagePlus size={15} />} onClick={() => onRun()} variant="primary">
+            Run image
+          </Button>
+        </div>
+      </div>
       <DataTable
         columns={[
           {
@@ -945,7 +1445,14 @@ function ImagesPage({ filter, imageUseCounts, images, loading, onFilterChange, o
           {
             id: 'actions',
             header: '',
-            render: (image) => <RowActions id={image.id} label={primaryImageRef(image)} onInspect={() => onInspect(image)} />,
+            render: (image) => (
+              <ImageRowActions
+                image={image}
+                onInspect={() => onInspect(image)}
+                onRun={() => onRun(image)}
+                onSave={() => onSave(image)}
+              />
+            ),
           },
         ]}
         empty={
@@ -968,26 +1475,32 @@ type VolumesPageProps = {
   filter: FilterID;
   search: string;
   loading: boolean;
+  onCreate: () => void;
   onFilterChange: (filter: FilterID) => void;
   onInspect: (volume: VolumeSummary) => void;
 };
 
-function VolumesPage({ filter, loading, onFilterChange, onInspect, search, volumeDetails, volumes }: VolumesPageProps) {
+function VolumesPage({ filter, loading, onCreate, onFilterChange, onInspect, search, volumeDetails, volumes }: VolumesPageProps) {
   const filtered = useMemo(() => filterVolumes(volumes, search, filter), [filter, search, volumes]);
   if (loading && volumes.length === 0) {
     return <TableSkeleton />;
   }
   return (
     <div className="space-y-4">
-      <FilterChips
-        active={filter}
-        items={[
-          ['all', 'All', volumes.length],
-          ['in-use', 'In use', volumes.filter((volume) => volume.inUse).length],
-          ['unused', 'Unused', volumes.filter((volume) => !volume.inUse).length],
-        ]}
-        onChange={onFilterChange}
-      />
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <FilterChips
+          active={filter}
+          items={[
+            ['all', 'All', volumes.length],
+            ['in-use', 'In use', volumes.filter((volume) => volume.inUse).length],
+            ['unused', 'Unused', volumes.filter((volume) => !volume.inUse).length],
+          ]}
+          onChange={onFilterChange}
+        />
+        <Button icon={<Plus size={15} />} onClick={onCreate} variant="primary">
+          Create volume
+        </Button>
+      </div>
       <DataTable
         columns={[
           {
@@ -1053,16 +1566,23 @@ type NetworksPageProps = {
   networkDetails: Record<string, NetworkDetail>;
   search: string;
   loading: boolean;
+  onCreate: () => void;
   onInspect: (network: NetworkSummary) => void;
 };
 
-function NetworksPage({ loading, networkDetails, networks, onInspect, search }: NetworksPageProps) {
+function NetworksPage({ loading, networkDetails, networks, onCreate, onInspect, search }: NetworksPageProps) {
   const filtered = useMemo(() => filterNetworks(networks, search), [networks, search]);
   if (loading && networks.length === 0) {
     return <TableSkeleton />;
   }
   return (
-    <DataTable
+    <div className="space-y-4">
+      <div className="flex justify-end">
+        <Button icon={<Plus size={15} />} onClick={onCreate} variant="primary">
+          Create network
+        </Button>
+      </div>
+      <DataTable
       columns={[
         {
           id: 'name',
@@ -1122,7 +1642,8 @@ function NetworksPage({ loading, networkDetails, networks, onInspect, search }: 
       }
       getRowID={(network) => network.id}
       rows={filtered}
-    />
+      />
+    </div>
   );
 }
 
@@ -1193,16 +1714,43 @@ function RowActions({ id, label, onInspect }: { id: string; label: string; onIns
   );
 }
 
+function ImageRowActions({
+  image,
+  onInspect,
+  onRun,
+  onSave,
+}: {
+  image: ImageSummary;
+  onInspect: () => void;
+  onRun: () => void;
+  onSave: () => void;
+}) {
+  const label = primaryImageRef(image);
+  return (
+    <div className="flex justify-end gap-1">
+      <Tooltip label="Run">
+        <Button aria-label={`Run ${label}`} icon={<Play size={15} />} onClick={onRun} size="icon" variant="ghost" />
+      </Tooltip>
+      <Tooltip label="Save to tar">
+        <Button aria-label={`Save ${label}`} icon={<Download size={15} />} onClick={onSave} size="icon" variant="ghost" />
+      </Tooltip>
+      <RowActions id={image.id} label={label} onInspect={onInspect} />
+    </div>
+  );
+}
+
 function ContainerRowActions({
   busyIDs,
   container,
   onAction,
   onInspect,
+  onRename,
 }: {
   busyIDs: Set<string>;
   container: ContainerSummary;
   onAction: (action: ContainerAction, container: ContainerSummary) => void;
   onInspect: (container: ContainerSummary) => void;
+  onRename: (container: ContainerSummary) => void;
 }) {
   const canStop = container.state === 'running' || container.state === 'paused' || container.state === 'restarting';
   const canStart = container.state !== 'running' && container.state !== 'restarting';
@@ -1236,6 +1784,15 @@ function ContainerRowActions({
           disabledReason="Container is not running"
           icon={<Skull size={15} />}
           onClick={() => onAction('kill', container)}
+          size="icon"
+          variant="ghost"
+        />
+      </Tooltip>
+      <Tooltip label="Rename">
+        <Button
+          aria-label={`Rename ${container.name}`}
+          icon={<Pencil size={15} />}
+          onClick={() => onRename(container)}
           size="icon"
           variant="ghost"
         />
@@ -1408,6 +1965,540 @@ function ConfirmPlanModal({
   );
 }
 
+function RenameContainerModal({
+  onChange,
+  onClose,
+  onSubmit,
+  state,
+}: {
+  state: RenameState;
+  onChange: (name: string) => void;
+  onClose: () => void;
+  onSubmit: () => void;
+}) {
+  const composeManaged = Boolean(state.container?.projectID);
+  return (
+    <Modal
+      busy={state.busy}
+      footer={<ModalActions busy={state.busy} disabled={!state.name.trim()} onCancel={onClose} onSubmit={onSubmit} submitLabel="Rename" />}
+      onClose={onClose}
+      open={state.open}
+      title={`Rename ${state.container?.name ?? 'container'}`}
+    >
+      <div className="space-y-4">
+        {composeManaged ? (
+          <div className="rounded-control border border-warn/30 bg-warn/10 p-3 text-warn">
+            Compose may recreate this container with its original service name.
+          </div>
+        ) : null}
+        <TextField autoFocus label="New name" onChange={onChange} value={state.name} />
+        <CodePreview value={joinPreview(['docker', 'rename', state.container?.name ?? '', state.name])} />
+        <FormError error={state.error} />
+      </div>
+    </Modal>
+  );
+}
+
+function RunImageModal({
+  networks,
+  onAddAutoPort,
+  onBack,
+  onChange,
+  onClose,
+  onSelectHubResult,
+  onSubmit,
+  state,
+}: {
+  state: RunImageState;
+  networks: NetworkSummary[];
+  onAddAutoPort: () => void;
+  onBack: () => void;
+  onChange: (patch: Partial<RunImageState>) => void;
+  onClose: () => void;
+  onSelectHubResult: (result: HubSearchResult) => void;
+  onSubmit: () => void;
+}) {
+  const validation = runImageValidation(state);
+  const command = safeDockerRunPreview(state);
+  return (
+    <Modal
+      busy={state.busy}
+      footer={
+        <div className="flex justify-between gap-2">
+          {state.step === 2 ? (
+            <Button disabled={state.busy} onClick={onBack} variant="secondary">
+              Back
+            </Button>
+          ) : (
+            <span />
+          )}
+          <div className="flex gap-2">
+            <Button disabled={state.busy} onClick={onClose} variant="secondary">
+              Cancel
+            </Button>
+            <Button disabled={Boolean(validation)} loading={state.busy} onClick={onSubmit} variant="primary">
+              {state.step === 1 ? 'Next' : 'Run'}
+            </Button>
+          </div>
+        </div>
+      }
+      onClose={onClose}
+      open={state.open}
+      size="lg"
+      title="Run Image"
+    >
+      <div className="max-h-[68vh] space-y-4 overflow-auto pr-1">
+        {state.step === 1 ? (
+          <>
+            <TextField
+              label="Image ref"
+              onChange={(imageRef) => onChange({ imageRef })}
+              readOnly={state.imageLocked}
+              value={state.imageRef}
+            />
+            {!state.imageLocked ? (
+              <>
+                <TextField
+                  label="Docker Hub search"
+                  onChange={(hubQuery) => onChange({ hubQuery })}
+                  value={state.hubQuery}
+                />
+                <HubResultList loading={state.hubLoading} onSelect={onSelectHubResult} results={state.hubResults} />
+                {state.hubError ? (
+                  <div className="rounded-control border border-warn/30 bg-warn/10 p-3 text-warn">
+                    {state.hubError}
+                  </div>
+                ) : null}
+              </>
+            ) : null}
+            <TextField label="Container name" onChange={(name) => onChange({ name })} value={state.name} />
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                checked={state.pullIfMissing}
+                onChange={(event) => onChange({ pullIfMissing: event.target.checked })}
+                type="checkbox"
+              />
+              <span>Pull if missing</span>
+            </label>
+          </>
+        ) : (
+          <>
+            <div className="grid grid-cols-2 gap-4">
+              <TextAreaField
+                label="Ports"
+                onChange={(portsText) => onChange({ portsText })}
+                rows={4}
+                value={state.portsText}
+              />
+              <div className="flex items-end">
+                <Button icon={<Plus size={15} />} onClick={onAddAutoPort} variant="secondary">
+                  Auto port
+                </Button>
+              </div>
+              <TextAreaField
+                label="Environment"
+                onChange={(envText) => onChange({ envText })}
+                rows={4}
+                value={state.envText}
+              />
+              <TextAreaField
+                label="Volumes"
+                onChange={(volumesText) => onChange({ volumesText })}
+                rows={4}
+                value={state.volumesText}
+              />
+              <SelectField
+                label="Network"
+                onChange={(networkID) => onChange({ networkID })}
+                options={[['', 'bridge'], ...networks.map((network) => [network.name, network.name] as [string, string])]}
+                value={state.networkID}
+              />
+              <SelectField
+                label="Restart"
+                onChange={(restartPolicy) => onChange({ restartPolicy })}
+                options={[
+                  ['no', 'no'],
+                  ['on-failure', 'on-failure'],
+                  ['unless-stopped', 'unless-stopped'],
+                  ['always', 'always'],
+                ]}
+                value={state.restartPolicy}
+              />
+              <TextField label="Command" onChange={(commandText) => onChange({ commandText })} value={state.commandText} />
+              <TextField label="User" onChange={(user) => onChange({ user })} value={state.user} />
+            </div>
+            {secretKeys(state.envText).length > 0 ? (
+              <div className="rounded-control border border-border bg-bg-inset p-3">
+                <Badge tone="warn">masked</Badge>
+                <span className="ml-2 text-text-muted">{secretKeys(state.envText).join(', ')}</span>
+              </div>
+            ) : null}
+            <CodePreview value={command} />
+          </>
+        )}
+        {validation ? <div className="rounded-control border border-error/30 bg-error/10 p-3 text-error">{validation}</div> : null}
+        <FormError error={state.error} />
+      </div>
+    </Modal>
+  );
+}
+
+function PullImageModal({
+  onChange,
+  onClose,
+  onSelectResult,
+  onSubmit,
+  state,
+}: {
+  state: PullImageState;
+  onChange: (patch: Partial<PullImageState>) => void;
+  onClose: () => void;
+  onSelectResult: (result: HubSearchResult) => void;
+  onSubmit: () => void;
+}) {
+  const ref = imageRefWithTag(state.ref, state.tag);
+  return (
+    <Modal
+      busy={state.busy}
+      footer={<ModalActions busy={state.busy} disabled={!state.ref.trim()} onCancel={onClose} onSubmit={onSubmit} submitLabel="Pull" />}
+      onClose={onClose}
+      open={state.open}
+      title="Pull Image"
+    >
+      <div className="space-y-4">
+        <TextField label="Image ref" onChange={(nextRef) => onChange({ ref: nextRef })} value={state.ref} />
+        <TextField label="Tag" onChange={(tag) => onChange({ tag })} value={state.tag} />
+        <TextField label="Docker Hub search" onChange={(query) => onChange({ query })} value={state.query} />
+        <HubResultList loading={state.loadingResults} onSelect={onSelectResult} results={state.results} />
+        {state.searchError ? (
+          <div className="rounded-control border border-warn/30 bg-warn/10 p-3 text-warn">
+            {state.searchError}
+          </div>
+        ) : null}
+        <CodePreview value={joinPreview(['docker', 'pull', ref])} />
+        <FormError error={state.error} />
+      </div>
+    </Modal>
+  );
+}
+
+function SaveImageModal({
+  onChange,
+  onClose,
+  onSubmit,
+  state,
+}: {
+  state: SaveImageState;
+  onChange: (patch: Partial<SaveImageState>) => void;
+  onClose: () => void;
+  onSubmit: () => void;
+}) {
+  const refs = splitRefs(state.refsText);
+  return (
+    <Modal
+      busy={state.busy}
+      footer={
+        <ModalActions
+          busy={state.busy}
+          disabled={refs.length === 0 || !state.destPath.trim()}
+          onCancel={onClose}
+          onSubmit={onSubmit}
+          submitLabel="Save"
+        />
+      }
+      onClose={onClose}
+      open={state.open}
+      title="Save Image"
+    >
+      <div className="space-y-4">
+        <TextAreaField label="Image refs" onChange={(refsText) => onChange({ refsText })} rows={3} value={state.refsText} />
+        <TextField label="Destination tar" onChange={(destPath) => onChange({ destPath })} value={state.destPath} />
+        <CodePreview value={joinPreview(['docker', 'save', '-o', state.destPath, ...refs])} />
+        <FormError error={state.error} />
+      </div>
+    </Modal>
+  );
+}
+
+function LoadImageModal({
+  onChange,
+  onClose,
+  onSubmit,
+  state,
+}: {
+  state: LoadImageState;
+  onChange: (patch: Partial<LoadImageState>) => void;
+  onClose: () => void;
+  onSubmit: () => void;
+}) {
+  return (
+    <Modal
+      busy={state.busy}
+      footer={<ModalActions busy={state.busy} disabled={!state.srcPath.trim()} onCancel={onClose} onSubmit={onSubmit} submitLabel="Load" />}
+      onClose={onClose}
+      open={state.open}
+      title="Load Image"
+    >
+      <div className="space-y-4">
+        <TextField label="Source tar" onChange={(srcPath) => onChange({ srcPath })} value={state.srcPath} />
+        <CodePreview value={joinPreview(['docker', 'load', '-i', state.srcPath])} />
+        <FormError error={state.error} />
+      </div>
+    </Modal>
+  );
+}
+
+function CreateVolumeModal({
+  onChange,
+  onClose,
+  onSubmit,
+  state,
+}: {
+  state: CreateVolumeState;
+  onChange: (patch: Partial<CreateVolumeState>) => void;
+  onClose: () => void;
+  onSubmit: () => void;
+}) {
+  return (
+    <Modal
+      busy={state.busy}
+      footer={<ModalActions busy={state.busy} disabled={!state.name.trim()} onCancel={onClose} onSubmit={onSubmit} submitLabel="Create" />}
+      onClose={onClose}
+      open={state.open}
+      title="Create Volume"
+    >
+      <div className="space-y-4">
+        <TextField autoFocus label="Name" onChange={(name) => onChange({ name })} value={state.name} />
+        <TextField label="Driver" onChange={(driver) => onChange({ driver })} value={state.driver} />
+        <details className="rounded-control border border-border bg-bg-inset">
+          <summary className="cursor-pointer px-3 py-2">Driver options</summary>
+          <div className="border-t border-border p-3">
+            <TextAreaField label="Options" onChange={(driverOptsText) => onChange({ driverOptsText })} rows={3} value={state.driverOptsText} />
+          </div>
+        </details>
+        <details className="rounded-control border border-border bg-bg-inset">
+          <summary className="cursor-pointer px-3 py-2">Labels</summary>
+          <div className="border-t border-border p-3">
+            <TextAreaField label="Labels" onChange={(labelsText) => onChange({ labelsText })} rows={3} value={state.labelsText} />
+          </div>
+        </details>
+        <CodePreview value={dockerVolumePreview(state)} />
+        <FormError error={state.error} />
+      </div>
+    </Modal>
+  );
+}
+
+function CreateNetworkModal({
+  onChange,
+  onClose,
+  onSubmit,
+  state,
+}: {
+  state: CreateNetworkState;
+  onChange: (patch: Partial<CreateNetworkState>) => void;
+  onClose: () => void;
+  onSubmit: () => void;
+}) {
+  const customDriver = state.driver === 'custom';
+  return (
+    <Modal
+      busy={state.busy}
+      footer={<ModalActions busy={state.busy} disabled={!state.name.trim()} onCancel={onClose} onSubmit={onSubmit} submitLabel="Create" />}
+      onClose={onClose}
+      open={state.open}
+      title="Create Network"
+    >
+      <div className="space-y-4">
+        <TextField autoFocus label="Name" onChange={(name) => onChange({ name })} value={state.name} />
+        <SelectField
+          label="Driver"
+          onChange={(nextDriver) => onChange({ driver: nextDriver })}
+          options={[
+            ['bridge', 'bridge'],
+            ['overlay', 'overlay'],
+            ['custom', 'custom'],
+          ]}
+          value={state.driver}
+        />
+        {customDriver ? <TextField label="Custom driver" onChange={(customDriver) => onChange({ customDriver })} value={state.customDriver} /> : null}
+        <div className="grid grid-cols-2 gap-3">
+          <TextField label="Subnet CIDR" onChange={(subnet) => onChange({ subnet })} value={state.subnet} />
+          <TextField label="Gateway" onChange={(gateway) => onChange({ gateway })} value={state.gateway} />
+        </div>
+        <div className="flex gap-4">
+          <label className="flex items-center gap-2">
+            <input checked={state.internal} onChange={(event) => onChange({ internal: event.target.checked })} type="checkbox" />
+            <span>Internal</span>
+          </label>
+          <label className="flex items-center gap-2">
+            <input checked={state.attachable} onChange={(event) => onChange({ attachable: event.target.checked })} type="checkbox" />
+            <span>Attachable</span>
+          </label>
+        </div>
+        <TextAreaField label="Labels" onChange={(labelsText) => onChange({ labelsText })} rows={3} value={state.labelsText} />
+        <CodePreview value={dockerNetworkPreview(state)} />
+        <FormError error={state.error} />
+      </div>
+    </Modal>
+  );
+}
+
+function ModalActions({
+  busy,
+  disabled,
+  onCancel,
+  onSubmit,
+  submitLabel,
+}: {
+  busy: boolean;
+  disabled: boolean;
+  onCancel: () => void;
+  onSubmit: () => void;
+  submitLabel: string;
+}) {
+  return (
+    <div className="flex justify-end gap-2">
+      <Button disabled={busy} onClick={onCancel} variant="secondary">
+        Cancel
+      </Button>
+      <Button disabled={disabled} loading={busy} onClick={onSubmit} variant="primary">
+        {submitLabel}
+      </Button>
+    </div>
+  );
+}
+
+function TextField({
+  autoFocus,
+  label,
+  onChange,
+  readOnly,
+  value,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  autoFocus?: boolean;
+  readOnly?: boolean;
+}) {
+  return (
+    <label className="block">
+      <span className="text-sm font-medium text-text-primary">{label}</span>
+      <input
+        autoFocus={autoFocus}
+        className="mt-2 h-9 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none focus:border-accent disabled:opacity-70"
+        onChange={(event) => onChange(event.target.value)}
+        readOnly={readOnly}
+        value={value}
+      />
+    </label>
+  );
+}
+
+function TextAreaField({
+  label,
+  onChange,
+  rows,
+  value,
+}: {
+  label: string;
+  value: string;
+  rows: number;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <label className="block">
+      <span className="text-sm font-medium text-text-primary">{label}</span>
+      <textarea
+        className="mt-2 w-full resize-y rounded-control border border-border bg-bg-inset px-3 py-2 font-mono text-sm text-text-primary outline-none focus:border-accent"
+        onChange={(event) => onChange(event.target.value)}
+        rows={rows}
+        value={value}
+      />
+    </label>
+  );
+}
+
+function SelectField({
+  label,
+  onChange,
+  options,
+  value,
+}: {
+  label: string;
+  value: string;
+  options: Array<[string, string]>;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <label className="block">
+      <span className="text-sm font-medium text-text-primary">{label}</span>
+      <select
+        className="mt-2 h-9 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none focus:border-accent"
+        onChange={(event) => onChange(event.target.value)}
+        value={value}
+      >
+        {options.map(([optionValue, label]) => (
+          <option key={optionValue || label} value={optionValue}>
+            {label}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+function HubResultList({
+  loading,
+  onSelect,
+  results,
+}: {
+  loading: boolean;
+  results: HubSearchResult[];
+  onSelect: (result: HubSearchResult) => void;
+}) {
+  if (loading) {
+    return <Skeleton className="h-20 w-full" />;
+  }
+  if (results.length === 0) {
+    return null;
+  }
+  return (
+    <div className="max-h-48 overflow-auto rounded-control border border-border bg-bg-inset">
+      {results.map((result) => (
+        <button
+          className="flex w-full items-start gap-3 border-b border-border px-3 py-2 text-left last:border-b-0 hover:bg-bg-card"
+          key={result.name}
+          onClick={() => onSelect(result)}
+          type="button"
+        >
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2">
+              <span className="truncate font-mono text-xs text-text-primary">{result.name}</span>
+              {result.official ? <Badge tone="ok">Official</Badge> : null}
+            </div>
+            <div className="mt-1 line-clamp-2 text-xs text-text-muted">{result.description || '-'}</div>
+          </div>
+          <Badge tone="neutral">{result.stars}</Badge>
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function CodePreview({ value }: { value: string }) {
+  return (
+    <pre className="overflow-auto rounded-control border border-border bg-bg-inset p-3 font-mono text-xs text-text-secondary">
+      {value || '-'}
+    </pre>
+  );
+}
+
+function FormError({ error }: { error?: string }) {
+  return error ? <div className="rounded-control border border-error/30 bg-error/10 p-3 text-error">{error}</div> : null;
+}
+
 function MetricButton({ hint, label, onClick, value }: { label: string; value: number; hint: string; onClick: () => void }) {
   return (
     <button
@@ -1481,6 +2572,282 @@ function MonoCopy({ value }: { value: string }) {
       {shortID(value)}
     </button>
   );
+}
+
+function buildRunImageRequest(state: RunImageState): RunImageRequest {
+  const validation = runImageValidation(state);
+  if (validation) {
+    throw new Error(validation);
+  }
+  return {
+    imageRef: state.imageRef.trim(),
+    name: state.name.trim(),
+    ports: parsePorts(state.portsText),
+    env: parseEnv(state.envText),
+    volumes: parseMounts(state.volumesText),
+    networkID: state.networkID,
+    restartPolicy: state.restartPolicy,
+    command: splitCommand(state.commandText),
+    user: state.user.trim(),
+    detach: true,
+    pullIfMissing: state.pullIfMissing,
+  };
+}
+
+function runImageValidation(state: RunImageState) {
+  if (!state.imageRef.trim()) {
+    return 'Image ref is required';
+  }
+  try {
+    parsePorts(state.portsText);
+    parseEnv(state.envText);
+    parseMounts(state.volumesText);
+  } catch (error) {
+    return error instanceof Error ? error.message : 'Invalid run configuration';
+  }
+  return '';
+}
+
+function parsePorts(value: string): PortMapping[] {
+  return splitLines(value).map((line) => {
+    const [portPart, protocol = 'tcp'] = line.split('/');
+    const parts = portPart.split(':');
+    const containerPort = parts.pop()?.trim() ?? '';
+    const hostPort = parts.pop()?.trim() ?? '';
+    const hostIP = parts.join(':').trim();
+    if (!containerPort) {
+      throw new Error('Container port is required');
+    }
+    return {
+      hostIP,
+      hostPort,
+      containerPort,
+      protocol: protocol.trim() || 'tcp',
+    };
+  });
+}
+
+function parseEnv(value: string) {
+  return splitLines(value).map((line) => {
+    const [name, envValue = ''] = line.split(/=(.*)/s);
+    if (!name.trim()) {
+      throw new Error('Environment key is required');
+    }
+    return { name: name.trim(), value: envValue };
+  });
+}
+
+function parseMounts(value: string): MountSpec[] {
+  return splitLines(value).map((line) => {
+    if (line.includes('type=') || line.includes('target=')) {
+      const values = parseCommaKeyValue(line);
+      const mountType = values.type || 'volume';
+      const target = values.target || values.destination || '';
+      const source = values.source || values.src || '';
+      if (!target || !source) {
+        throw new Error('Mount source and target are required');
+      }
+      return {
+        type: mountType,
+        source,
+        target,
+        volumeName: mountType === 'volume' ? source : '',
+        readOnly: values.ro === 'true' || values.readonly === 'true' || values.mode === 'ro',
+      };
+    }
+    const parts = line.split(':');
+    const mode = parts.length > 3 ? parts.pop() : 'rw';
+    const target = parts.pop()?.trim() ?? '';
+    const source = parts.slice(1).join(':').trim();
+    const mountType = parts[0]?.trim() || 'volume';
+    if (!target || !source) {
+      throw new Error('Mount source and target are required');
+    }
+    return {
+      type: mountType,
+      source,
+      target,
+      volumeName: mountType === 'volume' ? source : '',
+      readOnly: mode === 'ro',
+    };
+  });
+}
+
+function parseKeyValueLines(value: string) {
+  const pairs = splitLines(value);
+  if (pairs.length === 0) {
+    return undefined;
+  }
+  const out: Record<string, string> = {};
+  for (const line of pairs) {
+    const [key, nextValue = ''] = line.split(/=(.*)/s);
+    if (key.trim()) {
+      out[key.trim()] = nextValue;
+    }
+  }
+  return out;
+}
+
+function parseCommaKeyValue(value: string) {
+  const out: Record<string, string> = {};
+  for (const raw of value.split(',')) {
+    const [key, nextValue = ''] = raw.split(/=(.*)/s);
+    if (key.trim()) {
+      out[key.trim().toLowerCase()] = nextValue.trim();
+    }
+  }
+  return out;
+}
+
+function splitLines(value: string) {
+  return value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function splitRefs(value: string) {
+  return value
+    .split(/\r?\n|,/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function splitCommand(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return [];
+  }
+  const matches = trimmed.match(/"([^"]*)"|'([^']*)'|[^\s]+/g) ?? [];
+  return matches.map((part) => part.replace(/^["']|["']$/g, ''));
+}
+
+function appendLine(current: string, line: string) {
+  return current.trim() ? `${current.trimEnd()}\n${line}` : line;
+}
+
+function imageRefWithTag(ref: string, tag: string) {
+  const cleanRef = ref.trim();
+  const cleanTag = tag.trim();
+  if (!cleanRef || !cleanTag) {
+    return cleanRef;
+  }
+  const slash = cleanRef.lastIndexOf('/');
+  const colon = cleanRef.lastIndexOf(':');
+  if (colon > slash || cleanRef.includes('@')) {
+    return cleanRef;
+  }
+  return `${cleanRef}:${cleanTag}`;
+}
+
+function suggestContainerName(ref: string) {
+  const withoutDigest = ref.split('@')[0] ?? ref;
+  const withoutTag = withoutDigest.replace(/:[^/:]+$/, '');
+  const name = withoutTag.split('/').pop() || 'container';
+  return name.replace(/[^a-zA-Z0-9_.-]/g, '-');
+}
+
+function dockerRunPreview(state: RunImageState) {
+  const args = ['docker', 'run', '-d'];
+  if (state.name.trim()) {
+    args.push('--name', state.name.trim());
+  }
+  for (const port of parsePorts(state.portsText)) {
+    const host = [port.hostIP, port.hostPort].filter(Boolean).join(':');
+    args.push('-p', `${host ? `${host}:` : ''}${port.containerPort}/${port.protocol || 'tcp'}`);
+  }
+  for (const env of parseEnv(state.envText)) {
+    args.push('-e', `${env.name}=${secretLikeKey(env.name) ? '********' : env.value}`);
+  }
+  for (const mount of parseMounts(state.volumesText)) {
+    args.push('--mount', `type=${mount.type},source=${mount.source || mount.volumeName},target=${mount.target},${mount.readOnly ? 'ro' : 'rw'}`);
+  }
+  if (state.networkID) {
+    args.push('--network', state.networkID);
+  }
+  if (state.restartPolicy && state.restartPolicy !== 'no') {
+    args.push('--restart', state.restartPolicy);
+  }
+  if (state.user.trim()) {
+    args.push('--user', state.user.trim());
+  }
+  args.push(state.imageRef.trim() || '<image>');
+  args.push(...splitCommand(state.commandText));
+  return joinPreview(args);
+}
+
+function safeDockerRunPreview(state: RunImageState) {
+  try {
+    return dockerRunPreview(state);
+  } catch {
+    return 'docker run -d';
+  }
+}
+
+function dockerVolumePreview(state: CreateVolumeState) {
+  const args = ['docker', 'volume', 'create'];
+  if (state.driver.trim()) {
+    args.push('--driver', state.driver.trim());
+  }
+  for (const [key, value] of Object.entries(parseKeyValueLines(state.driverOptsText) ?? {})) {
+    args.push('--opt', `${key}=${value}`);
+  }
+  for (const [key, value] of Object.entries(parseKeyValueLines(state.labelsText) ?? {})) {
+    args.push('--label', `${key}=${value}`);
+  }
+  args.push(state.name.trim() || '<name>');
+  return joinPreview(args);
+}
+
+function dockerNetworkPreview(state: CreateNetworkState) {
+  const args = ['docker', 'network', 'create'];
+  const driver = state.driver === 'custom' ? state.customDriver : state.driver;
+  if (driver.trim()) {
+    args.push('--driver', driver.trim());
+  }
+  if (state.subnet.trim()) {
+    args.push('--subnet', state.subnet.trim());
+  }
+  if (state.gateway.trim()) {
+    args.push('--gateway', state.gateway.trim());
+  }
+  if (state.internal) {
+    args.push('--internal');
+  }
+  if (state.attachable) {
+    args.push('--attachable');
+  }
+  for (const [key, value] of Object.entries(parseKeyValueLines(state.labelsText) ?? {})) {
+    args.push('--label', `${key}=${value}`);
+  }
+  args.push(state.name.trim() || '<name>');
+  return joinPreview(args);
+}
+
+function joinPreview(args: string[]) {
+  return args.filter(Boolean).map(quotePreviewArg).join(' ');
+}
+
+function quotePreviewArg(value: string) {
+  if (!value) {
+    return '""';
+  }
+  return /\s|["']/.test(value) ? `"${value.replace(/"/g, '\\"')}"` : value;
+}
+
+function secretKeys(value: string) {
+  try {
+    return parseEnv(value)
+      .map((env) => env.name)
+      .filter(secretLikeKey);
+  } catch {
+    return [];
+  }
+}
+
+function secretLikeKey(name: string) {
+  const lower = name.toLowerCase();
+  return ['pass', 'password', 'token', 'secret', 'key', 'auth'].some((marker) => lower.includes(marker));
 }
 
 function activeProviderSummary(providers: ProviderSummary[]): ProviderSummary | null {

@@ -32,6 +32,14 @@ const dockerServiceMock = vi.hoisted(() => ({
   BulkContainerAction: vi.fn(),
   PlanKillContainer: vi.fn(),
   ApplyContainerPlan: vi.fn(),
+  RenameContainer: vi.fn(),
+  RunImage: vi.fn(),
+  PullImage: vi.fn(),
+  SaveImage: vi.fn(),
+  LoadImage: vi.fn(),
+  SearchHub: vi.fn(),
+  CreateVolume: vi.fn(),
+  CreateNetwork: vi.fn(),
 }));
 
 vi.mock('./api/app', () => ({
@@ -85,6 +93,20 @@ describe('App inventory shell', () => {
     dockerServiceMock.BulkContainerAction.mockResolvedValue({ total: 1, succeeded: 1, failed: 0, items: [] });
     dockerServiceMock.PlanKillContainer.mockResolvedValue(killPlan());
     dockerServiceMock.ApplyContainerPlan.mockResolvedValue(undefined);
+    dockerServiceMock.RenameContainer.mockResolvedValue(undefined);
+    dockerServiceMock.RunImage.mockResolvedValue('container-new');
+    dockerServiceMock.PullImage.mockResolvedValue('pull-stream');
+    dockerServiceMock.SaveImage.mockResolvedValue('save-job');
+    dockerServiceMock.LoadImage.mockResolvedValue('load-job');
+    dockerServiceMock.SearchHub.mockResolvedValue([]);
+    dockerServiceMock.CreateVolume.mockResolvedValue({ name: 'created_volume', driver: 'local', inUse: false });
+    dockerServiceMock.CreateNetwork.mockResolvedValue({
+      id: 'network-new',
+      name: 'created_network',
+      driver: 'bridge',
+      internal: false,
+      attachable: false,
+    });
 
     useAppStore.setState({
       version: null,
@@ -184,6 +206,110 @@ describe('App inventory shell', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
 
     await waitFor(() => expect(dockerServiceMock.ApplyContainerPlan).toHaveBeenCalledWith('plan-kill-web', ''));
+  });
+
+  it('runs an image from the row wizard and refreshes inventory', async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+
+    await screen.findByText('Docker Engine - Running');
+    fireEvent.click(
+      within(screen.getByRole('navigation', { name: 'Main navigation' })).getByRole('button', {
+        name: /Images/,
+      }),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Run cairn/web:latest' }));
+
+    expect(await screen.findByRole('dialog', { name: 'Run Image' })).toBeInTheDocument();
+    expect(screen.getByLabelText('Image ref')).toHaveValue('cairn/web:latest');
+    fireEvent.click(screen.getByRole('button', { name: 'Next' }));
+    expect(screen.getByText(/docker run -d/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Run' }));
+
+    await waitFor(() =>
+      expect(dockerServiceMock.RunImage).toHaveBeenCalledWith(
+        expect.objectContaining({
+          imageRef: 'cairn/web:latest',
+          name: 'web',
+          detach: true,
+          pullIfMissing: true,
+        }),
+      ),
+    );
+    await waitFor(() => expect(inventoryMock.getInventorySnapshot).toHaveBeenCalledTimes(2));
+  });
+
+  it('renames a container through the modal', async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+
+    await screen.findByText('Docker Engine - Running');
+    fireEvent.click(
+      within(screen.getByRole('navigation', { name: 'Main navigation' })).getByRole('button', {
+        name: /Containers/,
+      }),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Rename web' }));
+    fireEvent.change(screen.getByLabelText('New name'), { target: { value: 'web-renamed' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Rename' }));
+
+    await waitFor(() => expect(dockerServiceMock.RenameContainer).toHaveBeenCalledWith('container-1', 'web-renamed'));
+  });
+
+  it('pulls, saves, and loads images from image modals', async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+
+    await screen.findByText('Docker Engine - Running');
+    fireEvent.click(
+      within(screen.getByRole('navigation', { name: 'Main navigation' })).getByRole('button', {
+        name: /Images/,
+      }),
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pull image' }));
+    fireEvent.change(screen.getByLabelText('Image ref'), { target: { value: 'redis' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Pull' }));
+    await waitFor(() => expect(dockerServiceMock.PullImage).toHaveBeenCalledWith('redis:latest'));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save cairn/web:latest' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => expect(dockerServiceMock.SaveImage).toHaveBeenCalledWith(['cairn/web:latest'], 'cairn_web_latest.tar'));
+
+    fireEvent.click(screen.getByRole('button', { name: 'Load tar' }));
+    fireEvent.change(screen.getByLabelText('Source tar'), { target: { value: '/tmp/image.tar' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Load' }));
+    await waitFor(() => expect(dockerServiceMock.LoadImage).toHaveBeenCalledWith('/tmp/image.tar'));
+  });
+
+  it('creates volumes and networks from page actions', async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+
+    await screen.findByText('Docker Engine - Running');
+    fireEvent.click(
+      within(screen.getByRole('navigation', { name: 'Main navigation' })).getByRole('button', {
+        name: /Volumes/,
+      }),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Create volume' }));
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'demo_data' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }));
+    await waitFor(() => expect(dockerServiceMock.CreateVolume).toHaveBeenCalledWith(expect.objectContaining({ name: 'demo_data', driver: 'local' })));
+
+    fireEvent.click(
+      within(screen.getByRole('navigation', { name: 'Main navigation' })).getByRole('button', {
+        name: /Networks/,
+      }),
+    );
+    fireEvent.click(screen.getByRole('button', { name: 'Create network' }));
+    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'demo_net' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }));
+    await waitFor(() => expect(dockerServiceMock.CreateNetwork).toHaveBeenCalledWith(expect.objectContaining({ name: 'demo_net', driver: 'bridge' })));
   });
 
   it('renders empty states when the daemon has no objects', async () => {

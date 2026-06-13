@@ -2271,6 +2271,7 @@ export class RunImageRequest {
     "networkID"?: string;
     "restartPolicy"?: string;
     "command"?: string[];
+    "user"?: string;
     "detach": boolean;
     "pullIfMissing": boolean;
 

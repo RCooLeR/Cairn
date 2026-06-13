@@ -116,6 +116,9 @@ func Run(assets fs.FS) error {
 		bus.TopicDockerConnected,
 		bus.TopicDockerDisconnected,
 		bus.TopicObjectsChanged,
+		bus.TopicImagePullProgress,
+		bus.TopicJobProgress,
+		bus.TopicJobDone,
 	})
 
 	return app.Run()

@@ -178,6 +178,7 @@ type RunImageRequest struct {
 	NetworkID     string        `json:"networkID,omitempty"`
 	RestartPolicy string        `json:"restartPolicy,omitempty"`
 	Command       []string      `json:"command,omitempty"`
+	User          string        `json:"user,omitempty"`
 	Detach        bool          `json:"detach"`
 	PullIfMissing bool          `json:"pullIfMissing"`
 }
