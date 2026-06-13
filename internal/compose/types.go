@@ -39,6 +39,12 @@ type BuildOptions struct {
 	Services []string
 }
 
+type UpOptions struct {
+	ForceRecreate bool
+	NoBuild       bool
+	Services      []string
+}
+
 type ListOptions struct {
 	All bool
 }

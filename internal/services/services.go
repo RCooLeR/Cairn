@@ -1189,16 +1189,25 @@ func (s *UpdateService) ListCurrentUpdates(ctx context.Context, filter models.Up
 	return s.Manager.ListCurrentUpdates(ctx, filter)
 }
 
-func (s *UpdateService) PlanServiceUpdate(_ context.Context, projectID string, service string) (*models.UpdatePlan, error) {
-	return nil, notReady()
+func (s *UpdateService) PlanServiceUpdate(ctx context.Context, projectID string, service string) (*models.UpdatePlan, error) {
+	if s.Manager == nil {
+		return nil, notReady()
+	}
+	return s.Manager.PlanServiceUpdate(ctx, projectID, service)
 }
 
-func (s *UpdateService) PlanProjectUpdate(_ context.Context, projectID string) (*models.UpdatePlan, error) {
-	return nil, notReady()
+func (s *UpdateService) PlanProjectUpdate(ctx context.Context, projectID string) (*models.UpdatePlan, error) {
+	if s.Manager == nil {
+		return nil, notReady()
+	}
+	return s.Manager.PlanProjectUpdate(ctx, projectID)
 }
 
-func (s *UpdateService) ApplyUpdate(_ context.Context, req models.ApplyUpdateRequest) (string, error) {
-	return "", notReady()
+func (s *UpdateService) ApplyUpdate(ctx context.Context, req models.ApplyUpdateRequest) (string, error) {
+	if s.Manager == nil {
+		return "", notReady()
+	}
+	return s.Manager.ApplyUpdate(ctx, req)
 }
 
 func (s *UpdateService) IgnoreUpdate(ctx context.Context, req models.IgnoreUpdateRequest) error {
@@ -1222,8 +1231,11 @@ func (s *UpdateService) ListUpdateHistory(ctx context.Context, filter models.Upd
 	return s.Manager.ListUpdateHistory(ctx, filter)
 }
 
-func (s *UpdateService) Rollback(_ context.Context, historyID int64) (string, error) {
-	return "", notReady()
+func (s *UpdateService) Rollback(ctx context.Context, historyID int64) (string, error) {
+	if s.Manager == nil {
+		return "", notReady()
+	}
+	return s.Manager.Rollback(ctx, historyID)
 }
 
 func (s *ImageLineageService) DiscoverProjectLineage(ctx context.Context, projectID string) ([]models.ImageLineage, error) {

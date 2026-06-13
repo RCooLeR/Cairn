@@ -87,6 +87,10 @@ func Run(assets fs.FS) error {
 		registryManager = registrycore.NewManager(providerManager, auditRepo)
 		lineageManager = lineagecore.NewManager(projectRepo, db.Lineage(), db.Objects(), dockerClient)
 		updateManager = updatescore.NewManager(projectRepo, db.Lineage(), db.Updates(), db.Objects(), dockerClient, registryManager, db.Settings(), eventBus, lineageManager)
+		updateManager.Compose = composeClient
+		updateManager.Backups = backupManager
+		updateManager.Audit = auditRepo
+		updateManager.Notify = db.Notifications()
 		updateManager.Start(ctx)
 	}
 

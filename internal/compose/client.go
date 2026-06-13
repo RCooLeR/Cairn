@@ -102,7 +102,12 @@ func (c *Client) Restart(ctx context.Context, opts ProjectOptions) (*providers.C
 }
 
 func (c *Client) Pull(ctx context.Context, opts ProjectOptions) (*providers.CommandResult, error) {
-	return c.runProjectCommand(ctx, opts, "pull")
+	return c.PullServices(ctx, opts, nil)
+}
+
+func (c *Client) PullServices(ctx context.Context, opts ProjectOptions, services []string) (*providers.CommandResult, error) {
+	args := append([]string{"pull"}, nonEmptyServices(services)...)
+	return c.runProjectCommand(ctx, opts, args...)
 }
 
 func (c *Client) Build(ctx context.Context, opts ProjectOptions, build BuildOptions) (*providers.CommandResult, error) {
@@ -129,10 +134,18 @@ func (c *Client) Build(ctx context.Context, opts ProjectOptions, build BuildOpti
 }
 
 func (c *Client) Up(ctx context.Context, opts ProjectOptions, forceRecreate bool) (*providers.CommandResult, error) {
+	return c.UpServices(ctx, opts, UpOptions{ForceRecreate: forceRecreate})
+}
+
+func (c *Client) UpServices(ctx context.Context, opts ProjectOptions, up UpOptions) (*providers.CommandResult, error) {
 	args := []string{"up", "-d"}
-	if forceRecreate {
+	if up.ForceRecreate {
 		args = append(args, "--force-recreate")
 	}
+	if up.NoBuild {
+		args = append(args, "--no-build")
+	}
+	args = append(args, nonEmptyServices(up.Services)...)
 	return c.runProjectCommand(ctx, opts, args...)
 }
 
@@ -181,6 +194,17 @@ func projectArgs(opts ProjectOptions) []string {
 		}
 	}
 	return args
+}
+
+func nonEmptyServices(services []string) []string {
+	result := make([]string, 0, len(services))
+	for _, service := range services {
+		service = strings.TrimSpace(service)
+		if service != "" {
+			result = append(result, service)
+		}
+	}
+	return result
 }
 
 func projectEnv(opts ProjectOptions) []string {

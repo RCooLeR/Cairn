@@ -191,8 +191,25 @@ func (m *Manager) ApplyBackup(ctx context.Context, planID string) (string, error
 		return "", apperror.New(apperror.Conflict, "Plan is not a backup plan")
 	}
 	jobID := "backup-" + m.newID()
-	go m.runBackup(context.Background(), jobID, record)
+	go func() {
+		_ = m.runBackup(context.Background(), jobID, record)
+	}()
 	return jobID, nil
+}
+
+func (m *Manager) RunBackupVolume(ctx context.Context, req models.BackupVolumeRequest) error {
+	plan, err := m.PlanBackupVolume(ctx, req)
+	if err != nil {
+		return err
+	}
+	record, err := m.takePlan(ctx, plan.PlanID, "")
+	if err != nil {
+		return err
+	}
+	if record.Operation != "backup" {
+		return apperror.New(apperror.Conflict, "Plan is not a backup plan")
+	}
+	return m.runBackup(ctx, "backup-"+m.newID(), record)
 }
 
 func (m *Manager) PlanRestoreVolume(ctx context.Context, req models.RestoreVolumeRequest) (*models.CommandPlan, error) {
@@ -338,7 +355,7 @@ func (m *Manager) DeleteBackup(ctx context.Context, backupID string) error {
 	return m.recordAudit(ctx, "backup.delete", "backup", record.ID, record.ProviderID, record.ProjectID, command, models.RiskNeedsConfirmation, "success", duration, nil)
 }
 
-func (m *Manager) runBackup(ctx context.Context, jobID string, record planRecord) {
+func (m *Manager) runBackup(ctx context.Context, jobID string, record planRecord) error {
 	started := m.now()
 	command := plannedCommandText(record.Plan)
 	_ = m.recordAudit(ctx, "backup.volume", "volume", record.VolumeName, record.ProviderID, record.ProjectID, command, record.Plan.Risk, "started", 0, nil)
@@ -352,14 +369,14 @@ func (m *Manager) runBackup(ctx context.Context, jobID string, record planRecord
 		_ = m.insertBackupRecord(ctx, record, backupResultFailed, 0, err)
 		_ = m.recordAudit(ctx, "backup.volume", "volume", record.VolumeName, record.ProviderID, record.ProjectID, command, record.Plan.Risk, "failed", duration, err)
 		m.publishDone(jobID, "", err)
-		return
+		return err
 	}
 	sum, size, err := fileSHA256(record.ArchivePath)
 	if err != nil {
 		_ = m.insertBackupRecord(ctx, record, backupResultFailed, 0, err)
 		_ = m.recordAudit(ctx, "backup.volume", "volume", record.VolumeName, record.ProviderID, record.ProjectID, command, record.Plan.Risk, "failed", duration, err)
 		m.publishDone(jobID, "", err)
-		return
+		return err
 	}
 	contextName, _ := provider.DockerContext(ctx)
 	sidecar := BackupSidecar{
@@ -379,17 +396,18 @@ func (m *Manager) runBackup(ctx context.Context, jobID string, record planRecord
 		_ = m.insertBackupRecord(ctx, record, backupResultFailed, size, err)
 		_ = m.recordAudit(ctx, "backup.volume", "volume", record.VolumeName, record.ProviderID, record.ProjectID, command, record.Plan.Risk, "failed", duration, err)
 		m.publishDone(jobID, "", err)
-		return
+		return err
 	}
 	record.Sidecar = sidecar
 	if err := m.insertBackupRecord(ctx, record, backupResultOK, size, nil); err != nil {
 		_ = m.recordAudit(ctx, "backup.volume", "volume", record.VolumeName, record.ProviderID, record.ProjectID, command, record.Plan.Risk, "failed", duration, err)
 		m.publishDone(jobID, "", err)
-		return
+		return err
 	}
 	m.publishProgress(jobID, "backup", "Volume backup complete", floatPtr(100))
 	_ = m.recordAudit(ctx, "backup.volume", "volume", record.VolumeName, record.ProviderID, record.ProjectID, command, record.Plan.Risk, "success", duration, nil)
 	m.publishDone(jobID, record.ArchivePath, nil)
+	return nil
 }
 
 func (m *Manager) runRestore(ctx context.Context, jobID string, record planRecord) {

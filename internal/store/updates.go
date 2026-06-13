@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"strings"
 	"time"
 
@@ -54,7 +55,17 @@ type UpdateHistoryRecord struct {
 	UpdateKind     models.UpdateKind
 	ImageRef       string
 	BaseImageRef   string
+	OldImageID     string
+	OldDigest      string
+	OldBaseDigest  string
+	NewImageID     string
+	NewDigest      string
+	NewBaseDigest  string
+	DockerfileHash string
+	BuildArgs      map[string]string
+	Commands       []models.PlannedCommand
 	Result         string
+	HealthResult   string
 	StartedAt      time.Time
 	FinishedAt     time.Time
 	RollbackStatus string
@@ -223,6 +234,82 @@ func (r *UpdateRepository) Unignore(ctx context.Context, id int64) error {
 	return err
 }
 
+func (r *UpdateRepository) InsertHistory(ctx context.Context, record UpdateHistoryRecord) (int64, error) {
+	if record.StartedAt.IsZero() {
+		record.StartedAt = time.Now().UTC()
+	}
+	if record.Result == "" {
+		record.Result = "started"
+	}
+	buildArgs := "{}"
+	if len(record.BuildArgs) > 0 {
+		buildArgs = jsonText(record.BuildArgs, "{}")
+	}
+	commands := "[]"
+	if len(record.Commands) > 0 {
+		commands = jsonText(record.Commands, "[]")
+	}
+	result, err := r.db.ExecContext(ctx, `
+		INSERT INTO update_history (
+			provider_id, project_id, service_id, update_kind, image_ref, base_image_ref,
+			old_image_id, old_digest, old_base_digest, new_image_id, new_digest,
+			new_base_digest, dockerfile_hash, build_args_json, commands_json,
+			result, health_result, rollback_status, started_at, finished_at, error
+		)
+		VALUES (?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, NULLIF(?, ''),
+			NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''),
+			NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, '{}'), NULLIF(?, '[]'),
+			?, NULLIF(?, ''), NULLIF(?, ''), ?, NULLIF(?, ''), NULLIF(?, ''))
+	`, record.ProviderID, record.ProjectID, record.ServiceID, string(record.UpdateKind),
+		record.ImageRef, record.BaseImageRef, record.OldImageID, record.OldDigest,
+		record.OldBaseDigest, record.NewImageID, record.NewDigest, record.NewBaseDigest,
+		record.DockerfileHash, buildArgs, commands, record.Result, record.HealthResult,
+		record.RollbackStatus, formatTime(record.StartedAt), formatTime(record.FinishedAt),
+		record.Error)
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
+}
+
+func (r *UpdateRepository) FinishHistory(ctx context.Context, id int64, record UpdateHistoryRecord) error {
+	if record.FinishedAt.IsZero() {
+		record.FinishedAt = time.Now().UTC()
+	}
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE update_history
+		SET new_image_id = NULLIF(?, ''),
+			new_digest = NULLIF(?, ''),
+			new_base_digest = NULLIF(?, ''),
+			result = ?,
+			health_result = NULLIF(?, ''),
+			rollback_status = NULLIF(?, ''),
+			finished_at = ?,
+			error = NULLIF(?, '')
+		WHERE id = ?
+	`, record.NewImageID, record.NewDigest, record.NewBaseDigest, record.Result,
+		record.HealthResult, record.RollbackStatus, formatTime(record.FinishedAt),
+		record.Error, id)
+	return err
+}
+
+func (r *UpdateRepository) GetHistory(ctx context.Context, id int64) (UpdateHistoryRecord, error) {
+	row := r.db.QueryRowContext(ctx, `
+		SELECT id, provider_id, COALESCE(project_id, ''), COALESCE(service_id, ''),
+			update_kind, image_ref, COALESCE(base_image_ref, ''),
+			COALESCE(old_image_id, ''), COALESCE(old_digest, ''),
+			COALESCE(old_base_digest, ''), COALESCE(new_image_id, ''),
+			COALESCE(new_digest, ''), COALESCE(new_base_digest, ''),
+			COALESCE(dockerfile_hash, ''), COALESCE(build_args_json, '{}'),
+			COALESCE(commands_json, '[]'), result, COALESCE(health_result, ''),
+			started_at, COALESCE(finished_at, ''), COALESCE(rollback_status, ''),
+			COALESCE(error, '')
+		FROM update_history
+		WHERE id = ?
+	`, id)
+	return scanUpdateHistory(row)
+}
+
 func (r *UpdateRepository) ListHistory(ctx context.Context, filter models.UpdateHistoryFilter) ([]UpdateHistoryRecord, error) {
 	limit := filter.Limit
 	if limit <= 0 || limit > 500 {
@@ -271,6 +358,53 @@ func (r *UpdateRepository) ListHistory(ctx context.Context, filter models.Update
 		records = append(records, record)
 	}
 	return records, rows.Err()
+}
+
+func scanUpdateHistory(scanner updateHistoryScanner) (UpdateHistoryRecord, error) {
+	var record UpdateHistoryRecord
+	var startedAt string
+	var finishedAt string
+	buildArgsJSON := "{}"
+	commandsJSON := "[]"
+	if err := scanner.Scan(
+		&record.ID,
+		&record.ProviderID,
+		&record.ProjectID,
+		&record.ServiceID,
+		&record.UpdateKind,
+		&record.ImageRef,
+		&record.BaseImageRef,
+		&record.OldImageID,
+		&record.OldDigest,
+		&record.OldBaseDigest,
+		&record.NewImageID,
+		&record.NewDigest,
+		&record.NewBaseDigest,
+		&record.DockerfileHash,
+		&buildArgsJSON,
+		&commandsJSON,
+		&record.Result,
+		&record.HealthResult,
+		&startedAt,
+		&finishedAt,
+		&record.RollbackStatus,
+		&record.Error,
+	); err != nil {
+		return UpdateHistoryRecord{}, err
+	}
+	record.StartedAt = parseStoreTime(startedAt)
+	record.FinishedAt = parseStoreTime(finishedAt)
+	if err := json.Unmarshal([]byte(nullJSON(buildArgsJSON, "{}")), &record.BuildArgs); err != nil {
+		return UpdateHistoryRecord{}, err
+	}
+	if err := json.Unmarshal([]byte(nullJSON(commandsJSON, "[]")), &record.Commands); err != nil {
+		return UpdateHistoryRecord{}, err
+	}
+	return record, nil
+}
+
+type updateHistoryScanner interface {
+	Scan(dest ...any) error
 }
 
 func (r *UpdateRepository) listLatestChecks(ctx context.Context, projectID string) ([]UpdateCheckRecord, error) {

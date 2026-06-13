@@ -32,20 +32,29 @@ type LineageDiscoverer interface {
 }
 
 type Manager struct {
-	Projects  *store.ProjectRepository
-	Lineage   *store.LineageRepository
-	Updates   *store.UpdateRepository
-	Objects   *store.ObjectCacheRepository
-	Images    ImageInspector
-	Registry  RegistryResolver
-	Settings  *store.SettingsRepository
-	Events    bus.Bus
-	Discover  LineageDiscoverer
-	Now       func() time.Time
-	NewID     func() string
-	JitterFor func(time.Duration) time.Duration
+	Projects           *store.ProjectRepository
+	Lineage            *store.LineageRepository
+	Updates            *store.UpdateRepository
+	Objects            *store.ObjectCacheRepository
+	Images             ImageInspector
+	Docker             DockerRuntime
+	Compose            ComposeRunner
+	Backups            BackupRunner
+	Audit              *store.AuditRepository
+	Notify             *store.NotificationRepository
+	Registry           RegistryResolver
+	Settings           *store.SettingsRepository
+	Events             bus.Bus
+	Discover           LineageDiscoverer
+	Now                func() time.Time
+	NewID              func() string
+	JitterFor          func(time.Duration) time.Duration
+	HealthWindow       time.Duration
+	HealthPollInterval time.Duration
 
 	startOnce sync.Once
+	planMu    sync.Mutex
+	plans     map[string]updatePlanRecord
 }
 
 type checkProgressPayload struct {
@@ -56,7 +65,7 @@ type checkProgressPayload struct {
 }
 
 func NewManager(projects *store.ProjectRepository, lineage *store.LineageRepository, updates *store.UpdateRepository, objects *store.ObjectCacheRepository, images ImageInspector, registry RegistryResolver, settings *store.SettingsRepository, events bus.Bus, discover LineageDiscoverer) *Manager {
-	return &Manager{
+	manager := &Manager{
 		Projects: projects,
 		Lineage:  lineage,
 		Updates:  updates,
@@ -68,7 +77,12 @@ func NewManager(projects *store.ProjectRepository, lineage *store.LineageReposit
 		Discover: discover,
 		Now:      func() time.Time { return time.Now().UTC() },
 		NewID:    uuid.NewString,
+		plans:    map[string]updatePlanRecord{},
 	}
+	if dockerRuntime, ok := images.(DockerRuntime); ok {
+		manager.Docker = dockerRuntime
+	}
+	return manager
 }
 
 func (m *Manager) Start(ctx context.Context) {
