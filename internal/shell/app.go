@@ -10,6 +10,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/bus"
 	composecore "github.com/RCooLeR/Cairn/internal/compose"
 	dockercore "github.com/RCooLeR/Cairn/internal/docker"
+	lineagecore "github.com/RCooLeR/Cairn/internal/lineage"
 	"github.com/RCooLeR/Cairn/internal/logsvc"
 	"github.com/RCooLeR/Cairn/internal/metrics"
 	"github.com/RCooLeR/Cairn/internal/providers"
@@ -60,6 +61,7 @@ func Run(assets fs.FS) error {
 	var terminalManager *terminal.Manager
 	var backupManager *backupcore.Manager
 	var registryManager *registrycore.Manager
+	var lineageManager *lineagecore.Manager
 	if len(providerSet) > 0 {
 		dockerClient = dockercore.New(providerSet[0], eventBus)
 		dockerClient.SetObjectCache(db.Objects())
@@ -81,6 +83,7 @@ func Run(assets fs.FS) error {
 		terminalManager = terminal.NewManager(providerSet[0], dockerClient, projectRepo, eventBus, terminal.Options{})
 		backupManager = backupcore.NewManager(providerManager, dockerClient, db.Settings(), db.Backups(), auditRepo, eventBus, services.Version)
 		registryManager = registrycore.NewManager(providerManager, auditRepo)
+		lineageManager = lineagecore.NewManager(projectRepo, db.Lineage(), db.Objects(), dockerClient)
 	}
 
 	app := application.New(application.Options{
@@ -107,7 +110,7 @@ func Run(assets fs.FS) error {
 			application.NewService(&services.LogsService{Manager: logsManager}),
 			application.NewService(&services.TerminalService{Manager: terminalManager}),
 			application.NewService(&services.UpdateService{}),
-			application.NewService(&services.ImageLineageService{}),
+			application.NewService(&services.ImageLineageService{Manager: lineageManager}),
 			application.NewService(&services.BackupService{Manager: backupManager}),
 			application.NewService(&services.RegistryService{Manager: registryManager}),
 			application.NewService(&services.SettingsService{

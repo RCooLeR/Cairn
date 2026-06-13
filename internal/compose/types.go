@@ -33,6 +33,12 @@ type ProjectOptions struct {
 	Env         []string
 }
 
+type BuildOptions struct {
+	Pull     bool
+	Labels   map[string]string
+	Services []string
+}
+
 type ListOptions struct {
 	All bool
 }

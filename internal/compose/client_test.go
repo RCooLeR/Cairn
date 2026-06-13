@@ -46,6 +46,38 @@ func TestClientRunsProviderWithArgvWorkdirEnv(t *testing.T) {
 	}
 }
 
+func TestClientBuildAddsCairnLabelsDeterministically(t *testing.T) {
+	t.Parallel()
+	runner := newFakeRunner()
+	runner.outputs["/tmp/app|-f compose.yaml build --pull --label io.cairn.base.name=node:20-alpine --label io.cairn.project=linux_native/apps api"] = providers.CommandResult{}
+	client := NewClient(runner)
+
+	_, err := client.Build(context.Background(), ProjectOptions{
+		Workdir: "/tmp/app",
+		Files:   []string{"compose.yaml"},
+	}, BuildOptions{
+		Pull: true,
+		Labels: map[string]string{
+			"io.cairn.project":   "linux_native/apps",
+			"io.cairn.base.name": "node:20-alpine",
+			"empty":              "",
+		},
+		Services: []string{"api"},
+	})
+	if err != nil {
+		t.Fatalf("Build() error = %v", err)
+	}
+	want := []string{
+		"-f", "compose.yaml", "build", "--pull",
+		"--label", "io.cairn.base.name=node:20-alpine",
+		"--label", "io.cairn.project=linux_native/apps",
+		"api",
+	}
+	if got := runner.calls[0].args; !reflect.DeepEqual(got, want) {
+		t.Fatalf("args = %#v, want %#v", got, want)
+	}
+}
+
 func TestClientVersionRequiresMinimum(t *testing.T) {
 	t.Parallel()
 	runner := newFakeRunner()

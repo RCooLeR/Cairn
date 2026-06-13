@@ -3,6 +3,7 @@ package compose
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
@@ -102,6 +103,29 @@ func (c *Client) Restart(ctx context.Context, opts ProjectOptions) (*providers.C
 
 func (c *Client) Pull(ctx context.Context, opts ProjectOptions) (*providers.CommandResult, error) {
 	return c.runProjectCommand(ctx, opts, "pull")
+}
+
+func (c *Client) Build(ctx context.Context, opts ProjectOptions, build BuildOptions) (*providers.CommandResult, error) {
+	args := []string{"build"}
+	if build.Pull {
+		args = append(args, "--pull")
+	}
+	labelKeys := make([]string, 0, len(build.Labels))
+	for key := range build.Labels {
+		if strings.TrimSpace(key) != "" {
+			labelKeys = append(labelKeys, key)
+		}
+	}
+	sort.Strings(labelKeys)
+	for _, key := range labelKeys {
+		value := strings.TrimSpace(build.Labels[key])
+		if value == "" {
+			continue
+		}
+		args = append(args, "--label", key+"="+value)
+	}
+	args = append(args, build.Services...)
+	return c.runProjectCommand(ctx, opts, args...)
 }
 
 func (c *Client) Up(ctx context.Context, opts ProjectOptions, forceRecreate bool) (*providers.CommandResult, error) {

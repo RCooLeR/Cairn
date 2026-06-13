@@ -16,6 +16,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/backups"
 	"github.com/RCooLeR/Cairn/internal/bus"
 	composecore "github.com/RCooLeR/Cairn/internal/compose"
+	lineagecore "github.com/RCooLeR/Cairn/internal/lineage"
 	"github.com/RCooLeR/Cairn/internal/logsvc"
 	"github.com/RCooLeR/Cairn/internal/metrics"
 	"github.com/RCooLeR/Cairn/internal/models"
@@ -130,7 +131,9 @@ type TerminalService struct {
 	Manager *terminal.Manager
 }
 type UpdateService struct{}
-type ImageLineageService struct{}
+type ImageLineageService struct {
+	Manager *lineagecore.Manager
+}
 type BackupService struct {
 	Manager *backups.Manager
 }
@@ -1184,23 +1187,38 @@ func (s *UpdateService) Rollback(_ context.Context, historyID int64) (string, er
 	return "", notReady()
 }
 
-func (s *ImageLineageService) DiscoverProjectLineage(_ context.Context, projectID string) ([]models.ImageLineage, error) {
+func (s *ImageLineageService) DiscoverProjectLineage(ctx context.Context, projectID string) ([]models.ImageLineage, error) {
+	if s.Manager != nil {
+		return s.Manager.DiscoverProjectLineage(ctx, projectID)
+	}
 	return nil, notReady()
 }
 
-func (s *ImageLineageService) GetProjectLineage(_ context.Context, projectID string) ([]models.ImageLineage, error) {
+func (s *ImageLineageService) GetProjectLineage(ctx context.Context, projectID string) ([]models.ImageLineage, error) {
+	if s.Manager != nil {
+		return s.Manager.GetProjectLineage(ctx, projectID)
+	}
 	return nil, notReady()
 }
 
-func (s *ImageLineageService) GetServiceLineage(_ context.Context, projectID string, service string) (*models.ImageLineage, error) {
+func (s *ImageLineageService) GetServiceLineage(ctx context.Context, projectID string, service string) (*models.ImageLineage, error) {
+	if s.Manager != nil {
+		return s.Manager.GetServiceLineage(ctx, projectID, service)
+	}
 	return nil, notReady()
 }
 
-func (s *ImageLineageService) GetContainerLineage(_ context.Context, containerID string) (*models.ImageLineage, error) {
+func (s *ImageLineageService) GetContainerLineage(ctx context.Context, containerID string) (*models.ImageLineage, error) {
+	if s.Manager != nil {
+		return s.Manager.GetContainerLineage(ctx, containerID)
+	}
 	return nil, notReady()
 }
 
-func (s *ImageLineageService) RefreshServiceLineage(_ context.Context, projectID string, service string) (*models.ImageLineage, error) {
+func (s *ImageLineageService) RefreshServiceLineage(ctx context.Context, projectID string, service string) (*models.ImageLineage, error) {
+	if s.Manager != nil {
+		return s.Manager.RefreshServiceLineage(ctx, projectID, service)
+	}
 	return nil, notReady()
 }
 

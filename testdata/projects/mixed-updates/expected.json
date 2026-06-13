@@ -5,5 +5,9 @@
     {"name": "build-b", "image": "cairn-test/mixed-build-b:latest", "buildContext": "build-b"},
     {"name": "image-a", "image": "nginx:1.27-alpine"},
     {"name": "image-b", "image": "postgres:16-alpine"}
+  ],
+  "lineage": [
+    {"service": "build-a", "baseImage": "nginx:alpine"},
+    {"service": "build-b", "baseImage": "busybox:1.36"}
   ]
 }
