@@ -21,11 +21,16 @@ const (
 )
 
 const (
-	ProblemDockerMissing  = "DOCKER_MISSING"
-	ProblemDockerDown     = "DOCKERD_DOWN"
-	ProblemSocketPerm     = "PERM_SOCKET"
-	ProblemComposeMissing = "COMPOSE_MISSING"
-	ProblemBuildxMissing  = "BUILDX_MISSING"
+	ProblemWSLMissing                 = "WSL_MISSING"
+	ProblemUbuntuMissing              = "UBUNTU_MISSING"
+	ProblemWSL2Required               = "WSL2_REQUIRED"
+	ProblemSystemdOff                 = "SYSTEMD_OFF"
+	ProblemDesktopIntegrationConflict = "DESKTOP_INTEGRATION_CONFLICT"
+	ProblemDockerMissing              = "DOCKER_MISSING"
+	ProblemDockerDown                 = "DOCKERD_DOWN"
+	ProblemSocketPerm                 = "PERM_SOCKET"
+	ProblemComposeMissing             = "COMPOSE_MISSING"
+	ProblemBuildxMissing              = "BUILDX_MISSING"
 
 	WarningSystemdMissing = "SYSTEMD_MISSING"
 )

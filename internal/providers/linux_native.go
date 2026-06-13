@@ -335,7 +335,16 @@ func providerProblem(code, message, hint string, recoverable bool) models.Provid
 func hasBlockingProblem(problems []models.ProviderProblem) bool {
 	for _, problem := range problems {
 		switch problem.Code {
-		case ProblemDockerMissing, ProblemDockerDown, ProblemSocketPerm, ProblemComposeMissing, ProblemBuildxMissing:
+		case ProblemWSLMissing,
+			ProblemUbuntuMissing,
+			ProblemWSL2Required,
+			ProblemSystemdOff,
+			ProblemDesktopIntegrationConflict,
+			ProblemDockerMissing,
+			ProblemDockerDown,
+			ProblemSocketPerm,
+			ProblemComposeMissing,
+			ProblemBuildxMissing:
 			return true
 		}
 	}

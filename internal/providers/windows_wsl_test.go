@@ -1,0 +1,288 @@
+package providers
+
+import (
+	"context"
+	"encoding/binary"
+	"errors"
+	"reflect"
+	"strings"
+	"testing"
+	"unicode/utf16"
+
+	"github.com/RCooLeR/Cairn/internal/models"
+)
+
+func TestParseWSLListVerboseUTF16ExcludesDockerDesktop(t *testing.T) {
+	t.Parallel()
+	raw := "\ufeff  NAME                   STATE           VERSION\n" +
+		"* Ubuntu                 Running         2\n" +
+		"  docker-desktop         Running         2\n" +
+		"  docker-desktop-data    Stopped         2\n" +
+		"  Ubuntu-22.04           Stopped         2\n" +
+		"  cairn-dev              Running         2\n"
+
+	distros, err := parseWSLListVerbose(utf16LE(raw))
+	if err != nil {
+		t.Fatalf("parseWSLListVerbose() error = %v", err)
+	}
+
+	names := make([]string, 0, len(distros))
+	for _, distro := range distros {
+		names = append(names, distro.Name)
+		if strings.HasPrefix(distro.Name, "docker-desktop") {
+			t.Fatalf("Docker Desktop distro was not excluded: %#v", distros)
+		}
+	}
+	if got, want := names, []string{"Ubuntu", "Ubuntu-22.04", "cairn-dev"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("names = %#v, want %#v", got, want)
+	}
+	if !distros[0].Default || distros[0].Version != 2 || distros[0].State != "Running" {
+		t.Fatalf("first distro metadata = %#v", distros[0])
+	}
+}
+
+func TestSelectWSLDistroHonorsSettingsAndCustomNames(t *testing.T) {
+	t.Parallel()
+	distros := []wslDistro{
+		{Name: "dev-box", Version: 2, Default: true},
+		{Name: "Ubuntu-24.04", Version: 2},
+		{Name: "cairn-dev", Version: 2},
+	}
+
+	if got, ok := selectWSLDistro(distros, "cairn-dev"); !ok || got.Name != "cairn-dev" {
+		t.Fatalf("select configured = %#v, %v; want cairn-dev, true", got, ok)
+	}
+	if got, ok := selectWSLDistro(distros, "Ubuntu"); !ok || got.Name != "Ubuntu-24.04" {
+		t.Fatalf("select default Ubuntu family = %#v, %v; want Ubuntu-24.04, true", got, ok)
+	}
+	if got, ok := selectWSLDistro(distros, "missing-dev"); ok || got.Name != "" {
+		t.Fatalf("select missing explicit = %#v, %v; want empty, false", got, ok)
+	}
+	if got, ok := selectWSLDistro([]wslDistro{{Name: "cairn-dev", Version: 2}}, ""); !ok || got.Name != "cairn-dev" {
+		t.Fatalf("select custom default = %#v, %v; want cairn-dev, true", got, ok)
+	}
+}
+
+func TestWindowsWSLDetectHealthyCustomDistro(t *testing.T) {
+	t.Parallel()
+	runner := newFakeRunner()
+	runner.paths[wslCommandName] = `C:\Windows\System32\wsl.exe`
+	runner.outputs[wslCommandName+" --status"] = "Default Version: 2\n"
+	runner.outputs[wslCommandName+" -l -v"] = utf16LE("  NAME       STATE      VERSION\n  cairn-dev  Running    2\n")
+	runner.outputs[wslCommandName+" -d cairn-dev -- sh -lc cat /etc/os-release"] = "ID=ubuntu\nID_LIKE=debian\n"
+	runner.outputs[wslCommandName+" -d cairn-dev -- test -d /run/systemd/system"] = ""
+	runner.outputs[wslCommandName+" -d cairn-dev -- sh -lc readlink -f /usr/bin/docker 2>/dev/null || true"] = "/usr/bin/docker\n"
+	runner.outputs[wslCommandName+" -d cairn-dev -- sh -lc command -v docker >/dev/null 2>&1"] = "/usr/bin/docker\n"
+	runner.outputs[wslCommandName+" -d cairn-dev -- docker context show"] = "default\n"
+	runner.outputs[wslCommandName+" -d cairn-dev -- docker compose version --short"] = "v2.29.1\n"
+	runner.outputs[wslCommandName+" -d cairn-dev -- docker buildx version"] = "github.com/docker/buildx v0.16.2 123456\n"
+	runner.outputs[wslCommandName+" -d cairn-dev -- docker info --format {{.ServerVersion}}"] = "27.1.2\n"
+
+	status, err := NewWindowsWSL(WindowsWSLOptions{Distro: "cairn-dev", Runner: runner}).Detect(context.Background())
+	if err != nil {
+		t.Fatalf("Detect() error = %v", err)
+	}
+	if !status.Healthy {
+		t.Fatalf("Healthy = false, problems = %#v", status.Problems)
+	}
+	if !status.DockerInstalled || !status.ComposeInstalled || !status.BuildxInstalled || !status.DockerRunning {
+		t.Fatalf("status missing installed/running flags: %#v", status)
+	}
+	if status.DockerVersion != "27.1.2" || status.ComposeVersion != "2.29.1" || status.BackendVersion != "0.16.2" {
+		t.Fatalf("versions = docker %q compose %q backend %q", status.DockerVersion, status.ComposeVersion, status.BackendVersion)
+	}
+}
+
+func TestWindowsWSLDetectProblemCases(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		configure func(*fakeRunner)
+		want      string
+	}{
+		{
+			name:      "missing wsl",
+			configure: func(*fakeRunner) {},
+			want:      ProblemWSLMissing,
+		},
+		{
+			name: "no distro",
+			configure: func(r *fakeRunner) {
+				r.paths[wslCommandName] = `C:\Windows\System32\wsl.exe`
+				r.outputs[wslCommandName+" --status"] = "Default Version: 2\n"
+				r.outputs[wslCommandName+" -l -v"] = "  NAME              STATE      VERSION\n  docker-desktop    Running    2\n"
+			},
+			want: ProblemUbuntuMissing,
+		},
+		{
+			name: "wsl1 distro",
+			configure: func(r *fakeRunner) {
+				r.paths[wslCommandName] = `C:\Windows\System32\wsl.exe`
+				r.outputs[wslCommandName+" --status"] = "Default Version: 2\n"
+				r.outputs[wslCommandName+" -l -v"] = "  NAME      STATE      VERSION\n  Ubuntu    Running    1\n"
+			},
+			want: ProblemWSL2Required,
+		},
+		{
+			name: "systemd off",
+			configure: func(r *fakeRunner) {
+				seedWSLDetectThroughDockerProbe(r)
+				delete(r.outputs, wslCommandName+" -d Ubuntu -- test -d /run/systemd/system")
+				r.errors[wslCommandName+" -d Ubuntu -- test -d /run/systemd/system"] = errors.New("missing")
+			},
+			want: ProblemSystemdOff,
+		},
+		{
+			name: "desktop integration conflict",
+			configure: func(r *fakeRunner) {
+				seedWSLDetectThroughDockerProbe(r)
+				r.outputs[wslCommandName+" -d Ubuntu -- sh -lc readlink -f /usr/bin/docker 2>/dev/null || true"] = "/mnt/wsl/docker-desktop/cli-tools/usr/bin/docker\n"
+			},
+			want: ProblemDesktopIntegrationConflict,
+		},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			runner := newFakeRunner()
+			tt.configure(runner)
+			status, err := NewWindowsWSL(WindowsWSLOptions{Runner: runner}).Detect(context.Background())
+			if err != nil {
+				t.Fatalf("Detect() error = %v", err)
+			}
+			assertProblem(t, status.Problems, tt.want)
+		})
+	}
+}
+
+func TestWindowsWSLRunDockerComposeAndShellCommands(t *testing.T) {
+	t.Parallel()
+	runner := newFakeRunner()
+	runner.paths["pwsh"] = `C:\Program Files\PowerShell\7\pwsh.exe`
+	runner.outputs[wslCommandName+" -d cairn-dev -- docker ps -a"] = "CONTAINER ID\n"
+	runner.outputs[wslCommandName+" -d cairn-dev -- sh -lc cd '/mnt/c/Users/Ada/Project One' && exec docker 'compose' '-f' 'compose.yaml' 'config'"] = "services: {}\n"
+	provider := NewWindowsWSL(WindowsWSLOptions{Distro: "cairn-dev", Runner: runner})
+
+	result, err := provider.RunDocker(context.Background(), "ps", "-a")
+	if err != nil {
+		t.Fatalf("RunDocker() error = %v", err)
+	}
+	if got, want := result.Command, []string{wslCommandName, "-d", "cairn-dev", "--", "docker", "ps", "-a"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("RunDocker command = %#v, want %#v", got, want)
+	}
+
+	result, err = provider.RunCompose(context.Background(), `C:\Users\Ada\Project One`, "-f", "compose.yaml", "config")
+	if err != nil {
+		t.Fatalf("RunCompose() error = %v", err)
+	}
+	if result.Workdir != "/mnt/c/Users/Ada/Project One" {
+		t.Fatalf("RunCompose workdir = %q", result.Workdir)
+	}
+
+	hostShell, err := provider.HostShellCommand(models.TerminalOptions{})
+	if err != nil {
+		t.Fatalf("HostShellCommand() error = %v", err)
+	}
+	if got, want := hostShell, []string{"pwsh"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("HostShellCommand() = %#v, want %#v", got, want)
+	}
+	backendShell, err := provider.BackendShellCommand(models.TerminalOptions{Shell: "/bin/zsh"})
+	if err != nil {
+		t.Fatalf("BackendShellCommand() error = %v", err)
+	}
+	if got, want := backendShell, []string{wslCommandName, "-d", "cairn-dev", "--", "/bin/zsh"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("BackendShellCommand() = %#v, want %#v", got, want)
+	}
+}
+
+func TestWindowsWSLPathMapping(t *testing.T) {
+	t.Parallel()
+	provider := NewWindowsWSL(WindowsWSLOptions{Distro: "cairn-dev", Runner: newFakeRunner()})
+	unicodeUser := "\u0420\u043e\u043c\u0430\u043d"
+	unicodeHostPath := `C:\Users\` + unicodeUser + `\Projects`
+	unicodeBackendPath := "/mnt/c/Users/" + unicodeUser + "/Projects"
+
+	toBackend := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "drive-root-backslash", in: `C:\`, want: "/mnt/c"},
+		{name: "drive-root-slash", in: "C:/", want: "/mnt/c"},
+		{name: "drive-folder", in: `C:\Users\Ada\Project`, want: "/mnt/c/Users/Ada/Project"},
+		{name: "drive-lowercase", in: `d:\src\Cairn`, want: "/mnt/d/src/Cairn"},
+		{name: "drive-spaces", in: `C:\Users\Ada Lovelace\Project One`, want: "/mnt/c/Users/Ada Lovelace/Project One"},
+		{name: "drive-unicode", in: unicodeHostPath, want: unicodeBackendPath},
+		{name: "mixed-separators", in: `E:/Development\projects/Cairn`, want: "/mnt/e/Development/projects/Cairn"},
+		{name: "file-path", in: `C:\Users\Ada\compose.yaml`, want: "/mnt/c/Users/Ada/compose.yaml"},
+		{name: "wsl-unc", in: `\\wsl$\cairn-dev\home\ada\project`, want: "/home/ada/project"},
+		{name: "wsl-localhost-unc", in: `\\wsl.localhost\cairn-dev\home\ada\project one`, want: "/home/ada/project one"},
+		{name: "wsl-unc-root", in: `\\wsl$\cairn-dev`, want: "/"},
+		{name: "already-backend", in: "/home/ada/project", want: "/home/ada/project"},
+		{name: "already-mnt", in: "/mnt/c/Users/Ada/project", want: "/mnt/c/Users/Ada/project"},
+	}
+	for _, tt := range toBackend {
+		got, err := provider.MapPathToBackend(tt.in)
+		if err != nil {
+			t.Fatalf("%s MapPathToBackend() error = %v", tt.name, err)
+		}
+		if got != tt.want {
+			t.Fatalf("%s MapPathToBackend() = %q, want %q", tt.name, got, tt.want)
+		}
+	}
+
+	toHost := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "mnt-root", in: "/mnt/c", want: `C:\`},
+		{name: "mnt-folder", in: "/mnt/c/Users/Ada/Project", want: `C:\Users\Ada\Project`},
+		{name: "mnt-lower-drive", in: "/mnt/d/src/Cairn", want: `D:\src\Cairn`},
+		{name: "mnt-spaces", in: "/mnt/c/Users/Ada Lovelace/Project One", want: `C:\Users\Ada Lovelace\Project One`},
+		{name: "mnt-unicode", in: unicodeBackendPath, want: unicodeHostPath},
+		{name: "backend-home", in: "/home/ada/project", want: `\\wsl$\cairn-dev\home\ada\project`},
+		{name: "backend-root", in: "/", want: `\\wsl$\cairn-dev`},
+		{name: "already-drive", in: `C:\Users\Ada`, want: `C:\Users\Ada`},
+		{name: "already-unc", in: `\\wsl$\cairn-dev\home\ada`, want: `\\wsl$\cairn-dev\home\ada`},
+		{name: "file-path", in: "/mnt/c/Users/Ada/compose.yaml", want: `C:\Users\Ada\compose.yaml`},
+	}
+	for _, tt := range toHost {
+		got, err := provider.MapPathToHost(tt.in)
+		if err != nil {
+			t.Fatalf("%s MapPathToHost() error = %v", tt.name, err)
+		}
+		if got != tt.want {
+			t.Fatalf("%s MapPathToHost() = %q, want %q", tt.name, got, tt.want)
+		}
+	}
+
+	if _, err := provider.MapPathToBackend(`relative\path`); err == nil {
+		t.Fatalf("MapPathToBackend(relative) error = nil, want error")
+	}
+	if _, err := provider.MapPathToBackend(`\\wsl$\other\home\ada`); err == nil {
+		t.Fatalf("MapPathToBackend(other distro) error = nil, want error")
+	}
+}
+
+func seedWSLDetectThroughDockerProbe(runner *fakeRunner) {
+	runner.paths[wslCommandName] = `C:\Windows\System32\wsl.exe`
+	runner.outputs[wslCommandName+" --status"] = "Default Version: 2\n"
+	runner.outputs[wslCommandName+" -l -v"] = "  NAME      STATE      VERSION\n  Ubuntu    Running    2\n"
+	runner.outputs[wslCommandName+" -d Ubuntu -- sh -lc cat /etc/os-release"] = "ID=ubuntu\n"
+	runner.outputs[wslCommandName+" -d Ubuntu -- test -d /run/systemd/system"] = ""
+	runner.outputs[wslCommandName+" -d Ubuntu -- sh -lc readlink -f /usr/bin/docker 2>/dev/null || true"] = "/usr/bin/docker\n"
+}
+
+func utf16LE(value string) string {
+	units := utf16.Encode([]rune(value))
+	raw := make([]byte, 2+len(units)*2)
+	raw[0] = 0xff
+	raw[1] = 0xfe
+	for i, unit := range units {
+		binary.LittleEndian.PutUint16(raw[2+i*2:], unit)
+	}
+	return string(raw)
+}
