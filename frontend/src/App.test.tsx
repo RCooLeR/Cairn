@@ -869,6 +869,34 @@ describe('App inventory shell', () => {
     );
   });
 
+  it('warns when importing a project from a WSL mount path', async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValue([]);
+
+    render(<App />);
+
+    await screen.findByText('Docker Engine - Running');
+    fireEvent.click(
+      within(
+        screen.getByRole('navigation', { name: 'Main navigation' }),
+      ).getByRole('button', {
+        name: /Projects/,
+      }),
+    );
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Import Project' }),
+    );
+    fireEvent.change(await screen.findByLabelText('Folder'), {
+      target: { value: '/mnt/c/Users/Ada/path-heavy-project' },
+    });
+
+    expect(
+      screen.getByText(
+        'WSL mount paths may be slower than files stored inside the distro.',
+      ),
+    ).toBeInTheDocument();
+  });
+
   it('runs safe container actions directly and refreshes inventory', async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
 

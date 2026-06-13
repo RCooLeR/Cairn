@@ -53,6 +53,19 @@ Current evidence: unit tests cover the generated WSL install command plan, custo
 - [ ] Clean Win11 VM failure injection: systemd cannot start after `/etc/wsl.conf` update -> `SYSTEMD_OFF`/service-start guidance is shown.
 - [ ] Clean Win11 VM failure injection: no initialized non-root Ubuntu user -> docker-group step fails with a repair hint to finish first-run user setup.
 
+## Phase 5.3 Windows WSL Docker Connection
+
+Current evidence: `internal/docker.Client` now accepts provider-supplied Docker SDK dialers, and `WindowsWSLProvider` keeps the SDK host as `unix:///var/run/docker.sock` while routing the transport through `wsl.exe -d <distro> -- docker system dial-stdio`. If the Docker CLI lacks `dial-stdio`, the provider falls back to `wsl.exe -d <distro> -- socat UNIX-CONNECT:/var/run/docker.sock -`; if neither transport exists it returns `E_PROVIDER_NOT_READY` with repair hints. Local `CAIRN_REAL_WSL_DOCKER=1 go test ./internal/docker -run TestWindowsWSLDockerConnection -count=1 -v` passed against the dedicated `cairn-dev` distro, covering Connect/Ping/Info/Version/ListContainers through the WSL stdio path. A frontend test verifies that `/mnt/...` import paths show the performance warning.
+
+- [x] Verify the Docker SDK connection uses WSL stdio, not localhost TCP, npipe, Docker Desktop, or `desktop-linux`.
+- [x] Verify `docker system dial-stdio` is preferred when available.
+- [x] Verify `socat UNIX-CONNECT:/var/run/docker.sock -` is the fallback when `dial-stdio` is unavailable.
+- [x] Verify missing stdio transports return `E_PROVIDER_NOT_READY` with repair hints.
+- [x] Run the real local connection test against `cairn-dev`.
+- [x] Verify `/mnt/...` import paths show the WSL mount performance warning.
+- [ ] Clean Win11 VM: rerun the full Phase 1-3 Docker integration suite through the Windows WSL provider.
+- [ ] Clean Win11 VM: import a path-heavy Compose project under `/mnt/c` and verify the warning appears in the running desktop app.
+
 ## Full Platform Matrix TODO
 
 - [ ] Windows 11 x64: WSL present/absent, Ubuntu present/absent/multiple, Docker in Ubuntu present/absent, systemd on/off.

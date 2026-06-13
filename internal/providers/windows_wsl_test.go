@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"net"
 	"reflect"
 	"strings"
 	"testing"
@@ -91,6 +92,9 @@ func TestWindowsWSLDetectHealthyCustomDistro(t *testing.T) {
 	}
 	if status.DockerVersion != "27.1.2" || status.ComposeVersion != "2.29.1" || status.BackendVersion != "0.16.2" {
 		t.Fatalf("versions = docker %q compose %q backend %q", status.DockerVersion, status.ComposeVersion, status.BackendVersion)
+	}
+	if status.DockerHost != "wsl+stdio://cairn-dev" {
+		t.Fatalf("DockerHost = %q, want WSL stdio host marker", status.DockerHost)
 	}
 }
 
@@ -195,6 +199,83 @@ func TestWindowsWSLRunDockerComposeAndShellCommands(t *testing.T) {
 	}
 	if got, want := backendShell, []string{wslCommandName, "-d", "cairn-dev", "--", "/bin/zsh"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("BackendShellCommand() = %#v, want %#v", got, want)
+	}
+}
+
+func TestWindowsWSLDockerDialerUsesDockerDialStdio(t *testing.T) {
+	t.Parallel()
+	runner := newFakeRunner()
+	runner.outputs[wslCommandName+" -d cairn-dev -- docker system dial-stdio --help"] = "Usage: docker system dial-stdio\n"
+	var captured []string
+	provider := NewWindowsWSL(WindowsWSLOptions{
+		Distro: "cairn-dev",
+		Runner: runner,
+		StdioDialer: func(_ context.Context, command []string) (net.Conn, error) {
+			captured = append([]string(nil), command...)
+			client, server := net.Pipe()
+			_ = server.Close()
+			return client, nil
+		},
+	})
+
+	host, err := provider.DockerHost(context.Background())
+	if err != nil {
+		t.Fatalf("DockerHost() error = %v", err)
+	}
+	if host != "unix:///var/run/docker.sock" {
+		t.Fatalf("DockerHost() = %q, want SDK unix host", host)
+	}
+	dialContext, err := provider.DockerDialContext(context.Background())
+	if err != nil {
+		t.Fatalf("DockerDialContext() error = %v", err)
+	}
+	conn, err := dialContext(context.Background(), "unix", "/var/run/docker.sock")
+	if err != nil {
+		t.Fatalf("dialContext() error = %v", err)
+	}
+	_ = conn.Close()
+	if got, want := captured, []string{wslCommandName, "-d", "cairn-dev", "--", "docker", "system", "dial-stdio"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("stdio command = %#v, want %#v", got, want)
+	}
+}
+
+func TestWindowsWSLDockerDialerFallsBackToSocat(t *testing.T) {
+	t.Parallel()
+	runner := newFakeRunner()
+	runner.outputs[wslCommandName+" -d cairn-dev -- sh -lc command -v socat >/dev/null 2>&1"] = ""
+	var captured []string
+	provider := NewWindowsWSL(WindowsWSLOptions{
+		Distro: "cairn-dev",
+		Runner: runner,
+		StdioDialer: func(_ context.Context, command []string) (net.Conn, error) {
+			captured = append([]string(nil), command...)
+			client, server := net.Pipe()
+			_ = server.Close()
+			return client, nil
+		},
+	})
+
+	dialContext, err := provider.DockerDialContext(context.Background())
+	if err != nil {
+		t.Fatalf("DockerDialContext() error = %v", err)
+	}
+	conn, err := dialContext(context.Background(), "unix", "/var/run/docker.sock")
+	if err != nil {
+		t.Fatalf("dialContext() error = %v", err)
+	}
+	_ = conn.Close()
+	if got, want := captured, []string{wslCommandName, "-d", "cairn-dev", "--", "socat", "UNIX-CONNECT:/var/run/docker.sock", "-"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("stdio command = %#v, want %#v", got, want)
+	}
+}
+
+func TestWindowsWSLDockerDialerRequiresAvailableTransport(t *testing.T) {
+	t.Parallel()
+	provider := NewWindowsWSL(WindowsWSLOptions{Distro: "cairn-dev", Runner: newFakeRunner()})
+
+	_, err := provider.DockerDialContext(context.Background())
+	if !apperror.IsCode(err, apperror.ProviderNotReady) {
+		t.Fatalf("DockerDialContext() error = %v, want E_PROVIDER_NOT_READY", err)
 	}
 }
 

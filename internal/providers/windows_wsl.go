@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net"
 	"regexp"
 	"strconv"
 	"strings"
@@ -30,16 +31,20 @@ const (
 var windowsDrivePathPattern = regexp.MustCompile(`^[A-Za-z]:[\\/]?`)
 
 type WindowsWSLOptions struct {
-	Distro string
-	Runner CommandRunner
+	Distro      string
+	Runner      CommandRunner
+	StdioDialer WSLStdioDialer
 }
 
 type WindowsWSLProvider struct {
 	distro       string
 	runner       CommandRunner
+	stdioDialer  WSLStdioDialer
 	installMu    sync.Mutex
 	installPlans map[string]wslInstallPlan
 }
+
+type WSLStdioDialer func(context.Context, []string) (net.Conn, error)
 
 type wslDistro struct {
 	Name    string
@@ -64,9 +69,14 @@ func NewWindowsWSL(opts WindowsWSLOptions) *WindowsWSLProvider {
 	if runner == nil {
 		runner = ExecRunner{}
 	}
+	stdioDialer := opts.StdioDialer
+	if stdioDialer == nil {
+		stdioDialer = dialCommandStdio
+	}
 	return &WindowsWSLProvider{
 		distro:       strings.TrimSpace(opts.Distro),
 		runner:       runner,
+		stdioDialer:  stdioDialer,
 		installPlans: map[string]wslInstallPlan{},
 	}
 }
@@ -209,6 +219,7 @@ func (p *WindowsWSLProvider) Detect(ctx context.Context) (*models.ProviderStatus
 	if dockerVersion, ok := p.runWSLText(ctx, selected.Name, "docker", "info", "--format", "{{.ServerVersion}}"); ok {
 		status.DockerRunning = true
 		status.DockerVersion = normalizeDockerVersion(dockerVersion)
+		status.DockerHost = "wsl+stdio://" + selected.Name
 	} else {
 		status.Problems = append(status.Problems, providerProblem(
 			ProblemDockerDown,
@@ -313,7 +324,17 @@ func (p *WindowsWSLProvider) Restart(ctx context.Context) error {
 }
 
 func (p *WindowsWSLProvider) DockerHost(context.Context) (string, error) {
-	return "", apperror.New(apperror.ProviderNotReady, "WSL Docker API transport lands in Phase 5.3")
+	return "unix:///var/run/docker.sock", nil
+}
+
+func (p *WindowsWSLProvider) DockerDialContext(ctx context.Context) (func(context.Context, string, string) (net.Conn, error), error) {
+	command, err := p.dockerDialCommand(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return p.stdioDialer(ctx, command)
+	}, nil
 }
 
 func (p *WindowsWSLProvider) DockerContext(ctx context.Context) (string, error) {
@@ -452,6 +473,24 @@ func (p *WindowsWSLProvider) runWSLText(ctx context.Context, distro string, args
 func (p *WindowsWSLProvider) runWSL(ctx context.Context, distro string, args ...string) (*CommandResult, error) {
 	wslArgs := append([]string{"-d", distro, "--"}, args...)
 	return p.runner.Run(ctx, wslCommandTimeout, wslCommandName, wslArgs...)
+}
+
+func (p *WindowsWSLProvider) dockerDialCommand(ctx context.Context) ([]string, error) {
+	distro := p.configuredDistro()
+	if p.runWSLOK(ctx, distro, "docker", "system", "dial-stdio", "--help") {
+		return []string{wslCommandName, "-d", distro, "--", "docker", "system", "dial-stdio"}, nil
+	}
+	if p.runWSLOK(ctx, distro, "sh", "-lc", "command -v socat >/dev/null 2>&1") {
+		return []string{wslCommandName, "-d", distro, "--", "socat", "UNIX-CONNECT:/var/run/docker.sock", "-"}, nil
+	}
+	return nil, apperror.New(
+		apperror.ProviderNotReady,
+		"WSL Docker API transport is not available",
+		apperror.WithRepairHints(
+			"Install or upgrade the Docker CLI inside the selected WSL distro.",
+			"Install socat inside the selected WSL distro if docker system dial-stdio is unavailable.",
+		),
+	)
 }
 
 func (p *WindowsWSLProvider) mapWSLUNCToBackend(value string) (string, bool) {
@@ -669,6 +708,7 @@ func buildWSLInstallStepsFor(distro string, distribution string) []wslInstallSte
 		`echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" > /etc/apt/sources.list.d/docker.list`,
 		"apt-get update",
 		"apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin",
+		"if ! docker system dial-stdio --help >/dev/null 2>&1; then apt-get install -y socat; fi",
 	}, " && ")
 	groupCommand := `user="$(getent passwd 1000 | cut -d: -f1)"; if [ -z "$user" ]; then echo "No non-root WSL user was found for docker group membership." >&2; exit 1; fi; usermod -aG docker "$user"`
 	verifyCommand := strings.Join([]string{

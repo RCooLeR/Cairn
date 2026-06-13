@@ -131,6 +131,31 @@ func TestClientConnectAndDTOs(t *testing.T) {
 	}
 }
 
+func TestClientConnectUsesProviderDialer(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	var gotHost string
+	var gotDialer bool
+	client := New(fakeDialerProvider{
+		host: "unix:///var/run/docker.sock",
+		dialer: func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("dialer should be passed to SDK factory, not called by fake API")
+		},
+	}, nil)
+	client.factoryWithDialer = func(host string, dialer func(context.Context, string, string) (net.Conn, error)) (APIClient, error) {
+		gotHost = host
+		gotDialer = dialer != nil
+		return api, nil
+	}
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	if gotHost != "unix:///var/run/docker.sock" || !gotDialer {
+		t.Fatalf("factory host=%q dialer=%t", gotHost, gotDialer)
+	}
+}
+
 func TestClientContainerStatsUsesStreamAndOneShot(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -1490,6 +1515,27 @@ func (fakeDockerProvider) DockerHost(context.Context) (string, error) {
 
 func (fakeDockerProvider) DockerContext(context.Context) (string, error) {
 	return "default", nil
+}
+
+type fakeDialerProvider struct {
+	host   string
+	dialer func(context.Context, string, string) (net.Conn, error)
+}
+
+func (p fakeDialerProvider) ID() string {
+	return "windows_wsl_ubuntu"
+}
+
+func (p fakeDialerProvider) DockerHost(context.Context) (string, error) {
+	return p.host, nil
+}
+
+func (p fakeDialerProvider) DockerContext(context.Context) (string, error) {
+	return "default", nil
+}
+
+func (p fakeDialerProvider) DockerDialContext(context.Context) (func(context.Context, string, string) (net.Conn, error), error) {
+	return p.dialer, nil
 }
 
 type fakeAPI struct {

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"strconv"
 	"strings"
 	"sync"
@@ -41,6 +42,10 @@ type Provider interface {
 	ID() string
 	DockerHost(context.Context) (string, error)
 	DockerContext(context.Context) (string, error)
+}
+
+type DialerProvider interface {
+	DockerDialContext(context.Context) (func(context.Context, string, string) (net.Conn, error), error)
 }
 
 type APIClient interface {
@@ -96,11 +101,12 @@ type ObjectsChangedPayload struct {
 }
 
 type Client struct {
-	provider Provider
-	bus      bus.Bus
-	cache    *store.ObjectCacheRepository
-	now      func() time.Time
-	factory  func(string) (APIClient, error)
+	provider          Provider
+	bus               bus.Bus
+	cache             *store.ObjectCacheRepository
+	now               func() time.Time
+	factory           func(string) (APIClient, error)
+	factoryWithDialer func(string, func(context.Context, string, string) (net.Conn, error)) (APIClient, error)
 
 	mu             sync.RWMutex
 	api            APIClient
@@ -118,16 +124,17 @@ type Client struct {
 
 func New(provider Provider, eventBus bus.Bus) *Client {
 	return &Client{
-		provider:       provider,
-		bus:            eventBus,
-		now:            func() time.Time { return time.Now().UTC() },
-		factory:        newSDKClient,
-		unaryTimeout:   defaultTimeout,
-		pingInterval:   defaultPingEvery,
-		reconcileEvery: defaultReconcileEvery,
-		eventBatch:     defaultEventBatchWindow,
-		backoffMin:     defaultBackoffMin,
-		backoffMax:     defaultBackoffMax,
+		provider:          provider,
+		bus:               eventBus,
+		now:               func() time.Time { return time.Now().UTC() },
+		factory:           newSDKClient,
+		factoryWithDialer: newSDKClientWithDialer,
+		unaryTimeout:      defaultTimeout,
+		pingInterval:      defaultPingEvery,
+		reconcileEvery:    defaultReconcileEvery,
+		eventBatch:        defaultEventBatchWindow,
+		backoffMin:        defaultBackoffMin,
+		backoffMax:        defaultBackoffMax,
 	}
 }
 
@@ -142,9 +149,16 @@ func (c *Client) Connect(ctx context.Context) error {
 	if err != nil {
 		return mapDockerError("resolve Docker host", err)
 	}
+	var dialContext func(context.Context, string, string) (net.Conn, error)
+	if provider, ok := c.provider.(DialerProvider); ok {
+		dialContext, err = provider.DockerDialContext(ctx)
+		if err != nil {
+			return mapDockerError("resolve Docker dialer", err)
+		}
+	}
 	contextName, _ := c.provider.DockerContext(ctx)
 
-	api, err := c.factory(host)
+	api, err := c.newAPIClient(host, dialContext)
 	if err != nil {
 		return mapDockerError("create Docker client", err)
 	}
@@ -339,10 +353,27 @@ func (c *Client) withTimeout(ctx context.Context) (context.Context, context.Canc
 }
 
 func newSDKClient(host string) (APIClient, error) {
-	return dockerclient.NewClientWithOpts(
+	return newSDKClientWithDialer(host, nil)
+}
+
+func newSDKClientWithDialer(host string, dialContext func(context.Context, string, string) (net.Conn, error)) (APIClient, error) {
+	opts := []dockerclient.Opt{
 		dockerclient.WithHost(host),
-		dockerclient.WithAPIVersionNegotiation(),
+	}
+	if dialContext != nil {
+		opts = append(opts, dockerclient.WithDialContext(dialContext))
+	}
+	opts = append(opts, dockerclient.WithAPIVersionNegotiation())
+	return dockerclient.NewClientWithOpts(
+		opts...,
 	)
+}
+
+func (c *Client) newAPIClient(host string, dialContext func(context.Context, string, string) (net.Conn, error)) (APIClient, error) {
+	if dialContext != nil && c.factoryWithDialer != nil {
+		return c.factoryWithDialer(host, dialContext)
+	}
+	return c.factory(host)
 }
 
 func mapDockerError(action string, err error) error {

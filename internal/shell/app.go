@@ -180,8 +180,11 @@ func Run(assets fs.FS) error {
 }
 
 func defaultProviderSet() []providers.PlatformProvider {
-	if runtime.GOOS == "linux" {
+	switch runtime.GOOS {
+	case "linux":
 		return []providers.PlatformProvider{providers.NewLinuxNative(providers.LinuxNativeOptions{})}
+	case "windows":
+		return []providers.PlatformProvider{providers.NewWindowsWSL(providers.WindowsWSLOptions{})}
 	}
 	return nil
 }
