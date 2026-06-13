@@ -15,6 +15,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/bus"
 	composecore "github.com/RCooLeR/Cairn/internal/compose"
+	"github.com/RCooLeR/Cairn/internal/logsvc"
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
 	"github.com/RCooLeR/Cairn/internal/security"
@@ -101,7 +102,9 @@ type ComposeService struct {
 	Projects *store.ProjectRepository
 }
 type MetricsService struct{}
-type LogsService struct{}
+type LogsService struct {
+	Manager *logsvc.Manager
+}
 type TerminalService struct{}
 type UpdateService struct{}
 type ImageLineageService struct{}
@@ -865,20 +868,32 @@ func (s *MetricsService) StopStream(_ context.Context, streamID string) error {
 	return notReady()
 }
 
-func (s *LogsService) StartLogStream(_ context.Context, req models.LogStreamRequest) (string, error) {
-	return "", notReady()
+func (s *LogsService) StartLogStream(ctx context.Context, req models.LogStreamRequest) (string, error) {
+	if s.Manager == nil {
+		return "", notReady()
+	}
+	return s.Manager.StartLogStream(ctx, req)
 }
 
 func (s *LogsService) StopStream(_ context.Context, streamID string) error {
-	return notReady()
+	if s.Manager == nil {
+		return notReady()
+	}
+	return s.Manager.StopStream(streamID)
 }
 
-func (s *LogsService) FetchLogPage(_ context.Context, req models.LogPageRequest) (*models.LogPage, error) {
-	return nil, notReady()
+func (s *LogsService) FetchLogPage(ctx context.Context, req models.LogPageRequest) (*models.LogPage, error) {
+	if s.Manager == nil {
+		return nil, notReady()
+	}
+	return s.Manager.FetchLogPage(ctx, req)
 }
 
-func (s *LogsService) ExportLogs(_ context.Context, req models.ExportLogsRequest) (*models.ExportResult, error) {
-	return nil, notReady()
+func (s *LogsService) ExportLogs(ctx context.Context, req models.ExportLogsRequest) (*models.ExportResult, error) {
+	if s.Manager == nil {
+		return nil, notReady()
+	}
+	return s.Manager.ExportLogs(ctx, req)
 }
 
 func (s *TerminalService) OpenHostTerminal(_ context.Context, opts models.TerminalOptions) (*models.TerminalSessionInfo, error) {

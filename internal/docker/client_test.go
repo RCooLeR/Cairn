@@ -1519,6 +1519,10 @@ func (a *fakeAPI) ContainerUnpause(_ context.Context, id string) error {
 	return nil
 }
 
+func (a *fakeAPI) ContainerLogs(context.Context, string, container.LogsOptions) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("")), nil
+}
+
 func (a *fakeAPI) ContainerCreate(_ context.Context, config *container.Config, hostConfig *container.HostConfig, networkingConfig *network.NetworkingConfig, _ *ocispec.Platform, name string) (container.CreateResponse, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()

@@ -9,6 +9,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/bus"
 	composecore "github.com/RCooLeR/Cairn/internal/compose"
 	dockercore "github.com/RCooLeR/Cairn/internal/docker"
+	"github.com/RCooLeR/Cairn/internal/logsvc"
 	"github.com/RCooLeR/Cairn/internal/providers"
 	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/services"
@@ -50,6 +51,7 @@ func Run(assets fs.FS) error {
 	var dockerClient *dockercore.Client
 	var composeClient *composecore.Client
 	var projectDetector *composecore.ProjectDetector
+	var logsManager *logsvc.Manager
 	if len(providerSet) > 0 {
 		dockerClient = dockercore.New(providerSet[0], eventBus)
 		dockerClient.SetObjectCache(db.Objects())
@@ -65,6 +67,7 @@ func Run(assets fs.FS) error {
 			Projects:    projectRepo,
 			Objects:     db.Objects(),
 		}
+		logsManager = logsvc.NewManager(dockerClient, eventBus, logsvc.Options{})
 	}
 
 	app := application.New(application.Options{
@@ -88,7 +91,7 @@ func Run(assets fs.FS) error {
 			}),
 			application.NewService(&services.ComposeService{Client: composeClient, Projects: projectRepo}),
 			application.NewService(&services.MetricsService{}),
-			application.NewService(&services.LogsService{}),
+			application.NewService(&services.LogsService{Manager: logsManager}),
 			application.NewService(&services.TerminalService{}),
 			application.NewService(&services.UpdateService{}),
 			application.NewService(&services.ImageLineageService{}),
@@ -98,6 +101,9 @@ func Run(assets fs.FS) error {
 		},
 		OnShutdown: func() {
 			cancel()
+			if logsManager != nil {
+				logsManager.StopAll()
+			}
 			if dockerClient != nil {
 				_ = dockerClient.Close()
 			}
@@ -142,6 +148,9 @@ func Run(assets fs.FS) error {
 		bus.TopicObjectsChanged,
 		bus.TopicProjectChanged,
 		bus.TopicImagePullProgress,
+		bus.TopicLogsLines,
+		bus.TopicLogsEOF,
+		bus.TopicLogsError,
 		bus.TopicJobProgress,
 		bus.TopicJobDone,
 	})
