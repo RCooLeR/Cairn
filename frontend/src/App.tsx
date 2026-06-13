@@ -13799,7 +13799,7 @@ function notificationTargetPage(topic: string): PageID | null {
     case "system":
       return "overview";
     case "update":
-      return "projects";
+      return "updates";
     default:
       return null;
   }

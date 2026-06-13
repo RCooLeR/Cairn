@@ -508,7 +508,24 @@ describe("App inventory shell", () => {
       await screen.findByRole("heading", { name: "Overview" }),
     ).toBeInTheDocument();
 
-    fireEvent.click(bell);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Notifications 1 unread" }),
+    );
+    const updateDialog = screen.getByRole("dialog", {
+      name: "Notification center",
+    });
+    fireEvent.click(
+      within(updateDialog).getByRole("button", {
+        name: /Update check complete/,
+      }),
+    );
+    expect(
+      await screen.findByRole("heading", { name: "Updates" }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Notifications 1 unread" }),
+    );
     fireEvent.click(
       await screen.findByRole("button", { name: "Mark all read" }),
     );

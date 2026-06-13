@@ -91,8 +91,22 @@ func TestManagerRealDockerStatsIntegration(t *testing.T) {
 	if math.Abs(samples[0].CPUPercent-cli.CPUPercent) > 10 {
 		t.Fatalf("CPU percent = %.2f, docker stats = %.2f", samples[0].CPUPercent, cli.CPUPercent)
 	}
-	if cli.MemoryBytes > 0 && relativeDiff(float64(samples[0].MemoryBytes), float64(cli.MemoryBytes)) > 0.20 {
+	if cli.MemoryBytes > 0 && !withinMemoryTolerance(samples[0].MemoryBytes, cli.MemoryBytes) {
 		t.Fatalf("memory bytes = %d, docker stats = %d", samples[0].MemoryBytes, cli.MemoryBytes)
+	}
+}
+
+func TestWithinMemoryToleranceAllowsSmallAccountingDrift(t *testing.T) {
+	t.Parallel()
+
+	if !withinMemoryTolerance(548864, 352256) {
+		t.Fatal("withinMemoryTolerance() rejected sub-MiB Docker accounting drift")
+	}
+	if !withinMemoryTolerance(120*1024*1024, 100*1024*1024) {
+		t.Fatal("withinMemoryTolerance() rejected 20% relative drift")
+	}
+	if withinMemoryTolerance(150*1024*1024, 100*1024*1024) {
+		t.Fatal("withinMemoryTolerance() accepted large memory drift")
 	}
 }
 
@@ -163,4 +177,13 @@ func relativeDiff(a float64, b float64) float64 {
 		return math.Abs(a)
 	}
 	return math.Abs(a-b) / b
+}
+
+func withinMemoryTolerance(sampleBytes int64, dockerBytes int64) bool {
+	const absoluteToleranceBytes = int64(2 * 1024 * 1024)
+	diff := math.Abs(float64(sampleBytes - dockerBytes))
+	if diff <= float64(absoluteToleranceBytes) {
+		return true
+	}
+	return relativeDiff(float64(sampleBytes), float64(dockerBytes)) <= 0.20
 }
