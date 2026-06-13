@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,8 +23,16 @@ type Manager struct {
 	order     []string
 	now       func() time.Time
 
-	mu       sync.RWMutex
-	activeID string
+	mu           sync.RWMutex
+	activeID     string
+	installPlans map[string]installPlanRecord
+}
+
+type installPlanRecord struct {
+	providerID string
+	steps      int
+	command    string
+	risk       models.Risk
 }
 
 func NewManager(repo *store.ProviderRepository, settings *store.SettingsRepository, providerSet []PlatformProvider) *Manager {
@@ -37,11 +46,12 @@ func NewManager(repo *store.ProviderRepository, settings *store.SettingsReposito
 		order = append(order, provider.ID())
 	}
 	return &Manager{
-		repo:      repo,
-		settings:  settings,
-		providers: providersByID,
-		order:     order,
-		now:       func() time.Time { return time.Now().UTC() },
+		repo:         repo,
+		settings:     settings,
+		providers:    providersByID,
+		order:        order,
+		now:          func() time.Time { return time.Now().UTC() },
+		installPlans: map[string]installPlanRecord{},
 	}
 }
 
@@ -192,7 +202,56 @@ func (m *Manager) PlanInstall(ctx context.Context, providerID string, opts model
 	if !ok {
 		return nil, apperror.New(apperror.NotFound, "Provider was not found")
 	}
-	return provider.PlanInstall(ctx, opts)
+	plan, err := provider.PlanInstall(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	if plan != nil {
+		m.mu.Lock()
+		m.installPlans[plan.PlanID] = installPlanRecord{
+			providerID: providerID,
+			steps:      len(plan.Commands),
+			command:    plannedCommandText(plan),
+			risk:       plan.Risk,
+		}
+		m.mu.Unlock()
+	}
+	return plan, nil
+}
+
+func (m *Manager) InstallPlanAuditContext(planID string) (string, string, models.Risk) {
+	m.mu.RLock()
+	record, ok := m.installPlans[planID]
+	m.mu.RUnlock()
+	if !ok {
+		return "", "", ""
+	}
+	return record.providerID, record.command, record.risk
+}
+
+func (m *Manager) ApplyInstall(ctx context.Context, planID string, progress chan<- InstallProgress) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	record, ok := m.installPlans[planID]
+	if ok {
+		delete(m.installPlans, planID)
+	}
+	m.mu.Unlock()
+	if !ok {
+		return apperror.New(apperror.PlanExpired, "Install plan expired or was not found")
+	}
+	provider, ok := m.providers[record.providerID]
+	if !ok {
+		return apperror.New(apperror.NotFound, "Provider was not found")
+	}
+	for step := range record.steps {
+		if err := provider.ExecuteInstallStep(ctx, planID, step, progress); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (m *Manager) Start(ctx context.Context, providerID string) error {
@@ -266,4 +325,15 @@ func (m *Manager) setActiveBestEffort(ctx context.Context, providerID string) {
 	m.mu.Lock()
 	m.activeID = providerID
 	m.mu.Unlock()
+}
+
+func plannedCommandText(plan *models.CommandPlan) string {
+	if plan == nil {
+		return ""
+	}
+	commands := make([]string, 0, len(plan.Commands))
+	for _, command := range plan.Commands {
+		commands = append(commands, command.Command)
+	}
+	return strings.Join(commands, "\n")
 }

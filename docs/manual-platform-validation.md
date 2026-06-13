@@ -37,6 +37,22 @@ Current evidence: parser/unit tests cover UTF-16LE `wsl.exe -l -v` output, Docke
 - [ ] Clean Win11 VM: selected Ubuntu has Docker missing and reports `DOCKER_MISSING`.
 - [ ] Clean Win11 VM: Docker Desktop WSL integration enabled for selected distro and reports `DESKTOP_INTEGRATION_CONFLICT`.
 
+## Phase 5.2 Windows WSL Install Flow
+
+Current evidence: unit tests cover the generated WSL install command plan, custom distro naming with `--name cairn-dev`, step execution progress, `provider:install:progress` final `totalSteps`, provider-install audit logging, plan expiry after completion, and a simulated Docker apt/network failure returning `E_PROVIDER_NOT_READY` with repair hints. Local `cairn-dev` is already installed, so the destructive clean-machine installer was not run here. The non-destructive final verification was run inside `cairn-dev`: systemd present, Docker Engine 29.5.3, Compose 5.1.4, Buildx 0.34.1, and `docker run --rm hello-world` succeeded; the throwaway `hello-world:latest` image was removed afterward.
+
+- [x] Validate final Docker/Compose/Buildx/hello-world verification inside the local `cairn-dev` WSL distro.
+- [x] Verify the install plan uses the official Docker apt repository packages: `docker-ce`, `docker-ce-cli`, `containerd.io`, `docker-buildx-plugin`, and `docker-compose-plugin`.
+- [x] Verify the install plan runs privileged Ubuntu setup through WSL root execution and handles docker-group membership with an explicit WSL distro restart.
+- [x] Verify simulated no-network/apt failure returns `E_PROVIDER_NOT_READY` with repair hints.
+- [ ] Clean Win11 VM: WSL absent -> install plan enables WSL and gives reboot/resume guidance if Windows requires a restart.
+- [ ] Clean Win11 VM: WSL present, Ubuntu absent -> install plan installs Ubuntu and reaches a working Docker daemon.
+- [ ] Clean Win11 VM: custom distro name -> install plan uses a valid Ubuntu distribution source plus `--name <custom>`.
+- [ ] Clean Win11 VM: clean Ubuntu initialized, Docker absent -> install plan adds Docker apt repo, installs packages, enables systemd/service, adds docker group, restarts WSL, and verifies `hello-world`.
+- [ ] Clean Win11 VM failure injection: no network during apt/GPG/repository setup -> failed step shows output and repair hints.
+- [ ] Clean Win11 VM failure injection: systemd cannot start after `/etc/wsl.conf` update -> `SYSTEMD_OFF`/service-start guidance is shown.
+- [ ] Clean Win11 VM failure injection: no initialized non-root Ubuntu user -> docker-group step fails with a repair hint to finish first-run user setup.
+
 ## Full Platform Matrix TODO
 
 - [ ] Windows 11 x64: WSL present/absent, Ubuntu present/absent/multiple, Docker in Ubuntu present/absent, systemd on/off.

@@ -45,9 +45,10 @@ type CommandResult struct {
 }
 
 type InstallProgress struct {
-	Step    int
-	Message string
-	Done    bool
+	Step       int
+	TotalSteps int
+	Message    string
+	Done       bool
 }
 
 type PlatformProvider interface {

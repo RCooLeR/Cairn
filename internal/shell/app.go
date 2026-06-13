@@ -83,7 +83,7 @@ func Run(assets fs.FS) error {
 		Icon:         icon,
 		MarshalError: apperror.Marshal,
 		Services: []application.Service{
-			application.NewService(&services.ProviderService{Manager: providerManager}),
+			application.NewService(&services.ProviderService{Manager: providerManager, Events: eventBus, Audit: auditRepo}),
 			application.NewService(&services.DockerService{Client: dockerClient, Audit: auditRepo, Plans: containerPlans}),
 			application.NewService(&services.ProjectService{
 				Detector:    projectDetector,
@@ -164,6 +164,7 @@ func Run(assets fs.FS) error {
 		bus.TopicDockerDisconnected,
 		bus.TopicObjectsChanged,
 		bus.TopicProjectChanged,
+		bus.TopicProviderInstallProgress,
 		bus.TopicImagePullProgress,
 		bus.TopicLogsLines,
 		bus.TopicLogsEOF,

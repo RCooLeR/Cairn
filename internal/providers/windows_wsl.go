@@ -8,11 +8,14 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 	"unicode/utf16"
 	"unicode/utf8"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/security"
 )
 
 const (
@@ -21,6 +24,7 @@ const (
 	defaultWSLDistro      = "Ubuntu"
 	wslCommandName        = "wsl.exe"
 	wslCommandTimeout     = 10 * commandTimeout
+	wslInstallTimeout     = 15 * time.Minute
 )
 
 var windowsDrivePathPattern = regexp.MustCompile(`^[A-Za-z]:[\\/]?`)
@@ -31,8 +35,10 @@ type WindowsWSLOptions struct {
 }
 
 type WindowsWSLProvider struct {
-	distro string
-	runner CommandRunner
+	distro       string
+	runner       CommandRunner
+	installMu    sync.Mutex
+	installPlans map[string]wslInstallPlan
 }
 
 type wslDistro struct {
@@ -42,14 +48,26 @@ type wslDistro struct {
 	Default bool
 }
 
+type wslInstallPlan struct {
+	Steps []wslInstallStep
+}
+
+type wslInstallStep struct {
+	Message     string
+	Timeout     time.Duration
+	Command     []string
+	RepairHints []string
+}
+
 func NewWindowsWSL(opts WindowsWSLOptions) *WindowsWSLProvider {
 	runner := opts.Runner
 	if runner == nil {
 		runner = ExecRunner{}
 	}
 	return &WindowsWSLProvider{
-		distro: strings.TrimSpace(opts.Distro),
-		runner: runner,
+		distro:       strings.TrimSpace(opts.Distro),
+		runner:       runner,
+		installPlans: map[string]wslInstallPlan{},
 	}
 }
 
@@ -206,12 +224,77 @@ func (p *WindowsWSLProvider) Detect(ctx context.Context) (*models.ProviderStatus
 	return status, nil
 }
 
-func (p *WindowsWSLProvider) PlanInstall(context.Context, models.InstallOptions) (*models.CommandPlan, error) {
-	return nil, apperror.New(apperror.ProviderNotReady, "WSL install plans land in Phase 5.2")
+func (p *WindowsWSLProvider) PlanInstall(_ context.Context, opts models.InstallOptions) (*models.CommandPlan, error) {
+	distro := strings.TrimSpace(opts.Extra["distro"])
+	if distro == "" {
+		distro = p.configuredDistro()
+	}
+	distribution := strings.TrimSpace(opts.Extra["distribution"])
+	if distribution == "" {
+		distribution = defaultWSLDistro
+	}
+	steps := buildWSLInstallStepsFor(distro, distribution)
+	planID := security.NewPlanID()
+	commands := make([]models.PlannedCommand, 0, len(steps))
+	for index, step := range steps {
+		commands = append(commands, models.PlannedCommand{
+			Order:       index + 1,
+			Command:     displayCommand(step.Command),
+			Risk:        models.RiskNeedsConfirmation,
+			Explanation: step.Message,
+		})
+	}
+	plan := &models.CommandPlan{
+		PlanID:   planID,
+		Title:    "Install Docker Engine in Ubuntu on WSL",
+		Risk:     models.RiskNeedsConfirmation,
+		Commands: commands,
+		Effects: []string{
+			"Enable or verify WSL and the selected Ubuntu distro.",
+			"Enable systemd in the selected distro and restart WSL if needed.",
+			"Install Docker Engine, containerd, Compose, and Buildx from Docker's official apt repository.",
+			"Add the WSL user to the docker group; a WSL restart may be required before group membership applies.",
+			"Enable and start the Docker service, then verify Docker, Compose, Buildx, and hello-world.",
+		},
+		ExpiresAt: time.Now().UTC().Add(security.DefaultPlanTTL),
+	}
+	p.installMu.Lock()
+	p.installPlans[planID] = wslInstallPlan{Steps: steps}
+	p.installMu.Unlock()
+	return plan, nil
 }
 
-func (p *WindowsWSLProvider) ExecuteInstallStep(context.Context, string, int, chan<- InstallProgress) error {
-	return apperror.New(apperror.ProviderNotReady, "WSL install execution lands in Phase 5.2")
+func (p *WindowsWSLProvider) ExecuteInstallStep(ctx context.Context, planID string, step int, progress chan<- InstallProgress) error {
+	p.installMu.Lock()
+	plan, ok := p.installPlans[planID]
+	p.installMu.Unlock()
+	if !ok || step < 0 || step >= len(plan.Steps) {
+		return apperror.New(apperror.PlanExpired, "Install plan expired or was not found")
+	}
+	installStep := plan.Steps[step]
+	sendInstallProgress(progress, step+1, len(plan.Steps), "Running: "+installStep.Message, false)
+	result, err := p.runner.Run(ctx, installStep.Timeout, installStep.Command[0], installStep.Command[1:]...)
+	if err != nil || result == nil || result.ExitCode != 0 {
+		detail := ""
+		if result != nil {
+			detail = strings.TrimSpace(result.Stderr)
+			if detail == "" {
+				detail = strings.TrimSpace(result.Stdout)
+			}
+		}
+		opts := []apperror.Option{apperror.WithDetail(detail)}
+		if len(installStep.RepairHints) > 0 {
+			opts = append(opts, apperror.WithRepairHints(installStep.RepairHints...))
+		}
+		return apperror.Wrap(apperror.ProviderNotReady, "WSL install step failed", err, opts...)
+	}
+	if step == len(plan.Steps)-1 {
+		p.installMu.Lock()
+		delete(p.installPlans, planID)
+		p.installMu.Unlock()
+	}
+	sendInstallProgress(progress, step+1, len(plan.Steps), "Done: "+installStep.Message, false)
+	return nil
 }
 
 func (p *WindowsWSLProvider) Start(ctx context.Context) error {
@@ -560,4 +643,176 @@ func shellQuote(value string) string {
 		return "''"
 	}
 	return "'" + strings.ReplaceAll(value, "'", `'\''`) + "'"
+}
+
+func buildWSLInstallSteps(distro string) []wslInstallStep {
+	return buildWSLInstallStepsFor(distro, defaultWSLDistro)
+}
+
+func buildWSLInstallStepsFor(distro string, distribution string) []wslInstallStep {
+	if strings.TrimSpace(distro) == "" {
+		distro = defaultWSLDistro
+	}
+	if strings.TrimSpace(distribution) == "" {
+		distribution = defaultWSLDistro
+	}
+	systemdCommand := "printf '[boot]\\nsystemd=true\\n' > /etc/wsl.conf"
+	dockerAptCommand := strings.Join([]string{
+		"set -e",
+		"apt-get update",
+		"apt-get install -y ca-certificates curl gnupg",
+		"install -m 0755 -d /etc/apt/keyrings",
+		"rm -f /etc/apt/keyrings/docker.gpg",
+		"curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg",
+		"chmod a+r /etc/apt/keyrings/docker.gpg",
+		`. /etc/os-release`,
+		`echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" > /etc/apt/sources.list.d/docker.list`,
+		"apt-get update",
+		"apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin",
+	}, " && ")
+	groupCommand := `user="$(getent passwd 1000 | cut -d: -f1)"; if [ -z "$user" ]; then echo "No non-root WSL user was found for docker group membership." >&2; exit 1; fi; usermod -aG docker "$user"`
+	verifyCommand := strings.Join([]string{
+		"docker info >/dev/null",
+		"docker compose version",
+		"docker buildx version",
+		"docker run --rm hello-world",
+	}, " && ")
+	return []wslInstallStep{
+		{
+			Message: "Enable WSL without installing a distribution",
+			Timeout: 5 * time.Minute,
+			Command: powerShellCommand(wslEnableScript()),
+			RepairHints: []string{
+				"Approve the Windows elevation prompt if it appears.",
+				"Restart Windows if WSL reports that a reboot is required, then reopen Cairn and run the installer again.",
+			},
+		},
+		{
+			Message: "Install the selected Ubuntu WSL distribution",
+			Timeout: 20 * time.Minute,
+			Command: powerShellCommand(wslInstallDistroScript(distro, distribution)),
+			RepairHints: []string{
+				"Check network access to the Microsoft Store or use the WSL web-download option outside Cairn.",
+				"If the distro setup window asks for a UNIX user, finish that setup and then retry the install plan.",
+			},
+		},
+		{
+			Message: "Ensure the selected distribution runs as WSL2",
+			Timeout: 10 * time.Minute,
+			Command: []string{wslCommandName, "--set-version", distro, "2"},
+			RepairHints: []string{
+				"Enable virtualization in firmware and make sure the Virtual Machine Platform Windows feature is installed.",
+				"Restart Windows after changing WSL feature or virtualization settings.",
+			},
+		},
+		{
+			Message: "Enable systemd inside the selected distribution",
+			Timeout: commandTimeout,
+			Command: []string{wslCommandName, "-d", distro, "-u", "root", "--", "sh", "-lc", systemdCommand},
+			RepairHints: []string{
+				"Initialize the Ubuntu distro if WSL reports that the distribution is not ready.",
+				"Retry after closing all shells that are currently using the distro.",
+			},
+		},
+		{
+			Message: "Restart WSL so systemd configuration takes effect",
+			Timeout: commandTimeout,
+			Command: []string{wslCommandName, "--terminate", distro},
+			RepairHints: []string{
+				"Close running shells or terminals attached to the selected WSL distro, then retry.",
+			},
+		},
+		{
+			Message: "Install Docker Engine, containerd, Compose, and Buildx from Docker's apt repository",
+			Timeout: wslInstallTimeout,
+			Command: []string{wslCommandName, "-d", distro, "-u", "root", "--", "sh", "-lc", dockerAptCommand},
+			RepairHints: []string{
+				"Check internet access from inside WSL and retry.",
+				"If apt is locked, wait for the other package operation to finish and retry.",
+			},
+		},
+		{
+			Message: "Add the WSL user to the docker group",
+			Timeout: commandTimeout,
+			Command: []string{wslCommandName, "-d", distro, "-u", "root", "--", "sh", "-lc", groupCommand},
+			RepairHints: []string{
+				"Finish the Ubuntu first-run user setup, then retry.",
+				"Restart WSL after the group change if Docker access is still denied.",
+			},
+		},
+		{
+			Message: "Restart the selected WSL distro so docker group membership applies",
+			Timeout: commandTimeout,
+			Command: []string{wslCommandName, "--terminate", distro},
+			RepairHints: []string{
+				"Close running shells or terminals attached to the selected WSL distro, then retry.",
+			},
+		},
+		{
+			Message: "Enable and start the Docker service",
+			Timeout: commandTimeout,
+			Command: []string{wslCommandName, "-d", distro, "-u", "root", "--", "sh", "-lc", "systemctl enable --now docker"},
+			RepairHints: []string{
+				"Make sure systemd is enabled in /etc/wsl.conf, terminate the distro, and retry.",
+			},
+		},
+		{
+			Message: "Verify Docker Engine, Compose, Buildx, and hello-world",
+			Timeout: 5 * time.Minute,
+			Command: []string{wslCommandName, "-d", distro, "--", "sh", "-lc", verifyCommand},
+			RepairHints: []string{
+				"Restart the selected WSL distro so docker group membership applies, then retry verification.",
+				"Run `docker info` inside the WSL distro to inspect daemon or permission errors.",
+			},
+		},
+	}
+}
+
+func displayCommand(command []string) string {
+	return shellJoin(command)
+}
+
+func powerShellCommand(script string) []string {
+	return []string{"powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script}
+}
+
+func wslEnableScript() string {
+	return strings.Join([]string{
+		`$ErrorActionPreference = 'Stop'`,
+		`$wsl = (Get-Command wsl.exe -ErrorAction Stop).Source`,
+		`& $wsl --status *> $null`,
+		`if ($LASTEXITCODE -eq 0) { Write-Output 'WSL is already available.'; exit 0 }`,
+		`& $wsl --install --no-distribution`,
+		`exit $LASTEXITCODE`,
+	}, "; ")
+}
+
+func wslInstallDistroScript(distro string, distribution string) string {
+	name := psSingleQuote(distro)
+	source := psSingleQuote(distribution)
+	args := fmt.Sprintf(`$wslArgs = @('--install', %s)`, source)
+	if !strings.EqualFold(strings.TrimSpace(distro), strings.TrimSpace(distribution)) {
+		args += fmt.Sprintf(`; $wslArgs += @('--name', %s)`, name)
+	}
+	return strings.Join([]string{
+		`$ErrorActionPreference = 'Stop'`,
+		`$wsl = (Get-Command wsl.exe -ErrorAction Stop).Source`,
+		fmt.Sprintf(`$name = %s`, name),
+		`$distros = @(& $wsl -l -q 2>$null | ForEach-Object { ($_ -replace [char]0, '').Trim() } | Where-Object { $_ })`,
+		`if ($distros -contains $name) { Write-Output "WSL distro '$name' is already installed."; exit 0 }`,
+		args,
+		`& $wsl @wslArgs`,
+		`exit $LASTEXITCODE`,
+	}, "; ")
+}
+
+func psSingleQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+}
+
+func sendInstallProgress(progress chan<- InstallProgress, step int, totalSteps int, message string, done bool) {
+	if progress == nil {
+		return
+	}
+	progress <- InstallProgress{Step: step, TotalSteps: totalSteps, Message: message, Done: done}
 }

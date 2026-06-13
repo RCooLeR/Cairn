@@ -22,6 +22,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/store"
 	"github.com/RCooLeR/Cairn/internal/terminal"
+	"github.com/google/uuid"
 )
 
 var (
@@ -43,8 +44,20 @@ type jobDonePayload struct {
 	Error  string `json:"error,omitempty"`
 }
 
+type providerInstallProgressPayload struct {
+	PlanID     string `json:"planID"`
+	StreamID   string `json:"streamID"`
+	Step       int    `json:"step"`
+	TotalSteps int    `json:"totalSteps"`
+	Message    string `json:"message"`
+	Done       bool   `json:"done"`
+	Error      string `json:"error,omitempty"`
+}
+
 type ProviderService struct {
 	Manager *providers.Manager
+	Events  bus.Bus
+	Audit   *store.AuditRepository
 }
 
 type DockerClient interface {
@@ -166,7 +179,113 @@ func (s *ProviderService) PlanInstall(ctx context.Context, providerID string, op
 }
 
 func (s *ProviderService) ApplyInstall(_ context.Context, planID string) (*models.InstallProgressHandle, error) {
-	return nil, notReady()
+	if s.Manager == nil {
+		return nil, notReady()
+	}
+	streamID := uuid.NewString()
+	progress := make(chan providers.InstallProgress, 8)
+	providerID, command, risk := s.Manager.InstallPlanAuditContext(planID)
+	go s.runProviderInstall(planID, streamID, providerID, command, risk, progress)
+	return &models.InstallProgressHandle{PlanID: planID, StreamID: streamID}, nil
+}
+
+func (s *ProviderService) runProviderInstall(planID string, streamID string, providerID string, command string, risk models.Risk, progress chan providers.InstallProgress) {
+	ctx := context.Background()
+	done := make(chan error, 1)
+	started := time.Now()
+	go func() {
+		defer close(progress)
+		done <- s.Manager.ApplyInstall(ctx, planID, progress)
+	}()
+	last := providers.InstallProgress{}
+	for item := range progress {
+		last = item
+		s.publishProviderInstallProgress(planID, streamID, item, "")
+	}
+	if err := <-done; err != nil {
+		if auditErr := s.recordProviderInstallAudit(ctx, planID, providerID, command, risk, "failed", time.Since(started), err); auditErr != nil {
+			err = errors.Join(err, auditErr)
+		}
+		s.publishProviderInstallProgress(planID, streamID, providers.InstallProgress{
+			Step:       last.Step,
+			TotalSteps: last.TotalSteps,
+			Message:    "Install failed",
+			Done:       true,
+		}, err.Error())
+	} else {
+		if auditErr := s.recordProviderInstallAudit(ctx, planID, providerID, command, risk, "success", time.Since(started), nil); auditErr != nil {
+			s.publishProviderInstallProgress(planID, streamID, providers.InstallProgress{
+				Step:       last.Step,
+				TotalSteps: last.TotalSteps,
+				Message:    "Install failed",
+				Done:       true,
+			}, auditErr.Error())
+			return
+		}
+		s.publishProviderInstallProgress(planID, streamID, providers.InstallProgress{
+			Step:       last.Step,
+			TotalSteps: last.TotalSteps,
+			Message:    "Install complete",
+			Done:       true,
+		}, "")
+	}
+}
+
+func (s *ProviderService) publishProviderInstallProgress(planID string, streamID string, progress providers.InstallProgress, errText string) {
+	if s.Events == nil {
+		return
+	}
+	s.Events.Publish(bus.Event{
+		Topic: bus.TopicProviderInstallProgress,
+		Payload: providerInstallProgressPayload{
+			PlanID:     planID,
+			StreamID:   streamID,
+			Step:       progress.Step,
+			TotalSteps: progress.TotalSteps,
+			Message:    progress.Message,
+			Done:       progress.Done,
+			Error:      errText,
+		},
+	})
+}
+
+func (s *ProviderService) recordProviderInstallAudit(ctx context.Context, planID string, providerID string, command string, risk models.Risk, status string, duration time.Duration, actionErr error) error {
+	if s.Audit == nil {
+		return nil
+	}
+	if risk == "" {
+		risk = models.RiskNeedsConfirmation
+	}
+	targetID := providerID
+	if targetID == "" {
+		targetID = planID
+	}
+	var exitCode *int
+	if status == "success" {
+		code := 0
+		exitCode = &code
+	}
+	message := ""
+	if actionErr != nil {
+		message = actionErr.Error()
+	}
+	_, err := s.Audit.Insert(ctx, store.AuditRecord{
+		Action:     "provider.install",
+		TargetType: "provider",
+		TargetID:   targetID,
+		ProviderID: providerID,
+		Command:    command,
+		Risk:       risk,
+		Status:     status,
+		ExitCode:   exitCode,
+		Duration:   duration,
+		Error:      message,
+		CreatedAt:  time.Now().UTC(),
+	})
+	if err != nil {
+		return apperror.Wrap(apperror.Internal, "Record provider install audit entry failed", err)
+	}
+	return nil
 }
 
 func (s *ProviderService) Start(ctx context.Context, providerID string) error {

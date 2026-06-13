@@ -9,6 +9,7 @@ import (
 	"testing"
 	"unicode/utf16"
 
+	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/models"
 )
 
@@ -194,6 +195,80 @@ func TestWindowsWSLRunDockerComposeAndShellCommands(t *testing.T) {
 	}
 	if got, want := backendShell, []string{wslCommandName, "-d", "cairn-dev", "--", "/bin/zsh"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("BackendShellCommand() = %#v, want %#v", got, want)
+	}
+}
+
+func TestWindowsWSLInstallPlanAndExecution(t *testing.T) {
+	t.Parallel()
+	runner := newFakeRunner()
+	provider := NewWindowsWSL(WindowsWSLOptions{Distro: "cairn-dev", Runner: runner})
+
+	plan, err := provider.PlanInstall(context.Background(), models.InstallOptions{})
+	if err != nil {
+		t.Fatalf("PlanInstall() error = %v", err)
+	}
+	if plan.Risk != models.RiskNeedsConfirmation {
+		t.Fatalf("plan risk = %q, want %q", plan.Risk, models.RiskNeedsConfirmation)
+	}
+	if got, want := len(plan.Commands), 10; got != want {
+		t.Fatalf("command count = %d, want %d", got, want)
+	}
+	if !strings.Contains(plan.Commands[1].Command, "--name") || !strings.Contains(plan.Commands[1].Command, "cairn-dev") {
+		t.Fatalf("custom distro install command missing --name: %s", plan.Commands[1].Command)
+	}
+	if !strings.Contains(plan.Commands[5].Command, "docker-ce") || !strings.Contains(plan.Commands[9].Command, "hello-world") {
+		t.Fatalf("plan commands missing Docker install/verify steps: %#v", plan.Commands)
+	}
+	steps := buildWSLInstallSteps("cairn-dev")
+	for _, step := range steps {
+		runner.outputs[strings.Join(step.Command, " ")] = "ok\n"
+	}
+	progress := make(chan InstallProgress, 32)
+	for index := range steps {
+		if err := provider.ExecuteInstallStep(context.Background(), plan.PlanID, index, progress); err != nil {
+			t.Fatalf("ExecuteInstallStep(%d) error = %v", index, err)
+		}
+	}
+	close(progress)
+	var messages []string
+	for item := range progress {
+		messages = append(messages, item.Message)
+	}
+	if len(messages) != len(steps)*2 {
+		t.Fatalf("progress messages = %d, want %d: %#v", len(messages), len(steps)*2, messages)
+	}
+	if err := provider.ExecuteInstallStep(context.Background(), plan.PlanID, 0, nil); !apperror.IsCode(err, apperror.PlanExpired) {
+		t.Fatalf("ExecuteInstallStep after completion error = %v, want E_PLAN_EXPIRED", err)
+	}
+}
+
+func TestWindowsWSLInstallFailureIncludesRepairHints(t *testing.T) {
+	t.Parallel()
+	runner := newFakeRunner()
+	provider := NewWindowsWSL(WindowsWSLOptions{Distro: "cairn-dev", Runner: runner})
+	plan, err := provider.PlanInstall(context.Background(), models.InstallOptions{})
+	if err != nil {
+		t.Fatalf("PlanInstall() error = %v", err)
+	}
+
+	steps := buildWSLInstallSteps("cairn-dev")
+	const dockerInstallStep = 5
+	key := strings.Join(steps[dockerInstallStep].Command, " ")
+	runner.errors[key] = errors.New("temporary network failure")
+
+	err = provider.ExecuteInstallStep(context.Background(), plan.PlanID, dockerInstallStep, nil)
+	if !apperror.IsCode(err, apperror.ProviderNotReady) {
+		t.Fatalf("ExecuteInstallStep() error = %v, want E_PROVIDER_NOT_READY", err)
+	}
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) {
+		t.Fatalf("error type = %T, want AppError", err)
+	}
+	if len(appErr.RepairHints) == 0 || !strings.Contains(appErr.RepairHints[0], "internet access") {
+		t.Fatalf("repair hints = %#v", appErr.RepairHints)
+	}
+	if !strings.Contains(appErr.Detail, "temporary network failure") {
+		t.Fatalf("detail = %q, want failing command output", appErr.Detail)
 	}
 }
 

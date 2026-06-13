@@ -116,6 +116,69 @@ func TestSettingsServiceNotifications(t *testing.T) {
 	}
 }
 
+func TestProviderServiceApplyInstallPublishesProgress(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	eventBus := bus.New()
+	defer eventBus.Close()
+	db := openServiceTestStore(t)
+	provider := &fakeInstallProvider{}
+	manager := providers.NewManager(nil, nil, []providers.PlatformProvider{provider})
+	service := &ProviderService{Manager: manager, Events: eventBus, Audit: db.Audit()}
+
+	plan, err := service.PlanInstall(ctx, provider.ID(), models.InstallOptions{})
+	if err != nil {
+		t.Fatalf("PlanInstall() error = %v", err)
+	}
+	events := eventBus.Subscribe(ctx, bus.TopicProviderInstallProgress, 8)
+	handle, err := service.ApplyInstall(ctx, plan.PlanID)
+	if err != nil {
+		t.Fatalf("ApplyInstall() error = %v", err)
+	}
+	if handle.PlanID != plan.PlanID || handle.StreamID == "" {
+		t.Fatalf("handle = %#v", handle)
+	}
+
+	var seen []providerInstallProgressPayload
+	for {
+		select {
+		case event := <-events:
+			payload, ok := event.Payload.(providerInstallProgressPayload)
+			if !ok {
+				t.Fatalf("payload type = %T", event.Payload)
+			}
+			seen = append(seen, payload)
+			if payload.Done {
+				if payload.Error != "" {
+					t.Fatalf("final payload error = %q", payload.Error)
+				}
+				if payload.Message != "Install complete" {
+					t.Fatalf("final payload message = %q, want Install complete", payload.Message)
+				}
+				if payload.TotalSteps != 2 {
+					t.Fatalf("final payload totalSteps = %d, want 2", payload.TotalSteps)
+				}
+				if got, want := provider.executed, []int{0, 1}; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+					t.Fatalf("executed = %#v, want %#v", got, want)
+				}
+				if len(seen) < 3 {
+					t.Fatalf("progress events = %#v, want step events plus final", seen)
+				}
+				entries, err := (&SettingsService{Audit: db.Audit()}).GetAuditLog(ctx, models.AuditFilter{Topic: "provider.install", Limit: 5})
+				if err != nil {
+					t.Fatalf("GetAuditLog() error = %v", err)
+				}
+				if len(entries) != 1 || entries[0].Result != "success" {
+					t.Fatalf("provider install audit entries = %#v", entries)
+				}
+				return
+			}
+		case <-ctx.Done():
+			t.Fatalf("timed out waiting for install progress: %v", ctx.Err())
+		}
+	}
+}
+
 func TestDockerServiceLifecycleAuditsAndPlans(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "cairn.db"))
@@ -680,6 +743,64 @@ func (r *fakeComposeRunner) hasCall(want string) bool {
 	}
 	return false
 }
+
+type fakeInstallProvider struct {
+	executed []int
+}
+
+func (p *fakeInstallProvider) ID() string          { return "windows_wsl_ubuntu" }
+func (p *fakeInstallProvider) DisplayName() string { return "Windows WSL Ubuntu" }
+func (p *fakeInstallProvider) Type() string        { return providers.TypeWindowsWSL }
+func (p *fakeInstallProvider) Platform() string    { return providers.PlatformWindows }
+func (p *fakeInstallProvider) Detect(context.Context) (*models.ProviderStatus, error) {
+	return &models.ProviderStatus{}, nil
+}
+func (p *fakeInstallProvider) PlanInstall(context.Context, models.InstallOptions) (*models.CommandPlan, error) {
+	return &models.CommandPlan{
+		PlanID: "plan-install",
+		Title:  "Install",
+		Risk:   models.RiskNeedsConfirmation,
+		Commands: []models.PlannedCommand{
+			{Order: 1, Command: "step 1", Risk: models.RiskNeedsConfirmation},
+			{Order: 2, Command: "step 2", Risk: models.RiskNeedsConfirmation},
+		},
+		ExpiresAt: time.Now().Add(time.Minute),
+	}, nil
+}
+func (p *fakeInstallProvider) ExecuteInstallStep(_ context.Context, _ string, step int, progress chan<- providers.InstallProgress) error {
+	p.executed = append(p.executed, step)
+	if progress != nil {
+		progress <- providers.InstallProgress{
+			Step:       step + 1,
+			TotalSteps: 2,
+			Message:    "step complete",
+		}
+	}
+	return nil
+}
+func (p *fakeInstallProvider) Start(context.Context) error   { return nil }
+func (p *fakeInstallProvider) Stop(context.Context) error    { return nil }
+func (p *fakeInstallProvider) Restart(context.Context) error { return nil }
+func (p *fakeInstallProvider) DockerHost(context.Context) (string, error) {
+	return "", nil
+}
+func (p *fakeInstallProvider) DockerContext(context.Context) (string, error) {
+	return "", nil
+}
+func (p *fakeInstallProvider) RunDocker(context.Context, ...string) (*providers.CommandResult, error) {
+	return nil, nil
+}
+func (p *fakeInstallProvider) RunCompose(context.Context, string, ...string) (*providers.CommandResult, error) {
+	return nil, nil
+}
+func (p *fakeInstallProvider) HostShellCommand(models.TerminalOptions) ([]string, error) {
+	return nil, nil
+}
+func (p *fakeInstallProvider) BackendShellCommand(models.TerminalOptions) ([]string, error) {
+	return nil, nil
+}
+func (p *fakeInstallProvider) MapPathToBackend(path string) (string, error) { return path, nil }
+func (p *fakeInstallProvider) MapPathToHost(path string) (string, error)    { return path, nil }
 
 func openServiceTestStore(t *testing.T) *store.Store {
 	t.Helper()
