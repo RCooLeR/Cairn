@@ -1,12 +1,15 @@
 import type { LucideIcon } from 'lucide-react';
 import type {
+  AuditEntry,
   CommandPlan,
   ContainerSummary,
+  DashboardMetrics,
   ExportResult,
   HubSearchResult,
   ImageDetail,
   ImageSummary,
   LogLine,
+  MetricRankItem,
   MountSpec,
   NetworkDetail,
   NetworkSummary,
@@ -16,17 +19,21 @@ import type {
   ProjectSummary,
   ProviderSummary,
   RunImageRequest,
+  StatsScope,
   VolumeDetail,
   VolumeSummary,
 } from '../bindings/github.com/RCooLeR/Cairn/internal/models/models.js';
 
 import {
+  Activity,
   ArrowDown,
+  BarChart3,
   Bell,
   Box,
   Clock3,
   Container,
   Copy,
+  Cpu,
   Database,
   Download,
   Eye,
@@ -34,9 +41,9 @@ import {
   Filter,
   FolderOpen,
   Gauge,
-  HardDrive,
   LayoutGrid,
   List,
+  MemoryStick,
   MoreVertical,
   PackagePlus,
   Pencil,
@@ -51,16 +58,38 @@ import {
   Server,
   Skull,
   Square,
+  Terminal,
+  Trash2,
   Upload,
+  Wifi,
   WrapText,
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  Area,
+  AreaChart,
+  CartesianGrid,
+  Cell,
+  Line,
+  LineChart,
+  Pie,
+  PieChart as RechartsPieChart,
+  ResponsiveContainer,
+  Tooltip as RechartsTooltip,
+  XAxis,
+  YAxis,
+} from 'recharts';
 
 import Editor from '@monaco-editor/react';
 import { Clipboard, Dialogs, Events } from '@wailsio/runtime';
 
 import { getAppVersion } from './api/app';
-import { DockerService, LogsService, ProjectService } from './api/services';
+import {
+  DockerService,
+  LogsService,
+  MetricsService,
+  ProjectService,
+} from './api/services';
 import {
   Badge,
   Button,
@@ -90,6 +119,7 @@ type PageID =
   | 'networks';
 type FilterID = string;
 type BadgeTone = 'ok' | 'warn' | 'error' | 'info' | 'neutral' | 'accent';
+type StatusToneID = 'ok' | 'warn' | 'error' | 'info' | 'neutral';
 type LoadStatus = 'idle' | 'loading' | 'ready' | 'error';
 type ProjectViewMode = 'grid' | 'list';
 type ProjectSortID = 'name' | 'activity' | 'cpu';
@@ -243,6 +273,53 @@ type LogErrorPayload = {
   error?: string;
 };
 
+type DashboardMetricID = 'cpu' | 'memory' | 'network';
+type DashboardRangeID = '5m' | '1h' | '24h';
+
+type StatsSample = {
+  projectID?: string;
+  serviceID?: string;
+  containerID: string;
+  containerName?: string;
+  health?: string;
+  restartCount?: number;
+  uptimeSeconds?: number;
+  cpuPercent: number;
+  memoryBytes: number;
+  memoryLimitBytes?: number;
+  networkRxRate: number;
+  networkTxRate: number;
+  sampledAt: unknown;
+};
+
+type StatsSamplePayload = {
+  streamID: string;
+  samples?: StatsSample[];
+};
+
+type DashboardChartPoint = {
+  ts: number;
+  label: string;
+  cpu: number;
+  memory: number;
+  netRx: number;
+  netTx: number;
+};
+
+type SparkPoint = {
+  label: string;
+  value: number;
+};
+
+type CleanupState = {
+  open: boolean;
+  includeImages: boolean;
+  includeContainers: boolean;
+  includeBuildCache: boolean;
+  includeVolumes: boolean;
+  typedName: string;
+};
+
 const navItems: NavItem[] = [
   { id: 'overview', label: 'Overview', icon: Gauge },
   { id: 'projects', label: 'Projects', icon: LayoutGrid },
@@ -356,6 +433,15 @@ const emptyExportLogs: ExportLogsState = {
   result: null,
 };
 
+const emptyCleanup: CleanupState = {
+  open: false,
+  includeImages: true,
+  includeContainers: true,
+  includeBuildCache: true,
+  includeVolumes: false,
+  typedName: '',
+};
+
 function App() {
   const version = useAppStore((state) => state.version);
   const setVersion = useAppStore((state) => state.setVersion);
@@ -423,6 +509,14 @@ function App() {
     setActivePage(page);
     setSearch('');
   }, []);
+
+  const showContainers = useCallback(
+    (filter: FilterID = 'all') => {
+      setContainerFilter(filter);
+      navigate('containers');
+    },
+    [navigate],
+  );
 
   const refreshProjects = useCallback(async () => {
     setProjectsStatus('loading');
@@ -1354,9 +1448,15 @@ function App() {
             diskTotal={diskTotal}
             dockerRunning={dockerRunning}
             images={images}
-            networks={networks}
+            onImportProject={() =>
+              setImportProject({ ...emptyImportProject, open: true })
+            }
             onNavigate={navigate}
+            onOpenProject={openProjectDetail}
+            onShowContainers={showContainers}
             provider={activeProvider}
+            projects={projects}
+            projectsLoading={projectsStatus === 'loading'}
             runningContainers={runningContainers}
             unhealthyContainers={unhealthyContainers}
             volumes={volumes}
@@ -1639,12 +1739,16 @@ type OverviewProps = {
   containers: ContainerSummary[];
   images: ImageSummary[];
   volumes: VolumeSummary[];
-  networks: NetworkSummary[];
+  projects: ProjectSummary[];
+  projectsLoading: boolean;
   runningContainers: number;
   unhealthyContainers: number;
   diskTotal: number;
   diskReclaimable: number;
+  onImportProject: () => void;
   onNavigate: (page: PageID) => void;
+  onOpenProject: (project: ProjectSummary) => void;
+  onShowContainers: (filter: FilterID) => void;
 };
 
 function OverviewPage({
@@ -1653,163 +1757,1189 @@ function OverviewPage({
   diskTotal,
   dockerRunning,
   images,
-  networks,
+  onImportProject,
   onNavigate,
+  onOpenProject,
+  onShowContainers,
   provider,
+  projects,
+  projectsLoading,
   runningContainers,
   unhealthyContainers,
   volumes,
 }: OverviewProps) {
-  const stopped = containers.length - runningContainers;
-  return (
-    <div className="space-y-6">
-      <section className="grid grid-cols-[1.2fr_1fr] gap-4">
-        <Card>
-          <CardBody className="flex items-center justify-between">
-            <div className="min-w-0">
-              <div className="flex items-center gap-3">
-                <StatusDot
-                  pulse={!dockerRunning && provider?.healthy}
-                  tone={dockerRunning ? 'ok' : 'neutral'}
-                />
-                <div>
-                  <div className="text-lg font-semibold">
-                    Docker Engine - {dockerRunning ? 'Running' : 'Stopped'}
-                  </div>
-                  <div className="text-sm text-text-muted">
-                    {provider?.name ?? 'No provider selected'}
-                  </div>
-                </div>
-              </div>
-              <div className="mt-4 grid grid-cols-3 gap-3 text-sm">
-                <StatusPill label="Provider" ok={provider?.healthy ?? false} />
-                <StatusPill label="Docker" ok={dockerRunning} />
-                <StatusPill
-                  label="Inventory"
-                  ok={
-                    containers.length +
-                      images.length +
-                      volumes.length +
-                      networks.length >
-                    0
-                  }
-                />
-              </div>
-            </div>
-            <Server className="h-16 w-16 text-accent/70" strokeWidth={1.4} />
-          </CardBody>
-        </Card>
+  const [dashboard, setDashboard] = useState<DashboardMetrics | null>(null);
+  const [dashboardStatus, setDashboardStatus] =
+    useState<LoadStatus>('loading');
+  const [dashboardError, setDashboardError] = useState<string | null>(null);
+  const [metric, setMetric] = useState<DashboardMetricID>('cpu');
+  const [range, setRange] = useState<DashboardRangeID>('5m');
+  const [stacked, setStacked] = useState(false);
+  const [chartPaused, setChartPaused] = useState(false);
+  const chartPausedRef = useRef(false);
+  const [chartPoints, setChartPoints] = useState<DashboardChartPoint[]>([]);
+  const [latestSamples, setLatestSamples] = useState<Record<string, StatsSample>>(
+    {},
+  );
+  const [containerSparks, setContainerSparks] = useState<
+    Record<string, SparkPoint[]>
+  >({});
+  const [projectSparks, setProjectSparks] = useState<
+    Record<string, SparkPoint[]>
+  >({});
+  const [logPeek, setLogPeek] = useState<LogLine[]>([]);
+  const [cleanup, setCleanup] = useState<CleanupState>(emptyCleanup);
+  const statsStreamIDRef = useRef<string | null>(null);
+  const logStreamIDRef = useRef<string | null>(null);
 
-        <section
-          className="grid grid-cols-2 gap-3"
-          aria-label="Docker object counts"
+  const loadDashboard = useCallback(async () => {
+    setDashboardStatus((current) => (current === 'ready' ? current : 'loading'));
+    setDashboardError(null);
+    try {
+      const nextDashboard = await MetricsService.GetDashboardMetrics();
+      setDashboard(nextDashboard);
+      setDashboardStatus('ready');
+    } catch (error: unknown) {
+      setDashboardError(
+        error instanceof Error ? error.message : 'Unable to load dashboard',
+      );
+      setDashboardStatus('error');
+    }
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      void loadDashboard();
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, [loadDashboard]);
+
+  useEffect(() => {
+    let timer: number | undefined;
+    const off = Events.On('objects:changed', () => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        void loadDashboard();
+      }, 500);
+    });
+    return () => {
+      window.clearTimeout(timer);
+      off();
+    };
+  }, [loadDashboard]);
+
+  useEffect(() => {
+    chartPausedRef.current = chartPaused;
+  }, [chartPaused]);
+
+  useEffect(() => {
+    const off = Events.On('stats:sample', (event) => {
+      const payload = eventPayload<StatsSamplePayload>(event);
+      if (!payload || payload.streamID !== statsStreamIDRef.current) {
+        return;
+      }
+      const samples = (payload.samples ?? []).filter(isStatsSample);
+      if (samples.length === 0) {
+        return;
+      }
+      const label = sampleLabel(samples[0]);
+      setLatestSamples((current) => {
+        const next = { ...current };
+        for (const sample of samples) {
+          next[sample.containerID] = sample;
+        }
+        return next;
+      });
+      setContainerSparks((current) =>
+        appendSparkEntries(
+          current,
+          samples.map((sample) => ({
+            id: sample.containerID,
+            label,
+            value: sample.cpuPercent,
+          })),
+        ),
+      );
+      setProjectSparks((current) =>
+        appendSparkEntries(current, projectSparkEntries(samples, label)),
+      );
+      if (!chartPausedRef.current) {
+        setChartPoints((current) =>
+          trimChartPoints(current.concat(aggregateChartPoint(samples, label))),
+        );
+      }
+    });
+    return () => off();
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let activeStreamID: string | null = null;
+    const scope: StatsScope = { kind: 'all', ids: [] };
+    MetricsService.StartStatsStream(scope)
+      .then((streamID) => {
+        if (cancelled) {
+          void MetricsService.StopStream(streamID);
+          return;
+        }
+        activeStreamID = streamID;
+        statsStreamIDRef.current = streamID;
+      })
+      .catch((error: unknown) => {
+        setDashboardError(
+          error instanceof Error ? error.message : 'Unable to start metrics',
+        );
+      });
+    return () => {
+      cancelled = true;
+      statsStreamIDRef.current = null;
+      if (activeStreamID) {
+        void MetricsService.StopStream(activeStreamID);
+      }
+    };
+  }, []);
+
+  useEffect(() => {
+    const offLines = Events.On('logs:lines', (event) => {
+      const payload = eventPayload<LogLinesPayload>(event);
+      if (!payload || payload.streamID !== logStreamIDRef.current) {
+        return;
+      }
+      const nextLines = (payload.lines ?? []).filter(isLogLine);
+      if (nextLines.length === 0) {
+        return;
+      }
+      setLogPeek((current) => current.concat(nextLines).slice(-8));
+    });
+    return () => offLines();
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    let activeStreamID: string | null = null;
+    LogsService.StartLogStream({
+      scope: 'all',
+      ids: [],
+      follow: true,
+      tail: 8,
+      timestamps: true,
+    })
+      .then((streamID) => {
+        if (cancelled) {
+          void LogsService.StopStream(streamID);
+          return;
+        }
+        activeStreamID = streamID;
+        logStreamIDRef.current = streamID;
+      })
+      .catch(() => {
+        setLogPeek([]);
+      });
+    return () => {
+      cancelled = true;
+      logStreamIDRef.current = null;
+      if (activeStreamID) {
+        void LogsService.StopStream(activeStreamID);
+      }
+    };
+  }, []);
+
+  const stopped = Math.max(0, containers.length - runningContainers);
+  const paused = containers.filter((container) => container.state === 'paused')
+    .length;
+  const topRows = useMemo(
+    () => dashboardTopRows(dashboard?.top ?? [], latestSamples),
+    [dashboard?.top, latestSamples],
+  );
+  const recentContainers = useMemo(
+    () =>
+      [...containers]
+        .sort((left, right) => dateMillis(right.createdAt) - dateMillis(left.createdAt))
+        .slice(0, 6),
+    [containers],
+  );
+  const liveProjects = useMemo(
+    () =>
+      [...projects]
+        .sort(
+          (left, right) =>
+            projectActivityScore(right, projectSparks[right.id]) -
+            projectActivityScore(left, projectSparks[left.id]),
+        )
+        .slice(0, 5),
+    [projectSparks, projects],
+  );
+  const updateSummary = useMemo(() => summarizeProjectUpdates(projects), [projects]);
+  const counts = dashboard ?? {
+    projects: projects.length,
+    containers: containers.length,
+    images: images.length,
+    volumes: volumes.length,
+    diskUsage: {
+      images: { count: images.length, active: 0, sizeBytes: 0, reclaimable: 0 },
+      containers: {
+        count: containers.length,
+        active: runningContainers,
+        sizeBytes: 0,
+        reclaimable: 0,
+      },
+      volumes: {
+        count: volumes.length,
+        active: volumes.filter((volume) => volume.inUse).length,
+        sizeBytes: 0,
+        reclaimable: 0,
+      },
+      buildCache: { count: 0, active: 0, sizeBytes: 0, reclaimable: 0 },
+      totalBytes: diskTotal,
+      reclaimable: diskReclaimable,
+    },
+  };
+  const diskBytes = dashboard?.diskUsage.totalBytes ?? diskTotal;
+  const reclaimableBytes = dashboard?.diskUsage.reclaimable ?? diskReclaimable;
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center justify-end gap-2">
+        <Button
+          disabled
+          disabledReason="Terminal support begins in Phase 3.5"
+          icon={<Terminal size={15} />}
+          size="sm"
         >
-          <MetricButton
-            label="Containers"
-            value={containers.length}
-            hint={`${runningContainers} running`}
-            onClick={() => onNavigate('containers')}
-          />
-          <MetricButton
-            label="Images"
-            value={images.length}
-            hint={`${imageDanglingCount(images)} dangling`}
-            onClick={() => onNavigate('images')}
-          />
-          <MetricButton
-            label="Volumes"
-            value={volumes.length}
-            hint={`${volumes.filter((volume) => volume.inUse).length} in use`}
-            onClick={() => onNavigate('volumes')}
-          />
-          <MetricButton
-            label="Networks"
-            value={networks.length}
-            hint={`${networks.filter((network) => network.internal).length} internal`}
-            onClick={() => onNavigate('networks')}
-          />
-        </section>
+          Open terminal
+        </Button>
+        <Button
+          disabled
+          disabledReason="Update checks begin in Phase 8"
+          icon={<RefreshCw size={15} />}
+          size="sm"
+        >
+          Check updates
+        </Button>
+        <Button icon={<Upload size={15} />} onClick={onImportProject} size="sm">
+          Import project
+        </Button>
+        <Button
+          icon={<Trash2 size={15} />}
+          onClick={() => setCleanup({ ...emptyCleanup, open: true })}
+          size="sm"
+          variant="danger"
+        >
+          Prune
+        </Button>
+        <Button
+          disabled
+          disabledReason="Engine restart requires provider command planning"
+          icon={<RotateCw size={15} />}
+          size="sm"
+        >
+          Restart Docker
+        </Button>
+      </div>
+
+      {dashboardStatus === 'error' && dashboardError ? (
+        <div className="rounded-card border border-warn/30 bg-warn/10 px-4 py-3 text-sm text-warn">
+          {dashboardError}
+        </div>
+      ) : null}
+
+      <section className="grid gap-4 xl:grid-cols-[1fr_1.35fr]">
+        <EngineHeroCard dockerRunning={dockerRunning} provider={provider} />
+        <DashboardCountsStrip
+          containers={containers}
+          counts={counts}
+          diskReclaimable={reclaimableBytes}
+          diskTotal={diskBytes}
+          images={images}
+          onCleanUp={() => setCleanup({ ...emptyCleanup, open: true })}
+          onNavigate={onNavigate}
+          onShowContainers={onShowContainers}
+          runningContainers={runningContainers}
+          volumes={volumes}
+        />
       </section>
 
-      <section className="grid grid-cols-[1fr_360px] gap-4">
+      {containers.length === 0 ? (
         <Card>
-          <CardHeader
-            actions={
-              <Badge tone={unhealthyContainers > 0 ? 'error' : 'ok'}>
-                {unhealthyContainers} unhealthy
-              </Badge>
-            }
-            title="Container Status"
-          />
-          <CardBody>
-            <div className="grid grid-cols-3 gap-3">
-              <StatusBlock
-                label="Running"
-                tone="ok"
-                value={runningContainers}
-              />
-              <StatusBlock label="Stopped" tone="neutral" value={stopped} />
-              <StatusBlock
-                label="Unhealthy"
-                tone={unhealthyContainers > 0 ? 'error' : 'neutral'}
-                value={unhealthyContainers}
-              />
+          <CardBody className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+            <EmptyState
+              body="Import a project or run an image to populate local Compose inventory."
+              icon={<Container size={28} />}
+              title="Run your first container"
+            />
+            <div className="flex shrink-0 flex-wrap gap-2">
+              <Button
+                icon={<Upload size={15} />}
+                onClick={onImportProject}
+                variant="primary"
+              >
+                Import project
+              </Button>
+              <Button
+                disabled
+                disabledReason="Terminal support begins in Phase 3.5"
+                icon={<Terminal size={15} />}
+              >
+                Open terminal
+              </Button>
             </div>
-            <div className="mt-5 space-y-2">
-              {containers.slice(0, 6).map((container) => (
-                <div
-                  className="grid grid-cols-[1fr_auto_auto] items-center gap-3 text-sm"
-                  key={container.id}
-                >
-                  <div className="min-w-0 truncate">{container.name}</div>
-                  <Badge tone={containerTone(container)}>
-                    {container.state || 'unknown'}
-                  </Badge>
-                  <span className="text-xs text-text-muted">
-                    {formatBytes(container.memoryBytes)}
-                  </span>
-                </div>
-              ))}
-              {containers.length === 0 ? (
-                <EmptyState
-                  body="Import a project or run an image to populate the local inventory."
-                  icon={<Container size={28} />}
-                  title="No containers yet"
+          </CardBody>
+        </Card>
+      ) : null}
+
+      <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
+        <ResourceUsagePanel
+          metric={metric}
+          onMetricChange={setMetric}
+          onPauseChange={setChartPaused}
+          onRangeChange={setRange}
+          onStackedChange={setStacked}
+          paused={chartPaused || !dockerRunning}
+          points={chartPoints}
+          range={range}
+          stacked={stacked}
+        />
+        <ProjectsMiniList
+          loading={projectsLoading}
+          onOpenProject={onOpenProject}
+          onViewAll={() => onNavigate('projects')}
+          projectSparks={projectSparks}
+          projects={liveProjects}
+        />
+      </section>
+
+      <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
+        <ContainerHealthPanel
+          containerSparks={containerSparks}
+          containers={recentContainers}
+          latestSamples={latestSamples}
+          onShowContainers={onShowContainers}
+          paused={paused}
+          running={runningContainers}
+          stopped={stopped}
+          unhealthy={unhealthyContainers}
+        />
+        <div className="space-y-4">
+          <LogsPeekPanel lines={logPeek} onOpenLogs={() => onNavigate('logs')} />
+          <UpdatesCard
+            onOpenProjects={() => onNavigate('projects')}
+            projects={projects}
+            summary={updateSummary}
+          />
+        </div>
+      </section>
+
+      <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
+        <TopContainersTable rows={topRows} />
+        <RecentEventsPanel events={dashboard?.recentEvents ?? []} />
+      </section>
+
+      <CleanupModal
+        diskReclaimable={reclaimableBytes}
+        onChange={(patch) =>
+          setCleanup((current) => ({ ...current, ...patch }))
+        }
+        onClose={() => setCleanup(emptyCleanup)}
+        state={cleanup}
+      />
+    </div>
+  );
+}
+
+function EngineHeroCard({
+  dockerRunning,
+  provider,
+}: {
+  dockerRunning: boolean;
+  provider: ProviderSummary | null;
+}) {
+  const context = provider?.status?.currentContext || 'default';
+  const version = provider?.status?.dockerVersion || 'unknown';
+  return (
+    <Card className={!dockerRunning ? 'border-neutral/30 bg-bg-inset' : undefined}>
+      <CardBody className="flex items-center justify-between gap-5">
+        <div className="min-w-0">
+          <div className="flex items-center gap-3">
+            <StatusDot
+              pulse={!dockerRunning && provider?.healthy}
+              tone={dockerRunning ? 'ok' : 'neutral'}
+            />
+            <div className="min-w-0">
+              <div className="text-lg font-semibold">
+                Docker Engine - {dockerRunning ? 'Running' : 'Stopped'}
+              </div>
+              <div className="truncate text-sm text-text-muted">
+                {provider?.name ?? 'No provider selected'}
+              </div>
+            </div>
+          </div>
+          <div className="mt-5 grid gap-3 text-sm sm:grid-cols-3">
+            <StatusPill label="Provider" ok={provider?.healthy ?? false} />
+            <StatusPill label="Context" ok={dockerRunning} value={context} />
+            <StatusPill label="Engine" ok={dockerRunning} value={version} />
+          </div>
+        </div>
+        <Server className="h-16 w-16 text-accent/70" strokeWidth={1.4} />
+      </CardBody>
+    </Card>
+  );
+}
+
+function DashboardCountsStrip({
+  containers,
+  counts,
+  diskReclaimable,
+  diskTotal,
+  images,
+  onCleanUp,
+  onNavigate,
+  onShowContainers,
+  runningContainers,
+  volumes,
+}: {
+  counts: DashboardMetrics;
+  containers: ContainerSummary[];
+  images: ImageSummary[];
+  volumes: VolumeSummary[];
+  runningContainers: number;
+  diskTotal: number;
+  diskReclaimable: number;
+  onCleanUp: () => void;
+  onNavigate: (page: PageID) => void;
+  onShowContainers: (filter: FilterID) => void;
+}) {
+  const stopped = Math.max(0, containers.length - runningContainers);
+  return (
+    <section
+      className="grid gap-3 sm:grid-cols-2 2xl:grid-cols-5"
+      aria-label="Docker object counts"
+    >
+      <MetricButton
+        hint="Compose stacks"
+        label="Projects"
+        onClick={() => onNavigate('projects')}
+        value={counts.projects}
+      />
+      <MetricButton
+        hint={`${runningContainers} running / ${stopped} stopped`}
+        label="Containers"
+        onClick={() => onShowContainers('all')}
+        value={counts.containers}
+      />
+      <MetricButton
+        hint={`${imageDanglingCount(images)} dangling`}
+        label="Images"
+        onClick={() => onNavigate('images')}
+        value={counts.images}
+      />
+      <MetricButton
+        hint={`${volumes.filter((volume) => volume.inUse).length} in use`}
+        label="Volumes"
+        onClick={() => onNavigate('volumes')}
+        value={counts.volumes}
+      />
+      <button
+        className="rounded-card border border-border bg-bg-card p-4 text-left transition hover:border-border-strong hover:bg-bg-panel"
+        onClick={onCleanUp}
+        type="button"
+      >
+        <div className="text-sm text-text-secondary">Disk</div>
+        <div className="mt-3 text-2xl font-semibold">{formatBytes(diskTotal)}</div>
+        <div className="mt-2 text-xs text-text-muted">
+          {formatBytes(diskReclaimable)} reclaimable
+        </div>
+      </button>
+    </section>
+  );
+}
+
+function ResourceUsagePanel({
+  metric,
+  onMetricChange,
+  onPauseChange,
+  onRangeChange,
+  onStackedChange,
+  paused,
+  points,
+  range,
+  stacked,
+}: {
+  metric: DashboardMetricID;
+  range: DashboardRangeID;
+  stacked: boolean;
+  paused: boolean;
+  points: DashboardChartPoint[];
+  onMetricChange: (metric: DashboardMetricID) => void;
+  onRangeChange: (range: DashboardRangeID) => void;
+  onStackedChange: (stacked: boolean) => void;
+  onPauseChange: (paused: boolean) => void;
+}) {
+  const latest = points[points.length - 1];
+  const title =
+    metric === 'cpu'
+      ? `${(latest?.cpu ?? 0).toFixed(1)}% CPU`
+      : metric === 'memory'
+        ? `${formatBytes(latest?.memory ?? 0)} memory`
+        : `${formatRate(latest?.netRx ?? 0)} RX / ${formatRate(latest?.netTx ?? 0)} TX`;
+  const Icon = metric === 'cpu' ? Cpu : metric === 'memory' ? MemoryStick : Wifi;
+  return (
+    <Card>
+      <CardHeader
+        actions={
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            {(['5m', '1h', '24h'] as DashboardRangeID[]).map((item) => (
+              <button
+                className={[
+                  'h-8 rounded-control border px-2 text-xs transition',
+                  range === item
+                    ? 'border-accent/40 bg-accent/10 text-accent'
+                    : 'border-border bg-bg-inset text-text-secondary hover:text-text-primary',
+                ].join(' ')}
+                key={item}
+                onClick={() => onRangeChange(item)}
+                type="button"
+              >
+                {item}
+              </button>
+            ))}
+            <button
+              aria-pressed={stacked}
+              className={[
+                'h-8 rounded-control border px-2 text-xs transition',
+                stacked
+                  ? 'border-accent/40 bg-accent/10 text-accent'
+                  : 'border-border bg-bg-inset text-text-secondary hover:text-text-primary',
+              ].join(' ')}
+              onClick={() => onStackedChange(!stacked)}
+              type="button"
+            >
+              Stacked
+            </button>
+          </div>
+        }
+        title="Resource Usage"
+      />
+      <CardBody>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-control bg-accent/10 text-accent">
+              <Icon size={19} />
+            </div>
+            <div className="min-w-0">
+              <div className="text-lg font-semibold">{title}</div>
+              <div className="text-xs text-text-muted">
+                {paused ? 'Paused' : `${points.length}/300 points`}
+              </div>
+            </div>
+          </div>
+          <div className="flex rounded-control border border-border bg-bg-inset p-0.5">
+            {(['cpu', 'memory', 'network'] as DashboardMetricID[]).map((item) => (
+              <button
+                className={[
+                  'h-8 rounded-control px-3 text-xs font-medium capitalize transition',
+                  metric === item
+                    ? 'bg-bg-card text-text-primary'
+                    : 'text-text-secondary hover:text-text-primary',
+                ].join(' ')}
+                key={item}
+                onClick={() => onMetricChange(item)}
+                type="button"
+              >
+                {item}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div
+          className="mt-4 h-72"
+          onMouseEnter={() => onPauseChange(true)}
+          onMouseLeave={() => onPauseChange(false)}
+        >
+          <ResponsiveContainer height="100%" width="100%">
+            <AreaChart data={points} margin={{ bottom: 0, left: 0, right: 8, top: 8 }}>
+              <CartesianGrid stroke="rgba(255,255,255,0.1)" vertical={false} />
+              <XAxis dataKey="label" minTickGap={28} stroke="#8B949E" tick={{ fontSize: 11 }} />
+              <YAxis
+                stroke="#8B949E"
+                tick={{ fontSize: 11 }}
+                tickFormatter={(value) =>
+                  metric === 'memory'
+                    ? formatBytes(Number(value))
+                    : metric === 'network'
+                      ? formatRate(Number(value))
+                      : `${Number(value).toFixed(0)}%`
+                }
+                width={56}
+              />
+              <RechartsTooltip content={<DashboardChartTooltip metric={metric} />} />
+              {metric === 'cpu' ? (
+                <Area
+                  dataKey="cpu"
+                  fill="#2DD4A7"
+                  fillOpacity={0.22}
+                  isAnimationActive={false}
+                  name="CPU"
+                  stroke="#2DD4A7"
+                  strokeWidth={2}
+                  type="monotone"
                 />
               ) : null}
-            </div>
-          </CardBody>
-        </Card>
+              {metric === 'memory' ? (
+                <Area
+                  dataKey="memory"
+                  fill="#A78BFA"
+                  fillOpacity={0.2}
+                  isAnimationActive={false}
+                  name="Memory"
+                  stroke="#A78BFA"
+                  strokeWidth={2}
+                  type="monotone"
+                />
+              ) : null}
+              {metric === 'network' ? (
+                <>
+                  <Area
+                    dataKey="netRx"
+                    fill="#4D9FFF"
+                    fillOpacity={0.18}
+                    isAnimationActive={false}
+                    name="RX"
+                    stackId={stacked ? 'network' : undefined}
+                    stroke="#4D9FFF"
+                    strokeWidth={2}
+                    type="monotone"
+                  />
+                  <Area
+                    dataKey="netTx"
+                    fill="#80B7FF"
+                    fillOpacity={0.14}
+                    isAnimationActive={false}
+                    name="TX"
+                    stackId={stacked ? 'network' : undefined}
+                    stroke="#80B7FF"
+                    strokeWidth={2}
+                    type="monotone"
+                  />
+                </>
+              ) : null}
+            </AreaChart>
+          </ResponsiveContainer>
+        </div>
+      </CardBody>
+    </Card>
+  );
+}
 
-        <Card>
-          <CardHeader
-            actions={<HardDrive size={16} className="text-text-muted" />}
-            title="Disk Usage"
+function DashboardChartTooltip({
+  active,
+  label,
+  payload,
+  metric,
+}: {
+  active?: boolean;
+  label?: string;
+  payload?: Array<{ dataKey?: string; name?: string; value?: number }>;
+  metric: DashboardMetricID;
+}) {
+  if (!active || !payload?.length) {
+    return null;
+  }
+  return (
+    <div className="rounded-control border border-border bg-bg-panel px-3 py-2 text-xs shadow">
+      <div className="mb-1 font-medium text-text-primary">{label}</div>
+      {payload.map((entry) => (
+        <div className="text-text-secondary" key={entry.dataKey ?? entry.name}>
+          {entry.name}: {formatMetricValue(metric, Number(entry.value ?? 0), entry.dataKey)}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ProjectsMiniList({
+  loading,
+  onOpenProject,
+  onViewAll,
+  projectSparks,
+  projects,
+}: {
+  projects: ProjectSummary[];
+  loading: boolean;
+  projectSparks: Record<string, SparkPoint[]>;
+  onOpenProject: (project: ProjectSummary) => void;
+  onViewAll: () => void;
+}) {
+  return (
+    <Card>
+      <CardHeader
+        actions={
+          <Button onClick={onViewAll} size="sm" variant="ghost">
+            View all
+          </Button>
+        }
+        title="Projects"
+      />
+      <CardBody>
+        {loading && projects.length === 0 ? <Skeleton className="h-32" /> : null}
+        {!loading && projects.length === 0 ? (
+          <EmptyState
+            body="Import a Compose project to track services here."
+            icon={<LayoutGrid size={28} />}
+            title="No projects"
           />
-          <CardBody>
-            <div className="text-3xl font-semibold">
-              {formatBytes(diskTotal)}
-            </div>
-            <div className="mt-1 text-sm text-text-muted">
-              {formatBytes(diskReclaimable)} reclaimable
-            </div>
-            <div className="mt-5 h-3 overflow-hidden rounded-full bg-bg-inset">
-              <div
-                className="h-full bg-accent"
-                style={{
-                  width: `${diskTotal > 0 ? Math.max(8, ((diskTotal - diskReclaimable) / diskTotal) * 100) : 0}%`,
-                }}
+        ) : null}
+        <div className="space-y-3">
+          {projects.map((project) => (
+            <button
+              className="grid w-full grid-cols-[1fr_72px] items-center gap-3 rounded-control border border-border bg-bg-inset p-3 text-left transition hover:border-border-strong"
+              key={project.id}
+              onClick={() => onOpenProject(project)}
+              type="button"
+            >
+              <div className="min-w-0">
+                <div className="flex items-center gap-2">
+                  <StatusDot tone={dotTone(projectStatusTone(project.status))} />
+                  <span className="truncate font-medium">{project.name}</span>
+                </div>
+                <div className="mt-1 text-xs text-text-muted">
+                  {project.servicesRunning}/{project.servicesTotal} services
+                </div>
+                <div className="mt-2 flex flex-wrap gap-1">
+                  {projectUpdateBadges(project)}
+                </div>
+              </div>
+              <Sparkline
+                color="#2DD4A7"
+                points={projectSparks[project.id] ?? projectSparkPoints(project)}
+              />
+            </button>
+          ))}
+        </div>
+      </CardBody>
+    </Card>
+  );
+}
+
+function ContainerHealthPanel({
+  containerSparks,
+  containers,
+  latestSamples,
+  onShowContainers,
+  paused,
+  running,
+  stopped,
+  unhealthy,
+}: {
+  containers: ContainerSummary[];
+  latestSamples: Record<string, StatsSample>;
+  containerSparks: Record<string, SparkPoint[]>;
+  running: number;
+  stopped: number;
+  unhealthy: number;
+  paused: number;
+  onShowContainers: (filter: FilterID) => void;
+}) {
+  const data = [
+    { name: 'Running', value: running, color: '#2DD4A7', filter: 'running' },
+    { name: 'Stopped', value: stopped, color: '#8B949E', filter: 'stopped' },
+    { name: 'Unhealthy', value: unhealthy, color: '#F0605D', filter: 'unhealthy' },
+    { name: 'Paused', value: paused, color: '#F5B83D', filter: 'paused' },
+  ].filter((item) => item.value > 0);
+  return (
+    <Card>
+      <CardHeader
+        actions={
+          <Badge tone={unhealthy > 0 ? 'error' : 'ok'}>
+            {unhealthy} unhealthy
+          </Badge>
+        }
+        title="Container Status"
+      />
+      <CardBody>
+        <div className="grid gap-4 lg:grid-cols-[220px_1fr]">
+          <div className="h-56">
+            <ResponsiveContainer height="100%" width="100%">
+              <RechartsPieChart>
+                <Pie
+                  data={data.length > 0 ? data : [{ name: 'None', value: 1, color: '#8B949E', filter: 'all' }]}
+                  dataKey="value"
+                  innerRadius={58}
+                  isAnimationActive={false}
+                  nameKey="name"
+                  outerRadius={86}
+                >
+                  {(data.length > 0
+                    ? data
+                    : [{ name: 'None', value: 1, color: '#8B949E', filter: 'all' }]
+                  ).map((item) => (
+                    <Cell fill={item.color} key={item.name} />
+                  ))}
+                </Pie>
+              </RechartsPieChart>
+            </ResponsiveContainer>
+          </div>
+          <div className="min-w-0 space-y-2">
+            {[
+              ['running', 'Running', running, 'ok'],
+              ['stopped', 'Stopped', stopped, 'neutral'],
+              ['unhealthy', 'Unhealthy', unhealthy, unhealthy > 0 ? 'error' : 'neutral'],
+              ['paused', 'Paused', paused, 'warn'],
+            ].map(([filter, label, value, tone]) => (
+              <button
+                className="flex w-full items-center justify-between rounded-control border border-border bg-bg-inset px-3 py-2 text-sm transition hover:border-border-strong"
+                key={String(filter)}
+                onClick={() => onShowContainers(String(filter))}
+                type="button"
+              >
+                <span className="flex items-center gap-2">
+                  <StatusDot tone={dotTone(tone as BadgeTone)} />
+                  {label}
+                </span>
+                <span className="font-medium">{value}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="mt-4 overflow-hidden rounded-control border border-border">
+          <table className="w-full table-fixed text-sm">
+            <thead className="bg-bg-inset text-xs uppercase text-text-muted">
+              <tr>
+                <th className="px-3 py-2 text-left font-medium">Name</th>
+                <th className="px-3 py-2 text-left font-medium">Project</th>
+                <th className="px-3 py-2 text-left font-medium">Status</th>
+                <th className="px-3 py-2 text-left font-medium">CPU</th>
+                <th className="px-3 py-2 text-left font-medium">Memory</th>
+                <th className="px-3 py-2 text-left font-medium">Uptime</th>
+              </tr>
+            </thead>
+            <tbody>
+              {containers.map((container) => {
+                const sample = latestSamples[container.id];
+                return (
+                  <tr
+                    className="border-t border-border hover:bg-bg-inset"
+                    key={container.id}
+                  >
+                    <td className="truncate px-3 py-2">{container.name}</td>
+                    <td className="truncate px-3 py-2 text-text-muted">
+                      {container.projectID || '-'}
+                    </td>
+                    <td className="px-3 py-2">
+                      <Badge tone={containerTone(container)}>
+                        {container.state || 'unknown'}
+                      </Badge>
+                    </td>
+                    <td className="px-3 py-2">
+                      <Sparkline
+                        color="#2DD4A7"
+                        points={
+                          containerSparks[container.id] ??
+                          containerSparkPoints(container)
+                        }
+                      />
+                    </td>
+                    <td className="truncate px-3 py-2 text-text-muted">
+                      {formatBytes(sample?.memoryBytes ?? container.memoryBytes)}
+                    </td>
+                    <td className="truncate px-3 py-2 text-text-muted">
+                      {sample?.uptimeSeconds
+                        ? formatDuration(sample.uptimeSeconds)
+                        : relativeTime(dateMillis(container.createdAt))}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+          {containers.length === 0 ? (
+            <div className="p-4">
+              <EmptyState
+                body="Import a project or run an image to populate the local inventory."
+                icon={<Container size={28} />}
+                title="No containers yet"
               />
             </div>
-            <div className="mt-5 grid grid-cols-2 gap-2 text-xs text-text-muted">
-              <span>Images {images.length}</span>
-              <span>Volumes {volumes.length}</span>
-              <span>Containers {containers.length}</span>
-              <span>Networks {networks.length}</span>
+          ) : null}
+        </div>
+      </CardBody>
+    </Card>
+  );
+}
+
+function LogsPeekPanel({
+  lines,
+  onOpenLogs,
+}: {
+  lines: LogLine[];
+  onOpenLogs: () => void;
+}) {
+  return (
+    <Card>
+      <CardHeader
+        actions={
+          <Button onClick={onOpenLogs} size="sm" variant="ghost">
+            Open Logs
+          </Button>
+        }
+        title="Logs Peek"
+      />
+      <CardBody>
+        <button
+          className="block h-48 w-full overflow-hidden rounded-control border border-border bg-bg-inset p-3 text-left font-mono text-xs"
+          onClick={onOpenLogs}
+          type="button"
+        >
+          {lines.length === 0 ? (
+            <span className="text-text-muted">No log lines yet</span>
+          ) : (
+            lines.map((line) => (
+              <div className="grid grid-cols-[auto_1fr] gap-2" key={`${line.ts}-${line.text}`}>
+                <span className={logLevelClass(normalizeLogLevel(line.level))}>
+                  {normalizeLogLevel(line.level).toUpperCase()}
+                </span>
+                <span className="truncate text-text-secondary">{line.text}</span>
+              </div>
+            ))
+          )}
+        </button>
+      </CardBody>
+    </Card>
+  );
+}
+
+function UpdatesCard({
+  onOpenProjects,
+  projects,
+  summary,
+}: {
+  projects: ProjectSummary[];
+  summary: { image: number; base: number; rebuild: number };
+  onOpenProjects: () => void;
+}) {
+  const updateProjects = projects
+    .filter((project) => projectUpdateCount(project) > 0)
+    .slice(0, 3);
+  const total = summary.image + summary.base;
+  return (
+    <Card>
+      <CardHeader
+        actions={
+          <Button
+            disabled
+            disabledReason="Registry update checks begin in Phase 8"
+            icon={<RefreshCw size={15} />}
+            size="sm"
+          >
+            Check now
+          </Button>
+        }
+        title="Updates Available"
+      />
+      <CardBody>
+        <div className="text-lg font-semibold">
+          {total} updates available - {summary.rebuild} rebuild needed
+        </div>
+        <div className="mt-3 space-y-2">
+          {updateProjects.length === 0 ? (
+            <Badge tone="ok">Up to date</Badge>
+          ) : (
+            updateProjects.map((project) => (
+              <div
+                className="flex items-center justify-between gap-2 rounded-control border border-border bg-bg-inset px-3 py-2 text-sm"
+                key={project.id}
+              >
+                <span className="min-w-0 truncate">{project.name}</span>
+                <span className="flex shrink-0 gap-1">
+                  {projectUpdateBadges(project)}
+                </span>
+              </div>
+            ))
+          )}
+        </div>
+        <Button className="mt-4 w-full" onClick={onOpenProjects} variant="secondary">
+          Open Updates
+        </Button>
+      </CardBody>
+    </Card>
+  );
+}
+
+function TopContainersTable({ rows }: { rows: MetricRankItem[] }) {
+  return (
+    <Card>
+      <CardHeader
+        actions={<BarChart3 size={16} className="text-text-muted" />}
+        title="Top Containers"
+      />
+      <CardBody>
+        <div className="overflow-hidden rounded-control border border-border">
+          <table className="w-full table-fixed text-sm">
+            <thead className="bg-bg-inset text-xs uppercase text-text-muted">
+              <tr>
+                <th className="px-3 py-2 text-left font-medium">Name</th>
+                <th className="px-3 py-2 text-left font-medium">Kind</th>
+                <th className="px-3 py-2 text-left font-medium">CPU</th>
+                <th className="px-3 py-2 text-left font-medium">Memory</th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row) => (
+                <tr className="border-t border-border" key={row.id}>
+                  <td className="truncate px-3 py-2">{row.name}</td>
+                  <td className="px-3 py-2 text-text-muted">{row.kind}</td>
+                  <td className="px-3 py-2">{(row.cpuPercent ?? 0).toFixed(1)}%</td>
+                  <td className="px-3 py-2 text-text-muted">
+                    {formatBytes(row.memoryBytes)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {rows.length === 0 ? (
+            <div className="p-4 text-sm text-text-muted">No stats samples yet</div>
+          ) : null}
+        </div>
+      </CardBody>
+    </Card>
+  );
+}
+
+function RecentEventsPanel({ events }: { events: AuditEntry[] }) {
+  return (
+    <Card>
+      <CardHeader
+        actions={<Activity size={16} className="text-text-muted" />}
+        title="Recent Events"
+      />
+      <CardBody>
+        <div className="space-y-2">
+          {events.slice(0, 10).map((event) => (
+            <div
+              className="rounded-control border border-border bg-bg-inset px-3 py-2 text-sm"
+              key={event.id}
+            >
+              <div className="flex items-center justify-between gap-2">
+                <span className="min-w-0 truncate">{event.action}</span>
+                <Badge tone={event.result === 'success' ? 'ok' : 'neutral'}>
+                  {event.result || 'event'}
+                </Badge>
+              </div>
+              <div className="mt-1 truncate text-xs text-text-muted">
+                {event.target || event.actor || 'docker'} -{' '}
+                {relativeTime(dateMillis(event.ts))}
+              </div>
             </div>
-          </CardBody>
-        </Card>
-      </section>
+          ))}
+          {events.length === 0 ? (
+            <div className="text-sm text-text-muted">No recent Docker events</div>
+          ) : null}
+        </div>
+      </CardBody>
+    </Card>
+  );
+}
+
+function CleanupModal({
+  diskReclaimable,
+  onChange,
+  onClose,
+  state,
+}: {
+  state: CleanupState;
+  diskReclaimable: number;
+  onChange: (patch: Partial<CleanupState>) => void;
+  onClose: () => void;
+}) {
+  const requiresTypedName = state.includeVolumes;
+  const typedReady = !requiresTypedName || state.typedName === 'DELETE VOLUMES';
+  return (
+    <Modal onClose={onClose} open={state.open} size="md" title="Clean Up Docker Space">
+      <div className="space-y-4">
+        <div className="rounded-control border border-warn/30 bg-warn/10 p-3 text-sm text-warn">
+          {formatBytes(diskReclaimable)} is currently reclaimable.
+        </div>
+        <div className="grid gap-2">
+          {[
+            ['includeImages', 'Unused images'],
+            ['includeContainers', 'Stopped containers'],
+            ['includeBuildCache', 'Build cache'],
+            ['includeVolumes', 'Unused volumes'],
+          ].map(([key, label]) => (
+            <label
+              className="flex items-center gap-3 rounded-control border border-border bg-bg-inset px-3 py-2 text-sm"
+              key={key}
+            >
+              <input
+                checked={Boolean(state[key as keyof CleanupState])}
+                onChange={(event) =>
+                  onChange({
+                    [key]: event.target.checked,
+                    typedName: key === 'includeVolumes' ? '' : state.typedName,
+                  } as Partial<CleanupState>)
+                }
+                type="checkbox"
+              />
+              {label}
+            </label>
+          ))}
+        </div>
+        {requiresTypedName ? (
+          <label className="block text-sm">
+            <span className="mb-1 block text-text-secondary">
+              Type DELETE VOLUMES to confirm
+            </span>
+            <input
+              className="h-10 w-full rounded-control border border-border bg-bg-inset px-3 text-text-primary outline-none"
+              onChange={(event) => onChange({ typedName: event.target.value })}
+              value={state.typedName}
+            />
+          </label>
+        ) : null}
+        <div className="rounded-control border border-border bg-bg-inset p-3 font-mono text-xs text-text-muted">
+          {cleanupPreviewCommands(state).map((line) => (
+            <div key={line}>$ {line}</div>
+          ))}
+        </div>
+        <div className="flex justify-end gap-2">
+          <Button onClick={onClose} variant="ghost">
+            Cancel
+          </Button>
+          <Button
+            disabled={!typedReady}
+            disabledReason="Type the confirmation text first"
+            onClick={onClose}
+            variant="danger"
+          >
+            Confirm preview
+          </Button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function Sparkline({
+  color,
+  points,
+}: {
+  points: SparkPoint[];
+  color: string;
+}) {
+  const data = points.length > 0 ? points : [{ label: '0', value: 0 }];
+  return (
+    <div className="h-10 w-full min-w-0">
+      <ResponsiveContainer height="100%" width="100%">
+        <LineChart data={data} margin={{ bottom: 2, left: 0, right: 0, top: 2 }}>
+          <Line
+            dataKey="value"
+            dot={false}
+            isAnimationActive={false}
+            stroke={color}
+            strokeWidth={2}
+            type="monotone"
+          />
+        </LineChart>
+      </ResponsiveContainer>
     </div>
   );
 }
@@ -2852,6 +3982,54 @@ function ProjectsPage({
     () => sortProjects(filterProjects(projects, search, filter), sort),
     [filter, projects, search, sort],
   );
+  const [projectSparks, setProjectSparks] = useState<
+    Record<string, SparkPoint[]>
+  >({});
+
+  useEffect(() => {
+    if (projects.length === 0) {
+      return undefined;
+    }
+    let cancelled = false;
+    let activeStreamID: string | null = null;
+    const streamIDRef = { current: null as string | null };
+    const off = Events.On('stats:sample', (event) => {
+      const payload = eventPayload<StatsSamplePayload>(event);
+      if (!payload || payload.streamID !== streamIDRef.current) {
+        return;
+      }
+      const samples = (payload.samples ?? []).filter(isStatsSample);
+      if (samples.length === 0) {
+        return;
+      }
+      setProjectSparks((current) =>
+        appendSparkEntries(
+          current,
+          projectSparkEntries(samples, sampleLabel(samples[0])),
+        ),
+      );
+    });
+    MetricsService.StartStatsStream({ kind: 'all', ids: [] })
+      .then((streamID) => {
+        if (cancelled) {
+          void MetricsService.StopStream(streamID);
+          return;
+        }
+        activeStreamID = streamID;
+        streamIDRef.current = streamID;
+      })
+      .catch(() => {
+        setProjectSparks({});
+      });
+    return () => {
+      cancelled = true;
+      off();
+      if (activeStreamID) {
+        void MetricsService.StopStream(activeStreamID);
+      }
+    };
+  }, [projects.length]);
+
   if (loading && projects.length === 0) {
     return <TableSkeleton />;
   }
@@ -2971,6 +4149,7 @@ function ProjectsPage({
               onAction={onAction}
               onOpen={onOpen}
               project={project}
+              sparkPoints={projectSparks[project.id]}
             />
           ))}
         </section>
@@ -3001,8 +4180,10 @@ function ProjectCard({
   onAction,
   onOpen,
   project,
+  sparkPoints,
 }: {
   project: ProjectSummary;
+  sparkPoints?: SparkPoint[];
   actionBusyIDs: Set<string>;
   onAction: (action: ProjectAction, project: ProjectSummary) => void;
   onOpen: (project: ProjectSummary) => void;
@@ -3063,15 +4244,10 @@ function ProjectCard({
         </div>
 
         <div className="h-10 overflow-hidden rounded-control border border-border bg-bg-inset px-2 py-2">
-          <div className="flex h-full items-end gap-1">
-            {sparkBars(project.id).map((height, index) => (
-              <span
-                className="flex-1 rounded-sm bg-accent/50"
-                key={index}
-                style={{ height: `${height}%` }}
-              />
-            ))}
-          </div>
+          <Sparkline
+            color="#2DD4A7"
+            points={sparkPoints ?? projectSparkPoints(project)}
+          />
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -5892,13 +7068,24 @@ function MetricButton({
   );
 }
 
-function StatusPill({ label, ok }: { label: string; ok: boolean }) {
+function StatusPill({
+  label,
+  ok,
+  value,
+}: {
+  label: string;
+  ok: boolean;
+  value?: string;
+}) {
   return (
     <div className="rounded-control border border-border bg-bg-inset p-3">
       <div className="flex items-center gap-2">
         <StatusDot tone={ok ? 'ok' : 'neutral'} />
         <span>{label}</span>
       </div>
+      {value ? (
+        <div className="mt-1 truncate text-xs text-text-muted">{value}</div>
+      ) : null}
     </div>
   );
 }
@@ -6430,6 +7617,227 @@ function projectUpdateCount(project: ProjectSummary) {
   );
 }
 
+function summarizeProjectUpdates(projects: ProjectSummary[]) {
+  return projects.reduce(
+    (summary, project) => {
+      const badges = project.updateBadges;
+      summary.image += badges?.imageUpdates ?? 0;
+      summary.base += badges?.baseUpdates ?? 0;
+      summary.rebuild += badges?.rebuildNeeded ?? 0;
+      return summary;
+    },
+    { image: 0, base: 0, rebuild: 0 },
+  );
+}
+
+function projectUpdateBadges(project: ProjectSummary) {
+  const badges = project.updateBadges;
+  if (!badges || projectUpdateCount(project) === 0) {
+    return [<Badge key="up-to-date" tone="ok">Up to date</Badge>];
+  }
+  const out = [];
+  if (badges.imageUpdates > 0) {
+    out.push(<Badge key="image" tone="warn">{badges.imageUpdates} image</Badge>);
+  }
+  if (badges.baseUpdates > 0) {
+    out.push(<Badge key="base" tone="warn">{badges.baseUpdates} base</Badge>);
+  }
+  if (badges.rebuildNeeded > 0) {
+    out.push(<Badge key="rebuild" tone="warn">{badges.rebuildNeeded} rebuild</Badge>);
+  }
+  if (badges.pinned > 0) {
+    out.push(<Badge key="pinned" tone="neutral">{badges.pinned} pinned</Badge>);
+  }
+  if (badges.unknownBase > 0) {
+    out.push(<Badge key="unknown" tone="neutral">{badges.unknownBase} unknown</Badge>);
+  }
+  return out;
+}
+
+function isStatsSample(value: unknown): value is StatsSample {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  const sample = value as Partial<StatsSample>;
+  return (
+    typeof sample.containerID === 'string' &&
+    typeof sample.cpuPercent === 'number' &&
+    typeof sample.memoryBytes === 'number'
+  );
+}
+
+function sampleLabel(sample: StatsSample) {
+  const date = toDate(sample.sampledAt) ?? new Date();
+  return date.toLocaleTimeString(undefined, {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+}
+
+function aggregateChartPoint(
+  samples: StatsSample[],
+  label: string,
+): DashboardChartPoint {
+  return {
+    ts: Date.now(),
+    label,
+    cpu: samples.reduce((sum, sample) => sum + sample.cpuPercent, 0),
+    memory: samples.reduce((sum, sample) => sum + sample.memoryBytes, 0),
+    netRx: samples.reduce((sum, sample) => sum + sample.networkRxRate, 0),
+    netTx: samples.reduce((sum, sample) => sum + sample.networkTxRate, 0),
+  };
+}
+
+function trimChartPoints(points: DashboardChartPoint[]) {
+  return points.length > 300 ? points.slice(points.length - 300) : points;
+}
+
+function appendSparkEntries(
+  current: Record<string, SparkPoint[]>,
+  entries: Array<{ id: string; label: string; value: number }>,
+) {
+  if (entries.length === 0) {
+    return current;
+  }
+  const next = { ...current };
+  for (const entry of entries) {
+    if (!entry.id) {
+      continue;
+    }
+    const existing = next[entry.id] ?? [];
+    next[entry.id] = existing
+      .concat({ label: entry.label, value: entry.value })
+      .slice(-60);
+  }
+  return next;
+}
+
+function projectSparkEntries(samples: StatsSample[], label: string) {
+  const grouped = new Map<string, number>();
+  for (const sample of samples) {
+    if (!sample.projectID) {
+      continue;
+    }
+    grouped.set(
+      sample.projectID,
+      (grouped.get(sample.projectID) ?? 0) + sample.cpuPercent,
+    );
+  }
+  return Array.from(grouped.entries()).map(([id, value]) => ({
+    id,
+    label,
+    value,
+  }));
+}
+
+function dashboardTopRows(
+  dashboardTop: MetricRankItem[],
+  latestSamples: Record<string, StatsSample>,
+) {
+  const liveRows = Object.values(latestSamples)
+    .map(
+      (sample): MetricRankItem => ({
+        id: sample.containerID,
+        name: sample.containerName || shortID(sample.containerID),
+        kind: 'container',
+        cpuPercent: sample.cpuPercent,
+        memoryBytes: sample.memoryBytes,
+      }),
+    )
+    .sort(
+      (left, right) =>
+        (right.cpuPercent ?? 0) - (left.cpuPercent ?? 0) ||
+        (right.memoryBytes ?? 0) - (left.memoryBytes ?? 0),
+    )
+    .slice(0, 8);
+  return liveRows.length > 0 ? liveRows : dashboardTop.slice(0, 8);
+}
+
+function projectActivityScore(project: ProjectSummary, points?: SparkPoint[]) {
+  const latest = points?.[points.length - 1]?.value ?? project.cpuPercent;
+  return latest + project.memoryBytes / 1024 / 1024 / 1024;
+}
+
+function projectSparkPoints(project: ProjectSummary): SparkPoint[] {
+  const baseline = Math.max(0.2, project.cpuPercent);
+  return sparkBars(project.id).map((height, index) => ({
+    label: String(index),
+    value: Math.max(0, (height / 100) * baseline),
+  }));
+}
+
+function containerSparkPoints(container: ContainerSummary): SparkPoint[] {
+  const baseline = Math.max(0.2, container.cpuPercent ?? 0);
+  return sparkBars(container.id).map((height, index) => ({
+    label: String(index),
+    value: Math.max(0, (height / 100) * baseline),
+  }));
+}
+
+function formatRate(value: number) {
+  return `${formatBytes(value)}/s`;
+}
+
+function formatMetricValue(
+  metric: DashboardMetricID,
+  value: number,
+  key?: string,
+) {
+  if (metric === 'memory') {
+    return formatBytes(value);
+  }
+  if (metric === 'network' || key === 'netRx' || key === 'netTx') {
+    return formatRate(value);
+  }
+  return `${value.toFixed(1)}%`;
+}
+
+function formatDuration(seconds: number) {
+  if (seconds < 60) {
+    return `${seconds}s`;
+  }
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) {
+    return `${minutes}m`;
+  }
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    return `${hours}h ${minutes % 60}m`;
+  }
+  return `${Math.floor(hours / 24)}d ${hours % 24}h`;
+}
+
+function logLevelClass(level: LogLevelFilter) {
+  switch (level) {
+    case 'error':
+      return 'text-error';
+    case 'warn':
+      return 'text-warn';
+    case 'info':
+      return 'text-info';
+    default:
+      return 'text-text-muted';
+  }
+}
+
+function cleanupPreviewCommands(state: CleanupState) {
+  const commands = [];
+  if (state.includeImages) {
+    commands.push('docker image prune --all');
+  }
+  if (state.includeContainers) {
+    commands.push('docker container prune');
+  }
+  if (state.includeBuildCache) {
+    commands.push('docker builder prune');
+  }
+  if (state.includeVolumes) {
+    commands.push('docker volume prune');
+  }
+  return commands.length > 0 ? commands : ['docker system df'];
+}
+
 function projectActionBusyKey(action: ProjectAction, projectID: string) {
   return `project:${action}:${projectID}`;
 }
@@ -6452,6 +7860,10 @@ function projectStatusTone(status: string): BadgeTone {
     default:
       return 'info';
   }
+}
+
+function dotTone(tone: BadgeTone): StatusToneID {
+  return tone === 'accent' ? 'info' : tone;
 }
 
 function sparkBars(seed: string) {

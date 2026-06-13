@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { InventorySnapshot } from './api/inventory';
 import type {
   CommandPlan,
+  DashboardMetrics,
   DiskUsageCategory,
   LogLine,
   ProjectDetail,
@@ -83,6 +84,14 @@ const logsServiceMock = vi.hoisted(() => ({
   ExportLogs: vi.fn(),
 }));
 
+const metricsServiceMock = vi.hoisted(() => ({
+  GetDashboardMetrics: vi.fn(),
+  GetProjectMetrics: vi.fn(),
+  GetContainerMetrics: vi.fn(),
+  StartStatsStream: vi.fn(),
+  StopStream: vi.fn(),
+}));
+
 vi.mock('./api/app', () => ({
   getAppVersion: vi.fn().mockResolvedValue({
     version: '0.1.0',
@@ -97,6 +106,7 @@ vi.mock('./api/inventory', () => ({
 vi.mock('./api/services', () => ({
   DockerService: dockerServiceMock,
   LogsService: logsServiceMock,
+  MetricsService: metricsServiceMock,
   ProjectService: projectServiceMock,
 }));
 
@@ -198,6 +208,18 @@ describe('App inventory shell', () => {
       bytes: 42,
       lineCount: 2,
     });
+    metricsServiceMock.GetDashboardMetrics.mockReset();
+    metricsServiceMock.GetProjectMetrics.mockReset();
+    metricsServiceMock.GetContainerMetrics.mockReset();
+    metricsServiceMock.StartStatsStream.mockReset();
+    metricsServiceMock.StopStream.mockReset();
+    metricsServiceMock.GetDashboardMetrics.mockResolvedValue(
+      seededDashboardMetrics(),
+    );
+    metricsServiceMock.GetProjectMetrics.mockResolvedValue({ series: [] });
+    metricsServiceMock.GetContainerMetrics.mockResolvedValue({ series: [] });
+    metricsServiceMock.StartStatsStream.mockResolvedValue('stats-stream-1');
+    metricsServiceMock.StopStream.mockResolvedValue(undefined);
     runtimeMock.openFile.mockResolvedValue('');
     runtimeMock.saveFile.mockResolvedValue('/tmp/cairn-logs.jsonl');
     runtimeMock.setClipboardText.mockResolvedValue(undefined);
@@ -245,10 +267,79 @@ describe('App inventory shell', () => {
       await screen.findByText('Docker Engine - Running'),
     ).toBeInTheDocument();
     expect(screen.getAllByText('cairn-dev').length).toBeGreaterThan(0);
+    await waitFor(() =>
+      expect(metricsServiceMock.GetDashboardMetrics).toHaveBeenCalled(),
+    );
+    expect(metricsServiceMock.StartStatsStream).toHaveBeenCalledWith({
+      kind: 'all',
+      ids: [],
+    });
     expect(runtimeMock.on).toHaveBeenCalledWith(
       'objects:changed',
       expect.any(Function),
     );
+  });
+
+  it('updates dashboard charts from stats samples and deep-links container filters', async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
+
+    render(<App />);
+
+    await screen.findByText('Docker Engine - Running');
+    await waitFor(() => expect(metricsServiceMock.StartStatsStream).toHaveBeenCalled());
+
+    emitRuntimeEvent('stats:sample', {
+      streamID: 'stats-stream-1',
+      samples: [
+        statsSample({
+          cpuPercent: 31.2,
+          memoryBytes: 96 * 1024 * 1024,
+          networkRxRate: 4096,
+          networkTxRate: 2048,
+        }),
+      ],
+    });
+
+    expect(await screen.findByText('31.2% CPU')).toBeInTheDocument();
+    expect(screen.getByText('Top Containers')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /Running1/ }));
+
+    expect(
+      await screen.findByRole('heading', { name: 'Containers' }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Running1/ })).toHaveClass(
+      'border-accent/40',
+    );
+  });
+
+  it('requires typed confirmation when cleanup includes volumes', async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+
+    await screen.findByText('Docker Engine - Running');
+    fireEvent.click(screen.getByRole('button', { name: 'Prune' }));
+
+    const dialog = await screen.findByRole('dialog', {
+      name: 'Clean Up Docker Space',
+    });
+    fireEvent.click(within(dialog).getByLabelText('Unused volumes'));
+
+    expect(
+      within(dialog).getByRole('button', { name: 'Confirm preview' }),
+    ).toBeDisabled();
+    fireEvent.change(
+      within(dialog).getByLabelText('Type DELETE VOLUMES to confirm'),
+      {
+        target: { value: 'DELETE VOLUMES' },
+      },
+    );
+
+    expect(
+      within(dialog).getByRole('button', { name: 'Confirm preview' }),
+    ).toBeEnabled();
   });
 
   it('lists containers and applies search without leaving the table view', async () => {
@@ -815,20 +906,26 @@ describe('App inventory shell', () => {
     expect(inventoryMock.getInventorySnapshot).toHaveBeenCalledTimes(1);
     vi.useFakeTimers();
 
-    const callback = runtimeMock.on.mock.calls[0]?.[1] as
-      | ((event?: unknown) => void)
-      | undefined;
-    expect(callback).toEqual(expect.any(Function));
-    callback?.({ name: 'objects:changed', data: undefined });
+    const callbacks = runtimeMock.on.mock.calls
+      .filter(([name]) => name === 'objects:changed')
+      .map(([, callback]) => callback as (event?: unknown) => void);
+    expect(callbacks.length).toBeGreaterThan(0);
+    act(() => {
+      callbacks.forEach((callback) =>
+        callback({ name: 'objects:changed', data: undefined }),
+      );
+    });
 
-    await vi.advanceTimersByTimeAsync(500);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
 
     expect(inventoryMock.getInventorySnapshot).toHaveBeenCalledTimes(2);
   });
 });
 
 function emitRuntimeEvent(eventName: string, data: unknown) {
-  const callback = runtimeMock.on.mock.calls.find(
+  const callback = [...runtimeMock.on.mock.calls].reverse().find(
     ([name]) => name === eventName,
   )?.[1] as ((event?: unknown) => void) | undefined;
   expect(callback).toEqual(expect.any(Function));
@@ -848,6 +945,62 @@ function logLine(patch: Partial<LogLine>): LogLine {
     text: 'INFO log line',
     ...patch,
   } as LogLine;
+}
+
+function statsSample(patch: Record<string, unknown> = {}) {
+  return {
+    providerID: 'linux_native',
+    projectID: 'cairn',
+    serviceID: 'web',
+    containerID: 'container-1',
+    containerName: 'web',
+    health: HealthStatus.HealthStatusHealthy,
+    restartCount: 0,
+    uptimeSeconds: 120,
+    cpuPercent: 2.4,
+    memoryBytes: 64 * 1024 * 1024,
+    memoryLimitBytes: 512 * 1024 * 1024,
+    networkRxBytes: 1024,
+    networkTxBytes: 512,
+    networkRxRate: 0,
+    networkTxRate: 0,
+    blockReadBytes: 0,
+    blockWriteBytes: 0,
+    blockReadRate: 0,
+    blockWriteRate: 0,
+    pids: 4,
+    sampledAt: '2026-06-13T09:00:01Z',
+    ...patch,
+  };
+}
+
+function seededDashboardMetrics(): DashboardMetrics {
+  return {
+    projects: 1,
+    containers: 1,
+    images: 1,
+    volumes: 1,
+    diskUsage: seededSnapshot().diskUsage,
+    top: [
+      {
+        id: 'container-1',
+        name: 'web',
+        kind: 'container',
+        cpuPercent: 2.4,
+        memoryBytes: 64 * 1024 * 1024,
+      },
+    ],
+    recentEvents: [
+      {
+        id: 1,
+        ts: '2026-06-13T09:00:00Z',
+        actor: 'cairn',
+        action: 'container.start',
+        target: 'web',
+        result: 'success',
+      },
+    ],
+  } as DashboardMetrics;
 }
 
 function seededSnapshot(): InventorySnapshot {
