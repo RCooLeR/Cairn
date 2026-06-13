@@ -108,10 +108,21 @@ func (r *LineageRepository) ListProject(ctx context.Context, projectID string) (
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		_ = rows.Close()
-	}()
-	return r.scanLineageRows(ctx, rows)
+	records, err := scanLineageRows(rows)
+	closeErr := rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	for i := range records {
+		records[i].BaseRefs, err = r.listBaseRefs(ctx, records[i].ID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return records, nil
 }
 
 func (r *LineageRepository) GetService(ctx context.Context, projectID string, service string) (LineageRecord, error) {
@@ -148,14 +159,10 @@ func (r *LineageRepository) GetContainer(ctx context.Context, containerID string
 	return record, nil
 }
 
-func (r *LineageRepository) scanLineageRows(ctx context.Context, rows *sql.Rows) ([]LineageRecord, error) {
+func scanLineageRows(rows *sql.Rows) ([]LineageRecord, error) {
 	records := []LineageRecord{}
 	for rows.Next() {
 		record, err := scanLineageRecord(rows)
-		if err != nil {
-			return nil, err
-		}
-		record.BaseRefs, err = r.listBaseRefs(ctx, record.ID)
 		if err != nil {
 			return nil, err
 		}
