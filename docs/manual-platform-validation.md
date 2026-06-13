@@ -136,6 +136,22 @@ Current evidence: backend unit tests cover backup planning warnings, sidecar/che
 - [ ] macOS Colima VM: run the real backup/restore round-trip against Colima.
 - [ ] Existing Docker context matrix: run backup/restore against Docker Desktop/remote contexts without mutating global `docker context show`.
 
+## Phase 8 Registry, Updates, and Image Lineage
+
+Current evidence: automated tests cover the 14 normative update/lineage/registry cases from `dev-docs/06-testing.md section 5`: service-image update statuses, mutable `latest` warning, pinned digests, private-auth/rate-limit/unreachable registries, base-image rebuild detection, multi-stage lineage, unknown-base wording, mixed project plan ordering, health failure rollback/manual guidance, ignore/unignore badges, registry login/logout/auth, tag/push/pull digest round-trip, and plaintext Docker config storage labeling. CI run 27482496569 passed on Ubuntu 24.04, Windows, and macOS; Ubuntu CI includes real Docker registry auth and tag/push integrations. Windows WSL and macOS Colima runtime update/tag-push smoke remain manual because those clean platform VMs are unavailable in this environment.
+
+- [x] Linux CI: run the full unit/contract/frontend suite plus real registry auth and tag/push integrations.
+- [x] Linux CI: verify real Docker integrations still pass after update UI and metrics stabilization.
+- [x] React-test global Updates journey, project Updates tab grouping, lineage confidence wording, unknown-base wording, history rollback, ignored unignore, and update notification routing.
+- [x] Backend-test update status machine, base-image status machine, mixed plan ordering, health rollback/manual guidance, backup-first option, ignore/unignore badges, registry auth, registry tag/push, and plaintext storage source mapping.
+- [ ] Windows WSL `cairn-dev`: run update journey against a seeded old service-image digest, apply one-click update with health watch, and verify history row.
+- [ ] Windows WSL `cairn-dev`: run rebuild journey on `build-simple` with mocked/new base digest and verify `build --pull` + `up -d`.
+- [ ] Windows WSL `cairn-dev`: run local authenticated `registry:2` login, tag, push, pull-back digest, logout, and auth-required check without using Docker Desktop contexts.
+- [ ] macOS Colima VM: run update journey against a seeded old service-image digest, apply one-click update with health watch, and verify history row.
+- [ ] macOS Colima VM: run rebuild journey on `build-simple` with mocked/new base digest and verify `build --pull` + `up -d`.
+- [ ] macOS Colima VM: run local authenticated `registry:2` login, tag, push, pull-back digest, logout, and auth-required check.
+- [ ] Existing Docker context matrix: repeat update/rebuild/tag-push smoke against Docker Desktop/OrbStack/remote contexts without mutating global `docker context show`.
+
 ## Full Platform Matrix TODO
 
 - [ ] Windows 11 x64: WSL present/absent, Ubuntu present/absent/multiple, Docker in Ubuntu present/absent, systemd on/off.
