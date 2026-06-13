@@ -25,6 +25,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/store"
 	"github.com/RCooLeR/Cairn/internal/terminal"
+	updatescore "github.com/RCooLeR/Cairn/internal/updates"
 	"github.com/google/uuid"
 )
 
@@ -108,6 +109,7 @@ type ProjectService struct {
 	Detector    ProjectDetector
 	Projects    *store.ProjectRepository
 	Objects     *store.ObjectCacheRepository
+	Updates     *store.UpdateRepository
 	Client      *composecore.Client
 	Audit       *store.AuditRepository
 	Plans       *security.ProjectPlanStore
@@ -130,7 +132,9 @@ type LogsService struct {
 type TerminalService struct {
 	Manager *terminal.Manager
 }
-type UpdateService struct{}
+type UpdateService struct {
+	Manager *updatescore.Manager
+}
 type ImageLineageService struct {
 	Manager *lineagecore.Manager
 }
@@ -825,6 +829,9 @@ func (s *ProjectService) ListProjects(ctx context.Context) ([]models.ProjectSumm
 		}
 		summaries = append(summaries, projectSummaryFromRecord(project, services))
 	}
+	if err := s.hydrateUpdateBadges(ctx, summaries); err != nil {
+		return nil, err
+	}
 	return summaries, nil
 }
 
@@ -849,8 +856,12 @@ func (s *ProjectService) GetProject(ctx context.Context, projectID string) (*mod
 		return nil, err
 	}
 	composeConfig := s.projectComposeConfig(ctx, project)
+	summaries := []models.ProjectSummary{projectSummaryFromRecord(project, services)}
+	if err := s.hydrateUpdateBadges(ctx, summaries); err != nil {
+		return nil, err
+	}
 	return &models.ProjectDetail{
-		Summary:    projectSummaryFromRecord(project, services),
+		Summary:    summaries[0],
 		Services:   statuses,
 		Containers: containers,
 		Compose:    composeConfig,
@@ -933,7 +944,14 @@ func (s *ProjectService) RefreshProjects(ctx context.Context) ([]models.ProjectS
 	if s.Detector == nil {
 		return nil, notReady()
 	}
-	return s.Detector.Reconcile(ctx)
+	summaries, err := s.Detector.Reconcile(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.hydrateUpdateBadges(ctx, summaries); err != nil {
+		return nil, err
+	}
+	return summaries, nil
 }
 
 func (s *ProjectService) StartProject(ctx context.Context, projectID string) error {
@@ -1143,20 +1161,32 @@ func (s *TerminalService) ListTerminalSessions(_ context.Context) ([]models.Term
 	return s.Manager.ListTerminalSessions(), nil
 }
 
-func (s *UpdateService) CheckAllUpdates(_ context.Context) (string, error) {
-	return "", notReady()
+func (s *UpdateService) CheckAllUpdates(ctx context.Context) (string, error) {
+	if s.Manager == nil {
+		return "", notReady()
+	}
+	return s.Manager.CheckAllUpdates(ctx)
 }
 
-func (s *UpdateService) CheckProjectUpdates(_ context.Context, projectID string) ([]models.ImageUpdate, error) {
-	return nil, notReady()
+func (s *UpdateService) CheckProjectUpdates(ctx context.Context, projectID string) ([]models.ImageUpdate, error) {
+	if s.Manager == nil {
+		return nil, notReady()
+	}
+	return s.Manager.CheckProjectUpdates(ctx, projectID)
 }
 
-func (s *UpdateService) CheckServiceUpdate(_ context.Context, projectID string, service string) (*models.ImageUpdate, error) {
-	return nil, notReady()
+func (s *UpdateService) CheckServiceUpdate(ctx context.Context, projectID string, service string) (*models.ImageUpdate, error) {
+	if s.Manager == nil {
+		return nil, notReady()
+	}
+	return s.Manager.CheckServiceUpdate(ctx, projectID, service)
 }
 
-func (s *UpdateService) ListCurrentUpdates(_ context.Context, filter models.UpdateFilter) ([]models.ImageUpdate, error) {
-	return nil, notReady()
+func (s *UpdateService) ListCurrentUpdates(ctx context.Context, filter models.UpdateFilter) ([]models.ImageUpdate, error) {
+	if s.Manager == nil {
+		return nil, notReady()
+	}
+	return s.Manager.ListCurrentUpdates(ctx, filter)
 }
 
 func (s *UpdateService) PlanServiceUpdate(_ context.Context, projectID string, service string) (*models.UpdatePlan, error) {
@@ -1171,16 +1201,25 @@ func (s *UpdateService) ApplyUpdate(_ context.Context, req models.ApplyUpdateReq
 	return "", notReady()
 }
 
-func (s *UpdateService) IgnoreUpdate(_ context.Context, req models.IgnoreUpdateRequest) error {
-	return notReady()
+func (s *UpdateService) IgnoreUpdate(ctx context.Context, req models.IgnoreUpdateRequest) error {
+	if s.Manager == nil {
+		return notReady()
+	}
+	return s.Manager.IgnoreUpdate(ctx, req)
 }
 
-func (s *UpdateService) UnignoreUpdate(_ context.Context, id int64) error {
-	return notReady()
+func (s *UpdateService) UnignoreUpdate(ctx context.Context, id int64) error {
+	if s.Manager == nil {
+		return notReady()
+	}
+	return s.Manager.UnignoreUpdate(ctx, id)
 }
 
-func (s *UpdateService) ListUpdateHistory(_ context.Context, filter models.UpdateHistoryFilter) ([]models.UpdateHistoryItem, error) {
-	return nil, notReady()
+func (s *UpdateService) ListUpdateHistory(ctx context.Context, filter models.UpdateHistoryFilter) ([]models.UpdateHistoryItem, error) {
+	if s.Manager == nil {
+		return nil, notReady()
+	}
+	return s.Manager.ListUpdateHistory(ctx, filter)
 }
 
 func (s *UpdateService) Rollback(_ context.Context, historyID int64) (string, error) {
@@ -1514,6 +1553,20 @@ func projectSummaryFromRecord(project store.ProjectRecord, services []store.Serv
 		WorkingDir:      project.WorkingDir,
 		LastChangedAt:   project.LastSeenAt,
 	}
+}
+
+func (s *ProjectService) hydrateUpdateBadges(ctx context.Context, summaries []models.ProjectSummary) error {
+	if s.Updates == nil {
+		return nil
+	}
+	for i := range summaries {
+		badges, err := s.Updates.Badges(ctx, summaries[i].ID)
+		if err != nil {
+			return apperror.Wrap(apperror.Internal, "Load project update badges failed", err)
+		}
+		summaries[i].UpdateBadges = badges
+	}
+	return nil
 }
 
 func serviceStatusFromRecord(service store.ServiceRecord) models.ComposeServiceStatus {

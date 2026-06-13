@@ -19,6 +19,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/services"
 	"github.com/RCooLeR/Cairn/internal/store"
 	"github.com/RCooLeR/Cairn/internal/terminal"
+	updatescore "github.com/RCooLeR/Cairn/internal/updates"
 	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
@@ -62,6 +63,7 @@ func Run(assets fs.FS) error {
 	var backupManager *backupcore.Manager
 	var registryManager *registrycore.Manager
 	var lineageManager *lineagecore.Manager
+	var updateManager *updatescore.Manager
 	if len(providerSet) > 0 {
 		dockerClient = dockercore.New(providerSet[0], eventBus)
 		dockerClient.SetObjectCache(db.Objects())
@@ -84,6 +86,8 @@ func Run(assets fs.FS) error {
 		backupManager = backupcore.NewManager(providerManager, dockerClient, db.Settings(), db.Backups(), auditRepo, eventBus, services.Version)
 		registryManager = registrycore.NewManager(providerManager, auditRepo)
 		lineageManager = lineagecore.NewManager(projectRepo, db.Lineage(), db.Objects(), dockerClient)
+		updateManager = updatescore.NewManager(projectRepo, db.Lineage(), db.Updates(), db.Objects(), dockerClient, registryManager, db.Settings(), eventBus, lineageManager)
+		updateManager.Start(ctx)
 	}
 
 	app := application.New(application.Options{
@@ -98,6 +102,7 @@ func Run(assets fs.FS) error {
 				Detector:    projectDetector,
 				Projects:    projectRepo,
 				Objects:     db.Objects(),
+				Updates:     db.Updates(),
 				Client:      composeClient,
 				Audit:       auditRepo,
 				Plans:       projectPlans,
@@ -109,7 +114,7 @@ func Run(assets fs.FS) error {
 			application.NewService(&services.MetricsService{Manager: metricsManager}),
 			application.NewService(&services.LogsService{Manager: logsManager}),
 			application.NewService(&services.TerminalService{Manager: terminalManager}),
-			application.NewService(&services.UpdateService{}),
+			application.NewService(&services.UpdateService{Manager: updateManager}),
 			application.NewService(&services.ImageLineageService{Manager: lineageManager}),
 			application.NewService(&services.BackupService{Manager: backupManager}),
 			application.NewService(&services.RegistryService{Manager: registryManager}),
