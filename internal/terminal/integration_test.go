@@ -152,6 +152,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func main() {
@@ -178,7 +179,9 @@ func main() {
 func runLine(line string) {
 	switch {
 	case line == "block":
-		select {}
+		for {
+			time.Sleep(time.Hour)
+		}
 	case line == "id -u":
 		fmt.Println("0")
 	case line == "stty size":
