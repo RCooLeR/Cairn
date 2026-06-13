@@ -65,27 +65,23 @@ func TestManagerRealDockerStatsIntegration(t *testing.T) {
 		t.Fatalf("container %q not found in %v", name, containers)
 	}
 
-	reader, err := client.ContainerStats(ctx, summary.ID, dockercore.StatsOptions{Stream: true})
+	reader, err := client.ContainerStats(ctx, summary.ID, dockercore.StatsOptions{})
 	if err != nil {
-		t.Fatalf("ContainerStats(stream) error = %v", err)
+		t.Fatalf("ContainerStats() error = %v", err)
 	}
 	defer func() {
 		_ = reader.Body.Close()
 	}()
 	decoder := json.NewDecoder(reader.Body)
-	var first, second container.StatsResponse
-	if err := decoder.Decode(&first); err != nil {
-		t.Fatalf("decode first stats: %v", err)
-	}
-	if err := decoder.Decode(&second); err != nil {
-		t.Fatalf("decode second stats: %v", err)
+	var raw container.StatsResponse
+	if err := decoder.Decode(&raw); err != nil {
+		t.Fatalf("decode stats: %v", err)
 	}
 	manager := NewManager(client, nil, nil, nil, nil, Options{})
 	manager.ensureReady()
 	manager.containers[summary.ID] = summary
 	manager.refreshDockerInfo(ctx)
-	manager.ingest(summary.ID, first)
-	manager.ingest(summary.ID, second)
+	manager.ingest(summary.ID, raw)
 	samples := manager.latestForScope(models.StatsScope{Kind: ScopeAll})
 	if len(samples) != 1 {
 		t.Fatalf("samples = %#v, want one sample", samples)
