@@ -48,6 +48,21 @@ func TestKnownRegistriesHasDockerHub(t *testing.T) {
 	}
 }
 
+func TestSettingsServiceGetCheatsheetSafetyContract(t *testing.T) {
+	entries, err := (&SettingsService{}).GetCheatsheet(context.Background())
+	if err != nil {
+		t.Fatalf("GetCheatsheet() error = %v", err)
+	}
+	if len(entries) < 60 {
+		t.Fatalf("entries = %d, want at least 60", len(entries))
+	}
+	for _, entry := range entries {
+		if entry.Runnable && entry.Risk != models.RiskSafe {
+			t.Fatalf("non-safe runnable entry = %#v", entry)
+		}
+	}
+}
+
 func TestDockerServiceLifecycleAuditsAndPlans(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "cairn.db"))

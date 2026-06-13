@@ -608,6 +608,8 @@ export class ContainerSummary {
 export class ContainerTerminalOptions {
     "shell"?: string;
     "user"?: string;
+    "workingDir"?: string;
+    "env"?: { [_ in string]?: string };
     "cols"?: number;
     "rows"?: number;
 
@@ -621,7 +623,11 @@ export class ContainerTerminalOptions {
      * Creates a new ContainerTerminalOptions instance from a string or object.
      */
     static createFrom($$source: any = {}): ContainerTerminalOptions {
+        const $$createField3_0 = $$createType15;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        if ("env" in $$parsedSource) {
+            $$parsedSource["env"] = $$createField3_0($$parsedSource["env"]);
+        }
         return new ContainerTerminalOptions($$parsedSource as Partial<ContainerTerminalOptions>);
     }
 }

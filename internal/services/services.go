@@ -21,6 +21,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/providers"
 	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/store"
+	"github.com/RCooLeR/Cairn/internal/terminal"
 )
 
 var (
@@ -108,7 +109,9 @@ type MetricsService struct {
 type LogsService struct {
 	Manager *logsvc.Manager
 }
-type TerminalService struct{}
+type TerminalService struct {
+	Manager *terminal.Manager
+}
 type UpdateService struct{}
 type ImageLineageService struct{}
 type BackupService struct{}
@@ -914,40 +917,67 @@ func (s *LogsService) ExportLogs(ctx context.Context, req models.ExportLogsReque
 	return s.Manager.ExportLogs(ctx, req)
 }
 
-func (s *TerminalService) OpenHostTerminal(_ context.Context, opts models.TerminalOptions) (*models.TerminalSessionInfo, error) {
-	return nil, notReady()
+func (s *TerminalService) OpenHostTerminal(ctx context.Context, opts models.TerminalOptions) (*models.TerminalSessionInfo, error) {
+	if s.Manager == nil {
+		return nil, notReady()
+	}
+	return s.Manager.OpenHostTerminal(ctx, opts)
 }
 
-func (s *TerminalService) OpenBackendTerminal(_ context.Context, opts models.TerminalOptions) (*models.TerminalSessionInfo, error) {
-	return nil, notReady()
+func (s *TerminalService) OpenBackendTerminal(ctx context.Context, opts models.TerminalOptions) (*models.TerminalSessionInfo, error) {
+	if s.Manager == nil {
+		return nil, notReady()
+	}
+	return s.Manager.OpenBackendTerminal(ctx, opts)
 }
 
-func (s *TerminalService) OpenProjectTerminal(_ context.Context, projectID string, opts models.TerminalOptions) (*models.TerminalSessionInfo, error) {
-	return nil, notReady()
+func (s *TerminalService) OpenProjectTerminal(ctx context.Context, projectID string, opts models.TerminalOptions) (*models.TerminalSessionInfo, error) {
+	if s.Manager == nil {
+		return nil, notReady()
+	}
+	return s.Manager.OpenProjectTerminal(ctx, projectID, opts)
 }
 
-func (s *TerminalService) OpenContainerTerminal(_ context.Context, containerID string, opts models.ContainerTerminalOptions) (*models.TerminalSessionInfo, error) {
-	return nil, notReady()
+func (s *TerminalService) OpenContainerTerminal(ctx context.Context, containerID string, opts models.ContainerTerminalOptions) (*models.TerminalSessionInfo, error) {
+	if s.Manager == nil {
+		return nil, notReady()
+	}
+	return s.Manager.OpenContainerTerminal(ctx, containerID, opts)
 }
 
-func (s *TerminalService) DetectContainerShells(_ context.Context, containerID string) ([]string, error) {
-	return nil, notReady()
+func (s *TerminalService) DetectContainerShells(ctx context.Context, containerID string) ([]string, error) {
+	if s.Manager == nil {
+		return nil, notReady()
+	}
+	return s.Manager.DetectContainerShells(ctx, containerID)
 }
 
-func (s *TerminalService) WriteTerminal(_ context.Context, sessionID string, data []byte) error {
-	return notReady()
+func (s *TerminalService) WriteTerminal(ctx context.Context, sessionID string, data []byte) error {
+	if s.Manager == nil {
+		return notReady()
+	}
+	return s.Manager.WriteTerminal(ctx, sessionID, data)
 }
 
-func (s *TerminalService) ResizeTerminal(_ context.Context, sessionID string, cols int, rows int) error {
-	return notReady()
+func (s *TerminalService) ResizeTerminal(ctx context.Context, sessionID string, cols int, rows int) error {
+	if s.Manager == nil {
+		return notReady()
+	}
+	return s.Manager.ResizeTerminal(ctx, sessionID, cols, rows)
 }
 
 func (s *TerminalService) CloseTerminal(_ context.Context, sessionID string) error {
-	return notReady()
+	if s.Manager == nil {
+		return notReady()
+	}
+	return s.Manager.CloseTerminal(sessionID)
 }
 
 func (s *TerminalService) ListTerminalSessions(_ context.Context) ([]models.TerminalSessionInfo, error) {
-	return nil, notReady()
+	if s.Manager == nil {
+		return nil, notReady()
+	}
+	return s.Manager.ListTerminalSessions(), nil
 }
 
 func (s *UpdateService) CheckAllUpdates(_ context.Context) (string, error) {
@@ -1088,7 +1118,7 @@ func (s *SettingsService) MarkNotificationsRead(_ context.Context, ids []int64) 
 }
 
 func (s *SettingsService) GetCheatsheet(_ context.Context) ([]models.CheatsheetEntry, error) {
-	return []models.CheatsheetEntry{}, nil
+	return terminal.CheatsheetEntries(), nil
 }
 
 func (s *SettingsService) OpenPath(_ context.Context, path string) error {

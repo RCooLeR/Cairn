@@ -59,6 +59,10 @@ type APIClient interface {
 	ContainerLogs(context.Context, string, container.LogsOptions) (io.ReadCloser, error)
 	ContainerStats(context.Context, string, bool) (container.StatsResponseReader, error)
 	ContainerStatsOneShot(context.Context, string) (container.StatsResponseReader, error)
+	ContainerExecCreate(context.Context, string, container.ExecOptions) (container.ExecCreateResponse, error)
+	ContainerExecAttach(context.Context, string, container.ExecAttachOptions) (dockertypes.HijackedResponse, error)
+	ContainerExecResize(context.Context, string, container.ResizeOptions) error
+	ContainerExecInspect(context.Context, string) (container.ExecInspect, error)
 	ContainerCreate(context.Context, *container.Config, *container.HostConfig, *network.NetworkingConfig, *ocispec.Platform, string) (container.CreateResponse, error)
 	ContainerRename(context.Context, string, string) error
 	ImageList(context.Context, image.ListOptions) ([]image.Summary, error)
@@ -109,6 +113,7 @@ type Client struct {
 	backoffMin     time.Duration
 	backoffMax     time.Duration
 	connectedOnce  bool
+	shellCache     map[string][]string
 }
 
 func New(provider Provider, eventBus bus.Bus) *Client {

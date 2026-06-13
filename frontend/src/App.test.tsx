@@ -13,10 +13,12 @@ import type {
   CommandPlan,
   DashboardMetrics,
   DiskUsageCategory,
+  CheatsheetEntry,
   LogLine,
   ProjectDetail,
   ProjectSummary,
   ProviderStatus,
+  TerminalSessionInfo,
 } from '../bindings/github.com/RCooLeR/Cairn/internal/models/models.js';
 import {
   HealthStatus,
@@ -92,6 +94,22 @@ const metricsServiceMock = vi.hoisted(() => ({
   StopStream: vi.fn(),
 }));
 
+const terminalServiceMock = vi.hoisted(() => ({
+  ListTerminalSessions: vi.fn(),
+  OpenHostTerminal: vi.fn(),
+  OpenBackendTerminal: vi.fn(),
+  OpenProjectTerminal: vi.fn(),
+  OpenContainerTerminal: vi.fn(),
+  DetectContainerShells: vi.fn(),
+  WriteTerminal: vi.fn(),
+  ResizeTerminal: vi.fn(),
+  CloseTerminal: vi.fn(),
+}));
+
+const settingsServiceMock = vi.hoisted(() => ({
+  GetCheatsheet: vi.fn(),
+}));
+
 vi.mock('./api/app', () => ({
   getAppVersion: vi.fn().mockResolvedValue({
     version: '0.1.0',
@@ -108,12 +126,24 @@ vi.mock('./api/services', () => ({
   LogsService: logsServiceMock,
   MetricsService: metricsServiceMock,
   ProjectService: projectServiceMock,
+  SettingsService: settingsServiceMock,
+  TerminalService: terminalServiceMock,
 }));
 
 vi.mock('@monaco-editor/react', () => ({
   default: ({ value }: { value?: string }) => (
     <pre data-testid="monaco-viewer">{value}</pre>
   ),
+}));
+
+vi.mock('@xterm/xterm', () => ({
+  Terminal: class {
+    open = vi.fn();
+    resize = vi.fn();
+    write = vi.fn();
+    dispose = vi.fn();
+    onData = vi.fn(() => ({ dispose: vi.fn() }));
+  },
 }));
 
 vi.mock('@wailsio/runtime', () => ({
@@ -220,6 +250,39 @@ describe('App inventory shell', () => {
     metricsServiceMock.GetContainerMetrics.mockResolvedValue({ series: [] });
     metricsServiceMock.StartStatsStream.mockResolvedValue('stats-stream-1');
     metricsServiceMock.StopStream.mockResolvedValue(undefined);
+    terminalServiceMock.ListTerminalSessions.mockResolvedValue([]);
+    terminalServiceMock.OpenHostTerminal.mockResolvedValue(
+      seededTerminalSession({ id: 'host-1', title: 'Host', kind: 'host' }),
+    );
+    terminalServiceMock.OpenBackendTerminal.mockResolvedValue(
+      seededTerminalSession({
+        id: 'backend-1',
+        title: 'Linux native',
+        kind: 'backend',
+      }),
+    );
+    terminalServiceMock.OpenProjectTerminal.mockResolvedValue(
+      seededTerminalSession({
+        id: 'project-1',
+        title: 'demo',
+        kind: 'project',
+      }),
+    );
+    terminalServiceMock.OpenContainerTerminal.mockResolvedValue(
+      seededTerminalSession({
+        id: 'container-1-term',
+        title: 'web-1',
+        kind: 'container',
+        containerID: 'container-1',
+      }),
+    );
+    terminalServiceMock.DetectContainerShells.mockResolvedValue([
+      '/bin/sh',
+    ]);
+    terminalServiceMock.WriteTerminal.mockResolvedValue(undefined);
+    terminalServiceMock.ResizeTerminal.mockResolvedValue(undefined);
+    terminalServiceMock.CloseTerminal.mockResolvedValue(undefined);
+    settingsServiceMock.GetCheatsheet.mockResolvedValue(seededCheatsheet());
     runtimeMock.openFile.mockResolvedValue('');
     runtimeMock.saveFile.mockResolvedValue('/tmp/cairn-logs.jsonl');
     runtimeMock.setClipboardText.mockResolvedValue(undefined);
@@ -311,6 +374,55 @@ describe('App inventory shell', () => {
     ).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /Running1/ })).toHaveClass(
       'border-accent/40',
+    );
+  });
+
+  it('opens terminal sessions from the Terminal page', async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
+
+    render(<App />);
+
+    const nav = await screen.findByRole('navigation', {
+      name: 'Main navigation',
+    });
+    fireEvent.click(within(nav).getByRole('button', { name: /Terminal/i }));
+    expect(
+      await screen.findByRole('heading', { level: 1, name: 'Terminal' }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Host' }));
+
+    await waitFor(() =>
+      expect(terminalServiceMock.OpenHostTerminal).toHaveBeenCalledWith({
+        cols: 120,
+        rows: 30,
+      }),
+    );
+    await waitFor(() =>
+      expect(screen.getAllByText('Host').length).toBeGreaterThan(1),
+    );
+  });
+
+  it('command palette navigates and schedules safe terminal commands only', async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+
+    await screen.findByText('Docker Engine - Running');
+    fireEvent.keyDown(window, { key: 'k', ctrlKey: true });
+    expect(await screen.findByRole('dialog')).toBeInTheDocument();
+    fireEvent.click(await screen.findByText('docker ps'));
+
+    await waitFor(() =>
+      expect(terminalServiceMock.OpenBackendTerminal).toHaveBeenCalled(),
+    );
+    await waitFor(
+      () =>
+        expect(terminalServiceMock.WriteTerminal).toHaveBeenCalledWith(
+          'backend-1',
+          'ZG9ja2VyIHBzDQ==',
+        ),
+      { timeout: 1800 },
     );
   });
 
@@ -1218,6 +1330,39 @@ function seededProjectDetail(): ProjectDetail {
       errors: [],
     },
   };
+}
+
+function seededTerminalSession(
+  patch: Partial<TerminalSessionInfo> = {},
+): TerminalSessionInfo {
+  return {
+    id: 'terminal-1',
+    kind: 'host',
+    title: 'Host',
+    shell: 'sh',
+    isRoot: false,
+    createdAt: '2026-06-13T08:00:00Z',
+    ...patch,
+  };
+}
+
+function seededCheatsheet(): CheatsheetEntry[] {
+  return [
+    {
+      category: 'containers',
+      command: 'docker ps',
+      description: 'List running containers',
+      risk: Risk.RiskSafe,
+      runnable: true,
+    },
+    {
+      category: 'cleanup',
+      command: 'docker system prune',
+      description: 'Remove unused Docker data',
+      risk: Risk.RiskDangerous,
+      runnable: false,
+    },
+  ];
 }
 
 function killPlan(): CommandPlan {

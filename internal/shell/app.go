@@ -15,6 +15,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/services"
 	"github.com/RCooLeR/Cairn/internal/store"
+	"github.com/RCooLeR/Cairn/internal/terminal"
 	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
@@ -54,6 +55,7 @@ func Run(assets fs.FS) error {
 	var projectDetector *composecore.ProjectDetector
 	var logsManager *logsvc.Manager
 	var metricsManager *metrics.Manager
+	var terminalManager *terminal.Manager
 	if len(providerSet) > 0 {
 		dockerClient = dockercore.New(providerSet[0], eventBus)
 		dockerClient.SetObjectCache(db.Objects())
@@ -72,6 +74,7 @@ func Run(assets fs.FS) error {
 		logsManager = logsvc.NewManager(dockerClient, eventBus, logsvc.Options{})
 		metricsManager = metrics.NewManager(dockerClient, db.Metrics(), projectRepo, auditRepo, eventBus, metrics.Options{})
 		metricsManager.Start(ctx)
+		terminalManager = terminal.NewManager(providerSet[0], dockerClient, projectRepo, eventBus, terminal.Options{})
 	}
 
 	app := application.New(application.Options{
@@ -96,7 +99,7 @@ func Run(assets fs.FS) error {
 			application.NewService(&services.ComposeService{Client: composeClient, Projects: projectRepo}),
 			application.NewService(&services.MetricsService{Manager: metricsManager}),
 			application.NewService(&services.LogsService{Manager: logsManager}),
-			application.NewService(&services.TerminalService{}),
+			application.NewService(&services.TerminalService{Manager: terminalManager}),
 			application.NewService(&services.UpdateService{}),
 			application.NewService(&services.ImageLineageService{}),
 			application.NewService(&services.BackupService{}),
@@ -110,6 +113,9 @@ func Run(assets fs.FS) error {
 			}
 			if metricsManager != nil {
 				metricsManager.StopAll()
+			}
+			if terminalManager != nil {
+				terminalManager.StopAll()
 			}
 			if dockerClient != nil {
 				_ = dockerClient.Close()
@@ -158,6 +164,8 @@ func Run(assets fs.FS) error {
 		bus.TopicLogsLines,
 		bus.TopicLogsEOF,
 		bus.TopicLogsError,
+		bus.TopicTerminalData,
+		bus.TopicTerminalClosed,
 		bus.TopicStatsSample,
 		bus.TopicJobProgress,
 		bus.TopicJobDone,
@@ -183,7 +191,11 @@ func firstProviderID(providerSet []providers.PlatformProvider) string {
 func forwardBusEvents(ctx context.Context, eventBus bus.Bus, window application.Window, topics []bus.Topic) {
 	for _, topic := range topics {
 		topic := topic
-		ch := eventBus.Subscribe(ctx, topic, 32)
+		buffer := 32
+		if topic == bus.TopicTerminalData || topic == bus.TopicTerminalClosed {
+			buffer = 4096
+		}
+		ch := eventBus.Subscribe(ctx, topic, buffer)
 		go func() {
 			for {
 				select {

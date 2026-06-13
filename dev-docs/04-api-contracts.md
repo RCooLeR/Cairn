@@ -132,6 +132,8 @@ ListTerminalSessions() ([]TerminalSessionInfo, error)
 ```
 
 `TerminalSessionInfo`: `ID, Kind(host|backend|project|container), Title, Shell, User, WorkingDir, ContainerID?, ProjectID?, IsRoot bool, CreatedAt`.
+`TerminalOptions`: `Shell?, WorkingDir?, Env map[string]string?, Cols?, Rows?`.
+`ContainerTerminalOptions`: `Shell?, User?, WorkingDir?, Env map[string]string?, Cols?, Rows?`.
 
 ## 5. UpdateService, ImageLineageService, BackupService
 

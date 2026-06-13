@@ -436,10 +436,12 @@ type TerminalOptions struct {
 }
 
 type ContainerTerminalOptions struct {
-	Shell string `json:"shell,omitempty"`
-	User  string `json:"user,omitempty"`
-	Cols  int    `json:"cols,omitempty"`
-	Rows  int    `json:"rows,omitempty"`
+	Shell      string            `json:"shell,omitempty"`
+	User       string            `json:"user,omitempty"`
+	WorkingDir string            `json:"workingDir,omitempty"`
+	Env        map[string]string `json:"env,omitempty"`
+	Cols       int               `json:"cols,omitempty"`
+	Rows       int               `json:"rows,omitempty"`
 }
 
 type TerminalSessionInfo struct {

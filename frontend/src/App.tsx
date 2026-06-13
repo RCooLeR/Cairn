@@ -104,6 +104,11 @@ import {
   Toast,
   Tooltip,
 } from './components/ui';
+import {
+  CommandPalette,
+  TerminalPage,
+  type TerminalCommandRequest,
+} from './components/terminal/TerminalPage';
 import { useAppStore } from './state/appStore';
 import { useInventoryStore } from './state/inventoryStore';
 
@@ -112,11 +117,12 @@ const logoUrl = '/cairn-logo.png';
 type PageID =
   | 'overview'
   | 'projects'
-  | 'logs'
   | 'containers'
   | 'images'
   | 'volumes'
-  | 'networks';
+  | 'networks'
+  | 'logs'
+  | 'terminal';
 type FilterID = string;
 type BadgeTone = 'ok' | 'warn' | 'error' | 'info' | 'neutral' | 'accent';
 type StatusToneID = 'ok' | 'warn' | 'error' | 'info' | 'neutral';
@@ -323,11 +329,12 @@ type CleanupState = {
 const navItems: NavItem[] = [
   { id: 'overview', label: 'Overview', icon: Gauge },
   { id: 'projects', label: 'Projects', icon: LayoutGrid },
-  { id: 'logs', label: 'Logs', icon: ScrollText },
   { id: 'containers', label: 'Containers', icon: Container },
   { id: 'images', label: 'Images', icon: Box },
   { id: 'volumes', label: 'Volumes', icon: Database },
   { id: 'networks', label: 'Networks', icon: Network },
+  { id: 'logs', label: 'Logs', icon: ScrollText },
+  { id: 'terminal', label: 'Terminal', icon: Terminal },
 ];
 
 const emptyInspect: InspectState = {
@@ -504,11 +511,33 @@ function App() {
   );
   const [busyActionIDs, setBusyActionIDs] = useState(() => new Set<string>());
   const [actionError, setActionError] = useState<string | null>(null);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [queuedTerminalCommand, setQueuedTerminalCommand] =
+    useState<TerminalCommandRequest | null>(null);
 
   const navigate = useCallback((page: PageID) => {
     setActivePage(page);
     setSearch('');
   }, []);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+        event.preventDefault();
+        setPaletteOpen(true);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, []);
+
+  const runPaletteCommand = useCallback(
+    (command: string) => {
+      setQueuedTerminalCommand({ id: Date.now(), command });
+      navigate('terminal');
+    },
+    [navigate],
+  );
 
   const showContainers = useCallback(
     (filter: FilterID = 'all') => {
@@ -1379,6 +1408,19 @@ function App() {
             projectsLoading={projectsStatus === 'loading'}
           />
         );
+      case 'terminal':
+        return (
+          <TerminalPage
+            containers={containers}
+            onCommandConsumed={(id) =>
+              setQueuedTerminalCommand((current) =>
+                current?.id === id ? null : current,
+              )
+            }
+            projects={projects}
+            queuedCommand={queuedTerminalCommand}
+          />
+        );
       case 'containers':
         return (
           <ContainersPage
@@ -1452,6 +1494,7 @@ function App() {
               setImportProject({ ...emptyImportProject, open: true })
             }
             onNavigate={navigate}
+            onOpenTerminal={() => navigate('terminal')}
             onOpenProject={openProjectDetail}
             onShowContainers={showContainers}
             provider={activeProvider}
@@ -1600,6 +1643,14 @@ function App() {
         inspect={inspect}
         onClose={() => setInspect(emptyInspect)}
       />
+      <CommandPalette
+        activePage={activePage}
+        onClose={() => setPaletteOpen(false)}
+        onNavigate={navigate}
+        onRunSafeCommand={runPaletteCommand}
+        open={paletteOpen}
+        pages={navItems}
+      />
       <ConfirmPlanModal
         confirm={confirm}
         onApply={() => {
@@ -1747,6 +1798,7 @@ type OverviewProps = {
   diskReclaimable: number;
   onImportProject: () => void;
   onNavigate: (page: PageID) => void;
+  onOpenTerminal: () => void;
   onOpenProject: (project: ProjectSummary) => void;
   onShowContainers: (filter: FilterID) => void;
 };
@@ -1759,6 +1811,7 @@ function OverviewPage({
   images,
   onImportProject,
   onNavigate,
+  onOpenTerminal,
   onOpenProject,
   onShowContainers,
   provider,
@@ -2001,9 +2054,8 @@ function OverviewPage({
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-end gap-2">
         <Button
-          disabled
-          disabledReason="Terminal support begins in Phase 3.5"
           icon={<Terminal size={15} />}
+          onClick={onOpenTerminal}
           size="sm"
         >
           Open terminal
@@ -2076,9 +2128,8 @@ function OverviewPage({
                 Import project
               </Button>
               <Button
-                disabled
-                disabledReason="Terminal support begins in Phase 3.5"
                 icon={<Terminal size={15} />}
+                onClick={onOpenTerminal}
               >
                 Open terminal
               </Button>

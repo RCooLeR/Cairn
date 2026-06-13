@@ -6,6 +6,7 @@ toolchain go1.26.4
 
 require (
 	github.com/containerd/errdefs v1.0.0
+	github.com/creack/pty v1.1.24
 	github.com/docker/docker v28.5.2+incompatible
 	github.com/docker/go-connections v0.7.0
 	github.com/google/uuid v1.6.0

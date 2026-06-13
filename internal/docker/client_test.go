@@ -37,6 +37,7 @@ import (
 	"github.com/docker/docker/api/types/system"
 	"github.com/docker/docker/api/types/volume"
 	dockerclient "github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/stdcopy"
 	dockerspec "github.com/moby/docker-image-spec/specs-go/v1"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
@@ -178,6 +179,75 @@ func TestClientContainerStatsUsesStreamAndOneShot(t *testing.T) {
 	}
 	if !api.statsCalls[0].Stream || !api.statsCalls[1].OneShot {
 		t.Fatalf("stats calls = %#v", api.statsCalls)
+	}
+}
+
+func TestClientContainerExecAndShellDetection(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	api.containerInspects["abc123"] = container.InspectResponse{
+		ContainerJSONBase: &container.ContainerJSONBase{
+			ID:    "abc123",
+			Name:  "/api-1",
+			Image: "sha256:image1",
+			State: &container.State{Status: "running"},
+		},
+		Config: &container.Config{Image: "example/api:latest"},
+	}
+	api.executablePaths["/bin/sh"] = true
+
+	client := New(fakeDockerProvider{}, nil)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	shells, err := client.DetectContainerShells(ctx, "abc123")
+	if err != nil {
+		t.Fatalf("DetectContainerShells() error = %v", err)
+	}
+	if got, want := strings.Join(shells, ","), "/bin/sh"; got != want {
+		t.Fatalf("shells = %q, want %q", got, want)
+	}
+	if _, err := client.DetectContainerShells(ctx, "abc123"); err != nil {
+		t.Fatalf("DetectContainerShells(cached) error = %v", err)
+	}
+	if len(api.execCreates) != 3 {
+		t.Fatalf("exec create count = %d, want cached second call", len(api.execCreates))
+	}
+
+	session, err := client.OpenContainerExec(ctx, "abc123", ExecOptions{
+		Cmd:        []string{"/bin/sh"},
+		User:       "1000",
+		WorkingDir: "/app",
+		Env:        map[string]string{"B": "2", "A": "1"},
+		TTY:        true,
+		Cols:       132,
+		Rows:       43,
+	})
+	if err != nil {
+		t.Fatalf("OpenContainerExec() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = session.Close()
+	})
+	last := api.execCreates[len(api.execCreates)-1]
+	if last.ContainerID != "abc123" || !last.Options.Tty || last.Options.User != "1000" || last.Options.WorkingDir != "/app" {
+		t.Fatalf("exec create = %#v", last)
+	}
+	if fmt.Sprint(last.Options.Cmd) != "[/bin/sh]" || fmt.Sprint(last.Options.Env) != "[A=1 B=2]" {
+		t.Fatalf("exec argv/env = %#v %#v", last.Options.Cmd, last.Options.Env)
+	}
+	if last.Options.ConsoleSize == nil || *last.Options.ConsoleSize != [2]uint{43, 132} {
+		t.Fatalf("console size = %#v", last.Options.ConsoleSize)
+	}
+
+	if err := client.ResizeContainerExec(ctx, session.ID, 120, 30); err != nil {
+		t.Fatalf("ResizeContainerExec() error = %v", err)
+	}
+	if got := api.execResizes[len(api.execResizes)-1]; got.ExecID != session.ID || got.Options.Width != 120 || got.Options.Height != 30 {
+		t.Fatalf("resize = %#v", got)
 	}
 }
 
@@ -1445,6 +1515,12 @@ type fakeAPI struct {
 	eventErrs         chan error
 	stats             map[string][]container.StatsResponse
 	statsCalls        []statsCall
+	execCreates       []execCreateCall
+	execResizes       []execResizeCall
+	execInspects      map[string]container.ExecInspect
+	execOutputs       map[string]string
+	execExitCodes     map[string]int
+	executablePaths   map[string]bool
 	started           []string
 	stopped           []string
 	restarted         []string
@@ -1480,6 +1556,17 @@ type statsCall struct {
 	OneShot bool
 }
 
+type execCreateCall struct {
+	ID          string
+	ContainerID string
+	Options     container.ExecOptions
+}
+
+type execResizeCall struct {
+	ExecID  string
+	Options container.ResizeOptions
+}
+
 func newFakeAPI() *fakeAPI {
 	return &fakeAPI{
 		ping:              dockertypes.Ping{APIVersion: "1.51"},
@@ -1494,6 +1581,10 @@ func newFakeAPI() *fakeAPI {
 		events:            make(chan events.Message, 16),
 		eventErrs:         make(chan error, 4),
 		stats:             map[string][]container.StatsResponse{},
+		execInspects:      map[string]container.ExecInspect{},
+		execOutputs:       map[string]string{},
+		execExitCodes:     map[string]int{},
+		executablePaths:   map[string]bool{},
 	}
 }
 
@@ -1600,6 +1691,89 @@ func (a *fakeAPI) ContainerStatsOneShot(_ context.Context, id string) (container
 		entries = entries[len(entries)-1:]
 	}
 	return container.StatsResponseReader{Body: statsReader(entries), OSType: "linux"}, nil
+}
+
+func (a *fakeAPI) ContainerExecCreate(_ context.Context, containerID string, opts container.ExecOptions) (container.ExecCreateResponse, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	id := fmt.Sprintf("exec-%d", len(a.execCreates)+1)
+	exitCode := a.execExitCodeLocked(opts.Cmd)
+	a.execCreates = append(a.execCreates, execCreateCall{ID: id, ContainerID: containerID, Options: opts})
+	a.execInspects[id] = container.ExecInspect{
+		ExecID:      id,
+		ContainerID: containerID,
+		Running:     false,
+		ExitCode:    exitCode,
+		Pid:         1234,
+	}
+	return container.ExecCreateResponse{ID: id}, nil
+}
+
+func (a *fakeAPI) ContainerExecAttach(_ context.Context, execID string, opts container.ExecAttachOptions) (dockertypes.HijackedResponse, error) {
+	a.mu.Lock()
+	var output string
+	for _, call := range a.execCreates {
+		if call.ID == execID {
+			output = a.execOutputLocked(call.Options.Cmd)
+			break
+		}
+	}
+	a.mu.Unlock()
+
+	clientConn, serverConn := net.Pipe()
+	go func() {
+		defer func() {
+			_ = serverConn.Close()
+		}()
+		if output == "" {
+			return
+		}
+		if opts.Tty {
+			_, _ = serverConn.Write([]byte(output))
+			return
+		}
+		writer := stdcopy.NewStdWriter(serverConn, stdcopy.Stdout)
+		_, _ = writer.Write([]byte(output))
+	}()
+	return dockertypes.NewHijackedResponse(clientConn, ""), nil
+}
+
+func (a *fakeAPI) ContainerExecResize(_ context.Context, execID string, opts container.ResizeOptions) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.execResizes = append(a.execResizes, execResizeCall{ExecID: execID, Options: opts})
+	return nil
+}
+
+func (a *fakeAPI) ContainerExecInspect(_ context.Context, execID string) (container.ExecInspect, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	inspect, ok := a.execInspects[execID]
+	if !ok {
+		return container.ExecInspect{}, cerrdefs.ErrNotFound.WithMessage(fmt.Sprintf("no such exec: %s", execID))
+	}
+	return inspect, nil
+}
+
+func (a *fakeAPI) execExitCodeLocked(cmd []string) int {
+	if len(cmd) == 3 && cmd[0] == "test" && cmd[1] == "-x" {
+		if a.executablePaths[cmd[2]] {
+			return 0
+		}
+		return 1
+	}
+	if code, ok := a.execExitCodes[commandKey(cmd)]; ok {
+		return code
+	}
+	return 0
+}
+
+func (a *fakeAPI) execOutputLocked(cmd []string) string {
+	return a.execOutputs[commandKey(cmd)]
+}
+
+func commandKey(cmd []string) string {
+	return strings.Join(cmd, "\x00")
 }
 
 func (a *fakeAPI) ContainerCreate(_ context.Context, config *container.Config, hostConfig *container.HostConfig, networkingConfig *network.NetworkingConfig, _ *ocispec.Platform, name string) (container.CreateResponse, error) {

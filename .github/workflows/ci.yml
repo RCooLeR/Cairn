@@ -94,6 +94,12 @@ jobs:
           CAIRN_REAL_DOCKER_METRICS: "1"
         run: go test ./internal/metrics -run TestManagerRealDockerStatsIntegration -count=1 -timeout=3m
 
+      - name: Terminal integration
+        if: runner.os == 'Linux'
+        env:
+          CAIRN_REAL_DOCKER_TERMINAL: "1"
+        run: go test ./internal/terminal -run TestManagerRealDockerContainerTerminalIntegration -count=1 -timeout=3m
+
       - name: Go vet
         run: go vet . ./internal/...
 
