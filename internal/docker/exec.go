@@ -181,7 +181,7 @@ func (c *Client) DetectContainerShells(ctx context.Context, containerID string) 
 	candidates := []string{"/bin/bash", "/bin/sh", "/busybox/sh"}
 	shells := make([]string, 0, len(candidates))
 	for _, shell := range candidates {
-		_, code, err := c.RunContainerExec(ctx, containerID, ExecOptions{Cmd: []string{"test", "-x", shell}})
+		_, code, err := c.RunContainerExec(ctx, containerID, ExecOptions{Cmd: []string{shell, "-c", "exit 0"}})
 		if err == nil && code == 0 {
 			shells = append(shells, shell)
 		}

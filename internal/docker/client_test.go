@@ -1756,6 +1756,12 @@ func (a *fakeAPI) ContainerExecInspect(_ context.Context, execID string) (contai
 }
 
 func (a *fakeAPI) execExitCodeLocked(cmd []string) int {
+	if len(cmd) == 3 && cmd[1] == "-c" && cmd[2] == "exit 0" {
+		if a.executablePaths[cmd[0]] {
+			return 0
+		}
+		return 127
+	}
 	if len(cmd) == 3 && cmd[0] == "test" && cmd[1] == "-x" {
 		if a.executablePaths[cmd[2]] {
 			return 0
