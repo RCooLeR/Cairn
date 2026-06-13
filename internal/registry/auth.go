@@ -3,6 +3,7 @@ package registry
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -14,6 +15,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
 	"github.com/RCooLeR/Cairn/internal/store"
+	dockerregistry "github.com/docker/docker/api/types/registry"
 )
 
 func (m *Manager) Login(ctx context.Context, req models.RegistryLoginRequest) error {
@@ -132,6 +134,30 @@ func (m *Manager) credentialForRegistry(ctx context.Context, provider providers.
 		return m.credentialFromHelper(ctx, provider, helper, registry, "credsStore")
 	}
 	return credential{}, nil
+}
+
+func EncodeDockerAuthConfig(ctx context.Context, provider providers.PlatformProvider, registry string) (string, error) {
+	if provider == nil {
+		return "", apperror.New(apperror.ProviderNotReady, "Provider cannot resolve registry credentials")
+	}
+	registry = normalizeRegistryHost(registry)
+	creds, err := NewManager(nil, nil).credentialForRegistry(ctx, provider, registry)
+	if err != nil {
+		return "", err
+	}
+	if creds.Username == "" && creds.Password == "" && creds.IdentityToken == "" {
+		return "", nil
+	}
+	payload, err := json.Marshal(dockerregistry.AuthConfig{
+		Username:      creds.Username,
+		Password:      creds.Password,
+		IdentityToken: creds.IdentityToken,
+		ServerAddress: helperServerURL(registry),
+	})
+	if err != nil {
+		return "", apperror.Wrap(apperror.Internal, "Encode registry auth failed", err)
+	}
+	return base64.URLEncoding.EncodeToString(payload), nil
 }
 
 func (m *Manager) credentialFromHelper(ctx context.Context, provider providers.PlatformProvider, helper string, registry string, source string) (credential, error) {

@@ -712,6 +712,64 @@ func TestClientImagePullSaveLoadAndSearch(t *testing.T) {
 	}
 }
 
+func TestClientImageTagAndPush(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	eventBus := bus.New()
+	defer eventBus.Close()
+	pushEvents := eventBus.Subscribe(ctx, bus.TopicImagePushProgress, 8)
+
+	client := New(fakeDockerProvider{}, eventBus)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	if err := client.TagImage(ctx, "sha256:local", "localhost:5000/test/app:1.0"); err != nil {
+		t.Fatalf("TagImage() error = %v", err)
+	}
+	if got, want := api.tagged, []string{"sha256:local->localhost:5000/test/app:1.0"}; len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("tagged = %#v, want %#v", got, want)
+	}
+
+	streamID, err := client.PushImage(ctx, "localhost:5000/test/app:1.0")
+	if err != nil {
+		t.Fatalf("PushImage() error = %v", err)
+	}
+	if streamID == "" || len(api.pushed) != 1 || api.pushed[0] != "localhost:5000/test/app:1.0" {
+		t.Fatalf("streamID=%q pushed=%#v", streamID, api.pushed)
+	}
+	if len(api.pushAuth) != 1 || api.pushAuth[0] != "" {
+		t.Fatalf("push auth = %#v, want anonymous auth", api.pushAuth)
+	}
+	if got := waitImageProgress(t, ctx, pushEvents, time.Second); got.StreamID != streamID {
+		t.Fatalf("push progress = %#v, want stream %q", got, streamID)
+	}
+}
+
+func TestClientImagePushMapsRegistryAuth(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	api.pushBody = `{"errorDetail":{"message":"unauthorized: authentication required"}}` + "\n"
+
+	client := New(fakeDockerProvider{}, nil)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	_, err := client.PushImage(ctx, "localhost:5000/test/app:1.0")
+	if !apperror.IsCode(err, apperror.RegistryAuth) {
+		t.Fatalf("PushImage() error = %v, want %s", err, apperror.RegistryAuth)
+	}
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) || !strings.Contains(appErr.Detail, "localhost:5000") {
+		t.Fatalf("registry auth detail = %#v", appErr)
+	}
+}
+
 func TestClientRealDockerIntegration(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("real Docker integration runs only on Linux")
@@ -1576,6 +1634,11 @@ type fakeAPI struct {
 	createdContainers []createdContainerCall
 	renamed           []string
 	pulled            []string
+	tagged            []string
+	pushed            []string
+	pushAuth          []string
+	pushBody          string
+	pushErr           error
 	saved             [][]string
 	loadedBytes       []int
 	searches          []string
@@ -1902,6 +1965,35 @@ func (a *fakeAPI) ImagePull(_ context.Context, ref string, _ image.PullOptions) 
 		Os:           "linux",
 	}
 	return io.NopCloser(strings.NewReader(`{"status":"pulling","id":"layer","progressDetail":{"current":1,"total":2}}` + "\n" + `{"status":"done"}` + "\n")), nil
+}
+
+func (a *fakeAPI) ImageTag(_ context.Context, imageID string, ref string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.tagged = append(a.tagged, imageID+"->"+ref)
+	a.imageInspects[ref] = image.InspectResponse{
+		ID:           imageID,
+		RepoTags:     []string{ref},
+		Created:      time.Now().UTC().Format(time.RFC3339Nano),
+		Architecture: "amd64",
+		Os:           "linux",
+	}
+	return nil
+}
+
+func (a *fakeAPI) ImagePush(_ context.Context, ref string, opts image.PushOptions) (io.ReadCloser, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.pushed = append(a.pushed, ref)
+	a.pushAuth = append(a.pushAuth, opts.RegistryAuth)
+	if a.pushErr != nil {
+		return nil, a.pushErr
+	}
+	body := a.pushBody
+	if body == "" {
+		body = `{"status":"pushing","id":"layer","progressDetail":{"current":1,"total":2}}` + "\n" + `{"status":"done"}` + "\n"
+	}
+	return io.NopCloser(strings.NewReader(body)), nil
 }
 
 func (a *fakeAPI) ImageSave(_ context.Context, imageIDs []string, _ ...dockerclient.ImageSaveOption) (io.ReadCloser, error) {

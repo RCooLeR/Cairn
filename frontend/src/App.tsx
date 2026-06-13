@@ -23,6 +23,9 @@ import type {
   ProjectDetail,
   ProjectSummary,
   ProviderSummary,
+  RegistryAccount,
+  RegistryAuthStatus,
+  RegistryPreset,
   RunImageRequest,
   StatsScope,
   VolumeDetail,
@@ -48,8 +51,11 @@ import {
   Filter,
   FolderOpen,
   Gauge,
+  KeyRound,
   LayoutGrid,
   List,
+  LogIn,
+  LogOut,
   MemoryStick,
   MoreVertical,
   PackagePlus,
@@ -67,6 +73,7 @@ import {
   ShieldAlert,
   Skull,
   Square,
+  Tag,
   Terminal,
   Trash2,
   Upload,
@@ -108,6 +115,7 @@ import {
   MetricsService,
   ProviderService,
   ProjectService,
+  RegistryService,
   SettingsService,
 } from "./api/services";
 import {
@@ -255,6 +263,44 @@ type SaveImageState = {
 type LoadImageState = {
   open: boolean;
   srcPath: string;
+  busy: boolean;
+  error?: string;
+};
+
+type ImageProgressPayload = {
+  streamID: string;
+  layerID?: string;
+  status: string;
+  current?: number;
+  total?: number;
+};
+
+type TagImageState = {
+  open: boolean;
+  image: ImageSummary | null;
+  newRef: string;
+  busy: boolean;
+  error?: string;
+};
+
+type PushImageState = {
+  open: boolean;
+  image: ImageSummary | null;
+  ref: string;
+  confirmed: boolean;
+  streamID?: string;
+  progress: ImageProgressPayload[];
+  busy: boolean;
+  success: boolean;
+  error?: string;
+};
+
+type RegistryLoginState = {
+  open: boolean;
+  registry: string;
+  username: string;
+  secret: string;
+  secretKind: "password" | "token";
   busy: boolean;
   error?: string;
 };
@@ -486,6 +532,32 @@ const emptyLoadImage: LoadImageState = {
   busy: false,
 };
 
+const emptyTagImage: TagImageState = {
+  open: false,
+  image: null,
+  newRef: "",
+  busy: false,
+};
+
+const emptyPushImage: PushImageState = {
+  open: false,
+  image: null,
+  ref: "",
+  confirmed: false,
+  progress: [],
+  busy: false,
+  success: false,
+};
+
+const emptyRegistryLogin: RegistryLoginState = {
+  open: false,
+  registry: "docker.io",
+  username: "",
+  secret: "",
+  secretKind: "password",
+  busy: false,
+};
+
 const emptyCreateVolume: CreateVolumeState = {
   open: false,
   name: "",
@@ -621,8 +693,27 @@ function App() {
   const [rename, setRename] = useState<RenameState>(emptyRename);
   const [runImage, setRunImage] = useState<RunImageState>(emptyRunImage);
   const [pullImage, setPullImage] = useState<PullImageState>(emptyPullImage);
+  const [tagImage, setTagImage] = useState<TagImageState>(emptyTagImage);
+  const [pushImage, setPushImage] = useState<PushImageState>(emptyPushImage);
   const [saveImage, setSaveImage] = useState<SaveImageState>(emptySaveImage);
   const [loadImage, setLoadImage] = useState<LoadImageState>(emptyLoadImage);
+  const [registryAccounts, setRegistryAccounts] = useState<RegistryAccount[]>(
+    [],
+  );
+  const [registryAccountsStatus, setRegistryAccountsStatus] =
+    useState<LoadStatus>("idle");
+  const [registryAccountsError, setRegistryAccountsError] = useState<
+    string | null
+  >(null);
+  const [registryStatuses, setRegistryStatuses] = useState<
+    Record<string, RegistryAuthStatus>
+  >({});
+  const [registryPresets, setRegistryPresets] = useState<RegistryPreset[]>([]);
+  const [registryLogin, setRegistryLogin] =
+    useState<RegistryLoginState>(emptyRegistryLogin);
+  const [registryBusyKeys, setRegistryBusyKeys] = useState(
+    () => new Set<string>(),
+  );
   const [createVolume, setCreateVolume] =
     useState<CreateVolumeState>(emptyCreateVolume);
   const [backupVolume, setBackupVolume] =
@@ -993,6 +1084,30 @@ function App() {
   }, [pullImage.open, pullImage.query]);
 
   useEffect(() => {
+    const off = Events.On("image:push:progress", (event) => {
+      const payload = eventPayload<ImageProgressPayload>(event);
+      if (!payload?.streamID) {
+        return;
+      }
+      setPushImage((current) => {
+        if (current.streamID && current.streamID !== payload.streamID) {
+          return current;
+        }
+        if (!current.streamID && !current.busy) {
+          return current;
+        }
+        return {
+          ...current,
+          streamID: current.streamID ?? payload.streamID,
+          progress: mergeImageProgress(current.progress, payload),
+          success: current.success || payload.status === "done",
+        };
+      });
+    });
+    return () => off();
+  }, []);
+
+  useEffect(() => {
     const query = runImage.hubQuery.trim();
     if (!runImage.open || query.length < 3) {
       setRunImage((current) => ({
@@ -1104,6 +1219,18 @@ function App() {
 
   const setActionBusy = useCallback((key: string, busy: boolean) => {
     setBusyActionIDs((current) => {
+      const next = new Set(current);
+      if (busy) {
+        next.add(key);
+      } else {
+        next.delete(key);
+      }
+      return next;
+    });
+  }, []);
+
+  const setRegistryBusy = useCallback((key: string, busy: boolean) => {
+    setRegistryBusyKeys((current) => {
       const next = new Set(current);
       if (busy) {
         next.add(key);
@@ -1263,6 +1390,117 @@ function App() {
     }
   }, []);
 
+  const refreshRegistryAccounts = useCallback(async () => {
+    setRegistryAccountsStatus((current) =>
+      current === "ready" ? current : "loading",
+    );
+    setRegistryAccountsError(null);
+    try {
+      const accounts = await RegistryService.ListRegistryAccounts();
+      setRegistryAccounts(accounts ?? []);
+      setRegistryAccountsStatus("ready");
+    } catch (error: unknown) {
+      setRegistryAccounts([]);
+      setRegistryAccountsStatus("error");
+      setRegistryAccountsError(
+        error instanceof Error
+          ? error.message
+          : "Unable to list registry accounts",
+      );
+    }
+  }, []);
+
+  const openRegistryLogin = useCallback((registry = "docker.io") => {
+    setRegistryLogin({
+      ...emptyRegistryLogin,
+      open: true,
+      registry: registry.trim() || "docker.io",
+    });
+  }, []);
+
+  const submitRegistryLogin = useCallback(async () => {
+    setRegistryLogin((current) => ({
+      ...current,
+      busy: true,
+      error: undefined,
+    }));
+    try {
+      await RegistryService.Login({
+        registry: registryLogin.registry,
+        username: registryLogin.username,
+        secret: registryLogin.secret,
+        secretKind: registryLogin.secretKind,
+      });
+      setRegistryLogin(emptyRegistryLogin);
+      await refreshRegistryAccounts();
+    } catch (error: unknown) {
+      setRegistryLogin((current) => ({
+        ...current,
+        busy: false,
+        error:
+          error instanceof Error ? error.message : "Unable to log in registry",
+      }));
+    }
+  }, [
+    refreshRegistryAccounts,
+    registryLogin.registry,
+    registryLogin.secret,
+    registryLogin.secretKind,
+    registryLogin.username,
+  ]);
+
+  const testRegistryAuth = useCallback(
+    async (registry: string) => {
+      const key = `test:${registry}`;
+      setRegistryBusy(key, true);
+      try {
+        const status = await RegistryService.TestAuth(registry);
+        if (status) {
+          setRegistryStatuses((current) => ({
+            ...current,
+            [normalizeRegistryHostForUI(status.registry || registry)]: status,
+          }));
+        }
+      } catch (error: unknown) {
+        setRegistryStatuses((current) => ({
+          ...current,
+          [normalizeRegistryHostForUI(registry)]: {
+            registry,
+            loggedIn: false,
+            error:
+              error instanceof Error ? error.message : "Registry auth failed",
+          },
+        }));
+      } finally {
+        setRegistryBusy(key, false);
+      }
+    },
+    [setRegistryBusy],
+  );
+
+  const logoutRegistry = useCallback(
+    async (registry: string) => {
+      const key = `logout:${registry}`;
+      setRegistryBusy(key, true);
+      try {
+        await RegistryService.Logout(registry);
+        setRegistryStatuses((current) => {
+          const next = { ...current };
+          delete next[normalizeRegistryHostForUI(registry)];
+          return next;
+        });
+        await refreshRegistryAccounts();
+      } catch (error: unknown) {
+        setRegistryAccountsError(
+          error instanceof Error ? error.message : "Unable to log out registry",
+        );
+      } finally {
+        setRegistryBusy(key, false);
+      }
+    },
+    [refreshRegistryAccounts, setRegistryBusy],
+  );
+
   const activateDockerContext = useCallback(
     async (name: string) => {
       setSettingsSaving(true);
@@ -1300,6 +1538,18 @@ function App() {
       void refreshDockerContexts();
     }
   }, [activePage, refreshDockerContexts]);
+
+  useEffect(() => {
+    RegistryService.KnownRegistries()
+      .then((presets) => setRegistryPresets(presets ?? []))
+      .catch(() => setRegistryPresets([]));
+  }, []);
+
+  useEffect(() => {
+    if (activePage === "settings" || pushImage.open) {
+      void refreshRegistryAccounts();
+    }
+  }, [activePage, pushImage.open, refreshRegistryAccounts]);
 
   const openProviderSetup = useCallback(() => {
     const backend =
@@ -1794,6 +2044,75 @@ function App() {
     }
   }, [ensureDockerReady, pullImage.ref, pullImage.tag, refreshAfterAction]);
 
+  const openTagImageModal = useCallback((image: ImageSummary) => {
+    const ref = taggableImageRef(image);
+    setTagImage({
+      ...emptyTagImage,
+      open: true,
+      image,
+      newRef: ref,
+    });
+  }, []);
+
+  const submitTagImage = useCallback(async () => {
+    if (!ensureDockerReady() || !tagImage.image) {
+      return;
+    }
+    setTagImage((current) => ({ ...current, busy: true, error: undefined }));
+    try {
+      await DockerService.TagImage(tagImage.image.id, tagImage.newRef);
+      setTagImage(emptyTagImage);
+      await refreshAfterAction();
+    } catch (error: unknown) {
+      setTagImage((current) => ({
+        ...current,
+        busy: false,
+        error: error instanceof Error ? error.message : "Unable to tag image",
+      }));
+    }
+  }, [ensureDockerReady, refreshAfterAction, tagImage.image, tagImage.newRef]);
+
+  const openPushImageModal = useCallback((image: ImageSummary) => {
+    const ref = pushableImageRef(image);
+    setPushImage({
+      ...emptyPushImage,
+      open: true,
+      image,
+      ref,
+      error: ref ? undefined : "Create a registry tag before pushing.",
+    });
+  }, []);
+
+  const submitPushImage = useCallback(async () => {
+    if (!ensureDockerReady()) {
+      return;
+    }
+    setPushImage((current) => ({
+      ...current,
+      busy: true,
+      error: undefined,
+      success: false,
+      progress: [],
+      streamID: undefined,
+    }));
+    try {
+      const streamID = await DockerService.PushImage(pushImage.ref);
+      setPushImage((current) => ({
+        ...current,
+        busy: false,
+        streamID,
+        success: true,
+      }));
+      await refreshAfterAction();
+    } catch (error: unknown) {
+      setPushImage((current) => ({
+        ...current,
+        busy: false,
+        error: error instanceof Error ? error.message : "Unable to push image",
+      }));
+    }
+  }, [ensureDockerReady, pushImage.ref, refreshAfterAction]);
+
   const openSaveImageModal = useCallback((image: ImageSummary) => {
     const ref = primaryImageRef(image);
     setSaveImage({
@@ -1883,10 +2202,7 @@ function App() {
         ...emptyBackupVolume,
         open: true,
         volume,
-        destPath: normalizeStringSetting(
-          appSettings["backups.directory"],
-          "",
-        ),
+        destPath: normalizeStringSetting(appSettings["backups.directory"], ""),
       });
     },
     [appSettings],
@@ -1922,16 +2238,10 @@ function App() {
       setBackupVolume((current) => ({
         ...current,
         busy: false,
-        error:
-          error instanceof Error ? error.message : "Unable to plan backup",
+        error: error instanceof Error ? error.message : "Unable to plan backup",
       }));
     }
-  }, [
-    backupVolume.destPath,
-    backupVolume.volume,
-    ensureDockerReady,
-    projects,
-  ]);
+  }, [backupVolume.destPath, backupVolume.volume, ensureDockerReady, projects]);
 
   const openRestoreVolume = useCallback(
     async (volume: VolumeSummary, selectedBackup?: BackupSummary) => {
@@ -1962,9 +2272,7 @@ function App() {
           ...current,
           loading: false,
           error:
-            error instanceof Error
-              ? error.message
-              : "Unable to load backups",
+            error instanceof Error ? error.message : "Unable to load backups",
         }));
       }
     },
@@ -2395,6 +2703,16 @@ function App() {
             onRefreshDockerContexts={() => {
               void refreshDockerContexts();
             }}
+            onRefreshRegistries={() => {
+              void refreshRegistryAccounts();
+            }}
+            onRegistryLogin={openRegistryLogin}
+            onRegistryLogout={(registry) => {
+              void logoutRegistry(registry);
+            }}
+            onRegistryTest={(registry) => {
+              void testRegistryAuth(registry);
+            }}
             onSaveColimaCPU={() => {
               void saveColimaNumberSetting(
                 "macos.colima_cpu",
@@ -2430,6 +2748,11 @@ function App() {
             }}
             onWSLDistroChange={setWSLDistro}
             providers={providers}
+            registryAccounts={registryAccounts}
+            registryAccountsError={registryAccountsError}
+            registryAccountsLoading={registryAccountsStatus === "loading"}
+            registryBusyKeys={registryBusyKeys}
+            registryStatuses={registryStatuses}
             saving={settingsSaving}
             settings={appSettings}
             wslDistro={wslDistro}
@@ -2467,8 +2790,10 @@ function App() {
             onInspect={openImageInspect}
             onLoad={() => setLoadImage({ ...emptyLoadImage, open: true })}
             onPull={() => setPullImage({ ...emptyPullImage, open: true })}
+            onPush={openPushImageModal}
             onRun={openRunImageModal}
             onSave={openSaveImageModal}
+            onTag={openTagImageModal}
             search={search}
           />
         );
@@ -2867,6 +3192,35 @@ function App() {
         }}
         state={pullImage}
       />
+      <TagImageModal
+        onChange={(patch) =>
+          setTagImage((current) => ({ ...current, ...patch }))
+        }
+        onClose={() => setTagImage(emptyTagImage)}
+        onSubmit={() => {
+          void submitTagImage();
+        }}
+        state={tagImage}
+      />
+      <PushImageModal
+        accounts={registryAccounts}
+        accountsLoading={registryAccountsStatus === "loading"}
+        onChange={(patch) =>
+          setPushImage((current) => ({ ...current, ...patch }))
+        }
+        onClose={() => setPushImage(emptyPushImage)}
+        onCopyPull={(ref) => {
+          void Clipboard.SetText(`docker pull ${ref}`);
+        }}
+        onLogin={openRegistryLogin}
+        onRefreshAccounts={() => {
+          void refreshRegistryAccounts();
+        }}
+        onSubmit={() => {
+          void submitPushImage();
+        }}
+        state={pushImage}
+      />
       <SaveImageModal
         onChange={(patch) =>
           setSaveImage((current) => ({ ...current, ...patch }))
@@ -2886,6 +3240,17 @@ function App() {
           void submitLoadImage();
         }}
         state={loadImage}
+      />
+      <RegistryLoginModal
+        onChange={(patch) =>
+          setRegistryLogin((current) => ({ ...current, ...patch }))
+        }
+        onClose={() => setRegistryLogin(emptyRegistryLogin)}
+        onSubmit={() => {
+          void submitRegistryLogin();
+        }}
+        presets={registryPresets}
+        state={registryLogin}
       />
       <CreateVolumeModal
         onChange={(patch) =>
@@ -3905,6 +4270,10 @@ function SettingsPage({
   onDetect,
   onOpenSetup,
   onRefreshDockerContexts,
+  onRefreshRegistries,
+  onRegistryLogin,
+  onRegistryLogout,
+  onRegistryTest,
   onSaveColimaCPU,
   onSaveColimaDiskGB,
   onSaveColimaMemoryGB,
@@ -3913,6 +4282,11 @@ function SettingsPage({
   onUseDockerContext,
   onWSLDistroChange,
   providers,
+  registryAccounts,
+  registryAccountsError,
+  registryAccountsLoading,
+  registryBusyKeys,
+  registryStatuses,
   saving,
   settings,
   wslDistro,
@@ -3936,6 +4310,10 @@ function SettingsPage({
   onDetect: () => void;
   onOpenSetup: () => void;
   onRefreshDockerContexts: () => void;
+  onRefreshRegistries: () => void;
+  onRegistryLogin: (registry?: string) => void;
+  onRegistryLogout: (registry: string) => void;
+  onRegistryTest: (registry: string) => void;
   onSaveColimaCPU: () => void;
   onSaveColimaDiskGB: () => void;
   onSaveColimaMemoryGB: () => void;
@@ -3944,6 +4322,11 @@ function SettingsPage({
   onUseDockerContext: (name: string) => void;
   onWSLDistroChange: (distro: string) => void;
   providers: ProviderSummary[];
+  registryAccounts: RegistryAccount[];
+  registryAccountsError: string | null;
+  registryAccountsLoading: boolean;
+  registryBusyKeys: Set<string>;
+  registryStatuses: Record<string, RegistryAuthStatus>;
   saving: boolean;
   settings: Record<string, unknown>;
   wslDistro: string;
@@ -3957,6 +4340,7 @@ function SettingsPage({
           "General",
           "Providers",
           "Docker contexts",
+          "Registries",
           "Terminal",
           "Security & Audit",
           "About",
@@ -4214,6 +4598,62 @@ function SettingsPage({
         </Card>
 
         <Card>
+          <CardHeader
+            actions={
+              <div className="flex gap-2">
+                <Button
+                  icon={<RefreshCw size={15} />}
+                  loading={registryAccountsLoading}
+                  onClick={onRefreshRegistries}
+                  size="sm"
+                  variant="secondary"
+                >
+                  Refresh
+                </Button>
+                <Button
+                  icon={<LogIn size={15} />}
+                  onClick={() => onRegistryLogin("docker.io")}
+                  size="sm"
+                >
+                  Log in
+                </Button>
+              </div>
+            }
+            title="Registries"
+          />
+          <CardBody className="space-y-3">
+            <div className="text-sm text-text-muted">
+              Credentials stay in Docker's backend credential store. Cairn only
+              reads account metadata and sends secrets to `docker login` via
+              stdin.
+            </div>
+            {registryAccountsError ? (
+              <div className="rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
+                {registryAccountsError}
+              </div>
+            ) : null}
+            {registryAccountsLoading && registryAccounts.length === 0 ? (
+              <TableSkeleton />
+            ) : registryAccounts.length === 0 ? (
+              <EmptyState
+                body="Log in to a registry before pushing private images."
+                icon={<KeyRound size={28} />}
+                title="No registry accounts"
+              />
+            ) : (
+              <RegistryAccountsTable
+                accounts={registryAccounts}
+                busyKeys={registryBusyKeys}
+                onLogin={onRegistryLogin}
+                onLogout={onRegistryLogout}
+                onTest={onRegistryTest}
+                statuses={registryStatuses}
+              />
+            )}
+          </CardBody>
+        </Card>
+
+        <Card>
           <CardHeader title="Provider Inventory" />
           <CardBody>
             <div className="text-sm text-text-muted">
@@ -4328,6 +4768,113 @@ function DockerContextsTable({
       </table>
     </div>
   );
+}
+
+function RegistryAccountsTable({
+  accounts,
+  busyKeys,
+  onLogin,
+  onLogout,
+  onTest,
+  statuses,
+}: {
+  accounts: RegistryAccount[];
+  busyKeys: Set<string>;
+  statuses: Record<string, RegistryAuthStatus>;
+  onLogin: (registry?: string) => void;
+  onLogout: (registry: string) => void;
+  onTest: (registry: string) => void;
+}) {
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full min-w-[720px] border-separate border-spacing-0 text-sm">
+        <thead>
+          <tr className="text-left text-xs uppercase text-text-muted">
+            <th className="border-b border-border px-3 py-2">Registry</th>
+            <th className="border-b border-border px-3 py-2">Username</th>
+            <th className="border-b border-border px-3 py-2">Storage</th>
+            <th className="border-b border-border px-3 py-2">Status</th>
+            <th className="border-b border-border px-3 py-2 text-right">
+              Actions
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {accounts.map((account) => {
+            const registry = normalizeRegistryHostForUI(account.registry);
+            const status = statuses[registry];
+            return (
+              <tr key={`${registry}:${account.username ?? ""}`}>
+                <td className="border-b border-border/70 px-3 py-2 font-medium text-text-primary">
+                  {registry}
+                </td>
+                <td className="border-b border-border/70 px-3 py-2">
+                  {account.username || "-"}
+                </td>
+                <td className="border-b border-border/70 px-3 py-2">
+                  <Badge tone={account.source === "authsFile" ? "error" : "ok"}>
+                    {registryStorageLabel(account)}
+                  </Badge>
+                </td>
+                <td className="border-b border-border/70 px-3 py-2">
+                  <RegistryStatusBadge account={account} status={status} />
+                </td>
+                <td className="border-b border-border/70 px-3 py-2">
+                  <div className="flex justify-end gap-1">
+                    <Tooltip label="Test auth">
+                      <Button
+                        aria-label={`Test ${registry}`}
+                        icon={<ShieldAlert size={15} />}
+                        loading={busyKeys.has(`test:${registry}`)}
+                        onClick={() => onTest(registry)}
+                        size="icon"
+                        variant="ghost"
+                      />
+                    </Tooltip>
+                    <Tooltip label="Log in">
+                      <Button
+                        aria-label={`Log in ${registry}`}
+                        icon={<LogIn size={15} />}
+                        onClick={() => onLogin(registry)}
+                        size="icon"
+                        variant="ghost"
+                      />
+                    </Tooltip>
+                    <Tooltip label="Log out">
+                      <Button
+                        aria-label={`Log out ${registry}`}
+                        icon={<LogOut size={15} />}
+                        loading={busyKeys.has(`logout:${registry}`)}
+                        onClick={() => onLogout(registry)}
+                        size="icon"
+                        variant="ghost"
+                      />
+                    </Tooltip>
+                  </div>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function RegistryStatusBadge({
+  account,
+  status,
+}: {
+  account: RegistryAccount;
+  status?: RegistryAuthStatus;
+}) {
+  if (status?.error) {
+    return <Badge tone="error">Auth failed</Badge>;
+  }
+  if (status?.loggedIn) {
+    return <Badge tone="ok">Verified</Badge>;
+  }
+  return <Badge tone={account.loggedIn ? "warn" : "neutral"}>Unverified</Badge>;
 }
 
 function PermissionOption({
@@ -7521,9 +8068,7 @@ function ProjectDetailPage({
       {tab === "compose" ? <ProjectComposeTab detail={detail} /> : null}
       {tab === "backups" ? (
         <ProjectBackupsTab
-          backups={backups.filter(
-            (backup) => backup.projectID === project.id,
-          )}
+          backups={backups.filter((backup) => backup.projectID === project.id)}
           error={backupsError}
           loading={backupsLoading}
           mutationsDisabled={mutationsDisabled}
@@ -8156,8 +8701,10 @@ type ImagesPageProps = {
   onInspect: (image: ImageSummary) => void;
   onLoad: () => void;
   onPull: () => void;
+  onPush: (image: ImageSummary) => void;
   onRun: (image?: ImageSummary) => void;
   onSave: (image: ImageSummary) => void;
+  onTag: (image: ImageSummary) => void;
 };
 
 function ImagesPage({
@@ -8171,8 +8718,10 @@ function ImagesPage({
   onInspect,
   onLoad,
   onPull,
+  onPush,
   onRun,
   onSave,
+  onTag,
   search,
 }: ImagesPageProps) {
   const filtered = useMemo(
@@ -8300,8 +8849,10 @@ function ImagesPage({
                 mutationsDisabled={mutationsDisabled}
                 mutationDisabledReason={mutationDisabledReason}
                 onInspect={() => onInspect(image)}
+                onPush={() => onPush(image)}
                 onRun={() => onRun(image)}
                 onSave={() => onSave(image)}
+                onTag={() => onTag(image)}
               />
             ),
           },
@@ -8693,15 +9244,19 @@ function ImageRowActions({
   mutationsDisabled,
   mutationDisabledReason,
   onInspect,
+  onPush,
   onRun,
   onSave,
+  onTag,
 }: {
   image: ImageSummary;
   mutationsDisabled: boolean;
   mutationDisabledReason: string;
   onInspect: () => void;
+  onPush: () => void;
   onRun: () => void;
   onSave: () => void;
+  onTag: () => void;
 }) {
   const label = primaryImageRef(image);
   return (
@@ -8713,6 +9268,28 @@ function ImageRowActions({
           disabledReason={mutationDisabledReason}
           icon={<Play size={15} />}
           onClick={onRun}
+          size="icon"
+          variant="ghost"
+        />
+      </Tooltip>
+      <Tooltip label="Tag">
+        <Button
+          aria-label={`Tag ${label}`}
+          disabled={mutationsDisabled}
+          disabledReason={mutationDisabledReason}
+          icon={<Tag size={15} />}
+          onClick={onTag}
+          size="icon"
+          variant="ghost"
+        />
+      </Tooltip>
+      <Tooltip label="Push">
+        <Button
+          aria-label={`Push ${label}`}
+          disabled={mutationsDisabled}
+          disabledReason={mutationDisabledReason}
+          icon={<Upload size={15} />}
+          onClick={onPush}
           size="icon"
           variant="ghost"
         />
@@ -8939,17 +9516,13 @@ function projectName(projects: ProjectSummary[], id: string) {
   return projects.find((project) => project.id === id)?.name ?? id;
 }
 
-function projectIDForVolume(
-  volume: VolumeSummary,
-  projects: ProjectSummary[],
-) {
+function projectIDForVolume(volume: VolumeSummary, projects: ProjectSummary[]) {
   const composeName = volume.labels?.[composeProjectLabel] ?? "";
   if (!composeName) {
     return "";
   }
   return (
-    projects.find((project) => project.name === composeName)?.id ??
-    composeName
+    projects.find((project) => project.name === composeName)?.id ?? composeName
   );
 }
 
@@ -9580,6 +10153,185 @@ function PullImageModal({
   );
 }
 
+function TagImageModal({
+  onChange,
+  onClose,
+  onSubmit,
+  state,
+}: {
+  state: TagImageState;
+  onChange: (patch: Partial<TagImageState>) => void;
+  onClose: () => void;
+  onSubmit: () => void;
+}) {
+  const preview = imageRefPreview(state.newRef);
+  return (
+    <Modal
+      busy={state.busy}
+      footer={
+        <ModalActions
+          busy={state.busy}
+          disabled={!state.image || Boolean(preview.error)}
+          onCancel={onClose}
+          onSubmit={onSubmit}
+          submitLabel="Create tag"
+        />
+      }
+      onClose={onClose}
+      open={state.open}
+      title="Tag Image"
+    >
+      <div className="space-y-4">
+        <TextField
+          label="New ref"
+          onChange={(newRef) => onChange({ newRef })}
+          value={state.newRef}
+        />
+        <ImageRefPreview preview={preview} />
+        <CodePreview
+          value={joinPreview([
+            "docker",
+            "tag",
+            state.image?.id ?? "<image>",
+            state.newRef,
+          ])}
+        />
+        <FormError error={state.error ?? preview.error} />
+      </div>
+    </Modal>
+  );
+}
+
+function PushImageModal({
+  accounts,
+  accountsLoading,
+  onChange,
+  onClose,
+  onCopyPull,
+  onLogin,
+  onRefreshAccounts,
+  onSubmit,
+  state,
+}: {
+  state: PushImageState;
+  accounts: RegistryAccount[];
+  accountsLoading: boolean;
+  onChange: (patch: Partial<PushImageState>) => void;
+  onClose: () => void;
+  onCopyPull: (ref: string) => void;
+  onLogin: (registry?: string) => void;
+  onRefreshAccounts: () => void;
+  onSubmit: () => void;
+}) {
+  const preview = imageRefPreview(state.ref);
+  const registry = preview.registry || registryFromImageRef(state.ref);
+  const account = registryAccountFor(accounts, registry);
+  const disabled =
+    Boolean(preview.error) || !state.confirmed || state.busy || state.success;
+  return (
+    <Modal
+      busy={state.busy}
+      footer={
+        <div className="flex flex-wrap justify-end gap-2">
+          <Button disabled={state.busy} onClick={onClose} variant="secondary">
+            Close
+          </Button>
+          <Button
+            disabled={disabled}
+            loading={state.busy}
+            onClick={onSubmit}
+            variant="primary"
+          >
+            Push
+          </Button>
+        </div>
+      }
+      onClose={onClose}
+      open={state.open}
+      title="Push Image"
+    >
+      <div className="space-y-4">
+        <TextField
+          label="Image ref"
+          onChange={(ref) =>
+            onChange({
+              ref,
+              confirmed: false,
+              error: undefined,
+              success: false,
+            })
+          }
+          value={state.ref}
+        />
+        <ImageRefPreview preview={preview} />
+        <div className="rounded-control border border-border bg-bg-inset p-3 text-sm">
+          <div className="flex flex-wrap items-center gap-2">
+            {account ? (
+              <>
+                <Badge tone="ok">{account.username || registry}</Badge>
+                <span className="text-text-muted">
+                  {registryStorageLabel(account)}
+                </span>
+              </>
+            ) : (
+              <>
+                <Badge tone="error">Not logged in</Badge>
+                <Button
+                  icon={<LogIn size={15} />}
+                  onClick={() => onLogin(registry)}
+                  size="sm"
+                  variant="secondary"
+                >
+                  Log in
+                </Button>
+              </>
+            )}
+            <Button
+              icon={<RefreshCw size={15} />}
+              loading={accountsLoading}
+              onClick={onRefreshAccounts}
+              size="sm"
+              variant="ghost"
+            >
+              Refresh
+            </Button>
+          </div>
+        </div>
+        <CodePreview value={joinPreview(["docker", "push", state.ref])} />
+        <label className="flex items-start gap-3 rounded-control border border-border bg-bg-inset p-3 text-sm">
+          <input
+            checked={state.confirmed}
+            disabled={state.busy || state.success}
+            onChange={(event) => onChange({ confirmed: event.target.checked })}
+            type="checkbox"
+          />
+          <span>
+            Confirm publishing{" "}
+            <span className="font-mono text-xs text-text-primary">
+              {state.ref || "<ref>"}
+            </span>
+          </span>
+        </label>
+        <PushProgressList progress={state.progress} />
+        {state.success ? (
+          <div className="flex flex-wrap items-center gap-2 rounded-control border border-ok/30 bg-ok/10 p-3 text-sm text-ok">
+            <span className="font-medium">Push complete</span>
+            <Button
+              icon={<Copy size={15} />}
+              onClick={() => onCopyPull(state.ref)}
+              size="sm"
+              variant="secondary"
+            >
+              docker pull
+            </Button>
+          </div>
+        ) : null}
+        <FormError error={state.error ?? preview.error} />
+      </div>
+    </Modal>
+  );
+}
+
 function SaveImageModal({
   onChange,
   onClose,
@@ -9665,6 +10417,104 @@ function LoadImageModal({
         <CodePreview
           value={joinPreview(["docker", "load", "-i", state.srcPath])}
         />
+        <FormError error={state.error} />
+      </div>
+    </Modal>
+  );
+}
+
+function RegistryLoginModal({
+  onChange,
+  onClose,
+  onSubmit,
+  presets,
+  state,
+}: {
+  state: RegistryLoginState;
+  presets: RegistryPreset[];
+  onChange: (patch: Partial<RegistryLoginState>) => void;
+  onClose: () => void;
+  onSubmit: () => void;
+}) {
+  const options: Array<[string, string]> = [
+    ...presets.map(
+      (preset) => [preset.registry, preset.name] as [string, string],
+    ),
+    ["custom", "Custom"],
+  ];
+  const presetValue = presets.some(
+    (preset) => preset.registry === state.registry,
+  )
+    ? state.registry
+    : "custom";
+  return (
+    <Modal
+      busy={state.busy}
+      footer={
+        <ModalActions
+          busy={state.busy}
+          disabled={
+            !state.registry.trim() ||
+            !state.username.trim() ||
+            !state.secret.trim()
+          }
+          onCancel={onClose}
+          onSubmit={onSubmit}
+          submitLabel="Log in"
+        />
+      }
+      onClose={onClose}
+      open={state.open}
+      title="Registry Login"
+    >
+      <div className="space-y-4">
+        <SelectField
+          label="Registry"
+          onChange={(value) => {
+            if (value !== "custom") {
+              onChange({ registry: value });
+            }
+          }}
+          options={options}
+          value={presetValue}
+        />
+        <TextField
+          label="Registry URL"
+          onChange={(registry) => onChange({ registry })}
+          value={state.registry}
+        />
+        <TextField
+          label="Username"
+          onChange={(username) => onChange({ username })}
+          value={state.username}
+        />
+        <SelectField
+          label="Secret kind"
+          onChange={(secretKind) =>
+            onChange({
+              secretKind: secretKind === "token" ? "token" : "password",
+            })
+          }
+          options={[
+            ["password", "Password"],
+            ["token", "Access token"],
+          ]}
+          value={state.secretKind}
+        />
+        <label className="block">
+          <span className="text-sm font-medium text-text-primary">Secret</span>
+          <input
+            className="mt-2 h-9 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none focus:border-accent"
+            onChange={(event) => onChange({ secret: event.target.value })}
+            type="password"
+            value={state.secret}
+          />
+        </label>
+        {normalizeRegistryHostForUI(state.registry) === "docker.io" ? (
+          <div className="rounded-control border border-info/30 bg-info/10 p-3 text-sm text-info">
+            Docker Hub accounts with 2FA require an access token.
+          </div>
+        ) : null}
         <FormError error={state.error} />
       </div>
     </Modal>
@@ -10258,6 +11108,73 @@ function CodePreview({ value }: { value: string }) {
   );
 }
 
+function ImageRefPreview({
+  preview,
+}: {
+  preview: ReturnType<typeof imageRefPreview>;
+}) {
+  if (preview.error && !preview.registry && !preview.repository) {
+    return null;
+  }
+  return (
+    <div className="grid gap-2 rounded-control border border-border bg-bg-inset p-3 text-sm sm:grid-cols-3">
+      <StatusPill
+        label="Registry"
+        ok={Boolean(preview.registry)}
+        value={preview.registry || "-"}
+      />
+      <StatusPill
+        label="Repository"
+        ok={Boolean(preview.repository)}
+        value={preview.repository || "-"}
+      />
+      <StatusPill
+        label="Tag"
+        ok={Boolean(preview.tag)}
+        value={preview.tag || "-"}
+      />
+    </div>
+  );
+}
+
+function PushProgressList({ progress }: { progress: ImageProgressPayload[] }) {
+  if (progress.length === 0) {
+    return null;
+  }
+  return (
+    <div className="max-h-52 overflow-auto rounded-control border border-border bg-bg-inset">
+      {progress.map((item, index) => {
+        const pct =
+          item.total && item.current
+            ? Math.min(100, Math.round((item.current / item.total) * 100))
+            : null;
+        return (
+          <div
+            className="grid grid-cols-[minmax(0,1fr)_auto] gap-3 border-b border-border px-3 py-2 text-sm last:border-b-0"
+            key={`${item.layerID || "stream"}-${index}`}
+          >
+            <div className="min-w-0">
+              <div className="truncate font-mono text-xs text-text-primary">
+                {item.layerID || "push"}
+              </div>
+              <div className="mt-1 truncate text-xs text-text-muted">
+                {item.status}
+              </div>
+            </div>
+            {pct === null ? (
+              <Badge tone={item.status === "done" ? "ok" : "neutral"}>
+                {item.status}
+              </Badge>
+            ) : (
+              <Badge tone={pct >= 100 ? "ok" : "info"}>{pct}%</Badge>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function FormError({ error }: { error?: string }) {
   return error ? (
     <div className="rounded-control border border-error/30 bg-error/10 p-3 text-error">
@@ -10512,6 +11429,124 @@ function splitRefs(value: string) {
     .split(/\r?\n|,/)
     .map((line) => line.trim())
     .filter(Boolean);
+}
+
+function mergeImageProgress(
+  current: ImageProgressPayload[],
+  next: ImageProgressPayload,
+) {
+  if (!next.layerID) {
+    return current.concat(next).slice(-30);
+  }
+  const index = current.findIndex((item) => item.layerID === next.layerID);
+  if (index === -1) {
+    return current.concat(next).slice(-30);
+  }
+  const merged = current.slice();
+  merged[index] = next;
+  return merged;
+}
+
+function imageRefPreview(raw: string) {
+  const value = raw.trim();
+  if (!value) {
+    return {
+      registry: "",
+      repository: "",
+      tag: "",
+      error: "Image ref is required",
+    };
+  }
+  if (/\s/.test(value)) {
+    return {
+      registry: "",
+      repository: "",
+      tag: "",
+      error: "Image ref cannot contain whitespace",
+    };
+  }
+  if (value.includes("@")) {
+    return {
+      registry: "",
+      repository: "",
+      tag: "",
+      error: "Use a tag ref before pushing",
+    };
+  }
+  const first = value.split("/")[0] ?? "";
+  const hasRegistry =
+    first === "localhost" || first.includes(".") || first.includes(":");
+  const registry = hasRegistry
+    ? normalizeRegistryHostForUI(first)
+    : "docker.io";
+  const rest = hasRegistry ? value.slice(first.length + 1) : value;
+  const slash = rest.lastIndexOf("/");
+  const colon = rest.lastIndexOf(":");
+  const repository = colon > slash ? rest.slice(0, colon) : rest;
+  const tag = colon > slash ? rest.slice(colon + 1) : "latest";
+  if (!repository || !tag) {
+    return {
+      registry,
+      repository,
+      tag,
+      error: "Image ref needs repository and tag",
+    };
+  }
+  return { registry, repository, tag, error: undefined };
+}
+
+function registryFromImageRef(ref: string) {
+  return imageRefPreview(ref).registry || "docker.io";
+}
+
+function normalizeRegistryHostForUI(raw: string) {
+  const value = raw
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, "")
+    .replace(/\/$/, "")
+    .replace(/\/v[12]$/, "");
+  if (
+    value === "" ||
+    value === "index.docker.io" ||
+    value === "registry-1.docker.io" ||
+    value === "docker.io/v1"
+  ) {
+    return "docker.io";
+  }
+  return value;
+}
+
+function registryAccountFor(accounts: RegistryAccount[], registry: string) {
+  const normalized = normalizeRegistryHostForUI(registry);
+  return accounts.find(
+    (account) => normalizeRegistryHostForUI(account.registry) === normalized,
+  );
+}
+
+function registryStorageLabel(account: RegistryAccount) {
+  if (account.source === "authsFile") {
+    return "unencrypted config.json";
+  }
+  if (account.source === "credHelper") {
+    return "credential helper";
+  }
+  if (account.source === "credsStore") {
+    return "credential store";
+  }
+  return account.source || "Docker";
+}
+
+function pushableImageRef(image: ImageSummary) {
+  return image.repoTags?.find((tag) => tag && tag !== "<none>:<none>") ?? "";
+}
+
+function taggableImageRef(image: ImageSummary) {
+  const tagged = pushableImageRef(image);
+  if (tagged) {
+    return tagged;
+  }
+  return `localhost:5000/cairn/${shortID(image.id).replace(/^sha256:/, "")}:latest`;
 }
 
 function splitCommand(value: string) {

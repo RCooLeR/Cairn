@@ -70,6 +70,8 @@ const dockerServiceMock = vi.hoisted(() => ({
   RenameContainer: vi.fn(),
   RunImage: vi.fn(),
   PullImage: vi.fn(),
+  TagImage: vi.fn(),
+  PushImage: vi.fn(),
   SaveImage: vi.fn(),
   LoadImage: vi.fn(),
   SearchHub: vi.fn(),
@@ -144,6 +146,14 @@ const settingsServiceMock = vi.hoisted(() => ({
   GetCheatsheet: vi.fn(),
 }));
 
+const registryServiceMock = vi.hoisted(() => ({
+  KnownRegistries: vi.fn(),
+  ListRegistryAccounts: vi.fn(),
+  Login: vi.fn(),
+  Logout: vi.fn(),
+  TestAuth: vi.fn(),
+}));
+
 vi.mock("./api/app", () => ({
   getAppVersion: vi.fn().mockResolvedValue({
     version: "0.1.0",
@@ -162,6 +172,7 @@ vi.mock("./api/services", () => ({
   MetricsService: metricsServiceMock,
   ProviderService: providerServiceMock,
   ProjectService: projectServiceMock,
+  RegistryService: registryServiceMock,
   SettingsService: settingsServiceMock,
   TerminalService: terminalServiceMock,
 }));
@@ -240,6 +251,8 @@ describe("App inventory shell", () => {
     dockerServiceMock.RenameContainer.mockResolvedValue(undefined);
     dockerServiceMock.RunImage.mockResolvedValue("container-new");
     dockerServiceMock.PullImage.mockResolvedValue("pull-stream");
+    dockerServiceMock.TagImage.mockResolvedValue(undefined);
+    dockerServiceMock.PushImage.mockResolvedValue("push-stream");
     dockerServiceMock.SaveImage.mockResolvedValue("save-job");
     dockerServiceMock.LoadImage.mockResolvedValue("load-job");
     dockerServiceMock.SearchHub.mockResolvedValue([]);
@@ -355,6 +368,17 @@ describe("App inventory shell", () => {
     settingsServiceMock.GetNotifications.mockResolvedValue([]);
     settingsServiceMock.MarkNotificationsRead.mockResolvedValue(undefined);
     settingsServiceMock.GetCheatsheet.mockResolvedValue(seededCheatsheet());
+    registryServiceMock.KnownRegistries.mockResolvedValue([
+      { name: "Docker Hub", registry: "docker.io" },
+    ]);
+    registryServiceMock.ListRegistryAccounts.mockResolvedValue([]);
+    registryServiceMock.Login.mockResolvedValue(undefined);
+    registryServiceMock.Logout.mockResolvedValue(undefined);
+    registryServiceMock.TestAuth.mockResolvedValue({
+      registry: "docker.io",
+      loggedIn: true,
+      username: "ada",
+    });
     runtimeMock.openFile.mockResolvedValue("");
     runtimeMock.saveFile.mockResolvedValue("/tmp/cairn-logs.jsonl");
     runtimeMock.setClipboardText.mockResolvedValue(undefined);
@@ -1092,7 +1116,7 @@ describe("App inventory shell", () => {
     );
   });
 
-  it("pulls, saves, and loads images from image modals", async () => {
+  it("pulls, tags, pushes, saves, and loads images from image modals", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
 
     render(<App />);
@@ -1113,6 +1137,34 @@ describe("App inventory shell", () => {
     fireEvent.click(screen.getByRole("button", { name: "Pull" }));
     await waitFor(() =>
       expect(dockerServiceMock.PullImage).toHaveBeenCalledWith("redis:latest"),
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Tag cairn/web:latest" }),
+    );
+    fireEvent.change(screen.getByLabelText("New ref"), {
+      target: { value: "localhost:5000/test/app:1.0" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Create tag" }));
+    await waitFor(() =>
+      expect(dockerServiceMock.TagImage).toHaveBeenCalledWith(
+        "sha256:image-1",
+        "localhost:5000/test/app:1.0",
+      ),
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Push cairn/web:latest" }),
+    );
+    fireEvent.change(screen.getByLabelText("Image ref"), {
+      target: { value: "localhost:5000/test/app:1.0" },
+    });
+    fireEvent.click(screen.getByLabelText(/Confirm publishing/));
+    fireEvent.click(screen.getByRole("button", { name: "Push" }));
+    await waitFor(() =>
+      expect(dockerServiceMock.PushImage).toHaveBeenCalledWith(
+        "localhost:5000/test/app:1.0",
+      ),
     );
 
     fireEvent.click(
@@ -1214,25 +1266,19 @@ describe("App inventory shell", () => {
         }),
       ),
     );
-    fireEvent.click(
-      await screen.findByRole("button", { name: "Confirm" }),
-    );
+    fireEvent.click(await screen.findByRole("button", { name: "Confirm" }));
     await waitFor(() =>
       expect(backupServiceMock.ApplyBackup).toHaveBeenCalledWith(
         "plan-backup-volume",
       ),
     );
 
-    fireEvent.click(
-      screen.getByRole("button", { name: "Restore cairn_data" }),
-    );
+    fireEvent.click(screen.getByRole("button", { name: "Restore cairn_data" }));
     const restoreDialog = await screen.findByRole("dialog", {
       name: "Restore Volume",
     });
     await waitFor(() =>
-      expect(within(restoreDialog).getByLabelText("Backup")).toHaveValue(
-        "",
-      ),
+      expect(within(restoreDialog).getByLabelText("Backup")).toHaveValue(""),
     );
     fireEvent.change(within(restoreDialog).getByLabelText("Backup"), {
       target: { value: backup.id },
@@ -2210,15 +2256,13 @@ function restorePlan(): CommandPlan {
       {
         order: 1,
         command:
-          "docker run --rm -v cairn_data:/restore -v /tmp/cairn-backups:/backup:ro alpine:3 sh -c \"rm -rf /restore/* /restore/..?* /restore/.[!.]* ; tar xzf /backup/cairn_data-20260613T080000Z.tar.gz -C /restore\"",
+          'docker run --rm -v cairn_data:/restore -v /tmp/cairn-backups:/backup:ro alpine:3 sh -c "rm -rf /restore/* /restore/..?* /restore/.[!.]* ; tar xzf /backup/cairn_data-20260613T080000Z.tar.gz -C /restore"',
         risk: Risk.RiskDangerous,
         explanation:
           "Clears the target volume and restores files from the selected archive.",
       },
     ],
-    effects: [
-      "cairn_data: Replaces volume contents with the selected backup.",
-    ],
+    effects: ["cairn_data: Replaces volume contents with the selected backup."],
     requiresTypedName: "cairn_data",
     expiresAt: "2026-06-13T08:10:00Z",
   };

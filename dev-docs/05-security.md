@@ -43,7 +43,7 @@ Risk:     Dangerous — removes containers AND named volumes for this project.
 ## 4. Credentials & secrets
 
 - Registry auth: Cairn provides a registry login UI (Settings → Registries, [ui/10-settings.md §4a]) that **delegates to `docker login` on the backend OS** — credentials are stored by Docker's credential store/helper (Windows Credential Manager / macOS Keychain / pass or plaintext `config.json` under the user's existing Docker setup), never by Cairn. The secret is piped via stdin (`--password-stdin`), never passed as an argument, never written to SQLite/audit/logs (redactor-enforced). Docker Hub with 2FA → access tokens required; UI says so explicitly. If the backend's Docker would store the secret base64-plaintext in `config.json` (no helper configured), Cairn warns and recommends a credential helper before proceeding.
-- Push: `docker push` requires confirmed plan (`needs_confirmation`) and shows the exact ref being published.
+- Push: `docker push` requires confirmed preview/plan semantics (`needs_confirmation`) and shows the exact ref being published. In the current v1 generated API surface, `DockerService.PushImage(ref)` is callable only after the Images Push modal confirms that exact ref; the backend records `image.push` audit rows with `needs_confirmation`.
 - Never store: plaintext registry passwords, SSH private keys, tokens — in SQLite, settings, logs, or audit.
 - If Cairn must hold a secret (post-v1 remote SSH passphrases): Windows Credential Manager / macOS Keychain / Linux Secret Service via a single `security/secrets.go` abstraction.
 - Redaction: audit/command-history writers pass through a redactor that masks `-p/--password/AUTH=` patterns and anything sourced from env marked secret.

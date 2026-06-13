@@ -112,6 +112,12 @@ jobs:
           CAIRN_REAL_DOCKER_REGISTRY: "1"
         run: go test ./internal/registry -run TestManagerRealDockerRegistryAuthRoundTrip -count=1 -timeout=4m
 
+      - name: Registry tag push integration
+        if: runner.os == 'Linux'
+        env:
+          CAIRN_REAL_DOCKER_REGISTRY: "1"
+        run: go test ./internal/docker -run TestClientRealRegistryTagPushRoundTrip -count=1 -timeout=4m
+
       - name: Go vet
         run: go vet . ./internal/...
 

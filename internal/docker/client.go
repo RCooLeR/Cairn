@@ -73,6 +73,8 @@ type APIClient interface {
 	ImageList(context.Context, image.ListOptions) ([]image.Summary, error)
 	ImageInspectWithRaw(context.Context, string) (image.InspectResponse, []byte, error)
 	ImagePull(context.Context, string, image.PullOptions) (io.ReadCloser, error)
+	ImageTag(context.Context, string, string) error
+	ImagePush(context.Context, string, image.PushOptions) (io.ReadCloser, error)
 	ImageSave(context.Context, []string, ...dockerclient.ImageSaveOption) (io.ReadCloser, error)
 	ImageLoad(context.Context, io.Reader, ...dockerclient.ImageLoadOption) (image.LoadResponse, error)
 	ImageSearch(context.Context, string, registry.SearchOptions) ([]registry.SearchResult, error)

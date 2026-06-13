@@ -14,6 +14,8 @@ import (
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/bus"
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/providers"
+	registrycore "github.com/RCooLeR/Cairn/internal/registry"
 	"github.com/RCooLeR/Cairn/internal/store"
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types/container"
@@ -68,6 +70,50 @@ func (c *Client) PullImage(ctx context.Context, imageRef string) (string, error)
 		return streamID, err
 	}
 	c.publishImageChanged(ref)
+	return streamID, nil
+}
+
+func (c *Client) TagImage(ctx context.Context, imageID string, newRef string) error {
+	api, err := c.ensureConnected(ctx)
+	if err != nil {
+		return err
+	}
+	imageID = strings.TrimSpace(imageID)
+	if imageID == "" {
+		return apperror.New(apperror.Conflict, "Image ID is required")
+	}
+	ref, err := registrycore.NormalizeImageRef(newRef)
+	if err != nil {
+		return err
+	}
+	callCtx, cancel := c.withTimeout(ctx)
+	defer cancel()
+	if err := api.ImageTag(callCtx, imageID, ref.Normalized); err != nil {
+		return mapDockerError("tag image", err)
+	}
+	c.publishImageChanged(imageID)
+	c.publishImageChanged(ref.Normalized)
+	return nil
+}
+
+func (c *Client) PushImage(ctx context.Context, imageRef string) (string, error) {
+	api, err := c.ensureConnected(ctx)
+	if err != nil {
+		return "", err
+	}
+	ref, err := registrycore.NormalizeImageRef(imageRef)
+	if err != nil {
+		return "", err
+	}
+	streamID := newJobID("push")
+	auth, err := c.registryAuthForPush(ctx, ref.Registry)
+	if err != nil {
+		return streamID, err
+	}
+	if err := c.pushImage(ctx, api, ref.Normalized, ref.Registry, streamID, auth); err != nil {
+		return streamID, err
+	}
+	c.publishImageChanged(ref.Normalized)
 	return streamID, nil
 }
 
@@ -392,7 +438,7 @@ func (c *Client) validateContainerNameAvailable(ctx context.Context, api APIClie
 }
 
 func (c *Client) pullImage(ctx context.Context, api APIClient, imageRef string, streamID string) error {
-	c.publishImageProgress(streamID, "", "starting", 0, 0)
+	c.publishImageProgress(bus.TopicImagePullProgress, streamID, "", "starting", 0, 0)
 	reader, err := api.ImagePull(ctx, imageRef, image.PullOptions{})
 	if err != nil {
 		return mapDockerError("pull image", err)
@@ -424,9 +470,63 @@ func (c *Client) pullImage(ctx context.Context, api APIClient, imageRef string, 
 		if status == "" {
 			status = "progress"
 		}
-		c.publishImageProgress(streamID, message.ID, status, message.ProgressDetail.Current, message.ProgressDetail.Total)
+		c.publishImageProgress(bus.TopicImagePullProgress, streamID, message.ID, status, message.ProgressDetail.Current, message.ProgressDetail.Total)
 	}
-	c.publishImageProgress(streamID, "", "done", 0, 0)
+	c.publishImageProgress(bus.TopicImagePullProgress, streamID, "", "done", 0, 0)
+	return nil
+}
+
+func (c *Client) registryAuthForPush(ctx context.Context, registry string) (string, error) {
+	provider, ok := c.provider.(providers.PlatformProvider)
+	if !ok {
+		return "", nil
+	}
+	return registrycore.EncodeDockerAuthConfig(ctx, provider, registry)
+}
+
+func (c *Client) pushImage(ctx context.Context, api APIClient, imageRef string, registry string, streamID string, auth string) error {
+	c.publishImageProgress(bus.TopicImagePushProgress, streamID, "", "starting", 0, 0)
+	reader, err := api.ImagePush(ctx, imageRef, image.PushOptions{RegistryAuth: auth})
+	if err != nil {
+		return mapRegistryPushError(registry, err)
+	}
+	defer func() {
+		_ = reader.Close()
+	}()
+	decoder := json.NewDecoder(reader)
+	for {
+		var message struct {
+			ID           string `json:"id"`
+			Status       string `json:"status"`
+			ErrorMessage string `json:"error"`
+			ErrorDetail  struct {
+				Message string `json:"message"`
+			} `json:"errorDetail"`
+			ProgressDetail struct {
+				Current int64 `json:"current"`
+				Total   int64 `json:"total"`
+			} `json:"progressDetail"`
+		}
+		if err := decoder.Decode(&message); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return mapDockerError("read push progress", err)
+		}
+		if message.ErrorMessage != "" || message.ErrorDetail.Message != "" {
+			detail := message.ErrorMessage
+			if detail == "" {
+				detail = message.ErrorDetail.Message
+			}
+			return registryPushStreamError(registry, detail)
+		}
+		status := message.Status
+		if status == "" {
+			status = "progress"
+		}
+		c.publishImageProgress(bus.TopicImagePushProgress, streamID, message.ID, status, message.ProgressDetail.Current, message.ProgressDetail.Total)
+	}
+	c.publishImageProgress(bus.TopicImagePushProgress, streamID, "", "done", 0, 0)
 	return nil
 }
 
@@ -648,8 +748,8 @@ func newJobID(prefix string) string {
 	return prefix + "-" + uuid.NewString()
 }
 
-func (c *Client) publishImageProgress(streamID string, layerID string, status string, current int64, total int64) {
-	c.publish(bus.TopicImagePullProgress, ImageProgressPayload{
+func (c *Client) publishImageProgress(topic bus.Topic, streamID string, layerID string, status string, current int64, total int64) {
+	c.publish(topic, ImageProgressPayload{
 		StreamID: streamID,
 		LayerID:  layerID,
 		Status:   status,
@@ -689,6 +789,53 @@ func (c *Client) publishNetworkChanged(id string) {
 
 func floatPtr(value float64) *float64 {
 	return &value
+}
+
+func mapRegistryPushError(registry string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if registryAuthMessage(err.Error()) {
+		return apperror.Wrap(apperror.RegistryAuth, "Registry authentication failed", err, apperror.WithDetail(registry+": "+err.Error()))
+	}
+	if registryRateLimitMessage(err.Error()) {
+		return apperror.Wrap(apperror.RegistryRateLimit, "Registry rate limit reached", err, apperror.WithDetail(registry+": "+err.Error()))
+	}
+	return mapDockerError("push image", err)
+}
+
+func registryPushStreamError(registry string, detail string) error {
+	if registryAuthMessage(detail) {
+		return apperror.New(apperror.RegistryAuth, "Registry authentication failed", apperror.WithDetail(registry+": "+detail))
+	}
+	if registryRateLimitMessage(detail) {
+		return apperror.New(apperror.RegistryRateLimit, "Registry rate limit reached", apperror.WithDetail(registry+": "+detail))
+	}
+	return apperror.New(apperror.RegistryUnreachable, "Push image failed", apperror.WithDetail(detail))
+}
+
+func registryAuthMessage(detail string) bool {
+	lower := strings.ToLower(detail)
+	for _, marker := range []string{
+		"authentication required",
+		"authorization required",
+		"unauthorized",
+		"denied",
+		"forbidden",
+		"no basic auth credentials",
+		"invalid username",
+		"invalid password",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func registryRateLimitMessage(detail string) bool {
+	lower := strings.ToLower(detail)
+	return strings.Contains(lower, "too many requests") || strings.Contains(lower, "rate limit")
 }
 
 type progressWriter struct {

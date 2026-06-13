@@ -81,6 +81,8 @@ type DockerClient interface {
 	ListImages(context.Context) ([]models.ImageSummary, error)
 	GetImage(context.Context, string) (*models.ImageDetail, error)
 	PullImage(context.Context, string) (string, error)
+	TagImage(context.Context, string, string) error
+	PushImage(context.Context, string) (string, error)
 	SaveImage(context.Context, []string, string) (string, error)
 	LoadImage(context.Context, string) (string, error)
 	SearchHub(context.Context, string, int) ([]models.HubSearchResult, error)
@@ -644,12 +646,40 @@ func (s *DockerService) PullImage(ctx context.Context, imageRef string) (string,
 	return streamID, s.recordAudit(ctx, "image.pull", "image", imageRef, "", command, models.RiskSafe, "success", duration, nil)
 }
 
-func (s *DockerService) TagImage(_ context.Context, imageID string, newRef string) error {
-	return notReady()
+func (s *DockerService) TagImage(ctx context.Context, imageID string, newRef string) error {
+	if s.Client == nil {
+		return notReady()
+	}
+	command := joinCommand([]string{"docker", "tag", imageID, newRef})
+	started := time.Now().UTC()
+	if err := s.recordAudit(ctx, "image.tag", "image", newRef, "", command, models.RiskSafe, "started", 0, nil); err != nil {
+		return err
+	}
+	err := s.Client.TagImage(ctx, imageID, newRef)
+	duration := time.Since(started)
+	if err != nil {
+		_ = s.recordAudit(ctx, "image.tag", "image", newRef, "", command, models.RiskSafe, "failed", duration, err)
+		return err
+	}
+	return s.recordAudit(ctx, "image.tag", "image", newRef, "", command, models.RiskSafe, "success", duration, nil)
 }
 
-func (s *DockerService) PushImage(_ context.Context, imageRef string) (string, error) {
-	return "", notReady()
+func (s *DockerService) PushImage(ctx context.Context, imageRef string) (string, error) {
+	if s.Client == nil {
+		return "", notReady()
+	}
+	command := "docker push " + quoteArg(imageRef)
+	started := time.Now().UTC()
+	if err := s.recordAudit(ctx, "image.push", "image", imageRef, "", command, models.RiskNeedsConfirmation, "started", 0, nil); err != nil {
+		return "", err
+	}
+	streamID, err := s.Client.PushImage(ctx, imageRef)
+	duration := time.Since(started)
+	if err != nil {
+		_ = s.recordAudit(ctx, "image.push", "image", imageRef, "", command, models.RiskNeedsConfirmation, "failed", duration, err)
+		return "", err
+	}
+	return streamID, s.recordAudit(ctx, "image.push", "image", imageRef, "", command, models.RiskNeedsConfirmation, "success", duration, nil)
 }
 
 func (s *DockerService) SaveImage(ctx context.Context, imageRefs []string, destPath string) (string, error) {

@@ -255,6 +255,12 @@ func TestDockerServiceObjectCreationAudits(t *testing.T) {
 	if _, err := service.PullImage(ctx, "alpine:latest"); err != nil {
 		t.Fatalf("PullImage() error = %v", err)
 	}
+	if err := service.TagImage(ctx, "sha256:local", "localhost:5000/test/app:1.0"); err != nil {
+		t.Fatalf("TagImage() error = %v", err)
+	}
+	if _, err := service.PushImage(ctx, "localhost:5000/test/app:1.0"); err != nil {
+		t.Fatalf("PushImage() error = %v", err)
+	}
 	if _, err := service.SaveImage(ctx, []string{"alpine:latest"}, "/tmp/alpine.tar"); err != nil {
 		t.Fatalf("SaveImage() error = %v", err)
 	}
@@ -279,10 +285,11 @@ func TestDockerServiceObjectCreationAudits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAuditLog() error = %v", err)
 	}
-	if len(entries) != 14 {
-		t.Fatalf("audit entries count = %d, want 14: %#v", len(entries), entries)
+	if len(entries) != 18 {
+		t.Fatalf("audit entries count = %d, want 18: %#v", len(entries), entries)
 	}
 	var sawRun bool
+	var sawPush bool
 	for _, entry := range entries {
 		if entry.Action == "container.run" && entry.Result == "success" {
 			sawRun = true
@@ -291,9 +298,18 @@ func TestDockerServiceObjectCreationAudits(t *testing.T) {
 				t.Fatalf("run command was not redacted: %q", command)
 			}
 		}
+		if entry.Action == "image.push" && entry.Result == "success" {
+			sawPush = true
+			if entry.Metadata["risk"] != string(models.RiskNeedsConfirmation) {
+				t.Fatalf("push risk = %q, want %q", entry.Metadata["risk"], models.RiskNeedsConfirmation)
+			}
+		}
 	}
 	if !sawRun {
 		t.Fatalf("missing successful container.run audit in %#v", entries)
+	}
+	if !sawPush {
+		t.Fatalf("missing successful image.push audit in %#v", entries)
 	}
 }
 
@@ -573,6 +589,8 @@ type fakeDockerClient struct {
 	renamed    []string
 	runImages  []models.RunImageRequest
 	pulled     []string
+	tagged     []string
+	pushed     []string
 	saved      []string
 	loaded     []string
 	volumes    []models.CreateVolumeRequest
@@ -670,6 +688,16 @@ func (f *fakeDockerClient) GetImage(context.Context, string) (*models.ImageDetai
 func (f *fakeDockerClient) PullImage(_ context.Context, ref string) (string, error) {
 	f.pulled = append(f.pulled, ref)
 	return "pull-stream", nil
+}
+
+func (f *fakeDockerClient) TagImage(_ context.Context, imageID string, newRef string) error {
+	f.tagged = append(f.tagged, imageID+"->"+newRef)
+	return nil
+}
+
+func (f *fakeDockerClient) PushImage(_ context.Context, ref string) (string, error) {
+	f.pushed = append(f.pushed, ref)
+	return "push-stream", nil
 }
 
 func (f *fakeDockerClient) SaveImage(_ context.Context, refs []string, destPath string) (string, error) {

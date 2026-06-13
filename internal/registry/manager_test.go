@@ -14,6 +14,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
+	dockerregistry "github.com/docker/docker/api/types/registry"
 )
 
 func TestNormalizeImageRefCorpus(t *testing.T) {
@@ -109,6 +110,34 @@ func TestListRegistryAccountsIncludesCredentialHelperList(t *testing.T) {
 	}
 	if got[1].Registry != "ghcr.io" || got[1].Username != "octo" || got[1].Source != "credHelper" {
 		t.Fatalf("ghcr account = %#v", got[1])
+	}
+}
+
+func TestEncodeDockerAuthConfigUsesCredentialHelper(t *testing.T) {
+	config := `{"auths":{"ghcr.io":{}},"credHelpers":{"ghcr.io":"gh"}}`
+	provider := &fakeRegistryProvider{
+		backendResults: map[string]string{
+			`sh -lc cat "${DOCKER_CONFIG:-$HOME/.docker}/config.json" 2>/dev/null || true`: config,
+			"docker-credential-gh get": `{"Username":"octo","Secret":"token"}`,
+		},
+	}
+	encoded, err := EncodeDockerAuthConfig(context.Background(), provider, "ghcr.io")
+	if err != nil {
+		t.Fatalf("EncodeDockerAuthConfig() error = %v", err)
+	}
+	raw, err := base64.URLEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatalf("decode auth config: %v", err)
+	}
+	var auth dockerregistry.AuthConfig
+	if err := json.Unmarshal(raw, &auth); err != nil {
+		t.Fatalf("unmarshal auth config: %v", err)
+	}
+	if auth.Username != "octo" || auth.Password != "token" || auth.ServerAddress != "ghcr.io" {
+		t.Fatalf("auth config = %#v", auth)
+	}
+	if provider.backendInput != "ghcr.io\n" {
+		t.Fatalf("helper input = %q", provider.backendInput)
 	}
 }
 
