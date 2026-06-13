@@ -92,6 +92,8 @@ const projectServiceMock = vi.hoisted(() => ({
 
 const providerServiceMock = vi.hoisted(() => ({
   Detect: vi.fn(),
+  PlanInstall: vi.fn(),
+  ApplyInstall: vi.fn(),
   Start: vi.fn(),
 }));
 
@@ -248,10 +250,19 @@ describe('App inventory shell', () => {
     projectServiceMock.StopProject.mockResolvedValue(undefined);
     projectServiceMock.RestartProject.mockResolvedValue(undefined);
     projectServiceMock.PullProject.mockResolvedValue(undefined);
-    projectServiceMock.PlanRedeployProject.mockResolvedValue(projectRedeployPlan());
-    projectServiceMock.PlanDownProject.mockResolvedValue(projectDownVolumesPlan());
+    projectServiceMock.PlanRedeployProject.mockResolvedValue(
+      projectRedeployPlan(),
+    );
+    projectServiceMock.PlanDownProject.mockResolvedValue(
+      projectDownVolumesPlan(),
+    );
     projectServiceMock.ApplyProjectPlan.mockResolvedValue(undefined);
     providerServiceMock.Detect.mockResolvedValue(healthyProviderStatus());
+    providerServiceMock.PlanInstall.mockResolvedValue(wslInstallPlan());
+    providerServiceMock.ApplyInstall.mockResolvedValue({
+      planID: 'plan-wsl-install',
+      streamID: 'setup-stream',
+    });
     providerServiceMock.Start.mockResolvedValue(undefined);
     logsServiceMock.StartLogStream.mockResolvedValue('stream-1');
     logsServiceMock.StopStream.mockResolvedValue(undefined);
@@ -299,14 +310,14 @@ describe('App inventory shell', () => {
         containerID: 'container-1',
       }),
     );
-    terminalServiceMock.DetectContainerShells.mockResolvedValue([
-      '/bin/sh',
-    ]);
+    terminalServiceMock.DetectContainerShells.mockResolvedValue(['/bin/sh']);
     terminalServiceMock.WriteTerminal.mockResolvedValue(undefined);
     terminalServiceMock.ResizeTerminal.mockResolvedValue(undefined);
     terminalServiceMock.CloseTerminal.mockResolvedValue(undefined);
     settingsServiceMock.GetSettings.mockResolvedValue({
       'linux.sudo_mode': 'ask',
+      'provider.autostart_backend': true,
+      'windows.wsl_distro': 'Ubuntu',
     });
     settingsServiceMock.SetSetting.mockResolvedValue(undefined);
     settingsServiceMock.GetNotifications.mockResolvedValue([]);
@@ -412,7 +423,9 @@ describe('App inventory shell', () => {
     render(<App />);
 
     await screen.findByText('Docker Engine - Running');
-    await waitFor(() => expect(metricsServiceMock.StartStatsStream).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(metricsServiceMock.StartStatsStream).toHaveBeenCalled(),
+    );
 
     emitRuntimeEvent('stats:sample', {
       streamID: 'stats-stream-1',
@@ -452,16 +465,28 @@ describe('App inventory shell', () => {
     const renderStart = performance.now();
     render(<App />);
 
-    expect(await screen.findByLabelText('Docker object counts')).toBeInTheDocument();
+    expect(
+      await screen.findByLabelText('Docker object counts'),
+    ).toBeInTheDocument();
     expect(performance.now() - renderStart).toBeLessThan(1500);
 
     const counts = seedScaleImageUseCounts(snapshot.containers);
     const filterStart = performance.now();
-    expect(filterContainers(snapshot.containers, 'service-42', 'all')).toHaveLength(1);
-    expect(filterContainers(snapshot.containers, '', 'running')).toHaveLength(50);
-    expect(filterImages(snapshot.images, counts, 'repo-499', 'all')).toHaveLength(1);
-    expect(filterImages(snapshot.images, counts, '', 'unused').length).toBeGreaterThan(300);
-    expect(filterVolumes(snapshot.volumes, 'volume-199', 'all')).toHaveLength(1);
+    expect(
+      filterContainers(snapshot.containers, 'service-42', 'all'),
+    ).toHaveLength(1);
+    expect(filterContainers(snapshot.containers, '', 'running')).toHaveLength(
+      50,
+    );
+    expect(
+      filterImages(snapshot.images, counts, 'repo-499', 'all'),
+    ).toHaveLength(1);
+    expect(
+      filterImages(snapshot.images, counts, '', 'unused').length,
+    ).toBeGreaterThan(300);
+    expect(filterVolumes(snapshot.volumes, 'volume-199', 'all')).toHaveLength(
+      1,
+    );
     expect(filterNetworks(snapshot.networks, 'network-19')).toHaveLength(1);
     expect(filterProjects(projects, 'project-9', 'all')).toHaveLength(1);
     expect(performance.now() - filterStart).toBeLessThan(100);
@@ -649,7 +674,9 @@ describe('App inventory shell', () => {
       ),
     );
     expect(await screen.findByText('linux_native')).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Containers' })).toBeInTheDocument();
+    expect(
+      screen.getByRole('button', { name: 'Containers' }),
+    ).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'Services' }));
     expect(screen.getByText('postgres:16')).toBeInTheDocument();
@@ -659,9 +686,7 @@ describe('App inventory shell', () => {
 
     fireEvent.click(screen.getByRole('button', { name: 'Compose' }));
     expect(screen.getByText('valid')).toBeInTheDocument();
-    expect(screen.getByTestId('monaco-viewer')).toHaveTextContent(
-      'services:',
-    );
+    expect(screen.getByTestId('monaco-viewer')).toHaveTextContent('services:');
   });
 
   it('streams logs, filters search matches, and keeps nonmatching rows hidden', async () => {
@@ -688,7 +713,11 @@ describe('App inventory shell', () => {
       streamID: 'stream-1',
       lines: [
         logLine({ level: 'info', text: 'INFO server started' }),
-        logLine({ level: 'error', stream: 'stderr', text: 'ERROR failed request' }),
+        logLine({
+          level: 'error',
+          stream: 'stderr',
+          text: 'ERROR failed request',
+        }),
       ],
     });
 
@@ -718,7 +747,9 @@ describe('App inventory shell', () => {
         name: /Logs/,
       }),
     );
-    await waitFor(() => expect(logsServiceMock.StartLogStream).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(logsServiceMock.StartLogStream).toHaveBeenCalled(),
+    );
     emitRuntimeEvent('logs:lines', {
       streamID: 'stream-1',
       lines: [logLine({ text: 'INFO first line' })],
@@ -751,7 +782,9 @@ describe('App inventory shell', () => {
         name: /Logs/,
       }),
     );
-    await waitFor(() => expect(logsServiceMock.StartLogStream).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(logsServiceMock.StartLogStream).toHaveBeenCalled(),
+    );
     fireEvent.click(screen.getByRole('button', { name: 'Export' }));
 
     const dialog = await screen.findByRole('dialog', { name: 'Export Logs' });
@@ -1128,7 +1161,9 @@ describe('App inventory shell', () => {
   });
 
   it('renders stale cached data and disables Docker mutations when the daemon is stopped', async () => {
-    inventoryMock.getInventorySnapshot.mockResolvedValue(stoppedDaemonSnapshot());
+    inventoryMock.getInventorySnapshot.mockResolvedValue(
+      stoppedDaemonSnapshot(),
+    );
 
     render(<App />);
 
@@ -1161,7 +1196,9 @@ describe('App inventory shell', () => {
   });
 
   it('persists Linux socket permission choices from the provider repair dialog', async () => {
-    inventoryMock.getInventorySnapshot.mockResolvedValue(permissionDeniedSnapshot());
+    inventoryMock.getInventorySnapshot.mockResolvedValue(
+      permissionDeniedSnapshot(),
+    );
 
     render(<App />);
 
@@ -1187,6 +1224,136 @@ describe('App inventory shell', () => {
       ),
     );
     expect(providerServiceMock.Detect).toHaveBeenCalledWith('linux_native');
+  });
+
+  it('runs the Windows WSL setup checks and install plan from onboarding', async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(noProviderSnapshot());
+    providerServiceMock.Detect.mockResolvedValueOnce({
+      ...healthyProviderStatus(),
+      installed: false,
+      running: false,
+      healthy: false,
+      dockerInstalled: false,
+      dockerRunning: false,
+      composeInstalled: false,
+      buildxInstalled: false,
+      problems: [
+        {
+          code: 'WSL_MISSING',
+          message: 'WSL is not installed.',
+          repairHint: 'Install WSL 2 with an Ubuntu distribution.',
+          recoverable: true,
+        },
+      ],
+    });
+
+    render(<App />);
+
+    expect(
+      await screen.findByText('No Docker provider configured'),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole('button', { name: 'Set up' })[0]);
+    const dialog = await screen.findByRole('dialog', {
+      name: 'Set Up Docker Backend',
+    });
+
+    fireEvent.click(
+      within(dialog).getByRole('button', { name: 'Get started' }),
+    );
+    fireEvent.click(
+      within(dialog).getByRole('button', { name: /Ubuntu on WSL2/ }),
+    );
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Run checks' }));
+
+    await waitFor(() =>
+      expect(providerServiceMock.Detect).toHaveBeenCalledWith(
+        'windows_wsl_ubuntu',
+      ),
+    );
+    expect(
+      await within(dialog).findByText(
+        'Install WSL 2 with an Ubuntu distribution.',
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByText(/inside the WSL distro/),
+    ).toBeInTheDocument();
+
+    fireEvent.click(
+      within(dialog).getByRole('button', { name: 'Create install plan' }),
+    );
+    await waitFor(() =>
+      expect(providerServiceMock.PlanInstall).toHaveBeenCalledWith(
+        'windows_wsl_ubuntu',
+        expect.objectContaining({
+          backend: 'windows_wsl_ubuntu',
+          extra: { distro: 'Ubuntu' },
+        }),
+      ),
+    );
+    expect(
+      await within(dialog).findByText(
+        'wsl.exe --install Ubuntu --name cairn-dev',
+      ),
+    ).toBeInTheDocument();
+
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Install' }));
+    await waitFor(() =>
+      expect(providerServiceMock.ApplyInstall).toHaveBeenCalledWith(
+        'plan-wsl-install',
+      ),
+    );
+    emitRuntimeEvent('provider:install:progress', {
+      planID: 'plan-wsl-install',
+      streamID: 'setup-stream',
+      step: 1,
+      totalSteps: 1,
+      message: 'Install complete',
+      done: true,
+    });
+
+    expect(
+      await within(dialog).findByText('Windows WSL backend is ready'),
+    ).toBeInTheDocument();
+  });
+
+  it('saves Windows WSL settings and shows the path mapping panel', async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+
+    await screen.findByText('Docker Engine - Running');
+    fireEvent.click(
+      within(
+        screen.getByRole('navigation', { name: 'Main navigation' }),
+      ).getByRole('button', {
+        name: /Settings/,
+      }),
+    );
+
+    expect(await screen.findByText('Windows WSL')).toBeInTheDocument();
+    expect(screen.getByText('Path mapping')).toBeInTheDocument();
+    const distroInput = screen.getByLabelText('WSL distro');
+    fireEvent.change(distroInput, { target: { value: 'cairn-dev' } });
+    fireEvent.blur(distroInput);
+
+    await waitFor(() =>
+      expect(settingsServiceMock.SetSetting).toHaveBeenCalledWith(
+        'windows.wsl_distro',
+        'cairn-dev',
+      ),
+    );
+    fireEvent.click(
+      screen.getByRole('checkbox', {
+        name: /Start Docker backend on app launch/,
+      }),
+    );
+    await waitFor(() =>
+      expect(settingsServiceMock.SetSetting).toHaveBeenCalledWith(
+        'provider.autostart_backend',
+        false,
+      ),
+    );
   });
 
   it('refreshes inventory when Docker object events arrive', async () => {
@@ -1217,9 +1384,11 @@ describe('App inventory shell', () => {
 });
 
 function emitRuntimeEvent(eventName: string, data: unknown) {
-  const callback = [...runtimeMock.on.mock.calls].reverse().find(
-    ([name]) => name === eventName,
-  )?.[1] as ((event?: unknown) => void) | undefined;
+  const callback = [...runtimeMock.on.mock.calls]
+    .reverse()
+    .find(([name]) => name === eventName)?.[1] as
+    | ((event?: unknown) => void)
+    | undefined;
   expect(callback).toEqual(expect.any(Function));
   act(() => {
     callback?.({ name: eventName, data });
@@ -1406,64 +1575,76 @@ function seededSnapshot(): InventorySnapshot {
 
 function seedScaleSnapshot(projects: ProjectSummary[]): InventorySnapshot {
   const base = seededSnapshot();
-  const containers = Array.from({ length: 100 }, (_, index): ContainerSummary => {
-    const project = projects[index % projects.length];
-    const state =
-      index % 10 === 0 ? 'paused' : index % 5 < 3 ? 'running' : 'exited';
-    return {
-      id: `container-${index}`,
-      name: `service-${index}`,
-      image: `cairn/repo-${index % 500}:latest`,
-      imageID: `sha256:image-${index % 150}`,
-      status: state === 'running' ? 'Up 5 minutes' : state,
-      state,
-      health:
-        index % 17 === 0
-          ? HealthStatus.HealthStatusUnhealthy
-          : HealthStatus.HealthStatusHealthy,
-      projectID: project.id,
-      service: `svc-${index % 12}`,
-      ports: [],
-      cpuPercent: index % 100,
-      memoryBytes: (32 + index) * 1024 * 1024,
-      memoryLimit: 512 * 1024 * 1024,
-      restarts: index % 4,
-      createdAt: `2026-06-13T08:${String(index % 60).padStart(2, '0')}:00Z`,
-    };
-  });
-  const images = Array.from({ length: 500 }, (_, index): ImageSummary => ({
-    id: `sha256:image-${index}`,
-    repoTags: [`cairn/repo-${index}:latest`],
-    repoDigests: [`cairn/repo-${index}@sha256:digest-${index}`],
-    sizeBytes: (16 + index) * 1024 * 1024,
-    createdAt: `2026-06-12T${String(index % 24).padStart(2, '0')}:00:00Z`,
-    inUse: index < 150,
-    updateStatus:
-      index % 25 === 0
-        ? UpdateStatus.UpdateStatusServiceImageUpdateAvailable
-        : UpdateStatus.UpdateStatusUnknown,
-  }));
-  const volumes = Array.from({ length: 200 }, (_, index): VolumeSummary => ({
-    name: `volume-${index}`,
-    driver: 'local',
-    mountpoint: `/var/lib/docker/volumes/volume-${index}/_data`,
-    labels: {
-      'com.docker.compose.project': projects[index % projects.length].name,
+  const containers = Array.from(
+    { length: 100 },
+    (_, index): ContainerSummary => {
+      const project = projects[index % projects.length];
+      const state =
+        index % 10 === 0 ? 'paused' : index % 5 < 3 ? 'running' : 'exited';
+      return {
+        id: `container-${index}`,
+        name: `service-${index}`,
+        image: `cairn/repo-${index % 500}:latest`,
+        imageID: `sha256:image-${index % 150}`,
+        status: state === 'running' ? 'Up 5 minutes' : state,
+        state,
+        health:
+          index % 17 === 0
+            ? HealthStatus.HealthStatusUnhealthy
+            : HealthStatus.HealthStatusHealthy,
+        projectID: project.id,
+        service: `svc-${index % 12}`,
+        ports: [],
+        cpuPercent: index % 100,
+        memoryBytes: (32 + index) * 1024 * 1024,
+        memoryLimit: 512 * 1024 * 1024,
+        restarts: index % 4,
+        createdAt: `2026-06-13T08:${String(index % 60).padStart(2, '0')}:00Z`,
+      };
     },
-    sizeBytes: index * 4096,
-    inUse: index % 2 === 0,
-  }));
-  const networks = Array.from({ length: 20 }, (_, index): NetworkSummary => ({
-    id: `network-${index}`,
-    name: `network-${index}`,
-    driver: 'bridge',
-    scope: 'local',
-    internal: index % 5 === 0,
-    attachable: true,
-    labels: {
-      'com.docker.compose.project': projects[index % projects.length].name,
-    },
-  }));
+  );
+  const images = Array.from(
+    { length: 500 },
+    (_, index): ImageSummary => ({
+      id: `sha256:image-${index}`,
+      repoTags: [`cairn/repo-${index}:latest`],
+      repoDigests: [`cairn/repo-${index}@sha256:digest-${index}`],
+      sizeBytes: (16 + index) * 1024 * 1024,
+      createdAt: `2026-06-12T${String(index % 24).padStart(2, '0')}:00:00Z`,
+      inUse: index < 150,
+      updateStatus:
+        index % 25 === 0
+          ? UpdateStatus.UpdateStatusServiceImageUpdateAvailable
+          : UpdateStatus.UpdateStatusUnknown,
+    }),
+  );
+  const volumes = Array.from(
+    { length: 200 },
+    (_, index): VolumeSummary => ({
+      name: `volume-${index}`,
+      driver: 'local',
+      mountpoint: `/var/lib/docker/volumes/volume-${index}/_data`,
+      labels: {
+        'com.docker.compose.project': projects[index % projects.length].name,
+      },
+      sizeBytes: index * 4096,
+      inUse: index % 2 === 0,
+    }),
+  );
+  const networks = Array.from(
+    { length: 20 },
+    (_, index): NetworkSummary => ({
+      id: `network-${index}`,
+      name: `network-${index}`,
+      driver: 'bridge',
+      scope: 'local',
+      internal: index % 5 === 0,
+      attachable: true,
+      labels: {
+        'com.docker.compose.project': projects[index % projects.length].name,
+      },
+    }),
+  );
 
   return {
     ...base,
@@ -1485,25 +1666,28 @@ function seedScaleSnapshot(projects: ProjectSummary[]): InventorySnapshot {
 }
 
 function seedScaleProjects(): ProjectSummary[] {
-  return Array.from({ length: 10 }, (_, index): ProjectSummary => ({
-    ...seededProject(),
-    id: `linux_native/project-${index}`,
-    name: `project-${index}`,
-    status:
-      index % 3 === 0
-        ? ProjectStatus.ProjectStatusPartial
-        : ProjectStatus.ProjectStatusRunning,
-    health:
-      index % 4 === 0
-        ? HealthStatus.HealthStatusUnhealthy
-        : HealthStatus.HealthStatusHealthy,
-    servicesRunning: index % 3 === 0 ? 8 : 12,
-    servicesTotal: 12,
-    cpuPercent: index === 9 ? 92 : 10 + index,
-    memoryBytes: (256 + index * 32) * 1024 * 1024,
-    workingDir: `/home/cairn/projects/project-${index}`,
-    lastChangedAt: `2026-06-13T09:${String(index).padStart(2, '0')}:00Z`,
-  }));
+  return Array.from(
+    { length: 10 },
+    (_, index): ProjectSummary => ({
+      ...seededProject(),
+      id: `linux_native/project-${index}`,
+      name: `project-${index}`,
+      status:
+        index % 3 === 0
+          ? ProjectStatus.ProjectStatusPartial
+          : ProjectStatus.ProjectStatusRunning,
+      health:
+        index % 4 === 0
+          ? HealthStatus.HealthStatusUnhealthy
+          : HealthStatus.HealthStatusHealthy,
+      servicesRunning: index % 3 === 0 ? 8 : 12,
+      servicesTotal: 12,
+      cpuPercent: index === 9 ? 92 : 10 + index,
+      memoryBytes: (256 + index * 32) * 1024 * 1024,
+      workingDir: `/home/cairn/projects/project-${index}`,
+      lastChangedAt: `2026-06-13T09:${String(index).padStart(2, '0')}:00Z`,
+    }),
+  );
 }
 
 function seedScaleDashboardMetrics(
@@ -1765,6 +1949,24 @@ function projectDownVolumesPlan(): CommandPlan {
   };
 }
 
+function wslInstallPlan(): CommandPlan {
+  return {
+    planID: 'plan-wsl-install',
+    title: 'Install Docker Engine in Ubuntu on WSL',
+    risk: Risk.RiskNeedsConfirmation,
+    commands: [
+      {
+        order: 1,
+        command: 'wsl.exe --install Ubuntu --name cairn-dev',
+        risk: Risk.RiskNeedsConfirmation,
+        explanation: 'Install the selected Ubuntu WSL distribution',
+      },
+    ],
+    effects: ['Install Ubuntu and Docker Engine inside WSL.'],
+    expiresAt: '2026-06-13T08:10:00Z',
+  };
+}
+
 function emptySnapshot(): InventorySnapshot {
   return {
     ...seededSnapshot(),
@@ -1782,6 +1984,17 @@ function emptySnapshot(): InventorySnapshot {
     networks: [],
     volumeDetails: {},
     networkDetails: {},
+  };
+}
+
+function noProviderSnapshot(): InventorySnapshot {
+  return {
+    ...emptySnapshot(),
+    providers: [],
+    dockerInfo: null,
+    dockerVersion: null,
+    diskUsage: null,
+    degradedReason: 'No Docker provider configured',
   };
 }
 

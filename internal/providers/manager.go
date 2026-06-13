@@ -35,6 +35,10 @@ type installPlanRecord struct {
 	risk       models.Risk
 }
 
+type distroConfigurable interface {
+	SetDistro(string)
+}
+
 func NewManager(repo *store.ProviderRepository, settings *store.SettingsRepository, providerSet []PlatformProvider) *Manager {
 	providersByID := make(map[string]PlatformProvider, len(providerSet))
 	order := make([]string, 0, len(providerSet))
@@ -71,6 +75,7 @@ func (m *Manager) Detect(ctx context.Context, providerID string) (*models.Provid
 	if err := m.ensureProviderRecord(ctx, provider); err != nil {
 		return nil, err
 	}
+	m.applyProviderSettings(ctx, provider)
 	detectCtx, cancel := context.WithTimeout(ctx, detectBudget)
 	defer cancel()
 	status, err := provider.Detect(detectCtx)
@@ -87,6 +92,9 @@ func (m *Manager) Detect(ctx context.Context, providerID string) (*models.Provid
 func (m *Manager) DetectAll(ctx context.Context) (map[string]*models.ProviderStatus, error) {
 	if err := m.ensureProviderRecords(ctx); err != nil {
 		return nil, err
+	}
+	for _, id := range m.order {
+		m.applyProviderSettings(ctx, m.providers[id])
 	}
 
 	type detectResult struct {
@@ -202,6 +210,7 @@ func (m *Manager) PlanInstall(ctx context.Context, providerID string, opts model
 	if !ok {
 		return nil, apperror.New(apperror.NotFound, "Provider was not found")
 	}
+	m.applyProviderSettings(ctx, provider)
 	plan, err := provider.PlanInstall(ctx, opts)
 	if err != nil {
 		return nil, err
@@ -246,6 +255,7 @@ func (m *Manager) ApplyInstall(ctx context.Context, planID string, progress chan
 	if !ok {
 		return apperror.New(apperror.NotFound, "Provider was not found")
 	}
+	m.applyProviderSettings(ctx, provider)
 	for step := range record.steps {
 		if err := provider.ExecuteInstallStep(ctx, planID, step, progress); err != nil {
 			return err
@@ -259,6 +269,7 @@ func (m *Manager) Start(ctx context.Context, providerID string) error {
 	if !ok {
 		return apperror.New(apperror.NotFound, "Provider was not found")
 	}
+	m.applyProviderSettings(ctx, provider)
 	return provider.Start(ctx)
 }
 
@@ -267,6 +278,7 @@ func (m *Manager) Stop(ctx context.Context, providerID string) error {
 	if !ok {
 		return apperror.New(apperror.NotFound, "Provider was not found")
 	}
+	m.applyProviderSettings(ctx, provider)
 	return provider.Stop(ctx)
 }
 
@@ -275,6 +287,7 @@ func (m *Manager) Restart(ctx context.Context, providerID string) error {
 	if !ok {
 		return apperror.New(apperror.NotFound, "Provider was not found")
 	}
+	m.applyProviderSettings(ctx, provider)
 	return provider.Restart(ctx)
 }
 
@@ -325,6 +338,17 @@ func (m *Manager) setActiveBestEffort(ctx context.Context, providerID string) {
 	m.mu.Lock()
 	m.activeID = providerID
 	m.mu.Unlock()
+}
+
+func (m *Manager) applyProviderSettings(ctx context.Context, provider PlatformProvider) {
+	if m.settings == nil || provider == nil {
+		return
+	}
+	if configurable, ok := provider.(distroConfigurable); ok && provider.Type() == TypeWindowsWSL {
+		if distro, err := m.settings.GetString(ctx, "windows.wsl_distro"); err == nil && strings.TrimSpace(distro) != "" {
+			configurable.SetDistro(distro)
+		}
+	}
 }
 
 func plannedCommandText(plan *models.CommandPlan) string {

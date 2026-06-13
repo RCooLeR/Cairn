@@ -68,6 +68,24 @@ func TestManagerSelectsBestDetectedWhenSavedProviderUnhealthy(t *testing.T) {
 	}
 }
 
+func TestManagerAppliesWindowsWSLDistroSetting(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openProviderTestStore(t, ctx)
+	provider := &fakeProvider{id: "windows_wsl_ubuntu", kind: TypeWindowsWSL, platform: PlatformWindows, healthy: true}
+	manager := NewManager(db.Providers(), db.Settings(), []PlatformProvider{provider})
+	if err := db.Settings().SetString(ctx, "windows.wsl_distro", "cairn-dev"); err != nil {
+		t.Fatalf("SetString() error = %v", err)
+	}
+
+	if _, err := manager.Detect(ctx, provider.ID()); err != nil {
+		t.Fatalf("Detect() error = %v", err)
+	}
+	if provider.distro != "cairn-dev" {
+		t.Fatalf("provider distro = %q, want cairn-dev", provider.distro)
+	}
+}
+
 func openProviderTestStore(t *testing.T, ctx context.Context) *store.Store {
 	t.Helper()
 	db, err := store.Open(ctx, t.TempDir()+"/cairn.db")
@@ -88,6 +106,7 @@ type fakeProvider struct {
 	kind     string
 	platform string
 	healthy  bool
+	distro   string
 }
 
 func (p *fakeProvider) ID() string          { return p.id }
@@ -104,6 +123,9 @@ func (p *fakeProvider) Detect(context.Context) (*models.ProviderStatus, error) {
 		ComposeInstalled: p.healthy,
 		BuildxInstalled:  p.healthy,
 	}, nil
+}
+func (p *fakeProvider) SetDistro(distro string) {
+	p.distro = distro
 }
 func (p *fakeProvider) PlanInstall(context.Context, models.InstallOptions) (*models.CommandPlan, error) {
 	return nil, nil

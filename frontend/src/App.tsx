@@ -17,6 +17,7 @@ import type {
   PortMapping,
   PortBinding,
   ProviderProblem,
+  ProviderStatus,
   ProjectDetail,
   ProjectSummary,
   ProviderSummary,
@@ -60,6 +61,7 @@ import {
   ScrollText,
   Search,
   Server,
+  Settings as SettingsIcon,
   ShieldAlert,
   Skull,
   Square,
@@ -137,7 +139,8 @@ type PageID =
   | 'volumes'
   | 'networks'
   | 'logs'
-  | 'terminal';
+  | 'terminal'
+  | 'settings';
 type FilterID = string;
 type BadgeTone = 'ok' | 'warn' | 'error' | 'info' | 'neutral' | 'accent';
 type StatusToneID = 'ok' | 'warn' | 'error' | 'info' | 'neutral';
@@ -148,6 +151,7 @@ type ProjectTabID = 'overview' | 'services' | 'containers' | 'compose';
 type LogScope = 'all' | 'project' | 'service' | 'container';
 type LogLevelFilter = 'error' | 'warn' | 'info' | 'debug' | 'unknown';
 type PermissionMode = 'ask' | 'group' | 'rootless';
+type SetupStepID = 'welcome' | 'backend' | 'checks' | 'install' | 'verify';
 
 type NavItem = {
   id: PageID;
@@ -275,6 +279,31 @@ type ImportProjectState = {
   imported?: ProjectDetail | null;
 };
 
+type ProviderInstallProgressPayload = {
+  planID: string;
+  streamID: string;
+  step: number;
+  totalSteps: number;
+  message: string;
+  done: boolean;
+  error?: string;
+};
+
+type ProviderSetupState = {
+  open: boolean;
+  step: SetupStepID;
+  distro: string;
+  detecting: boolean;
+  detection: ProviderStatus | null;
+  detectError?: string;
+  plan: CommandPlan | null;
+  planning: boolean;
+  installing: boolean;
+  installStreamID?: string;
+  progress: ProviderInstallProgressPayload[];
+  error?: string;
+};
+
 type ExportLogsState = {
   open: boolean;
   path: string;
@@ -351,6 +380,7 @@ const navItems: NavItem[] = [
   { id: 'networks', label: 'Networks', icon: Network },
   { id: 'logs', label: 'Logs', icon: ScrollText },
   { id: 'terminal', label: 'Terminal', icon: Terminal },
+  { id: 'settings', label: 'Settings', icon: SettingsIcon },
 ];
 
 const emptyInspect: InspectState = {
@@ -447,6 +477,20 @@ const emptyImportProject: ImportProjectState = {
   imported: null,
 };
 
+const windowsWSLProviderID = 'windows_wsl_ubuntu';
+
+const emptyProviderSetup: ProviderSetupState = {
+  open: false,
+  step: 'welcome',
+  distro: 'Ubuntu',
+  detecting: false,
+  detection: null,
+  plan: null,
+  planning: false,
+  installing: false,
+  progress: [],
+};
+
 const emptyExportLogs: ExportLogsState = {
   open: false,
   path: '',
@@ -531,8 +575,14 @@ function App() {
   const [repairOpen, setRepairOpen] = useState(false);
   const [repairError, setRepairError] = useState<string | null>(null);
   const [repairSaving, setRepairSaving] = useState(false);
-  const [permissionMode, setPermissionMode] =
-    useState<PermissionMode>('ask');
+  const [permissionMode, setPermissionMode] = useState<PermissionMode>('ask');
+  const [appSettings, setAppSettings] = useState<Record<string, unknown>>({});
+  const [wslDistro, setWSLDistro] = useState('Ubuntu');
+  const [providerAutostart, setProviderAutostart] = useState(true);
+  const [settingsSaving, setSettingsSaving] = useState(false);
+  const [settingsMessage, setSettingsMessage] = useState<string | null>(null);
+  const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [setup, setSetup] = useState<ProviderSetupState>(emptyProviderSetup);
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [notificationsLoading, setNotificationsLoading] = useState(false);
@@ -662,19 +712,57 @@ function App() {
         if (!active) {
           return;
         }
+        const nextSettings = settings ?? {};
+        setAppSettings(nextSettings);
         setPermissionMode(
-          normalizePermissionMode(settings?.['linux.sudo_mode']),
+          normalizePermissionMode(nextSettings['linux.sudo_mode']),
+        );
+        setWSLDistro(
+          normalizeStringSetting(nextSettings['windows.wsl_distro'], 'Ubuntu'),
+        );
+        setProviderAutostart(
+          normalizeBoolSetting(
+            nextSettings['provider.autostart_backend'],
+            true,
+          ),
         );
       })
       .catch(() => {
         if (active) {
+          setAppSettings({});
           setPermissionMode('ask');
+          setWSLDistro('Ubuntu');
+          setProviderAutostart(true);
         }
       });
     return () => {
       active = false;
     };
   }, []);
+
+  useEffect(() => {
+    if (!setup.installStreamID) {
+      return undefined;
+    }
+    const off = Events.On('provider:install:progress', (event) => {
+      const payload = eventPayload<ProviderInstallProgressPayload>(event);
+      if (!payload || payload.streamID !== setup.installStreamID) {
+        return;
+      }
+      setSetup((current) => ({
+        ...current,
+        step: payload.done && !payload.error ? 'verify' : current.step,
+        installing: !payload.done,
+        error: payload.error || current.error,
+        progress: current.progress.concat(payload),
+      }));
+      if (payload.done && !payload.error) {
+        void refreshInventory();
+        void refreshProjects();
+      }
+    });
+    return () => off();
+  }, [refreshInventory, refreshProjects, setup.installStreamID]);
 
   const refreshNotifications = useCallback(async () => {
     setNotificationsLoading(true);
@@ -739,7 +827,12 @@ function App() {
       window.clearTimeout(timer);
       off();
     };
-  }, [activeProjectID, refreshInventory, refreshProjectDetail, refreshProjects]);
+  }, [
+    activeProjectID,
+    refreshInventory,
+    refreshProjectDetail,
+    refreshProjects,
+  ]);
 
   useEffect(() => {
     const query = pullImage.query.trim();
@@ -970,6 +1063,158 @@ function App() {
     }
   }, [permissionMode, retryProviderDetection]);
 
+  const saveSetting = useCallback(
+    async (key: string, value: unknown) => {
+      setSettingsSaving(true);
+      setSettingsError(null);
+      setSettingsMessage(null);
+      try {
+        await SettingsService.SetSetting(key, value);
+        setAppSettings((current) => ({ ...current, [key]: value }));
+        setSettingsMessage('Setting saved');
+        if (key === 'windows.wsl_distro') {
+          if (activeProvider?.id) {
+            await ProviderService.Detect(activeProvider.id);
+          } else {
+            await ProviderService.Detect(windowsWSLProviderID).catch(
+              () => null,
+            );
+          }
+          await refreshInventory();
+          await refreshProjects();
+        }
+      } catch (error: unknown) {
+        setSettingsError(
+          error instanceof Error ? error.message : 'Unable to save setting',
+        );
+      } finally {
+        setSettingsSaving(false);
+      }
+    },
+    [activeProvider?.id, refreshInventory, refreshProjects],
+  );
+
+  const saveWSLDistro = useCallback(async () => {
+    const nextDistro = wslDistro.trim() || 'Ubuntu';
+    setWSLDistro(nextDistro);
+    await saveSetting('windows.wsl_distro', nextDistro);
+  }, [saveSetting, wslDistro]);
+
+  const changeProviderAutostart = useCallback(
+    (enabled: boolean) => {
+      setProviderAutostart(enabled);
+      void saveSetting('provider.autostart_backend', enabled);
+    },
+    [saveSetting],
+  );
+
+  const openProviderSetup = useCallback(() => {
+    setSetup({
+      ...emptyProviderSetup,
+      open: true,
+      distro: wslDistro.trim() || 'Ubuntu',
+    });
+  }, [wslDistro]);
+
+  const closeProviderSetup = useCallback(() => {
+    setSetup(emptyProviderSetup);
+  }, []);
+
+  const runWindowsSetupChecks = useCallback(async () => {
+    const distro = setup.distro.trim() || 'Ubuntu';
+    setSetup((current) => ({
+      ...current,
+      distro,
+      step: 'checks',
+      detecting: true,
+      detectError: undefined,
+      error: undefined,
+    }));
+    try {
+      await SettingsService.SetSetting('windows.wsl_distro', distro);
+      setWSLDistro(distro);
+      setAppSettings((current) => ({
+        ...current,
+        'windows.wsl_distro': distro,
+      }));
+      const status = await ProviderService.Detect(windowsWSLProviderID);
+      setSetup((current) => ({
+        ...current,
+        detection: status ?? null,
+        detecting: false,
+        step: status?.healthy ? 'verify' : 'checks',
+      }));
+      await refreshInventory();
+    } catch (error: unknown) {
+      setSetup((current) => ({
+        ...current,
+        detecting: false,
+        detectError:
+          error instanceof Error ? error.message : 'Provider checks failed',
+      }));
+    }
+  }, [refreshInventory, setup.distro]);
+
+  const planWindowsInstall = useCallback(async () => {
+    const distro = setup.distro.trim() || 'Ubuntu';
+    setSetup((current) => ({
+      ...current,
+      distro,
+      planning: true,
+      error: undefined,
+    }));
+    try {
+      const plan = await ProviderService.PlanInstall(windowsWSLProviderID, {
+        backend: 'windows_wsl_ubuntu',
+        extra: { distro },
+      });
+      if (!plan) {
+        throw new Error('Install plan was empty');
+      }
+      setSetup((current) => ({
+        ...current,
+        step: 'install',
+        plan,
+        planning: false,
+      }));
+    } catch (error: unknown) {
+      setSetup((current) => ({
+        ...current,
+        planning: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : 'Unable to create install plan',
+      }));
+    }
+  }, [setup.distro]);
+
+  const applyWindowsInstall = useCallback(async () => {
+    if (!setup.plan?.planID) {
+      return;
+    }
+    setSetup((current) => ({
+      ...current,
+      installing: true,
+      progress: [],
+      error: undefined,
+    }));
+    try {
+      const handle = await ProviderService.ApplyInstall(setup.plan.planID);
+      setSetup((current) => ({
+        ...current,
+        installStreamID: handle?.streamID,
+      }));
+    } catch (error: unknown) {
+      setSetup((current) => ({
+        ...current,
+        installing: false,
+        error:
+          error instanceof Error ? error.message : 'Unable to start install',
+      }));
+    }
+  }, [setup.plan?.planID]);
+
   const ensureDockerReady = useCallback(() => {
     if (!mutationsDisabled) {
       return true;
@@ -1006,13 +1251,13 @@ function App() {
           if (!plan) {
             throw new Error('Kill plan was empty');
           }
-        setConfirm({
-          open: true,
-          plan,
-          planKind: 'container',
-          targetName: container.name,
-          typedName: '',
-          busy: false,
+          setConfirm({
+            open: true,
+            plan,
+            planKind: 'container',
+            targetName: container.name,
+            typedName: '',
+            busy: false,
           });
           return;
         }
@@ -1064,7 +1309,12 @@ function App() {
         setActionBusy(key, false);
       }
     },
-    [ensureDockerReady, refreshAfterAction, selectedContainerIDs, setActionBusy],
+    [
+      ensureDockerReady,
+      refreshAfterAction,
+      selectedContainerIDs,
+      setActionBusy,
+    ],
   );
 
   const applyConfirmedPlan = useCallback(async () => {
@@ -1667,6 +1917,28 @@ function App() {
             queuedCommand={queuedTerminalCommand}
           />
         );
+      case 'settings':
+        return (
+          <SettingsPage
+            activeProvider={activeProvider}
+            autostartBackend={providerAutostart}
+            error={settingsError}
+            message={settingsMessage}
+            onAutostartChange={changeProviderAutostart}
+            onDetect={() => {
+              void retryProviderDetection();
+            }}
+            onOpenSetup={openProviderSetup}
+            onSaveWSLDistro={() => {
+              void saveWSLDistro();
+            }}
+            onWSLDistroChange={setWSLDistro}
+            providers={providers}
+            saving={settingsSaving}
+            settings={appSettings}
+            wslDistro={wslDistro}
+          />
+        );
       case 'containers':
         return (
           <ContainersPage
@@ -1838,6 +2110,8 @@ function App() {
                     onClick={() => {
                       if (dockerStopped) {
                         void startProvider();
+                      } else if (noProviderConfigured) {
+                        openProviderSetup();
                       } else {
                         setRepairOpen(true);
                       }
@@ -1845,7 +2119,11 @@ function App() {
                     size="sm"
                     variant="secondary"
                   >
-                    {dockerStopped ? 'Start' : 'Repair'}
+                    {dockerStopped
+                      ? 'Start'
+                      : noProviderConfigured
+                        ? 'Set up'
+                        : 'Repair'}
                   </Button>
                 </div>
               ) : null}
@@ -1897,9 +2175,7 @@ function App() {
                         : 'Notifications'
                     }
                     icon={<Bell size={17} />}
-                    onClick={() =>
-                      setNotificationsOpen((current) => !current)
-                    }
+                    onClick={() => setNotificationsOpen((current) => !current)}
                     size="icon"
                     variant="secondary"
                   />
@@ -1933,6 +2209,7 @@ function App() {
             inventoryError={inventoryError}
             noProviderConfigured={noProviderConfigured}
             onOpenRepair={() => setRepairOpen(true)}
+            onOpenSetup={openProviderSetup}
             onRetry={() => {
               void retryProviderDetection();
             }}
@@ -1994,6 +2271,24 @@ function App() {
         permissionProblem={permissionProblem}
         problems={providerProblems}
         provider={activeProvider}
+      />
+      <ProviderSetupModal
+        onApplyInstall={() => {
+          void applyWindowsInstall();
+        }}
+        onChangeDistro={(distro) =>
+          setSetup((current) => ({ ...current, distro }))
+        }
+        onClose={closeProviderSetup}
+        onPlanInstall={() => {
+          void planWindowsInstall();
+        }}
+        onRunChecks={() => {
+          void runWindowsSetupChecks();
+        }}
+        onStep={(step) => setSetup((current) => ({ ...current, step }))}
+        open={setup.open}
+        setup={setup}
       />
       <RenameContainerModal
         onChange={(name) => setRename((current) => ({ ...current, name }))}
@@ -2124,6 +2419,7 @@ function GlobalStateBanner({
   inventoryError,
   noProviderConfigured,
   onOpenRepair,
+  onOpenSetup,
   onRetry,
   onStart,
   permissionProblem,
@@ -2136,6 +2432,7 @@ function GlobalStateBanner({
   inventoryError: string | null;
   noProviderConfigured: boolean;
   onOpenRepair: () => void;
+  onOpenSetup: () => void;
   onRetry: () => void;
   onStart: () => void;
   permissionProblem: ProviderProblem | null;
@@ -2198,7 +2495,7 @@ function GlobalStateBanner({
           <div className="font-medium">{state.title}</div>
           <div className="text-xs opacity-90">{state.body}</div>
         </div>
-        {providerRepairNeeded || noProviderConfigured ? (
+        {providerRepairNeeded ? (
           <Button
             icon={<Wrench size={15} />}
             onClick={onOpenRepair}
@@ -2206,6 +2503,16 @@ function GlobalStateBanner({
             variant="secondary"
           >
             Repair
+          </Button>
+        ) : null}
+        {noProviderConfigured ? (
+          <Button
+            icon={<Wrench size={15} />}
+            onClick={onOpenSetup}
+            size="sm"
+            variant="secondary"
+          >
+            Set up
           </Button>
         ) : null}
         {dockerStopped ? (
@@ -2254,8 +2561,9 @@ function NotificationCenter({
     return null;
   }
 
-  const unread = notifications.filter((notification) => !notification.read)
-    .length;
+  const unread = notifications.filter(
+    (notification) => !notification.read,
+  ).length;
 
   return (
     <div
@@ -2394,7 +2702,12 @@ function RepairProviderModal({
   provider: ProviderSummary | null;
 }) {
   return (
-    <Modal onClose={onClose} open={open} size="lg" title="Repair Docker Provider">
+    <Modal
+      onClose={onClose}
+      open={open}
+      size="lg"
+      title="Repair Docker Provider"
+    >
       <div className="space-y-5">
         <div className="flex items-start gap-3 rounded-card border border-border bg-bg-inset p-4">
           <Wrench className="mt-0.5 text-accent" size={19} />
@@ -2403,7 +2716,8 @@ function RepairProviderModal({
               {provider?.name ?? 'No provider selected'}
             </div>
             <div className="mt-1 text-sm text-text-muted">
-              Provider checks list the exact failure and repair hint from the backend.
+              Provider checks list the exact failure and repair hint from the
+              backend.
             </div>
           </div>
         </div>
@@ -2445,7 +2759,8 @@ function RepairProviderModal({
                 Linux Docker permission options
               </h3>
               <p className="mt-1 text-sm text-text-muted">
-                Socket access was denied. Pick how Cairn should work with this Linux backend.
+                Socket access was denied. Pick how Cairn should work with this
+                Linux backend.
               </p>
             </div>
             <div className="grid gap-2">
@@ -2496,6 +2811,613 @@ function RepairProviderModal({
         </div>
       </div>
     </Modal>
+  );
+}
+
+function ProviderSetupModal({
+  onApplyInstall,
+  onChangeDistro,
+  onClose,
+  onPlanInstall,
+  onRunChecks,
+  onStep,
+  open,
+  setup,
+}: {
+  open: boolean;
+  setup: ProviderSetupState;
+  onApplyInstall: () => void;
+  onChangeDistro: (distro: string) => void;
+  onClose: () => void;
+  onPlanInstall: () => void;
+  onRunChecks: () => void;
+  onStep: (step: SetupStepID) => void;
+}) {
+  const rows = windowsSetupCheckRows(setup.detection);
+  const hasProblems = Boolean(setup.detection?.problems?.length);
+  const canPlan = !setup.detecting && Boolean(setup.detection) && hasProblems;
+  const completed =
+    setup.detection?.healthy ||
+    setup.progress.some((entry) => entry.done && !entry.error);
+
+  return (
+    <Modal
+      onClose={onClose}
+      open={open}
+      size="lg"
+      title="Set Up Docker Backend"
+    >
+      <div className="space-y-5">
+        <div className="flex flex-wrap gap-2">
+          {(
+            [
+              'welcome',
+              'backend',
+              'checks',
+              'install',
+              'verify',
+            ] as SetupStepID[]
+          ).map((step, index) => (
+            <button
+              className={[
+                'flex h-8 items-center gap-2 rounded-control border px-3 text-xs font-medium',
+                setup.step === step
+                  ? 'border-accent/40 bg-accent/10 text-accent'
+                  : 'border-border bg-bg-inset text-text-muted',
+              ].join(' ')}
+              disabled={setup.installing}
+              key={step}
+              onClick={() => onStep(step)}
+              type="button"
+            >
+              <span>{index + 1}</span>
+              <span className="capitalize">{step}</span>
+            </button>
+          ))}
+        </div>
+
+        {setup.step === 'welcome' ? (
+          <section className="space-y-4">
+            <div className="flex items-center gap-4">
+              <img alt="Cairn" className="h-14 w-auto" src={logoUrl} />
+              <div>
+                <h2 className="text-lg font-semibold text-text-primary">
+                  Clean control for Docker and Compose
+                </h2>
+                <p className="mt-1 text-sm text-text-muted">
+                  Cairn uses the Docker backend you already trust and keeps
+                  provider setup explicit.
+                </p>
+              </div>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <Button
+                icon={<Play size={15} />}
+                onClick={() => onStep('backend')}
+              >
+                Get started
+              </Button>
+              <Button
+                icon={<RefreshCw size={15} />}
+                onClick={onRunChecks}
+                variant="secondary"
+              >
+                I already have Docker running
+              </Button>
+            </div>
+          </section>
+        ) : null}
+
+        {setup.step === 'backend' ? (
+          <section className="grid gap-3 md:grid-cols-3">
+            <BackendChoiceCard
+              badge="Recommended"
+              body="Install or use Ubuntu on WSL2 with official Docker Engine packages inside the distro."
+              icon={<Server size={19} />}
+              onSelect={() => onStep('checks')}
+              title="Ubuntu on WSL2"
+            />
+            <BackendChoiceCard
+              body="Existing Docker context support arrives with the cross-provider context phase."
+              disabled
+              icon={<Terminal size={19} />}
+              title="Existing Docker context"
+            />
+            <BackendChoiceCard
+              body="Remote hosts are outside the v1 MVP setup flow."
+              disabled
+              icon={<Wifi size={19} />}
+              title="Remote host"
+            />
+          </section>
+        ) : null}
+
+        {setup.step === 'checks' ? (
+          <section className="space-y-4">
+            <div className="grid gap-3 md:grid-cols-[1fr_auto] md:items-end">
+              <label className="block">
+                <span className="text-xs font-medium uppercase text-text-muted">
+                  WSL distro
+                </span>
+                <input
+                  className="mt-1 h-9 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
+                  onChange={(event) => onChangeDistro(event.target.value)}
+                  placeholder="Ubuntu"
+                  value={setup.distro}
+                />
+              </label>
+              <Button
+                icon={<RefreshCw size={15} />}
+                loading={setup.detecting}
+                onClick={onRunChecks}
+              >
+                Run checks
+              </Button>
+            </div>
+            <PathRecommendation />
+            {setup.detectError ? (
+              <div className="rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
+                {setup.detectError}
+              </div>
+            ) : null}
+            <div className="grid gap-2">
+              {rows.map((row) => (
+                <SetupCheckRow key={row.label} row={row} />
+              ))}
+            </div>
+            <div className="flex justify-end gap-2 border-t border-border pt-4">
+              <Button onClick={() => onStep('backend')} variant="secondary">
+                Back
+              </Button>
+              {setup.detection?.healthy ? (
+                <Button
+                  icon={<CheckCircle2 size={15} />}
+                  onClick={() => onStep('verify')}
+                >
+                  Continue
+                </Button>
+              ) : (
+                <Button
+                  disabled={!canPlan}
+                  disabledReason="Run checks before creating an install plan"
+                  icon={<Wrench size={15} />}
+                  loading={setup.planning}
+                  onClick={onPlanInstall}
+                >
+                  Create install plan
+                </Button>
+              )}
+            </div>
+          </section>
+        ) : null}
+
+        {setup.step === 'install' ? (
+          <section className="space-y-4">
+            {setup.plan ? (
+              <div className="space-y-3">
+                <div>
+                  <h2 className="text-base font-semibold text-text-primary">
+                    {setup.plan.title}
+                  </h2>
+                  <p className="mt-1 text-sm text-text-muted">
+                    Windows may ask for administrator approval when WSL features
+                    are enabled.
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  {setup.plan.commands.map((command) => (
+                    <div
+                      className="rounded-card border border-border bg-bg-inset p-3"
+                      key={`${command.order}:${command.command}`}
+                    >
+                      <div className="mb-2 flex items-center gap-2 text-sm">
+                        <Badge tone="warn">Step {command.order}</Badge>
+                        <span className="font-medium text-text-primary">
+                          {command.explanation}
+                        </span>
+                      </div>
+                      <CodePreview value={command.command} />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <EmptyState
+                body="Run checks and create a plan before installation starts."
+                icon={<Wrench size={28} />}
+                title="No install plan yet"
+              />
+            )}
+            {setup.progress.length > 0 ? (
+              <div className="space-y-2">
+                {setup.progress.map((entry, index) => (
+                  <div
+                    className={[
+                      'rounded-card border px-3 py-2 text-sm',
+                      entry.error
+                        ? 'border-error/30 bg-error/10 text-error'
+                        : entry.done
+                          ? 'border-ok/30 bg-ok/10 text-ok'
+                          : 'border-info/30 bg-info/10 text-info',
+                    ].join(' ')}
+                    key={`${entry.streamID}:${index}`}
+                  >
+                    {entry.message}
+                    {entry.totalSteps ? (
+                      <span className="ml-2 text-xs opacity-80">
+                        {entry.step}/{entry.totalSteps}
+                      </span>
+                    ) : null}
+                    {entry.error ? (
+                      <div className="mt-1">{entry.error}</div>
+                    ) : null}
+                  </div>
+                ))}
+              </div>
+            ) : null}
+            {setup.error ? (
+              <div className="rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
+                {setup.error}
+              </div>
+            ) : null}
+            <div className="flex justify-end gap-2 border-t border-border pt-4">
+              <Button
+                disabled={setup.installing}
+                onClick={() => onStep('checks')}
+                variant="secondary"
+              >
+                Back
+              </Button>
+              <Button
+                disabled={!setup.plan || setup.installing}
+                disabledReason="Create an install plan first"
+                icon={<Play size={15} />}
+                loading={setup.installing}
+                onClick={onApplyInstall}
+              >
+                Install
+              </Button>
+            </div>
+          </section>
+        ) : null}
+
+        {setup.step === 'verify' ? (
+          <section className="space-y-4">
+            <div className="rounded-card border border-ok/30 bg-ok/10 p-4">
+              <div className="flex items-center gap-2 font-medium text-ok">
+                <CheckCircle2 size={17} />
+                {completed
+                  ? 'Windows WSL backend is ready'
+                  : 'Provider checks complete'}
+              </div>
+              <div className="mt-2 grid gap-2 text-sm text-text-secondary sm:grid-cols-2">
+                <span>Provider: Windows WSL Ubuntu</span>
+                <span>Distro: {setup.distro || 'Ubuntu'}</span>
+                <span>
+                  Docker:{' '}
+                  {setup.detection?.dockerVersion || 'verified after install'}
+                </span>
+                <span>
+                  Compose:{' '}
+                  {setup.detection?.composeVersion || 'verified after install'}
+                </span>
+                <span>
+                  Context: {setup.detection?.currentContext || 'default'}
+                </span>
+                <span>Host: {setup.detection?.dockerHost || 'wsl+stdio'}</span>
+              </div>
+            </div>
+            <PathRecommendation />
+            <div className="flex justify-end gap-2 border-t border-border pt-4">
+              <Button onClick={onClose}>Continue</Button>
+            </div>
+          </section>
+        ) : null}
+      </div>
+    </Modal>
+  );
+}
+
+function BackendChoiceCard({
+  badge,
+  body,
+  disabled = false,
+  icon,
+  onSelect,
+  title,
+}: {
+  badge?: string;
+  body: string;
+  disabled?: boolean;
+  icon: ReactNode;
+  onSelect?: () => void;
+  title: string;
+}) {
+  return (
+    <button
+      className={[
+        'rounded-card border p-4 text-left transition',
+        disabled
+          ? 'cursor-not-allowed border-border bg-bg-inset text-text-muted opacity-70'
+          : 'border-accent/30 bg-accent/10 text-text-primary hover:border-accent',
+      ].join(' ')}
+      disabled={disabled}
+      onClick={onSelect}
+      type="button"
+    >
+      <div className="flex items-center gap-2">
+        <span className="text-accent">{icon}</span>
+        <span className="font-medium">{title}</span>
+        {badge ? <Badge tone="accent">{badge}</Badge> : null}
+      </div>
+      <div className="mt-3 text-sm text-text-secondary">{body}</div>
+      <details className="mt-3 text-xs text-text-muted">
+        <summary>What will be installed</summary>
+        <div className="mt-2">
+          WSL2, Ubuntu, Docker Engine, Compose, Buildx, systemd service wiring,
+          and docker-group access.
+        </div>
+      </details>
+    </button>
+  );
+}
+
+function SetupCheckRow({
+  row,
+}: {
+  row: {
+    label: string;
+    state: StatusToneID;
+    detail: string;
+  };
+}) {
+  const icon =
+    row.state === 'ok' ? (
+      <CheckCircle2 size={16} />
+    ) : row.state === 'error' ? (
+      <AlertTriangle size={16} />
+    ) : (
+      <Clock3 size={16} />
+    );
+  const toneClass =
+    row.state === 'ok'
+      ? 'border-ok/25 bg-ok/10 text-ok'
+      : row.state === 'error'
+        ? 'border-error/25 bg-error/10 text-error'
+        : 'border-border bg-bg-inset text-text-muted';
+  return (
+    <div className={`rounded-card border px-3 py-2 text-sm ${toneClass}`}>
+      <div className="flex items-center gap-2 font-medium">
+        {icon}
+        {row.label}
+      </div>
+      <div className="mt-1 text-xs opacity-85">{row.detail}</div>
+    </div>
+  );
+}
+
+function PathRecommendation() {
+  return (
+    <div className="rounded-card border border-warn/30 bg-warn/10 px-3 py-2 text-sm text-warn">
+      Store heavy Compose projects inside the WSL distro, such as `~/projects`,
+      instead of `/mnt/c/...`.
+    </div>
+  );
+}
+
+function SettingsPage({
+  activeProvider,
+  autostartBackend,
+  error,
+  message,
+  onAutostartChange,
+  onDetect,
+  onOpenSetup,
+  onSaveWSLDistro,
+  onWSLDistroChange,
+  providers,
+  saving,
+  settings,
+  wslDistro,
+}: {
+  activeProvider: ProviderSummary | null;
+  autostartBackend: boolean;
+  error: string | null;
+  message: string | null;
+  onAutostartChange: (enabled: boolean) => void;
+  onDetect: () => void;
+  onOpenSetup: () => void;
+  onSaveWSLDistro: () => void;
+  onWSLDistroChange: (distro: string) => void;
+  providers: ProviderSummary[];
+  saving: boolean;
+  settings: Record<string, unknown>;
+  wslDistro: string;
+}) {
+  const activeStatus = activeProvider?.status;
+  const providerKind = activeProvider?.kind || 'windows_wsl_ubuntu';
+  return (
+    <div className="grid gap-4 xl:grid-cols-[220px_minmax(0,1fr)]">
+      <div className="space-y-2">
+        {[
+          'General',
+          'Providers',
+          'Docker contexts',
+          'Terminal',
+          'Security & Audit',
+          'About',
+        ].map((section) => (
+          <button
+            className={[
+              'block h-9 w-full rounded-control px-3 text-left text-sm',
+              section === 'Providers'
+                ? 'bg-accent/10 text-accent'
+                : 'text-text-secondary hover:bg-bg-card',
+            ].join(' ')}
+            key={section}
+            type="button"
+          >
+            {section}
+          </button>
+        ))}
+      </div>
+
+      <div className="space-y-4">
+        {message ? (
+          <div className="rounded-card border border-ok/30 bg-ok/10 px-3 py-2 text-sm text-ok">
+            {message}
+          </div>
+        ) : null}
+        {error ? (
+          <div className="rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
+            {error}
+          </div>
+        ) : null}
+
+        <Card>
+          <CardHeader
+            status={
+              <Badge tone={activeProvider?.healthy ? 'ok' : 'warn'}>
+                {activeProvider?.healthy ? 'Healthy' : 'Needs checks'}
+              </Badge>
+            }
+            title="Providers"
+          />
+          <CardBody className="space-y-4">
+            <div className="rounded-card border border-border bg-bg-inset p-3">
+              <div className="flex flex-wrap items-center gap-3">
+                <Server className="text-accent" size={18} />
+                <div className="min-w-0 flex-1">
+                  <div className="font-medium text-text-primary">
+                    {activeProvider?.name ?? 'Windows WSL Ubuntu'}
+                  </div>
+                  <div className="truncate text-xs text-text-muted">
+                    {providerKind}
+                  </div>
+                </div>
+                <Button
+                  icon={<RefreshCw size={15} />}
+                  onClick={onDetect}
+                  size="sm"
+                  variant="secondary"
+                >
+                  Detect again
+                </Button>
+                <Button
+                  icon={<Wrench size={15} />}
+                  onClick={onOpenSetup}
+                  size="sm"
+                >
+                  Set up new backend
+                </Button>
+              </div>
+              <div className="mt-3 grid gap-2 text-sm sm:grid-cols-4">
+                <StatusPill
+                  label="Docker"
+                  ok={Boolean(activeStatus?.dockerRunning)}
+                  value={activeStatus?.dockerVersion || '-'}
+                />
+                <StatusPill
+                  label="Compose"
+                  ok={Boolean(activeStatus?.composeInstalled)}
+                  value={activeStatus?.composeVersion || '-'}
+                />
+                <StatusPill
+                  label="Buildx"
+                  ok={Boolean(activeStatus?.buildxInstalled)}
+                  value={activeStatus?.backendVersion || '-'}
+                />
+                <StatusPill
+                  label="Context"
+                  ok={Boolean(activeStatus?.currentContext)}
+                  value={activeStatus?.currentContext || 'default'}
+                />
+              </div>
+            </div>
+
+            <section className="space-y-3">
+              <div>
+                <h3 className="text-sm font-semibold text-text-primary">
+                  Windows WSL
+                </h3>
+                <p className="mt-1 text-sm text-text-muted">
+                  Active WSL provider settings save to Cairn settings and rerun
+                  detection.
+                </p>
+              </div>
+              <label className="block">
+                <span className="text-xs font-medium uppercase text-text-muted">
+                  WSL distro
+                </span>
+                <input
+                  className="mt-1 h-9 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
+                  list="wsl-distro-options"
+                  onBlur={onSaveWSLDistro}
+                  onChange={(event) => onWSLDistroChange(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Enter') {
+                      onSaveWSLDistro();
+                    }
+                  }}
+                  value={wslDistro}
+                />
+                <datalist id="wsl-distro-options">
+                  <option value={wslDistro} />
+                  <option value="Ubuntu" />
+                  <option value="cairn-dev" />
+                </datalist>
+              </label>
+
+              <label className="flex items-center justify-between gap-3 rounded-card border border-border bg-bg-inset p-3 text-sm">
+                <span>
+                  <span className="block font-medium text-text-primary">
+                    Start Docker backend on app launch
+                  </span>
+                  <span className="mt-1 block text-text-muted">
+                    Current setting:{' '}
+                    {String(
+                      settings['provider.autostart_backend'] ??
+                        autostartBackend,
+                    )}
+                  </span>
+                </span>
+                <input
+                  checked={autostartBackend}
+                  disabled={saving}
+                  onChange={(event) => onAutostartChange(event.target.checked)}
+                  type="checkbox"
+                />
+              </label>
+
+              <div className="rounded-card border border-info/30 bg-info/10 p-3 text-sm text-info">
+                <div className="font-medium">Path mapping</div>
+                <div className="mt-2 grid gap-1 font-mono text-xs">
+                  <span>
+                    {'C:\\Users\\Ada\\project -> /mnt/c/Users/Ada/project'}
+                  </span>
+                  <span>
+                    {'\\\\wsl$\\' +
+                      (wslDistro || 'Ubuntu') +
+                      '\\home\\ada\\project -> /home/ada/project'}
+                  </span>
+                </div>
+              </div>
+              <PathRecommendation />
+            </section>
+          </CardBody>
+        </Card>
+
+        <Card>
+          <CardHeader title="Provider Inventory" />
+          <CardBody>
+            <div className="text-sm text-text-muted">
+              {providers.length} configured provider
+              {providers.length === 1 ? '' : 's'}.
+            </div>
+          </CardBody>
+        </Card>
+      </div>
+    </div>
   );
 }
 
@@ -2572,8 +3494,7 @@ function OverviewPage({
   volumes,
 }: OverviewProps) {
   const [dashboard, setDashboard] = useState<DashboardMetrics | null>(null);
-  const [dashboardStatus, setDashboardStatus] =
-    useState<LoadStatus>('loading');
+  const [dashboardStatus, setDashboardStatus] = useState<LoadStatus>('loading');
   const [dashboardError, setDashboardError] = useState<string | null>(null);
   const [metric, setMetric] = useState<DashboardMetricID>('cpu');
   const [range, setRange] = useState<DashboardRangeID>('5m');
@@ -2581,9 +3502,9 @@ function OverviewPage({
   const [chartPaused, setChartPaused] = useState(false);
   const chartPausedRef = useRef(false);
   const [chartPoints, setChartPoints] = useState<DashboardChartPoint[]>([]);
-  const [latestSamples, setLatestSamples] = useState<Record<string, StatsSample>>(
-    {},
-  );
+  const [latestSamples, setLatestSamples] = useState<
+    Record<string, StatsSample>
+  >({});
   const [containerSparks, setContainerSparks] = useState<
     Record<string, SparkPoint[]>
   >({});
@@ -2601,7 +3522,9 @@ function OverviewPage({
       setDashboardStatus('ready');
       return;
     }
-    setDashboardStatus((current) => (current === 'ready' ? current : 'loading'));
+    setDashboardStatus((current) =>
+      current === 'ready' ? current : 'loading',
+    );
     setDashboardError(null);
     try {
       const nextDashboard = await MetricsService.GetDashboardMetrics();
@@ -2759,8 +3682,9 @@ function OverviewPage({
   }, [dockerRunning]);
 
   const stopped = Math.max(0, containers.length - runningContainers);
-  const paused = containers.filter((container) => container.state === 'paused')
-    .length;
+  const paused = containers.filter(
+    (container) => container.state === 'paused',
+  ).length;
   const topRows = useMemo(
     () => dashboardTopRows(dashboard?.top ?? [], latestSamples),
     [dashboard?.top, latestSamples],
@@ -2768,7 +3692,10 @@ function OverviewPage({
   const recentContainers = useMemo(
     () =>
       [...containers]
-        .sort((left, right) => dateMillis(right.createdAt) - dateMillis(left.createdAt))
+        .sort(
+          (left, right) =>
+            dateMillis(right.createdAt) - dateMillis(left.createdAt),
+        )
         .slice(0, 6),
     [containers],
   );
@@ -2783,7 +3710,10 @@ function OverviewPage({
         .slice(0, 5),
     [projectSparks, projects],
   );
-  const updateSummary = useMemo(() => summarizeProjectUpdates(projects), [projects]);
+  const updateSummary = useMemo(
+    () => summarizeProjectUpdates(projects),
+    [projects],
+  );
   const counts = dashboard ?? {
     projects: projects.length,
     containers: containers.length,
@@ -2892,10 +3822,7 @@ function OverviewPage({
               >
                 Import project
               </Button>
-              <Button
-                icon={<Terminal size={15} />}
-                onClick={onOpenTerminal}
-              >
+              <Button icon={<Terminal size={15} />} onClick={onOpenTerminal}>
                 Open terminal
               </Button>
             </div>
@@ -2936,7 +3863,10 @@ function OverviewPage({
           unhealthy={unhealthyContainers}
         />
         <div className="space-y-4">
-          <LogsPeekPanel lines={logPeek} onOpenLogs={() => onNavigate('logs')} />
+          <LogsPeekPanel
+            lines={logPeek}
+            onOpenLogs={() => onNavigate('logs')}
+          />
           <UpdatesCard
             onOpenProjects={() => onNavigate('projects')}
             projects={projects}
@@ -2972,7 +3902,9 @@ function EngineHeroCard({
   const context = provider?.status?.currentContext || 'default';
   const version = provider?.status?.dockerVersion || 'unknown';
   return (
-    <Card className={!dockerRunning ? 'border-neutral/30 bg-bg-inset' : undefined}>
+    <Card
+      className={!dockerRunning ? 'border-neutral/30 bg-bg-inset' : undefined}
+    >
       <CardBody className="flex items-center justify-between gap-5">
         <div className="min-w-0">
           <div className="flex items-center gap-3">
@@ -3073,7 +4005,9 @@ function DashboardCountsStrip({
         type="button"
       >
         <div className="text-sm text-text-secondary">Disk</div>
-        <div className="mt-3 text-2xl font-semibold">{formatBytes(diskTotal)}</div>
+        <div className="mt-3 text-2xl font-semibold">
+          {formatBytes(diskTotal)}
+        </div>
         <div className="mt-2 text-xs text-text-muted">
           {formatBytes(diskReclaimable)} reclaimable
         </div>
@@ -3110,7 +4044,8 @@ function ResourceUsagePanel({
       : metric === 'memory'
         ? `${formatBytes(latest?.memory ?? 0)} memory`
         : `${formatRate(latest?.netRx ?? 0)} RX / ${formatRate(latest?.netTx ?? 0)} TX`;
-  const Icon = metric === 'cpu' ? Cpu : metric === 'memory' ? MemoryStick : Wifi;
+  const Icon =
+    metric === 'cpu' ? Cpu : metric === 'memory' ? MemoryStick : Wifi;
   return (
     <Card>
       <CardHeader
@@ -3162,21 +4097,23 @@ function ResourceUsagePanel({
             </div>
           </div>
           <div className="flex rounded-control border border-border bg-bg-inset p-0.5">
-            {(['cpu', 'memory', 'network'] as DashboardMetricID[]).map((item) => (
-              <button
-                className={[
-                  'h-8 rounded-control px-3 text-xs font-medium capitalize transition',
-                  metric === item
-                    ? 'bg-bg-card text-text-primary'
-                    : 'text-text-secondary hover:text-text-primary',
-                ].join(' ')}
-                key={item}
-                onClick={() => onMetricChange(item)}
-                type="button"
-              >
-                {item}
-              </button>
-            ))}
+            {(['cpu', 'memory', 'network'] as DashboardMetricID[]).map(
+              (item) => (
+                <button
+                  className={[
+                    'h-8 rounded-control px-3 text-xs font-medium capitalize transition',
+                    metric === item
+                      ? 'bg-bg-card text-text-primary'
+                      : 'text-text-secondary hover:text-text-primary',
+                  ].join(' ')}
+                  key={item}
+                  onClick={() => onMetricChange(item)}
+                  type="button"
+                >
+                  {item}
+                </button>
+              ),
+            )}
           </div>
         </div>
         <div
@@ -3185,9 +4122,17 @@ function ResourceUsagePanel({
           onMouseLeave={() => onPauseChange(false)}
         >
           <ResponsiveContainer height="100%" width="100%">
-            <AreaChart data={points} margin={{ bottom: 0, left: 0, right: 8, top: 8 }}>
+            <AreaChart
+              data={points}
+              margin={{ bottom: 0, left: 0, right: 8, top: 8 }}
+            >
               <CartesianGrid stroke="rgba(255,255,255,0.1)" vertical={false} />
-              <XAxis dataKey="label" minTickGap={28} stroke="#8B949E" tick={{ fontSize: 11 }} />
+              <XAxis
+                dataKey="label"
+                minTickGap={28}
+                stroke="#8B949E"
+                tick={{ fontSize: 11 }}
+              />
               <YAxis
                 stroke="#8B949E"
                 tick={{ fontSize: 11 }}
@@ -3200,7 +4145,9 @@ function ResourceUsagePanel({
                 }
                 width={56}
               />
-              <RechartsTooltip content={<DashboardChartTooltip metric={metric} />} />
+              <RechartsTooltip
+                content={<DashboardChartTooltip metric={metric} />}
+              />
               {metric === 'cpu' ? (
                 <Area
                   dataKey="cpu"
@@ -3278,7 +4225,8 @@ function DashboardChartTooltip({
       <div className="mb-1 font-medium text-text-primary">{label}</div>
       {payload.map((entry) => (
         <div className="text-text-secondary" key={entry.dataKey ?? entry.name}>
-          {entry.name}: {formatMetricValue(metric, Number(entry.value ?? 0), entry.dataKey)}
+          {entry.name}:{' '}
+          {formatMetricValue(metric, Number(entry.value ?? 0), entry.dataKey)}
         </div>
       ))}
     </div>
@@ -3309,7 +4257,9 @@ function ProjectsMiniList({
         title="Projects"
       />
       <CardBody>
-        {loading && projects.length === 0 ? <Skeleton className="h-32" /> : null}
+        {loading && projects.length === 0 ? (
+          <Skeleton className="h-32" />
+        ) : null}
         {!loading && projects.length === 0 ? (
           <EmptyState
             body="Import a Compose project to track services here."
@@ -3327,7 +4277,9 @@ function ProjectsMiniList({
             >
               <div className="min-w-0">
                 <div className="flex items-center gap-2">
-                  <StatusDot tone={dotTone(projectStatusTone(project.status))} />
+                  <StatusDot
+                    tone={dotTone(projectStatusTone(project.status))}
+                  />
                   <span className="truncate font-medium">{project.name}</span>
                 </div>
                 <div className="mt-1 text-xs text-text-muted">
@@ -3339,7 +4291,9 @@ function ProjectsMiniList({
               </div>
               <Sparkline
                 color="#2DD4A7"
-                points={projectSparks[project.id] ?? projectSparkPoints(project)}
+                points={
+                  projectSparks[project.id] ?? projectSparkPoints(project)
+                }
               />
             </button>
           ))}
@@ -3371,7 +4325,12 @@ function ContainerHealthPanel({
   const data = [
     { name: 'Running', value: running, color: '#2DD4A7', filter: 'running' },
     { name: 'Stopped', value: stopped, color: '#8B949E', filter: 'stopped' },
-    { name: 'Unhealthy', value: unhealthy, color: '#F0605D', filter: 'unhealthy' },
+    {
+      name: 'Unhealthy',
+      value: unhealthy,
+      color: '#F0605D',
+      filter: 'unhealthy',
+    },
     { name: 'Paused', value: paused, color: '#F5B83D', filter: 'paused' },
   ].filter((item) => item.value > 0);
   return (
@@ -3390,7 +4349,18 @@ function ContainerHealthPanel({
             <ResponsiveContainer height="100%" width="100%">
               <RechartsPieChart>
                 <Pie
-                  data={data.length > 0 ? data : [{ name: 'None', value: 1, color: '#8B949E', filter: 'all' }]}
+                  data={
+                    data.length > 0
+                      ? data
+                      : [
+                          {
+                            name: 'None',
+                            value: 1,
+                            color: '#8B949E',
+                            filter: 'all',
+                          },
+                        ]
+                  }
                   dataKey="value"
                   innerRadius={58}
                   isAnimationActive={false}
@@ -3399,7 +4369,14 @@ function ContainerHealthPanel({
                 >
                   {(data.length > 0
                     ? data
-                    : [{ name: 'None', value: 1, color: '#8B949E', filter: 'all' }]
+                    : [
+                        {
+                          name: 'None',
+                          value: 1,
+                          color: '#8B949E',
+                          filter: 'all',
+                        },
+                      ]
                   ).map((item) => (
                     <Cell fill={item.color} key={item.name} />
                   ))}
@@ -3411,7 +4388,12 @@ function ContainerHealthPanel({
             {[
               ['running', 'Running', running, 'ok'],
               ['stopped', 'Stopped', stopped, 'neutral'],
-              ['unhealthy', 'Unhealthy', unhealthy, unhealthy > 0 ? 'error' : 'neutral'],
+              [
+                'unhealthy',
+                'Unhealthy',
+                unhealthy,
+                unhealthy > 0 ? 'error' : 'neutral',
+              ],
               ['paused', 'Paused', paused, 'warn'],
             ].map(([filter, label, value, tone]) => (
               <button
@@ -3468,7 +4450,9 @@ function ContainerHealthPanel({
                       />
                     </td>
                     <td className="truncate px-3 py-2 text-text-muted">
-                      {formatBytes(sample?.memoryBytes ?? container.memoryBytes)}
+                      {formatBytes(
+                        sample?.memoryBytes ?? container.memoryBytes,
+                      )}
                     </td>
                     <td className="truncate px-3 py-2 text-text-muted">
                       {sample?.uptimeSeconds
@@ -3522,11 +4506,16 @@ function LogsPeekPanel({
             <span className="text-text-muted">No log lines yet</span>
           ) : (
             lines.map((line) => (
-              <div className="grid grid-cols-[auto_1fr] gap-2" key={`${line.ts}-${line.text}`}>
+              <div
+                className="grid grid-cols-[auto_1fr] gap-2"
+                key={`${line.ts}-${line.text}`}
+              >
                 <span className={logLevelClass(normalizeLogLevel(line.level))}>
                   {normalizeLogLevel(line.level).toUpperCase()}
                 </span>
-                <span className="truncate text-text-secondary">{line.text}</span>
+                <span className="truncate text-text-secondary">
+                  {line.text}
+                </span>
               </div>
             ))
           )}
@@ -3585,7 +4574,11 @@ function UpdatesCard({
             ))
           )}
         </div>
-        <Button className="mt-4 w-full" onClick={onOpenProjects} variant="secondary">
+        <Button
+          className="mt-4 w-full"
+          onClick={onOpenProjects}
+          variant="secondary"
+        >
           Open Updates
         </Button>
       </CardBody>
@@ -3616,7 +4609,9 @@ function TopContainersTable({ rows }: { rows: MetricRankItem[] }) {
                 <tr className="border-t border-border" key={row.id}>
                   <td className="truncate px-3 py-2">{row.name}</td>
                   <td className="px-3 py-2 text-text-muted">{row.kind}</td>
-                  <td className="px-3 py-2">{(row.cpuPercent ?? 0).toFixed(1)}%</td>
+                  <td className="px-3 py-2">
+                    {(row.cpuPercent ?? 0).toFixed(1)}%
+                  </td>
                   <td className="px-3 py-2 text-text-muted">
                     {formatBytes(row.memoryBytes)}
                   </td>
@@ -3625,7 +4620,9 @@ function TopContainersTable({ rows }: { rows: MetricRankItem[] }) {
             </tbody>
           </table>
           {rows.length === 0 ? (
-            <div className="p-4 text-sm text-text-muted">No stats samples yet</div>
+            <div className="p-4 text-sm text-text-muted">
+              No stats samples yet
+            </div>
           ) : null}
         </div>
       </CardBody>
@@ -3660,7 +4657,9 @@ function RecentEventsPanel({ events }: { events: AuditEntry[] }) {
             </div>
           ))}
           {events.length === 0 ? (
-            <div className="text-sm text-text-muted">No recent Docker events</div>
+            <div className="text-sm text-text-muted">
+              No recent Docker events
+            </div>
           ) : null}
         </div>
       </CardBody>
@@ -3682,7 +4681,12 @@ function CleanupModal({
   const requiresTypedName = state.includeVolumes;
   const typedReady = !requiresTypedName || state.typedName === 'DELETE VOLUMES';
   return (
-    <Modal onClose={onClose} open={state.open} size="md" title="Clean Up Docker Space">
+    <Modal
+      onClose={onClose}
+      open={state.open}
+      size="md"
+      title="Clean Up Docker Space"
+    >
       <div className="space-y-4">
         <div className="rounded-control border border-warn/30 bg-warn/10 p-3 text-sm text-warn">
           {formatBytes(diskReclaimable)} is currently reclaimable.
@@ -3747,18 +4751,15 @@ function CleanupModal({
   );
 }
 
-function Sparkline({
-  color,
-  points,
-}: {
-  points: SparkPoint[];
-  color: string;
-}) {
+function Sparkline({ color, points }: { points: SparkPoint[]; color: string }) {
   const data = points.length > 0 ? points : [{ label: '0', value: 0 }];
   return (
     <div className="h-10 w-full min-w-0">
       <ResponsiveContainer height="100%" width="100%">
-        <LineChart data={data} margin={{ bottom: 2, left: 0, right: 0, top: 2 }}>
+        <LineChart
+          data={data}
+          margin={{ bottom: 2, left: 0, right: 0, top: 2 }}
+        >
           <Line
             dataKey="value"
             dot={false}
@@ -3931,9 +4932,7 @@ function LogsPage({
     update();
     window.addEventListener('resize', update);
     const observer =
-      typeof ResizeObserver === 'undefined'
-        ? null
-        : new ResizeObserver(update);
+      typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(update);
     observer?.observe(node);
     return () => {
       window.removeEventListener('resize', update);
@@ -4051,8 +5050,12 @@ function LogsPage({
   }, [canStream, restartNonce, scope, streamIDs]);
 
   const pausedViewLength =
-    paused && pausedAt !== null ? Math.min(pausedAt, lines.length) : lines.length;
-  const pausedNewCount = paused ? Math.max(0, lines.length - pausedViewLength) : 0;
+    paused && pausedAt !== null
+      ? Math.min(pausedAt, lines.length)
+      : lines.length;
+  const pausedNewCount = paused
+    ? Math.max(0, lines.length - pausedViewLength)
+    : 0;
   const visibleSource = useMemo(
     () => lines.slice(0, pausedViewLength),
     [lines, pausedViewLength],
@@ -4100,7 +5103,10 @@ function LogsPage({
   );
   const visibleCount =
     Math.ceil(viewportHeight / rowHeight) + logRowOverscan * 2;
-  const virtualEnd = Math.min(filteredLines.length, virtualStart + visibleCount);
+  const virtualEnd = Math.min(
+    filteredLines.length,
+    virtualStart + visibleCount,
+  );
   const virtualRows = filteredLines.slice(virtualStart, virtualEnd);
   const newLinesWhileUnpinned =
     !follow && !paused && unpinnedAt !== null
@@ -4204,10 +5210,9 @@ function LogsPage({
       : streamIDs.length > 0
         ? `${streamIDs.length} selected`
         : 'No scope selected';
-  const emptyTitle =
-    !canStream
-      ? 'Pick a project, service, or container'
-      : streamStatus === 'loading'
+  const emptyTitle = !canStream
+    ? 'Pick a project, service, or container'
+    : streamStatus === 'loading'
       ? 'Opening log stream'
       : 'No visible logs';
 
@@ -4327,16 +5332,13 @@ function LogsPage({
                 Next
               </Button>
               <Badge>
-                {matchRows.length > 0 ? activeMatch + 1 : 0}/
-                {matchRows.length}
+                {matchRows.length > 0 ? activeMatch + 1 : 0}/{matchRows.length}
               </Badge>
             </div>
 
             <Tooltip label={paused ? 'Resume stream display' : 'Pause display'}>
               <Button
-                icon={
-                  paused ? <Play size={16} /> : <Pause size={16} />
-                }
+                icon={paused ? <Play size={16} /> : <Pause size={16} />}
                 onClick={() => {
                   if (paused) {
                     setPaused(false);
@@ -4623,7 +5625,8 @@ function LogRow({
   wrap: boolean;
 }) {
   const source = logSource(line);
-  const isSkipMarker = line.stream === 'system' && line.text.includes('skipped');
+  const isSkipMarker =
+    line.stream === 'system' && line.text.includes('skipped');
   if (isSkipMarker) {
     return (
       <div
@@ -4741,7 +5744,9 @@ function LogsExportModal({
             className="h-9 rounded-control border border-border bg-bg-inset px-3 text-text-primary"
             id="logs-export-range"
             onChange={(event) =>
-              onChange({ range: event.currentTarget.value as 'buffer' | 'tail' })
+              onChange({
+                range: event.currentTarget.value as 'buffer' | 'tail',
+              })
             }
             value={state.range}
           >
@@ -4756,7 +5761,9 @@ function LogsExportModal({
             <input
               className="h-9 min-w-0 flex-1 rounded-control border border-border bg-bg-inset px-3 text-text-primary"
               id="logs-export-path"
-              onChange={(event) => onChange({ path: event.currentTarget.value })}
+              onChange={(event) =>
+                onChange({ path: event.currentTarget.value })
+              }
               value={state.path}
             />
             <Button onClick={onBrowse} size="sm" variant="secondary">
@@ -4768,7 +5775,9 @@ function LogsExportModal({
         <div className="rounded-control border border-border bg-bg-inset px-3 py-2 text-xs text-text-muted">
           {currentFilters}
         </div>
-        {state.error ? <div className="text-sm text-error">{state.error}</div> : null}
+        {state.error ? (
+          <div className="text-sm text-error">{state.error}</div>
+        ) : null}
       </div>
     </Modal>
   );
@@ -5501,7 +6510,13 @@ function ProjectDetailPage({
           <Button
             disabled={lifecycleDisabled}
             disabledReason={disabledReason}
-            icon={primaryAction === 'stop' ? <Square size={15} /> : <Play size={15} />}
+            icon={
+              primaryAction === 'stop' ? (
+                <Square size={15} />
+              ) : (
+                <Play size={15} />
+              )
+            }
             loading={busy(primaryAction)}
             onClick={() => onAction(primaryAction, project)}
           >
@@ -5578,9 +6593,7 @@ function ProjectDetailPage({
         ))}
       </div>
 
-      {tab === 'overview' ? (
-        <ProjectOverviewTab detail={detail} />
-      ) : null}
+      {tab === 'overview' ? <ProjectOverviewTab detail={detail} /> : null}
       {tab === 'services' ? <ProjectServicesTab detail={detail} /> : null}
       {tab === 'containers' ? <ProjectContainersTab detail={detail} /> : null}
       {tab === 'compose' ? <ProjectComposeTab detail={detail} /> : null}
@@ -5602,7 +6615,9 @@ function ProjectOverviewTab({ detail }: { detail: ProjectDetail }) {
         />
         <StatusBlock
           label="Running"
-          tone={project.servicesRunning === project.servicesTotal ? 'ok' : 'warn'}
+          tone={
+            project.servicesRunning === project.servicesTotal ? 'ok' : 'warn'
+          }
           value={project.servicesRunning}
         />
         <StatusBlock
@@ -5799,8 +6814,8 @@ function ProjectComposeTab({ detail }: { detail: ProjectDetail }) {
   const rawFile = rawFiles.find((file) => file.path === activeSelection);
   const value =
     activeSelection === 'resolved'
-      ? detail.compose?.resolvedYAML ?? ''
-      : rawFile?.content ?? '';
+      ? (detail.compose?.resolvedYAML ?? '')
+      : (rawFile?.content ?? '');
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-2">
@@ -6647,7 +7662,9 @@ function ContainerRowActions({
         <Button
           aria-label={`Restart ${container.name}`}
           disabled={
-            mutationsDisabled || !canStop || busyIDs.has(`restart:${container.id}`)
+            mutationsDisabled ||
+            !canStop ||
+            busyIDs.has(`restart:${container.id}`)
           }
           disabledReason={
             mutationsDisabled
@@ -6760,12 +7777,19 @@ function isLogLine(value: unknown): value is LogLine {
     return false;
   }
   const candidate = value as Partial<LogLine>;
-  return typeof candidate.text === 'string' && typeof candidate.stream === 'string';
+  return (
+    typeof candidate.text === 'string' && typeof candidate.stream === 'string'
+  );
 }
 
 function normalizeLogLevel(level?: string): LogLevelFilter {
   const value = level?.toLowerCase();
-  if (value === 'error' || value === 'warn' || value === 'info' || value === 'debug') {
+  if (
+    value === 'error' ||
+    value === 'warn' ||
+    value === 'info' ||
+    value === 'debug'
+  ) {
     return value;
   }
   return 'unknown';
@@ -6785,7 +7809,12 @@ function levelTone(level: LogLevelFilter): BadgeTone {
 }
 
 function logSource(line: LogLine) {
-  return line.containerName || line.service || shortID(line.containerID ?? '') || 'system';
+  return (
+    line.containerName ||
+    line.service ||
+    shortID(line.containerID ?? '') ||
+    'system'
+  );
 }
 
 function logSourceKey(line: LogLine) {
@@ -6826,7 +7855,10 @@ function formatLogTimestamp(value: unknown) {
 }
 
 function renderAnsiText(text: string, query: string) {
-  const ansiPattern = new RegExp(`${String.fromCharCode(27)}\\[([0-9;]*)m`, 'g');
+  const ansiPattern = new RegExp(
+    `${String.fromCharCode(27)}\\[([0-9;]*)m`,
+    'g',
+  );
   const nodes: JSX.Element[] = [];
   let className = '';
   let cursor = 0;
@@ -6898,7 +7930,11 @@ function renderHighlightedText(text: string, query: string, keyPrefix: number) {
   let key = 0;
   while (index >= 0) {
     if (index > cursor) {
-      parts.push(<span key={`${keyPrefix}-text-${key}`}>{text.slice(cursor, index)}</span>);
+      parts.push(
+        <span key={`${keyPrefix}-text-${key}`}>
+          {text.slice(cursor, index)}
+        </span>,
+      );
       key += 1;
     }
     parts.push(
@@ -6914,7 +7950,9 @@ function renderHighlightedText(text: string, query: string, keyPrefix: number) {
     index = lower.indexOf(query, cursor);
   }
   if (cursor < text.length) {
-    parts.push(<span key={`${keyPrefix}-text-${key}`}>{text.slice(cursor)}</span>);
+    parts.push(
+      <span key={`${keyPrefix}-text-${key}`}>{text.slice(cursor)}</span>,
+    );
   }
   return parts;
 }
@@ -8542,6 +9580,79 @@ function normalizePermissionMode(value: unknown): PermissionMode {
   return value === 'group' || value === 'rootless' ? value : 'ask';
 }
 
+function normalizeStringSetting(value: unknown, fallback: string) {
+  return typeof value === 'string' && value.trim() ? value : fallback;
+}
+
+function normalizeBoolSetting(value: unknown, fallback: boolean) {
+  return typeof value === 'boolean' ? value : fallback;
+}
+
+function windowsSetupCheckRows(status: ProviderStatus | null) {
+  const problem = (code: string) =>
+    status?.problems?.find((entry) => entry.code === code) ?? null;
+  return [
+    setupCheckRow('WSL installed', status, problem('WSL_MISSING')),
+    setupCheckRow('Ubuntu distro present', status, problem('UBUNTU_MISSING')),
+    setupCheckRow('WSL2 enabled', status, problem('WSL2_REQUIRED')),
+    setupCheckRow('systemd enabled', status, problem('SYSTEMD_OFF')),
+    setupCheckRow(
+      'Docker CLI installed',
+      status,
+      problem('DOCKER_MISSING'),
+      status?.dockerInstalled,
+    ),
+    setupCheckRow(
+      'Compose plugin installed',
+      status,
+      problem('COMPOSE_MISSING'),
+      status?.composeInstalled,
+    ),
+    setupCheckRow(
+      'Buildx plugin installed',
+      status,
+      problem('BUILDX_MISSING'),
+      status?.buildxInstalled,
+    ),
+    setupCheckRow(
+      'Docker daemon reachable',
+      status,
+      problem('DOCKERD_DOWN'),
+      status?.dockerRunning,
+    ),
+  ];
+}
+
+function setupCheckRow(
+  label: string,
+  status: ProviderStatus | null,
+  problem: ProviderProblem | null,
+  okFlag?: boolean,
+) {
+  if (!status) {
+    return {
+      label,
+      state: 'neutral' as StatusToneID,
+      detail: 'Not checked yet',
+    };
+  }
+  if (problem) {
+    return {
+      label,
+      state: 'error' as StatusToneID,
+      detail: problem.repairHint || problem.message,
+    };
+  }
+  if (okFlag === false) {
+    return {
+      label,
+      state: 'neutral' as StatusToneID,
+      detail: 'Not detected yet',
+    };
+  }
+  return { label, state: 'ok' as StatusToneID, detail: 'Ready' };
+}
+
 function notificationTone(level: string): BadgeTone {
   switch (level) {
     case 'ok':
@@ -8672,23 +9783,47 @@ function summarizeProjectUpdates(projects: ProjectSummary[]) {
 function projectUpdateBadges(project: ProjectSummary) {
   const badges = project.updateBadges;
   if (!badges || projectUpdateCount(project) === 0) {
-    return [<Badge key="up-to-date" tone="ok">Up to date</Badge>];
+    return [
+      <Badge key="up-to-date" tone="ok">
+        Up to date
+      </Badge>,
+    ];
   }
   const out = [];
   if (badges.imageUpdates > 0) {
-    out.push(<Badge key="image" tone="warn">{badges.imageUpdates} image</Badge>);
+    out.push(
+      <Badge key="image" tone="warn">
+        {badges.imageUpdates} image
+      </Badge>,
+    );
   }
   if (badges.baseUpdates > 0) {
-    out.push(<Badge key="base" tone="warn">{badges.baseUpdates} base</Badge>);
+    out.push(
+      <Badge key="base" tone="warn">
+        {badges.baseUpdates} base
+      </Badge>,
+    );
   }
   if (badges.rebuildNeeded > 0) {
-    out.push(<Badge key="rebuild" tone="warn">{badges.rebuildNeeded} rebuild</Badge>);
+    out.push(
+      <Badge key="rebuild" tone="warn">
+        {badges.rebuildNeeded} rebuild
+      </Badge>,
+    );
   }
   if (badges.pinned > 0) {
-    out.push(<Badge key="pinned" tone="neutral">{badges.pinned} pinned</Badge>);
+    out.push(
+      <Badge key="pinned" tone="neutral">
+        {badges.pinned} pinned
+      </Badge>,
+    );
   }
   if (badges.unknownBase > 0) {
-    out.push(<Badge key="unknown" tone="neutral">{badges.unknownBase} unknown</Badge>);
+    out.push(
+      <Badge key="unknown" tone="neutral">
+        {badges.unknownBase} unknown
+      </Badge>,
+    );
   }
   return out;
 }

@@ -66,6 +66,19 @@ Current evidence: `internal/docker.Client` now accepts provider-supplied Docker 
 - [ ] Clean Win11 VM: rerun the full Phase 1-3 Docker integration suite through the Windows WSL provider.
 - [ ] Clean Win11 VM: import a path-heavy Compose project under `/mnt/c` and verify the warning appears in the running desktop app.
 
+## Phase 5.4 Windows UX
+
+Current evidence: frontend tests cover the Windows setup modal path from no-provider state through WSL checks, CommandPlan preview, install start, `provider:install:progress`, and verify summary. Settings tests cover the Providers-focused Windows WSL section, `windows.wsl_distro` save, `provider.autostart_backend`, and path-mapping panel. Backend provider-manager tests verify `windows.wsl_distro` is applied before WSL detection. Local gates passed: `go test . ./internal/...`, `go vet . ./internal/...`, `go build . ./internal/...`, `golangci-lint v2.12.2 run --timeout=5m`, frontend ESLint, Vitest, Vite dev build, and audit.
+
+- [x] Render the Windows onboarding branch with Ubuntu on WSL2 recommended, Existing Docker context, and disabled Remote host option.
+- [x] Render WSL setup checks with repair hints and WSL path-performance guidance.
+- [x] Preview the WSL install CommandPlan and consume `provider:install:progress` events in the setup flow.
+- [x] Provide WSL settings for distro selection, path mapping, and start-Docker-on-launch.
+- [x] Apply `windows.wsl_distro` to WSL provider detection and install planning.
+- [ ] Windows runner/VM E2E smoke: first-launch no-provider flow reaches WSL setup checks and install-plan preview.
+- [ ] Windows runner/VM E2E smoke: Settings -> Providers updates `windows.wsl_distro`, reruns detection, and preserves Docker Desktop contexts.
+- [ ] Fresh clean Win11 manual checklist: run onboarding from WSL absent through working `cairn-dev` Docker backend, including reboot/resume guidance if Windows requires restart.
+
 ## Full Platform Matrix TODO
 
 - [ ] Windows 11 x64: WSL present/absent, Ubuntu present/absent/multiple, Docker in Ubuntu present/absent, systemd on/off.
