@@ -208,6 +208,7 @@ func (m *Manager) reconcileOnce(ctx context.Context) error {
 	if err := m.requireDocker(); err != nil {
 		return err
 	}
+	m.refreshDockerInfo(ctx)
 	containers, err := m.Docker.ListContainers(ctx, models.ContainerListOptions{All: false})
 	if err != nil {
 		return err
@@ -345,6 +346,7 @@ func (m *Manager) buildSample(containerID string, raw container.StatsResponse) (
 	m.mu.Lock()
 	previous, hasPrevious := m.previous[containerID]
 	summary := m.containers[containerID]
+	onlineCPUs := m.onlineCPUs
 	m.previous[containerID] = raw
 	m.mu.Unlock()
 
@@ -352,7 +354,7 @@ func (m *Manager) buildSample(containerID string, raw container.StatsResponse) (
 	if hasPrevious {
 		cpuPrevious = previous.CPUStats
 	}
-	cpu := CPUPercent(cpuPrevious, raw.CPUStats)
+	cpu := CPUPercentWithFallback(cpuPrevious, raw.CPUStats, onlineCPUs)
 	var netRXRate, netTXRate, blockReadRate, blockWriteRate float64
 	if hasPrevious {
 		previousRX, previousTX := networkBytes(previous.Networks)
@@ -447,6 +449,24 @@ func (m *Manager) maybeRetain(ctx context.Context) {
 	m.lastRetain = now
 	m.mu.Unlock()
 	_ = m.Repository.RetainAndDownsample(ctx, now)
+}
+
+func (m *Manager) refreshDockerInfo(ctx context.Context) {
+	m.mu.Lock()
+	hasCPUCount := m.onlineCPUs > 0
+	m.mu.Unlock()
+	if hasCPUCount || m.Docker == nil {
+		return
+	}
+	info, err := m.Docker.Info(ctx)
+	if err != nil || info == nil || info.CPUs <= 0 {
+		return
+	}
+	m.mu.Lock()
+	if m.onlineCPUs == 0 {
+		m.onlineCPUs = uint32(info.CPUs)
+	}
+	m.mu.Unlock()
 }
 
 func newStreamSession(manager *Manager, streamID string, scope models.StatsScope) *streamSession {

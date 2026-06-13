@@ -83,6 +83,7 @@ func TestManagerRealDockerStatsIntegration(t *testing.T) {
 	manager := NewManager(client, nil, nil, nil, nil, Options{})
 	manager.ensureReady()
 	manager.containers[summary.ID] = summary
+	manager.refreshDockerInfo(ctx)
 	manager.ingest(summary.ID, first)
 	manager.ingest(summary.ID, second)
 	samples := manager.latestForScope(models.StatsScope{Kind: ScopeAll})

@@ -202,6 +202,10 @@ func (f *fakeMetricsDocker) ProviderID() string {
 	return "linux_native"
 }
 
+func (f *fakeMetricsDocker) Info(context.Context) (*models.DockerInfo, error) {
+	return &models.DockerInfo{CPUs: 2}, nil
+}
+
 func (f *fakeMetricsDocker) DiskUsage(context.Context) (*models.DiskUsage, error) {
 	return &models.DiskUsage{TotalBytes: 1024}, nil
 }

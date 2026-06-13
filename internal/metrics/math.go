@@ -9,6 +9,10 @@ import (
 )
 
 func CPUPercent(previous container.CPUStats, current container.CPUStats) float64 {
+	return CPUPercentWithFallback(previous, current, 0)
+}
+
+func CPUPercentWithFallback(previous container.CPUStats, current container.CPUStats, fallbackOnlineCPUs uint32) float64 {
 	if current.CPUUsage.TotalUsage < previous.CPUUsage.TotalUsage || current.SystemUsage < previous.SystemUsage {
 		return 0
 	}
@@ -20,6 +24,9 @@ func CPUPercent(previous container.CPUStats, current container.CPUStats) float64
 	onlineCPUs := float64(current.OnlineCPUs)
 	if onlineCPUs == 0 {
 		onlineCPUs = float64(len(current.CPUUsage.PercpuUsage))
+	}
+	if onlineCPUs == 0 {
+		onlineCPUs = float64(fallbackOnlineCPUs)
 	}
 	if onlineCPUs == 0 {
 		onlineCPUs = 1

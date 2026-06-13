@@ -28,6 +28,7 @@ const (
 
 type DockerClient interface {
 	ProviderID() string
+	Info(context.Context) (*models.DockerInfo, error)
 	DiskUsage(context.Context) (*models.DiskUsage, error)
 	ListContainers(context.Context, models.ContainerListOptions) ([]models.ContainerSummary, error)
 	ListImages(context.Context) ([]models.ImageSummary, error)
@@ -72,6 +73,7 @@ type Manager struct {
 	lastAccepted map[string]time.Time
 	pending      []store.MetricsSampleRecord
 	lastRetain   time.Time
+	onlineCPUs   uint32
 }
 
 type Sample struct {

@@ -25,6 +25,22 @@ func TestCPUPercentUsesDockerFormula(t *testing.T) {
 	}
 }
 
+func TestCPUPercentUsesDaemonCPUFallback(t *testing.T) {
+	t.Parallel()
+	previous := container.CPUStats{
+		CPUUsage:    container.CPUUsage{TotalUsage: 100},
+		SystemUsage: 1000,
+	}
+	current := container.CPUStats{
+		CPUUsage:    container.CPUUsage{TotalUsage: 300},
+		SystemUsage: 2000,
+	}
+
+	if got := CPUPercentWithFallback(previous, current, 8); got != 160 {
+		t.Fatalf("CPUPercentWithFallback() = %v, want 160", got)
+	}
+}
+
 func TestCPUPercentHandlesMissingOrInvalidDeltas(t *testing.T) {
 	t.Parallel()
 	if got := CPUPercent(container.CPUStats{}, container.CPUStats{}); got != 0 {
