@@ -16,7 +16,9 @@ import type {
   DashboardMetrics,
   DiskUsageCategory,
   CheatsheetEntry,
+  ImageLineage,
   ImageSummary,
+  ImageUpdate,
   LogLine,
   NetworkSummary,
   Notification,
@@ -24,11 +26,16 @@ import type {
   ProjectSummary,
   ProviderStatus,
   TerminalSessionInfo,
+  UpdateHistoryItem,
+  UpdatePlan,
   VolumeSummary,
 } from "../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
 import {
+  Confidence,
   HealthStatus,
   ProjectStatus,
+  RecommendedAction,
+  UpdateKind,
   Risk,
   UpdateStatus,
 } from "../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
@@ -154,6 +161,28 @@ const registryServiceMock = vi.hoisted(() => ({
   TestAuth: vi.fn(),
 }));
 
+const updateServiceMock = vi.hoisted(() => ({
+  CheckAllUpdates: vi.fn(),
+  CheckProjectUpdates: vi.fn(),
+  CheckServiceUpdate: vi.fn(),
+  ListCurrentUpdates: vi.fn(),
+  PlanServiceUpdate: vi.fn(),
+  PlanProjectUpdate: vi.fn(),
+  ApplyUpdate: vi.fn(),
+  IgnoreUpdate: vi.fn(),
+  UnignoreUpdate: vi.fn(),
+  ListUpdateHistory: vi.fn(),
+  Rollback: vi.fn(),
+}));
+
+const imageLineageServiceMock = vi.hoisted(() => ({
+  DiscoverProjectLineage: vi.fn(),
+  GetContainerLineage: vi.fn(),
+  GetProjectLineage: vi.fn(),
+  GetServiceLineage: vi.fn(),
+  RefreshServiceLineage: vi.fn(),
+}));
+
 vi.mock("./api/app", () => ({
   getAppVersion: vi.fn().mockResolvedValue({
     version: "0.1.0",
@@ -175,6 +204,8 @@ vi.mock("./api/services", () => ({
   RegistryService: registryServiceMock,
   SettingsService: settingsServiceMock,
   TerminalService: terminalServiceMock,
+  UpdateService: updateServiceMock,
+  ImageLineageService: imageLineageServiceMock,
 }));
 
 vi.mock("@monaco-editor/react", () => ({
@@ -379,6 +410,22 @@ describe("App inventory shell", () => {
       loggedIn: true,
       username: "ada",
     });
+    updateServiceMock.CheckAllUpdates.mockResolvedValue("updates-check-job");
+    updateServiceMock.CheckProjectUpdates.mockResolvedValue([]);
+    updateServiceMock.CheckServiceUpdate.mockResolvedValue(null);
+    updateServiceMock.ListCurrentUpdates.mockResolvedValue([]);
+    updateServiceMock.PlanServiceUpdate.mockResolvedValue(updatePlan());
+    updateServiceMock.PlanProjectUpdate.mockResolvedValue(updateProjectPlan());
+    updateServiceMock.ApplyUpdate.mockResolvedValue("updates-apply-job");
+    updateServiceMock.IgnoreUpdate.mockResolvedValue(undefined);
+    updateServiceMock.UnignoreUpdate.mockResolvedValue(undefined);
+    updateServiceMock.ListUpdateHistory.mockResolvedValue([]);
+    updateServiceMock.Rollback.mockResolvedValue("updates-rollback-job");
+    imageLineageServiceMock.DiscoverProjectLineage.mockResolvedValue([]);
+    imageLineageServiceMock.GetContainerLineage.mockResolvedValue(null);
+    imageLineageServiceMock.GetProjectLineage.mockResolvedValue([]);
+    imageLineageServiceMock.GetServiceLineage.mockResolvedValue(null);
+    imageLineageServiceMock.RefreshServiceLineage.mockResolvedValue(null);
     runtimeMock.openFile.mockResolvedValue("");
     runtimeMock.saveFile.mockResolvedValue("/tmp/cairn-logs.jsonl");
     runtimeMock.setClipboardText.mockResolvedValue(undefined);
@@ -749,6 +796,105 @@ describe("App inventory shell", () => {
     expect(screen.getByText("Project Volumes")).toBeInTheDocument();
     expect(screen.getByText("cairn_data")).toBeInTheDocument();
     expect(screen.getByText("success")).toBeInTheDocument();
+  });
+
+  it("plans and applies updates from the global Updates page", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
+    updateServiceMock.ListCurrentUpdates.mockImplementation((filter) =>
+      Promise.resolve(
+        filter?.status?.includes(UpdateStatus.UpdateStatusIgnored)
+          ? [ignoredUpdate()]
+          : seededUpdates(),
+      ),
+    );
+    updateServiceMock.ListUpdateHistory.mockResolvedValue([updateHistoryRow()]);
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", {
+        name: /Updates/,
+      }),
+    );
+
+    expect(await screen.findByText("Image update available")).toBeInTheDocument();
+    expect(screen.getAllByText("Rebuild required").length).toBeGreaterThan(0);
+    expect(
+      screen.getByText(
+        "Base image: Unknown — this is a third-party registry image and no base metadata was found.",
+      ),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getAllByRole("button", { name: "Update" })[0]);
+    expect(await screen.findByText("$ docker compose pull app")).toBeInTheDocument();
+    fireEvent.click(screen.getByLabelText(/Back up named volumes first/));
+    fireEvent.click(screen.getByRole("button", { name: "Update service" }));
+
+    await waitFor(() =>
+      expect(updateServiceMock.ApplyUpdate).toHaveBeenCalledWith({
+        planID: "plan-update-app",
+        backupVolumesFirst: true,
+        watchHealth: true,
+        rollbackOnFailure: true,
+      }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    fireEvent.click(screen.getByRole("button", { name: "History" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Rollback" }));
+    expect(updateServiceMock.Rollback).toHaveBeenCalledWith(301);
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    fireEvent.click(screen.getByRole("button", { name: "Ignored" }));
+    expect(await screen.findByText("Waiting for maintenance window")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Unignore" }));
+    expect(updateServiceMock.UnignoreUpdate).toHaveBeenCalledWith(201);
+  });
+
+  it("shows project Updates tab grouping and lineage wording", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
+    projectServiceMock.GetProject.mockResolvedValue(seededProjectDetail());
+    updateServiceMock.ListCurrentUpdates.mockResolvedValue(seededUpdates());
+    imageLineageServiceMock.GetProjectLineage.mockResolvedValue(seededLineage());
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", {
+        name: /Projects/,
+      }),
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "app-db" }));
+    await screen.findByText("linux_native");
+    const updatesButtons = await waitFor(() => {
+      const buttons = screen.getAllByRole("button", { name: "Updates" });
+      expect(buttons.length).toBeGreaterThan(1);
+      return buttons;
+    });
+    fireEvent.click(updatesButtons[updatesButtons.length - 1]);
+
+    expect(await screen.findByText("Pull & recreate")).toBeInTheDocument();
+    expect(screen.getByText("Rebuild & redeploy")).toBeInTheDocument();
+    expect(screen.getByText("Manual attention")).toBeInTheDocument();
+    expect(screen.getByText(/node:20-alpine - Confidence: High/)).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Base image: Unknown — this is a third-party registry image and no base metadata was found.",
+      ),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Update project" }));
+    expect(updateServiceMock.PlanProjectUpdate).toHaveBeenCalledWith(
+      "linux_native/app-db",
+    );
   });
 
   it("streams logs, filters search matches, and keeps nonmatching rows hidden", async () => {
@@ -2211,6 +2357,91 @@ function seededNotifications(): Notification[] {
   ];
 }
 
+function seededUpdates(): ImageUpdate[] {
+  return [
+    {
+      id: 101,
+      projectID: "linux_native/app-db",
+      service: "app",
+      containerID: "container-app",
+      kind: UpdateKind.UpdateKindServiceImage,
+      status: UpdateStatus.UpdateStatusServiceImageUpdateAvailable,
+      currentImage: "cairn/app:latest",
+      localDigest: "sha256:aaa111",
+      remoteDigest: "sha256:bbb222",
+      confidence: Confidence.ConfidenceHigh,
+      recommendedAction: RecommendedAction.RecommendedActionPullRecreate,
+      checkedAt: "2026-06-13T09:00:00Z",
+      notes: ["Mutable tag warning"],
+    },
+    {
+      id: 102,
+      projectID: "linux_native/app-db",
+      service: "worker",
+      containerID: "container-worker",
+      kind: UpdateKind.UpdateKindBaseImage,
+      status: UpdateStatus.UpdateStatusRebuildRequired,
+      currentImage: "cairn/worker:local",
+      baseImage: "node:20-alpine",
+      localDigest: "sha256:ccc333",
+      remoteDigest: "sha256:ddd444",
+      confidence: Confidence.ConfidenceHigh,
+      recommendedAction: RecommendedAction.RecommendedActionRebuildRedeploy,
+      checkedAt: "2026-06-13T09:01:00Z",
+    },
+    {
+      id: 103,
+      projectID: "linux_native/app-db",
+      service: "third-party",
+      kind: UpdateKind.UpdateKindBaseImage,
+      status: UpdateStatus.UpdateStatusUnknownBaseImage,
+      currentImage: "postgres:16",
+      confidence: Confidence.ConfidenceUnknown,
+      recommendedAction: RecommendedAction.RecommendedActionManual,
+      checkedAt: "2026-06-13T09:02:00Z",
+    },
+  ] as ImageUpdate[];
+}
+
+function ignoredUpdate(): ImageUpdate {
+  return {
+    ...seededUpdates()[0],
+    id: 201,
+    status: UpdateStatus.UpdateStatusIgnored,
+    notes: ["Waiting for maintenance window"],
+  };
+}
+
+function seededLineage(): ImageLineage[] {
+  return [
+    {
+      projectID: "linux_native/app-db",
+      service: "worker",
+      containerID: "container-worker",
+      imageRef: "cairn/worker:local",
+      imageID: "sha256:image-worker",
+      baseImage: "node:20-alpine",
+      baseDigest: "sha256:ccc333",
+      source: "compose_dockerfile",
+      confidence: Confidence.ConfidenceHigh,
+      reason: "from Compose build config and Dockerfile",
+    },
+  ] as ImageLineage[];
+}
+
+function updateHistoryRow(): UpdateHistoryItem {
+  return {
+    id: 301,
+    projectID: "linux_native/app-db",
+    service: "app",
+    kind: UpdateKind.UpdateKindServiceImage,
+    result: "success",
+    startedAt: "2026-06-13T09:05:00Z",
+    finishedAt: "2026-06-13T09:06:00Z",
+    rollbackStatus: "available",
+  } as UpdateHistoryItem;
+}
+
 function seededBackup(): BackupSummary {
   return {
     id: "backup-1",
@@ -2223,6 +2454,79 @@ function seededBackup(): BackupSummary {
     result: "success",
     createdAt: "2026-06-13T08:00:00Z",
   } as BackupSummary;
+}
+
+function updatePlan(): UpdatePlan {
+  return {
+    planID: "plan-update-app",
+    projectID: "linux_native/app-db",
+    items: [
+      {
+        service: "app",
+        kind: UpdateKind.UpdateKindServiceImage,
+        currentImage: "cairn/app:latest",
+        localDigest: "sha256:aaa111",
+        remoteDigest: "sha256:bbb222",
+        confidence: Confidence.ConfidenceHigh,
+        action: RecommendedAction.RecommendedActionPullRecreate,
+      },
+    ],
+    commands: [
+      {
+        order: 1,
+        command: "docker compose pull app",
+        risk: Risk.RiskNeedsConfirmation,
+        explanation: "Pull updated service image.",
+      },
+      {
+        order: 2,
+        command: "docker compose up -d app",
+        risk: Risk.RiskNeedsConfirmation,
+        explanation: "Recreate service with the pulled image.",
+      },
+    ],
+    warnings: [],
+  };
+}
+
+function updateProjectPlan(): UpdatePlan {
+  return {
+    planID: "plan-update-project",
+    projectID: "linux_native/app-db",
+    items: updatePlan().items.concat([
+      {
+        service: "worker",
+        kind: UpdateKind.UpdateKindBaseImage,
+        currentImage: "cairn/worker:local",
+        baseImage: "node:20-alpine",
+        localDigest: "sha256:ccc333",
+        remoteDigest: "sha256:ddd444",
+        confidence: Confidence.ConfidenceHigh,
+        action: RecommendedAction.RecommendedActionRebuildRedeploy,
+      },
+    ]),
+    commands: [
+      {
+        order: 1,
+        command: "docker compose pull app",
+        risk: Risk.RiskNeedsConfirmation,
+        explanation: "Pull updated service images.",
+      },
+      {
+        order: 2,
+        command: "docker compose build --pull worker",
+        risk: Risk.RiskNeedsConfirmation,
+        explanation: "Rebuild services from newer base images.",
+      },
+      {
+        order: 3,
+        command: "docker compose up -d app worker",
+        risk: Risk.RiskNeedsConfirmation,
+        explanation: "Recreate changed services.",
+      },
+    ],
+    warnings: ["third-party: base image unknown"],
+  };
 }
 
 function backupPlan(): CommandPlan {

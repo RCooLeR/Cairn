@@ -9,7 +9,9 @@ import type {
   ExportResult,
   HubSearchResult,
   ImageDetail,
+  ImageLineage,
   ImageSummary,
+  ImageUpdate,
   LogLine,
   MetricRankItem,
   MountSpec,
@@ -28,8 +30,14 @@ import type {
   RegistryPreset,
   RunImageRequest,
   StatsScope,
+  UpdateHistoryItem,
+  UpdatePlan,
   VolumeDetail,
   VolumeSummary,
+} from "../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
+import {
+  UpdateKind,
+  UpdateStatus,
 } from "../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
 
 import {
@@ -52,6 +60,7 @@ import {
   FolderOpen,
   Gauge,
   KeyRound,
+  Layers,
   LayoutGrid,
   List,
   LogIn,
@@ -76,6 +85,7 @@ import {
   Tag,
   Terminal,
   Trash2,
+  Undo2,
   Upload,
   Wifi,
   Wrench,
@@ -111,12 +121,14 @@ import { getAppVersion } from "./api/app";
 import {
   BackupService,
   DockerService,
+  ImageLineageService,
   LogsService,
   MetricsService,
   ProviderService,
   ProjectService,
   RegistryService,
   SettingsService,
+  UpdateService,
 } from "./api/services";
 import {
   Badge,
@@ -145,6 +157,7 @@ const logoUrl = "/cairn-logo.png";
 type PageID =
   | "overview"
   | "projects"
+  | "updates"
   | "containers"
   | "images"
   | "volumes"
@@ -162,6 +175,7 @@ type ProjectTabID =
   | "overview"
   | "services"
   | "containers"
+  | "updates"
   | "compose"
   | "backups";
 type LogScope = "all" | "project" | "service" | "container";
@@ -184,8 +198,49 @@ type InspectState = {
   title: string;
   subtitle?: string;
   rows: Array<[string, string]>;
+  lineage?: ImageLineage | null;
   raw?: string;
   loading?: boolean;
+  error?: string;
+};
+
+type UpdatesTabID = "current" | "history" | "ignored";
+type UpdatePlanTarget =
+  | {
+      kind: "service";
+      projectID: string;
+      projectName?: string;
+      service: string;
+    }
+  | { kind: "project"; projectID: string; projectName?: string };
+
+type UpdateProgressEntry = {
+  jobID?: string;
+  phase?: string;
+  message?: string;
+  pct?: number;
+};
+
+type UpdatePlanState = {
+  open: boolean;
+  plan: UpdatePlan | null;
+  target: UpdatePlanTarget | null;
+  backupVolumesFirst: boolean;
+  watchHealth: boolean;
+  rollbackOnFailure: boolean;
+  busy: boolean;
+  applying: boolean;
+  jobID?: string;
+  progress: UpdateProgressEntry[];
+  result?: string;
+  error?: string;
+};
+
+type IgnoreUpdateState = {
+  open: boolean;
+  update: ImageUpdate | null;
+  reason: string;
+  busy: boolean;
   error?: string;
 };
 
@@ -458,6 +513,7 @@ type CleanupState = {
 const navItems: NavItem[] = [
   { id: "overview", label: "Overview", icon: Gauge },
   { id: "projects", label: "Projects", icon: LayoutGrid },
+  { id: "updates", label: "Updates", icon: RefreshCw },
   { id: "containers", label: "Containers", icon: Container },
   { id: "images", label: "Images", icon: Box },
   { id: "volumes", label: "Volumes", icon: Database },
@@ -471,6 +527,25 @@ const emptyInspect: InspectState = {
   open: false,
   title: "",
   rows: [],
+};
+
+const emptyUpdatePlan: UpdatePlanState = {
+  open: false,
+  plan: null,
+  target: null,
+  backupVolumesFirst: false,
+  watchHealth: true,
+  rollbackOnFailure: true,
+  busy: false,
+  applying: false,
+  progress: [],
+};
+
+const emptyIgnoreUpdate: IgnoreUpdateState = {
+  open: false,
+  update: null,
+  reason: "",
+  busy: false,
 };
 
 const emptyConfirm: ConfirmState = {
@@ -723,6 +798,38 @@ function App() {
   const [backups, setBackups] = useState<BackupSummary[]>([]);
   const [backupsStatus, setBackupsStatus] = useState<LoadStatus>("idle");
   const [backupsError, setBackupsError] = useState<string | null>(null);
+  const [updates, setUpdates] = useState<ImageUpdate[]>([]);
+  const [updatesStatus, setUpdatesStatus] = useState<LoadStatus>("idle");
+  const [updatesError, setUpdatesError] = useState<string | null>(null);
+  const [updateHistory, setUpdateHistory] = useState<UpdateHistoryItem[]>([]);
+  const [updateHistoryStatus, setUpdateHistoryStatus] =
+    useState<LoadStatus>("idle");
+  const [updateHistoryError, setUpdateHistoryError] = useState<string | null>(
+    null,
+  );
+  const [ignoredUpdates, setIgnoredUpdates] = useState<ImageUpdate[]>([]);
+  const [ignoredUpdatesStatus, setIgnoredUpdatesStatus] =
+    useState<LoadStatus>("idle");
+  const [ignoredUpdatesError, setIgnoredUpdatesError] = useState<string | null>(
+    null,
+  );
+  const [updatesTab, setUpdatesTab] = useState<UpdatesTabID>("current");
+  const [updateFilter, setUpdateFilter] = useState<FilterID>("all");
+  const [lastUpdateCheckAt, setLastUpdateCheckAt] = useState<number | null>(
+    null,
+  );
+  const [updateCheckJobID, setUpdateCheckJobID] = useState<string | null>(null);
+  const [updateCheckProgress, setUpdateCheckProgress] =
+    useState<UpdateProgressEntry | null>(null);
+  const [updatePlan, setUpdatePlan] =
+    useState<UpdatePlanState>(emptyUpdatePlan);
+  const [ignoreUpdate, setIgnoreUpdate] =
+    useState<IgnoreUpdateState>(emptyIgnoreUpdate);
+  const [projectLineage, setProjectLineage] = useState<
+    Record<string, ImageLineage[]>
+  >({});
+  const [projectLineageStatus, setProjectLineageStatus] =
+    useState<Record<string, LoadStatus>>({});
   const [createNetwork, setCreateNetwork] =
     useState<CreateNetworkState>(emptyCreateNetwork);
   const [importProject, setImportProject] =
@@ -844,13 +951,94 @@ function App() {
     }
   }, []);
 
+  const refreshUpdates = useCallback(async () => {
+    setUpdatesStatus("loading");
+    setUpdatesError(null);
+    try {
+      const nextUpdates = await UpdateService.ListCurrentUpdates({});
+      setUpdates(nextUpdates ?? []);
+      setUpdatesStatus("ready");
+    } catch (error: unknown) {
+      setUpdatesError(
+        error instanceof Error ? error.message : "Unable to load updates",
+      );
+      setUpdatesStatus("error");
+    }
+  }, []);
+
+  const refreshIgnoredUpdates = useCallback(async () => {
+    setIgnoredUpdatesStatus("loading");
+    setIgnoredUpdatesError(null);
+    try {
+      const nextUpdates = await UpdateService.ListCurrentUpdates({
+        status: [UpdateStatus.UpdateStatusIgnored],
+      });
+      setIgnoredUpdates(nextUpdates ?? []);
+      setIgnoredUpdatesStatus("ready");
+    } catch (error: unknown) {
+      setIgnoredUpdatesError(
+        error instanceof Error
+          ? error.message
+          : "Unable to load ignored updates",
+      );
+      setIgnoredUpdatesStatus("error");
+    }
+  }, []);
+
+  const refreshUpdateHistory = useCallback(async () => {
+    setUpdateHistoryStatus("loading");
+    setUpdateHistoryError(null);
+    try {
+      const nextHistory = await UpdateService.ListUpdateHistory({ limit: 200 });
+      setUpdateHistory(nextHistory ?? []);
+      setUpdateHistoryStatus("ready");
+    } catch (error: unknown) {
+      setUpdateHistoryError(
+        error instanceof Error
+          ? error.message
+          : "Unable to load update history",
+      );
+      setUpdateHistoryStatus("error");
+    }
+  }, []);
+
+  const refreshUpdateSurfaces = useCallback(async () => {
+    await Promise.all([
+      refreshUpdates(),
+      refreshIgnoredUpdates(),
+      refreshUpdateHistory(),
+    ]);
+  }, [refreshIgnoredUpdates, refreshUpdateHistory, refreshUpdates]);
+
+  const refreshProjectLineage = useCallback(async (projectID: string) => {
+    setProjectLineageStatus((current) => ({
+      ...current,
+      [projectID]: "loading",
+    }));
+    try {
+      const rows = await ImageLineageService.GetProjectLineage(projectID);
+      setProjectLineage((current) => ({ ...current, [projectID]: rows ?? [] }));
+      setProjectLineageStatus((current) => ({
+        ...current,
+        [projectID]: "ready",
+      }));
+    } catch {
+      setProjectLineage((current) => ({ ...current, [projectID]: [] }));
+      setProjectLineageStatus((current) => ({
+        ...current,
+        [projectID]: "error",
+      }));
+    }
+  }, []);
+
   const openProjectDetail = useCallback(
     (project: ProjectSummary) => {
       setActiveProjectID(project.id);
       setProjectTab("overview");
       void refreshProjectDetail(project.id);
+      void refreshProjectLineage(project.id);
     },
-    [refreshProjectDetail],
+    [refreshProjectDetail, refreshProjectLineage],
   );
 
   const closeProjectDetail = useCallback(() => {
@@ -1018,6 +1206,10 @@ function App() {
   }, [refreshBackups]);
 
   useEffect(() => {
+    void refreshUpdateSurfaces();
+  }, [refreshUpdateSurfaces]);
+
+  useEffect(() => {
     let timer: number | undefined;
     const off = Events.On("objects:changed", () => {
       window.clearTimeout(timer);
@@ -1025,8 +1217,10 @@ function App() {
         void refreshInventory();
         void refreshProjects();
         void refreshBackups();
+        void refreshUpdateSurfaces();
         if (activeProjectID) {
           void refreshProjectDetail(activeProjectID);
+          void refreshProjectLineage(activeProjectID);
         }
       }, 500);
     });
@@ -1039,7 +1233,102 @@ function App() {
     refreshBackups,
     refreshInventory,
     refreshProjectDetail,
+    refreshProjectLineage,
     refreshProjects,
+    refreshUpdateSurfaces,
+  ]);
+
+  useEffect(() => {
+    const offCheck = Events.On("updates:check:progress", (event) => {
+      const payload = eventPayload<UpdateProgressEntry & {
+        done?: number;
+        total?: number;
+        current?: string;
+      }>(event);
+      if (!payload) {
+        return;
+      }
+      setUpdateCheckJobID(payload.jobID ?? null);
+      setUpdateCheckProgress({
+        jobID: payload.jobID,
+        phase: "check",
+        message:
+          payload.current ??
+          (payload.done && payload.total
+            ? `${payload.done}/${payload.total} checked`
+            : "Checking updates"),
+        pct:
+          payload.done && payload.total
+            ? Math.round((payload.done / payload.total) * 100)
+            : undefined,
+      });
+      if (payload.done && payload.total && payload.done >= payload.total) {
+        setLastUpdateCheckAt(Date.now());
+        window.setTimeout(() => setUpdateCheckProgress(null), 1200);
+        void refreshUpdateSurfaces();
+      }
+    });
+    const offApplied = Events.On("updates:applied", () => {
+      void refreshUpdateSurfaces();
+      void refreshProjects();
+      if (activeProjectID) {
+        void refreshProjectDetail(activeProjectID);
+        void refreshProjectLineage(activeProjectID);
+      }
+    });
+    const offJobProgress = Events.On("job:progress", (event) => {
+      const payload = eventPayload<UpdateProgressEntry>(event);
+      if (!payload?.jobID) {
+        return;
+      }
+      setUpdatePlan((current) => {
+        if (!current.jobID || current.jobID !== payload.jobID) {
+          return current;
+        }
+        return {
+          ...current,
+          progress: current.progress.concat(payload),
+        };
+      });
+    });
+    const offJobDone = Events.On("job:done", (event) => {
+      const payload = eventPayload<UpdateProgressEntry & { result?: string }>(
+        event,
+      );
+      if (!payload?.jobID) {
+        return;
+      }
+      setUpdatePlan((current) => {
+        if (!current.jobID || current.jobID !== payload.jobID) {
+          return current;
+        }
+        return {
+          ...current,
+          applying: false,
+          busy: false,
+          result: payload.result ?? payload.message ?? "done",
+          progress: current.progress.concat(payload),
+        };
+      });
+      void refreshUpdateSurfaces();
+      void refreshProjects();
+      if (activeProjectID) {
+        void refreshProjectDetail(activeProjectID);
+        void refreshProjectLineage(activeProjectID);
+      }
+    });
+    return () => {
+      offCheck();
+      offApplied();
+      offJobProgress();
+      offJobDone();
+    };
+  }, [
+    activeProjectID,
+    refreshProjectDetail,
+    refreshProjectLineage,
+    refreshProjects,
+    refreshUpdateSurfaces,
   ]);
 
   useEffect(() => {
@@ -1755,6 +2044,207 @@ function App() {
     providerRepairNeeded,
   ]);
 
+  const checkAllUpdates = useCallback(async () => {
+    if (!ensureDockerReady()) {
+      return;
+    }
+    setUpdatesError(null);
+    setUpdateCheckProgress({
+      phase: "check",
+      message: "Starting update check",
+    });
+    try {
+      const jobID = await UpdateService.CheckAllUpdates();
+      setUpdateCheckJobID(jobID);
+      setUpdateCheckProgress({
+        jobID,
+        phase: "check",
+        message: "Checking updates",
+      });
+    } catch (error: unknown) {
+      setUpdateCheckProgress(null);
+      setUpdatesError(
+        error instanceof Error ? error.message : "Unable to check updates",
+      );
+    }
+  }, [ensureDockerReady]);
+
+  const openUpdatePlan = useCallback(
+    async (target: UpdatePlanTarget) => {
+      if (!ensureDockerReady()) {
+        return;
+      }
+      setUpdatePlan({
+        ...emptyUpdatePlan,
+        open: true,
+        target,
+        busy: true,
+      });
+      try {
+        const plan =
+          target.kind === "project"
+            ? await UpdateService.PlanProjectUpdate(target.projectID)
+            : await UpdateService.PlanServiceUpdate(
+                target.projectID,
+                target.service,
+              );
+        if (!plan) {
+          throw new Error("Update plan was empty");
+        }
+        setUpdatePlan({
+          ...emptyUpdatePlan,
+          open: true,
+          target,
+          plan,
+        });
+      } catch (error: unknown) {
+        setUpdatePlan((current) => ({
+          ...current,
+          busy: false,
+          error:
+            error instanceof Error
+              ? error.message
+              : "Unable to create update plan",
+        }));
+      }
+    },
+    [ensureDockerReady],
+  );
+
+  const applyUpdatePlan = useCallback(async () => {
+    if (!updatePlan.plan) {
+      return;
+    }
+    setUpdatePlan((current) => ({
+      ...current,
+      busy: true,
+      applying: true,
+      error: undefined,
+      result: undefined,
+      progress: [
+        {
+          phase: "apply",
+          message: "Starting update",
+        },
+      ],
+    }));
+    try {
+      const jobID = await UpdateService.ApplyUpdate({
+        planID: updatePlan.plan.planID,
+        backupVolumesFirst: updatePlan.backupVolumesFirst,
+        watchHealth: updatePlan.watchHealth,
+        rollbackOnFailure: updatePlan.rollbackOnFailure,
+      });
+      setUpdatePlan((current) => ({
+        ...current,
+        jobID,
+        progress: current.progress.concat({
+          jobID,
+          phase: "apply",
+          message: "Update job started",
+        }),
+      }));
+    } catch (error: unknown) {
+      setUpdatePlan((current) => ({
+        ...current,
+        busy: false,
+        applying: false,
+        error:
+          error instanceof Error ? error.message : "Unable to apply update",
+      }));
+    }
+  }, [
+    updatePlan.backupVolumesFirst,
+    updatePlan.plan,
+    updatePlan.rollbackOnFailure,
+    updatePlan.watchHealth,
+  ]);
+
+  const openIgnoreUpdate = useCallback((update: ImageUpdate) => {
+    setIgnoreUpdate({
+      ...emptyIgnoreUpdate,
+      open: true,
+      update,
+    });
+  }, []);
+
+  const submitIgnoreUpdate = useCallback(async () => {
+    if (!ignoreUpdate.update) {
+      return;
+    }
+    setIgnoreUpdate((current) => ({
+      ...current,
+      busy: true,
+      error: undefined,
+    }));
+    try {
+      await UpdateService.IgnoreUpdate({
+        id: ignoreUpdate.update.id,
+        reason: ignoreUpdate.reason.trim() || undefined,
+      });
+      setIgnoreUpdate(emptyIgnoreUpdate);
+      await refreshUpdateSurfaces();
+      await refreshProjects();
+    } catch (error: unknown) {
+      setIgnoreUpdate((current) => ({
+        ...current,
+        busy: false,
+        error:
+          error instanceof Error ? error.message : "Unable to ignore update",
+      }));
+    }
+  }, [
+    ignoreUpdate.reason,
+    ignoreUpdate.update,
+    refreshProjects,
+    refreshUpdateSurfaces,
+  ]);
+
+  const unignoreUpdate = useCallback(
+    async (id: number) => {
+      try {
+        await UpdateService.UnignoreUpdate(id);
+        await refreshUpdateSurfaces();
+        await refreshProjects();
+      } catch (error: unknown) {
+        setIgnoredUpdatesError(
+          error instanceof Error ? error.message : "Unable to unignore update",
+        );
+      }
+    },
+    [refreshProjects, refreshUpdateSurfaces],
+  );
+
+  const rollbackUpdate = useCallback(
+    async (historyID: number) => {
+      if (!ensureDockerReady()) {
+        return;
+      }
+      try {
+        const jobID = await UpdateService.Rollback(historyID);
+        setUpdatePlan({
+          ...emptyUpdatePlan,
+          open: true,
+          applying: true,
+          busy: true,
+          jobID,
+          progress: [
+            {
+              jobID,
+              phase: "rollback",
+              message: "Rollback job started",
+            },
+          ],
+        });
+      } catch (error: unknown) {
+        setUpdateHistoryError(
+          error instanceof Error ? error.message : "Unable to roll back update",
+        );
+      }
+    },
+    [ensureDockerReady],
+  );
+
   const runContainerAction = useCallback(
     async (action: ContainerAction, container: ContainerSummary) => {
       if (!ensureDockerReady()) {
@@ -2448,34 +2938,52 @@ function App() {
   }, []);
 
   const openContainerInspect = useCallback((container: ContainerSummary) => {
+    const subtitle = shortID(container.id);
     setInspect({
       open: true,
       title: container.name,
-      subtitle: shortID(container.id),
+      subtitle,
       rows: containerRows(container),
       loading: true,
     });
     DockerService.InspectContainerRaw(container.id)
       .then((raw) => {
-        setInspect({
+        setInspect((current) => ({
           open: true,
           title: container.name,
-          subtitle: shortID(container.id),
+          subtitle,
           rows: containerRows(container),
+          lineage: current.lineage,
           raw: formatJSON(raw),
-        });
+        }));
       })
       .catch((error: unknown) => {
-        setInspect({
+        setInspect((current) => ({
           open: true,
           title: container.name,
-          subtitle: shortID(container.id),
+          subtitle,
           rows: containerRows(container),
+          lineage: current.lineage,
           error:
             error instanceof Error
               ? error.message
               : "Unable to inspect container",
-        });
+        }));
+      });
+    ImageLineageService.GetContainerLineage(container.id)
+      .then((lineage) => {
+        setInspect((current) =>
+          current.open && current.subtitle === subtitle
+            ? { ...current, lineage }
+            : current,
+        );
+      })
+      .catch(() => {
+        setInspect((current) =>
+          current.open && current.subtitle === subtitle
+            ? { ...current, lineage: null }
+            : current,
+        );
       });
   }, []);
 
@@ -2601,6 +3109,9 @@ function App() {
     switch (activePage) {
       case "projects":
         if (activeProjectID) {
+          const detailProject = projectDetail?.summary;
+          const projectID = detailProject?.id ?? activeProjectID;
+          const projectName = detailProject?.name ?? projectNameForID(projects, projectID);
           return (
             <ProjectDetailPage
               actionBusyIDs={busyActionIDs}
@@ -2610,17 +3121,38 @@ function App() {
               detail={projectDetail}
               error={projectDetailError}
               loading={projectDetailStatus === "loading"}
+              lineage={projectLineage[projectID] ?? []}
+              lineageLoading={projectLineageStatus[projectID] === "loading"}
               mutationsDisabled={mutationsDisabled}
               mutationDisabledReason={mutationDisabledReason}
               onAction={runProjectAction}
               onBack={closeProjectDetail}
               onBackupVolume={openBackupVolume}
+              onCheckUpdates={checkAllUpdates}
+              onIgnoreUpdate={openIgnoreUpdate}
               onRefresh={() => {
                 void refreshProjectDetail(activeProjectID);
                 void refreshBackups();
+                void refreshUpdateSurfaces();
+                void refreshProjectLineage(activeProjectID);
               }}
               onRestoreBackup={openRestoreBackup}
               onTabChange={setProjectTab}
+              onUpdateProject={() =>
+                void openUpdatePlan({
+                  kind: "project",
+                  projectID,
+                  projectName,
+                })
+              }
+              onUpdateService={(service) =>
+                void openUpdatePlan({
+                  kind: "service",
+                  projectID,
+                  projectName,
+                  service,
+                })
+              }
               projectVolumes={volumes.filter(
                 (volume) =>
                   projectDetail &&
@@ -2628,6 +3160,9 @@ function App() {
                     projectDetail.summary.id,
               )}
               tab={projectTab}
+              updates={updates.filter(
+                (update) => update.projectID === projectID,
+              )}
             />
           );
         }
@@ -2652,6 +3187,64 @@ function App() {
             search={search}
             sort={projectSort}
             view={projectView}
+          />
+        );
+      case "updates":
+        return (
+          <UpdatesPage
+            checkJobID={updateCheckJobID}
+            checkProgress={updateCheckProgress}
+            error={updatesError}
+            filter={updateFilter}
+            history={updateHistory}
+            historyError={updateHistoryError}
+            historyLoading={updateHistoryStatus === "loading"}
+            ignored={ignoredUpdates}
+            ignoredError={ignoredUpdatesError}
+            ignoredLoading={ignoredUpdatesStatus === "loading"}
+            lastCheckAt={lastUpdateCheckAt}
+            loading={updatesStatus === "loading"}
+            mutationsDisabled={mutationsDisabled}
+            mutationDisabledReason={mutationDisabledReason}
+            onCheckNow={checkAllUpdates}
+            onFilterChange={setUpdateFilter}
+            onIgnore={openIgnoreUpdate}
+            onOpenProject={(projectID) => {
+              const project = projects.find((item) => item.id === projectID);
+              if (project) {
+                openProjectDetail(project);
+                setActivePage("projects");
+                setProjectTab("updates");
+              }
+            }}
+            onPlanProject={(projectID) => {
+              const project = projects.find((item) => item.id === projectID);
+              void openUpdatePlan({
+                kind: "project",
+                projectID,
+                projectName: project?.name,
+              });
+            }}
+            onPlanService={(update) =>
+              void openUpdatePlan({
+                kind: "service",
+                projectID: update.projectID ?? "",
+                projectName: projectNameForID(projects, update.projectID),
+                service: update.service ?? "",
+              })
+            }
+            onRefresh={refreshUpdateSurfaces}
+            onRollback={(historyID) => {
+              void rollbackUpdate(historyID);
+            }}
+            onTabChange={setUpdatesTab}
+            onUnignore={(id) => {
+              void unignoreUpdate(id);
+            }}
+            projects={projects}
+            search={search}
+            tab={updatesTab}
+            updates={updates}
           />
         );
       case "logs":
@@ -2978,11 +3571,17 @@ function App() {
                   loading={
                     activePage === "projects"
                       ? projectsStatus === "loading"
+                      : activePage === "updates"
+                        ? updatesStatus === "loading" ||
+                          updateHistoryStatus === "loading" ||
+                          ignoredUpdatesStatus === "loading"
                       : inventoryStatus === "loading"
                   }
                   onClick={() => {
                     if (activePage === "projects") {
                       void refreshProjects();
+                    } else if (activePage === "updates") {
+                      void refreshUpdateSurfaces();
                     } else {
                       void refreshInventory();
                     }
@@ -3079,6 +3678,26 @@ function App() {
           setConfirm((current) => ({ ...current, typedName }))
         }
         onClose={() => setConfirm(emptyConfirm)}
+      />
+      <UpdatePlanModal
+        onApply={() => {
+          void applyUpdatePlan();
+        }}
+        onChange={(patch) =>
+          setUpdatePlan((current) => ({ ...current, ...patch }))
+        }
+        onClose={() => setUpdatePlan(emptyUpdatePlan)}
+        state={updatePlan}
+      />
+      <IgnoreUpdateModal
+        onChange={(patch) =>
+          setIgnoreUpdate((current) => ({ ...current, ...patch }))
+        }
+        onClose={() => setIgnoreUpdate(emptyIgnoreUpdate)}
+        onSubmit={() => {
+          void submitIgnoreUpdate();
+        }}
+        state={ignoreUpdate}
       />
       <RepairProviderModal
         busy={repairSaving || providerActionBusy}
@@ -7479,6 +8098,566 @@ function ProjectsPage({
   );
 }
 
+function UpdatesPage({
+  checkJobID,
+  checkProgress,
+  error,
+  filter,
+  history,
+  historyError,
+  historyLoading,
+  ignored,
+  ignoredError,
+  ignoredLoading,
+  lastCheckAt,
+  loading,
+  mutationsDisabled,
+  mutationDisabledReason,
+  onCheckNow,
+  onFilterChange,
+  onIgnore,
+  onOpenProject,
+  onPlanProject,
+  onPlanService,
+  onRefresh,
+  onRollback,
+  onTabChange,
+  onUnignore,
+  projects,
+  search,
+  tab,
+  updates,
+}: {
+  updates: ImageUpdate[];
+  history: UpdateHistoryItem[];
+  ignored: ImageUpdate[];
+  projects: ProjectSummary[];
+  tab: UpdatesTabID;
+  filter: FilterID;
+  search: string;
+  loading: boolean;
+  historyLoading: boolean;
+  ignoredLoading: boolean;
+  error: string | null;
+  historyError: string | null;
+  ignoredError: string | null;
+  lastCheckAt: number | null;
+  checkJobID: string | null;
+  checkProgress: UpdateProgressEntry | null;
+  mutationsDisabled: boolean;
+  mutationDisabledReason: string;
+  onCheckNow: () => void;
+  onFilterChange: (filter: FilterID) => void;
+  onIgnore: (update: ImageUpdate) => void;
+  onOpenProject: (projectID: string) => void;
+  onPlanProject: (projectID: string) => void;
+  onPlanService: (update: ImageUpdate) => void;
+  onRefresh: () => void;
+  onRollback: (historyID: number) => void;
+  onTabChange: (tab: UpdatesTabID) => void;
+  onUnignore: (id: number) => void;
+}) {
+  const filtered = useMemo(
+    () => filterUpdateRows(updates, search, filter),
+    [filter, search, updates],
+  );
+  const groups = useMemo(
+    () => groupUpdatesByProject(filtered, projects),
+    [filtered, projects],
+  );
+  const counts = useMemo(() => updateFilterCounts(updates), [updates]);
+  const checking = Boolean(checkProgress || checkJobID);
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="space-y-1">
+          <div className="text-sm text-text-muted">
+            {lastCheckAt
+              ? `Checked ${relativeTime(lastCheckAt)}`
+              : "No update check recorded"}
+          </div>
+          {checkProgress ? (
+            <div className="min-w-[260px]">
+              <div className="mb-1 flex items-center justify-between gap-3 text-xs text-text-muted">
+                <span>{checkProgress.message ?? "Checking updates"}</span>
+                {typeof checkProgress.pct === "number" ? (
+                  <span>{checkProgress.pct}%</span>
+                ) : null}
+              </div>
+              <div className="h-1.5 overflow-hidden rounded-full bg-bg-inset">
+                <div
+                  className="h-full rounded-full bg-accent transition-all"
+                  style={{ width: `${checkProgress.pct ?? 20}%` }}
+                />
+              </div>
+            </div>
+          ) : null}
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Button
+            disabled={mutationsDisabled}
+            disabledReason={mutationDisabledReason}
+            icon={<RefreshCw size={15} />}
+            loading={checking}
+            onClick={onCheckNow}
+            variant="primary"
+          >
+            Check now
+          </Button>
+          <Button icon={<RotateCw size={15} />} onClick={onRefresh}>
+            Refresh
+          </Button>
+        </div>
+      </div>
+
+      <div className="flex flex-wrap gap-2 border-b border-border">
+        {(["current", "history", "ignored"] as UpdatesTabID[]).map((id) => (
+          <button
+            className={[
+              "border-b-2 px-3 py-2 text-sm font-medium transition",
+              tab === id
+                ? "border-accent text-accent"
+                : "border-transparent text-text-secondary hover:text-text-primary",
+            ].join(" ")}
+            key={id}
+            onClick={() => onTabChange(id)}
+            type="button"
+          >
+            {id === "current" ? "Current" : titleCase(id)}
+          </button>
+        ))}
+      </div>
+
+      {tab === "current" ? (
+        <div className="space-y-4">
+          <FilterChips
+            active={filter}
+            items={[
+              ["all", "All", counts.all],
+              ["image", "Image updates", counts.image],
+              ["base", "Base updates", counts.base],
+              ["rebuild", "Rebuild required", counts.rebuild],
+              ["pinned", "Pinned", counts.pinned],
+              ["unknown", "Unknown base", counts.unknown],
+              ["errors", "Errors", counts.errors],
+              ["up-to-date", "Up to date", counts.upToDate],
+            ]}
+            onChange={onFilterChange}
+          />
+          {error ? (
+            <div className="rounded-card border border-error/30 bg-error/10 px-4 py-3 text-sm text-error">
+              {error}
+            </div>
+          ) : null}
+          {loading && updates.length === 0 ? <TableSkeleton /> : null}
+          {!loading && filtered.length === 0 ? (
+            <EmptyState
+              body="All images up to date."
+              icon={<CheckCircle2 size={28} />}
+              title="All images up to date"
+            />
+          ) : null}
+          {groups.map((group) => {
+            const actionable = group.rows.filter(isActionableUpdate);
+            return (
+              <Card key={group.projectID || group.projectName}>
+                <CardHeader
+                  actions={
+                    <div className="flex flex-wrap gap-2">
+                      {group.projectID ? (
+                        <Button
+                          onClick={() => onOpenProject(group.projectID)}
+                          size="sm"
+                          variant="secondary"
+                        >
+                          Open project
+                        </Button>
+                      ) : null}
+                      <Button
+                        disabled={actionable.length === 0}
+                        disabledReason="No actionable rows in this project"
+                        icon={<PackagePlus size={15} />}
+                        onClick={() => onPlanProject(group.projectID)}
+                        size="sm"
+                      >
+                        Update project
+                      </Button>
+                    </div>
+                  }
+                  title={group.projectName}
+                />
+                <CardBody>
+                  <DataTable
+                    columns={[
+                      {
+                        id: "service",
+                        header: "Service",
+                        render: (update) => (
+                          <span className="font-medium text-text-primary">
+                            {update.service || "-"}
+                          </span>
+                        ),
+                      },
+                      {
+                        id: "container",
+                        header: "Container",
+                        render: (update) => shortID(update.containerID ?? ""),
+                      },
+                      {
+                        id: "kind",
+                        header: "Update type",
+                        render: (update) => (
+                          <Badge
+                            tone={
+                              update.kind === UpdateKind.UpdateKindBaseImage
+                                ? "accent"
+                                : "info"
+                            }
+                          >
+                            {update.kind === UpdateKind.UpdateKindBaseImage
+                              ? "Base"
+                              : "Image"}
+                          </Badge>
+                        ),
+                      },
+                      {
+                        id: "image",
+                        header: "Current image",
+                        render: (update) => (
+                          <span title={update.currentImage}>
+                            {update.currentImage}
+                          </span>
+                        ),
+                      },
+                      {
+                        id: "base",
+                        header: "Base image",
+                        render: (update) => update.baseImage || "-",
+                      },
+                      {
+                        id: "digest",
+                        header: "Local -> Remote",
+                        render: (update) => (
+                          <DigestDelta
+                            local={update.localDigest}
+                            remote={update.remoteDigest}
+                          />
+                        ),
+                      },
+                      {
+                        id: "confidence",
+                        header: "Confidence",
+                        render: (update) => (
+                          <ConfidenceChip confidence={update.confidence} />
+                        ),
+                      },
+                      {
+                        id: "status",
+                        header: "Status/notes",
+                        render: (update) => (
+                          <div className="space-y-1">
+                            <Badge tone={updateTone(update.status)}>
+                              {updateStatusLabel(update.status)}
+                            </Badge>
+                            {updateStatusNote(update) ? (
+                              <div className="text-xs text-text-muted">
+                                {updateStatusNote(update)}
+                              </div>
+                            ) : null}
+                          </div>
+                        ),
+                      },
+                      {
+                        id: "checked",
+                        header: "Last checked",
+                        render: (update) =>
+                          relativeTime(dateMillis(update.checkedAt)),
+                      },
+                      {
+                        id: "actions",
+                        header: "",
+                        render: (update) => (
+                          <div className="flex justify-end gap-2">
+                            {isActionableUpdate(update) ? (
+                              <Button
+                                icon={<PackagePlus size={15} />}
+                                onClick={() => onPlanService(update)}
+                                size="sm"
+                              >
+                                Update
+                              </Button>
+                            ) : null}
+                            <Button
+                              icon={<Eye size={15} />}
+                              onClick={() => onIgnore(update)}
+                              size="sm"
+                              variant="secondary"
+                            >
+                              Ignore
+                            </Button>
+                          </div>
+                        ),
+                      },
+                    ]}
+                    empty={
+                      <EmptyState
+                        body="This project has no matching update rows."
+                        icon={<RefreshCw size={28} />}
+                        title="No matching rows"
+                      />
+                    }
+                    getRowID={(update) => String(update.id)}
+                    rows={group.rows}
+                  />
+                </CardBody>
+              </Card>
+            );
+          })}
+        </div>
+      ) : null}
+
+      {tab === "history" ? (
+        <UpdateHistoryTable
+          error={historyError}
+          history={history}
+          loading={historyLoading}
+          onRollback={onRollback}
+          projects={projects}
+        />
+      ) : null}
+
+      {tab === "ignored" ? (
+        <IgnoredUpdatesTable
+          error={ignoredError}
+          ignored={ignored}
+          loading={ignoredLoading}
+          onUnignore={onUnignore}
+          projects={projects}
+        />
+      ) : null}
+    </div>
+  );
+}
+
+function UpdateHistoryTable({
+  error,
+  history,
+  loading,
+  onRollback,
+  projects,
+}: {
+  history: UpdateHistoryItem[];
+  projects: ProjectSummary[];
+  loading: boolean;
+  error: string | null;
+  onRollback: (historyID: number) => void;
+}) {
+  return (
+    <div className="space-y-4">
+      {error ? (
+        <div className="rounded-card border border-error/30 bg-error/10 px-4 py-3 text-sm text-error">
+          {error}
+        </div>
+      ) : null}
+      {loading && history.length === 0 ? <TableSkeleton /> : null}
+      <DataTable
+        columns={[
+          {
+            id: "time",
+            header: "Time",
+            render: (item) => relativeTime(dateMillis(item.startedAt)),
+            sortable: true,
+            sortValue: (item) => dateMillis(item.startedAt),
+          },
+          {
+            id: "project",
+            header: "Project",
+            render: (item) => projectNameForID(projects, item.projectID),
+          },
+          {
+            id: "service",
+            header: "Service",
+            render: (item) => item.service || "-",
+          },
+          {
+            id: "kind",
+            header: "Kind",
+            render: (item) => updateKindLabel(item.kind),
+          },
+          {
+            id: "result",
+            header: "Result",
+            render: (item) => (
+              <Badge tone={updateResultTone(item.result)}>
+                {item.result || "unknown"}
+              </Badge>
+            ),
+          },
+          {
+            id: "duration",
+            header: "Duration",
+            render: (item) => updateDuration(item),
+          },
+          {
+            id: "details",
+            header: "Details",
+            render: (item) => (
+              <details className="max-w-md">
+                <summary className="cursor-pointer text-sm text-accent">
+                  Details
+                </summary>
+                <div className="mt-2 space-y-1 rounded-control border border-border bg-bg-inset p-3 text-xs text-text-muted">
+                  <div>Rollback: {item.rollbackStatus || "unavailable"}</div>
+                  {item.error ? <div>Error: {item.error}</div> : null}
+                </div>
+              </details>
+            ),
+          },
+          {
+            id: "actions",
+            header: "",
+            render: (item) =>
+              item.rollbackStatus === "available" ? (
+                <Button
+                  icon={<Undo2 size={15} />}
+                  onClick={() => onRollback(item.id)}
+                  size="sm"
+                  variant="secondary"
+                >
+                  Rollback
+                </Button>
+              ) : null,
+          },
+        ]}
+        empty={
+          <EmptyState
+            body="Applied update results land here."
+            icon={<HistoryIcon />}
+            title="No update history"
+          />
+        }
+        getRowID={(item) => String(item.id)}
+        rows={history}
+      />
+    </div>
+  );
+}
+
+function HistoryIcon() {
+  return <Clock3 size={28} />;
+}
+
+function IgnoredUpdatesTable({
+  error,
+  ignored,
+  loading,
+  onUnignore,
+  projects,
+}: {
+  ignored: ImageUpdate[];
+  projects: ProjectSummary[];
+  loading: boolean;
+  error: string | null;
+  onUnignore: (id: number) => void;
+}) {
+  return (
+    <div className="space-y-4">
+      {error ? (
+        <div className="rounded-card border border-error/30 bg-error/10 px-4 py-3 text-sm text-error">
+          {error}
+        </div>
+      ) : null}
+      {loading && ignored.length === 0 ? <TableSkeleton /> : null}
+      <DataTable
+        columns={[
+          {
+            id: "project",
+            header: "Project",
+            render: (update) => projectNameForID(projects, update.projectID),
+          },
+          {
+            id: "service",
+            header: "Service",
+            render: (update) => update.service || "-",
+          },
+          {
+            id: "scope",
+            header: "Scope",
+            render: (update) => update.currentImage,
+          },
+          {
+            id: "reason",
+            header: "Reason",
+            render: (update) => update.notes?.join(", ") || "-",
+          },
+          {
+            id: "actions",
+            header: "",
+            render: (update) => (
+              <Button
+                icon={<RotateCw size={15} />}
+                onClick={() => onUnignore(update.id)}
+                size="sm"
+                variant="secondary"
+              >
+                Unignore
+              </Button>
+            ),
+          },
+        ]}
+        empty={
+          <EmptyState
+            body="Ignored updates appear here with their reason and scope."
+            icon={<Eye size={28} />}
+            title="No ignored updates"
+          />
+        }
+        getRowID={(update) => String(update.id)}
+        rows={ignored}
+      />
+    </div>
+  );
+}
+
+function DigestDelta({
+  local,
+  remote,
+}: {
+  local?: string;
+  remote?: string;
+}) {
+  const differs = Boolean(local && remote && local !== remote);
+  return (
+    <div
+      className={[
+        "font-mono text-xs",
+        differs ? "text-warn" : "text-text-muted",
+      ].join(" ")}
+      title={`${local || "-"} -> ${remote || "-"}`}
+    >
+      {shortDigest(local)} -&gt; {shortDigest(remote)}
+    </div>
+  );
+}
+
+function ConfidenceChip({
+  confidence,
+  reason,
+}: {
+  confidence?: string;
+  reason?: string;
+}) {
+  return (
+    <Tooltip label={reason || confidenceReason(confidence)}>
+      <span>
+        <Badge tone={confidenceTone(confidence)}>
+          Confidence: {titleCase(confidence || "unknown")}
+        </Badge>
+      </span>
+    </Tooltip>
+  );
+}
+
 function ProjectCard({
   actionBusyIDs,
   mutationsDisabled,
@@ -7889,6 +9068,7 @@ const projectTabs: Array<[ProjectTabID, string]> = [
   ["overview", "Overview"],
   ["services", "Services"],
   ["containers", "Containers"],
+  ["updates", "Updates"],
   ["compose", "Compose"],
   ["backups", "Backups"],
 ];
@@ -7901,16 +9081,23 @@ function ProjectDetailPage({
   detail,
   error,
   loading,
+  lineage,
+  lineageLoading,
   mutationsDisabled,
   mutationDisabledReason,
   onAction,
   onBack,
   onBackupVolume,
+  onCheckUpdates,
+  onIgnoreUpdate,
   onRefresh,
   onRestoreBackup,
   onTabChange,
+  onUpdateProject,
+  onUpdateService,
   projectVolumes,
   tab,
+  updates,
 }: {
   detail: ProjectDetail | null;
   actionBusyIDs: Set<string>;
@@ -7918,17 +9105,24 @@ function ProjectDetailPage({
   backupsError: string | null;
   backupsLoading: boolean;
   loading: boolean;
+  lineage: ImageLineage[];
+  lineageLoading: boolean;
   error: string | null;
   mutationsDisabled: boolean;
   mutationDisabledReason: string;
   projectVolumes: VolumeSummary[];
   tab: ProjectTabID;
+  updates: ImageUpdate[];
   onAction: (action: ProjectAction, project: ProjectSummary) => void;
   onBack: () => void;
   onBackupVolume: (volume: VolumeSummary) => void;
+  onCheckUpdates: () => void;
+  onIgnoreUpdate: (update: ImageUpdate) => void;
   onRefresh: () => void;
   onRestoreBackup: (backup: BackupSummary) => void;
   onTabChange: (tab: ProjectTabID) => void;
+  onUpdateProject: () => void;
+  onUpdateService: (service: string) => void;
 }) {
   if (loading && !detail) {
     return <TableSkeleton />;
@@ -8065,6 +9259,18 @@ function ProjectDetailPage({
       {tab === "overview" ? <ProjectOverviewTab detail={detail} /> : null}
       {tab === "services" ? <ProjectServicesTab detail={detail} /> : null}
       {tab === "containers" ? <ProjectContainersTab detail={detail} /> : null}
+      {tab === "updates" ? (
+        <ProjectUpdatesTab
+          detail={detail}
+          lineage={lineage}
+          lineageLoading={lineageLoading}
+          onCheckUpdates={onCheckUpdates}
+          onIgnoreUpdate={onIgnoreUpdate}
+          onUpdateProject={onUpdateProject}
+          onUpdateService={onUpdateService}
+          updates={updates}
+        />
+      ) : null}
       {tab === "compose" ? <ProjectComposeTab detail={detail} /> : null}
       {tab === "backups" ? (
         <ProjectBackupsTab
@@ -8282,6 +9488,169 @@ function ProjectContainersTab({ detail }: { detail: ProjectDetail }) {
       getRowID={(container) => container.id}
       rows={detail.containers ?? []}
     />
+  );
+}
+
+function ProjectUpdatesTab({
+  detail,
+  lineage,
+  lineageLoading,
+  onCheckUpdates,
+  onIgnoreUpdate,
+  onUpdateProject,
+  onUpdateService,
+  updates,
+}: {
+  detail: ProjectDetail;
+  lineage: ImageLineage[];
+  lineageLoading: boolean;
+  updates: ImageUpdate[];
+  onCheckUpdates: () => void;
+  onIgnoreUpdate: (update: ImageUpdate) => void;
+  onUpdateProject: () => void;
+  onUpdateService: (service: string) => void;
+}) {
+  const actionable = updates.filter(isActionableUpdate);
+  const groups = [
+    {
+      title: "Pull & recreate",
+      rows: updates.filter(
+        (update) =>
+          update.recommendedAction === "pull_recreate" ||
+          update.status === "service_image_update_available",
+      ),
+    },
+    {
+      title: "Rebuild & redeploy",
+      rows: updates.filter(
+        (update) =>
+          update.recommendedAction === "rebuild_redeploy" ||
+          update.status === "base_image_update_available" ||
+          update.status === "rebuild_required",
+      ),
+    },
+    {
+      title: "Manual attention",
+      rows: updates.filter((update) => !isActionableUpdate(update)),
+    },
+  ];
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-wrap gap-2">
+          {projectUpdateBadges(detail.summary)}
+          {lineageLoading ? <Badge tone="info">Lineage loading</Badge> : null}
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Button icon={<RefreshCw size={15} />} onClick={onCheckUpdates}>
+            Check now
+          </Button>
+          <Button
+            disabled={actionable.length === 0}
+            disabledReason="No actionable update rows"
+            icon={<PackagePlus size={15} />}
+            onClick={onUpdateProject}
+            variant="primary"
+          >
+            Update project
+          </Button>
+        </div>
+      </div>
+
+      {updates.length === 0 ? (
+        <EmptyState
+          body="All images up to date."
+          icon={<CheckCircle2 size={28} />}
+          title="All images up to date"
+        />
+      ) : null}
+
+      {groups.map((group) => (
+        <Card key={group.title}>
+          <CardHeader
+            actions={
+              <Badge tone={group.rows.length > 0 ? "warn" : "neutral"}>
+                {group.rows.length}
+              </Badge>
+            }
+            title={group.title}
+          />
+          <CardBody className="space-y-2">
+            {group.rows.length === 0 ? (
+              <div className="text-sm text-text-muted">No services.</div>
+            ) : (
+              group.rows.map((update) => {
+                const rowLineage = lineage.find(
+                  (item) => item.service === update.service,
+                );
+                return (
+                  <div
+                    className="grid gap-3 rounded-control border border-border bg-bg-inset p-3 text-sm lg:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)_auto]"
+                    key={update.id}
+                  >
+                    <div className="min-w-0">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="font-medium text-text-primary">
+                          {update.service || "-"}
+                        </span>
+                        <Badge tone={updateTone(update.status)}>
+                          {updateStatusLabel(update.status)}
+                        </Badge>
+                      </div>
+                      <div className="mt-1 truncate font-mono text-xs text-text-muted">
+                        {update.currentImage}
+                      </div>
+                    </div>
+                    <div className="min-w-0 space-y-1">
+                      <div className="truncate text-xs text-text-muted">
+                        Base image:{" "}
+                        {rowLineage
+                          ? lineageBaseText(rowLineage)
+                          : update.baseImage || "-"}
+                      </div>
+                      <DigestDelta
+                        local={update.localDigest}
+                        remote={update.remoteDigest}
+                      />
+                      <div className="flex flex-wrap gap-2">
+                        <ConfidenceChip
+                          confidence={update.confidence}
+                          reason={rowLineage?.reason}
+                        />
+                        {updateStatusNote(update) ? (
+                          <Badge tone={updateTone(update.status)}>
+                            {updateStatusNote(update)}
+                          </Badge>
+                        ) : null}
+                      </div>
+                    </div>
+                    <div className="flex items-center justify-end gap-2">
+                      {isActionableUpdate(update) ? (
+                        <Button
+                          icon={<PackagePlus size={15} />}
+                          onClick={() => onUpdateService(update.service ?? "")}
+                          size="sm"
+                        >
+                          Update service
+                        </Button>
+                      ) : null}
+                      <Button
+                        icon={<Eye size={15} />}
+                        onClick={() => onIgnoreUpdate(update)}
+                        size="sm"
+                        variant="secondary"
+                      >
+                        Ignore
+                      </Button>
+                    </div>
+                  </div>
+                );
+              })
+            )}
+          </CardBody>
+        </Card>
+      ))}
+    </div>
   );
 }
 
@@ -9683,6 +11052,84 @@ function logFilterSummary(
   return parts.join(" | ");
 }
 
+function ImageLineageCard({ lineage }: { lineage: ImageLineage | null }) {
+  return (
+    <div className="mt-4 rounded-control border border-border bg-bg-inset p-3">
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <div className="flex items-center gap-2 font-medium text-text-primary">
+          <Layers size={16} />
+          Image Lineage
+        </div>
+        <ConfidenceChip
+          confidence={lineage?.confidence ?? "unknown"}
+          reason={lineage?.reason}
+        />
+      </div>
+      {lineage ? (
+        <div className="grid gap-3 text-sm md:grid-cols-2">
+          <LineageField label="Running image" value={lineage.imageRef} />
+          <LineageField label="Image ID" value={shortID(lineage.imageID ?? "")} />
+          <LineageField
+            label="Built from"
+            value={lineage.baseImage || "Unknown"}
+          />
+          <LineageField
+            copyable
+            label="Base @ build"
+            value={lineage.baseDigest || "-"}
+          />
+          <LineageField label="Source" value={lineage.source || "unknown"} />
+          <LineageField
+            label="Status"
+            value={
+              lineage.baseImage
+                ? "Base tracking available"
+                : "Base image: Unknown — this is a third-party registry image and no base metadata was found."
+            }
+          />
+        </div>
+      ) : (
+        <div className="text-sm text-text-muted">
+          Base image: Unknown — this is a third-party registry image and no base
+          metadata was found.
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LineageField({
+  copyable,
+  label,
+  value,
+}: {
+  label: string;
+  value: string;
+  copyable?: boolean;
+}) {
+  return (
+    <div className="min-w-0">
+      <div className="text-xs text-text-muted">{label}</div>
+      <div className="mt-1 flex items-center gap-2">
+        <span className="truncate font-mono text-xs text-text-primary" title={value}>
+          {value || "-"}
+        </span>
+        {copyable && value && value !== "-" ? (
+          <Button
+            aria-label={`Copy ${label}`}
+            icon={<Copy size={14} />}
+            onClick={() => {
+              void Clipboard.SetText(value);
+            }}
+            size="icon"
+            variant="ghost"
+          />
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 function InspectModal({
   inspect,
   onClose,
@@ -9718,6 +11165,9 @@ function InspectModal({
           </div>
         ))}
       </div>
+      {typeof inspect.lineage !== "undefined" ? (
+        <ImageLineageCard lineage={inspect.lineage} />
+      ) : null}
       {inspect.loading ? (
         <div className="mt-4 space-y-2">
           <Skeleton className="h-4 w-40" />
@@ -9849,6 +11299,296 @@ function ConfirmPlanModal({
           ) : null}
         </div>
       ) : null}
+    </Modal>
+  );
+}
+
+function UpdatePlanModal({
+  onApply,
+  onChange,
+  onClose,
+  state,
+}: {
+  state: UpdatePlanState;
+  onApply: () => void;
+  onChange: (patch: Partial<UpdatePlanState>) => void;
+  onClose: () => void;
+}) {
+  const plan = state.plan;
+  const targetLabel =
+    state.target?.kind === "project"
+      ? `project "${state.target.projectName ?? state.target.projectID}"`
+      : `service "${state.target?.service ?? ""}" in project "${
+          state.target?.projectName ?? state.target?.projectID ?? ""
+        }"`;
+  const title = plan
+    ? `Update ${targetLabel}`
+    : state.target
+      ? `Plan update for ${targetLabel}`
+      : "Update";
+  const commandText = plan?.commands.map((command) => command.command).join("\n");
+  const applying = state.applying || Boolean(state.jobID);
+  return (
+    <Modal
+      busy={state.busy}
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button disabled={state.busy} onClick={onClose} variant="secondary">
+            {state.result ? "Close" : "Cancel"}
+          </Button>
+          {plan && !applying && !state.result ? (
+            <Button loading={state.busy} onClick={onApply} variant="primary">
+              {state.target?.kind === "project"
+                ? "Update project"
+                : "Update service"}
+            </Button>
+          ) : null}
+        </div>
+      }
+      onClose={onClose}
+      open={state.open}
+      size="lg"
+      title={title}
+    >
+      <div className="max-h-[72vh] space-y-4 overflow-auto pr-1">
+        {state.busy && !plan ? (
+          <div className="space-y-2">
+            <Skeleton className="h-4 w-48" />
+            <Skeleton className="h-32 w-full" />
+          </div>
+        ) : null}
+
+        {plan ? (
+          <>
+            <div className="flex flex-wrap gap-2">
+              {plan.items.map((item) => (
+                <Badge key={`${item.service}-${item.kind}`} tone="warn">
+                  {item.service} - {updateActionLabel(item.action)}
+                </Badge>
+              ))}
+            </div>
+            <div className="grid gap-3 md:grid-cols-2">
+              {plan.items.map((item) => (
+                <div
+                  className="rounded-control border border-border bg-bg-inset p-3"
+                  key={`${item.service}-${item.kind}-digest`}
+                >
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="font-medium text-text-primary">
+                      {item.service}
+                    </div>
+                    <ConfidenceChip confidence={item.confidence} />
+                  </div>
+                  <dl className="mt-3 space-y-2 text-sm">
+                    <div>
+                      <dt className="text-xs text-text-muted">Service image</dt>
+                      <dd className="truncate font-mono text-xs">
+                        {item.currentImage}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt className="text-xs text-text-muted">Base image</dt>
+                      <dd className="truncate font-mono text-xs">
+                        {item.baseImage || "-"}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt className="text-xs text-text-muted">Digest</dt>
+                      <dd>
+                        <DigestDelta
+                          local={item.localDigest}
+                          remote={item.remoteDigest}
+                        />
+                      </dd>
+                    </div>
+                  </dl>
+                </div>
+              ))}
+            </div>
+
+            <div>
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <div className="text-sm font-medium text-text-primary">
+                  Commands
+                </div>
+                <Button
+                  icon={<Copy size={15} />}
+                  onClick={() => {
+                    if (commandText) {
+                      void Clipboard.SetText(commandText);
+                    }
+                  }}
+                  size="sm"
+                  variant="secondary"
+                >
+                  Copy
+                </Button>
+              </div>
+              <div className="space-y-2">
+                {plan.commands.map((command) => (
+                  <div
+                    className="rounded-control border border-border bg-bg-inset p-3"
+                    key={`${command.order}-${command.command}`}
+                  >
+                    <div className="font-mono text-xs text-text-primary">
+                      $ {command.command}
+                    </div>
+                    <div className="mt-2 flex flex-wrap gap-2 text-xs text-text-muted">
+                      <Badge tone={riskTone(command.risk)}>{command.risk}</Badge>
+                      <span>{command.explanation}</span>
+                      {command.workingDir ? (
+                        <span>workdir: {command.workingDir}</span>
+                      ) : null}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {plan.warnings?.length ? (
+              <div className="rounded-control border border-warn/30 bg-warn/10 p-3 text-sm text-warn">
+                {plan.warnings.map((warning) => (
+                  <div key={warning}>{warning}</div>
+                ))}
+              </div>
+            ) : null}
+
+            <div className="space-y-2 rounded-control border border-border bg-bg-inset p-3 text-sm">
+              <label className="flex items-center gap-2">
+                <input
+                  checked={state.backupVolumesFirst}
+                  disabled={applying}
+                  onChange={(event) =>
+                    onChange({ backupVolumesFirst: event.target.checked })
+                  }
+                  type="checkbox"
+                />
+                Back up named volumes first
+              </label>
+              <label className="flex items-center gap-2">
+                <input
+                  checked={state.watchHealth}
+                  disabled={applying}
+                  onChange={(event) =>
+                    onChange({ watchHealth: event.target.checked })
+                  }
+                  type="checkbox"
+                />
+                Watch health after update (60 s)
+              </label>
+              <label className="flex items-center gap-2">
+                <input
+                  checked={state.rollbackOnFailure}
+                  disabled={applying}
+                  onChange={(event) =>
+                    onChange({ rollbackOnFailure: event.target.checked })
+                  }
+                  type="checkbox"
+                />
+                Roll back automatically if health check fails
+              </label>
+              <div className="text-xs text-text-muted">
+                Rollback possible when the previous image is kept locally. If it
+                is unavailable, Cairn records manual-needed guidance in History.
+              </div>
+            </div>
+          </>
+        ) : null}
+
+        {applying ? (
+          <div className="space-y-2 rounded-control border border-border bg-bg-inset p-3">
+            <div className="text-sm font-medium text-text-primary">
+              Apply progress
+            </div>
+            {state.progress.length === 0 ? (
+              <div className="text-sm text-text-muted">Waiting for job...</div>
+            ) : (
+              <ol className="space-y-2">
+                {state.progress.map((entry, index) => (
+                  <li
+                    className="rounded-control border border-border bg-bg-card p-2 text-sm"
+                    key={`${entry.jobID}-${index}`}
+                  >
+                    <div className="flex items-center justify-between gap-3">
+                      <span className="text-text-primary">
+                        {entry.phase || "update"}
+                      </span>
+                      {typeof entry.pct === "number" ? (
+                        <span className="text-xs text-text-muted">
+                          {entry.pct}%
+                        </span>
+                      ) : null}
+                    </div>
+                    <div className="mt-1 text-xs text-text-muted">
+                      {entry.message || "Working"}
+                    </div>
+                  </li>
+                ))}
+              </ol>
+            )}
+          </div>
+        ) : null}
+
+        {state.result ? (
+          <div className="rounded-control border border-ok/30 bg-ok/10 p-3 text-sm text-ok">
+            Result: {state.result}
+          </div>
+        ) : null}
+        {state.error ? (
+          <div className="rounded-control border border-error/30 bg-error/10 p-3 text-sm text-error">
+            {state.error}
+          </div>
+        ) : null}
+      </div>
+    </Modal>
+  );
+}
+
+function IgnoreUpdateModal({
+  onChange,
+  onClose,
+  onSubmit,
+  state,
+}: {
+  state: IgnoreUpdateState;
+  onChange: (patch: Partial<IgnoreUpdateState>) => void;
+  onClose: () => void;
+  onSubmit: () => void;
+}) {
+  const update = state.update;
+  return (
+    <Modal
+      busy={state.busy}
+      footer={
+        <ModalActions
+          busy={state.busy}
+          disabled={false}
+          onCancel={onClose}
+          onSubmit={onSubmit}
+          submitLabel="Ignore"
+        />
+      }
+      onClose={onClose}
+      open={state.open}
+      title={`Ignore ${update?.service ?? "update"}`}
+    >
+      <div className="space-y-4">
+        <div className="rounded-control border border-border bg-bg-inset p-3 text-sm">
+          <div className="font-medium text-text-primary">
+            {update?.currentImage ?? "-"}
+          </div>
+          <div className="mt-1 text-text-muted">
+            Scope: this service update. It will move to the Ignored tab and
+            stop contributing to project badges.
+          </div>
+        </div>
+        <TextField
+          label="Reason"
+          onChange={(reason) => onChange({ reason })}
+          value={state.reason}
+        />
+        <FormError error={state.error} />
+      </div>
     </Modal>
   );
 }
@@ -12497,6 +14237,311 @@ function updateTone(status?: string): BadgeTone {
     return "error";
   }
   return "warn";
+}
+
+function isActionableUpdate(update: ImageUpdate) {
+  return (
+    update.status === UpdateStatus.UpdateStatusServiceImageUpdateAvailable ||
+    update.status === UpdateStatus.UpdateStatusBaseImageUpdateAvailable ||
+    update.status === UpdateStatus.UpdateStatusRebuildRequired ||
+    update.recommendedAction === "pull_recreate" ||
+    update.recommendedAction === "rebuild_redeploy"
+  );
+}
+
+function updateFilterCounts(updates: ImageUpdate[]) {
+  return updates.reduce(
+    (counts, update) => {
+      counts.all++;
+      if (update.kind === UpdateKind.UpdateKindServiceImage) {
+        counts.image++;
+      }
+      if (update.status === UpdateStatus.UpdateStatusBaseImageUpdateAvailable) {
+        counts.base++;
+      }
+      if (update.status === UpdateStatus.UpdateStatusRebuildRequired) {
+        counts.rebuild++;
+      }
+      if (update.status === UpdateStatus.UpdateStatusPinnedDigest) {
+        counts.pinned++;
+      }
+      if (update.status === UpdateStatus.UpdateStatusUnknownBaseImage) {
+        counts.unknown++;
+      }
+      if (
+        update.status === UpdateStatus.UpdateStatusAuthRequired ||
+        update.status === UpdateStatus.UpdateStatusRateLimited ||
+        update.status === UpdateStatus.UpdateStatusError
+      ) {
+        counts.errors++;
+      }
+      if (update.status === UpdateStatus.UpdateStatusUpToDate) {
+        counts.upToDate++;
+      }
+      return counts;
+    },
+    {
+      all: 0,
+      image: 0,
+      base: 0,
+      rebuild: 0,
+      pinned: 0,
+      unknown: 0,
+      errors: 0,
+      upToDate: 0,
+    },
+  );
+}
+
+function filterUpdateRows(
+  updates: ImageUpdate[],
+  search: string,
+  filter: FilterID,
+) {
+  const query = search.trim().toLowerCase();
+  return updates.filter((update) => {
+    if (
+      query &&
+      ![
+        update.projectID,
+        update.service,
+        update.containerID,
+        update.currentImage,
+        update.baseImage,
+        update.localDigest,
+        update.remoteDigest,
+      ].some((value) => normalizedIncludes(value, query))
+    ) {
+      return false;
+    }
+    switch (filter) {
+      case "image":
+        return update.kind === UpdateKind.UpdateKindServiceImage;
+      case "base":
+        return update.status === UpdateStatus.UpdateStatusBaseImageUpdateAvailable;
+      case "rebuild":
+        return update.status === UpdateStatus.UpdateStatusRebuildRequired;
+      case "pinned":
+        return update.status === UpdateStatus.UpdateStatusPinnedDigest;
+      case "unknown":
+        return update.status === UpdateStatus.UpdateStatusUnknownBaseImage;
+      case "errors":
+        return (
+          update.status === UpdateStatus.UpdateStatusAuthRequired ||
+          update.status === UpdateStatus.UpdateStatusRateLimited ||
+          update.status === UpdateStatus.UpdateStatusError
+        );
+      case "up-to-date":
+        return update.status === UpdateStatus.UpdateStatusUpToDate;
+      default:
+        return true;
+    }
+  });
+}
+
+function groupUpdatesByProject(
+  updates: ImageUpdate[],
+  projects: ProjectSummary[],
+) {
+  const map = new Map<
+    string,
+    { projectID: string; projectName: string; rows: ImageUpdate[] }
+  >();
+  for (const update of updates) {
+    const projectID = update.projectID ?? "";
+    const key = projectID || "unscoped";
+    const current =
+      map.get(key) ??
+      {
+        projectID,
+        projectName: projectNameForID(projects, projectID),
+        rows: [],
+      };
+    current.rows.push(update);
+    map.set(key, current);
+  }
+  return Array.from(map.values()).map((group) => ({
+    ...group,
+    rows: sortUpdateRows(group.rows),
+  }));
+}
+
+function sortUpdateRows(rows: ImageUpdate[]) {
+  const rank = (update: ImageUpdate) => {
+    switch (update.status) {
+      case UpdateStatus.UpdateStatusRebuildRequired:
+        return 0;
+      case UpdateStatus.UpdateStatusBaseImageUpdateAvailable:
+        return 1;
+      case UpdateStatus.UpdateStatusServiceImageUpdateAvailable:
+        return 2;
+      case UpdateStatus.UpdateStatusAuthRequired:
+      case UpdateStatus.UpdateStatusRateLimited:
+      case UpdateStatus.UpdateStatusError:
+        return 3;
+      case UpdateStatus.UpdateStatusPinnedDigest:
+      case UpdateStatus.UpdateStatusUnknownBaseImage:
+        return 4;
+      default:
+        return 5;
+    }
+  };
+  return [...rows].sort(
+    (left, right) =>
+      rank(left) - rank(right) ||
+      (left.service ?? "").localeCompare(right.service ?? ""),
+  );
+}
+
+function projectNameForID(projects: ProjectSummary[], projectID?: string) {
+  if (!projectID) {
+    return "Unscoped";
+  }
+  return projects.find((project) => project.id === projectID)?.name ?? projectID;
+}
+
+function updateStatusLabel(status?: string) {
+  switch (status) {
+    case UpdateStatus.UpdateStatusServiceImageUpdateAvailable:
+      return "Image update available";
+    case UpdateStatus.UpdateStatusBaseImageUpdateAvailable:
+      return "Base image update available";
+    case UpdateStatus.UpdateStatusRebuildRequired:
+      return "Rebuild required";
+    case UpdateStatus.UpdateStatusPinnedDigest:
+      return "Pinned digest";
+    case UpdateStatus.UpdateStatusBuiltLocally:
+      return "Built locally";
+    case UpdateStatus.UpdateStatusUnknownBaseImage:
+      return "Unknown base image";
+    case UpdateStatus.UpdateStatusLocalOnlyImage:
+      return "Local only image";
+    case UpdateStatus.UpdateStatusAuthRequired:
+      return "Auth required";
+    case UpdateStatus.UpdateStatusRateLimited:
+      return "Rate limited";
+    case UpdateStatus.UpdateStatusUpToDate:
+      return "Up to date";
+    case UpdateStatus.UpdateStatusIgnored:
+      return "Ignored";
+    case UpdateStatus.UpdateStatusError:
+      return "Error";
+    default:
+      return "Unknown";
+  }
+}
+
+function updateStatusNote(update: ImageUpdate) {
+  if (
+    update.status === UpdateStatus.UpdateStatusServiceImageUpdateAvailable &&
+    /:latest($|@)/.test(update.currentImage)
+  ) {
+    return "Mutable tag warning";
+  }
+  if (update.status === UpdateStatus.UpdateStatusAuthRequired) {
+    return "Registry login required";
+  }
+  if (update.status === UpdateStatus.UpdateStatusRateLimited) {
+    return "Rate limited; retry after the registry cooldown";
+  }
+  if (update.status === UpdateStatus.UpdateStatusUnknownBaseImage) {
+    return "Base image: Unknown — this is a third-party registry image and no base metadata was found.";
+  }
+  return update.notes?.[0] ?? "";
+}
+
+function updateActionLabel(action?: string) {
+  switch (action) {
+    case "pull_recreate":
+      return "Pull & recreate";
+    case "rebuild_redeploy":
+      return "Rebuild & redeploy";
+    case "manual":
+      return "Manual attention";
+    default:
+      return "No action";
+  }
+}
+
+function updateKindLabel(kind?: string) {
+  return kind === UpdateKind.UpdateKindBaseImage ? "Base image" : "Service image";
+}
+
+function updateResultTone(result?: string): BadgeTone {
+  switch (result) {
+    case "success":
+      return "ok";
+    case "success_warn":
+      return "warn";
+    case "rolled_back":
+      return "info";
+    case "failed":
+    case "manual_needed":
+      return "error";
+    default:
+      return "neutral";
+  }
+}
+
+function updateDuration(item: UpdateHistoryItem) {
+  const started = dateMillis(item.startedAt);
+  const finished = dateMillis(item.finishedAt);
+  if (!started || !finished || finished < started) {
+    return "-";
+  }
+  const seconds = Math.round((finished - started) / 1000);
+  return seconds < 60 ? `${seconds}s` : `${Math.round(seconds / 60)}m`;
+}
+
+function confidenceTone(confidence?: string): BadgeTone {
+  switch (confidence) {
+    case "high":
+      return "ok";
+    case "medium":
+      return "info";
+    case "low":
+      return "warn";
+    default:
+      return "neutral";
+  }
+}
+
+function confidenceReason(confidence?: string) {
+  switch (confidence) {
+    case "high":
+      return "from Compose build config and Dockerfile";
+    case "medium":
+      return "from Compose build config and Dockerfile; build-time digest unknown";
+    case "low":
+      return "from image metadata labels";
+    default:
+      return "no reliable base information";
+  }
+}
+
+function lineageBaseText(lineage: ImageLineage) {
+  if (!lineage.baseImage) {
+    return "Unknown — this is a third-party registry image and no base metadata was found.";
+  }
+  return `${lineage.baseImage} - Confidence: ${titleCase(lineage.confidence)} - Reason: ${
+    lineage.reason || confidenceReason(lineage.confidence)
+  }`;
+}
+
+function shortDigest(value?: string) {
+  if (!value) {
+    return "-";
+  }
+  const clean = value.replace(/^sha256:/, "");
+  return clean.length > 12 ? `sha256:${clean.slice(0, 12)}` : value;
+}
+
+function titleCase(value: string) {
+  return value
+    .split(/[_\s-]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
 }
 
 function riskTone(risk?: string): BadgeTone {
