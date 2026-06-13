@@ -100,10 +100,20 @@ type InspectState = {
 };
 
 type ContainerAction = 'start' | 'stop' | 'restart' | 'kill';
+type ProjectAction =
+  | 'start'
+  | 'stop'
+  | 'restart'
+  | 'pull'
+  | 'redeploy'
+  | 'down'
+  | 'down-volumes';
+type ConfirmPlanKind = 'container' | 'project';
 
 type ConfirmState = {
   open: boolean;
   plan: CommandPlan | null;
+  planKind: ConfirmPlanKind;
   targetName: string;
   typedName: string;
   busy: boolean;
@@ -217,6 +227,7 @@ const emptyInspect: InspectState = {
 const emptyConfirm: ConfirmState = {
   open: false,
   plan: null,
+  planKind: 'container',
   targetName: '',
   typedName: '',
   busy: false,
@@ -573,12 +584,13 @@ function App() {
           if (!plan) {
             throw new Error('Kill plan was empty');
           }
-          setConfirm({
-            open: true,
-            plan,
-            targetName: container.name,
-            typedName: '',
-            busy: false,
+        setConfirm({
+          open: true,
+          plan,
+          planKind: 'container',
+          targetName: container.name,
+          typedName: '',
+          busy: false,
           });
           return;
         }
@@ -636,13 +648,24 @@ function App() {
     }
     setConfirm((current) => ({ ...current, busy: true, error: undefined }));
     try {
-      await DockerService.ApplyContainerPlan(
-        confirm.plan.planID,
-        confirm.typedName,
-      );
+      if (confirm.planKind === 'project') {
+        await ProjectService.ApplyProjectPlan(
+          confirm.plan.planID,
+          confirm.typedName,
+        );
+      } else {
+        await DockerService.ApplyContainerPlan(
+          confirm.plan.planID,
+          confirm.typedName,
+        );
+      }
       setConfirm(emptyConfirm);
       setSelectedContainerIDs(new Set<string>());
-      await refreshAfterAction();
+      if (confirm.planKind === 'project') {
+        await refreshProjects();
+      } else {
+        await refreshAfterAction();
+      }
     } catch (error: unknown) {
       setConfirm((current) => ({
         ...current,
@@ -650,7 +673,60 @@ function App() {
         error: error instanceof Error ? error.message : 'Unable to apply plan',
       }));
     }
-  }, [confirm.plan, confirm.typedName, refreshAfterAction]);
+  }, [
+    confirm.plan,
+    confirm.planKind,
+    confirm.typedName,
+    refreshAfterAction,
+    refreshProjects,
+  ]);
+
+  const runProjectAction = useCallback(
+    async (action: ProjectAction, project: ProjectSummary) => {
+      const key = projectActionBusyKey(action, project.id);
+      setActionError(null);
+      setActionBusy(key, true);
+      try {
+        if (action === 'start') {
+          await ProjectService.StartProject(project.id);
+        } else if (action === 'stop') {
+          await ProjectService.StopProject(project.id);
+        } else if (action === 'restart') {
+          await ProjectService.RestartProject(project.id);
+        } else if (action === 'pull') {
+          await ProjectService.PullProject(project.id);
+        } else {
+          const plan =
+            action === 'redeploy'
+              ? await ProjectService.PlanRedeployProject(project.id)
+              : await ProjectService.PlanDownProject(
+                  project.id,
+                  action === 'down-volumes',
+                );
+          if (!plan) {
+            throw new Error('Project plan was empty');
+          }
+          setConfirm({
+            open: true,
+            plan,
+            planKind: 'project',
+            targetName: project.name,
+            typedName: '',
+            busy: false,
+          });
+          return;
+        }
+        await refreshProjects();
+      } catch (error: unknown) {
+        setActionError(
+          error instanceof Error ? error.message : 'Project action failed',
+        );
+      } finally {
+        setActionBusy(key, false);
+      }
+    },
+    [refreshProjects, setActionBusy],
+  );
 
   const openRunImageModal = useCallback((image?: ImageSummary) => {
     const ref = image ? primaryImageRef(image) : '';
@@ -1065,8 +1141,10 @@ function App() {
         return (
           <ProjectsPage
             error={projectsError}
+            actionBusyIDs={busyActionIDs}
             filter={projectFilter}
             loading={projectsStatus === 'loading'}
+            onAction={runProjectAction}
             onFilterChange={setProjectFilter}
             onImport={() =>
               setImportProject({ ...emptyImportProject, open: true })
@@ -1611,12 +1689,14 @@ function OverviewPage({
 
 type ProjectsPageProps = {
   projects: ProjectSummary[];
+  actionBusyIDs: Set<string>;
   filter: FilterID;
   search: string;
   sort: ProjectSortID;
   view: ProjectViewMode;
   loading: boolean;
   error: string | null;
+  onAction: (action: ProjectAction, project: ProjectSummary) => void;
   onFilterChange: (filter: FilterID) => void;
   onSortChange: (sort: ProjectSortID) => void;
   onViewChange: (view: ProjectViewMode) => void;
@@ -1625,9 +1705,11 @@ type ProjectsPageProps = {
 };
 
 function ProjectsPage({
+  actionBusyIDs,
   error,
   filter,
   loading,
+  onAction,
   onFilterChange,
   onImport,
   onRefresh,
@@ -1755,11 +1837,20 @@ function ProjectsPage({
           aria-label="Compose projects"
         >
           {filtered.map((project) => (
-            <ProjectCard key={project.id} project={project} />
+            <ProjectCard
+              actionBusyIDs={actionBusyIDs}
+              key={project.id}
+              onAction={onAction}
+              project={project}
+            />
           ))}
         </section>
       ) : (
-        <ProjectList projects={filtered} />
+        <ProjectList
+          actionBusyIDs={actionBusyIDs}
+          onAction={onAction}
+          projects={filtered}
+        />
       )}
 
       <div className="flex justify-end">
@@ -1775,9 +1866,25 @@ function ProjectsPage({
   );
 }
 
-function ProjectCard({ project }: { project: ProjectSummary }) {
+function ProjectCard({
+  actionBusyIDs,
+  onAction,
+  project,
+}: {
+  project: ProjectSummary;
+  actionBusyIDs: Set<string>;
+  onAction: (action: ProjectAction, project: ProjectSummary) => void;
+}) {
   const updates = projectUpdateCount(project);
   const workdirMissing = project.status === 'error';
+  const primaryAction: ProjectAction =
+    project.status === 'running' ? 'stop' : 'start';
+  const lifecycleDisabled = workdirMissing || !project.workingDir;
+  const disabledReason = workdirMissing
+    ? 'Re-link folder before running project actions'
+    : 'No workdir';
+  const busy = (action: ProjectAction) =>
+    actionBusyIDs.has(projectActionBusyKey(action, project.id));
   return (
     <Card>
       <CardBody className="space-y-4">
@@ -1846,8 +1953,8 @@ function ProjectCard({ project }: { project: ProjectSummary }) {
           <Tooltip label={project.status === 'running' ? 'Stop' : 'Start'}>
             <Button
               aria-label={`${project.status === 'running' ? 'Stop' : 'Start'} ${project.name}`}
-              disabled
-              disabledReason="Unavailable"
+              disabled={lifecycleDisabled}
+              disabledReason={disabledReason}
               icon={
                 project.status === 'running' ? (
                   <Square size={15} />
@@ -1855,6 +1962,8 @@ function ProjectCard({ project }: { project: ProjectSummary }) {
                   <Play size={15} />
                 )
               }
+              loading={busy(primaryAction)}
+              onClick={() => onAction(primaryAction, project)}
               size="icon"
               variant="ghost"
             />
@@ -1862,11 +1971,61 @@ function ProjectCard({ project }: { project: ProjectSummary }) {
           <Tooltip label="Restart">
             <Button
               aria-label={`Restart ${project.name}`}
-              disabled
-              disabledReason="Unavailable"
+              disabled={lifecycleDisabled}
+              disabledReason={disabledReason}
               icon={<RotateCw size={15} />}
+              loading={busy('restart')}
+              onClick={() => onAction('restart', project)}
               size="icon"
               variant="ghost"
+            />
+          </Tooltip>
+          <Tooltip label="Pull images">
+            <Button
+              aria-label={`Pull images ${project.name}`}
+              disabled={lifecycleDisabled}
+              disabledReason={disabledReason}
+              icon={<Download size={15} />}
+              loading={busy('pull')}
+              onClick={() => onAction('pull', project)}
+              size="icon"
+              variant="ghost"
+            />
+          </Tooltip>
+          <Tooltip label="Redeploy">
+            <Button
+              aria-label={`Redeploy ${project.name}`}
+              disabled={lifecycleDisabled}
+              disabledReason={disabledReason}
+              icon={<PackagePlus size={15} />}
+              loading={busy('redeploy')}
+              onClick={() => onAction('redeploy', project)}
+              size="icon"
+              variant="ghost"
+            />
+          </Tooltip>
+          <Tooltip label="Down">
+            <Button
+              aria-label={`Down ${project.name}`}
+              disabled={lifecycleDisabled}
+              disabledReason={disabledReason}
+              icon={<Square size={15} />}
+              loading={busy('down')}
+              onClick={() => onAction('down', project)}
+              size="icon"
+              variant="danger"
+            />
+          </Tooltip>
+          <Tooltip label="Down with volumes">
+            <Button
+              aria-label={`Down with volumes ${project.name}`}
+              disabled={lifecycleDisabled}
+              disabledReason={disabledReason}
+              icon={<Skull size={15} />}
+              loading={busy('down-volumes')}
+              onClick={() => onAction('down-volumes', project)}
+              size="icon"
+              variant="danger"
             />
           </Tooltip>
           <Tooltip label="Open folder">
@@ -1887,7 +2046,15 @@ function ProjectCard({ project }: { project: ProjectSummary }) {
   );
 }
 
-function ProjectList({ projects }: { projects: ProjectSummary[] }) {
+function ProjectList({
+  actionBusyIDs,
+  onAction,
+  projects,
+}: {
+  projects: ProjectSummary[];
+  actionBusyIDs: Set<string>;
+  onAction: (action: ProjectAction, project: ProjectSummary) => void;
+}) {
   return (
     <DataTable
       columns={[
@@ -1963,6 +2130,17 @@ function ProjectList({ projects }: { projects: ProjectSummary[] }) {
           sortValue: (project) => project.workingDir || '',
           sortable: true,
         },
+        {
+          id: 'actions',
+          header: '',
+          render: (project) => (
+            <ProjectRowActions
+              actionBusyIDs={actionBusyIDs}
+              onAction={onAction}
+              project={project}
+            />
+          ),
+        },
       ]}
       empty={
         <EmptyState
@@ -1974,6 +2152,92 @@ function ProjectList({ projects }: { projects: ProjectSummary[] }) {
       getRowID={(project) => project.id}
       rows={projects}
     />
+  );
+}
+
+function ProjectRowActions({
+  actionBusyIDs,
+  onAction,
+  project,
+}: {
+  project: ProjectSummary;
+  actionBusyIDs: Set<string>;
+  onAction: (action: ProjectAction, project: ProjectSummary) => void;
+}) {
+  const workdirMissing = project.status === 'error';
+  const lifecycleDisabled = workdirMissing || !project.workingDir;
+  const disabledReason = workdirMissing
+    ? 'Re-link folder before running project actions'
+    : 'No workdir';
+  const primaryAction: ProjectAction =
+    project.status === 'running' ? 'stop' : 'start';
+  const busy = (action: ProjectAction) =>
+    actionBusyIDs.has(projectActionBusyKey(action, project.id));
+  return (
+    <div className="flex justify-end gap-1">
+      <Tooltip label={primaryAction === 'stop' ? 'Stop' : 'Start'}>
+        <Button
+          aria-label={`${primaryAction === 'stop' ? 'Stop' : 'Start'} ${project.name}`}
+          disabled={lifecycleDisabled}
+          disabledReason={disabledReason}
+          icon={
+            primaryAction === 'stop' ? <Square size={15} /> : <Play size={15} />
+          }
+          loading={busy(primaryAction)}
+          onClick={() => onAction(primaryAction, project)}
+          size="icon"
+          variant="ghost"
+        />
+      </Tooltip>
+      <Tooltip label="Restart">
+        <Button
+          aria-label={`Restart ${project.name}`}
+          disabled={lifecycleDisabled}
+          disabledReason={disabledReason}
+          icon={<RotateCw size={15} />}
+          loading={busy('restart')}
+          onClick={() => onAction('restart', project)}
+          size="icon"
+          variant="ghost"
+        />
+      </Tooltip>
+      <Tooltip label="Pull images">
+        <Button
+          aria-label={`Pull images ${project.name}`}
+          disabled={lifecycleDisabled}
+          disabledReason={disabledReason}
+          icon={<Download size={15} />}
+          loading={busy('pull')}
+          onClick={() => onAction('pull', project)}
+          size="icon"
+          variant="ghost"
+        />
+      </Tooltip>
+      <Tooltip label="Redeploy">
+        <Button
+          aria-label={`Redeploy ${project.name}`}
+          disabled={lifecycleDisabled}
+          disabledReason={disabledReason}
+          icon={<PackagePlus size={15} />}
+          loading={busy('redeploy')}
+          onClick={() => onAction('redeploy', project)}
+          size="icon"
+          variant="ghost"
+        />
+      </Tooltip>
+      <Tooltip label="Down with volumes">
+        <Button
+          aria-label={`Down with volumes ${project.name}`}
+          disabled={lifecycleDisabled}
+          disabledReason={disabledReason}
+          icon={<Skull size={15} />}
+          loading={busy('down-volumes')}
+          onClick={() => onAction('down-volumes', project)}
+          size="icon"
+          variant="danger"
+        />
+      </Tooltip>
+    </div>
   );
 }
 
@@ -4394,6 +4658,10 @@ function projectUpdateCount(project: ProjectSummary) {
     badges.pinned +
     badges.unknownBase
   );
+}
+
+function projectActionBusyKey(action: ProjectAction, projectID: string) {
+  return `project:${action}:${projectID}`;
 }
 
 function isRecentlyChanged(value: unknown) {

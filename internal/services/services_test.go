@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
+	"github.com/RCooLeR/Cairn/internal/bus"
 	composecore "github.com/RCooLeR/Cairn/internal/compose"
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
@@ -221,6 +222,123 @@ func TestProjectServiceImportProjectInvalidFolder(t *testing.T) {
 	}
 }
 
+func TestProjectServiceStartProjectAuditsAndPublishesProgress(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	root, composeFile := writeServiceComposeProject(t, "app-db")
+	runner := newFakeComposeRunner()
+	runner.outputs[root+"|-f "+composeFile+" config"] = providers.CommandResult{
+		Stdout: "services:\n  app:\n    image: nginx:alpine\n",
+	}
+	runner.outputs[root+"|-f "+composeFile+" start"] = providers.CommandResult{Stdout: "Container app Started\n"}
+	eventBus := bus.New()
+	defer eventBus.Close()
+	progress := eventBus.Subscribe(ctx, bus.TopicJobProgress, 8)
+	done := eventBus.Subscribe(ctx, bus.TopicJobDone, 8)
+	service := &ProjectService{
+		Client:     composecore.NewClient(runner),
+		Projects:   db.Projects(),
+		Audit:      db.Audit(),
+		Events:     eventBus,
+		ProviderID: "linux_native",
+		Now:        func() time.Time { return time.Date(2026, 6, 13, 6, 0, 0, 0, time.UTC) },
+	}
+	detail, err := service.ImportProject(ctx, models.ImportProjectRequest{FolderPath: root})
+	if err != nil {
+		t.Fatalf("ImportProject() error = %v", err)
+	}
+
+	if err := service.StartProject(ctx, detail.Summary.ID); err != nil {
+		t.Fatalf("StartProject() error = %v", err)
+	}
+	if !runner.hasCall(root + "|-f " + composeFile + " start") {
+		t.Fatalf("compose calls = %#v, want start", runner.calls)
+	}
+	entries, err := db.Audit().List(ctx, models.AuditFilter{Topic: "project", Limit: 10})
+	if err != nil {
+		t.Fatalf("Audit List() error = %v", err)
+	}
+	if len(entries) < 2 || entries[0].Action != "project.start" || entries[0].Result != "success" {
+		t.Fatalf("audit entries = %#v", entries)
+	}
+	if got := receiveEventPayload(t, progress, time.Second); got == nil {
+		t.Fatal("expected job progress event")
+	}
+	if got := receiveEventPayload(t, done, time.Second); got == nil {
+		t.Fatal("expected job done event")
+	}
+}
+
+func TestProjectServicePlanDownWithVolumesRequiresTypedName(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	root, composeFile := writeServiceComposeProject(t, "app-db")
+	runner := newFakeComposeRunner()
+	runner.outputs[root+"|-f "+composeFile+" config"] = providers.CommandResult{
+		Stdout: "services:\n  app:\n    image: nginx:alpine\n",
+	}
+	runner.outputs[root+"|-f "+composeFile+" down --volumes"] = providers.CommandResult{Stdout: "removed\n"}
+	service := &ProjectService{
+		Client:     composecore.NewClient(runner),
+		Projects:   db.Projects(),
+		Audit:      db.Audit(),
+		ProviderID: "linux_native",
+		Now:        func() time.Time { return time.Date(2026, 6, 13, 6, 0, 0, 0, time.UTC) },
+	}
+	detail, err := service.ImportProject(ctx, models.ImportProjectRequest{FolderPath: root})
+	if err != nil {
+		t.Fatalf("ImportProject() error = %v", err)
+	}
+
+	plan, err := service.PlanDownProject(ctx, detail.Summary.ID, true)
+	if err != nil {
+		t.Fatalf("PlanDownProject() error = %v", err)
+	}
+	if plan.Risk != models.RiskDangerous || plan.RequiresTypedName != "app-db" {
+		t.Fatalf("plan = %#v", plan)
+	}
+	if len(plan.Commands) != 1 || !strings.Contains(plan.Commands[0].Command, "down --volumes") || plan.Commands[0].WorkingDir != root {
+		t.Fatalf("commands = %#v", plan.Commands)
+	}
+
+	if err := service.ApplyProjectPlan(ctx, plan.PlanID, "wrong"); !apperror.IsCode(err, apperror.ConfirmationRequired) {
+		t.Fatalf("ApplyProjectPlan(wrong) error = %v, want confirmation", err)
+	}
+	if err := service.ApplyProjectPlan(ctx, plan.PlanID, "app-db"); err != nil {
+		t.Fatalf("ApplyProjectPlan() error = %v", err)
+	}
+	if !runner.hasCall(root + "|-f " + composeFile + " down --volumes") {
+		t.Fatalf("compose calls = %#v, want down --volumes", runner.calls)
+	}
+}
+
+func TestProjectServiceLifecycleWorkdirMissing(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	root, composeFile := writeServiceComposeProject(t, "app-db")
+	runner := newFakeComposeRunner()
+	runner.outputs[root+"|-f "+composeFile+" config"] = providers.CommandResult{
+		Stdout: "services:\n  app:\n    image: nginx:alpine\n",
+	}
+	service := &ProjectService{
+		Client:     composecore.NewClient(runner),
+		Projects:   db.Projects(),
+		ProviderID: "linux_native",
+	}
+	detail, err := service.ImportProject(ctx, models.ImportProjectRequest{FolderPath: root})
+	if err != nil {
+		t.Fatalf("ImportProject() error = %v", err)
+	}
+	if err := os.RemoveAll(root); err != nil {
+		t.Fatalf("RemoveAll() error = %v", err)
+	}
+
+	err = service.StartProject(ctx, detail.Summary.ID)
+	if !apperror.IsCode(err, apperror.WorkdirMissing) {
+		t.Fatalf("StartProject() error = %v, want %s", err, apperror.WorkdirMissing)
+	}
+}
+
 type fakeDockerClient struct {
 	container  models.ContainerSummary
 	started    []string
@@ -373,6 +491,7 @@ func (f *fakeDockerClient) CreateNetwork(_ context.Context, req models.CreateNet
 
 type fakeComposeRunner struct {
 	outputs map[string]providers.CommandResult
+	calls   []string
 }
 
 func newFakeComposeRunner() *fakeComposeRunner {
@@ -384,10 +503,21 @@ func (r *fakeComposeRunner) RunCompose(ctx context.Context, workdir string, args
 }
 
 func (r *fakeComposeRunner) RunComposeEnv(_ context.Context, workdir string, _ []string, args ...string) (*providers.CommandResult, error) {
-	result := r.outputs[workdir+"|"+strings.Join(args, " ")]
+	key := workdir + "|" + strings.Join(args, " ")
+	r.calls = append(r.calls, key)
+	result := r.outputs[key]
 	result.Workdir = workdir
 	result.Command = append([]string{"docker", "compose"}, args...)
 	return &result, nil
+}
+
+func (r *fakeComposeRunner) hasCall(want string) bool {
+	for _, call := range r.calls {
+		if call == want {
+			return true
+		}
+	}
+	return false
 }
 
 func openServiceTestStore(t *testing.T) *store.Store {
@@ -413,4 +543,27 @@ func openServiceTestStore(t *testing.T) *store.Store {
 		t.Fatalf("seed provider: %v", err)
 	}
 	return db
+}
+
+func writeServiceComposeProject(t *testing.T, name string) (string, string) {
+	t.Helper()
+	root := filepath.Join(t.TempDir(), name)
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	composeFile := filepath.Join(root, "compose.yaml")
+	if err := os.WriteFile(composeFile, []byte("services:\n  app:\n    image: nginx:alpine\n"), 0o600); err != nil {
+		t.Fatalf("write compose file: %v", err)
+	}
+	return root, composeFile
+}
+
+func receiveEventPayload(t *testing.T, events <-chan bus.Event, timeout time.Duration) any {
+	t.Helper()
+	select {
+	case event := <-events:
+		return event.Payload
+	case <-time.After(timeout):
+		return nil
+	}
 }

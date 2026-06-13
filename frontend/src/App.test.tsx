@@ -63,6 +63,13 @@ const projectServiceMock = vi.hoisted(() => ({
   ListProjects: vi.fn(),
   GetProject: vi.fn(),
   ImportProject: vi.fn(),
+  StartProject: vi.fn(),
+  StopProject: vi.fn(),
+  RestartProject: vi.fn(),
+  PullProject: vi.fn(),
+  PlanRedeployProject: vi.fn(),
+  PlanDownProject: vi.fn(),
+  ApplyProjectPlan: vi.fn(),
 }));
 
 vi.mock('./api/app', () => ({
@@ -154,6 +161,13 @@ describe('App inventory shell', () => {
     projectServiceMock.ListProjects.mockResolvedValue([]);
     projectServiceMock.GetProject.mockResolvedValue(null);
     projectServiceMock.ImportProject.mockResolvedValue(seededProjectDetail());
+    projectServiceMock.StartProject.mockResolvedValue(undefined);
+    projectServiceMock.StopProject.mockResolvedValue(undefined);
+    projectServiceMock.RestartProject.mockResolvedValue(undefined);
+    projectServiceMock.PullProject.mockResolvedValue(undefined);
+    projectServiceMock.PlanRedeployProject.mockResolvedValue(projectRedeployPlan());
+    projectServiceMock.PlanDownProject.mockResolvedValue(projectDownVolumesPlan());
+    projectServiceMock.ApplyProjectPlan.mockResolvedValue(undefined);
     runtimeMock.openFile.mockResolvedValue('');
 
     useAppStore.setState({
@@ -258,6 +272,74 @@ describe('App inventory shell', () => {
     fireEvent.click(screen.getByRole('button', { name: /Stopped/ }));
 
     expect(screen.getByText('No projects found')).toBeInTheDocument();
+  });
+
+  it('runs safe project lifecycle actions from project cards', async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
+
+    render(<App />);
+
+    await screen.findByText('Docker Engine - Running');
+    fireEvent.click(
+      within(
+        screen.getByRole('navigation', { name: 'Main navigation' }),
+      ).getByRole('button', {
+        name: /Projects/,
+      }),
+    );
+    await screen.findByText('app-db');
+    fireEvent.click(screen.getByRole('button', { name: 'Stop app-db' }));
+
+    await waitFor(() =>
+      expect(projectServiceMock.StopProject).toHaveBeenCalledWith(
+        'linux_native/app-db',
+      ),
+    );
+    await waitFor(() =>
+      expect(projectServiceMock.RefreshProjects).toHaveBeenCalledTimes(2),
+    );
+  });
+
+  it('confirms dangerous project plans through the project apply endpoint', async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
+
+    render(<App />);
+
+    await screen.findByText('Docker Engine - Running');
+    fireEvent.click(
+      within(
+        screen.getByRole('navigation', { name: 'Main navigation' }),
+      ).getByRole('button', {
+        name: /Projects/,
+      }),
+    );
+    await screen.findByText('app-db');
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Down with volumes app-db' }),
+    );
+
+    await waitFor(() =>
+      expect(projectServiceMock.PlanDownProject).toHaveBeenCalledWith(
+        'linux_native/app-db',
+        true,
+      ),
+    );
+    expect(
+      await screen.findByRole('dialog', { name: 'Down app-db with volumes' }),
+    ).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText('Type app-db to confirm'), {
+      target: { value: 'app-db' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
+
+    await waitFor(() =>
+      expect(projectServiceMock.ApplyProjectPlan).toHaveBeenCalledWith(
+        'plan-down-volumes',
+        'app-db',
+      ),
+    );
   });
 
   it('imports a Compose project through the folder picker', async () => {
@@ -753,6 +835,53 @@ function killPlan(): CommandPlan {
       },
     ],
     effects: ['web: Immediately sends SIGKILL to the selected container.'],
+    expiresAt: '2026-06-13T08:10:00Z',
+  };
+}
+
+function projectRedeployPlan(): CommandPlan {
+  return {
+    planID: 'plan-redeploy',
+    title: 'Redeploy app-db',
+    risk: Risk.RiskDestructive,
+    commands: [
+      {
+        order: 1,
+        command: 'docker compose -f compose.yaml up -d --force-recreate',
+        workingDir:
+          'E:\\Development\\projects\\apps\\rcooler\\Cairn\\testdata\\projects\\app-db',
+        risk: Risk.RiskDestructive,
+        explanation:
+          'Runs docker compose up -d --force-recreate for the project.',
+      },
+    ],
+    effects: [
+      'app-db: Runs docker compose up -d --force-recreate for the project.',
+    ],
+    expiresAt: '2026-06-13T08:10:00Z',
+  };
+}
+
+function projectDownVolumesPlan(): CommandPlan {
+  return {
+    planID: 'plan-down-volumes',
+    title: 'Down app-db with volumes',
+    risk: Risk.RiskDangerous,
+    commands: [
+      {
+        order: 1,
+        command: 'docker compose -f compose.yaml down --volumes',
+        workingDir:
+          'E:\\Development\\projects\\apps\\rcooler\\Cairn\\testdata\\projects\\app-db',
+        risk: Risk.RiskDangerous,
+        explanation:
+          'Runs docker compose down --volumes and removes named volumes declared by the project.',
+      },
+    ],
+    effects: [
+      'app-db: Runs docker compose down --volumes and removes named volumes declared by the project.',
+    ],
+    requiresTypedName: 'app-db',
     expiresAt: '2026-06-13T08:10:00Z',
   };
 }

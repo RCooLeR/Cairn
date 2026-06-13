@@ -89,6 +89,7 @@ RefreshProjects() ([]ProjectSummary, error)
 StartProject / StopProject / RestartProject / PullProject(projectID) error      // safe; preview shown anyway
 PlanRedeployProject(projectID string) (*CommandPlan, error)                     // up -d --force-recreate
 PlanDownProject(projectID string, removeVolumes bool) (*CommandPlan, error)     // dangerous if removeVolumes
+ApplyProjectPlan(planID string, typedName string) error
 
 // ComposeService
 Config(projectID string) (*ComposeConfigResult, error)   // {rawFiles[], resolvedYAML, envFiles[], valid, errors[]}

@@ -88,6 +88,47 @@ func (c *Client) Config(ctx context.Context, opts ProjectOptions) (*ConfigResult
 	return config, nil
 }
 
+func (c *Client) Start(ctx context.Context, opts ProjectOptions) (*providers.CommandResult, error) {
+	return c.runProjectCommand(ctx, opts, "start")
+}
+
+func (c *Client) Stop(ctx context.Context, opts ProjectOptions) (*providers.CommandResult, error) {
+	return c.runProjectCommand(ctx, opts, "stop")
+}
+
+func (c *Client) Restart(ctx context.Context, opts ProjectOptions) (*providers.CommandResult, error) {
+	return c.runProjectCommand(ctx, opts, "restart")
+}
+
+func (c *Client) Pull(ctx context.Context, opts ProjectOptions) (*providers.CommandResult, error) {
+	return c.runProjectCommand(ctx, opts, "pull")
+}
+
+func (c *Client) Up(ctx context.Context, opts ProjectOptions, forceRecreate bool) (*providers.CommandResult, error) {
+	args := []string{"up", "-d"}
+	if forceRecreate {
+		args = append(args, "--force-recreate")
+	}
+	return c.runProjectCommand(ctx, opts, args...)
+}
+
+func (c *Client) Down(ctx context.Context, opts ProjectOptions, removeVolumes bool) (*providers.CommandResult, error) {
+	args := []string{"down"}
+	if removeVolumes {
+		args = append(args, "--volumes")
+	}
+	return c.runProjectCommand(ctx, opts, args...)
+}
+
+func (c *Client) runProjectCommand(ctx context.Context, opts ProjectOptions, args ...string) (*providers.CommandResult, error) {
+	fullArgs := append(projectArgs(opts), args...)
+	result, err := c.run(ctx, opts.Workdir, projectEnv(opts), fullArgs...)
+	if commandFailed(result, err) {
+		return result, composeCommandError(apperror.ComposeInvalid, "Compose project action failed", result, err)
+	}
+	return result, nil
+}
+
 func (c *Client) run(ctx context.Context, workdir string, env []string, args ...string) (*providers.CommandResult, error) {
 	if c == nil || c.runner == nil {
 		return nil, apperror.New(apperror.ProviderNotReady, "Compose runner is not ready")

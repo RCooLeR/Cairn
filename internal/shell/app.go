@@ -46,6 +46,7 @@ func Run(assets fs.FS) error {
 	auditRepo := db.Audit()
 	projectRepo := db.Projects()
 	containerPlans := security.NewPlanStore(nil)
+	projectPlans := security.NewProjectPlanStore(nil)
 	var dockerClient *dockercore.Client
 	var composeClient *composecore.Client
 	var projectDetector *composecore.ProjectDetector
@@ -78,6 +79,9 @@ func Run(assets fs.FS) error {
 				Detector:    projectDetector,
 				Projects:    projectRepo,
 				Client:      composeClient,
+				Audit:       auditRepo,
+				Plans:       projectPlans,
+				Events:      eventBus,
 				ProviderID:  firstProviderID(providerSet),
 				ContextName: "",
 			}),
@@ -135,6 +139,7 @@ func Run(assets fs.FS) error {
 		bus.TopicDockerConnected,
 		bus.TopicDockerDisconnected,
 		bus.TopicObjectsChanged,
+		bus.TopicProjectChanged,
 		bus.TopicImagePullProgress,
 		bus.TopicJobProgress,
 		bus.TopicJobDone,

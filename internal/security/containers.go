@@ -126,7 +126,7 @@ func NewContainerActionPlan(action string, containers []models.ContainerSummary,
 		requiresTypedName = containers[0].Name
 	}
 	plan := models.CommandPlan{
-		PlanID:            newPlanID(),
+		PlanID:            NewPlanID(),
 		Title:             containerPlanTitle(action, containers),
 		Risk:              risk,
 		Commands:          []models.PlannedCommand{{Order: 1, Command: command, Risk: risk, Explanation: containerActionExplanation(action, opts)}},
@@ -256,7 +256,7 @@ func titleWord(value string) string {
 	return strings.ToUpper(value[:1]) + value[1:]
 }
 
-func newPlanID() string {
+func NewPlanID() string {
 	var buf [16]byte
 	if _, err := rand.Read(buf[:]); err != nil {
 		return fmt.Sprintf("plan-%d", time.Now().UnixNano())

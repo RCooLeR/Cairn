@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
+	"github.com/RCooLeR/Cairn/internal/bus"
 	composecore "github.com/RCooLeR/Cairn/internal/compose"
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
@@ -25,6 +26,19 @@ var (
 	Commit    = ""
 	BuildDate = ""
 )
+
+type jobProgressPayload struct {
+	JobID   string   `json:"jobID"`
+	Phase   string   `json:"phase"`
+	Message string   `json:"message"`
+	Pct     *float64 `json:"pct,omitempty"`
+}
+
+type jobDonePayload struct {
+	JobID  string `json:"jobID"`
+	Result string `json:"result,omitempty"`
+	Error  string `json:"error,omitempty"`
+}
 
 type ProviderService struct {
 	Manager *providers.Manager
@@ -73,6 +87,9 @@ type ProjectService struct {
 	Detector    ProjectDetector
 	Projects    *store.ProjectRepository
 	Client      *composecore.Client
+	Audit       *store.AuditRepository
+	Plans       *security.ProjectPlanStore
+	Events      bus.Bus
 	ProviderID  string
 	ContextName string
 	Now         func() time.Time
@@ -739,28 +756,36 @@ func (s *ProjectService) RefreshProjects(ctx context.Context) ([]models.ProjectS
 	return s.Detector.Reconcile(ctx)
 }
 
-func (s *ProjectService) StartProject(_ context.Context, projectID string) error {
-	return notReady()
+func (s *ProjectService) StartProject(ctx context.Context, projectID string) error {
+	return s.runProjectAction(ctx, security.ProjectActionStart, projectID, false, nil)
 }
 
-func (s *ProjectService) StopProject(_ context.Context, projectID string) error {
-	return notReady()
+func (s *ProjectService) StopProject(ctx context.Context, projectID string) error {
+	return s.runProjectAction(ctx, security.ProjectActionStop, projectID, false, nil)
 }
 
-func (s *ProjectService) RestartProject(_ context.Context, projectID string) error {
-	return notReady()
+func (s *ProjectService) RestartProject(ctx context.Context, projectID string) error {
+	return s.runProjectAction(ctx, security.ProjectActionRestart, projectID, false, nil)
 }
 
-func (s *ProjectService) PullProject(_ context.Context, projectID string) error {
-	return notReady()
+func (s *ProjectService) PullProject(ctx context.Context, projectID string) error {
+	return s.runProjectAction(ctx, security.ProjectActionPull, projectID, false, nil)
 }
 
-func (s *ProjectService) PlanRedeployProject(_ context.Context, projectID string) (*models.CommandPlan, error) {
-	return nil, notReady()
+func (s *ProjectService) PlanRedeployProject(ctx context.Context, projectID string) (*models.CommandPlan, error) {
+	return s.planProjectAction(ctx, security.ProjectActionRedeploy, projectID, false)
 }
 
-func (s *ProjectService) PlanDownProject(_ context.Context, projectID string, removeVolumes bool) (*models.CommandPlan, error) {
-	return nil, notReady()
+func (s *ProjectService) PlanDownProject(ctx context.Context, projectID string, removeVolumes bool) (*models.CommandPlan, error) {
+	return s.planProjectAction(ctx, security.ProjectActionDown, projectID, removeVolumes)
+}
+
+func (s *ProjectService) ApplyProjectPlan(ctx context.Context, planID string, typedName string) error {
+	plan, err := s.projectPlanStore().Take(ctx, planID, typedName)
+	if err != nil {
+		return err
+	}
+	return s.runProjectAction(ctx, plan.Action, plan.ProjectID, plan.RemoveVolumes, &plan.Plan)
 }
 
 func (s *ComposeService) Config(ctx context.Context, projectID string) (*models.ComposeConfigResult, error) {
@@ -1217,6 +1242,293 @@ func composeOptionsFromProject(project store.ProjectRecord) composecore.ProjectO
 		Files:       append([]string(nil), project.ComposeFiles...),
 		ProjectName: composecore.ProjectNameFromID(project.ProviderID, project.ID),
 	}
+}
+
+func (s *ProjectService) planProjectAction(ctx context.Context, action string, projectID string, removeVolumes bool) (*models.CommandPlan, error) {
+	project, err := s.projectForAction(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	plan := newProjectCommandPlan(project, action, removeVolumes, s.now())
+	s.projectPlanStore().Save(security.ProjectPlan{
+		Plan:          plan,
+		Action:        action,
+		ProjectID:     project.ID,
+		RemoveVolumes: removeVolumes,
+	})
+	return &plan, nil
+}
+
+func (s *ProjectService) runProjectAction(ctx context.Context, action string, projectID string, removeVolumes bool, planned *models.CommandPlan) error {
+	project, err := s.projectForAction(ctx, projectID)
+	if err != nil {
+		return err
+	}
+	plan := planned
+	if plan == nil {
+		nextPlan := newProjectCommandPlan(project, action, removeVolumes, s.now())
+		plan = &nextPlan
+	}
+	command := ""
+	if len(plan.Commands) > 0 {
+		command = plan.Commands[0].Command
+	}
+	jobID := strings.Replace(security.NewPlanID(), "plan-", "job-", 1)
+	started := time.Now().UTC()
+	if err := s.recordProjectAudit(ctx, project, action, command, plan.Risk, "started", 0, nil); err != nil {
+		return err
+	}
+	s.publishJobProgress(jobID, "running", command, nil)
+
+	result, err := s.executeProjectAction(ctx, action, project, removeVolumes)
+	duration := time.Since(started)
+	s.publishComposeOutput(jobID, result)
+	if err != nil {
+		_ = s.recordProjectAudit(ctx, project, action, command, plan.Risk, "failed", duration, err)
+		s.publishJobDone(jobID, "", err)
+		return err
+	}
+	if err := s.recordProjectAudit(ctx, project, action, command, plan.Risk, "success", duration, nil); err != nil {
+		return err
+	}
+	s.publishJobDone(jobID, "success", nil)
+	if s.Detector != nil {
+		_, _ = s.Detector.Reconcile(ctx)
+	}
+	if s.Events != nil {
+		s.Events.Publish(bus.Event{Topic: bus.TopicProjectChanged, Payload: map[string]any{"projectID": project.ID, "action": action}})
+		s.Events.Publish(bus.Event{Topic: bus.TopicObjectsChanged, Payload: map[string]any{"kind": "project", "ids": []string{project.ID}}})
+	}
+	return nil
+}
+
+func (s *ProjectService) projectForAction(ctx context.Context, projectID string) (store.ProjectRecord, error) {
+	if s.Client == nil || s.Projects == nil {
+		return store.ProjectRecord{}, notReady()
+	}
+	project, err := s.Projects.Get(ctx, projectID)
+	if err != nil {
+		return store.ProjectRecord{}, mapStoreNotFound(err, "Project was not found")
+	}
+	workdir := strings.TrimSpace(project.WorkingDir)
+	if workdir == "" {
+		return store.ProjectRecord{}, apperror.New(apperror.WorkdirMissing, "Project working directory is missing")
+	}
+	info, err := os.Stat(workdir)
+	if err != nil || !info.IsDir() {
+		return store.ProjectRecord{}, apperror.New(apperror.WorkdirMissing, "Project working directory was not found", apperror.WithDetail(workdir), apperror.WithRepairHints("Re-link the project folder before running Compose actions."))
+	}
+	if len(project.ComposeFiles) == 0 {
+		project.ComposeFiles = discoverComposeFiles(workdir)
+		if len(project.ComposeFiles) == 0 {
+			return store.ProjectRecord{}, apperror.New(apperror.ComposeInvalid, "No Compose files were found for this project", apperror.WithDetail(workdir))
+		}
+	}
+	return project, nil
+}
+
+func (s *ProjectService) executeProjectAction(ctx context.Context, action string, project store.ProjectRecord, removeVolumes bool) (*providers.CommandResult, error) {
+	opts := composeOptionsFromProject(project)
+	switch action {
+	case security.ProjectActionStart:
+		return s.Client.Start(ctx, opts)
+	case security.ProjectActionStop:
+		return s.Client.Stop(ctx, opts)
+	case security.ProjectActionRestart:
+		return s.Client.Restart(ctx, opts)
+	case security.ProjectActionPull:
+		return s.Client.Pull(ctx, opts)
+	case security.ProjectActionRedeploy:
+		return s.Client.Up(ctx, opts, true)
+	case security.ProjectActionDown:
+		return s.Client.Down(ctx, opts, removeVolumes)
+	default:
+		return nil, apperror.New(apperror.Conflict, "Unsupported project action", apperror.WithDetail(action))
+	}
+}
+
+func newProjectCommandPlan(project store.ProjectRecord, action string, removeVolumes bool, now time.Time) models.CommandPlan {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	risk := projectActionRisk(action, removeVolumes)
+	title := projectActionTitle(action, project.Name, removeVolumes)
+	explanation := projectActionExplanation(action, removeVolumes)
+	requiresTypedName := ""
+	if risk == models.RiskDangerous {
+		requiresTypedName = project.Name
+	}
+	return models.CommandPlan{
+		PlanID: security.NewPlanID(),
+		Title:  title,
+		Risk:   risk,
+		Commands: []models.PlannedCommand{{
+			Order:       1,
+			Command:     projectCommandDisplay(project, action, removeVolumes),
+			WorkingDir:  project.WorkingDir,
+			Risk:        risk,
+			Explanation: explanation,
+		}},
+		Effects:           []string{project.Name + ": " + explanation},
+		RequiresTypedName: requiresTypedName,
+		ExpiresAt:         now.Add(security.DefaultPlanTTL),
+	}
+}
+
+func projectActionRisk(action string, removeVolumes bool) models.Risk {
+	switch action {
+	case security.ProjectActionRedeploy:
+		return models.RiskDestructive
+	case security.ProjectActionDown:
+		if removeVolumes {
+			return models.RiskDangerous
+		}
+		return models.RiskDestructive
+	default:
+		return models.RiskSafe
+	}
+}
+
+func projectActionTitle(action string, name string, removeVolumes bool) string {
+	switch action {
+	case security.ProjectActionPull:
+		return "Pull images for " + name
+	case security.ProjectActionRedeploy:
+		return "Redeploy " + name
+	case security.ProjectActionDown:
+		if removeVolumes {
+			return "Down " + name + " with volumes"
+		}
+		return "Down " + name
+	default:
+		return strings.ToUpper(action[:1]) + action[1:] + " " + name
+	}
+}
+
+func projectActionExplanation(action string, removeVolumes bool) string {
+	switch action {
+	case security.ProjectActionStart:
+		return "Starts the Compose project services from the stored working directory."
+	case security.ProjectActionStop:
+		return "Stops the Compose project services without removing containers or volumes."
+	case security.ProjectActionRestart:
+		return "Restarts the Compose project services in place."
+	case security.ProjectActionPull:
+		return "Pulls images declared by the Compose project."
+	case security.ProjectActionRedeploy:
+		return "Runs docker compose up -d --force-recreate for the project."
+	case security.ProjectActionDown:
+		if removeVolumes {
+			return "Runs docker compose down --volumes and removes named volumes declared by the project."
+		}
+		return "Runs docker compose down and removes project containers and networks."
+	default:
+		return "Runs a Compose project action."
+	}
+}
+
+func projectCommandDisplay(project store.ProjectRecord, action string, removeVolumes bool) string {
+	args := []string{"docker", "compose"}
+	for _, file := range project.ComposeFiles {
+		if strings.TrimSpace(file) != "" {
+			args = append(args, "-f", file)
+		}
+	}
+	switch action {
+	case security.ProjectActionRedeploy:
+		args = append(args, "up", "-d", "--force-recreate")
+	case security.ProjectActionDown:
+		args = append(args, "down")
+		if removeVolumes {
+			args = append(args, "--volumes")
+		}
+	case security.ProjectActionPull:
+		args = append(args, "pull")
+	default:
+		args = append(args, action)
+	}
+	return joinCommand(args)
+}
+
+func (s *ProjectService) recordProjectAudit(ctx context.Context, project store.ProjectRecord, action string, command string, risk models.Risk, status string, duration time.Duration, actionErr error) error {
+	if s.Audit == nil {
+		return nil
+	}
+	var exitCode *int
+	if status == "success" {
+		code := 0
+		exitCode = &code
+	}
+	message := ""
+	if actionErr != nil {
+		message = actionErr.Error()
+	}
+	_, err := s.Audit.Insert(ctx, store.AuditRecord{
+		Action:     "project." + action,
+		TargetType: "project",
+		TargetID:   project.ID,
+		ProviderID: project.ProviderID,
+		ProjectID:  project.ID,
+		Command:    command,
+		Risk:       risk,
+		Status:     status,
+		ExitCode:   exitCode,
+		Duration:   duration,
+		Error:      message,
+		CreatedAt:  s.now(),
+	})
+	if err != nil {
+		return apperror.Wrap(apperror.Internal, "Record project audit entry failed", err)
+	}
+	return nil
+}
+
+func (s *ProjectService) publishComposeOutput(jobID string, result *providers.CommandResult) {
+	if result == nil {
+		return
+	}
+	for _, line := range splitOutputLines(result.Stdout) {
+		s.publishJobProgress(jobID, "stdout", line, nil)
+	}
+	for _, line := range splitOutputLines(result.Stderr) {
+		s.publishJobProgress(jobID, "stderr", line, nil)
+	}
+}
+
+func (s *ProjectService) publishJobProgress(jobID string, phase string, message string, pct *float64) {
+	if s.Events == nil {
+		return
+	}
+	s.Events.Publish(bus.Event{Topic: bus.TopicJobProgress, Payload: jobProgressPayload{JobID: jobID, Phase: phase, Message: message, Pct: pct}})
+}
+
+func (s *ProjectService) publishJobDone(jobID string, result string, actionErr error) {
+	if s.Events == nil {
+		return
+	}
+	payload := jobDonePayload{JobID: jobID, Result: result}
+	if actionErr != nil {
+		payload.Error = actionErr.Error()
+	}
+	s.Events.Publish(bus.Event{Topic: bus.TopicJobDone, Payload: payload})
+}
+
+func (s *ProjectService) projectPlanStore() *security.ProjectPlanStore {
+	if s.Plans == nil {
+		s.Plans = security.NewProjectPlanStore(nil)
+	}
+	return s.Plans
+}
+
+func splitOutputLines(output string) []string {
+	lines := []string{}
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if strings.TrimSpace(line) != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
 }
 
 func readComposeRawFiles(project store.ProjectRecord) []models.ComposeRawFile {
