@@ -100,15 +100,6 @@ func accountsFromDockerConfig(config dockerConfig, verified time.Time) []models.
 		}
 		accountsByRegistry[host] = account(host, username, source, verified)
 	}
-	if strings.TrimSpace(config.CredsStore) != "" {
-		for registry, current := range accountsByRegistry {
-			if current.Source == "authsFile" {
-				current.Source = "credsStore"
-				accountsByRegistry[registry] = current
-			}
-		}
-	}
-
 	accounts := make([]models.RegistryAccount, 0, len(accountsByRegistry))
 	for _, item := range accountsByRegistry {
 		accounts = append(accounts, item)
