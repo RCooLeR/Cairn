@@ -1621,7 +1621,7 @@ func (s *ProjectService) publishJobDone(jobID string, result string, actionErr e
 
 func (s *ProjectService) projectPlanStore() *security.ProjectPlanStore {
 	if s.Plans == nil {
-		s.Plans = security.NewProjectPlanStore(nil)
+		s.Plans = security.NewProjectPlanStore(s.now)
 	}
 	return s.Plans
 }
