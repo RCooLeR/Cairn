@@ -19,6 +19,7 @@ type CommandRunOptions struct {
 	Timeout time.Duration
 	Workdir string
 	Env     []string
+	Stdin   string
 }
 
 type OptionsCommandRunner interface {
@@ -48,6 +49,9 @@ func (ExecRunner) RunWithOptions(ctx context.Context, opts CommandRunOptions, na
 	cmd.Dir = opts.Workdir
 	if len(opts.Env) > 0 {
 		cmd.Env = mergeEnv(os.Environ(), opts.Env)
+	}
+	if opts.Stdin != "" {
+		cmd.Stdin = strings.NewReader(opts.Stdin)
 	}
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer

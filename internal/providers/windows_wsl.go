@@ -349,6 +349,17 @@ func (p *WindowsWSLProvider) RunDocker(ctx context.Context, args ...string) (*Co
 	return p.runWSLWithTimeout(ctx, dockerOperationTimeout, p.configuredDistro(), append([]string{"docker"}, args...)...)
 }
 
+func (p *WindowsWSLProvider) RunDockerWithInput(ctx context.Context, input string, args ...string) (*CommandResult, error) {
+	return p.runWSLWithOptions(ctx, dockerOperationTimeout, input, p.configuredDistro(), append([]string{"docker"}, args...)...)
+}
+
+func (p *WindowsWSLProvider) RunBackendCommand(ctx context.Context, input string, args ...string) (*CommandResult, error) {
+	if len(args) == 0 {
+		return nil, apperror.New(apperror.Conflict, "Backend command is required")
+	}
+	return p.runWSLWithOptions(ctx, wslCommandTimeout, input, p.configuredDistro(), args...)
+}
+
 func (p *WindowsWSLProvider) RunCompose(ctx context.Context, workdir string, args ...string) (*CommandResult, error) {
 	composeArgs := append([]string{"compose"}, args...)
 	if strings.TrimSpace(workdir) == "" {
@@ -475,7 +486,17 @@ func (p *WindowsWSLProvider) runWSL(ctx context.Context, distro string, args ...
 }
 
 func (p *WindowsWSLProvider) runWSLWithTimeout(ctx context.Context, timeout time.Duration, distro string, args ...string) (*CommandResult, error) {
+	return p.runWSLWithOptions(ctx, timeout, "", distro, args...)
+}
+
+func (p *WindowsWSLProvider) runWSLWithOptions(ctx context.Context, timeout time.Duration, input string, distro string, args ...string) (*CommandResult, error) {
 	wslArgs := append([]string{"-d", distro, "--"}, args...)
+	if runner, ok := p.runner.(OptionsCommandRunner); ok {
+		return runner.RunWithOptions(ctx, CommandRunOptions{
+			Timeout: timeout,
+			Stdin:   input,
+		}, wslCommandName, wslArgs...)
+	}
 	return p.runner.Run(ctx, timeout, wslCommandName, wslArgs...)
 }
 

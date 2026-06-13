@@ -13,6 +13,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/logsvc"
 	"github.com/RCooLeR/Cairn/internal/metrics"
 	"github.com/RCooLeR/Cairn/internal/providers"
+	registrycore "github.com/RCooLeR/Cairn/internal/registry"
 	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/services"
 	"github.com/RCooLeR/Cairn/internal/store"
@@ -58,6 +59,7 @@ func Run(assets fs.FS) error {
 	var metricsManager *metrics.Manager
 	var terminalManager *terminal.Manager
 	var backupManager *backupcore.Manager
+	var registryManager *registrycore.Manager
 	if len(providerSet) > 0 {
 		dockerClient = dockercore.New(providerSet[0], eventBus)
 		dockerClient.SetObjectCache(db.Objects())
@@ -78,6 +80,7 @@ func Run(assets fs.FS) error {
 		metricsManager.Start(ctx)
 		terminalManager = terminal.NewManager(providerSet[0], dockerClient, projectRepo, eventBus, terminal.Options{})
 		backupManager = backupcore.NewManager(providerManager, dockerClient, db.Settings(), db.Backups(), auditRepo, eventBus, services.Version)
+		registryManager = registrycore.NewManager(providerManager, auditRepo)
 	}
 
 	app := application.New(application.Options{
@@ -106,7 +109,7 @@ func Run(assets fs.FS) error {
 			application.NewService(&services.UpdateService{}),
 			application.NewService(&services.ImageLineageService{}),
 			application.NewService(&services.BackupService{Manager: backupManager}),
-			application.NewService(&services.RegistryService{}),
+			application.NewService(&services.RegistryService{Manager: registryManager}),
 			application.NewService(&services.SettingsService{
 				Audit:         auditRepo,
 				Notifications: db.Notifications(),

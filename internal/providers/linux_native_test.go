@@ -136,6 +136,26 @@ func TestLinuxNativeRunComposeUsesWorkdirEnvAndArgv(t *testing.T) {
 	}
 }
 
+func TestLinuxNativeRunDockerWithInputUsesOptionsRunner(t *testing.T) {
+	t.Parallel()
+	runner := &composeOptionsRunner{}
+	provider := NewLinuxNative(LinuxNativeOptions{Runner: runner, Probe: &fakeLinuxProbe{}})
+
+	result, err := provider.RunDockerWithInput(context.Background(), "secret\n", "login", "docker.io", "-u", "ada", "--password-stdin")
+	if err != nil {
+		t.Fatalf("RunDockerWithInput() error = %v", err)
+	}
+	if got, want := result.Command, []string{"docker", "login", "docker.io", "-u", "ada", "--password-stdin"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("command = %#v, want %#v", got, want)
+	}
+	if runner.opts.Stdin != "secret\n" {
+		t.Fatalf("stdin = %q", runner.opts.Stdin)
+	}
+	if runner.opts.Timeout != dockerOperationTimeout {
+		t.Fatalf("timeout = %s, want %s", runner.opts.Timeout, dockerOperationTimeout)
+	}
+}
+
 type fakeRunner struct {
 	paths   map[string]string
 	outputs map[string]string

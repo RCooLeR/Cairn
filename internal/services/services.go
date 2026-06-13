@@ -20,6 +20,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/metrics"
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
+	registrycore "github.com/RCooLeR/Cairn/internal/registry"
 	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/store"
 	"github.com/RCooLeR/Cairn/internal/terminal"
@@ -131,7 +132,9 @@ type ImageLineageService struct{}
 type BackupService struct {
 	Manager *backups.Manager
 }
-type RegistryService struct{}
+type RegistryService struct {
+	Manager *registrycore.Manager
+}
 type SettingsService struct {
 	Audit         *store.AuditRepository
 	Notifications *store.NotificationRepository
@@ -1213,19 +1216,31 @@ func (s *BackupService) DeleteBackup(ctx context.Context, backupID string) error
 	return notReady()
 }
 
-func (s *RegistryService) ListRegistryAccounts(_ context.Context) ([]models.RegistryAccount, error) {
+func (s *RegistryService) ListRegistryAccounts(ctx context.Context) ([]models.RegistryAccount, error) {
+	if s.Manager != nil {
+		return s.Manager.ListRegistryAccounts(ctx)
+	}
 	return nil, notReady()
 }
 
-func (s *RegistryService) Login(_ context.Context, req models.RegistryLoginRequest) error {
+func (s *RegistryService) Login(ctx context.Context, req models.RegistryLoginRequest) error {
+	if s.Manager != nil {
+		return s.Manager.Login(ctx, req)
+	}
 	return notReady()
 }
 
-func (s *RegistryService) Logout(_ context.Context, registry string) error {
+func (s *RegistryService) Logout(ctx context.Context, registry string) error {
+	if s.Manager != nil {
+		return s.Manager.Logout(ctx, registry)
+	}
 	return notReady()
 }
 
-func (s *RegistryService) TestAuth(_ context.Context, registry string) (*models.RegistryAuthStatus, error) {
+func (s *RegistryService) TestAuth(ctx context.Context, registry string) (*models.RegistryAuthStatus, error) {
+	if s.Manager != nil {
+		return s.Manager.TestAuth(ctx, registry)
+	}
 	return nil, notReady()
 }
 

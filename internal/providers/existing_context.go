@@ -164,6 +164,30 @@ func (p *ExistingContextProvider) RunDocker(ctx context.Context, args ...string)
 	return p.runner.Run(ctx, dockerOperationTimeout, "docker", dockerArgs...)
 }
 
+func (p *ExistingContextProvider) RunDockerWithInput(ctx context.Context, input string, args ...string) (*CommandResult, error) {
+	dockerArgs := append([]string{"--context", p.configuredContext()}, args...)
+	if runner, ok := p.runner.(OptionsCommandRunner); ok {
+		return runner.RunWithOptions(ctx, CommandRunOptions{
+			Timeout: dockerOperationTimeout,
+			Stdin:   input,
+		}, "docker", dockerArgs...)
+	}
+	return p.RunDocker(ctx, args...)
+}
+
+func (p *ExistingContextProvider) RunBackendCommand(ctx context.Context, input string, args ...string) (*CommandResult, error) {
+	if len(args) == 0 {
+		return nil, apperror.New(apperror.Conflict, "Backend command is required")
+	}
+	if runner, ok := p.runner.(OptionsCommandRunner); ok {
+		return runner.RunWithOptions(ctx, CommandRunOptions{
+			Timeout: commandTimeout,
+			Stdin:   input,
+		}, args[0], args[1:]...)
+	}
+	return p.runner.Run(ctx, commandTimeout, args[0], args[1:]...)
+}
+
 func (p *ExistingContextProvider) RunCompose(ctx context.Context, workdir string, args ...string) (*CommandResult, error) {
 	return p.RunComposeEnv(ctx, workdir, nil, args...)
 }
