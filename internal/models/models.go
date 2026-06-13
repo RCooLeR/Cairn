@@ -562,12 +562,16 @@ type BackupFilter struct {
 }
 
 type BackupSummary struct {
-	ID         string    `json:"id"`
-	VolumeName string    `json:"volumeName"`
-	ProjectID  string    `json:"projectID,omitempty"`
-	Path       string    `json:"path"`
-	SizeBytes  int64     `json:"sizeBytes"`
-	CreatedAt  time.Time `json:"createdAt"`
+	ID           string    `json:"id"`
+	ProviderID   string    `json:"providerID,omitempty"`
+	VolumeName   string    `json:"volumeName"`
+	ProjectID    string    `json:"projectID,omitempty"`
+	Path         string    `json:"path"`
+	MetadataPath string    `json:"metadataPath,omitempty"`
+	SizeBytes    int64     `json:"sizeBytes"`
+	Result       string    `json:"result,omitempty"`
+	Error        string    `json:"error,omitempty"`
+	CreatedAt    time.Time `json:"createdAt"`
 }
 
 type CommandPlan struct {

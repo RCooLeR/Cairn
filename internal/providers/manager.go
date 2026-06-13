@@ -220,6 +220,27 @@ func (m *Manager) ActiveProviderID(ctx context.Context) string {
 	return ""
 }
 
+func (m *Manager) ActiveProvider(ctx context.Context) (PlatformProvider, error) {
+	providerID := m.ActiveProviderID(ctx)
+	if providerID == "" {
+		return nil, apperror.New(apperror.ProviderNotReady, "No active Docker provider")
+	}
+	if strings.HasPrefix(providerID, existingContextIDPrefix) {
+		contextName := strings.TrimPrefix(providerID, existingContextIDPrefix)
+		if err := m.ensureExistingContextProvider(ctx, contextName); err != nil {
+			return nil, err
+		}
+	}
+	m.mu.RLock()
+	provider, ok := m.providers[providerID]
+	m.mu.RUnlock()
+	if !ok {
+		return nil, apperror.New(apperror.NotFound, "Active provider was not found")
+	}
+	m.applyProviderSettings(ctx, provider)
+	return provider, nil
+}
+
 func (m *Manager) PlanInstall(ctx context.Context, providerID string, opts models.InstallOptions) (*models.CommandPlan, error) {
 	provider, ok := m.providers[providerID]
 	if !ok {

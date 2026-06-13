@@ -18,6 +18,7 @@ const (
 	linuxNativeDisplayName = "Linux Native"
 	defaultDockerSocket    = "/var/run/docker.sock"
 	commandTimeout         = 2 * time.Second
+	dockerOperationTimeout = 2 * time.Hour
 	composeCommandTimeout  = 30 * time.Second
 	socketTimeout          = time.Second
 )
@@ -242,7 +243,7 @@ func (p *LinuxNativeProvider) DockerContext(ctx context.Context) (string, error)
 }
 
 func (p *LinuxNativeProvider) RunDocker(ctx context.Context, args ...string) (*CommandResult, error) {
-	return p.runner.Run(ctx, commandTimeout, "docker", args...)
+	return p.runner.Run(ctx, dockerOperationTimeout, "docker", args...)
 }
 
 func (p *LinuxNativeProvider) RunCompose(ctx context.Context, workdir string, args ...string) (*CommandResult, error) {

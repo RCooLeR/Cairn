@@ -124,10 +124,14 @@ export class BackupFilter {
 
 export class BackupSummary {
     "id": string;
+    "providerID"?: string;
     "volumeName": string;
     "projectID"?: string;
     "path": string;
+    "metadataPath"?: string;
     "sizeBytes": number;
+    "result"?: string;
+    "error"?: string;
     "createdAt": time$0.Time;
 
     /** Creates a new BackupSummary instance. */

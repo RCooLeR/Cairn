@@ -1,6 +1,7 @@
 import type { LucideIcon } from "lucide-react";
 import type {
   AuditEntry,
+  BackupSummary,
   CommandPlan,
   ContainerSummary,
   DashboardMetrics,
@@ -101,6 +102,7 @@ import { Clipboard, Dialogs, Events } from "@wailsio/runtime";
 
 import { getAppVersion } from "./api/app";
 import {
+  BackupService,
   DockerService,
   LogsService,
   MetricsService,
@@ -148,7 +150,12 @@ type StatusToneID = "ok" | "warn" | "error" | "info" | "neutral";
 type LoadStatus = "idle" | "loading" | "ready" | "error";
 type ProjectViewMode = "grid" | "list";
 type ProjectSortID = "name" | "activity" | "cpu";
-type ProjectTabID = "overview" | "services" | "containers" | "compose";
+type ProjectTabID =
+  | "overview"
+  | "services"
+  | "containers"
+  | "compose"
+  | "backups";
 type LogScope = "all" | "project" | "service" | "container";
 type LogLevelFilter = "error" | "warn" | "info" | "debug" | "unknown";
 type PermissionMode = "ask" | "group" | "rootless";
@@ -183,7 +190,7 @@ type ProjectAction =
   | "redeploy"
   | "down"
   | "down-volumes";
-type ConfirmPlanKind = "container" | "project";
+type ConfirmPlanKind = "container" | "project" | "backup" | "restore";
 
 type ConfirmState = {
   open: boolean;
@@ -258,6 +265,27 @@ type CreateVolumeState = {
   driver: string;
   driverOptsText: string;
   labelsText: string;
+  busy: boolean;
+  error?: string;
+};
+
+type BackupVolumeState = {
+  open: boolean;
+  volume: VolumeSummary | null;
+  destPath: string;
+  busy: boolean;
+  error?: string;
+};
+
+type RestoreVolumeState = {
+  open: boolean;
+  volume: VolumeSummary | null;
+  backups: BackupSummary[];
+  backupID: string;
+  sourcePath: string;
+  targetName: string;
+  overwrite: boolean;
+  loading: boolean;
   busy: boolean;
   error?: string;
 };
@@ -467,6 +495,25 @@ const emptyCreateVolume: CreateVolumeState = {
   busy: false,
 };
 
+const emptyBackupVolume: BackupVolumeState = {
+  open: false,
+  volume: null,
+  destPath: "",
+  busy: false,
+};
+
+const emptyRestoreVolume: RestoreVolumeState = {
+  open: false,
+  volume: null,
+  backups: [],
+  backupID: "",
+  sourcePath: "",
+  targetName: "",
+  overwrite: false,
+  loading: false,
+  busy: false,
+};
+
 const emptyCreateNetwork: CreateNetworkState = {
   open: false,
   name: "",
@@ -578,6 +625,13 @@ function App() {
   const [loadImage, setLoadImage] = useState<LoadImageState>(emptyLoadImage);
   const [createVolume, setCreateVolume] =
     useState<CreateVolumeState>(emptyCreateVolume);
+  const [backupVolume, setBackupVolume] =
+    useState<BackupVolumeState>(emptyBackupVolume);
+  const [restoreVolume, setRestoreVolume] =
+    useState<RestoreVolumeState>(emptyRestoreVolume);
+  const [backups, setBackups] = useState<BackupSummary[]>([]);
+  const [backupsStatus, setBackupsStatus] = useState<LoadStatus>("idle");
+  const [backupsError, setBackupsError] = useState<string | null>(null);
   const [createNetwork, setCreateNetwork] =
     useState<CreateNetworkState>(emptyCreateNetwork);
   const [importProject, setImportProject] =
@@ -681,6 +735,21 @@ function App() {
         error instanceof Error ? error.message : "Unable to load project",
       );
       setProjectDetailStatus("error");
+    }
+  }, []);
+
+  const refreshBackups = useCallback(async () => {
+    setBackupsStatus("loading");
+    setBackupsError(null);
+    try {
+      const nextBackups = await BackupService.ListBackups({ limit: 500 });
+      setBackups(nextBackups ?? []);
+      setBackupsStatus("ready");
+    } catch (error: unknown) {
+      setBackupsError(
+        error instanceof Error ? error.message : "Unable to load backups",
+      );
+      setBackupsStatus("error");
     }
   }, []);
 
@@ -854,12 +923,17 @@ function App() {
   }, [refreshProjects]);
 
   useEffect(() => {
+    void refreshBackups();
+  }, [refreshBackups]);
+
+  useEffect(() => {
     let timer: number | undefined;
     const off = Events.On("objects:changed", () => {
       window.clearTimeout(timer);
       timer = window.setTimeout(() => {
         void refreshInventory();
         void refreshProjects();
+        void refreshBackups();
         if (activeProjectID) {
           void refreshProjectDetail(activeProjectID);
         }
@@ -871,6 +945,7 @@ function App() {
     };
   }, [
     activeProjectID,
+    refreshBackups,
     refreshInventory,
     refreshProjectDetail,
     refreshProjects,
@@ -1527,6 +1602,13 @@ function App() {
           confirm.plan.planID,
           confirm.typedName,
         );
+      } else if (confirm.planKind === "backup") {
+        await BackupService.ApplyBackup(confirm.plan.planID);
+      } else if (confirm.planKind === "restore") {
+        await BackupService.ApplyRestore(
+          confirm.plan.planID,
+          confirm.typedName,
+        );
       } else {
         await DockerService.ApplyContainerPlan(
           confirm.plan.planID,
@@ -1537,6 +1619,15 @@ function App() {
       setSelectedContainerIDs(new Set<string>());
       if (confirm.planKind === "project") {
         await refreshProjects();
+        if (activeProjectID) {
+          await refreshProjectDetail(activeProjectID);
+        }
+      } else if (
+        confirm.planKind === "backup" ||
+        confirm.planKind === "restore"
+      ) {
+        await refreshBackups();
+        await refreshInventory();
         if (activeProjectID) {
           await refreshProjectDetail(activeProjectID);
         }
@@ -1555,6 +1646,8 @@ function App() {
     confirm.planKind,
     confirm.typedName,
     activeProjectID,
+    refreshBackups,
+    refreshInventory,
     refreshAfterAction,
     refreshProjectDetail,
     refreshProjects,
@@ -1783,6 +1876,154 @@ function App() {
     ensureDockerReady,
     refreshAfterAction,
   ]);
+
+  const openBackupVolume = useCallback(
+    (volume: VolumeSummary) => {
+      setBackupVolume({
+        ...emptyBackupVolume,
+        open: true,
+        volume,
+        destPath: normalizeStringSetting(
+          appSettings["backups.directory"],
+          "",
+        ),
+      });
+    },
+    [appSettings],
+  );
+
+  const submitBackupVolume = useCallback(async () => {
+    if (!backupVolume.volume || !ensureDockerReady()) {
+      return;
+    }
+    setBackupVolume((current) => ({
+      ...current,
+      busy: true,
+      error: undefined,
+    }));
+    try {
+      const plan = await BackupService.PlanBackupVolume({
+        volumeName: backupVolume.volume.name,
+        destPath: backupVolume.destPath,
+        projectID: projectIDForVolume(backupVolume.volume, projects),
+      });
+      if (!plan) {
+        throw new Error("Backup plan was empty");
+      }
+      setBackupVolume(emptyBackupVolume);
+      setConfirm({
+        ...emptyConfirm,
+        open: true,
+        plan,
+        planKind: "backup",
+        targetName: backupVolume.volume.name,
+      });
+    } catch (error: unknown) {
+      setBackupVolume((current) => ({
+        ...current,
+        busy: false,
+        error:
+          error instanceof Error ? error.message : "Unable to plan backup",
+      }));
+    }
+  }, [
+    backupVolume.destPath,
+    backupVolume.volume,
+    ensureDockerReady,
+    projects,
+  ]);
+
+  const openRestoreVolume = useCallback(
+    async (volume: VolumeSummary, selectedBackup?: BackupSummary) => {
+      setRestoreVolume({
+        ...emptyRestoreVolume,
+        open: true,
+        volume,
+        backupID: selectedBackup?.id ?? "",
+        sourcePath: selectedBackup?.path ?? "",
+        targetName: volume.name,
+        overwrite: Boolean(selectedBackup),
+        loading: true,
+      });
+      try {
+        const volumeBackups = await BackupService.ListBackups({
+          volumeName: volume.name,
+          limit: 100,
+        });
+        setRestoreVolume((current) => ({
+          ...current,
+          backups: volumeBackups ?? [],
+          loading: false,
+          backupID: selectedBackup?.id ?? current.backupID,
+          sourcePath: selectedBackup?.path ?? current.sourcePath,
+        }));
+      } catch (error: unknown) {
+        setRestoreVolume((current) => ({
+          ...current,
+          loading: false,
+          error:
+            error instanceof Error
+              ? error.message
+              : "Unable to load backups",
+        }));
+      }
+    },
+    [],
+  );
+
+  const openRestoreBackup = useCallback(
+    (backup: BackupSummary) => {
+      const volume =
+        volumes.find((item) => item.name === backup.volumeName) ??
+        ({
+          name: backup.volumeName,
+          driver: "local",
+          labels: backup.projectID
+            ? { [composeProjectLabel]: backup.projectID }
+            : {},
+          inUse: false,
+        } as VolumeSummary);
+      void openRestoreVolume(volume, backup);
+    },
+    [openRestoreVolume, volumes],
+  );
+
+  const submitRestoreVolume = useCallback(async () => {
+    if (!restoreVolume.volume || !ensureDockerReady()) {
+      return;
+    }
+    setRestoreVolume((current) => ({
+      ...current,
+      busy: true,
+      error: undefined,
+    }));
+    try {
+      const plan = await BackupService.PlanRestoreVolume({
+        backupID: restoreVolume.backupID,
+        sourcePath: restoreVolume.sourcePath,
+        volumeName: restoreVolume.targetName,
+        overwrite: restoreVolume.overwrite,
+      });
+      if (!plan) {
+        throw new Error("Restore plan was empty");
+      }
+      setRestoreVolume(emptyRestoreVolume);
+      setConfirm({
+        ...emptyConfirm,
+        open: true,
+        plan,
+        planKind: "restore",
+        targetName: restoreVolume.targetName,
+      });
+    } catch (error: unknown) {
+      setRestoreVolume((current) => ({
+        ...current,
+        busy: false,
+        error:
+          error instanceof Error ? error.message : "Unable to plan restore",
+      }));
+    }
+  }, [ensureDockerReady, restoreVolume]);
 
   const submitCreateNetwork = useCallback(async () => {
     if (!ensureDockerReady()) {
@@ -2055,6 +2296,9 @@ function App() {
           return (
             <ProjectDetailPage
               actionBusyIDs={busyActionIDs}
+              backups={backups}
+              backupsError={backupsError}
+              backupsLoading={backupsStatus === "loading"}
               detail={projectDetail}
               error={projectDetailError}
               loading={projectDetailStatus === "loading"}
@@ -2062,10 +2306,19 @@ function App() {
               mutationDisabledReason={mutationDisabledReason}
               onAction={runProjectAction}
               onBack={closeProjectDetail}
+              onBackupVolume={openBackupVolume}
               onRefresh={() => {
                 void refreshProjectDetail(activeProjectID);
+                void refreshBackups();
               }}
+              onRestoreBackup={openRestoreBackup}
               onTabChange={setProjectTab}
+              projectVolumes={volumes.filter(
+                (volume) =>
+                  projectDetail &&
+                  projectIDForVolume(volume, projects) ===
+                    projectDetail.summary.id,
+              )}
               tab={projectTab}
             />
           );
@@ -2226,11 +2479,15 @@ function App() {
             loading={inventoryStatus === "loading"}
             mutationsDisabled={mutationsDisabled}
             mutationDisabledReason={mutationDisabledReason}
+            onBackup={openBackupVolume}
             onCreate={() =>
               setCreateVolume({ ...emptyCreateVolume, open: true })
             }
             onFilterChange={setVolumeFilter}
             onInspect={openVolumeInspect}
+            onRestore={(volume) => {
+              void openRestoreVolume(volume);
+            }}
             search={search}
             volumeDetails={volumeDetails}
             volumes={volumes}
@@ -2639,6 +2896,26 @@ function App() {
           void submitCreateVolume();
         }}
         state={createVolume}
+      />
+      <BackupVolumeModal
+        onChange={(patch) =>
+          setBackupVolume((current) => ({ ...current, ...patch }))
+        }
+        onClose={() => setBackupVolume(emptyBackupVolume)}
+        onSubmit={() => {
+          void submitBackupVolume();
+        }}
+        state={backupVolume}
+      />
+      <RestoreVolumeModal
+        onChange={(patch) =>
+          setRestoreVolume((current) => ({ ...current, ...patch }))
+        }
+        onClose={() => setRestoreVolume(emptyRestoreVolume)}
+        onSubmit={() => {
+          void submitRestoreVolume();
+        }}
+        state={restoreVolume}
       />
       <CreateNetworkModal
         onChange={(patch) =>
@@ -7066,10 +7343,14 @@ const projectTabs: Array<[ProjectTabID, string]> = [
   ["services", "Services"],
   ["containers", "Containers"],
   ["compose", "Compose"],
+  ["backups", "Backups"],
 ];
 
 function ProjectDetailPage({
   actionBusyIDs,
+  backups,
+  backupsError,
+  backupsLoading,
   detail,
   error,
   loading,
@@ -7077,20 +7358,29 @@ function ProjectDetailPage({
   mutationDisabledReason,
   onAction,
   onBack,
+  onBackupVolume,
   onRefresh,
+  onRestoreBackup,
   onTabChange,
+  projectVolumes,
   tab,
 }: {
   detail: ProjectDetail | null;
   actionBusyIDs: Set<string>;
+  backups: BackupSummary[];
+  backupsError: string | null;
+  backupsLoading: boolean;
   loading: boolean;
   error: string | null;
   mutationsDisabled: boolean;
   mutationDisabledReason: string;
+  projectVolumes: VolumeSummary[];
   tab: ProjectTabID;
   onAction: (action: ProjectAction, project: ProjectSummary) => void;
   onBack: () => void;
+  onBackupVolume: (volume: VolumeSummary) => void;
   onRefresh: () => void;
+  onRestoreBackup: (backup: BackupSummary) => void;
   onTabChange: (tab: ProjectTabID) => void;
 }) {
   if (loading && !detail) {
@@ -7229,6 +7519,20 @@ function ProjectDetailPage({
       {tab === "services" ? <ProjectServicesTab detail={detail} /> : null}
       {tab === "containers" ? <ProjectContainersTab detail={detail} /> : null}
       {tab === "compose" ? <ProjectComposeTab detail={detail} /> : null}
+      {tab === "backups" ? (
+        <ProjectBackupsTab
+          backups={backups.filter(
+            (backup) => backup.projectID === project.id,
+          )}
+          error={backupsError}
+          loading={backupsLoading}
+          mutationsDisabled={mutationsDisabled}
+          mutationDisabledReason={mutationDisabledReason}
+          onBackupVolume={onBackupVolume}
+          onRestoreBackup={onRestoreBackup}
+          volumes={projectVolumes}
+        />
+      ) : null}
     </div>
   );
 }
@@ -7496,6 +7800,156 @@ function ProjectComposeTab({ detail }: { detail: ProjectDetail }) {
           value={value || "# No Compose content available"}
         />
       </div>
+    </div>
+  );
+}
+
+function ProjectBackupsTab({
+  backups,
+  error,
+  loading,
+  mutationsDisabled,
+  mutationDisabledReason,
+  onBackupVolume,
+  onRestoreBackup,
+  volumes,
+}: {
+  backups: BackupSummary[];
+  error: string | null;
+  loading: boolean;
+  mutationsDisabled: boolean;
+  mutationDisabledReason: string;
+  volumes: VolumeSummary[];
+  onBackupVolume: (volume: VolumeSummary) => void;
+  onRestoreBackup: (backup: BackupSummary) => void;
+}) {
+  return (
+    <div className="space-y-4">
+      {error ? (
+        <div className="rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
+          {error}
+        </div>
+      ) : null}
+
+      <Card>
+        <CardHeader title="Project Volumes" />
+        <CardBody>
+          {volumes.length > 0 ? (
+            <div className="grid gap-2">
+              {volumes.map((volume) => (
+                <div
+                  className="flex flex-wrap items-center justify-between gap-3 rounded-control border border-border bg-bg-inset px-3 py-2 text-sm"
+                  key={volume.name}
+                >
+                  <div className="min-w-0">
+                    <div className="truncate font-medium text-text-primary">
+                      {volume.name}
+                    </div>
+                    <div className="text-xs text-text-muted">
+                      {volume.sizeBytes
+                        ? formatBytes(volume.sizeBytes)
+                        : "size unknown"}
+                    </div>
+                  </div>
+                  <Button
+                    disabled={mutationsDisabled}
+                    disabledReason={mutationDisabledReason}
+                    icon={<Download size={15} />}
+                    onClick={() => onBackupVolume(volume)}
+                    size="sm"
+                  >
+                    Backup
+                  </Button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <EmptyState
+              body="Named project volumes appear here after inventory refresh."
+              icon={<Database size={28} />}
+              title="No project volumes"
+            />
+          )}
+        </CardBody>
+      </Card>
+
+      <DataTable
+        columns={[
+          {
+            id: "volume",
+            header: "Volume",
+            render: (backup) => backup.volumeName,
+            sortable: true,
+            sortValue: (backup) => backup.volumeName,
+          },
+          {
+            id: "file",
+            header: "File",
+            render: (backup) => (
+              <span title={backup.path}>{shortPath(backup.path)}</span>
+            ),
+          },
+          {
+            id: "size",
+            header: "Size",
+            render: (backup) =>
+              backup.sizeBytes ? formatBytes(backup.sizeBytes) : "-",
+            sortable: true,
+            sortValue: (backup) => backup.sizeBytes,
+          },
+          {
+            id: "result",
+            header: "Result",
+            render: (backup) => (
+              <Badge tone={backup.result === "success" ? "ok" : "error"}>
+                {backup.result || "unknown"}
+              </Badge>
+            ),
+            sortable: true,
+            sortValue: (backup) => backup.result ?? "",
+          },
+          {
+            id: "created",
+            header: "Created",
+            render: (backup) => relativeTime(dateMillis(backup.createdAt)),
+            sortable: true,
+            sortValue: (backup) => dateMillis(backup.createdAt),
+          },
+          {
+            id: "actions",
+            header: "",
+            render: (backup) => (
+              <Button
+                disabled={mutationsDisabled || backup.result !== "success"}
+                disabledReason={
+                  backup.result !== "success"
+                    ? "Only successful backups can be restored"
+                    : mutationDisabledReason
+                }
+                icon={<Upload size={15} />}
+                onClick={() => onRestoreBackup(backup)}
+                size="sm"
+                variant="secondary"
+              >
+                Restore
+              </Button>
+            ),
+          },
+        ]}
+        empty={
+          <EmptyState
+            body={
+              loading
+                ? "Loading backups..."
+                : "Backups created for this project appear here."
+            }
+            icon={<Download size={28} />}
+            title={loading ? "Loading backups" : "No backups yet"}
+          />
+        }
+        getRowID={(backup) => backup.id}
+        rows={backups}
+      />
     </div>
   );
 }
@@ -7874,9 +8328,11 @@ type VolumesPageProps = {
   loading: boolean;
   mutationsDisabled: boolean;
   mutationDisabledReason: string;
+  onBackup: (volume: VolumeSummary) => void;
   onCreate: () => void;
   onFilterChange: (filter: FilterID) => void;
   onInspect: (volume: VolumeSummary) => void;
+  onRestore: (volume: VolumeSummary) => void;
 };
 
 function VolumesPage({
@@ -7884,9 +8340,11 @@ function VolumesPage({
   loading,
   mutationsDisabled,
   mutationDisabledReason,
+  onBackup,
   onCreate,
   onFilterChange,
   onInspect,
+  onRestore,
   search,
   volumeDetails,
   volumes,
@@ -7975,11 +8433,35 @@ function VolumesPage({
             id: "actions",
             header: "",
             render: (volume) => (
-              <RowActions
-                id={volume.name}
-                label={volume.name}
-                onInspect={() => onInspect(volume)}
-              />
+              <div className="flex justify-end gap-1">
+                <Tooltip label="Backup">
+                  <Button
+                    aria-label={`Backup ${volume.name}`}
+                    disabled={mutationsDisabled}
+                    disabledReason={mutationDisabledReason}
+                    icon={<Download size={15} />}
+                    onClick={() => onBackup(volume)}
+                    size="icon"
+                    variant="ghost"
+                  />
+                </Tooltip>
+                <Tooltip label="Restore">
+                  <Button
+                    aria-label={`Restore ${volume.name}`}
+                    disabled={mutationsDisabled}
+                    disabledReason={mutationDisabledReason}
+                    icon={<Upload size={15} />}
+                    onClick={() => onRestore(volume)}
+                    size="icon"
+                    variant="ghost"
+                  />
+                </Tooltip>
+                <RowActions
+                  id={volume.name}
+                  label={volume.name}
+                  onInspect={() => onInspect(volume)}
+                />
+              </div>
             ),
           },
         ]}
@@ -8455,6 +8937,20 @@ function logSourceKey(line: LogLine) {
 
 function projectName(projects: ProjectSummary[], id: string) {
   return projects.find((project) => project.id === id)?.name ?? id;
+}
+
+function projectIDForVolume(
+  volume: VolumeSummary,
+  projects: ProjectSummary[],
+) {
+  const composeName = volume.labels?.[composeProjectLabel] ?? "";
+  if (!composeName) {
+    return "";
+  }
+  return (
+    projects.find((project) => project.name === composeName)?.id ??
+    composeName
+  );
 }
 
 function sourceColor(source: string) {
@@ -9237,6 +9733,167 @@ function CreateVolumeModal({
           </div>
         </details>
         <CodePreview value={dockerVolumePreview(state)} />
+        <FormError error={state.error} />
+      </div>
+    </Modal>
+  );
+}
+
+function BackupVolumeModal({
+  onChange,
+  onClose,
+  onSubmit,
+  state,
+}: {
+  state: BackupVolumeState;
+  onChange: (patch: Partial<BackupVolumeState>) => void;
+  onClose: () => void;
+  onSubmit: () => void;
+}) {
+  const volumeName = state.volume?.name ?? "";
+  return (
+    <Modal
+      busy={state.busy}
+      footer={
+        <ModalActions
+          busy={state.busy}
+          disabled={!volumeName}
+          onCancel={onClose}
+          onSubmit={onSubmit}
+          submitLabel="Preview backup"
+        />
+      }
+      onClose={onClose}
+      open={state.open}
+      title="Back Up Volume"
+    >
+      <div className="space-y-4">
+        <div className="rounded-control border border-border bg-bg-inset p-3 text-sm">
+          <div className="text-xs uppercase text-text-muted">Volume</div>
+          <div className="mt-1 font-medium text-text-primary">{volumeName}</div>
+        </div>
+        <TextField
+          label="Destination directory"
+          onChange={(destPath) => onChange({ destPath })}
+          value={state.destPath}
+        />
+        <div className="rounded-control border border-warn/30 bg-warn/10 p-3 text-sm text-warn">
+          Stop projects that write to this volume before backing up databases.
+        </div>
+        <CodePreview
+          value={joinPreview([
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            `${volumeName}:/source:ro`,
+            "-v",
+            `${state.destPath || "<backup-dir>"}:/backup`,
+            "alpine:3",
+            "tar",
+            "czf",
+            `/backup/${volumeName || "volume"}-<timestamp>.tar.gz`,
+            "-C",
+            "/source",
+            ".",
+          ])}
+        />
+        <FormError error={state.error} />
+      </div>
+    </Modal>
+  );
+}
+
+function RestoreVolumeModal({
+  onChange,
+  onClose,
+  onSubmit,
+  state,
+}: {
+  state: RestoreVolumeState;
+  onChange: (patch: Partial<RestoreVolumeState>) => void;
+  onClose: () => void;
+  onSubmit: () => void;
+}) {
+  const selectedBackup = state.backups.find(
+    (backup) => backup.id === state.backupID,
+  );
+  const archivePath = selectedBackup?.path ?? state.sourcePath;
+  const disabled =
+    !state.targetName.trim() || (!state.backupID && !state.sourcePath.trim());
+  return (
+    <Modal
+      busy={state.busy}
+      footer={
+        <ModalActions
+          busy={state.busy}
+          disabled={disabled}
+          onCancel={onClose}
+          onSubmit={onSubmit}
+          submitLabel="Preview restore"
+        />
+      }
+      onClose={onClose}
+      open={state.open}
+      title="Restore Volume"
+    >
+      <div className="space-y-4">
+        <SelectField
+          label="Backup"
+          onChange={(backupID) => {
+            const backup = state.backups.find((item) => item.id === backupID);
+            onChange({
+              backupID,
+              sourcePath: backup?.path ?? state.sourcePath,
+            });
+          }}
+          options={[
+            ["", state.loading ? "Loading backups..." : "Manual archive path"],
+            ...state.backups.map(
+              (backup) =>
+                [
+                  backup.id,
+                  `${backup.volumeName} - ${formatDate(backup.createdAt)}`,
+                ] as [string, string],
+            ),
+          ]}
+          value={state.backupID}
+        />
+        {!state.backupID ? (
+          <TextField
+            label="Source archive"
+            onChange={(sourcePath) => onChange({ sourcePath })}
+            value={state.sourcePath}
+          />
+        ) : null}
+        <TextField
+          label="Target volume"
+          onChange={(targetName) => onChange({ targetName })}
+          value={state.targetName}
+        />
+        <label className="flex items-center gap-2 rounded-control border border-border bg-bg-inset px-3 py-2 text-sm">
+          <input
+            checked={state.overwrite}
+            onChange={(event) => onChange({ overwrite: event.target.checked })}
+            type="checkbox"
+          />
+          <span>Overwrite existing target volume</span>
+        </label>
+        <CodePreview
+          value={joinPreview([
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            `${state.targetName || "<target>"}:/restore`,
+            "-v",
+            `${archivePath ? shortPath(archivePath) : "<backup-dir>"}:/backup:ro`,
+            "alpine:3",
+            "sh",
+            "-c",
+            "rm -rf /restore/* ... ; tar xzf /backup/<file> -C /restore",
+          ])}
+        />
         <FormError error={state.error} />
       </div>
     </Modal>

@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { InventorySnapshot } from "./api/inventory";
 import type {
+  BackupSummary,
   ContainerSummary,
   CommandPlan,
   DashboardMetrics,
@@ -90,6 +91,15 @@ const projectServiceMock = vi.hoisted(() => ({
   ApplyProjectPlan: vi.fn(),
 }));
 
+const backupServiceMock = vi.hoisted(() => ({
+  PlanBackupVolume: vi.fn(),
+  ApplyBackup: vi.fn(),
+  PlanRestoreVolume: vi.fn(),
+  ApplyRestore: vi.fn(),
+  ListBackups: vi.fn(),
+  DeleteBackup: vi.fn(),
+}));
+
 const providerServiceMock = vi.hoisted(() => ({
   Detect: vi.fn(),
   ListDockerContexts: vi.fn(),
@@ -146,6 +156,7 @@ vi.mock("./api/inventory", () => ({
 }));
 
 vi.mock("./api/services", () => ({
+  BackupService: backupServiceMock,
   DockerService: dockerServiceMock,
   LogsService: logsServiceMock,
   MetricsService: metricsServiceMock,
@@ -259,6 +270,12 @@ describe("App inventory shell", () => {
       projectDownVolumesPlan(),
     );
     projectServiceMock.ApplyProjectPlan.mockResolvedValue(undefined);
+    backupServiceMock.ListBackups.mockResolvedValue([]);
+    backupServiceMock.PlanBackupVolume.mockResolvedValue(backupPlan());
+    backupServiceMock.ApplyBackup.mockResolvedValue("backup-job");
+    backupServiceMock.PlanRestoreVolume.mockResolvedValue(restorePlan());
+    backupServiceMock.ApplyRestore.mockResolvedValue("restore-job");
+    backupServiceMock.DeleteBackup.mockResolvedValue(undefined);
     providerServiceMock.Detect.mockResolvedValue(healthyProviderStatus());
     providerServiceMock.ListDockerContexts.mockResolvedValue([
       {
@@ -670,6 +687,7 @@ describe("App inventory shell", () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
     projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
     projectServiceMock.GetProject.mockResolvedValue(seededProjectDetail());
+    backupServiceMock.ListBackups.mockResolvedValue([seededBackup()]);
 
     render(<App />);
 
@@ -702,6 +720,11 @@ describe("App inventory shell", () => {
     fireEvent.click(screen.getByRole("button", { name: "Compose" }));
     expect(screen.getByText("valid")).toBeInTheDocument();
     expect(screen.getByTestId("monaco-viewer")).toHaveTextContent("services:");
+
+    fireEvent.click(screen.getByRole("button", { name: "Backups" }));
+    expect(screen.getByText("Project Volumes")).toBeInTheDocument();
+    expect(screen.getByText("cairn_data")).toBeInTheDocument();
+    expect(screen.getByText("success")).toBeInTheDocument();
   });
 
   it("streams logs, filters search matches, and keeps nonmatching rows hidden", async () => {
@@ -1154,6 +1177,91 @@ describe("App inventory shell", () => {
     await waitFor(() =>
       expect(dockerServiceMock.CreateNetwork).toHaveBeenCalledWith(
         expect.objectContaining({ name: "demo_net", driver: "bridge" }),
+      ),
+    );
+  });
+
+  it("plans volume backup and restore actions behind confirmation", async () => {
+    const backup = seededBackup();
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    backupServiceMock.ListBackups.mockResolvedValue([backup]);
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", {
+        name: /Volumes/,
+      }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Backup cairn_data" }));
+    const backupDialog = await screen.findByRole("dialog", {
+      name: "Back Up Volume",
+    });
+    expect(within(backupDialog).getByText("cairn_data")).toBeInTheDocument();
+    fireEvent.click(
+      within(backupDialog).getByRole("button", { name: "Preview backup" }),
+    );
+
+    await waitFor(() =>
+      expect(backupServiceMock.PlanBackupVolume).toHaveBeenCalledWith(
+        expect.objectContaining({
+          volumeName: "cairn_data",
+          projectID: "cairn",
+        }),
+      ),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Confirm" }),
+    );
+    await waitFor(() =>
+      expect(backupServiceMock.ApplyBackup).toHaveBeenCalledWith(
+        "plan-backup-volume",
+      ),
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Restore cairn_data" }),
+    );
+    const restoreDialog = await screen.findByRole("dialog", {
+      name: "Restore Volume",
+    });
+    await waitFor(() =>
+      expect(within(restoreDialog).getByLabelText("Backup")).toHaveValue(
+        "",
+      ),
+    );
+    fireEvent.change(within(restoreDialog).getByLabelText("Backup"), {
+      target: { value: backup.id },
+    });
+    fireEvent.change(within(restoreDialog).getByLabelText("Target volume"), {
+      target: { value: "cairn_data" },
+    });
+    fireEvent.click(
+      within(restoreDialog).getByRole("button", { name: "Preview restore" }),
+    );
+
+    await waitFor(() =>
+      expect(backupServiceMock.PlanRestoreVolume).toHaveBeenCalledWith(
+        expect.objectContaining({
+          backupID: backup.id,
+          sourcePath: backup.path,
+          volumeName: "cairn_data",
+        }),
+      ),
+    );
+    fireEvent.change(
+      await screen.findByLabelText("Type cairn_data to confirm"),
+      { target: { value: "cairn_data" } },
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Confirm" }));
+    await waitFor(() =>
+      expect(backupServiceMock.ApplyRestore).toHaveBeenCalledWith(
+        "plan-restore-volume",
+        "cairn_data",
       ),
     );
   });
@@ -2055,6 +2163,65 @@ function seededNotifications(): Notification[] {
       createdAt: "2026-06-13T08:55:00Z",
     },
   ];
+}
+
+function seededBackup(): BackupSummary {
+  return {
+    id: "backup-1",
+    providerID: "linux_native",
+    volumeName: "cairn_data",
+    projectID: "linux_native/app-db",
+    path: "/tmp/cairn-backups/cairn_data-20260613T080000Z.tar.gz",
+    metadataPath: "/tmp/cairn-backups/cairn_data-20260613T080000Z.json",
+    sizeBytes: 4096,
+    result: "success",
+    createdAt: "2026-06-13T08:00:00Z",
+  } as BackupSummary;
+}
+
+function backupPlan(): CommandPlan {
+  return {
+    planID: "plan-backup-volume",
+    title: "Back up cairn_data",
+    risk: Risk.RiskNeedsConfirmation,
+    commands: [
+      {
+        order: 1,
+        command:
+          "docker run --rm -v cairn_data:/source:ro -v /tmp/cairn-backups:/backup alpine:3 tar czf /backup/cairn_data-20260613T080000Z.tar.gz -C /source .",
+        risk: Risk.RiskNeedsConfirmation,
+        explanation:
+          "Runs a helper container to archive the selected named volume.",
+      },
+    ],
+    effects: [
+      "cairn_data: Creates a compressed tar.gz backup and JSON sidecar.",
+    ],
+    expiresAt: "2026-06-13T08:10:00Z",
+  };
+}
+
+function restorePlan(): CommandPlan {
+  return {
+    planID: "plan-restore-volume",
+    title: "Restore cairn_data",
+    risk: Risk.RiskDangerous,
+    commands: [
+      {
+        order: 1,
+        command:
+          "docker run --rm -v cairn_data:/restore -v /tmp/cairn-backups:/backup:ro alpine:3 sh -c \"rm -rf /restore/* /restore/..?* /restore/.[!.]* ; tar xzf /backup/cairn_data-20260613T080000Z.tar.gz -C /restore\"",
+        risk: Risk.RiskDangerous,
+        explanation:
+          "Clears the target volume and restores files from the selected archive.",
+      },
+    ],
+    effects: [
+      "cairn_data: Replaces volume contents with the selected backup.",
+    ],
+    requiresTypedName: "cairn_data",
+    expiresAt: "2026-06-13T08:10:00Z",
+  };
 }
 
 function killPlan(): CommandPlan {

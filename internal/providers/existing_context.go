@@ -161,7 +161,7 @@ func (p *ExistingContextProvider) DockerContext(context.Context) (string, error)
 
 func (p *ExistingContextProvider) RunDocker(ctx context.Context, args ...string) (*CommandResult, error) {
 	dockerArgs := append([]string{"--context", p.configuredContext()}, args...)
-	return p.runner.Run(ctx, commandTimeout, "docker", dockerArgs...)
+	return p.runner.Run(ctx, dockerOperationTimeout, "docker", dockerArgs...)
 }
 
 func (p *ExistingContextProvider) RunCompose(ctx context.Context, workdir string, args ...string) (*CommandResult, error) {

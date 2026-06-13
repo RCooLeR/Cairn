@@ -123,6 +123,19 @@ Current evidence: frontend tests cover the macOS Colima onboarding branch throug
 - [ ] macOS runner/VM E2E: switch Colima -> Docker Desktop/OrbStack context and back without app restart or changing `docker context show`.
 - [ ] macOS runner/VM E2E: host terminal opens zsh and backend terminal opens `colima ssh` for the selected profile.
 
+## Phase 7 Volume Backup/Restore
+
+Current evidence: backend unit tests cover backup planning warnings, sidecar/checksum validation, filename collisions, backup repository insertion, restore overwrite typed-name confirmation, and provider helper execution. Local Windows-hosted WSL validation passed against the dedicated `cairn-dev` Docker Engine with `CAIRN_REAL_WSL_DOCKER_BACKUPS=1 go test -tags=wslintegration ./internal/backups -run TestManagerRealWSLDockerBackupRestoreRoundTrip -count=1 -timeout=3m -v`, covering backup of a real named volume, restore into a new volume, overwrite restore with typed-name confirmation, and data verification after each restore.
+
+- [x] Validate real backup/restore round-trip against local `cairn-dev` through the Windows WSL provider.
+- [x] Verify restore overwrite requires typing the target volume name.
+- [x] Verify backup archives and JSON sidecars are written outside Cairn's SQLite database.
+- [x] Add Linux CI real-daemon integration with `CAIRN_REAL_DOCKER_BACKUPS=1`.
+- [ ] Linux CI: confirm the new backup integration step is green after push.
+- [ ] Clean Win11 VM: run the tagged WSL backup integration after fresh WSL/provider setup.
+- [ ] macOS Colima VM: run the real backup/restore round-trip against Colima.
+- [ ] Existing Docker context matrix: run backup/restore against Docker Desktop/remote contexts without mutating global `docker context show`.
+
 ## Full Platform Matrix TODO
 
 - [ ] Windows 11 x64: WSL present/absent, Ubuntu present/absent/multiple, Docker in Ubuntu present/absent, systemd on/off.

@@ -6,6 +6,7 @@ import (
 	"runtime"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
+	backupcore "github.com/RCooLeR/Cairn/internal/backups"
 	"github.com/RCooLeR/Cairn/internal/bus"
 	composecore "github.com/RCooLeR/Cairn/internal/compose"
 	dockercore "github.com/RCooLeR/Cairn/internal/docker"
@@ -56,6 +57,7 @@ func Run(assets fs.FS) error {
 	var logsManager *logsvc.Manager
 	var metricsManager *metrics.Manager
 	var terminalManager *terminal.Manager
+	var backupManager *backupcore.Manager
 	if len(providerSet) > 0 {
 		dockerClient = dockercore.New(providerSet[0], eventBus)
 		dockerClient.SetObjectCache(db.Objects())
@@ -75,6 +77,7 @@ func Run(assets fs.FS) error {
 		metricsManager = metrics.NewManager(dockerClient, db.Metrics(), projectRepo, auditRepo, eventBus, metrics.Options{})
 		metricsManager.Start(ctx)
 		terminalManager = terminal.NewManager(providerSet[0], dockerClient, projectRepo, eventBus, terminal.Options{})
+		backupManager = backupcore.NewManager(providerManager, dockerClient, db.Settings(), db.Backups(), auditRepo, eventBus, services.Version)
 	}
 
 	app := application.New(application.Options{
@@ -102,7 +105,7 @@ func Run(assets fs.FS) error {
 			application.NewService(&services.TerminalService{Manager: terminalManager}),
 			application.NewService(&services.UpdateService{}),
 			application.NewService(&services.ImageLineageService{}),
-			application.NewService(&services.BackupService{}),
+			application.NewService(&services.BackupService{Manager: backupManager}),
 			application.NewService(&services.RegistryService{}),
 			application.NewService(&services.SettingsService{
 				Audit:         auditRepo,

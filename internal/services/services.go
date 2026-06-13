@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
+	"github.com/RCooLeR/Cairn/internal/backups"
 	"github.com/RCooLeR/Cairn/internal/bus"
 	composecore "github.com/RCooLeR/Cairn/internal/compose"
 	"github.com/RCooLeR/Cairn/internal/logsvc"
@@ -127,7 +128,9 @@ type TerminalService struct {
 }
 type UpdateService struct{}
 type ImageLineageService struct{}
-type BackupService struct{}
+type BackupService struct {
+	Manager *backups.Manager
+}
 type RegistryService struct{}
 type SettingsService struct {
 	Audit         *store.AuditRepository
@@ -1168,27 +1171,45 @@ func (s *ImageLineageService) RefreshServiceLineage(_ context.Context, projectID
 	return nil, notReady()
 }
 
-func (s *BackupService) PlanBackupVolume(_ context.Context, req models.BackupVolumeRequest) (*models.CommandPlan, error) {
+func (s *BackupService) PlanBackupVolume(ctx context.Context, req models.BackupVolumeRequest) (*models.CommandPlan, error) {
+	if s.Manager != nil {
+		return s.Manager.PlanBackupVolume(ctx, req)
+	}
 	return nil, notReady()
 }
 
-func (s *BackupService) ApplyBackup(_ context.Context, planID string) (string, error) {
+func (s *BackupService) ApplyBackup(ctx context.Context, planID string) (string, error) {
+	if s.Manager != nil {
+		return s.Manager.ApplyBackup(ctx, planID)
+	}
 	return "", notReady()
 }
 
-func (s *BackupService) PlanRestoreVolume(_ context.Context, req models.RestoreVolumeRequest) (*models.CommandPlan, error) {
+func (s *BackupService) PlanRestoreVolume(ctx context.Context, req models.RestoreVolumeRequest) (*models.CommandPlan, error) {
+	if s.Manager != nil {
+		return s.Manager.PlanRestoreVolume(ctx, req)
+	}
 	return nil, notReady()
 }
 
-func (s *BackupService) ApplyRestore(_ context.Context, planID string) (string, error) {
+func (s *BackupService) ApplyRestore(ctx context.Context, planID string, typedName string) (string, error) {
+	if s.Manager != nil {
+		return s.Manager.ApplyRestore(ctx, planID, typedName)
+	}
 	return "", notReady()
 }
 
-func (s *BackupService) ListBackups(_ context.Context, filter models.BackupFilter) ([]models.BackupSummary, error) {
+func (s *BackupService) ListBackups(ctx context.Context, filter models.BackupFilter) ([]models.BackupSummary, error) {
+	if s.Manager != nil {
+		return s.Manager.ListBackups(ctx, filter)
+	}
 	return nil, notReady()
 }
 
-func (s *BackupService) DeleteBackup(_ context.Context, backupID string) error {
+func (s *BackupService) DeleteBackup(ctx context.Context, backupID string) error {
+	if s.Manager != nil {
+		return s.Manager.DeleteBackup(ctx, backupID)
+	}
 	return notReady()
 }
 

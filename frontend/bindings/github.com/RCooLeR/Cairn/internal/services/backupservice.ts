@@ -13,8 +13,8 @@ export function ApplyBackup(planID: string): $CancellablePromise<string> {
     return $Call.ByID(2274904588, planID);
 }
 
-export function ApplyRestore(planID: string): $CancellablePromise<string> {
-    return $Call.ByID(2356649536, planID);
+export function ApplyRestore(planID: string, typedName: string): $CancellablePromise<string> {
+    return $Call.ByID(2356649536, planID, typedName);
 }
 
 export function DeleteBackup(backupID: string): $CancellablePromise<void> {

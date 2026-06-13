@@ -346,7 +346,7 @@ func (p *WindowsWSLProvider) DockerContext(ctx context.Context) (string, error) 
 }
 
 func (p *WindowsWSLProvider) RunDocker(ctx context.Context, args ...string) (*CommandResult, error) {
-	return p.runWSL(ctx, p.configuredDistro(), append([]string{"docker"}, args...)...)
+	return p.runWSLWithTimeout(ctx, dockerOperationTimeout, p.configuredDistro(), append([]string{"docker"}, args...)...)
 }
 
 func (p *WindowsWSLProvider) RunCompose(ctx context.Context, workdir string, args ...string) (*CommandResult, error) {
@@ -471,8 +471,12 @@ func (p *WindowsWSLProvider) runWSLText(ctx context.Context, distro string, args
 }
 
 func (p *WindowsWSLProvider) runWSL(ctx context.Context, distro string, args ...string) (*CommandResult, error) {
+	return p.runWSLWithTimeout(ctx, wslCommandTimeout, distro, args...)
+}
+
+func (p *WindowsWSLProvider) runWSLWithTimeout(ctx context.Context, timeout time.Duration, distro string, args ...string) (*CommandResult, error) {
 	wslArgs := append([]string{"-d", distro, "--"}, args...)
-	return p.runner.Run(ctx, wslCommandTimeout, wslCommandName, wslArgs...)
+	return p.runner.Run(ctx, timeout, wslCommandName, wslArgs...)
 }
 
 func (p *WindowsWSLProvider) dockerDialCommand(ctx context.Context) ([]string, error) {

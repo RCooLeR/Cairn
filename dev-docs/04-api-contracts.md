@@ -163,7 +163,7 @@ RefreshServiceLineage(projectID, service string) (*ImageLineage, error)
 PlanBackupVolume(req BackupVolumeRequest) (*CommandPlan, error)
 ApplyBackup(planID string) (string /*jobID*/, error)
 PlanRestoreVolume(req RestoreVolumeRequest) (*CommandPlan, error) // dangerous when overwriting
-ApplyRestore(planID string) (string /*jobID*/, error)
+ApplyRestore(planID, typedName string) (string /*jobID*/, error)
 ListBackups(filter BackupFilter) ([]BackupSummary, error)
 DeleteBackup(backupID string) error
 ```

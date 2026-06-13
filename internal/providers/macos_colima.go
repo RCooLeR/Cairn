@@ -359,7 +359,7 @@ func (p *MacOSColimaProvider) DockerContext(context.Context) (string, error) {
 
 func (p *MacOSColimaProvider) RunDocker(ctx context.Context, args ...string) (*CommandResult, error) {
 	dockerArgs := append([]string{"--context", p.contextName()}, args...)
-	return p.runner.Run(ctx, commandTimeout, "docker", dockerArgs...)
+	return p.runner.Run(ctx, dockerOperationTimeout, "docker", dockerArgs...)
 }
 
 func (p *MacOSColimaProvider) RunCompose(ctx context.Context, workdir string, args ...string) (*CommandResult, error) {
