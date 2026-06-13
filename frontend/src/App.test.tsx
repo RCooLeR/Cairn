@@ -1,13 +1,26 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import {
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { InventorySnapshot } from './api/inventory';
 import type {
   CommandPlan,
   DiskUsageCategory,
+  ProjectDetail,
+  ProjectSummary,
   ProviderStatus,
 } from '../bindings/github.com/RCooLeR/Cairn/internal/models/models.js';
-import { HealthStatus, Risk, UpdateStatus } from '../bindings/github.com/RCooLeR/Cairn/internal/models/models.js';
+import {
+  HealthStatus,
+  ProjectStatus,
+  Risk,
+  UpdateStatus,
+} from '../bindings/github.com/RCooLeR/Cairn/internal/models/models.js';
 
 import App from './App';
 import { useAppStore } from './state/appStore';
@@ -18,7 +31,10 @@ const inventoryMock = vi.hoisted(() => ({
 }));
 
 const runtimeMock = vi.hoisted(() => ({
-  on: vi.fn<(eventName: string, callback: (event?: unknown) => void) => () => void>(() => vi.fn()),
+  on: vi.fn<
+    (eventName: string, callback: (event?: unknown) => void) => () => void
+  >(() => vi.fn()),
+  openFile: vi.fn(),
 }));
 
 const dockerServiceMock = vi.hoisted(() => ({
@@ -42,6 +58,13 @@ const dockerServiceMock = vi.hoisted(() => ({
   CreateNetwork: vi.fn(),
 }));
 
+const projectServiceMock = vi.hoisted(() => ({
+  RefreshProjects: vi.fn(),
+  ListProjects: vi.fn(),
+  GetProject: vi.fn(),
+  ImportProject: vi.fn(),
+}));
+
 vi.mock('./api/app', () => ({
   getAppVersion: vi.fn().mockResolvedValue({
     version: '0.1.0',
@@ -55,6 +78,7 @@ vi.mock('./api/inventory', () => ({
 
 vi.mock('./api/services', () => ({
   DockerService: dockerServiceMock,
+  ProjectService: projectServiceMock,
 }));
 
 vi.mock('@wailsio/runtime', () => ({
@@ -67,7 +91,12 @@ vi.mock('@wailsio/runtime', () => ({
     Map:
       <T,>(_key: (source: unknown) => string, value: (source: unknown) => T) =>
       (source: Record<string, unknown> | null) =>
-        Object.fromEntries(Object.entries(source ?? {}).map(([key, entry]) => [key, value(entry)])),
+        Object.fromEntries(
+          Object.entries(source ?? {}).map(([key, entry]) => [
+            key,
+            value(entry),
+          ]),
+        ),
     Nullable:
       <T,>(element: (source: unknown) => T) =>
       (source: unknown | null) =>
@@ -76,6 +105,9 @@ vi.mock('@wailsio/runtime', () => ({
   Events: {
     On: runtimeMock.on,
   },
+  Dialogs: {
+    OpenFile: runtimeMock.openFile,
+  },
 }));
 
 describe('App inventory shell', () => {
@@ -83,14 +115,21 @@ describe('App inventory shell', () => {
     vi.useRealTimers();
     vi.clearAllMocks();
     inventoryMock.getInventorySnapshot.mockReset();
-    dockerServiceMock.InspectContainerRaw.mockResolvedValue('{"Id":"container-1"}');
+    dockerServiceMock.InspectContainerRaw.mockResolvedValue(
+      '{"Id":"container-1"}',
+    );
     dockerServiceMock.GetImage.mockResolvedValue(null);
     dockerServiceMock.GetNetwork.mockResolvedValue(null);
     dockerServiceMock.GetVolume.mockResolvedValue(null);
     dockerServiceMock.StartContainer.mockResolvedValue(undefined);
     dockerServiceMock.StopContainer.mockResolvedValue(undefined);
     dockerServiceMock.RestartContainer.mockResolvedValue(undefined);
-    dockerServiceMock.BulkContainerAction.mockResolvedValue({ total: 1, succeeded: 1, failed: 0, items: [] });
+    dockerServiceMock.BulkContainerAction.mockResolvedValue({
+      total: 1,
+      succeeded: 1,
+      failed: 0,
+      items: [],
+    });
     dockerServiceMock.PlanKillContainer.mockResolvedValue(killPlan());
     dockerServiceMock.ApplyContainerPlan.mockResolvedValue(undefined);
     dockerServiceMock.RenameContainer.mockResolvedValue(undefined);
@@ -99,7 +138,11 @@ describe('App inventory shell', () => {
     dockerServiceMock.SaveImage.mockResolvedValue('save-job');
     dockerServiceMock.LoadImage.mockResolvedValue('load-job');
     dockerServiceMock.SearchHub.mockResolvedValue([]);
-    dockerServiceMock.CreateVolume.mockResolvedValue({ name: 'created_volume', driver: 'local', inUse: false });
+    dockerServiceMock.CreateVolume.mockResolvedValue({
+      name: 'created_volume',
+      driver: 'local',
+      inUse: false,
+    });
     dockerServiceMock.CreateNetwork.mockResolvedValue({
       id: 'network-new',
       name: 'created_network',
@@ -107,6 +150,11 @@ describe('App inventory shell', () => {
       internal: false,
       attachable: false,
     });
+    projectServiceMock.RefreshProjects.mockResolvedValue([]);
+    projectServiceMock.ListProjects.mockResolvedValue([]);
+    projectServiceMock.GetProject.mockResolvedValue(null);
+    projectServiceMock.ImportProject.mockResolvedValue(seededProjectDetail());
+    runtimeMock.openFile.mockResolvedValue('');
 
     useAppStore.setState({
       version: null,
@@ -140,12 +188,21 @@ describe('App inventory shell', () => {
     render(<App />);
 
     expect(screen.getByRole('img', { name: 'Cairn' })).toBeInTheDocument();
-    expect(screen.getByRole('navigation', { name: 'Main navigation' })).toBeInTheDocument();
-    expect(screen.getByRole('heading', { name: 'Overview' })).toBeInTheDocument();
+    expect(
+      screen.getByRole('navigation', { name: 'Main navigation' }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole('heading', { name: 'Overview' }),
+    ).toBeInTheDocument();
     expect(await screen.findByText('v0.1.0')).toBeInTheDocument();
-    expect(await screen.findByText('Docker Engine - Running')).toBeInTheDocument();
+    expect(
+      await screen.findByText('Docker Engine - Running'),
+    ).toBeInTheDocument();
     expect(screen.getAllByText('cairn-dev').length).toBeGreaterThan(0);
-    expect(runtimeMock.on).toHaveBeenCalledWith('objects:changed', expect.any(Function));
+    expect(runtimeMock.on).toHaveBeenCalledWith(
+      'objects:changed',
+      expect.any(Function),
+    );
   });
 
   it('lists containers and applies search without leaving the table view', async () => {
@@ -155,18 +212,103 @@ describe('App inventory shell', () => {
 
     await screen.findByText('Docker Engine - Running');
     fireEvent.click(
-      within(screen.getByRole('navigation', { name: 'Main navigation' })).getByRole('button', {
+      within(
+        screen.getByRole('navigation', { name: 'Main navigation' }),
+      ).getByRole('button', {
         name: /Containers/,
       }),
     );
 
-    expect(screen.getByRole('heading', { name: 'Containers' })).toBeInTheDocument();
+    expect(
+      screen.getByRole('heading', { name: 'Containers' }),
+    ).toBeInTheDocument();
     expect(screen.getAllByText('web').length).toBeGreaterThan(0);
     expect(screen.getByText('cairn/web:latest')).toBeInTheDocument();
 
-    fireEvent.change(screen.getByLabelText('Search inventory'), { target: { value: 'does-not-exist' } });
+    fireEvent.change(screen.getByLabelText('Search inventory'), {
+      target: { value: 'does-not-exist' },
+    });
 
     expect(screen.getByText('No containers match')).toBeInTheDocument();
+  });
+
+  it('renders Compose projects and applies project filters', async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
+
+    render(<App />);
+
+    await screen.findByText('Docker Engine - Running');
+    fireEvent.click(
+      within(
+        screen.getByRole('navigation', { name: 'Main navigation' }),
+      ).getByRole('button', {
+        name: /Projects/,
+      }),
+    );
+
+    expect(
+      await screen.findByRole('heading', { name: 'Projects' }),
+    ).toBeInTheDocument();
+    expect(await screen.findByText('app-db')).toBeInTheDocument();
+    expect(screen.getByText('1/2')).toBeInTheDocument();
+    expect(screen.getByText('2 updates')).toBeInTheDocument();
+    expect(screen.getByText('8080->80/tcp')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: /Stopped/ }));
+
+    expect(screen.getByText('No projects found')).toBeInTheDocument();
+  });
+
+  it('imports a Compose project through the folder picker', async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValueOnce(
+      [],
+    ).mockResolvedValueOnce([seededProject()]);
+    runtimeMock.openFile.mockResolvedValue(
+      'E:\\Development\\projects\\apps\\rcooler\\Cairn\\testdata\\projects\\app-db',
+    );
+
+    render(<App />);
+
+    await screen.findByText('Docker Engine - Running');
+    fireEvent.click(
+      within(
+        screen.getByRole('navigation', { name: 'Main navigation' }),
+      ).getByRole('button', {
+        name: /Projects/,
+      }),
+    );
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Import Project' }),
+    );
+    expect(
+      await screen.findByRole('dialog', { name: 'Import Project' }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Browse' }));
+    await waitFor(() =>
+      expect(runtimeMock.openFile).toHaveBeenCalledWith(
+        expect.objectContaining({ CanChooseDirectories: true }),
+      ),
+    );
+    expect(screen.getByLabelText('Folder')).toHaveValue(
+      'E:\\Development\\projects\\apps\\rcooler\\Cairn\\testdata\\projects\\app-db',
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'Import' }));
+
+    await waitFor(() =>
+      expect(projectServiceMock.ImportProject).toHaveBeenCalledWith({
+        folderPath:
+          'E:\\Development\\projects\\apps\\rcooler\\Cairn\\testdata\\projects\\app-db',
+        composeFilePaths: [],
+      }),
+    );
+    expect(await screen.findByText('Imported app-db')).toBeInTheDocument();
+    await waitFor(() =>
+      expect(projectServiceMock.RefreshProjects).toHaveBeenCalledTimes(2),
+    );
   });
 
   it('runs safe container actions directly and refreshes inventory', async () => {
@@ -176,14 +318,21 @@ describe('App inventory shell', () => {
 
     await screen.findByText('Docker Engine - Running');
     fireEvent.click(
-      within(screen.getByRole('navigation', { name: 'Main navigation' })).getByRole('button', {
+      within(
+        screen.getByRole('navigation', { name: 'Main navigation' }),
+      ).getByRole('button', {
         name: /Containers/,
       }),
     );
     fireEvent.click(screen.getByRole('button', { name: 'Stop web' }));
 
-    expect(dockerServiceMock.StopContainer).toHaveBeenCalledWith('container-1', 10);
-    await waitFor(() => expect(inventoryMock.getInventorySnapshot).toHaveBeenCalledTimes(2));
+    expect(dockerServiceMock.StopContainer).toHaveBeenCalledWith(
+      'container-1',
+      10,
+    );
+    await waitFor(() =>
+      expect(inventoryMock.getInventorySnapshot).toHaveBeenCalledTimes(2),
+    );
   });
 
   it('previews and confirms kill through the command-plan pipeline', async () => {
@@ -193,19 +342,30 @@ describe('App inventory shell', () => {
 
     await screen.findByText('Docker Engine - Running');
     fireEvent.click(
-      within(screen.getByRole('navigation', { name: 'Main navigation' })).getByRole('button', {
+      within(
+        screen.getByRole('navigation', { name: 'Main navigation' }),
+      ).getByRole('button', {
         name: /Containers/,
       }),
     );
     fireEvent.click(screen.getByRole('button', { name: 'Kill web' }));
 
-    expect(dockerServiceMock.PlanKillContainer).toHaveBeenCalledWith('container-1');
-    expect(await screen.findByRole('dialog', { name: 'Kill web' })).toBeInTheDocument();
+    expect(dockerServiceMock.PlanKillContainer).toHaveBeenCalledWith(
+      'container-1',
+    );
+    expect(
+      await screen.findByRole('dialog', { name: 'Kill web' }),
+    ).toBeInTheDocument();
     expect(screen.getByText('docker kill web')).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
 
-    await waitFor(() => expect(dockerServiceMock.ApplyContainerPlan).toHaveBeenCalledWith('plan-kill-web', ''));
+    await waitFor(() =>
+      expect(dockerServiceMock.ApplyContainerPlan).toHaveBeenCalledWith(
+        'plan-kill-web',
+        '',
+      ),
+    );
   });
 
   it('runs an image from the row wizard and refreshes inventory', async () => {
@@ -215,13 +375,19 @@ describe('App inventory shell', () => {
 
     await screen.findByText('Docker Engine - Running');
     fireEvent.click(
-      within(screen.getByRole('navigation', { name: 'Main navigation' })).getByRole('button', {
+      within(
+        screen.getByRole('navigation', { name: 'Main navigation' }),
+      ).getByRole('button', {
         name: /Images/,
       }),
     );
-    fireEvent.click(screen.getByRole('button', { name: 'Run cairn/web:latest' }));
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Run cairn/web:latest' }),
+    );
 
-    expect(await screen.findByRole('dialog', { name: 'Run Image' })).toBeInTheDocument();
+    expect(
+      await screen.findByRole('dialog', { name: 'Run Image' }),
+    ).toBeInTheDocument();
     expect(screen.getByLabelText('Image ref')).toHaveValue('cairn/web:latest');
     fireEvent.click(screen.getByRole('button', { name: 'Next' }));
     expect(screen.getByText(/docker run -d/)).toBeInTheDocument();
@@ -237,7 +403,9 @@ describe('App inventory shell', () => {
         }),
       ),
     );
-    await waitFor(() => expect(inventoryMock.getInventorySnapshot).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(inventoryMock.getInventorySnapshot).toHaveBeenCalledTimes(2),
+    );
   });
 
   it('renames a container through the modal', async () => {
@@ -247,15 +415,24 @@ describe('App inventory shell', () => {
 
     await screen.findByText('Docker Engine - Running');
     fireEvent.click(
-      within(screen.getByRole('navigation', { name: 'Main navigation' })).getByRole('button', {
+      within(
+        screen.getByRole('navigation', { name: 'Main navigation' }),
+      ).getByRole('button', {
         name: /Containers/,
       }),
     );
     fireEvent.click(screen.getByRole('button', { name: 'Rename web' }));
-    fireEvent.change(screen.getByLabelText('New name'), { target: { value: 'web-renamed' } });
+    fireEvent.change(screen.getByLabelText('New name'), {
+      target: { value: 'web-renamed' },
+    });
     fireEvent.click(screen.getByRole('button', { name: 'Rename' }));
 
-    await waitFor(() => expect(dockerServiceMock.RenameContainer).toHaveBeenCalledWith('container-1', 'web-renamed'));
+    await waitFor(() =>
+      expect(dockerServiceMock.RenameContainer).toHaveBeenCalledWith(
+        'container-1',
+        'web-renamed',
+      ),
+    );
   });
 
   it('pulls, saves, and loads images from image modals', async () => {
@@ -265,24 +442,43 @@ describe('App inventory shell', () => {
 
     await screen.findByText('Docker Engine - Running');
     fireEvent.click(
-      within(screen.getByRole('navigation', { name: 'Main navigation' })).getByRole('button', {
+      within(
+        screen.getByRole('navigation', { name: 'Main navigation' }),
+      ).getByRole('button', {
         name: /Images/,
       }),
     );
 
     fireEvent.click(screen.getByRole('button', { name: 'Pull image' }));
-    fireEvent.change(screen.getByLabelText('Image ref'), { target: { value: 'redis' } });
+    fireEvent.change(screen.getByLabelText('Image ref'), {
+      target: { value: 'redis' },
+    });
     fireEvent.click(screen.getByRole('button', { name: 'Pull' }));
-    await waitFor(() => expect(dockerServiceMock.PullImage).toHaveBeenCalledWith('redis:latest'));
+    await waitFor(() =>
+      expect(dockerServiceMock.PullImage).toHaveBeenCalledWith('redis:latest'),
+    );
 
-    fireEvent.click(screen.getByRole('button', { name: 'Save cairn/web:latest' }));
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Save cairn/web:latest' }),
+    );
     fireEvent.click(screen.getByRole('button', { name: 'Save' }));
-    await waitFor(() => expect(dockerServiceMock.SaveImage).toHaveBeenCalledWith(['cairn/web:latest'], 'cairn_web_latest.tar'));
+    await waitFor(() =>
+      expect(dockerServiceMock.SaveImage).toHaveBeenCalledWith(
+        ['cairn/web:latest'],
+        'cairn_web_latest.tar',
+      ),
+    );
 
     fireEvent.click(screen.getByRole('button', { name: 'Load tar' }));
-    fireEvent.change(screen.getByLabelText('Source tar'), { target: { value: '/tmp/image.tar' } });
+    fireEvent.change(screen.getByLabelText('Source tar'), {
+      target: { value: '/tmp/image.tar' },
+    });
     fireEvent.click(screen.getByRole('button', { name: 'Load' }));
-    await waitFor(() => expect(dockerServiceMock.LoadImage).toHaveBeenCalledWith('/tmp/image.tar'));
+    await waitFor(() =>
+      expect(dockerServiceMock.LoadImage).toHaveBeenCalledWith(
+        '/tmp/image.tar',
+      ),
+    );
   });
 
   it('creates volumes and networks from page actions', async () => {
@@ -292,24 +488,40 @@ describe('App inventory shell', () => {
 
     await screen.findByText('Docker Engine - Running');
     fireEvent.click(
-      within(screen.getByRole('navigation', { name: 'Main navigation' })).getByRole('button', {
+      within(
+        screen.getByRole('navigation', { name: 'Main navigation' }),
+      ).getByRole('button', {
         name: /Volumes/,
       }),
     );
     fireEvent.click(screen.getByRole('button', { name: 'Create volume' }));
-    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'demo_data' } });
+    fireEvent.change(screen.getByLabelText('Name'), {
+      target: { value: 'demo_data' },
+    });
     fireEvent.click(screen.getByRole('button', { name: 'Create' }));
-    await waitFor(() => expect(dockerServiceMock.CreateVolume).toHaveBeenCalledWith(expect.objectContaining({ name: 'demo_data', driver: 'local' })));
+    await waitFor(() =>
+      expect(dockerServiceMock.CreateVolume).toHaveBeenCalledWith(
+        expect.objectContaining({ name: 'demo_data', driver: 'local' }),
+      ),
+    );
 
     fireEvent.click(
-      within(screen.getByRole('navigation', { name: 'Main navigation' })).getByRole('button', {
+      within(
+        screen.getByRole('navigation', { name: 'Main navigation' }),
+      ).getByRole('button', {
         name: /Networks/,
       }),
     );
     fireEvent.click(screen.getByRole('button', { name: 'Create network' }));
-    fireEvent.change(screen.getByLabelText('Name'), { target: { value: 'demo_net' } });
+    fireEvent.change(screen.getByLabelText('Name'), {
+      target: { value: 'demo_net' },
+    });
     fireEvent.click(screen.getByRole('button', { name: 'Create' }));
-    await waitFor(() => expect(dockerServiceMock.CreateNetwork).toHaveBeenCalledWith(expect.objectContaining({ name: 'demo_net', driver: 'bridge' })));
+    await waitFor(() =>
+      expect(dockerServiceMock.CreateNetwork).toHaveBeenCalledWith(
+        expect.objectContaining({ name: 'demo_net', driver: 'bridge' }),
+      ),
+    );
   });
 
   it('renders empty states when the daemon has no objects', async () => {
@@ -319,7 +531,9 @@ describe('App inventory shell', () => {
 
     expect(await screen.findByText('No containers yet')).toBeInTheDocument();
     fireEvent.click(
-      within(screen.getByRole('navigation', { name: 'Main navigation' })).getByRole('button', {
+      within(
+        screen.getByRole('navigation', { name: 'Main navigation' }),
+      ).getByRole('button', {
         name: /Images/,
       }),
     );
@@ -336,7 +550,9 @@ describe('App inventory shell', () => {
     expect(inventoryMock.getInventorySnapshot).toHaveBeenCalledTimes(1);
     vi.useFakeTimers();
 
-    const callback = runtimeMock.on.mock.calls[0]?.[1] as ((event?: unknown) => void) | undefined;
+    const callback = runtimeMock.on.mock.calls[0]?.[1] as
+      | ((event?: unknown) => void)
+      | undefined;
     expect(callback).toEqual(expect.any(Function));
     callback?.({ name: 'objects:changed', data: undefined });
 
@@ -357,7 +573,14 @@ function seededSnapshot(): InventorySnapshot {
     health: HealthStatus.HealthStatusHealthy,
     projectID: 'cairn',
     service: 'web',
-    ports: [{ hostIP: '127.0.0.1', hostPort: '8080', containerPort: '80', protocol: 'tcp' }],
+    ports: [
+      {
+        hostIP: '127.0.0.1',
+        hostPort: '8080',
+        containerPort: '80',
+        protocol: 'tcp',
+      },
+    ],
     cpuPercent: 2.4,
     memoryBytes: 64 * 1024 * 1024,
     memoryLimit: 512 * 1024 * 1024,
@@ -448,6 +671,74 @@ function seededSnapshot(): InventorySnapshot {
   };
 }
 
+function seededProject(): ProjectSummary {
+  return {
+    id: 'linux_native/app-db',
+    name: 'app-db',
+    providerID: 'linux_native',
+    status: ProjectStatus.ProjectStatusRunning,
+    health: HealthStatus.HealthStatusHealthy,
+    servicesRunning: 1,
+    servicesTotal: 2,
+    cpuPercent: 12.5,
+    memoryBytes: 256 * 1024 * 1024,
+    netRxRate: 0,
+    netTxRate: 0,
+    updateBadges: {
+      imageUpdates: 2,
+      baseUpdates: 0,
+      rebuildNeeded: 0,
+      pinned: 0,
+      unknownBase: 0,
+    },
+    ports: [
+      {
+        hostIP: '127.0.0.1',
+        hostPort: '8080',
+        containerPort: '80',
+        protocol: 'tcp',
+      },
+    ],
+    workingDir:
+      'E:\\Development\\projects\\apps\\rcooler\\Cairn\\testdata\\projects\\app-db',
+    lastChangedAt: '2026-06-13T08:00:00Z',
+  };
+}
+
+function seededProjectDetail(): ProjectDetail {
+  return {
+    summary: seededProject(),
+    services: [
+      {
+        name: 'app',
+        image: 'cairn/app:latest',
+        replicas: 1,
+        running: 1,
+        status: ProjectStatus.ProjectStatusRunning,
+        health: HealthStatus.HealthStatusHealthy,
+        ports: [
+          {
+            hostIP: '127.0.0.1',
+            hostPort: '8080',
+            containerPort: '80',
+            protocol: 'tcp',
+          },
+        ],
+        cpuPercent: 10,
+        memoryBytes: 128 * 1024 * 1024,
+      },
+      {
+        name: 'db',
+        image: 'postgres:16',
+        replicas: 1,
+        running: 0,
+        status: ProjectStatus.ProjectStatusStopped,
+        health: HealthStatus.HealthStatusUnknown,
+      },
+    ],
+  };
+}
+
 function killPlan(): CommandPlan {
   return {
     planID: 'plan-kill-web',
@@ -486,7 +777,11 @@ function emptySnapshot(): InventorySnapshot {
   };
 }
 
-function diskCategory(count: number, active: number, sizeBytes: number): DiskUsageCategory {
+function diskCategory(
+  count: number,
+  active: number,
+  sizeBytes: number,
+): DiskUsageCategory {
   return {
     count,
     active,

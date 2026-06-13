@@ -10,6 +10,8 @@ import type {
   NetworkSummary,
   PortMapping,
   PortBinding,
+  ProjectDetail,
+  ProjectSummary,
   ProviderSummary,
   RunImageRequest,
   VolumeDetail,
@@ -25,8 +27,12 @@ import {
   Download,
   Eye,
   FileJson,
+  FolderOpen,
   Gauge,
   HardDrive,
+  LayoutGrid,
+  List,
+  MoreVertical,
   PackagePlus,
   Pencil,
   Plus,
@@ -42,10 +48,10 @@ import {
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
-import { Events } from '@wailsio/runtime';
+import { Dialogs, Events } from '@wailsio/runtime';
 
 import { getAppVersion } from './api/app';
-import { DockerService } from './api/services';
+import { DockerService, ProjectService } from './api/services';
 import {
   Badge,
   Button,
@@ -64,9 +70,18 @@ import { useInventoryStore } from './state/inventoryStore';
 
 const logoUrl = '/cairn-logo.png';
 
-type PageID = 'overview' | 'containers' | 'images' | 'volumes' | 'networks';
+type PageID =
+  | 'overview'
+  | 'projects'
+  | 'containers'
+  | 'images'
+  | 'volumes'
+  | 'networks';
 type FilterID = string;
 type BadgeTone = 'ok' | 'warn' | 'error' | 'info' | 'neutral' | 'accent';
+type LoadStatus = 'idle' | 'loading' | 'ready' | 'error';
+type ProjectViewMode = 'grid' | 'list';
+type ProjectSortID = 'name' | 'activity' | 'cpu';
 
 type NavItem = {
   id: PageID;
@@ -176,8 +191,17 @@ type CreateNetworkState = {
   error?: string;
 };
 
+type ImportProjectState = {
+  open: boolean;
+  folderPath: string;
+  busy: boolean;
+  error?: string;
+  imported?: ProjectDetail | null;
+};
+
 const navItems: NavItem[] = [
   { id: 'overview', label: 'Overview', icon: Gauge },
+  { id: 'projects', label: 'Projects', icon: LayoutGrid },
   { id: 'containers', label: 'Containers', icon: Container },
   { id: 'images', label: 'Images', icon: Box },
   { id: 'volumes', label: 'Volumes', icon: Database },
@@ -270,6 +294,13 @@ const emptyCreateNetwork: CreateNetworkState = {
   busy: false,
 };
 
+const emptyImportProject: ImportProjectState = {
+  open: false,
+  folderPath: '',
+  busy: false,
+  imported: null,
+};
+
 function App() {
   const version = useAppStore((state) => state.version);
   const setVersion = useAppStore((state) => state.setVersion);
@@ -292,6 +323,15 @@ function App() {
 
   const [activePage, setActivePage] = useState<PageID>('overview');
   const [search, setSearch] = useState('');
+  const [projects, setProjects] = useState<ProjectSummary[]>([]);
+  const [projectsStatus, setProjectsStatus] = useState<LoadStatus>('idle');
+  const [projectsError, setProjectsError] = useState<string | null>(null);
+  const [projectFilter, setProjectFilter] = useState<FilterID>('all');
+  const [projectSort, setProjectSort] = useState<ProjectSortID>('name');
+  const [projectView, setProjectView] = useState<ProjectViewMode>(() => {
+    const saved = window.localStorage.getItem('cairn.projects.view');
+    return saved === 'list' ? 'list' : 'grid';
+  });
   const [containerFilter, setContainerFilter] = useState<FilterID>('all');
   const [imageFilter, setImageFilter] = useState<FilterID>('all');
   const [volumeFilter, setVolumeFilter] = useState<FilterID>('all');
@@ -302,15 +342,36 @@ function App() {
   const [pullImage, setPullImage] = useState<PullImageState>(emptyPullImage);
   const [saveImage, setSaveImage] = useState<SaveImageState>(emptySaveImage);
   const [loadImage, setLoadImage] = useState<LoadImageState>(emptyLoadImage);
-  const [createVolume, setCreateVolume] = useState<CreateVolumeState>(emptyCreateVolume);
-  const [createNetwork, setCreateNetwork] = useState<CreateNetworkState>(emptyCreateNetwork);
-  const [selectedContainerIDs, setSelectedContainerIDs] = useState(() => new Set<string>());
+  const [createVolume, setCreateVolume] =
+    useState<CreateVolumeState>(emptyCreateVolume);
+  const [createNetwork, setCreateNetwork] =
+    useState<CreateNetworkState>(emptyCreateNetwork);
+  const [importProject, setImportProject] =
+    useState<ImportProjectState>(emptyImportProject);
+  const [selectedContainerIDs, setSelectedContainerIDs] = useState(
+    () => new Set<string>(),
+  );
   const [busyActionIDs, setBusyActionIDs] = useState(() => new Set<string>());
   const [actionError, setActionError] = useState<string | null>(null);
 
   const navigate = useCallback((page: PageID) => {
     setActivePage(page);
     setSearch('');
+  }, []);
+
+  const refreshProjects = useCallback(async () => {
+    setProjectsStatus('loading');
+    setProjectsError(null);
+    try {
+      const nextProjects = await ProjectService.RefreshProjects();
+      setProjects(nextProjects ?? []);
+      setProjectsStatus('ready');
+    } catch (error: unknown) {
+      setProjectsError(
+        error instanceof Error ? error.message : 'Unable to refresh projects',
+      );
+      setProjectsStatus('error');
+    }
   }, []);
 
   useEffect(() => {
@@ -325,7 +386,11 @@ function App() {
       })
       .catch((error: unknown) => {
         if (active) {
-          setVersionError(error instanceof Error ? error.message : 'Unable to load app version');
+          setVersionError(
+            error instanceof Error
+              ? error.message
+              : 'Unable to load app version',
+          );
         }
       })
       .finally(() => {
@@ -344,27 +409,41 @@ function App() {
   }, [refreshInventory]);
 
   useEffect(() => {
+    void refreshProjects();
+  }, [refreshProjects]);
+
+  useEffect(() => {
     let timer: number | undefined;
     const off = Events.On('objects:changed', () => {
       window.clearTimeout(timer);
       timer = window.setTimeout(() => {
         void refreshInventory();
+        void refreshProjects();
       }, 500);
     });
     return () => {
       window.clearTimeout(timer);
       off();
     };
-  }, [refreshInventory]);
+  }, [refreshInventory, refreshProjects]);
 
   useEffect(() => {
     const query = pullImage.query.trim();
     if (!pullImage.open || query.length < 3) {
-      setPullImage((current) => ({ ...current, results: [], loadingResults: false, searchError: undefined }));
+      setPullImage((current) => ({
+        ...current,
+        results: [],
+        loadingResults: false,
+        searchError: undefined,
+      }));
       return undefined;
     }
     const timer = window.setTimeout(() => {
-      setPullImage((current) => ({ ...current, loadingResults: true, searchError: undefined }));
+      setPullImage((current) => ({
+        ...current,
+        loadingResults: true,
+        searchError: undefined,
+      }));
       DockerService.SearchHub(query, 10)
         .then((results) => {
           setPullImage((current) => ({
@@ -379,7 +458,10 @@ function App() {
             ...current,
             loadingResults: false,
             results: [],
-            searchError: error instanceof Error ? error.message : 'Docker Hub search is offline',
+            searchError:
+              error instanceof Error
+                ? error.message
+                : 'Docker Hub search is offline',
           }));
         });
     }, 300);
@@ -389,11 +471,20 @@ function App() {
   useEffect(() => {
     const query = runImage.hubQuery.trim();
     if (!runImage.open || query.length < 3) {
-      setRunImage((current) => ({ ...current, hubResults: [], hubLoading: false, hubError: undefined }));
+      setRunImage((current) => ({
+        ...current,
+        hubResults: [],
+        hubLoading: false,
+        hubError: undefined,
+      }));
       return undefined;
     }
     const timer = window.setTimeout(() => {
-      setRunImage((current) => ({ ...current, hubLoading: true, hubError: undefined }));
+      setRunImage((current) => ({
+        ...current,
+        hubLoading: true,
+        hubError: undefined,
+      }));
       DockerService.SearchHub(query, 10)
         .then((results) => {
           setRunImage((current) => ({
@@ -408,25 +499,41 @@ function App() {
             ...current,
             hubLoading: false,
             hubResults: [],
-            hubError: error instanceof Error ? error.message : 'Docker Hub search is offline',
+            hubError:
+              error instanceof Error
+                ? error.message
+                : 'Docker Hub search is offline',
           }));
         });
     }, 300);
     return () => window.clearTimeout(timer);
   }, [runImage.hubQuery, runImage.open]);
 
-  const activeProvider = useMemo(() => activeProviderSummary(providers), [providers]);
-  const runningContainers = containers.filter((container) => container.state === 'running').length;
-  const unhealthyContainers = containers.filter((container) => container.health === 'unhealthy').length;
+  const activeProvider = useMemo(
+    () => activeProviderSummary(providers),
+    [providers],
+  );
+  const runningContainers = containers.filter(
+    (container) => container.state === 'running',
+  ).length;
+  const unhealthyContainers = containers.filter(
+    (container) => container.health === 'unhealthy',
+  ).length;
   const diskTotal = diskUsage?.totalBytes ?? 0;
   const diskReclaimable = diskUsage?.reclaimable ?? 0;
-  const versionLabel = version?.version ? `v${version.version}` : 'v1.0 workspace';
-  const pageTitle = navItems.find((item) => item.id === activePage)?.label ?? 'Overview';
+  const versionLabel = version?.version
+    ? `v${version.version}`
+    : 'v1.0 workspace';
+  const pageTitle =
+    navItems.find((item) => item.id === activePage)?.label ?? 'Overview';
   const dockerRunning = !inventoryError && Boolean(dockerInfo || dockerVersion);
   const providerName = activeProvider?.name ?? 'No provider selected';
   const statusLabel = dockerRunning ? 'Running' : 'Stopped';
 
-  const imageUseCounts = useMemo(() => imageUsageCounts(containers), [containers]);
+  const imageUseCounts = useMemo(
+    () => imageUsageCounts(containers),
+    [containers],
+  );
 
   const setActionBusy = useCallback((key: string, busy: boolean) => {
     setBusyActionIDs((current) => {
@@ -444,65 +551,84 @@ function App() {
     await refreshInventory();
   }, [refreshInventory]);
 
-  const runContainerAction = useCallback(async (action: ContainerAction, container: ContainerSummary) => {
-    const key = `${action}:${container.id}`;
-    setActionError(null);
-    setActionBusy(key, true);
-    try {
-      if (action === 'start') {
-        await DockerService.StartContainer(container.id);
-      } else if (action === 'stop') {
-        await DockerService.StopContainer(container.id, 10);
-      } else if (action === 'restart') {
-        await DockerService.RestartContainer(container.id, 10);
-      } else {
-        const plan = await DockerService.PlanKillContainer(container.id);
-        if (!plan) {
-          throw new Error('Kill plan was empty');
+  const changeProjectView = useCallback((view: ProjectViewMode) => {
+    setProjectView(view);
+    window.localStorage.setItem('cairn.projects.view', view);
+  }, []);
+
+  const runContainerAction = useCallback(
+    async (action: ContainerAction, container: ContainerSummary) => {
+      const key = `${action}:${container.id}`;
+      setActionError(null);
+      setActionBusy(key, true);
+      try {
+        if (action === 'start') {
+          await DockerService.StartContainer(container.id);
+        } else if (action === 'stop') {
+          await DockerService.StopContainer(container.id, 10);
+        } else if (action === 'restart') {
+          await DockerService.RestartContainer(container.id, 10);
+        } else {
+          const plan = await DockerService.PlanKillContainer(container.id);
+          if (!plan) {
+            throw new Error('Kill plan was empty');
+          }
+          setConfirm({
+            open: true,
+            plan,
+            targetName: container.name,
+            typedName: '',
+            busy: false,
+          });
+          return;
         }
-        setConfirm({
-          open: true,
-          plan,
-          targetName: container.name,
-          typedName: '',
-          busy: false,
+        setSelectedContainerIDs((current) => {
+          const next = new Set(current);
+          next.delete(container.id);
+          return next;
         });
+        await refreshAfterAction();
+      } catch (error: unknown) {
+        setActionError(
+          error instanceof Error ? error.message : 'Container action failed',
+        );
+      } finally {
+        setActionBusy(key, false);
+      }
+    },
+    [refreshAfterAction, setActionBusy],
+  );
+
+  const runBulkContainerAction = useCallback(
+    async (action: Exclude<ContainerAction, 'kill'>) => {
+      const ids = Array.from(selectedContainerIDs);
+      if (ids.length === 0) {
         return;
       }
-      setSelectedContainerIDs((current) => {
-        const next = new Set(current);
-        next.delete(container.id);
-        return next;
-      });
-      await refreshAfterAction();
-    } catch (error: unknown) {
-      setActionError(error instanceof Error ? error.message : 'Container action failed');
-    } finally {
-      setActionBusy(key, false);
-    }
-  }, [refreshAfterAction, setActionBusy]);
-
-  const runBulkContainerAction = useCallback(async (action: Exclude<ContainerAction, 'kill'>) => {
-    const ids = Array.from(selectedContainerIDs);
-    if (ids.length === 0) {
-      return;
-    }
-    const key = `bulk:${action}`;
-    setActionError(null);
-    setActionBusy(key, true);
-    try {
-      const result = await DockerService.BulkContainerAction(ids, action);
-      setSelectedContainerIDs(new Set<string>());
-      await refreshAfterAction();
-      if (result && result.failed > 0) {
-        setActionError(`${result.failed} of ${result.total} container actions failed`);
+      const key = `bulk:${action}`;
+      setActionError(null);
+      setActionBusy(key, true);
+      try {
+        const result = await DockerService.BulkContainerAction(ids, action);
+        setSelectedContainerIDs(new Set<string>());
+        await refreshAfterAction();
+        if (result && result.failed > 0) {
+          setActionError(
+            `${result.failed} of ${result.total} container actions failed`,
+          );
+        }
+      } catch (error: unknown) {
+        setActionError(
+          error instanceof Error
+            ? error.message
+            : 'Bulk container action failed',
+        );
+      } finally {
+        setActionBusy(key, false);
       }
-    } catch (error: unknown) {
-      setActionError(error instanceof Error ? error.message : 'Bulk container action failed');
-    } finally {
-      setActionBusy(key, false);
-    }
-  }, [refreshAfterAction, selectedContainerIDs, setActionBusy]);
+    },
+    [refreshAfterAction, selectedContainerIDs, setActionBusy],
+  );
 
   const applyConfirmedPlan = useCallback(async () => {
     if (!confirm.plan) {
@@ -510,7 +636,10 @@ function App() {
     }
     setConfirm((current) => ({ ...current, busy: true, error: undefined }));
     try {
-      await DockerService.ApplyContainerPlan(confirm.plan.planID, confirm.typedName);
+      await DockerService.ApplyContainerPlan(
+        confirm.plan.planID,
+        confirm.typedName,
+      );
       setConfirm(emptyConfirm);
       setSelectedContainerIDs(new Set<string>());
       await refreshAfterAction();
@@ -574,7 +703,8 @@ function App() {
       setRename((current) => ({
         ...current,
         busy: false,
-        error: error instanceof Error ? error.message : 'Unable to rename container',
+        error:
+          error instanceof Error ? error.message : 'Unable to rename container',
       }));
     }
   }, [refreshAfterAction, rename.container, rename.name]);
@@ -608,7 +738,10 @@ function App() {
   const submitSaveImage = useCallback(async () => {
     setSaveImage((current) => ({ ...current, busy: true, error: undefined }));
     try {
-      await DockerService.SaveImage(splitRefs(saveImage.refsText), saveImage.destPath);
+      await DockerService.SaveImage(
+        splitRefs(saveImage.refsText),
+        saveImage.destPath,
+      );
       setSaveImage(emptySaveImage);
     } catch (error: unknown) {
       setSaveImage((current) => ({
@@ -635,7 +768,11 @@ function App() {
   }, [loadImage.srcPath, refreshAfterAction]);
 
   const submitCreateVolume = useCallback(async () => {
-    setCreateVolume((current) => ({ ...current, busy: true, error: undefined }));
+    setCreateVolume((current) => ({
+      ...current,
+      busy: true,
+      error: undefined,
+    }));
     try {
       await DockerService.CreateVolume({
         name: createVolume.name,
@@ -649,17 +786,31 @@ function App() {
       setCreateVolume((current) => ({
         ...current,
         busy: false,
-        error: error instanceof Error ? error.message : 'Unable to create volume',
+        error:
+          error instanceof Error ? error.message : 'Unable to create volume',
       }));
     }
-  }, [createVolume.driver, createVolume.driverOptsText, createVolume.labelsText, createVolume.name, refreshAfterAction]);
+  }, [
+    createVolume.driver,
+    createVolume.driverOptsText,
+    createVolume.labelsText,
+    createVolume.name,
+    refreshAfterAction,
+  ]);
 
   const submitCreateNetwork = useCallback(async () => {
-    setCreateNetwork((current) => ({ ...current, busy: true, error: undefined }));
+    setCreateNetwork((current) => ({
+      ...current,
+      busy: true,
+      error: undefined,
+    }));
     try {
       await DockerService.CreateNetwork({
         name: createNetwork.name,
-        driver: createNetwork.driver === 'custom' ? createNetwork.customDriver : createNetwork.driver,
+        driver:
+          createNetwork.driver === 'custom'
+            ? createNetwork.customDriver
+            : createNetwork.driver,
         subnet: createNetwork.subnet,
         gateway: createNetwork.gateway,
         internal: createNetwork.internal,
@@ -672,10 +823,79 @@ function App() {
       setCreateNetwork((current) => ({
         ...current,
         busy: false,
-        error: error instanceof Error ? error.message : 'Unable to create network',
+        error:
+          error instanceof Error ? error.message : 'Unable to create network',
       }));
     }
   }, [createNetwork, refreshAfterAction]);
+
+  const browseImportFolder = useCallback(async () => {
+    try {
+      const selected = await Dialogs.OpenFile({
+        Title: 'Import Compose Project',
+        Message: 'Choose a Compose project folder',
+        ButtonText: 'Import',
+        CanChooseDirectories: true,
+        CanChooseFiles: false,
+      });
+      const folderPath = Array.isArray(selected) ? selected[0] : selected;
+      if (folderPath) {
+        setImportProject((current) => ({
+          ...current,
+          folderPath,
+          error: undefined,
+          imported: null,
+        }));
+      }
+    } catch (error: unknown) {
+      setImportProject((current) => ({
+        ...current,
+        error:
+          error instanceof Error
+            ? error.message
+            : 'Unable to open folder picker',
+      }));
+    }
+  }, []);
+
+  const submitImportProject = useCallback(async () => {
+    const folderPath = importProject.folderPath.trim();
+    if (!folderPath) {
+      setImportProject((current) => ({
+        ...current,
+        error: 'Choose a project folder',
+      }));
+      return;
+    }
+    setImportProject((current) => ({
+      ...current,
+      busy: true,
+      error: undefined,
+      imported: null,
+    }));
+    try {
+      const detail = await ProjectService.ImportProject({
+        folderPath,
+        composeFilePaths: [],
+      });
+      setImportProject((current) => ({
+        ...current,
+        busy: false,
+        imported: detail,
+        error: undefined,
+      }));
+      await refreshProjects();
+      setActivePage('projects');
+    } catch (error: unknown) {
+      setImportProject((current) => ({
+        ...current,
+        busy: false,
+        imported: null,
+        error:
+          error instanceof Error ? error.message : 'Unable to import project',
+      }));
+    }
+  }, [importProject.folderPath, refreshProjects]);
 
   const toggleContainerSelection = useCallback((id: string) => {
     setSelectedContainerIDs((current) => {
@@ -713,113 +933,153 @@ function App() {
           title: container.name,
           subtitle: shortID(container.id),
           rows: containerRows(container),
-          error: error instanceof Error ? error.message : 'Unable to inspect container',
+          error:
+            error instanceof Error
+              ? error.message
+              : 'Unable to inspect container',
         });
       });
   }, []);
 
-  const openImageInspect = useCallback((image: ImageSummary) => {
-    setInspect({
-      open: true,
-      title: primaryImageRef(image),
-      subtitle: shortID(image.id),
-      rows: imageRows(image, imageUseCounts[image.id] ?? 0),
-      loading: true,
-    });
-    DockerService.GetImage(image.id)
-      .then((detail) => {
-        if (!detail) {
-          throw new Error('Image detail was empty');
-        }
-        setInspect({
-          open: true,
-          title: primaryImageRef(image),
-          subtitle: shortID(image.id),
-          rows: imageDetailRows(detail, imageUseCounts[image.id] ?? 0),
-          raw: JSON.stringify(detail, null, 2),
-        });
-      })
-      .catch((error: unknown) => {
-        setInspect({
-          open: true,
-          title: primaryImageRef(image),
-          subtitle: shortID(image.id),
-          rows: imageRows(image, imageUseCounts[image.id] ?? 0),
-          error: error instanceof Error ? error.message : 'Unable to inspect image',
-        });
+  const openImageInspect = useCallback(
+    (image: ImageSummary) => {
+      setInspect({
+        open: true,
+        title: primaryImageRef(image),
+        subtitle: shortID(image.id),
+        rows: imageRows(image, imageUseCounts[image.id] ?? 0),
+        loading: true,
       });
-  }, [imageUseCounts]);
+      DockerService.GetImage(image.id)
+        .then((detail) => {
+          if (!detail) {
+            throw new Error('Image detail was empty');
+          }
+          setInspect({
+            open: true,
+            title: primaryImageRef(image),
+            subtitle: shortID(image.id),
+            rows: imageDetailRows(detail, imageUseCounts[image.id] ?? 0),
+            raw: JSON.stringify(detail, null, 2),
+          });
+        })
+        .catch((error: unknown) => {
+          setInspect({
+            open: true,
+            title: primaryImageRef(image),
+            subtitle: shortID(image.id),
+            rows: imageRows(image, imageUseCounts[image.id] ?? 0),
+            error:
+              error instanceof Error
+                ? error.message
+                : 'Unable to inspect image',
+          });
+        });
+    },
+    [imageUseCounts],
+  );
 
-  const openVolumeInspect = useCallback((volume: VolumeSummary) => {
-    const detail = volumeDetails[volume.name];
-    setInspect({
-      open: true,
-      title: volume.name,
-      subtitle: volume.driver,
-      rows: volumeRows(volume, detail),
-      raw: detail ? JSON.stringify(detail, null, 2) : undefined,
-      loading: !detail,
-    });
-    if (detail) {
-      return;
-    }
-    DockerService.GetVolume(volume.name)
-      .then((nextDetail) => {
-        setInspect({
-          open: true,
-          title: volume.name,
-          subtitle: volume.driver,
-          rows: volumeRows(volume, nextDetail ?? undefined),
-          raw: nextDetail ? JSON.stringify(nextDetail, null, 2) : undefined,
-        });
-      })
-      .catch((error: unknown) => {
-        setInspect({
-          open: true,
-          title: volume.name,
-          subtitle: volume.driver,
-          rows: volumeRows(volume),
-          error: error instanceof Error ? error.message : 'Unable to inspect volume',
-        });
+  const openVolumeInspect = useCallback(
+    (volume: VolumeSummary) => {
+      const detail = volumeDetails[volume.name];
+      setInspect({
+        open: true,
+        title: volume.name,
+        subtitle: volume.driver,
+        rows: volumeRows(volume, detail),
+        raw: detail ? JSON.stringify(detail, null, 2) : undefined,
+        loading: !detail,
       });
-  }, [volumeDetails]);
+      if (detail) {
+        return;
+      }
+      DockerService.GetVolume(volume.name)
+        .then((nextDetail) => {
+          setInspect({
+            open: true,
+            title: volume.name,
+            subtitle: volume.driver,
+            rows: volumeRows(volume, nextDetail ?? undefined),
+            raw: nextDetail ? JSON.stringify(nextDetail, null, 2) : undefined,
+          });
+        })
+        .catch((error: unknown) => {
+          setInspect({
+            open: true,
+            title: volume.name,
+            subtitle: volume.driver,
+            rows: volumeRows(volume),
+            error:
+              error instanceof Error
+                ? error.message
+                : 'Unable to inspect volume',
+          });
+        });
+    },
+    [volumeDetails],
+  );
 
-  const openNetworkInspect = useCallback((network: NetworkSummary) => {
-    const detail = networkDetails[network.id];
-    setInspect({
-      open: true,
-      title: network.name,
-      subtitle: shortID(network.id),
-      rows: networkRows(network, detail),
-      raw: detail ? JSON.stringify(detail, null, 2) : undefined,
-      loading: !detail,
-    });
-    if (detail) {
-      return;
-    }
-    DockerService.GetNetwork(network.id)
-      .then((nextDetail) => {
-        setInspect({
-          open: true,
-          title: network.name,
-          subtitle: shortID(network.id),
-          rows: networkRows(network, nextDetail ?? undefined),
-          raw: nextDetail ? JSON.stringify(nextDetail, null, 2) : undefined,
-        });
-      })
-      .catch((error: unknown) => {
-        setInspect({
-          open: true,
-          title: network.name,
-          subtitle: shortID(network.id),
-          rows: networkRows(network),
-          error: error instanceof Error ? error.message : 'Unable to inspect network',
-        });
+  const openNetworkInspect = useCallback(
+    (network: NetworkSummary) => {
+      const detail = networkDetails[network.id];
+      setInspect({
+        open: true,
+        title: network.name,
+        subtitle: shortID(network.id),
+        rows: networkRows(network, detail),
+        raw: detail ? JSON.stringify(detail, null, 2) : undefined,
+        loading: !detail,
       });
-  }, [networkDetails]);
+      if (detail) {
+        return;
+      }
+      DockerService.GetNetwork(network.id)
+        .then((nextDetail) => {
+          setInspect({
+            open: true,
+            title: network.name,
+            subtitle: shortID(network.id),
+            rows: networkRows(network, nextDetail ?? undefined),
+            raw: nextDetail ? JSON.stringify(nextDetail, null, 2) : undefined,
+          });
+        })
+        .catch((error: unknown) => {
+          setInspect({
+            open: true,
+            title: network.name,
+            subtitle: shortID(network.id),
+            rows: networkRows(network),
+            error:
+              error instanceof Error
+                ? error.message
+                : 'Unable to inspect network',
+          });
+        });
+    },
+    [networkDetails],
+  );
 
   const content = (() => {
     switch (activePage) {
+      case 'projects':
+        return (
+          <ProjectsPage
+            error={projectsError}
+            filter={projectFilter}
+            loading={projectsStatus === 'loading'}
+            onFilterChange={setProjectFilter}
+            onImport={() =>
+              setImportProject({ ...emptyImportProject, open: true })
+            }
+            onRefresh={refreshProjects}
+            onSortChange={setProjectSort}
+            onViewChange={changeProjectView}
+            projects={projects}
+            search={search}
+            sort={projectSort}
+            view={projectView}
+          />
+        );
       case 'containers':
         return (
           <ContainersPage
@@ -858,7 +1118,9 @@ function App() {
           <VolumesPage
             filter={volumeFilter}
             loading={inventoryStatus === 'loading'}
-            onCreate={() => setCreateVolume({ ...emptyCreateVolume, open: true })}
+            onCreate={() =>
+              setCreateVolume({ ...emptyCreateVolume, open: true })
+            }
             onFilterChange={setVolumeFilter}
             onInspect={openVolumeInspect}
             search={search}
@@ -872,7 +1134,9 @@ function App() {
             loading={inventoryStatus === 'loading'}
             networkDetails={networkDetails}
             networks={networks}
-            onCreate={() => setCreateNetwork({ ...emptyCreateNetwork, open: true })}
+            onCreate={() =>
+              setCreateNetwork({ ...emptyCreateNetwork, open: true })
+            }
             onInspect={openNetworkInspect}
             search={search}
           />
@@ -898,26 +1162,38 @@ function App() {
 
   return (
     <main className="min-h-screen bg-bg-app text-text-primary">
-      <div className="grid min-h-screen grid-cols-[236px_1fr]">
-        <aside className="flex min-h-screen flex-col border-r border-border bg-bg-panel">
+      <div className="grid min-h-screen grid-cols-1 lg:grid-cols-[236px_1fr]">
+        <aside className="flex flex-col border-b border-border bg-bg-panel lg:min-h-screen lg:border-b-0 lg:border-r">
           <div className="flex h-16 items-center gap-3 border-b border-border px-4">
-            <img src={logoUrl} alt="Cairn" className="h-9 max-w-32 object-contain" />
+            <img
+              src={logoUrl}
+              alt="Cairn"
+              className="h-9 max-w-32 object-contain"
+            />
             <div className="min-w-0">
               <div className="text-sm font-semibold">Cairn</div>
-              <div className="truncate text-xs text-text-muted">{versionLabel}</div>
+              <div className="truncate text-xs text-text-muted">
+                {versionLabel}
+              </div>
             </div>
           </div>
 
-          <nav className="flex-1 space-y-1 px-2 py-3" aria-label="Main navigation">
+          <nav
+            className="flex gap-2 overflow-x-auto px-2 py-3 lg:flex-1 lg:flex-col lg:space-y-1 lg:overflow-visible"
+            aria-label="Main navigation"
+          >
             {navItems.map((item) => {
               const Icon = item.icon;
               const active = activePage === item.id;
-              const badge = item.id === 'containers' ? String(containers.length) : undefined;
+              const badge =
+                item.id === 'containers'
+                  ? String(containers.length)
+                  : undefined;
               return (
                 <button
                   key={item.id}
                   className={[
-                    'flex h-10 w-full items-center gap-3 rounded-control px-3 text-left text-sm transition',
+                    'flex h-10 w-auto shrink-0 items-center gap-3 rounded-control px-3 text-left text-sm transition lg:w-full',
                     active
                       ? 'bg-accent/10 text-accent shadow-[inset_3px_0_0_rgb(45_212_167)]'
                       : 'text-text-secondary hover:bg-bg-card hover:text-text-primary',
@@ -933,46 +1209,69 @@ function App() {
             })}
           </nav>
 
-          <div className="border-t border-border p-3">
+          <div className="hidden border-t border-border p-3 lg:block">
             <div className="rounded-card border border-border bg-bg-inset p-3">
               <div className="flex items-center gap-2 text-sm">
                 <StatusDot tone={dockerRunning ? 'ok' : 'neutral'} />
                 <span className="font-medium">Docker Engine</span>
-                <span className="ml-auto text-xs text-text-muted">{statusLabel}</span>
+                <span className="ml-auto text-xs text-text-muted">
+                  {statusLabel}
+                </span>
               </div>
-              <div className="mt-2 truncate font-mono text-xs text-text-muted">{providerName}</div>
+              <div className="mt-2 truncate font-mono text-xs text-text-muted">
+                {providerName}
+              </div>
               <div className="mt-2 truncate text-xs text-text-muted">
-                {dockerVersion?.serverVersion ? `Engine ${dockerVersion.serverVersion}` : 'No engine version'}
+                {dockerVersion?.serverVersion
+                  ? `Engine ${dockerVersion.serverVersion}`
+                  : 'No engine version'}
               </div>
             </div>
           </div>
         </aside>
 
         <section className="flex min-w-0 flex-col">
-          <header className="flex h-16 shrink-0 items-center justify-between border-b border-border bg-bg-app px-6">
+          <header className="flex h-auto shrink-0 flex-col items-stretch gap-3 border-b border-border bg-bg-app px-4 py-3 sm:flex-row sm:items-center sm:justify-between lg:h-16 lg:px-6 lg:py-0">
             <div className="min-w-0">
-              <h1 className="truncate text-xl font-semibold tracking-normal">{pageTitle}</h1>
+              <h1 className="truncate text-xl font-semibold tracking-normal">
+                {pageTitle}
+              </h1>
               <p className="truncate text-sm text-text-muted">
                 {dockerInfo?.name ?? providerName}
-                {lastLoadedAt ? ` - refreshed ${relativeTime(lastLoadedAt)}` : ''}
+                {lastLoadedAt
+                  ? ` - refreshed ${relativeTime(lastLoadedAt)}`
+                  : ''}
               </p>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex w-full items-center gap-2 sm:w-auto">
               <SearchBox value={search} onChange={setSearch} />
               <Tooltip label="Refresh">
                 <Button
                   aria-label="Refresh"
                   icon={<RefreshCw size={17} />}
-                  loading={inventoryStatus === 'loading'}
+                  loading={
+                    activePage === 'projects'
+                      ? projectsStatus === 'loading'
+                      : inventoryStatus === 'loading'
+                  }
                   onClick={() => {
-                    void refreshInventory();
+                    if (activePage === 'projects') {
+                      void refreshProjects();
+                    } else {
+                      void refreshInventory();
+                    }
                   }}
                   size="icon"
                   variant="secondary"
                 />
               </Tooltip>
               <Tooltip label="Notifications">
-                <Button aria-label="Notifications" icon={<Bell size={17} />} size="icon" variant="secondary" />
+                <Button
+                  aria-label="Notifications"
+                  icon={<Bell size={17} />}
+                  size="icon"
+                  variant="secondary"
+                />
               </Tooltip>
             </div>
           </header>
@@ -992,13 +1291,18 @@ function App() {
         </section>
       </div>
 
-      <InspectModal inspect={inspect} onClose={() => setInspect(emptyInspect)} />
+      <InspectModal
+        inspect={inspect}
+        onClose={() => setInspect(emptyInspect)}
+      />
       <ConfirmPlanModal
         confirm={confirm}
         onApply={() => {
           void applyConfirmedPlan();
         }}
-        onChangeTypedName={(typedName) => setConfirm((current) => ({ ...current, typedName }))}
+        onChangeTypedName={(typedName) =>
+          setConfirm((current) => ({ ...current, typedName }))
+        }
         onClose={() => setConfirm(emptyConfirm)}
       />
       <RenameContainerModal
@@ -1011,9 +1315,16 @@ function App() {
       />
       <RunImageModal
         networks={networks}
-        onAddAutoPort={() => setRunImage((current) => ({ ...current, portsText: appendLine(current.portsText, '0:80/tcp') }))}
+        onAddAutoPort={() =>
+          setRunImage((current) => ({
+            ...current,
+            portsText: appendLine(current.portsText, '0:80/tcp'),
+          }))
+        }
         onBack={() => setRunImage((current) => ({ ...current, step: 1 }))}
-        onChange={(patch) => setRunImage((current) => ({ ...current, ...patch }))}
+        onChange={(patch) =>
+          setRunImage((current) => ({ ...current, ...patch }))
+        }
         onClose={() => setRunImage(emptyRunImage)}
         onSelectHubResult={(result) =>
           setRunImage((current) => ({
@@ -1026,7 +1337,11 @@ function App() {
         }
         onSubmit={() => {
           if (runImage.step === 1) {
-            setRunImage((current) => ({ ...current, step: 2, error: undefined }));
+            setRunImage((current) => ({
+              ...current,
+              step: 2,
+              error: undefined,
+            }));
             return;
           }
           void submitRunImage();
@@ -1034,7 +1349,9 @@ function App() {
         state={runImage}
       />
       <PullImageModal
-        onChange={(patch) => setPullImage((current) => ({ ...current, ...patch }))}
+        onChange={(patch) =>
+          setPullImage((current) => ({ ...current, ...patch }))
+        }
         onClose={() => setPullImage(emptyPullImage)}
         onSelectResult={(result) =>
           setPullImage((current) => ({
@@ -1050,7 +1367,9 @@ function App() {
         state={pullImage}
       />
       <SaveImageModal
-        onChange={(patch) => setSaveImage((current) => ({ ...current, ...patch }))}
+        onChange={(patch) =>
+          setSaveImage((current) => ({ ...current, ...patch }))
+        }
         onClose={() => setSaveImage(emptySaveImage)}
         onSubmit={() => {
           void submitSaveImage();
@@ -1058,7 +1377,9 @@ function App() {
         state={saveImage}
       />
       <LoadImageModal
-        onChange={(patch) => setLoadImage((current) => ({ ...current, ...patch }))}
+        onChange={(patch) =>
+          setLoadImage((current) => ({ ...current, ...patch }))
+        }
         onClose={() => setLoadImage(emptyLoadImage)}
         onSubmit={() => {
           void submitLoadImage();
@@ -1066,7 +1387,9 @@ function App() {
         state={loadImage}
       />
       <CreateVolumeModal
-        onChange={(patch) => setCreateVolume((current) => ({ ...current, ...patch }))}
+        onChange={(patch) =>
+          setCreateVolume((current) => ({ ...current, ...patch }))
+        }
         onClose={() => setCreateVolume(emptyCreateVolume)}
         onSubmit={() => {
           void submitCreateVolume();
@@ -1074,12 +1397,32 @@ function App() {
         state={createVolume}
       />
       <CreateNetworkModal
-        onChange={(patch) => setCreateNetwork((current) => ({ ...current, ...patch }))}
+        onChange={(patch) =>
+          setCreateNetwork((current) => ({ ...current, ...patch }))
+        }
         onClose={() => setCreateNetwork(emptyCreateNetwork)}
         onSubmit={() => {
           void submitCreateNetwork();
         }}
         state={createNetwork}
+      />
+      <ImportProjectModal
+        onBrowse={() => {
+          void browseImportFolder();
+        }}
+        onChange={(folderPath) =>
+          setImportProject((current) => ({
+            ...current,
+            folderPath,
+            error: undefined,
+            imported: null,
+          }))
+        }
+        onClose={() => setImportProject(emptyImportProject)}
+        onSubmit={() => {
+          void submitImportProject();
+        }}
+        state={importProject}
       />
     </main>
   );
@@ -1120,48 +1463,106 @@ function OverviewPage({
           <CardBody className="flex items-center justify-between">
             <div className="min-w-0">
               <div className="flex items-center gap-3">
-                <StatusDot pulse={!dockerRunning && provider?.healthy} tone={dockerRunning ? 'ok' : 'neutral'} />
+                <StatusDot
+                  pulse={!dockerRunning && provider?.healthy}
+                  tone={dockerRunning ? 'ok' : 'neutral'}
+                />
                 <div>
-                  <div className="text-lg font-semibold">Docker Engine - {dockerRunning ? 'Running' : 'Stopped'}</div>
-                  <div className="text-sm text-text-muted">{provider?.name ?? 'No provider selected'}</div>
+                  <div className="text-lg font-semibold">
+                    Docker Engine - {dockerRunning ? 'Running' : 'Stopped'}
+                  </div>
+                  <div className="text-sm text-text-muted">
+                    {provider?.name ?? 'No provider selected'}
+                  </div>
                 </div>
               </div>
               <div className="mt-4 grid grid-cols-3 gap-3 text-sm">
                 <StatusPill label="Provider" ok={provider?.healthy ?? false} />
                 <StatusPill label="Docker" ok={dockerRunning} />
-                <StatusPill label="Inventory" ok={containers.length + images.length + volumes.length + networks.length > 0} />
+                <StatusPill
+                  label="Inventory"
+                  ok={
+                    containers.length +
+                      images.length +
+                      volumes.length +
+                      networks.length >
+                    0
+                  }
+                />
               </div>
             </div>
             <Server className="h-16 w-16 text-accent/70" strokeWidth={1.4} />
           </CardBody>
         </Card>
 
-        <section className="grid grid-cols-2 gap-3" aria-label="Docker object counts">
-          <MetricButton label="Containers" value={containers.length} hint={`${runningContainers} running`} onClick={() => onNavigate('containers')} />
-          <MetricButton label="Images" value={images.length} hint={`${imageDanglingCount(images)} dangling`} onClick={() => onNavigate('images')} />
-          <MetricButton label="Volumes" value={volumes.length} hint={`${volumes.filter((volume) => volume.inUse).length} in use`} onClick={() => onNavigate('volumes')} />
-          <MetricButton label="Networks" value={networks.length} hint={`${networks.filter((network) => network.internal).length} internal`} onClick={() => onNavigate('networks')} />
+        <section
+          className="grid grid-cols-2 gap-3"
+          aria-label="Docker object counts"
+        >
+          <MetricButton
+            label="Containers"
+            value={containers.length}
+            hint={`${runningContainers} running`}
+            onClick={() => onNavigate('containers')}
+          />
+          <MetricButton
+            label="Images"
+            value={images.length}
+            hint={`${imageDanglingCount(images)} dangling`}
+            onClick={() => onNavigate('images')}
+          />
+          <MetricButton
+            label="Volumes"
+            value={volumes.length}
+            hint={`${volumes.filter((volume) => volume.inUse).length} in use`}
+            onClick={() => onNavigate('volumes')}
+          />
+          <MetricButton
+            label="Networks"
+            value={networks.length}
+            hint={`${networks.filter((network) => network.internal).length} internal`}
+            onClick={() => onNavigate('networks')}
+          />
         </section>
       </section>
 
       <section className="grid grid-cols-[1fr_360px] gap-4">
         <Card>
           <CardHeader
-            actions={<Badge tone={unhealthyContainers > 0 ? 'error' : 'ok'}>{unhealthyContainers} unhealthy</Badge>}
+            actions={
+              <Badge tone={unhealthyContainers > 0 ? 'error' : 'ok'}>
+                {unhealthyContainers} unhealthy
+              </Badge>
+            }
             title="Container Status"
           />
           <CardBody>
             <div className="grid grid-cols-3 gap-3">
-              <StatusBlock label="Running" tone="ok" value={runningContainers} />
+              <StatusBlock
+                label="Running"
+                tone="ok"
+                value={runningContainers}
+              />
               <StatusBlock label="Stopped" tone="neutral" value={stopped} />
-              <StatusBlock label="Unhealthy" tone={unhealthyContainers > 0 ? 'error' : 'neutral'} value={unhealthyContainers} />
+              <StatusBlock
+                label="Unhealthy"
+                tone={unhealthyContainers > 0 ? 'error' : 'neutral'}
+                value={unhealthyContainers}
+              />
             </div>
             <div className="mt-5 space-y-2">
               {containers.slice(0, 6).map((container) => (
-                <div className="grid grid-cols-[1fr_auto_auto] items-center gap-3 text-sm" key={container.id}>
+                <div
+                  className="grid grid-cols-[1fr_auto_auto] items-center gap-3 text-sm"
+                  key={container.id}
+                >
                   <div className="min-w-0 truncate">{container.name}</div>
-                  <Badge tone={containerTone(container)}>{container.state || 'unknown'}</Badge>
-                  <span className="text-xs text-text-muted">{formatBytes(container.memoryBytes)}</span>
+                  <Badge tone={containerTone(container)}>
+                    {container.state || 'unknown'}
+                  </Badge>
+                  <span className="text-xs text-text-muted">
+                    {formatBytes(container.memoryBytes)}
+                  </span>
                 </div>
               ))}
               {containers.length === 0 ? (
@@ -1176,12 +1577,24 @@ function OverviewPage({
         </Card>
 
         <Card>
-          <CardHeader actions={<HardDrive size={16} className="text-text-muted" />} title="Disk Usage" />
+          <CardHeader
+            actions={<HardDrive size={16} className="text-text-muted" />}
+            title="Disk Usage"
+          />
           <CardBody>
-            <div className="text-3xl font-semibold">{formatBytes(diskTotal)}</div>
-            <div className="mt-1 text-sm text-text-muted">{formatBytes(diskReclaimable)} reclaimable</div>
+            <div className="text-3xl font-semibold">
+              {formatBytes(diskTotal)}
+            </div>
+            <div className="mt-1 text-sm text-text-muted">
+              {formatBytes(diskReclaimable)} reclaimable
+            </div>
             <div className="mt-5 h-3 overflow-hidden rounded-full bg-bg-inset">
-              <div className="h-full bg-accent" style={{ width: `${diskTotal > 0 ? Math.max(8, ((diskTotal - diskReclaimable) / diskTotal) * 100) : 0}%` }} />
+              <div
+                className="h-full bg-accent"
+                style={{
+                  width: `${diskTotal > 0 ? Math.max(8, ((diskTotal - diskReclaimable) / diskTotal) * 100) : 0}%`,
+                }}
+              />
             </div>
             <div className="mt-5 grid grid-cols-2 gap-2 text-xs text-text-muted">
               <span>Images {images.length}</span>
@@ -1192,6 +1605,385 @@ function OverviewPage({
           </CardBody>
         </Card>
       </section>
+    </div>
+  );
+}
+
+type ProjectsPageProps = {
+  projects: ProjectSummary[];
+  filter: FilterID;
+  search: string;
+  sort: ProjectSortID;
+  view: ProjectViewMode;
+  loading: boolean;
+  error: string | null;
+  onFilterChange: (filter: FilterID) => void;
+  onSortChange: (sort: ProjectSortID) => void;
+  onViewChange: (view: ProjectViewMode) => void;
+  onImport: () => void;
+  onRefresh: () => void;
+};
+
+function ProjectsPage({
+  error,
+  filter,
+  loading,
+  onFilterChange,
+  onImport,
+  onRefresh,
+  onSortChange,
+  onViewChange,
+  projects,
+  search,
+  sort,
+  view,
+}: ProjectsPageProps) {
+  const filtered = useMemo(
+    () => sortProjects(filterProjects(projects, search, filter), sort),
+    [filter, projects, search, sort],
+  );
+  if (loading && projects.length === 0) {
+    return <TableSkeleton />;
+  }
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <FilterChips
+          active={filter}
+          items={[
+            ['all', 'All', projects.length],
+            [
+              'running',
+              'Running',
+              projects.filter((project) => project.status === 'running').length,
+            ],
+            [
+              'stopped',
+              'Stopped',
+              projects.filter((project) => project.status === 'stopped').length,
+            ],
+            [
+              'partial',
+              'Partial',
+              projects.filter((project) => project.status === 'partial').length,
+            ],
+            [
+              'unhealthy',
+              'Unhealthy',
+              projects.filter((project) => project.health === 'unhealthy')
+                .length,
+            ],
+            [
+              'updates',
+              'Updates available',
+              projects.filter((project) => projectUpdateCount(project) > 0)
+                .length,
+            ],
+            [
+              'high-cpu',
+              'High CPU',
+              projects.filter((project) => project.cpuPercent >= 80).length,
+            ],
+            [
+              'recent',
+              'Recently changed',
+              projects.filter((project) =>
+                isRecentlyChanged(project.lastChangedAt),
+              ).length,
+            ],
+          ]}
+          onChange={onFilterChange}
+        />
+        <div className="flex flex-wrap items-center gap-2">
+          <select
+            aria-label="Sort projects"
+            className="h-9 rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
+            onChange={(event) =>
+              onSortChange(event.target.value as ProjectSortID)
+            }
+            value={sort}
+          >
+            <option value="name">Name</option>
+            <option value="activity">Activity</option>
+            <option value="cpu">CPU</option>
+          </select>
+          <div className="flex rounded-control border border-border bg-bg-inset p-0.5">
+            <Tooltip label="Grid view">
+              <Button
+                aria-label="Grid view"
+                icon={<LayoutGrid size={16} />}
+                onClick={() => onViewChange('grid')}
+                size="icon"
+                variant={view === 'grid' ? 'secondary' : 'ghost'}
+              />
+            </Tooltip>
+            <Tooltip label="List view">
+              <Button
+                aria-label="List view"
+                icon={<List size={16} />}
+                onClick={() => onViewChange('list')}
+                size="icon"
+                variant={view === 'list' ? 'secondary' : 'ghost'}
+              />
+            </Tooltip>
+          </div>
+          <Button
+            icon={<Plus size={16} />}
+            onClick={onImport}
+            variant="primary"
+          >
+            Import Project
+          </Button>
+        </div>
+      </div>
+
+      {error ? (
+        <div className="rounded-card border border-error/30 bg-error/10 px-4 py-3 text-sm text-error">
+          {error}
+        </div>
+      ) : null}
+
+      {filtered.length === 0 ? (
+        <EmptyState
+          body="Import a Compose project or refresh after starting one from the Docker CLI."
+          icon={<LayoutGrid size={28} />}
+          title="No projects found"
+        />
+      ) : view === 'grid' ? (
+        <section
+          className="grid grid-cols-[repeat(auto-fill,minmax(320px,1fr))] gap-4"
+          aria-label="Compose projects"
+        >
+          {filtered.map((project) => (
+            <ProjectCard key={project.id} project={project} />
+          ))}
+        </section>
+      ) : (
+        <ProjectList projects={filtered} />
+      )}
+
+      <div className="flex justify-end">
+        <Button
+          icon={<RefreshCw size={16} />}
+          loading={loading}
+          onClick={onRefresh}
+        >
+          Refresh Projects
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function ProjectCard({ project }: { project: ProjectSummary }) {
+  const updates = projectUpdateCount(project);
+  const workdirMissing = project.status === 'error';
+  return (
+    <Card>
+      <CardBody className="space-y-4">
+        <div className="flex items-start gap-3">
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-control bg-accent/10 text-accent">
+            <LayoutGrid size={19} />
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="flex items-center gap-2">
+              <h2 className="truncate text-base font-semibold">
+                {project.name}
+              </h2>
+              <Badge tone={projectStatusTone(project.status)}>
+                {project.status || 'unknown'}
+              </Badge>
+            </div>
+            <div className="mt-1 truncate text-xs text-text-muted">
+              {project.workingDir || 'No workdir'}
+            </div>
+          </div>
+          <Tooltip label="More">
+            <Button
+              aria-label={`More actions for ${project.name}`}
+              icon={<MoreVertical size={16} />}
+              size="icon"
+              variant="ghost"
+            />
+          </Tooltip>
+        </div>
+
+        <div className="grid grid-cols-3 gap-2 text-sm">
+          <MiniMetric
+            label="Services"
+            value={`${project.servicesRunning}/${project.servicesTotal}`}
+          />
+          <MiniMetric label="CPU" value={`${project.cpuPercent.toFixed(1)}%`} />
+          <MiniMetric label="RAM" value={formatBytes(project.memoryBytes)} />
+        </div>
+
+        <div className="h-10 overflow-hidden rounded-control border border-border bg-bg-inset px-2 py-2">
+          <div className="flex h-full items-end gap-1">
+            {sparkBars(project.id).map((height, index) => (
+              <span
+                className="flex-1 rounded-sm bg-accent/50"
+                key={index}
+                style={{ height: `${height}%` }}
+              />
+            ))}
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge tone={healthTone(project.health)}>
+            {project.health || 'unknown'}
+          </Badge>
+          {updates > 0 ? (
+            <Badge tone="warn">{updates} updates</Badge>
+          ) : (
+            <Badge tone="neutral">0 updates</Badge>
+          )}
+          {workdirMissing ? <Badge tone="warn">Workdir missing</Badge> : null}
+          <PortList ports={project.ports ?? []} />
+        </div>
+
+        <div className="flex items-center gap-1 border-t border-border pt-3">
+          <Tooltip label={project.status === 'running' ? 'Stop' : 'Start'}>
+            <Button
+              aria-label={`${project.status === 'running' ? 'Stop' : 'Start'} ${project.name}`}
+              disabled
+              disabledReason="Unavailable"
+              icon={
+                project.status === 'running' ? (
+                  <Square size={15} />
+                ) : (
+                  <Play size={15} />
+                )
+              }
+              size="icon"
+              variant="ghost"
+            />
+          </Tooltip>
+          <Tooltip label="Restart">
+            <Button
+              aria-label={`Restart ${project.name}`}
+              disabled
+              disabledReason="Unavailable"
+              icon={<RotateCw size={15} />}
+              size="icon"
+              variant="ghost"
+            />
+          </Tooltip>
+          <Tooltip label="Open folder">
+            <Button
+              aria-label={`Open folder ${project.name}`}
+              disabled={!project.workingDir}
+              icon={<FolderOpen size={15} />}
+              size="icon"
+              variant="ghost"
+            />
+          </Tooltip>
+          <span className="ml-auto text-xs text-text-muted">
+            {relativeTime(dateMillis(project.lastChangedAt))}
+          </span>
+        </div>
+      </CardBody>
+    </Card>
+  );
+}
+
+function ProjectList({ projects }: { projects: ProjectSummary[] }) {
+  return (
+    <DataTable
+      columns={[
+        {
+          id: 'name',
+          header: 'Name',
+          render: (project) => (
+            <span className="font-medium text-text-primary">
+              {project.name}
+            </span>
+          ),
+          sortValue: (project) => project.name,
+          sortable: true,
+        },
+        {
+          id: 'status',
+          header: 'Status',
+          render: (project) => (
+            <Badge tone={projectStatusTone(project.status)}>
+              {project.status}
+            </Badge>
+          ),
+          sortValue: (project) => project.status,
+          sortable: true,
+        },
+        {
+          id: 'services',
+          header: 'Services',
+          render: (project) =>
+            `${project.servicesRunning}/${project.servicesTotal}`,
+          sortValue: (project) => project.servicesTotal,
+          sortable: true,
+        },
+        {
+          id: 'health',
+          header: 'Health',
+          render: (project) => (
+            <Badge tone={healthTone(project.health)}>{project.health}</Badge>
+          ),
+          sortValue: (project) => project.health,
+          sortable: true,
+        },
+        {
+          id: 'cpu',
+          header: 'CPU',
+          render: (project) => `${project.cpuPercent.toFixed(1)}%`,
+          sortValue: (project) => project.cpuPercent,
+          sortable: true,
+        },
+        {
+          id: 'ram',
+          header: 'RAM',
+          render: (project) => formatBytes(project.memoryBytes),
+          sortValue: (project) => project.memoryBytes,
+          sortable: true,
+        },
+        {
+          id: 'ports',
+          header: 'Ports',
+          render: (project) => <PortList ports={project.ports ?? []} />,
+        },
+        {
+          id: 'changed',
+          header: 'Last changed',
+          render: (project) => relativeTime(dateMillis(project.lastChangedAt)),
+          sortValue: (project) => dateMillis(project.lastChangedAt),
+          sortable: true,
+        },
+        {
+          id: 'workdir',
+          header: 'Workdir',
+          render: (project) => project.workingDir || '-',
+          sortValue: (project) => project.workingDir || '',
+          sortable: true,
+        },
+      ]}
+      empty={
+        <EmptyState
+          body="Import a Compose project to populate this list."
+          icon={<LayoutGrid size={28} />}
+          title="No projects found"
+        />
+      }
+      getRowID={(project) => project.id}
+      rows={projects}
+    />
+  );
+}
+
+function MiniMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-control border border-border bg-bg-inset px-2 py-2">
+      <div className="text-[11px] uppercase text-text-muted">{label}</div>
+      <div className="mt-1 truncate text-sm font-medium text-text-primary">
+        {value}
+      </div>
     </div>
   );
 }
@@ -1238,11 +2030,35 @@ function ContainersPage({
         active={filter}
         items={[
           ['all', 'All', containers.length],
-          ['running', 'Running', containers.filter((container) => container.state === 'running').length],
-          ['stopped', 'Stopped', containers.filter((container) => container.state === 'exited').length],
-          ['paused', 'Paused', containers.filter((container) => container.state === 'paused').length],
-          ['unhealthy', 'Unhealthy', containers.filter((container) => container.health === 'unhealthy').length],
-          ['ungrouped', 'Ungrouped', containers.filter((container) => !container.projectID).length],
+          [
+            'running',
+            'Running',
+            containers.filter((container) => container.state === 'running')
+              .length,
+          ],
+          [
+            'stopped',
+            'Stopped',
+            containers.filter((container) => container.state === 'exited')
+              .length,
+          ],
+          [
+            'paused',
+            'Paused',
+            containers.filter((container) => container.state === 'paused')
+              .length,
+          ],
+          [
+            'unhealthy',
+            'Unhealthy',
+            containers.filter((container) => container.health === 'unhealthy')
+              .length,
+          ],
+          [
+            'ungrouped',
+            'Ungrouped',
+            containers.filter((container) => !container.projectID).length,
+          ],
         ]}
         onChange={onFilterChange}
       />
@@ -1253,8 +2069,12 @@ function ContainersPage({
             header: 'Name',
             render: (container) => (
               <div className="min-w-0">
-                <div className="truncate text-text-primary">{container.name}</div>
-                <div className="truncate text-xs text-text-muted">{container.service || shortID(container.id)}</div>
+                <div className="truncate text-text-primary">
+                  {container.name}
+                </div>
+                <div className="truncate text-xs text-text-muted">
+                  {container.service || shortID(container.id)}
+                </div>
               </div>
             ),
             sortable: true,
@@ -1263,7 +2083,11 @@ function ContainersPage({
           {
             id: 'status',
             header: 'Status',
-            render: (container) => <Badge tone={containerTone(container)}>{container.state || 'unknown'}</Badge>,
+            render: (container) => (
+              <Badge tone={containerTone(container)}>
+                {container.state || 'unknown'}
+              </Badge>
+            ),
             sortable: true,
             sortValue: (container) => container.state,
           },
@@ -1277,7 +2101,9 @@ function ContainersPage({
           {
             id: 'image',
             header: 'Image',
-            render: (container) => <span title={container.image}>{container.image}</span>,
+            render: (container) => (
+              <span title={container.image}>{container.image}</span>
+            ),
             sortable: true,
             sortValue: (container) => container.image,
           },
@@ -1289,21 +2115,34 @@ function ContainersPage({
           {
             id: 'memory',
             header: 'Memory',
-            render: (container) => formatMemory(container.memoryBytes, container.memoryLimit),
+            render: (container) =>
+              formatMemory(container.memoryBytes, container.memoryLimit),
             sortable: true,
             sortValue: (container) => container.memoryBytes ?? 0,
           },
           {
             id: 'health',
             header: 'Health',
-            render: (container) => <Badge tone={healthTone(container.health)}>{container.health || 'unknown'}</Badge>,
+            render: (container) => (
+              <Badge tone={healthTone(container.health)}>
+                {container.health || 'unknown'}
+              </Badge>
+            ),
             sortable: true,
             sortValue: (container) => container.health,
           },
           {
             id: 'restarts',
             header: 'Restarts',
-            render: (container) => <span className={(container.restarts ?? 0) > 3 ? 'text-error' : undefined}>{container.restarts ?? 0}</span>,
+            render: (container) => (
+              <span
+                className={
+                  (container.restarts ?? 0) > 3 ? 'text-error' : undefined
+                }
+              >
+                {container.restarts ?? 0}
+              </span>
+            ),
             sortable: true,
             sortValue: (container) => container.restarts ?? 0,
           },
@@ -1321,7 +2160,12 @@ function ContainersPage({
             ),
           },
         ]}
-        bulkActions={<ContainerBulkActions busyIDs={actionBusyIDs} onAction={onBulkAction} />}
+        bulkActions={
+          <ContainerBulkActions
+            busyIDs={actionBusyIDs}
+            onAction={onBulkAction}
+          />
+        }
         empty={
           <EmptyState
             body="Run your first container or import a Compose project."
@@ -1365,7 +2209,10 @@ function ImagesPage({
   onSave,
   search,
 }: ImagesPageProps) {
-  const filtered = useMemo(() => filterImages(images, imageUseCounts, search, filter), [filter, imageUseCounts, images, search]);
+  const filtered = useMemo(
+    () => filterImages(images, imageUseCounts, search, filter),
+    [filter, imageUseCounts, images, search],
+  );
   if (loading && images.length === 0) {
     return <TableSkeleton />;
   }
@@ -1376,21 +2223,53 @@ function ImagesPage({
           active={filter}
           items={[
             ['all', 'All', images.length],
-            ['in-use', 'In use', images.filter((image) => (imageUseCounts[image.id] ?? 0) > 0 || image.inUse).length],
-            ['unused', 'Unused', images.filter((image) => (imageUseCounts[image.id] ?? 0) === 0 && !image.inUse).length],
+            [
+              'in-use',
+              'In use',
+              images.filter(
+                (image) => (imageUseCounts[image.id] ?? 0) > 0 || image.inUse,
+              ).length,
+            ],
+            [
+              'unused',
+              'Unused',
+              images.filter(
+                (image) =>
+                  (imageUseCounts[image.id] ?? 0) === 0 && !image.inUse,
+              ).length,
+            ],
             ['dangling', 'Dangling', imageDanglingCount(images)],
-            ['updates', 'Update available', images.filter((image) => image.updateStatus && image.updateStatus !== 'unknown').length],
+            [
+              'updates',
+              'Update available',
+              images.filter(
+                (image) =>
+                  image.updateStatus && image.updateStatus !== 'unknown',
+              ).length,
+            ],
           ]}
           onChange={onFilterChange}
         />
         <div className="flex items-center gap-2">
-          <Button icon={<Download size={15} />} onClick={onPull} variant="secondary">
+          <Button
+            icon={<Download size={15} />}
+            onClick={onPull}
+            variant="secondary"
+          >
             Pull image
           </Button>
-          <Button icon={<Upload size={15} />} onClick={onLoad} variant="secondary">
+          <Button
+            icon={<Upload size={15} />}
+            onClick={onLoad}
+            variant="secondary"
+          >
             Load tar
           </Button>
-          <Button icon={<PackagePlus size={15} />} onClick={() => onRun()} variant="primary">
+          <Button
+            icon={<PackagePlus size={15} />}
+            onClick={() => onRun()}
+            variant="primary"
+          >
             Run image
           </Button>
         </div>
@@ -1435,12 +2314,26 @@ function ImagesPage({
           {
             id: 'used-by',
             header: 'Used by',
-            render: (image) => <Badge tone={(imageUseCounts[image.id] ?? 0) > 0 || image.inUse ? 'accent' : 'neutral'}>{imageUseCounts[image.id] ?? (image.inUse ? '>=1' : 0)}</Badge>,
+            render: (image) => (
+              <Badge
+                tone={
+                  (imageUseCounts[image.id] ?? 0) > 0 || image.inUse
+                    ? 'accent'
+                    : 'neutral'
+                }
+              >
+                {imageUseCounts[image.id] ?? (image.inUse ? '>=1' : 0)}
+              </Badge>
+            ),
           },
           {
             id: 'update',
             header: 'Update',
-            render: (image) => <Badge tone={updateTone(image.updateStatus)}>{image.updateStatus || 'unknown'}</Badge>,
+            render: (image) => (
+              <Badge tone={updateTone(image.updateStatus)}>
+                {image.updateStatus || 'unknown'}
+              </Badge>
+            ),
           },
           {
             id: 'actions',
@@ -1480,8 +2373,20 @@ type VolumesPageProps = {
   onInspect: (volume: VolumeSummary) => void;
 };
 
-function VolumesPage({ filter, loading, onCreate, onFilterChange, onInspect, search, volumeDetails, volumes }: VolumesPageProps) {
-  const filtered = useMemo(() => filterVolumes(volumes, search, filter), [filter, search, volumes]);
+function VolumesPage({
+  filter,
+  loading,
+  onCreate,
+  onFilterChange,
+  onInspect,
+  search,
+  volumeDetails,
+  volumes,
+}: VolumesPageProps) {
+  const filtered = useMemo(
+    () => filterVolumes(volumes, search, filter),
+    [filter, search, volumes],
+  );
   if (loading && volumes.length === 0) {
     return <TableSkeleton />;
   }
@@ -1492,8 +2397,16 @@ function VolumesPage({ filter, loading, onCreate, onFilterChange, onInspect, sea
           active={filter}
           items={[
             ['all', 'All', volumes.length],
-            ['in-use', 'In use', volumes.filter((volume) => volume.inUse).length],
-            ['unused', 'Unused', volumes.filter((volume) => !volume.inUse).length],
+            [
+              'in-use',
+              'In use',
+              volumes.filter((volume) => volume.inUse).length,
+            ],
+            [
+              'unused',
+              'Unused',
+              volumes.filter((volume) => !volume.inUse).length,
+            ],
           ]}
           onChange={onFilterChange}
         />
@@ -1506,7 +2419,9 @@ function VolumesPage({ filter, loading, onCreate, onFilterChange, onInspect, sea
           {
             id: 'name',
             header: 'Name',
-            render: (volume) => <span className="text-text-primary">{volume.name}</span>,
+            render: (volume) => (
+              <span className="text-text-primary">{volume.name}</span>
+            ),
             sortable: true,
             sortValue: (volume) => volume.name,
           },
@@ -1520,7 +2435,8 @@ function VolumesPage({ filter, loading, onCreate, onFilterChange, onInspect, sea
           {
             id: 'size',
             header: 'Size',
-            render: (volume) => volume.sizeBytes ? formatBytes(volume.sizeBytes) : '-',
+            render: (volume) =>
+              volume.sizeBytes ? formatBytes(volume.sizeBytes) : '-',
             sortable: true,
             sortValue: (volume) => volume.sizeBytes ?? 0,
           },
@@ -1534,17 +2450,30 @@ function VolumesPage({ filter, loading, onCreate, onFilterChange, onInspect, sea
           {
             id: 'used-by',
             header: 'Used by',
-            render: (volume) => <Badge tone={volume.inUse ? 'accent' : 'neutral'}>{volumeDetails[volume.name]?.containers?.length ?? (volume.inUse ? '>=1' : 0)}</Badge>,
+            render: (volume) => (
+              <Badge tone={volume.inUse ? 'accent' : 'neutral'}>
+                {volumeDetails[volume.name]?.containers?.length ??
+                  (volume.inUse ? '>=1' : 0)}
+              </Badge>
+            ),
           },
           {
             id: 'mountpoint',
             header: 'Mountpoint',
-            render: (volume) => <span title={volume.mountpoint}>{volume.mountpoint || '-'}</span>,
+            render: (volume) => (
+              <span title={volume.mountpoint}>{volume.mountpoint || '-'}</span>
+            ),
           },
           {
             id: 'actions',
             header: '',
-            render: (volume) => <RowActions id={volume.name} label={volume.name} onInspect={() => onInspect(volume)} />,
+            render: (volume) => (
+              <RowActions
+                id={volume.name}
+                label={volume.name}
+                onInspect={() => onInspect(volume)}
+              />
+            ),
           },
         ]}
         empty={
@@ -1570,8 +2499,18 @@ type NetworksPageProps = {
   onInspect: (network: NetworkSummary) => void;
 };
 
-function NetworksPage({ loading, networkDetails, networks, onCreate, onInspect, search }: NetworksPageProps) {
-  const filtered = useMemo(() => filterNetworks(networks, search), [networks, search]);
+function NetworksPage({
+  loading,
+  networkDetails,
+  networks,
+  onCreate,
+  onInspect,
+  search,
+}: NetworksPageProps) {
+  const filtered = useMemo(
+    () => filterNetworks(networks, search),
+    [networks, search],
+  );
   if (loading && networks.length === 0) {
     return <TableSkeleton />;
   }
@@ -1583,73 +2522,95 @@ function NetworksPage({ loading, networkDetails, networks, onCreate, onInspect, 
         </Button>
       </div>
       <DataTable
-      columns={[
-        {
-          id: 'name',
-          header: 'Name',
-          render: (network) => <span className="text-text-primary">{network.name}</span>,
-          sortable: true,
-          sortValue: (network) => network.name,
-        },
-        {
-          id: 'driver',
-          header: 'Driver',
-          render: (network) => network.driver,
-          sortable: true,
-          sortValue: (network) => network.driver,
-        },
-        {
-          id: 'scope',
-          header: 'Scope',
-          render: (network) => network.scope || '-',
-          sortable: true,
-          sortValue: (network) => network.scope || '',
-        },
-        {
-          id: 'subnet',
-          header: 'Subnet',
-          render: (network) => networkDetails[network.id]?.subnet || '-',
-        },
-        {
-          id: 'gateway',
-          header: 'Gateway',
-          render: (network) => networkDetails[network.id]?.gateway || '-',
-        },
-        {
-          id: 'containers',
-          header: 'Containers',
-          render: (network) => <Badge tone="neutral">{networkDetails[network.id]?.containers?.length ?? 0}</Badge>,
-        },
-        {
-          id: 'internal',
-          header: 'Internal',
-          render: (network) => <Badge tone={network.internal ? 'info' : 'neutral'}>{network.internal ? 'yes' : 'no'}</Badge>,
-          sortable: true,
-          sortValue: (network) => (network.internal ? 1 : 0),
-        },
-        {
-          id: 'actions',
-          header: '',
-          render: (network) => <RowActions id={network.id} label={network.name} onInspect={() => onInspect(network)} />,
-        },
-      ]}
-      empty={
-        <EmptyState
-          body="System-only networks are normal on a new daemon."
-          icon={<Network size={28} />}
-          title="No networks match"
-        />
-      }
-      getRowID={(network) => network.id}
-      rows={filtered}
+        columns={[
+          {
+            id: 'name',
+            header: 'Name',
+            render: (network) => (
+              <span className="text-text-primary">{network.name}</span>
+            ),
+            sortable: true,
+            sortValue: (network) => network.name,
+          },
+          {
+            id: 'driver',
+            header: 'Driver',
+            render: (network) => network.driver,
+            sortable: true,
+            sortValue: (network) => network.driver,
+          },
+          {
+            id: 'scope',
+            header: 'Scope',
+            render: (network) => network.scope || '-',
+            sortable: true,
+            sortValue: (network) => network.scope || '',
+          },
+          {
+            id: 'subnet',
+            header: 'Subnet',
+            render: (network) => networkDetails[network.id]?.subnet || '-',
+          },
+          {
+            id: 'gateway',
+            header: 'Gateway',
+            render: (network) => networkDetails[network.id]?.gateway || '-',
+          },
+          {
+            id: 'containers',
+            header: 'Containers',
+            render: (network) => (
+              <Badge tone="neutral">
+                {networkDetails[network.id]?.containers?.length ?? 0}
+              </Badge>
+            ),
+          },
+          {
+            id: 'internal',
+            header: 'Internal',
+            render: (network) => (
+              <Badge tone={network.internal ? 'info' : 'neutral'}>
+                {network.internal ? 'yes' : 'no'}
+              </Badge>
+            ),
+            sortable: true,
+            sortValue: (network) => (network.internal ? 1 : 0),
+          },
+          {
+            id: 'actions',
+            header: '',
+            render: (network) => (
+              <RowActions
+                id={network.id}
+                label={network.name}
+                onInspect={() => onInspect(network)}
+              />
+            ),
+          },
+        ]}
+        empty={
+          <EmptyState
+            body="System-only networks are normal on a new daemon."
+            icon={<Network size={28} />}
+            title="No networks match"
+          />
+        }
+        getRowID={(network) => network.id}
+        rows={filtered}
       />
     </div>
   );
 }
 
-function SearchBox({ onChange, value }: { value: string; onChange: (value: string) => void }) {
+function SearchBox({
+  onChange,
+  value,
+}: {
+  value: string;
+  onChange: (value: string) => void;
+}) {
   return (
-    <label className="flex h-9 w-72 items-center gap-2 rounded-control border border-border bg-bg-inset px-3 text-sm text-text-muted">
+    <label className="flex h-9 w-full items-center gap-2 rounded-control border border-border bg-bg-inset px-3 text-sm text-text-muted sm:w-72">
       <Search size={16} />
       <input
         aria-label="Search inventory"
@@ -1693,11 +2654,25 @@ function FilterChips({
   );
 }
 
-function RowActions({ id, label, onInspect }: { id: string; label: string; onInspect: () => void }) {
+function RowActions({
+  id,
+  label,
+  onInspect,
+}: {
+  id: string;
+  label: string;
+  onInspect: () => void;
+}) {
   return (
     <div className="flex justify-end gap-1">
       <Tooltip label="Inspect">
-        <Button aria-label={`Inspect ${label}`} icon={<Eye size={15} />} onClick={onInspect} size="icon" variant="ghost" />
+        <Button
+          aria-label={`Inspect ${label}`}
+          icon={<Eye size={15} />}
+          onClick={onInspect}
+          size="icon"
+          variant="ghost"
+        />
       </Tooltip>
       <Tooltip label="Copy ID">
         <Button
@@ -1729,10 +2704,22 @@ function ImageRowActions({
   return (
     <div className="flex justify-end gap-1">
       <Tooltip label="Run">
-        <Button aria-label={`Run ${label}`} icon={<Play size={15} />} onClick={onRun} size="icon" variant="ghost" />
+        <Button
+          aria-label={`Run ${label}`}
+          icon={<Play size={15} />}
+          onClick={onRun}
+          size="icon"
+          variant="ghost"
+        />
       </Tooltip>
       <Tooltip label="Save to tar">
-        <Button aria-label={`Save ${label}`} icon={<Download size={15} />} onClick={onSave} size="icon" variant="ghost" />
+        <Button
+          aria-label={`Save ${label}`}
+          icon={<Download size={15} />}
+          onClick={onSave}
+          size="icon"
+          variant="ghost"
+        />
       </Tooltip>
       <RowActions id={image.id} label={label} onInspect={onInspect} />
     </div>
@@ -1752,14 +2739,20 @@ function ContainerRowActions({
   onInspect: (container: ContainerSummary) => void;
   onRename: (container: ContainerSummary) => void;
 }) {
-  const canStop = container.state === 'running' || container.state === 'paused' || container.state === 'restarting';
-  const canStart = container.state !== 'running' && container.state !== 'restarting';
+  const canStop =
+    container.state === 'running' ||
+    container.state === 'paused' ||
+    container.state === 'restarting';
+  const canStart =
+    container.state !== 'running' && container.state !== 'restarting';
   return (
     <div className="flex justify-end gap-1">
       <Tooltip label={canStart ? 'Start' : 'Stop'}>
         <Button
           aria-label={`${canStart ? 'Start' : 'Stop'} ${container.name}`}
-          disabled={busyIDs.has(`${canStart ? 'start' : 'stop'}:${container.id}`)}
+          disabled={busyIDs.has(
+            `${canStart ? 'start' : 'stop'}:${container.id}`,
+          )}
           icon={canStart ? <Play size={15} /> : <Square size={15} />}
           onClick={() => onAction(canStart ? 'start' : 'stop', container)}
           size="icon"
@@ -1797,7 +2790,11 @@ function ContainerRowActions({
           variant="ghost"
         />
       </Tooltip>
-      <RowActions id={container.id} label={container.name} onInspect={() => onInspect(container)} />
+      <RowActions
+        id={container.id}
+        label={container.name}
+        onInspect={() => onInspect(container)}
+      />
     </div>
   );
 }
@@ -1842,15 +2839,36 @@ function ContainerBulkActions({
   );
 }
 
-function InspectModal({ inspect, onClose }: { inspect: InspectState; onClose: () => void }) {
+function InspectModal({
+  inspect,
+  onClose,
+}: {
+  inspect: InspectState;
+  onClose: () => void;
+}) {
   return (
-    <Modal open={inspect.open} onClose={onClose} size="lg" title={inspect.title || 'Inspect'}>
-      {inspect.subtitle ? <div className="mb-3 font-mono text-xs text-text-muted">{inspect.subtitle}</div> : null}
+    <Modal
+      open={inspect.open}
+      onClose={onClose}
+      size="lg"
+      title={inspect.title || 'Inspect'}
+    >
+      {inspect.subtitle ? (
+        <div className="mb-3 font-mono text-xs text-text-muted">
+          {inspect.subtitle}
+        </div>
+      ) : null}
       <div className="grid grid-cols-2 gap-3">
         {inspect.rows.map(([label, value]) => (
-          <div className="rounded-control border border-border bg-bg-inset p-3" key={label}>
+          <div
+            className="rounded-control border border-border bg-bg-inset p-3"
+            key={label}
+          >
             <div className="text-xs text-text-muted">{label}</div>
-            <div className="mt-1 truncate font-mono text-xs text-text-primary" title={value}>
+            <div
+              className="mt-1 truncate font-mono text-xs text-text-primary"
+              title={value}
+            >
               {value || '-'}
             </div>
           </div>
@@ -1868,7 +2886,10 @@ function InspectModal({ inspect, onClose }: { inspect: InspectState; onClose: ()
         </div>
       ) : null}
       {inspect.raw ? (
-        <details className="mt-4 rounded-control border border-border bg-bg-inset" open>
+        <details
+          className="mt-4 rounded-control border border-border bg-bg-inset"
+          open
+        >
           <summary className="cursor-pointer px-3 py-2 text-sm text-text-primary">
             <span className="inline-flex items-center gap-2">
               <FileJson size={15} />
@@ -1907,7 +2928,12 @@ function ConfirmPlanModal({
           <Button disabled={confirm.busy} onClick={onClose} variant="secondary">
             Cancel
           </Button>
-          <Button disabled={!typedReady} loading={confirm.busy} onClick={onApply} variant="danger">
+          <Button
+            disabled={!typedReady}
+            loading={confirm.busy}
+            onClick={onApply}
+            variant="danger"
+          >
             Confirm
           </Button>
         </div>
@@ -1921,32 +2947,50 @@ function ConfirmPlanModal({
         <div className="space-y-4">
           <div className="flex items-center gap-2">
             <Badge tone={riskTone(plan.risk)}>{plan.risk}</Badge>
-            <span className="text-text-muted">Plan expires {formatDate(plan.expiresAt)}</span>
+            <span className="text-text-muted">
+              Plan expires {formatDate(plan.expiresAt)}
+            </span>
           </div>
           <div>
-            <div className="mb-2 text-sm font-medium text-text-primary">Effects</div>
+            <div className="mb-2 text-sm font-medium text-text-primary">
+              Effects
+            </div>
             <ul className="space-y-2">
               {plan.effects?.map((effect) => (
-                <li className="rounded-control border border-border bg-bg-inset p-3" key={effect}>
+                <li
+                  className="rounded-control border border-border bg-bg-inset p-3"
+                  key={effect}
+                >
                   {effect}
                 </li>
               ))}
             </ul>
           </div>
           <div>
-            <div className="mb-2 text-sm font-medium text-text-primary">Commands</div>
+            <div className="mb-2 text-sm font-medium text-text-primary">
+              Commands
+            </div>
             <div className="space-y-2">
               {plan.commands?.map((command) => (
-                <div className="rounded-control border border-border bg-bg-inset p-3" key={`${command.order}-${command.command}`}>
-                  <div className="font-mono text-xs text-text-primary">{command.command}</div>
-                  <div className="mt-2 text-xs text-text-muted">{command.explanation}</div>
+                <div
+                  className="rounded-control border border-border bg-bg-inset p-3"
+                  key={`${command.order}-${command.command}`}
+                >
+                  <div className="font-mono text-xs text-text-primary">
+                    {command.command}
+                  </div>
+                  <div className="mt-2 text-xs text-text-muted">
+                    {command.explanation}
+                  </div>
                 </div>
               ))}
             </div>
           </div>
           {typedName ? (
             <label className="block">
-              <span className="text-sm font-medium text-text-primary">Type {typedName} to confirm</span>
+              <span className="text-sm font-medium text-text-primary">
+                Type {typedName} to confirm
+              </span>
               <input
                 className="mt-2 h-9 w-full rounded-control border border-border bg-bg-inset px-3 font-mono text-sm text-text-primary outline-none focus:border-accent"
                 onChange={(event) => onChangeTypedName(event.target.value)}
@@ -1980,7 +3024,15 @@ function RenameContainerModal({
   return (
     <Modal
       busy={state.busy}
-      footer={<ModalActions busy={state.busy} disabled={!state.name.trim()} onCancel={onClose} onSubmit={onSubmit} submitLabel="Rename" />}
+      footer={
+        <ModalActions
+          busy={state.busy}
+          disabled={!state.name.trim()}
+          onCancel={onClose}
+          onSubmit={onSubmit}
+          submitLabel="Rename"
+        />
+      }
       onClose={onClose}
       open={state.open}
       title={`Rename ${state.container?.name ?? 'container'}`}
@@ -1991,8 +3043,20 @@ function RenameContainerModal({
             Compose may recreate this container with its original service name.
           </div>
         ) : null}
-        <TextField autoFocus label="New name" onChange={onChange} value={state.name} />
-        <CodePreview value={joinPreview(['docker', 'rename', state.container?.name ?? '', state.name])} />
+        <TextField
+          autoFocus
+          label="New name"
+          onChange={onChange}
+          value={state.name}
+        />
+        <CodePreview
+          value={joinPreview([
+            'docker',
+            'rename',
+            state.container?.name ?? '',
+            state.name,
+          ])}
+        />
         <FormError error={state.error} />
       </div>
     </Modal>
@@ -2036,7 +3100,12 @@ function RunImageModal({
             <Button disabled={state.busy} onClick={onClose} variant="secondary">
               Cancel
             </Button>
-            <Button disabled={Boolean(validation)} loading={state.busy} onClick={onSubmit} variant="primary">
+            <Button
+              disabled={Boolean(validation)}
+              loading={state.busy}
+              onClick={onSubmit}
+              variant="primary"
+            >
               {state.step === 1 ? 'Next' : 'Run'}
             </Button>
           </div>
@@ -2063,7 +3132,11 @@ function RunImageModal({
                   onChange={(hubQuery) => onChange({ hubQuery })}
                   value={state.hubQuery}
                 />
-                <HubResultList loading={state.hubLoading} onSelect={onSelectHubResult} results={state.hubResults} />
+                <HubResultList
+                  loading={state.hubLoading}
+                  onSelect={onSelectHubResult}
+                  results={state.hubResults}
+                />
                 {state.hubError ? (
                   <div className="rounded-control border border-warn/30 bg-warn/10 p-3 text-warn">
                     {state.hubError}
@@ -2071,11 +3144,17 @@ function RunImageModal({
                 ) : null}
               </>
             ) : null}
-            <TextField label="Container name" onChange={(name) => onChange({ name })} value={state.name} />
+            <TextField
+              label="Container name"
+              onChange={(name) => onChange({ name })}
+              value={state.name}
+            />
             <label className="flex items-center gap-2 text-sm">
               <input
                 checked={state.pullIfMissing}
-                onChange={(event) => onChange({ pullIfMissing: event.target.checked })}
+                onChange={(event) =>
+                  onChange({ pullIfMissing: event.target.checked })
+                }
                 type="checkbox"
               />
               <span>Pull if missing</span>
@@ -2091,7 +3170,11 @@ function RunImageModal({
                 value={state.portsText}
               />
               <div className="flex items-end">
-                <Button icon={<Plus size={15} />} onClick={onAddAutoPort} variant="secondary">
+                <Button
+                  icon={<Plus size={15} />}
+                  onClick={onAddAutoPort}
+                  variant="secondary"
+                >
                   Auto port
                 </Button>
               </div>
@@ -2110,7 +3193,13 @@ function RunImageModal({
               <SelectField
                 label="Network"
                 onChange={(networkID) => onChange({ networkID })}
-                options={[['', 'bridge'], ...networks.map((network) => [network.name, network.name] as [string, string])]}
+                options={[
+                  ['', 'bridge'],
+                  ...networks.map(
+                    (network) =>
+                      [network.name, network.name] as [string, string],
+                  ),
+                ]}
                 value={state.networkID}
               />
               <SelectField
@@ -2124,19 +3213,33 @@ function RunImageModal({
                 ]}
                 value={state.restartPolicy}
               />
-              <TextField label="Command" onChange={(commandText) => onChange({ commandText })} value={state.commandText} />
-              <TextField label="User" onChange={(user) => onChange({ user })} value={state.user} />
+              <TextField
+                label="Command"
+                onChange={(commandText) => onChange({ commandText })}
+                value={state.commandText}
+              />
+              <TextField
+                label="User"
+                onChange={(user) => onChange({ user })}
+                value={state.user}
+              />
             </div>
             {secretKeys(state.envText).length > 0 ? (
               <div className="rounded-control border border-border bg-bg-inset p-3">
                 <Badge tone="warn">masked</Badge>
-                <span className="ml-2 text-text-muted">{secretKeys(state.envText).join(', ')}</span>
+                <span className="ml-2 text-text-muted">
+                  {secretKeys(state.envText).join(', ')}
+                </span>
               </div>
             ) : null}
             <CodePreview value={command} />
           </>
         )}
-        {validation ? <div className="rounded-control border border-error/30 bg-error/10 p-3 text-error">{validation}</div> : null}
+        {validation ? (
+          <div className="rounded-control border border-error/30 bg-error/10 p-3 text-error">
+            {validation}
+          </div>
+        ) : null}
         <FormError error={state.error} />
       </div>
     </Modal>
@@ -2160,16 +3263,40 @@ function PullImageModal({
   return (
     <Modal
       busy={state.busy}
-      footer={<ModalActions busy={state.busy} disabled={!state.ref.trim()} onCancel={onClose} onSubmit={onSubmit} submitLabel="Pull" />}
+      footer={
+        <ModalActions
+          busy={state.busy}
+          disabled={!state.ref.trim()}
+          onCancel={onClose}
+          onSubmit={onSubmit}
+          submitLabel="Pull"
+        />
+      }
       onClose={onClose}
       open={state.open}
       title="Pull Image"
     >
       <div className="space-y-4">
-        <TextField label="Image ref" onChange={(nextRef) => onChange({ ref: nextRef })} value={state.ref} />
-        <TextField label="Tag" onChange={(tag) => onChange({ tag })} value={state.tag} />
-        <TextField label="Docker Hub search" onChange={(query) => onChange({ query })} value={state.query} />
-        <HubResultList loading={state.loadingResults} onSelect={onSelectResult} results={state.results} />
+        <TextField
+          label="Image ref"
+          onChange={(nextRef) => onChange({ ref: nextRef })}
+          value={state.ref}
+        />
+        <TextField
+          label="Tag"
+          onChange={(tag) => onChange({ tag })}
+          value={state.tag}
+        />
+        <TextField
+          label="Docker Hub search"
+          onChange={(query) => onChange({ query })}
+          value={state.query}
+        />
+        <HubResultList
+          loading={state.loadingResults}
+          onSelect={onSelectResult}
+          results={state.results}
+        />
         {state.searchError ? (
           <div className="rounded-control border border-warn/30 bg-warn/10 p-3 text-warn">
             {state.searchError}
@@ -2211,9 +3338,20 @@ function SaveImageModal({
       title="Save Image"
     >
       <div className="space-y-4">
-        <TextAreaField label="Image refs" onChange={(refsText) => onChange({ refsText })} rows={3} value={state.refsText} />
-        <TextField label="Destination tar" onChange={(destPath) => onChange({ destPath })} value={state.destPath} />
-        <CodePreview value={joinPreview(['docker', 'save', '-o', state.destPath, ...refs])} />
+        <TextAreaField
+          label="Image refs"
+          onChange={(refsText) => onChange({ refsText })}
+          rows={3}
+          value={state.refsText}
+        />
+        <TextField
+          label="Destination tar"
+          onChange={(destPath) => onChange({ destPath })}
+          value={state.destPath}
+        />
+        <CodePreview
+          value={joinPreview(['docker', 'save', '-o', state.destPath, ...refs])}
+        />
         <FormError error={state.error} />
       </div>
     </Modal>
@@ -2234,14 +3372,28 @@ function LoadImageModal({
   return (
     <Modal
       busy={state.busy}
-      footer={<ModalActions busy={state.busy} disabled={!state.srcPath.trim()} onCancel={onClose} onSubmit={onSubmit} submitLabel="Load" />}
+      footer={
+        <ModalActions
+          busy={state.busy}
+          disabled={!state.srcPath.trim()}
+          onCancel={onClose}
+          onSubmit={onSubmit}
+          submitLabel="Load"
+        />
+      }
       onClose={onClose}
       open={state.open}
       title="Load Image"
     >
       <div className="space-y-4">
-        <TextField label="Source tar" onChange={(srcPath) => onChange({ srcPath })} value={state.srcPath} />
-        <CodePreview value={joinPreview(['docker', 'load', '-i', state.srcPath])} />
+        <TextField
+          label="Source tar"
+          onChange={(srcPath) => onChange({ srcPath })}
+          value={state.srcPath}
+        />
+        <CodePreview
+          value={joinPreview(['docker', 'load', '-i', state.srcPath])}
+        />
         <FormError error={state.error} />
       </div>
     </Modal>
@@ -2262,24 +3414,51 @@ function CreateVolumeModal({
   return (
     <Modal
       busy={state.busy}
-      footer={<ModalActions busy={state.busy} disabled={!state.name.trim()} onCancel={onClose} onSubmit={onSubmit} submitLabel="Create" />}
+      footer={
+        <ModalActions
+          busy={state.busy}
+          disabled={!state.name.trim()}
+          onCancel={onClose}
+          onSubmit={onSubmit}
+          submitLabel="Create"
+        />
+      }
       onClose={onClose}
       open={state.open}
       title="Create Volume"
     >
       <div className="space-y-4">
-        <TextField autoFocus label="Name" onChange={(name) => onChange({ name })} value={state.name} />
-        <TextField label="Driver" onChange={(driver) => onChange({ driver })} value={state.driver} />
+        <TextField
+          autoFocus
+          label="Name"
+          onChange={(name) => onChange({ name })}
+          value={state.name}
+        />
+        <TextField
+          label="Driver"
+          onChange={(driver) => onChange({ driver })}
+          value={state.driver}
+        />
         <details className="rounded-control border border-border bg-bg-inset">
           <summary className="cursor-pointer px-3 py-2">Driver options</summary>
           <div className="border-t border-border p-3">
-            <TextAreaField label="Options" onChange={(driverOptsText) => onChange({ driverOptsText })} rows={3} value={state.driverOptsText} />
+            <TextAreaField
+              label="Options"
+              onChange={(driverOptsText) => onChange({ driverOptsText })}
+              rows={3}
+              value={state.driverOptsText}
+            />
           </div>
         </details>
         <details className="rounded-control border border-border bg-bg-inset">
           <summary className="cursor-pointer px-3 py-2">Labels</summary>
           <div className="border-t border-border p-3">
-            <TextAreaField label="Labels" onChange={(labelsText) => onChange({ labelsText })} rows={3} value={state.labelsText} />
+            <TextAreaField
+              label="Labels"
+              onChange={(labelsText) => onChange({ labelsText })}
+              rows={3}
+              value={state.labelsText}
+            />
           </div>
         </details>
         <CodePreview value={dockerVolumePreview(state)} />
@@ -2304,13 +3483,26 @@ function CreateNetworkModal({
   return (
     <Modal
       busy={state.busy}
-      footer={<ModalActions busy={state.busy} disabled={!state.name.trim()} onCancel={onClose} onSubmit={onSubmit} submitLabel="Create" />}
+      footer={
+        <ModalActions
+          busy={state.busy}
+          disabled={!state.name.trim()}
+          onCancel={onClose}
+          onSubmit={onSubmit}
+          submitLabel="Create"
+        />
+      }
       onClose={onClose}
       open={state.open}
       title="Create Network"
     >
       <div className="space-y-4">
-        <TextField autoFocus label="Name" onChange={(name) => onChange({ name })} value={state.name} />
+        <TextField
+          autoFocus
+          label="Name"
+          onChange={(name) => onChange({ name })}
+          value={state.name}
+        />
         <SelectField
           label="Driver"
           onChange={(nextDriver) => onChange({ driver: nextDriver })}
@@ -2321,24 +3513,154 @@ function CreateNetworkModal({
           ]}
           value={state.driver}
         />
-        {customDriver ? <TextField label="Custom driver" onChange={(customDriver) => onChange({ customDriver })} value={state.customDriver} /> : null}
+        {customDriver ? (
+          <TextField
+            label="Custom driver"
+            onChange={(customDriver) => onChange({ customDriver })}
+            value={state.customDriver}
+          />
+        ) : null}
         <div className="grid grid-cols-2 gap-3">
-          <TextField label="Subnet CIDR" onChange={(subnet) => onChange({ subnet })} value={state.subnet} />
-          <TextField label="Gateway" onChange={(gateway) => onChange({ gateway })} value={state.gateway} />
+          <TextField
+            label="Subnet CIDR"
+            onChange={(subnet) => onChange({ subnet })}
+            value={state.subnet}
+          />
+          <TextField
+            label="Gateway"
+            onChange={(gateway) => onChange({ gateway })}
+            value={state.gateway}
+          />
         </div>
         <div className="flex gap-4">
           <label className="flex items-center gap-2">
-            <input checked={state.internal} onChange={(event) => onChange({ internal: event.target.checked })} type="checkbox" />
+            <input
+              checked={state.internal}
+              onChange={(event) => onChange({ internal: event.target.checked })}
+              type="checkbox"
+            />
             <span>Internal</span>
           </label>
           <label className="flex items-center gap-2">
-            <input checked={state.attachable} onChange={(event) => onChange({ attachable: event.target.checked })} type="checkbox" />
+            <input
+              checked={state.attachable}
+              onChange={(event) =>
+                onChange({ attachable: event.target.checked })
+              }
+              type="checkbox"
+            />
             <span>Attachable</span>
           </label>
         </div>
-        <TextAreaField label="Labels" onChange={(labelsText) => onChange({ labelsText })} rows={3} value={state.labelsText} />
+        <TextAreaField
+          label="Labels"
+          onChange={(labelsText) => onChange({ labelsText })}
+          rows={3}
+          value={state.labelsText}
+        />
         <CodePreview value={dockerNetworkPreview(state)} />
         <FormError error={state.error} />
+      </div>
+    </Modal>
+  );
+}
+
+function ImportProjectModal({
+  onBrowse,
+  onChange,
+  onClose,
+  onSubmit,
+  state,
+}: {
+  state: ImportProjectState;
+  onBrowse: () => void;
+  onChange: (folderPath: string) => void;
+  onClose: () => void;
+  onSubmit: () => void;
+}) {
+  const previewName = projectNameFromPath(state.folderPath);
+  const candidates = composeFileCandidates(state.folderPath);
+  const wslMount = state.folderPath.replace(/\\/g, '/').startsWith('/mnt/');
+  return (
+    <Modal
+      busy={state.busy}
+      footer={
+        <ModalActions
+          busy={state.busy}
+          disabled={!state.folderPath.trim()}
+          onCancel={onClose}
+          onSubmit={onSubmit}
+          submitLabel="Import"
+        />
+      }
+      onClose={onClose}
+      open={state.open}
+      title="Import Project"
+      size="lg"
+    >
+      <div className="space-y-4">
+        <label className="block">
+          <span className="text-xs font-medium uppercase text-text-muted">
+            Folder
+          </span>
+          <div className="mt-1 flex flex-col gap-2 sm:flex-row">
+            <input
+              className="h-9 min-w-0 flex-1 rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
+              onChange={(event) => onChange(event.target.value)}
+              placeholder="/home/me/project"
+              value={state.folderPath}
+            />
+            <Button icon={<FolderOpen size={16} />} onClick={onBrowse}>
+              Browse
+            </Button>
+          </div>
+        </label>
+
+        {state.folderPath ? (
+          <div className="grid gap-3 md:grid-cols-2">
+            <div className="rounded-card border border-border bg-bg-inset p-3">
+              <div className="text-xs font-medium uppercase text-text-muted">
+                Compose files
+              </div>
+              <div className="mt-2 space-y-1">
+                {candidates.map((file) => (
+                  <label className="flex items-center gap-2 text-sm" key={file}>
+                    <input checked readOnly type="checkbox" />
+                    <span className="truncate font-mono text-xs">{file}</span>
+                  </label>
+                ))}
+              </div>
+            </div>
+            <div className="rounded-card border border-border bg-bg-inset p-3">
+              <div className="text-xs font-medium uppercase text-text-muted">
+                Project name
+              </div>
+              <div className="mt-2 truncate text-base font-semibold text-text-primary">
+                {previewName || '-'}
+              </div>
+              <div className="mt-3 text-xs text-text-muted">
+                {state.imported?.summary.id ?? 'Pending validation'}
+              </div>
+            </div>
+          </div>
+        ) : null}
+
+        {wslMount ? (
+          <div className="rounded-card border border-warn/30 bg-warn/10 px-3 py-2 text-sm text-warn">
+            WSL mount paths may be slower than files stored inside the distro.
+          </div>
+        ) : null}
+
+        {state.error ? (
+          <div className="rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
+            {state.error}
+          </div>
+        ) : null}
+        {state.imported ? (
+          <div className="rounded-card border border-ok/30 bg-ok/10 px-3 py-2 text-sm text-ok">
+            Imported {state.imported.summary.name}
+          </div>
+        ) : null}
       </div>
     </Modal>
   );
@@ -2362,7 +3684,12 @@ function ModalActions({
       <Button disabled={busy} onClick={onCancel} variant="secondary">
         Cancel
       </Button>
-      <Button disabled={disabled} loading={busy} onClick={onSubmit} variant="primary">
+      <Button
+        disabled={disabled}
+        loading={busy}
+        onClick={onSubmit}
+        variant="primary"
+      >
         {submitLabel}
       </Button>
     </div>
@@ -2475,10 +3802,14 @@ function HubResultList({
         >
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
-              <span className="truncate font-mono text-xs text-text-primary">{result.name}</span>
+              <span className="truncate font-mono text-xs text-text-primary">
+                {result.name}
+              </span>
               {result.official ? <Badge tone="ok">Official</Badge> : null}
             </div>
-            <div className="mt-1 line-clamp-2 text-xs text-text-muted">{result.description || '-'}</div>
+            <div className="mt-1 line-clamp-2 text-xs text-text-muted">
+              {result.description || '-'}
+            </div>
           </div>
           <Badge tone="neutral">{result.stars}</Badge>
         </button>
@@ -2496,10 +3827,24 @@ function CodePreview({ value }: { value: string }) {
 }
 
 function FormError({ error }: { error?: string }) {
-  return error ? <div className="rounded-control border border-error/30 bg-error/10 p-3 text-error">{error}</div> : null;
+  return error ? (
+    <div className="rounded-control border border-error/30 bg-error/10 p-3 text-error">
+      {error}
+    </div>
+  ) : null;
 }
 
-function MetricButton({ hint, label, onClick, value }: { label: string; value: number; hint: string; onClick: () => void }) {
+function MetricButton({
+  hint,
+  label,
+  onClick,
+  value,
+}: {
+  label: string;
+  value: number;
+  hint: string;
+  onClick: () => void;
+}) {
   return (
     <button
       className="rounded-card border border-border bg-bg-card p-4 text-left transition hover:border-border-strong hover:bg-bg-panel"
@@ -2524,7 +3869,15 @@ function StatusPill({ label, ok }: { label: string; ok: boolean }) {
   );
 }
 
-function StatusBlock({ label, tone, value }: { label: string; value: number; tone: BadgeTone }) {
+function StatusBlock({
+  label,
+  tone,
+  value,
+}: {
+  label: string;
+  value: number;
+  tone: BadgeTone;
+}) {
   return (
     <div className="rounded-control border border-border bg-bg-inset p-3">
       <Badge tone={tone}>{label}</Badge>
@@ -2549,7 +3902,9 @@ function PortList({ ports }: { ports: PortBinding[] }) {
   return (
     <div className="flex flex-wrap gap-1">
       {ports.slice(0, 3).map((port) => (
-        <Badge key={`${port.hostIP}-${port.hostPort}-${port.containerPort}-${port.protocol}`}>
+        <Badge
+          key={`${port.hostIP}-${port.hostPort}-${port.containerPort}-${port.protocol}`}
+        >
           {port.hostPort ? `${port.hostPort}->` : ''}
           {port.containerPort}/{port.protocol}
         </Badge>
@@ -2652,7 +4007,10 @@ function parseMounts(value: string): MountSpec[] {
         source,
         target,
         volumeName: mountType === 'volume' ? source : '',
-        readOnly: values.ro === 'true' || values.readonly === 'true' || values.mode === 'ro',
+        readOnly:
+          values.ro === 'true' ||
+          values.readonly === 'true' ||
+          values.mode === 'ro',
       };
     }
     const parts = line.split(':');
@@ -2754,13 +4112,22 @@ function dockerRunPreview(state: RunImageState) {
   }
   for (const port of parsePorts(state.portsText)) {
     const host = [port.hostIP, port.hostPort].filter(Boolean).join(':');
-    args.push('-p', `${host ? `${host}:` : ''}${port.containerPort}/${port.protocol || 'tcp'}`);
+    args.push(
+      '-p',
+      `${host ? `${host}:` : ''}${port.containerPort}/${port.protocol || 'tcp'}`,
+    );
   }
   for (const env of parseEnv(state.envText)) {
-    args.push('-e', `${env.name}=${secretLikeKey(env.name) ? '********' : env.value}`);
+    args.push(
+      '-e',
+      `${env.name}=${secretLikeKey(env.name) ? '********' : env.value}`,
+    );
   }
   for (const mount of parseMounts(state.volumesText)) {
-    args.push('--mount', `type=${mount.type},source=${mount.source || mount.volumeName},target=${mount.target},${mount.readOnly ? 'ro' : 'rw'}`);
+    args.push(
+      '--mount',
+      `type=${mount.type},source=${mount.source || mount.volumeName},target=${mount.target},${mount.readOnly ? 'ro' : 'rw'}`,
+    );
   }
   if (state.networkID) {
     args.push('--network', state.networkID);
@@ -2789,10 +4156,14 @@ function dockerVolumePreview(state: CreateVolumeState) {
   if (state.driver.trim()) {
     args.push('--driver', state.driver.trim());
   }
-  for (const [key, value] of Object.entries(parseKeyValueLines(state.driverOptsText) ?? {})) {
+  for (const [key, value] of Object.entries(
+    parseKeyValueLines(state.driverOptsText) ?? {},
+  )) {
     args.push('--opt', `${key}=${value}`);
   }
-  for (const [key, value] of Object.entries(parseKeyValueLines(state.labelsText) ?? {})) {
+  for (const [key, value] of Object.entries(
+    parseKeyValueLines(state.labelsText) ?? {},
+  )) {
     args.push('--label', `${key}=${value}`);
   }
   args.push(state.name.trim() || '<name>');
@@ -2817,7 +4188,9 @@ function dockerNetworkPreview(state: CreateNetworkState) {
   if (state.attachable) {
     args.push('--attachable');
   }
-  for (const [key, value] of Object.entries(parseKeyValueLines(state.labelsText) ?? {})) {
+  for (const [key, value] of Object.entries(
+    parseKeyValueLines(state.labelsText) ?? {},
+  )) {
     args.push('--label', `${key}=${value}`);
   }
   args.push(state.name.trim() || '<name>');
@@ -2847,17 +4220,31 @@ function secretKeys(value: string) {
 
 function secretLikeKey(name: string) {
   const lower = name.toLowerCase();
-  return ['pass', 'password', 'token', 'secret', 'key', 'auth'].some((marker) => lower.includes(marker));
+  return ['pass', 'password', 'token', 'secret', 'key', 'auth'].some((marker) =>
+    lower.includes(marker),
+  );
 }
 
-function activeProviderSummary(providers: ProviderSummary[]): ProviderSummary | null {
+function activeProviderSummary(
+  providers: ProviderSummary[],
+): ProviderSummary | null {
   return providers.find((provider) => provider.active) ?? providers[0] ?? null;
 }
 
-function filterContainers(containers: ContainerSummary[], search: string, filter: FilterID) {
+function filterContainers(
+  containers: ContainerSummary[],
+  search: string,
+  filter: FilterID,
+) {
   const needle = normalize(search);
   return containers.filter((container) => {
-    const matchesSearch = [container.name, container.image, container.id, container.projectID, container.service]
+    const matchesSearch = [
+      container.name,
+      container.image,
+      container.id,
+      container.projectID,
+      container.service,
+    ]
       .filter(Boolean)
       .some((value) => normalize(value).includes(needle));
     const matchesFilter =
@@ -2870,29 +4257,51 @@ function filterContainers(containers: ContainerSummary[], search: string, filter
   });
 }
 
-function filterImages(images: ImageSummary[], counts: Record<string, number>, search: string, filter: FilterID) {
+function filterImages(
+  images: ImageSummary[],
+  counts: Record<string, number>,
+  search: string,
+  filter: FilterID,
+) {
   const needle = normalize(search);
   return images.filter((image) => {
     const refs = imageRefs(image);
-    const matchesSearch = [image.id, ...refs, ...(image.repoDigests ?? [])].some((value) => normalize(value).includes(needle));
+    const matchesSearch = [
+      image.id,
+      ...refs,
+      ...(image.repoDigests ?? []),
+    ].some((value) => normalize(value).includes(needle));
     const inUse = (counts[image.id] ?? 0) > 0 || image.inUse;
     const matchesFilter =
       filter === 'all' ||
       (filter === 'in-use' && inUse) ||
       (filter === 'unused' && !inUse) ||
       (filter === 'dangling' && imageDangling(image)) ||
-      (filter === 'updates' && Boolean(image.updateStatus && image.updateStatus !== 'unknown'));
+      (filter === 'updates' &&
+        Boolean(image.updateStatus && image.updateStatus !== 'unknown'));
     return matchesSearch && matchesFilter;
   });
 }
 
-function filterVolumes(volumes: VolumeSummary[], search: string, filter: FilterID) {
+function filterVolumes(
+  volumes: VolumeSummary[],
+  search: string,
+  filter: FilterID,
+) {
   const needle = normalize(search);
   return volumes.filter((volume) => {
-    const matchesSearch = [volume.name, volume.driver, volume.mountpoint, volume.labels?.[composeProjectLabel]]
+    const matchesSearch = [
+      volume.name,
+      volume.driver,
+      volume.mountpoint,
+      volume.labels?.[composeProjectLabel],
+    ]
       .filter(Boolean)
       .some((value) => normalize(value).includes(needle));
-    const matchesFilter = filter === 'all' || (filter === 'in-use' && volume.inUse) || (filter === 'unused' && !volume.inUse);
+    const matchesFilter =
+      filter === 'all' ||
+      (filter === 'in-use' && volume.inUse) ||
+      (filter === 'unused' && !volume.inUse);
     return matchesSearch && matchesFilter;
   });
 }
@@ -2917,6 +4326,127 @@ function imageUsageCounts(containers: ContainerSummary[]) {
     }
     return counts;
   }, {});
+}
+
+function filterProjects(
+  projects: ProjectSummary[],
+  search: string,
+  filter: FilterID,
+) {
+  const query = search.trim().toLowerCase();
+  return projects.filter((project) => {
+    const matchesSearch = [
+      project.name,
+      project.id,
+      project.providerID,
+      project.workingDir,
+    ]
+      .filter(Boolean)
+      .some((value) => value.toLowerCase().includes(query));
+    if (!matchesSearch) {
+      return false;
+    }
+    switch (filter) {
+      case 'running':
+        return project.status === 'running';
+      case 'stopped':
+        return project.status === 'stopped';
+      case 'partial':
+        return project.status === 'partial';
+      case 'unhealthy':
+        return project.health === 'unhealthy';
+      case 'updates':
+        return projectUpdateCount(project) > 0;
+      case 'high-cpu':
+        return project.cpuPercent >= 80;
+      case 'recent':
+        return isRecentlyChanged(project.lastChangedAt);
+      default:
+        return true;
+    }
+  });
+}
+
+function sortProjects(projects: ProjectSummary[], sort: ProjectSortID) {
+  return [...projects].sort((left, right) => {
+    if (sort === 'activity') {
+      return dateMillis(right.lastChangedAt) - dateMillis(left.lastChangedAt);
+    }
+    if (sort === 'cpu') {
+      return right.cpuPercent - left.cpuPercent;
+    }
+    return left.name.localeCompare(right.name, undefined, {
+      numeric: true,
+      sensitivity: 'base',
+    });
+  });
+}
+
+function projectUpdateCount(project: ProjectSummary) {
+  const badges = project.updateBadges;
+  if (!badges) {
+    return 0;
+  }
+  return (
+    badges.imageUpdates +
+    badges.baseUpdates +
+    badges.rebuildNeeded +
+    badges.pinned +
+    badges.unknownBase
+  );
+}
+
+function isRecentlyChanged(value: unknown) {
+  const changedAt = dateMillis(value);
+  return changedAt > 0 && Date.now() - changedAt < 24 * 60 * 60 * 1000;
+}
+
+function projectStatusTone(status: string): BadgeTone {
+  switch (status) {
+    case 'running':
+      return 'ok';
+    case 'partial':
+      return 'warn';
+    case 'error':
+      return 'error';
+    case 'stopped':
+      return 'neutral';
+    default:
+      return 'info';
+  }
+}
+
+function sparkBars(seed: string) {
+  const source = seed || 'project';
+  return Array.from({ length: 24 }, (_, index) => {
+    const code = source.charCodeAt(index % source.length) || 17;
+    return 18 + ((code + index * 13) % 70);
+  });
+}
+
+function projectNameFromPath(path: string) {
+  const normalized = path.trim().replace(/\\/g, '/').replace(/\/+$/, '');
+  return (
+    normalized
+      .split('/')
+      .pop()
+      ?.toLowerCase()
+      .replace(/[^a-z0-9_-]/g, '-') ?? ''
+  );
+}
+
+function composeFileCandidates(folderPath: string) {
+  if (!folderPath.trim()) {
+    return [];
+  }
+  const separator = folderPath.includes('\\') ? '\\' : '/';
+  const base = folderPath.replace(/[\\/]+$/, '');
+  return [
+    'compose.yaml',
+    'compose.yml',
+    'docker-compose.yml',
+    'docker-compose.yaml',
+  ].map((name) => `${base}${separator}${name}`);
 }
 
 function containerTone(container: ContainerSummary): BadgeTone {
@@ -2956,7 +4486,11 @@ function updateTone(status?: string): BadgeTone {
   if (status === 'up_to_date') {
     return 'ok';
   }
-  if (status === 'error' || status === 'auth_required' || status === 'rate_limited') {
+  if (
+    status === 'error' ||
+    status === 'auth_required' ||
+    status === 'rate_limited'
+  ) {
     return 'error';
   }
   return 'warn';
@@ -2994,7 +4528,9 @@ function formatMemory(used?: number, limit?: number) {
   if (!used) {
     return '-';
   }
-  return limit ? `${formatBytes(used)} / ${formatBytes(limit)}` : formatBytes(used);
+  return limit
+    ? `${formatBytes(used)} / ${formatBytes(limit)}`
+    : formatBytes(used);
 }
 
 function shortID(value: string) {
@@ -3015,7 +4551,10 @@ function formatDate(value: unknown) {
   if (!date) {
     return '-';
   }
-  return date.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' });
+  return date.toLocaleString(undefined, {
+    dateStyle: 'medium',
+    timeStyle: 'short',
+  });
 }
 
 function relativeTime(value: number) {
@@ -3039,8 +4578,9 @@ function toDate(value: unknown): Date | null {
 }
 
 function imageRefs(image: ImageSummary) {
-  const tags = image.repoTags?.filter((tag) => tag && tag !== '<none>:<none>') ?? [];
-  return tags.length > 0 ? tags : image.repoDigests ?? [];
+  const tags =
+    image.repoTags?.filter((tag) => tag && tag !== '<none>:<none>') ?? [];
+  return tags.length > 0 ? tags : (image.repoDigests ?? []);
 }
 
 function primaryImageRef(image: ImageSummary) {
@@ -3089,7 +4629,10 @@ function containerRows(container: ContainerSummary): Array<[string, string]> {
   ];
 }
 
-function imageRows(image: ImageSummary, usedBy: number): Array<[string, string]> {
+function imageRows(
+  image: ImageSummary,
+  usedBy: number,
+): Array<[string, string]> {
   return [
     ['Image ID', image.id],
     ['Reference', primaryImageRef(image)],
@@ -3100,7 +4643,10 @@ function imageRows(image: ImageSummary, usedBy: number): Array<[string, string]>
   ];
 }
 
-function imageDetailRows(detail: ImageDetail, usedBy: number): Array<[string, string]> {
+function imageDetailRows(
+  detail: ImageDetail,
+  usedBy: number,
+): Array<[string, string]> {
   return [
     ...imageRows(detail.summary, usedBy),
     ['Architecture', detail.architecture || '-'],
@@ -3110,7 +4656,10 @@ function imageDetailRows(detail: ImageDetail, usedBy: number): Array<[string, st
   ];
 }
 
-function volumeRows(volume: VolumeSummary, detail?: VolumeDetail): Array<[string, string]> {
+function volumeRows(
+  volume: VolumeSummary,
+  detail?: VolumeDetail,
+): Array<[string, string]> {
   return [
     ['Name', volume.name],
     ['Driver', volume.driver],
@@ -3122,7 +4671,10 @@ function volumeRows(volume: VolumeSummary, detail?: VolumeDetail): Array<[string
   ];
 }
 
-function networkRows(network: NetworkSummary, detail?: NetworkDetail): Array<[string, string]> {
+function networkRows(
+  network: NetworkSummary,
+  detail?: NetworkDetail,
+): Array<[string, string]> {
   return [
     ['ID', network.id],
     ['Name', network.name],

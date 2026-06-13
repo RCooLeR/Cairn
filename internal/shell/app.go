@@ -74,7 +74,13 @@ func Run(assets fs.FS) error {
 		Services: []application.Service{
 			application.NewService(&services.ProviderService{Manager: providerManager}),
 			application.NewService(&services.DockerService{Client: dockerClient, Audit: auditRepo, Plans: containerPlans}),
-			application.NewService(&services.ProjectService{Detector: projectDetector, Projects: projectRepo}),
+			application.NewService(&services.ProjectService{
+				Detector:    projectDetector,
+				Projects:    projectRepo,
+				Client:      composeClient,
+				ProviderID:  firstProviderID(providerSet),
+				ContextName: "",
+			}),
 			application.NewService(&services.ComposeService{Client: composeClient, Projects: projectRepo}),
 			application.NewService(&services.MetricsService{}),
 			application.NewService(&services.LogsService{}),
@@ -142,6 +148,13 @@ func defaultProviderSet() []providers.PlatformProvider {
 		return []providers.PlatformProvider{providers.NewLinuxNative(providers.LinuxNativeOptions{})}
 	}
 	return nil
+}
+
+func firstProviderID(providerSet []providers.PlatformProvider) string {
+	if len(providerSet) == 0 || providerSet[0] == nil {
+		return ""
+	}
+	return providerSet[0].ID()
 }
 
 func forwardBusEvents(ctx context.Context, eventBus bus.Bus, window application.Window, topics []bus.Topic) {

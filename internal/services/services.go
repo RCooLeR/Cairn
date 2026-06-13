@@ -70,8 +70,12 @@ type ProjectDetector interface {
 }
 
 type ProjectService struct {
-	Detector ProjectDetector
-	Projects *store.ProjectRepository
+	Detector    ProjectDetector
+	Projects    *store.ProjectRepository
+	Client      *composecore.Client
+	ProviderID  string
+	ContextName string
+	Now         func() time.Time
 }
 
 type ComposeService struct {
@@ -656,8 +660,72 @@ func (s *ProjectService) GetProject(ctx context.Context, projectID string) (*mod
 	}, nil
 }
 
-func (s *ProjectService) ImportProject(_ context.Context, req models.ImportProjectRequest) (*models.ProjectDetail, error) {
-	return nil, notReady()
+func (s *ProjectService) ImportProject(ctx context.Context, req models.ImportProjectRequest) (*models.ProjectDetail, error) {
+	if s.Client == nil || s.Projects == nil || strings.TrimSpace(s.ProviderID) == "" {
+		return nil, notReady()
+	}
+	workdir, files, err := resolveImportFiles(req)
+	if err != nil {
+		return nil, err
+	}
+	projectName := composecore.NormalizeProjectName(filepath.Base(workdir))
+	if projectName == "" {
+		projectName = "project"
+	}
+	config, err := s.Client.Config(ctx, composecore.ProjectOptions{
+		Workdir:     workdir,
+		Files:       files,
+		ProjectName: projectName,
+	})
+	if err != nil {
+		detail := err.Error()
+		if config != nil && len(config.Errors) > 0 {
+			detail = strings.Join(config.Errors, "\n")
+		}
+		return nil, apperror.New(apperror.ComposeInvalid, "Compose project validation failed", apperror.WithDetail(detail))
+	}
+
+	now := s.now()
+	projectID := composecore.ProjectID(s.ProviderID, projectName)
+	project := store.ProjectRecord{
+		ID:           projectID,
+		ProviderID:   s.ProviderID,
+		ContextName:  s.ContextName,
+		Name:         projectName,
+		WorkingDir:   workdir,
+		ComposeFiles: files,
+		Status:       models.ProjectStatusStopped,
+		Health:       models.HealthStatusUnknown,
+		Source:       store.ProjectSourceImported,
+		LastSeenAt:   now,
+		Metadata:     map[string]any{},
+	}
+	if len(config.EnvFiles) > 0 {
+		project.Metadata["envFiles"] = append([]string(nil), config.EnvFiles...)
+	}
+	services := make([]store.ServiceRecord, 0, len(config.Services))
+	for _, serviceConfig := range config.Services {
+		services = append(services, store.ServiceRecord{
+			ID:             composecore.ServiceID(projectID, serviceConfig.Name),
+			ProjectID:      projectID,
+			Name:           serviceConfig.Name,
+			ImageRef:       serviceConfig.Image,
+			BuildContext:   serviceConfig.BuildContext,
+			DockerfilePath: serviceConfig.DockerfilePath,
+			BuildTarget:    serviceConfig.BuildTarget,
+			Status:         models.ProjectStatusStopped,
+			Health:         models.HealthStatusUnknown,
+			Metadata:       serviceConfigMetadata(serviceConfig),
+			LastSeenAt:     now,
+		})
+	}
+	if err := s.Projects.SaveSnapshot(ctx, s.ProviderID, []store.ProjectRecord{project}, services, now, time.Time{}); err != nil {
+		return nil, apperror.Wrap(apperror.Internal, "Import project failed", err)
+	}
+	if s.Detector != nil {
+		_, _ = s.Detector.Reconcile(ctx)
+	}
+	return s.GetProject(ctx, projectID)
 }
 
 func (s *ProjectService) RemoveProjectFromList(_ context.Context, projectID string) error {
@@ -1178,6 +1246,87 @@ func readComposeRawFiles(project store.ProjectRecord) []models.ComposeRawFile {
 		})
 	}
 	return rawFiles
+}
+
+func resolveImportFiles(req models.ImportProjectRequest) (string, []string, error) {
+	if folder := strings.TrimSpace(req.FolderPath); folder != "" {
+		absFolder, err := filepath.Abs(folder)
+		if err != nil {
+			return "", nil, apperror.Wrap(apperror.ComposeInvalid, "Resolve project folder failed", err)
+		}
+		info, err := os.Stat(absFolder)
+		if err != nil || !info.IsDir() {
+			return "", nil, apperror.New(apperror.ComposeInvalid, "Project folder was not found", apperror.WithDetail(absFolder))
+		}
+		files := discoverComposeFiles(absFolder)
+		if len(files) == 0 {
+			return "", nil, apperror.New(apperror.ComposeInvalid, "No Compose files were found", apperror.WithDetail(absFolder))
+		}
+		return absFolder, files, nil
+	}
+
+	if len(req.ComposeFilePaths) == 0 {
+		return "", nil, apperror.New(apperror.ComposeInvalid, "Choose a project folder or Compose file")
+	}
+	files := make([]string, 0, len(req.ComposeFilePaths))
+	for _, file := range req.ComposeFilePaths {
+		file = strings.TrimSpace(file)
+		if file == "" {
+			continue
+		}
+		absFile, err := filepath.Abs(file)
+		if err != nil {
+			return "", nil, apperror.Wrap(apperror.ComposeInvalid, "Resolve Compose file failed", err)
+		}
+		info, err := os.Stat(absFile)
+		if err != nil || info.IsDir() {
+			return "", nil, apperror.New(apperror.ComposeInvalid, "Compose file was not found", apperror.WithDetail(absFile))
+		}
+		files = append(files, absFile)
+	}
+	if len(files) == 0 {
+		return "", nil, apperror.New(apperror.ComposeInvalid, "Choose at least one Compose file")
+	}
+	return filepath.Dir(files[0]), files, nil
+}
+
+func discoverComposeFiles(folder string) []string {
+	names := []string{"compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml"}
+	files := make([]string, 0, len(names))
+	for _, name := range names {
+		path := filepath.Join(folder, name)
+		if info, err := os.Stat(path); err == nil && !info.IsDir() {
+			files = append(files, path)
+		}
+	}
+	return files
+}
+
+func serviceConfigMetadata(config composecore.ServiceConfig) map[string]any {
+	metadata := map[string]any{}
+	if len(config.BuildArgs) > 0 {
+		metadata["buildArgs"] = config.BuildArgs
+	}
+	if len(config.DependsOn) > 0 {
+		metadata["dependsOn"] = append([]string(nil), config.DependsOn...)
+	}
+	if len(config.EnvFiles) > 0 {
+		metadata["envFiles"] = append([]string(nil), config.EnvFiles...)
+	}
+	if len(config.Profiles) > 0 {
+		metadata["profiles"] = append([]string(nil), config.Profiles...)
+	}
+	if config.HasHealthcheck {
+		metadata["hasHealthcheck"] = true
+	}
+	return metadata
+}
+
+func (s *ProjectService) now() time.Time {
+	if s.Now != nil {
+		return s.Now().UTC()
+	}
+	return time.Now().UTC()
 }
 
 func mapStoreNotFound(err error, message string) error {

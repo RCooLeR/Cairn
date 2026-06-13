@@ -2,12 +2,16 @@ package services
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
+	composecore "github.com/RCooLeR/Cairn/internal/compose"
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/providers"
 	"github.com/RCooLeR/Cairn/internal/store"
 )
 
@@ -161,6 +165,62 @@ func TestDockerServiceObjectCreationAudits(t *testing.T) {
 	}
 }
 
+func TestProjectServiceImportProject(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	root := filepath.Join(t.TempDir(), "app-db")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatalf("MkdirAll() error = %v", err)
+	}
+	composeFile := filepath.Join(root, "compose.yaml")
+	if err := os.WriteFile(composeFile, []byte("services:\n  app:\n    image: nginx:alpine\n"), 0o600); err != nil {
+		t.Fatalf("write compose file: %v", err)
+	}
+
+	runner := newFakeComposeRunner()
+	runner.outputs[root+"|-f "+composeFile+" config"] = providers.CommandResult{
+		Stdout: "services:\n  app:\n    image: nginx:alpine\n  db:\n    image: postgres:16-alpine\n",
+	}
+	service := &ProjectService{
+		Client:     composecore.NewClient(runner),
+		Projects:   db.Projects(),
+		ProviderID: "linux_native",
+		Now:        func() time.Time { return time.Date(2026, 6, 13, 6, 0, 0, 0, time.UTC) },
+	}
+
+	detail, err := service.ImportProject(ctx, models.ImportProjectRequest{FolderPath: root})
+	if err != nil {
+		t.Fatalf("ImportProject() error = %v", err)
+	}
+	if detail.Summary.ID != "linux_native/app-db" || detail.Summary.ServicesTotal != 2 {
+		t.Fatalf("detail summary = %#v", detail.Summary)
+	}
+	if len(detail.Services) != 2 || detail.Services[0].Name != "app" || detail.Services[1].Name != "db" {
+		t.Fatalf("services = %#v", detail.Services)
+	}
+	projects, err := service.ListProjects(ctx)
+	if err != nil {
+		t.Fatalf("ListProjects() error = %v", err)
+	}
+	if len(projects) != 1 || projects[0].ID != "linux_native/app-db" {
+		t.Fatalf("projects = %#v", projects)
+	}
+}
+
+func TestProjectServiceImportProjectInvalidFolder(t *testing.T) {
+	db := openServiceTestStore(t)
+	service := &ProjectService{
+		Client:     composecore.NewClient(newFakeComposeRunner()),
+		Projects:   db.Projects(),
+		ProviderID: "linux_native",
+	}
+
+	_, err := service.ImportProject(context.Background(), models.ImportProjectRequest{FolderPath: t.TempDir()})
+	if !apperror.IsCode(err, apperror.ComposeInvalid) {
+		t.Fatalf("ImportProject() error = %v, want %s", err, apperror.ComposeInvalid)
+	}
+}
+
 type fakeDockerClient struct {
 	container  models.ContainerSummary
 	started    []string
@@ -309,4 +369,48 @@ func (f *fakeDockerClient) GetNetwork(context.Context, string) (*models.NetworkD
 func (f *fakeDockerClient) CreateNetwork(_ context.Context, req models.CreateNetworkRequest) (*models.NetworkSummary, error) {
 	f.networks = append(f.networks, req)
 	return &models.NetworkSummary{ID: "network-created", Name: req.Name, Driver: req.Driver, Attachable: req.Attachable}, nil
+}
+
+type fakeComposeRunner struct {
+	outputs map[string]providers.CommandResult
+}
+
+func newFakeComposeRunner() *fakeComposeRunner {
+	return &fakeComposeRunner{outputs: map[string]providers.CommandResult{}}
+}
+
+func (r *fakeComposeRunner) RunCompose(ctx context.Context, workdir string, args ...string) (*providers.CommandResult, error) {
+	return r.RunComposeEnv(ctx, workdir, nil, args...)
+}
+
+func (r *fakeComposeRunner) RunComposeEnv(_ context.Context, workdir string, _ []string, args ...string) (*providers.CommandResult, error) {
+	result := r.outputs[workdir+"|"+strings.Join(args, " ")]
+	result.Workdir = workdir
+	result.Command = append([]string{"docker", "compose"}, args...)
+	return &result, nil
+}
+
+func openServiceTestStore(t *testing.T) *store.Store {
+	t.Helper()
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "cairn.db"))
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	if err := db.Providers().Upsert(ctx, store.ProviderRecord{
+		ID:          "linux_native",
+		Type:        "linux_native",
+		Platform:    "linux",
+		DisplayName: "Linux Native",
+		Enabled:     true,
+	}); err != nil {
+		t.Fatalf("seed provider: %v", err)
+	}
+	return db
 }
