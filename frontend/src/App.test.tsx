@@ -1,4 +1,5 @@
 import {
+  act,
   fireEvent,
   render,
   screen,
@@ -11,6 +12,7 @@ import type { InventorySnapshot } from './api/inventory';
 import type {
   CommandPlan,
   DiskUsageCategory,
+  LogLine,
   ProjectDetail,
   ProjectSummary,
   ProviderStatus,
@@ -35,6 +37,8 @@ const runtimeMock = vi.hoisted(() => ({
     (eventName: string, callback: (event?: unknown) => void) => () => void
   >(() => vi.fn()),
   openFile: vi.fn(),
+  saveFile: vi.fn(),
+  setClipboardText: vi.fn(),
 }));
 
 const dockerServiceMock = vi.hoisted(() => ({
@@ -72,6 +76,13 @@ const projectServiceMock = vi.hoisted(() => ({
   ApplyProjectPlan: vi.fn(),
 }));
 
+const logsServiceMock = vi.hoisted(() => ({
+  StartLogStream: vi.fn(),
+  StopStream: vi.fn(),
+  FetchLogPage: vi.fn(),
+  ExportLogs: vi.fn(),
+}));
+
 vi.mock('./api/app', () => ({
   getAppVersion: vi.fn().mockResolvedValue({
     version: '0.1.0',
@@ -85,6 +96,7 @@ vi.mock('./api/inventory', () => ({
 
 vi.mock('./api/services', () => ({
   DockerService: dockerServiceMock,
+  LogsService: logsServiceMock,
   ProjectService: projectServiceMock,
 }));
 
@@ -120,6 +132,10 @@ vi.mock('@wailsio/runtime', () => ({
   },
   Dialogs: {
     OpenFile: runtimeMock.openFile,
+    SaveFile: runtimeMock.saveFile,
+  },
+  Clipboard: {
+    SetText: runtimeMock.setClipboardText,
   },
 }));
 
@@ -174,7 +190,17 @@ describe('App inventory shell', () => {
     projectServiceMock.PlanRedeployProject.mockResolvedValue(projectRedeployPlan());
     projectServiceMock.PlanDownProject.mockResolvedValue(projectDownVolumesPlan());
     projectServiceMock.ApplyProjectPlan.mockResolvedValue(undefined);
+    logsServiceMock.StartLogStream.mockResolvedValue('stream-1');
+    logsServiceMock.StopStream.mockResolvedValue(undefined);
+    logsServiceMock.FetchLogPage.mockResolvedValue({ lines: [] });
+    logsServiceMock.ExportLogs.mockResolvedValue({
+      path: '/tmp/cairn-logs.jsonl',
+      bytes: 42,
+      lineCount: 2,
+    });
     runtimeMock.openFile.mockResolvedValue('');
+    runtimeMock.saveFile.mockResolvedValue('/tmp/cairn-logs.jsonl');
+    runtimeMock.setClipboardText.mockResolvedValue(undefined);
 
     useAppStore.setState({
       version: null,
@@ -342,6 +368,119 @@ describe('App inventory shell', () => {
     expect(screen.getByText('valid')).toBeInTheDocument();
     expect(screen.getByTestId('monaco-viewer')).toHaveTextContent(
       'services:',
+    );
+  });
+
+  it('streams logs, filters search matches, and keeps nonmatching rows hidden', async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
+
+    render(<App />);
+
+    await screen.findByText('Docker Engine - Running');
+    fireEvent.click(
+      within(
+        screen.getByRole('navigation', { name: 'Main navigation' }),
+      ).getByRole('button', {
+        name: /Logs/,
+      }),
+    );
+
+    await waitFor(() =>
+      expect(logsServiceMock.StartLogStream).toHaveBeenCalledWith(
+        expect.objectContaining({ follow: true, scope: 'all' }),
+      ),
+    );
+    emitRuntimeEvent('logs:lines', {
+      streamID: 'stream-1',
+      lines: [
+        logLine({ level: 'info', text: 'INFO server started' }),
+        logLine({ level: 'error', stream: 'stderr', text: 'ERROR failed request' }),
+      ],
+    });
+
+    expect(await screen.findByText(/server started/)).toBeInTheDocument();
+    expect(screen.getByText(/failed request/)).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('Search logs'), {
+      target: { value: 'failed' },
+    });
+    await waitFor(() => expect(screen.getByText('1/1')).toBeInTheDocument());
+    fireEvent.click(screen.getByLabelText('Matches only'));
+
+    expect(screen.queryByText(/server started/)).not.toBeInTheDocument();
+    expect(screen.getByText(/request/)).toBeInTheDocument();
+  });
+
+  it('pauses visible logs while buffering new stream events', async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+
+    await screen.findByText('Docker Engine - Running');
+    fireEvent.click(
+      within(
+        screen.getByRole('navigation', { name: 'Main navigation' }),
+      ).getByRole('button', {
+        name: /Logs/,
+      }),
+    );
+    await waitFor(() => expect(logsServiceMock.StartLogStream).toHaveBeenCalled());
+    emitRuntimeEvent('logs:lines', {
+      streamID: 'stream-1',
+      lines: [logLine({ text: 'INFO first line' })],
+    });
+    expect(await screen.findByText(/first line/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Pause' }));
+    emitRuntimeEvent('logs:lines', {
+      streamID: 'stream-1',
+      lines: [logLine({ text: 'INFO buffered line' })],
+    });
+
+    expect(await screen.findByText('Paused - 1 new lines')).toBeInTheDocument();
+    expect(screen.queryByText(/buffered line/)).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getAllByRole('button', { name: 'Resume' })[0]);
+    expect(await screen.findByText(/buffered line/)).toBeInTheDocument();
+  });
+
+  it('exports logs through the current stream scope', async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+
+    await screen.findByText('Docker Engine - Running');
+    fireEvent.click(
+      within(
+        screen.getByRole('navigation', { name: 'Main navigation' }),
+      ).getByRole('button', {
+        name: /Logs/,
+      }),
+    );
+    await waitFor(() => expect(logsServiceMock.StartLogStream).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole('button', { name: 'Export' }));
+
+    const dialog = await screen.findByRole('dialog', { name: 'Export Logs' });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Browse' }));
+    await waitFor(() =>
+      expect(runtimeMock.saveFile).toHaveBeenCalledWith(
+        expect.objectContaining({ ButtonText: 'Export' }),
+      ),
+    );
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Export' }));
+
+    await waitFor(() =>
+      expect(logsServiceMock.ExportLogs).toHaveBeenCalledWith({
+        scope: 'all',
+        ids: [],
+        path: '/tmp/cairn-logs.jsonl',
+      }),
+    );
+    expect(await screen.findByText('Logs exported')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Open folder' }));
+    expect(runtimeMock.setClipboardText).toHaveBeenCalledWith(
+      '/tmp/cairn-logs.jsonl',
     );
   });
 
@@ -687,6 +826,29 @@ describe('App inventory shell', () => {
     expect(inventoryMock.getInventorySnapshot).toHaveBeenCalledTimes(2);
   });
 });
+
+function emitRuntimeEvent(eventName: string, data: unknown) {
+  const callback = runtimeMock.on.mock.calls.find(
+    ([name]) => name === eventName,
+  )?.[1] as ((event?: unknown) => void) | undefined;
+  expect(callback).toEqual(expect.any(Function));
+  act(() => {
+    callback?.({ name: eventName, data });
+  });
+}
+
+function logLine(patch: Partial<LogLine>): LogLine {
+  return {
+    ts: '2026-06-13T09:00:00Z',
+    containerID: 'container-1',
+    containerName: 'web',
+    service: 'web',
+    stream: 'stdout',
+    level: 'info',
+    text: 'INFO log line',
+    ...patch,
+  } as LogLine;
+}
 
 function seededSnapshot(): InventorySnapshot {
   const container = {

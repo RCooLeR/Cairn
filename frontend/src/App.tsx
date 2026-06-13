@@ -2,9 +2,11 @@ import type { LucideIcon } from 'lucide-react';
 import type {
   CommandPlan,
   ContainerSummary,
+  ExportResult,
   HubSearchResult,
   ImageDetail,
   ImageSummary,
+  LogLine,
   MountSpec,
   NetworkDetail,
   NetworkSummary,
@@ -19,14 +21,17 @@ import type {
 } from '../bindings/github.com/RCooLeR/Cairn/internal/models/models.js';
 
 import {
+  ArrowDown,
   Bell,
   Box,
+  Clock3,
   Container,
   Copy,
   Database,
   Download,
   Eye,
   FileJson,
+  Filter,
   FolderOpen,
   Gauge,
   HardDrive,
@@ -37,22 +42,25 @@ import {
   Pencil,
   Plus,
   Network,
+  Pause,
   Play,
   RefreshCw,
   RotateCw,
+  ScrollText,
   Search,
   Server,
   Skull,
   Square,
   Upload,
+  WrapText,
 } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import Editor from '@monaco-editor/react';
-import { Dialogs, Events } from '@wailsio/runtime';
+import { Clipboard, Dialogs, Events } from '@wailsio/runtime';
 
 import { getAppVersion } from './api/app';
-import { DockerService, ProjectService } from './api/services';
+import { DockerService, LogsService, ProjectService } from './api/services';
 import {
   Badge,
   Button,
@@ -64,6 +72,7 @@ import {
   Modal,
   Skeleton,
   StatusDot,
+  Toast,
   Tooltip,
 } from './components/ui';
 import { useAppStore } from './state/appStore';
@@ -74,6 +83,7 @@ const logoUrl = '/cairn-logo.png';
 type PageID =
   | 'overview'
   | 'projects'
+  | 'logs'
   | 'containers'
   | 'images'
   | 'volumes'
@@ -84,6 +94,8 @@ type LoadStatus = 'idle' | 'loading' | 'ready' | 'error';
 type ProjectViewMode = 'grid' | 'list';
 type ProjectSortID = 'name' | 'activity' | 'cpu';
 type ProjectTabID = 'overview' | 'services' | 'containers' | 'compose';
+type LogScope = 'all' | 'project' | 'service' | 'container';
+type LogLevelFilter = 'error' | 'warn' | 'info' | 'debug' | 'unknown';
 
 type NavItem = {
   id: PageID;
@@ -211,9 +223,30 @@ type ImportProjectState = {
   imported?: ProjectDetail | null;
 };
 
+type ExportLogsState = {
+  open: boolean;
+  path: string;
+  format: 'log' | 'jsonl';
+  range: 'buffer' | 'tail';
+  busy: boolean;
+  error?: string;
+  result?: ExportResult | null;
+};
+
+type LogLinesPayload = {
+  streamID: string;
+  lines?: LogLine[];
+};
+
+type LogErrorPayload = {
+  streamID: string;
+  error?: string;
+};
+
 const navItems: NavItem[] = [
   { id: 'overview', label: 'Overview', icon: Gauge },
   { id: 'projects', label: 'Projects', icon: LayoutGrid },
+  { id: 'logs', label: 'Logs', icon: ScrollText },
   { id: 'containers', label: 'Containers', icon: Container },
   { id: 'images', label: 'Images', icon: Box },
   { id: 'volumes', label: 'Volumes', icon: Database },
@@ -312,6 +345,15 @@ const emptyImportProject: ImportProjectState = {
   folderPath: '',
   busy: false,
   imported: null,
+};
+
+const emptyExportLogs: ExportLogsState = {
+  open: false,
+  path: '',
+  format: 'jsonl',
+  range: 'buffer',
+  busy: false,
+  result: null,
 };
 
 function App() {
@@ -1234,6 +1276,15 @@ function App() {
             view={projectView}
           />
         );
+      case 'logs':
+        return (
+          <LogsPage
+            containers={containers}
+            inventoryLoading={inventoryStatus === 'loading'}
+            projects={projects}
+            projectsLoading={projectsStatus === 'loading'}
+          />
+        );
       case 'containers':
         return (
           <ContainersPage
@@ -1760,6 +1811,1005 @@ function OverviewPage({
         </Card>
       </section>
     </div>
+  );
+}
+
+const logLevelOptions: Array<{
+  id: LogLevelFilter;
+  label: string;
+  tone: BadgeTone;
+}> = [
+  { id: 'error', label: 'ERROR', tone: 'error' },
+  { id: 'warn', label: 'WARN', tone: 'warn' },
+  { id: 'info', label: 'INFO', tone: 'info' },
+  { id: 'debug', label: 'DEBUG', tone: 'neutral' },
+  { id: 'unknown', label: 'unknown', tone: 'neutral' },
+];
+
+const logBufferLimit = 50000;
+const logRowOverscan = 8;
+
+type LogsPageProps = {
+  containers: ContainerSummary[];
+  projects: ProjectSummary[];
+  inventoryLoading: boolean;
+  projectsLoading: boolean;
+};
+
+type LogOption = {
+  id: string;
+  label: string;
+  hint?: string;
+};
+
+function LogsPage({
+  containers,
+  inventoryLoading,
+  projects,
+  projectsLoading,
+}: LogsPageProps) {
+  const [scope, setScope] = useState<LogScope>('all');
+  const [selectedProjectID, setSelectedProjectID] = useState('');
+  const [selectedServiceID, setSelectedServiceID] = useState('');
+  const [selectedContainerIDs, setSelectedContainerIDs] = useState<string[]>(
+    [],
+  );
+  const [lines, setLines] = useState<LogLine[]>([]);
+  const [streamID, setStreamID] = useState<string | null>(null);
+  const streamIDRef = useRef<string | null>(null);
+  const [streamStatus, setStreamStatus] = useState<LoadStatus>('idle');
+  const [streamError, setStreamError] = useState<string | null>(null);
+  const [streamEnded, setStreamEnded] = useState(false);
+  const [restartNonce, setRestartNonce] = useState(0);
+  const [paused, setPaused] = useState(false);
+  const [pausedAt, setPausedAt] = useState<number | null>(null);
+  const [follow, setFollow] = useState(true);
+  const [unpinnedAt, setUnpinnedAt] = useState<number | null>(null);
+  const [showTimestamps, setShowTimestamps] = useState(true);
+  const [wrapLines, setWrapLines] = useState(false);
+  const [sourceFilter, setSourceFilter] = useState<string | null>(null);
+  const [levelFilters, setLevelFilters] = useState<Set<LogLevelFilter>>(
+    () => new Set(logLevelOptions.map((level) => level.id)),
+  );
+  const [query, setQuery] = useState('');
+  const [debouncedQuery, setDebouncedQuery] = useState('');
+  const [hideNonMatching, setHideNonMatching] = useState(false);
+  const [activeMatch, setActiveMatch] = useState(0);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(520);
+  const [exportLogs, setExportLogs] =
+    useState<ExportLogsState>(emptyExportLogs);
+  const [exportToast, setExportToast] = useState<ExportResult | null>(null);
+  const viewerRef = useRef<HTMLDivElement>(null);
+
+  const projectOptions = useMemo<LogOption[]>(
+    () =>
+      projects.map((project) => ({
+        id: project.id,
+        label: project.name,
+        hint: project.status,
+      })),
+    [projects],
+  );
+  const serviceOptions = useMemo<LogOption[]>(() => {
+    const seen = new Map<string, LogOption>();
+    for (const container of containers) {
+      if (!container.projectID || !container.service) {
+        continue;
+      }
+      const id = `${container.projectID}::${container.service}`;
+      if (!seen.has(id)) {
+        seen.set(id, {
+          id,
+          label: `${projectName(projects, container.projectID)} / ${container.service}`,
+          hint: container.state,
+        });
+      }
+    }
+    return Array.from(seen.values()).sort((left, right) =>
+      left.label.localeCompare(right.label),
+    );
+  }, [containers, projects]);
+  const containerOptions = useMemo<LogOption[]>(
+    () =>
+      containers
+        .map((container) => ({
+          id: container.id,
+          label: container.name,
+          hint: container.service || container.state,
+        }))
+        .sort((left, right) => left.label.localeCompare(right.label)),
+    [containers],
+  );
+
+  useEffect(() => {
+    if (scope === 'project' && !selectedProjectID && projectOptions[0]) {
+      setSelectedProjectID(projectOptions[0].id);
+    }
+    if (scope === 'service' && !selectedServiceID && serviceOptions[0]) {
+      setSelectedServiceID(serviceOptions[0].id);
+    }
+    if (
+      scope === 'container' &&
+      selectedContainerIDs.length === 0 &&
+      containerOptions[0]
+    ) {
+      setSelectedContainerIDs([containerOptions[0].id]);
+    }
+  }, [
+    containerOptions,
+    projectOptions,
+    scope,
+    selectedContainerIDs.length,
+    selectedProjectID,
+    selectedServiceID,
+    serviceOptions,
+  ]);
+
+  useEffect(() => {
+    streamIDRef.current = streamID;
+  }, [streamID]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      setDebouncedQuery(query.trim().toLowerCase());
+    }, 200);
+    return () => window.clearTimeout(timer);
+  }, [query]);
+
+  useEffect(() => {
+    setActiveMatch(0);
+  }, [debouncedQuery, hideNonMatching, sourceFilter, levelFilters]);
+
+  useEffect(() => {
+    const node = viewerRef.current;
+    if (!node) {
+      return undefined;
+    }
+    const update = () => setViewportHeight(node.clientHeight || 520);
+    update();
+    window.addEventListener('resize', update);
+    const observer =
+      typeof ResizeObserver === 'undefined'
+        ? null
+        : new ResizeObserver(update);
+    observer?.observe(node);
+    return () => {
+      window.removeEventListener('resize', update);
+      observer?.disconnect();
+    };
+  }, []);
+
+  useEffect(() => {
+    const offLines = Events.On('logs:lines', (event) => {
+      const payload = eventPayload<LogLinesPayload>(event);
+      if (!payload || payload.streamID !== streamIDRef.current) {
+        return;
+      }
+      const nextLines = (payload.lines ?? []).filter(isLogLine);
+      if (nextLines.length === 0) {
+        return;
+      }
+      setLines((current) => {
+        const merged = current.concat(nextLines);
+        return merged.length > logBufferLimit
+          ? merged.slice(merged.length - logBufferLimit)
+          : merged;
+      });
+    });
+    const offEOF = Events.On('logs:eof', (event) => {
+      const payload = eventPayload<LogErrorPayload>(event);
+      if (!payload || payload.streamID !== streamIDRef.current) {
+        return;
+      }
+      setStreamEnded(true);
+      setStreamStatus('ready');
+    });
+    const offError = Events.On('logs:error', (event) => {
+      const payload = eventPayload<LogErrorPayload>(event);
+      if (!payload || payload.streamID !== streamIDRef.current) {
+        return;
+      }
+      setStreamError(payload.error ?? 'Log stream failed');
+      setStreamStatus('error');
+    });
+    return () => {
+      offLines();
+      offEOF();
+      offError();
+    };
+  }, []);
+
+  const streamIDs = useMemo(() => {
+    if (scope === 'project') {
+      return selectedProjectID ? [selectedProjectID] : [];
+    }
+    if (scope === 'service') {
+      return selectedServiceID ? [selectedServiceID] : [];
+    }
+    if (scope === 'container') {
+      return selectedContainerIDs;
+    }
+    return [];
+  }, [scope, selectedContainerIDs, selectedProjectID, selectedServiceID]);
+  const canStream = scope === 'all' || streamIDs.length > 0;
+
+  useEffect(() => {
+    if (!canStream) {
+      setLines([]);
+      setStreamID(null);
+      setStreamStatus('idle');
+      setStreamError(null);
+      setStreamEnded(false);
+      return undefined;
+    }
+
+    let cancelled = false;
+    let activeStreamID: string | null = null;
+    setLines([]);
+    setStreamID(null);
+    setStreamStatus('loading');
+    setStreamError(null);
+    setStreamEnded(false);
+    setPaused(false);
+    setPausedAt(null);
+    setFollow(true);
+    setUnpinnedAt(null);
+
+    LogsService.StartLogStream({
+      scope,
+      ids: streamIDs,
+      follow: true,
+      tail: 500,
+      timestamps: true,
+    })
+      .then((nextStreamID) => {
+        if (cancelled) {
+          void LogsService.StopStream(nextStreamID);
+          return;
+        }
+        activeStreamID = nextStreamID;
+        setStreamID(nextStreamID);
+        setStreamStatus('ready');
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setStreamError(
+            error instanceof Error ? error.message : 'Unable to start logs',
+          );
+          setStreamStatus('error');
+        }
+      });
+
+    return () => {
+      cancelled = true;
+      if (activeStreamID) {
+        void LogsService.StopStream(activeStreamID);
+      }
+    };
+  }, [canStream, restartNonce, scope, streamIDs]);
+
+  const pausedViewLength =
+    paused && pausedAt !== null ? Math.min(pausedAt, lines.length) : lines.length;
+  const pausedNewCount = paused ? Math.max(0, lines.length - pausedViewLength) : 0;
+  const visibleSource = useMemo(
+    () => lines.slice(0, pausedViewLength),
+    [lines, pausedViewLength],
+  );
+  const filteredLines = useMemo(
+    () =>
+      visibleSource.filter((line) => {
+        const level = normalizeLogLevel(line.level);
+        if (!levelFilters.has(level)) {
+          return false;
+        }
+        if (sourceFilter && logSourceKey(line) !== sourceFilter) {
+          return false;
+        }
+        if (debouncedQuery && hideNonMatching) {
+          return line.text.toLowerCase().includes(debouncedQuery);
+        }
+        return true;
+      }),
+    [
+      debouncedQuery,
+      hideNonMatching,
+      levelFilters,
+      sourceFilter,
+      visibleSource,
+    ],
+  );
+  const matchRows = useMemo(() => {
+    if (!debouncedQuery) {
+      return [];
+    }
+    const rows: number[] = [];
+    filteredLines.forEach((line, index) => {
+      if (line.text.toLowerCase().includes(debouncedQuery)) {
+        rows.push(index);
+      }
+    });
+    return rows;
+  }, [debouncedQuery, filteredLines]);
+  const rowHeight = wrapLines ? 44 : 26;
+  const totalHeight = filteredLines.length * rowHeight;
+  const virtualStart = Math.max(
+    0,
+    Math.floor(scrollTop / rowHeight) - logRowOverscan,
+  );
+  const visibleCount =
+    Math.ceil(viewportHeight / rowHeight) + logRowOverscan * 2;
+  const virtualEnd = Math.min(filteredLines.length, virtualStart + visibleCount);
+  const virtualRows = filteredLines.slice(virtualStart, virtualEnd);
+  const newLinesWhileUnpinned =
+    !follow && !paused && unpinnedAt !== null
+      ? Math.max(0, filteredLines.length - unpinnedAt)
+      : 0;
+
+  useEffect(() => {
+    if (!follow || paused) {
+      return;
+    }
+    window.requestAnimationFrame(() => {
+      const node = viewerRef.current;
+      if (node) {
+        node.scrollTop = node.scrollHeight;
+      }
+    });
+  }, [filteredLines.length, follow, paused]);
+
+  const toggleLevel = useCallback((level: LogLevelFilter) => {
+    setLevelFilters((current) => {
+      const next = new Set(current);
+      if (next.has(level) && next.size > 1) {
+        next.delete(level);
+      } else {
+        next.add(level);
+      }
+      return next;
+    });
+  }, []);
+
+  const scrollToBottom = useCallback(() => {
+    setFollow(true);
+    setUnpinnedAt(null);
+    window.requestAnimationFrame(() => {
+      const node = viewerRef.current;
+      if (node) {
+        node.scrollTop = node.scrollHeight;
+      }
+    });
+  }, []);
+
+  const jumpMatch = useCallback(
+    (direction: -1 | 1) => {
+      if (matchRows.length === 0) {
+        return;
+      }
+      setActiveMatch((current) => {
+        const next =
+          (current + direction + matchRows.length) % matchRows.length;
+        const node = viewerRef.current;
+        if (node) {
+          node.scrollTop = Math.max(0, matchRows[next] * rowHeight - rowHeight);
+        }
+        return next;
+      });
+    },
+    [matchRows, rowHeight],
+  );
+
+  const browseExportPath = useCallback(async () => {
+    const format = exportLogs.format;
+    const selected = await Dialogs.SaveFile({
+      Title: 'Export Logs',
+      Message: 'Choose a log export file',
+      ButtonText: 'Export',
+      Filename: `cairn-${scope}-logs.${format}`,
+      Filters: [
+        {
+          DisplayName: format === 'jsonl' ? 'JSON Lines' : 'Log file',
+          Pattern: format === 'jsonl' ? '*.jsonl' : '*.log',
+        },
+      ],
+    });
+    if (selected) {
+      setExportLogs((current) => ({ ...current, path: selected }));
+    }
+  }, [exportLogs.format, scope]);
+
+  const submitExport = useCallback(async () => {
+    setExportLogs((current) => ({ ...current, busy: true, error: undefined }));
+    try {
+      const result = await LogsService.ExportLogs({
+        scope,
+        ids: streamIDs,
+        path: exportLogs.path,
+      });
+      setExportLogs({ ...emptyExportLogs, result });
+      setExportToast(result);
+    } catch (error: unknown) {
+      setExportLogs((current) => ({
+        ...current,
+        busy: false,
+        error: error instanceof Error ? error.message : 'Unable to export logs',
+      }));
+    }
+  }, [exportLogs.path, scope, streamIDs]);
+
+  const streamLabel =
+    scope === 'all'
+      ? 'All scopes'
+      : streamIDs.length > 0
+        ? `${streamIDs.length} selected`
+        : 'No scope selected';
+  const emptyTitle =
+    !canStream
+      ? 'Pick a project, service, or container'
+      : streamStatus === 'loading'
+      ? 'Opening log stream'
+      : 'No visible logs';
+
+  return (
+    <div className="relative min-h-full space-y-4">
+      <Card>
+        <CardBody className="space-y-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <div
+              aria-label="Log scope"
+              className="flex rounded-control border border-border bg-bg-inset p-1"
+              role="group"
+            >
+              {(['all', 'project', 'service', 'container'] as LogScope[]).map(
+                (nextScope) => (
+                  <button
+                    className={[
+                      'h-8 rounded-control px-3 text-xs font-medium capitalize transition',
+                      scope === nextScope
+                        ? 'bg-accent text-bg-app'
+                        : 'text-text-secondary hover:bg-bg-card hover:text-text-primary',
+                    ].join(' ')}
+                    key={nextScope}
+                    onClick={() => setScope(nextScope)}
+                    type="button"
+                  >
+                    {nextScope}
+                  </button>
+                ),
+              )}
+            </div>
+
+            {scope === 'project' ? (
+              <LogSelect
+                ariaLabel="Project scope"
+                disabled={projectsLoading}
+                onChange={setSelectedProjectID}
+                options={projectOptions}
+                value={selectedProjectID}
+              />
+            ) : null}
+            {scope === 'service' ? (
+              <LogSelect
+                ariaLabel="Service scope"
+                disabled={inventoryLoading}
+                onChange={setSelectedServiceID}
+                options={serviceOptions}
+                value={selectedServiceID}
+              />
+            ) : null}
+            {scope === 'container' ? (
+              <select
+                aria-label="Container scope"
+                className="h-20 min-w-60 rounded-control border border-border bg-bg-inset px-3 py-2 text-sm text-text-primary"
+                multiple
+                onChange={(event) =>
+                  setSelectedContainerIDs(
+                    Array.from(event.currentTarget.selectedOptions).map(
+                      (option) => option.value,
+                    ),
+                  )
+                }
+                value={selectedContainerIDs}
+              >
+                {containerOptions.map((option) => (
+                  <option key={option.id} value={option.id}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            ) : null}
+
+            <Badge tone={streamStatus === 'error' ? 'error' : 'info'}>
+              {streamLabel}
+            </Badge>
+            {streamEnded ? <Badge tone="neutral">eof</Badge> : null}
+            {streamID ? <Badge>{shortID(streamID)}</Badge> : null}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="relative min-w-72 flex-1">
+              <Search
+                className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-text-muted"
+                size={16}
+              />
+              <input
+                aria-label="Search logs"
+                className="h-9 w-full rounded-control border border-border bg-bg-inset pl-9 pr-3 text-sm text-text-primary placeholder:text-text-muted"
+                onChange={(event) => setQuery(event.target.value)}
+                placeholder="Search"
+                value={query}
+              />
+            </div>
+            <label className="inline-flex h-9 items-center gap-2 rounded-control border border-border bg-bg-inset px-3 text-xs text-text-secondary">
+              <input
+                checked={hideNonMatching}
+                onChange={(event) => setHideNonMatching(event.target.checked)}
+                type="checkbox"
+              />
+              Matches only
+            </label>
+            <div className="flex items-center gap-1">
+              <Button
+                disabled={matchRows.length === 0}
+                onClick={() => jumpMatch(-1)}
+                size="sm"
+                variant="secondary"
+              >
+                Prev
+              </Button>
+              <Button
+                disabled={matchRows.length === 0}
+                onClick={() => jumpMatch(1)}
+                size="sm"
+                variant="secondary"
+              >
+                Next
+              </Button>
+              <Badge>
+                {matchRows.length > 0 ? activeMatch + 1 : 0}/
+                {matchRows.length}
+              </Badge>
+            </div>
+
+            <Tooltip label={paused ? 'Resume stream display' : 'Pause display'}>
+              <Button
+                icon={
+                  paused ? <Play size={16} /> : <Pause size={16} />
+                }
+                onClick={() => {
+                  if (paused) {
+                    setPaused(false);
+                    setPausedAt(null);
+                    scrollToBottom();
+                  } else {
+                    setPaused(true);
+                    setPausedAt(lines.length);
+                  }
+                }}
+                variant={paused ? 'primary' : 'secondary'}
+              >
+                {paused ? 'Resume' : 'Pause'}
+              </Button>
+            </Tooltip>
+            <Tooltip label="Pin to newest logs">
+              <Button
+                icon={<ArrowDown size={16} />}
+                onClick={scrollToBottom}
+                variant={follow ? 'primary' : 'secondary'}
+              >
+                Follow
+              </Button>
+            </Tooltip>
+            <Tooltip label="Toggle timestamps">
+              <Button
+                aria-label="Toggle timestamps"
+                icon={<Clock3 size={16} />}
+                onClick={() => setShowTimestamps((current) => !current)}
+                size="icon"
+                variant={showTimestamps ? 'primary' : 'secondary'}
+              />
+            </Tooltip>
+            <Tooltip label="Toggle line wrap">
+              <Button
+                aria-label="Toggle line wrap"
+                icon={<WrapText size={16} />}
+                onClick={() => setWrapLines((current) => !current)}
+                size="icon"
+                variant={wrapLines ? 'primary' : 'secondary'}
+              />
+            </Tooltip>
+            <Tooltip label="Export logs">
+              <Button
+                icon={<Download size={16} />}
+                onClick={() =>
+                  setExportLogs({
+                    ...emptyExportLogs,
+                    open: true,
+                    path: `cairn-${scope}-logs.jsonl`,
+                  })
+                }
+              >
+                Export
+              </Button>
+            </Tooltip>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2">
+            <Filter size={15} className="text-text-muted" />
+            {logLevelOptions.map((level) => (
+              <button
+                className={[
+                  'h-7 rounded-control border px-2 text-xs font-medium transition',
+                  levelFilters.has(level.id)
+                    ? 'border-accent bg-accent/10 text-text-primary'
+                    : 'border-border bg-bg-inset text-text-muted hover:text-text-primary',
+                ].join(' ')}
+                key={level.id}
+                onClick={() => toggleLevel(level.id)}
+                type="button"
+              >
+                {level.label}
+              </button>
+            ))}
+            {sourceFilter ? (
+              <Button
+                onClick={() => setSourceFilter(null)}
+                size="sm"
+                variant="ghost"
+              >
+                Clear source
+              </Button>
+            ) : null}
+          </div>
+        </CardBody>
+      </Card>
+
+      {paused && pausedNewCount > 0 ? (
+        <div className="flex items-center justify-between rounded-control border border-warn/40 bg-warn/10 px-3 py-2 text-sm text-warn">
+          <span>Paused - {formatCount(pausedNewCount)} new lines</span>
+          <Button
+            onClick={() => {
+              setPaused(false);
+              setPausedAt(null);
+              scrollToBottom();
+            }}
+            size="sm"
+            variant="secondary"
+          >
+            Resume
+          </Button>
+        </div>
+      ) : null}
+      {streamError ? (
+        <div className="flex items-center justify-between rounded-control border border-error/40 bg-error/10 px-3 py-2 text-sm text-error">
+          <span>{streamError}</span>
+          <Button
+            onClick={() => setRestartNonce((current) => current + 1)}
+            size="sm"
+            variant="secondary"
+          >
+            Retry
+          </Button>
+        </div>
+      ) : null}
+
+      <section className="overflow-hidden rounded-card border border-border bg-bg-card">
+        <div className="flex h-9 items-center justify-between border-b border-border bg-bg-inset px-3 text-xs text-text-muted">
+          <span>{formatCount(filteredLines.length)} visible lines</span>
+          <span>{formatCount(lines.length)} buffered</span>
+        </div>
+        {filteredLines.length === 0 ? (
+          <div className="p-10">
+            <EmptyState
+              body={
+                canStream
+                  ? 'The selected stream has not produced visible lines.'
+                  : 'Select a scope before opening a stream.'
+              }
+              icon={<ScrollText size={28} />}
+              title={emptyTitle}
+            />
+          </div>
+        ) : (
+          <div
+            aria-label="Log lines"
+            className="relative h-[520px] overflow-auto font-mono text-xs"
+            onScroll={(event) => {
+              const node = event.currentTarget;
+              const nextTop = node.scrollTop;
+              setScrollTop(nextTop);
+              const distanceFromBottom =
+                node.scrollHeight - node.clientHeight - nextTop;
+              if (distanceFromBottom > 48) {
+                if (follow) {
+                  setUnpinnedAt(filteredLines.length);
+                }
+                setFollow(false);
+              } else if (!paused) {
+                setFollow(true);
+                setUnpinnedAt(null);
+              }
+            }}
+            ref={viewerRef}
+            role="log"
+          >
+            <div style={{ height: totalHeight, position: 'relative' }}>
+              {virtualRows.map((line, offset) => {
+                const rowIndex = virtualStart + offset;
+                return (
+                  <LogRow
+                    activeSearch={matchRows[activeMatch] === rowIndex}
+                    key={`${rowIndex}:${line.ts}:${line.containerID ?? line.containerName ?? ''}:${line.text}`}
+                    line={line}
+                    onSourceClick={setSourceFilter}
+                    query={debouncedQuery}
+                    rowHeight={rowHeight}
+                    showTimestamp={showTimestamps}
+                    style={{ top: rowIndex * rowHeight }}
+                    wrap={wrapLines}
+                  />
+                );
+              })}
+            </div>
+          </div>
+        )}
+      </section>
+
+      {newLinesWhileUnpinned > 0 ? (
+        <button
+          className="absolute bottom-5 left-1/2 -translate-x-1/2 rounded-full border border-accent bg-bg-panel px-3 py-1 text-sm text-accent shadow-lg"
+          onClick={scrollToBottom}
+          type="button"
+        >
+          {formatCount(newLinesWhileUnpinned)} new lines
+        </button>
+      ) : null}
+
+      {exportToast ? (
+        <div className="fixed bottom-5 right-5 z-40">
+          <Toast
+            action={
+              <Button
+                icon={<FolderOpen size={15} />}
+                onClick={() => {
+                  void Clipboard.SetText(exportToast.path);
+                }}
+                size="sm"
+                variant="secondary"
+              >
+                Open folder
+              </Button>
+            }
+            body={`${formatCount(exportToast.lineCount)} lines saved`}
+            level="ok"
+            title="Logs exported"
+          />
+        </div>
+      ) : null}
+
+      <LogsExportModal
+        currentFilters={logFilterSummary(
+          scope,
+          streamIDs,
+          levelFilters,
+          sourceFilter,
+          debouncedQuery,
+        )}
+        onBrowse={() => {
+          void browseExportPath();
+        }}
+        onChange={(patch) =>
+          setExportLogs((current) => ({ ...current, ...patch }))
+        }
+        onClose={() => setExportLogs(emptyExportLogs)}
+        onSubmit={() => {
+          void submitExport();
+        }}
+        state={exportLogs}
+      />
+    </div>
+  );
+}
+
+function LogSelect({
+  ariaLabel,
+  disabled,
+  onChange,
+  options,
+  value,
+}: {
+  ariaLabel: string;
+  disabled?: boolean;
+  onChange: (value: string) => void;
+  options: LogOption[];
+  value: string;
+}) {
+  return (
+    <select
+      aria-label={ariaLabel}
+      className="h-9 min-w-60 rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary"
+      disabled={disabled || options.length === 0}
+      onChange={(event) => onChange(event.currentTarget.value)}
+      value={value}
+    >
+      {options.length === 0 ? <option value="">No options</option> : null}
+      {options.map((option) => (
+        <option key={option.id} value={option.id}>
+          {option.label}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+function LogRow({
+  activeSearch,
+  line,
+  onSourceClick,
+  query,
+  rowHeight,
+  showTimestamp,
+  style,
+  wrap,
+}: {
+  activeSearch: boolean;
+  line: LogLine;
+  onSourceClick: (source: string) => void;
+  query: string;
+  rowHeight: number;
+  showTimestamp: boolean;
+  style: { top: number };
+  wrap: boolean;
+}) {
+  const source = logSource(line);
+  const isSkipMarker = line.stream === 'system' && line.text.includes('skipped');
+  if (isSkipMarker) {
+    return (
+      <div
+        className="absolute left-0 right-0 flex items-center justify-center border-y border-warn/30 bg-warn/10 text-warn"
+        style={{ height: rowHeight, top: style.top }}
+      >
+        -- {line.text} (UI lagging) --
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className={[
+        'absolute left-0 right-0 grid items-start gap-2 border-b border-border/60 px-3 py-1',
+        showTimestamp
+          ? 'grid-cols-[96px_128px_64px_1fr]'
+          : 'grid-cols-[128px_64px_1fr]',
+        line.stream === 'stderr' ? 'border-l-2 border-l-error/70' : '',
+        activeSearch ? 'bg-accent/10' : 'hover:bg-bg-inset',
+      ].join(' ')}
+      style={{ height: rowHeight, top: style.top }}
+    >
+      {showTimestamp ? (
+        <span className="text-text-muted">{formatLogTimestamp(line.ts)}</span>
+      ) : null}
+      <button
+        className="truncate rounded-control border px-2 py-0.5 text-left"
+        onClick={() => onSourceClick(logSourceKey(line))}
+        style={{
+          borderColor: sourceColor(source),
+          color: sourceColor(source),
+        }}
+        title={source}
+        type="button"
+      >
+        {source}
+      </button>
+      <Tooltip label={line.level ? 'detected' : 'undetected'}>
+        <span>
+          <Badge tone={levelTone(normalizeLogLevel(line.level))}>
+            {line.level || 'LOG'}
+          </Badge>
+        </span>
+      </Tooltip>
+      <span
+        className={[
+          'min-w-0 text-text-primary',
+          wrap ? 'whitespace-pre-wrap break-words' : 'truncate whitespace-pre',
+        ].join(' ')}
+      >
+        {renderAnsiText(line.text, query)}
+      </span>
+    </div>
+  );
+}
+
+function LogsExportModal({
+  currentFilters,
+  onBrowse,
+  onChange,
+  onClose,
+  onSubmit,
+  state,
+}: {
+  currentFilters: string;
+  onBrowse: () => void;
+  onChange: (patch: Partial<ExportLogsState>) => void;
+  onClose: () => void;
+  onSubmit: () => void;
+  state: ExportLogsState;
+}) {
+  return (
+    <Modal
+      busy={state.busy}
+      footer={
+        <ModalActions
+          busy={state.busy}
+          disabled={!state.path.trim()}
+          onCancel={onClose}
+          onSubmit={onSubmit}
+          submitLabel="Export"
+        />
+      }
+      onClose={onClose}
+      open={state.open}
+      size="md"
+      title="Export Logs"
+    >
+      <div className="space-y-4">
+        <div className="grid grid-cols-[120px_1fr] items-center gap-3">
+          <label className="text-text-muted" htmlFor="logs-export-format">
+            Format
+          </label>
+          <select
+            className="h-9 rounded-control border border-border bg-bg-inset px-3 text-text-primary"
+            id="logs-export-format"
+            onChange={(event) => {
+              const format = event.currentTarget.value as 'log' | 'jsonl';
+              onChange({
+                format,
+                path: state.path.replace(/\.(log|jsonl)$/i, `.${format}`),
+              });
+            }}
+            value={state.format}
+          >
+            <option value="jsonl">.jsonl</option>
+            <option value="log">.log</option>
+          </select>
+
+          <label className="text-text-muted" htmlFor="logs-export-range">
+            Range
+          </label>
+          <select
+            className="h-9 rounded-control border border-border bg-bg-inset px-3 text-text-primary"
+            id="logs-export-range"
+            onChange={(event) =>
+              onChange({ range: event.currentTarget.value as 'buffer' | 'tail' })
+            }
+            value={state.range}
+          >
+            <option value="buffer">current buffer</option>
+            <option value="tail">tail</option>
+          </select>
+
+          <label className="text-text-muted" htmlFor="logs-export-path">
+            Path
+          </label>
+          <div className="flex gap-2">
+            <input
+              className="h-9 min-w-0 flex-1 rounded-control border border-border bg-bg-inset px-3 text-text-primary"
+              id="logs-export-path"
+              onChange={(event) => onChange({ path: event.currentTarget.value })}
+              value={state.path}
+            />
+            <Button onClick={onBrowse} size="sm" variant="secondary">
+              Browse
+            </Button>
+          </div>
+        </div>
+
+        <div className="rounded-control border border-border bg-bg-inset px-3 py-2 text-xs text-text-muted">
+          {currentFilters}
+        </div>
+        {state.error ? <div className="text-sm text-error">{state.error}</div> : null}
+      </div>
+    </Modal>
   );
 }
 
@@ -3622,6 +4672,205 @@ function ContainerBulkActions({
       </Button>
     </div>
   );
+}
+
+function eventPayload<T>(event: unknown): T | null {
+  if (!event) {
+    return null;
+  }
+  if (typeof event === 'object' && 'data' in event) {
+    return ((event as { data?: T }).data ?? null) as T | null;
+  }
+  return event as T;
+}
+
+function isLogLine(value: unknown): value is LogLine {
+  if (!value || typeof value !== 'object') {
+    return false;
+  }
+  const candidate = value as Partial<LogLine>;
+  return typeof candidate.text === 'string' && typeof candidate.stream === 'string';
+}
+
+function normalizeLogLevel(level?: string): LogLevelFilter {
+  const value = level?.toLowerCase();
+  if (value === 'error' || value === 'warn' || value === 'info' || value === 'debug') {
+    return value;
+  }
+  return 'unknown';
+}
+
+function levelTone(level: LogLevelFilter): BadgeTone {
+  if (level === 'error') {
+    return 'error';
+  }
+  if (level === 'warn') {
+    return 'warn';
+  }
+  if (level === 'info') {
+    return 'info';
+  }
+  return 'neutral';
+}
+
+function logSource(line: LogLine) {
+  return line.containerName || line.service || shortID(line.containerID ?? '') || 'system';
+}
+
+function logSourceKey(line: LogLine) {
+  return line.containerID || line.containerName || line.service || 'system';
+}
+
+function projectName(projects: ProjectSummary[], id: string) {
+  return projects.find((project) => project.id === id)?.name ?? id;
+}
+
+function sourceColor(source: string) {
+  const hue = hashString(source) % 360;
+  return `hsl(${hue} 78% 68%)`;
+}
+
+function hashString(value: string) {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
+  }
+  return hash;
+}
+
+function formatCount(value: number) {
+  return new Intl.NumberFormat().format(value);
+}
+
+function formatLogTimestamp(value: unknown) {
+  const date = value instanceof Date ? value : new Date(String(value ?? ''));
+  if (Number.isNaN(date.getTime())) {
+    return '--:--:--.---';
+  }
+  const hh = String(date.getHours()).padStart(2, '0');
+  const mm = String(date.getMinutes()).padStart(2, '0');
+  const ss = String(date.getSeconds()).padStart(2, '0');
+  const ms = String(date.getMilliseconds()).padStart(3, '0');
+  return `${hh}:${mm}:${ss}.${ms}`;
+}
+
+function renderAnsiText(text: string, query: string) {
+  const ansiPattern = new RegExp(`${String.fromCharCode(27)}\\[([0-9;]*)m`, 'g');
+  const nodes: JSX.Element[] = [];
+  let className = '';
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  let key = 0;
+
+  while ((match = ansiPattern.exec(text)) !== null) {
+    if (match.index > cursor) {
+      nodes.push(
+        <span className={className} key={`ansi-${key}`}>
+          {renderHighlightedText(text.slice(cursor, match.index), query, key)}
+        </span>,
+      );
+      key += 1;
+    }
+    className = ansiClass(match[1], className);
+    cursor = ansiPattern.lastIndex;
+  }
+  if (cursor < text.length) {
+    nodes.push(
+      <span className={className} key={`ansi-${key}`}>
+        {renderHighlightedText(text.slice(cursor), query, key)}
+      </span>,
+    );
+  }
+  if (nodes.length === 0) {
+    return renderHighlightedText(text, query, 0);
+  }
+  return nodes;
+}
+
+function ansiClass(codesText: string, current: string) {
+  const codes = codesText
+    .split(';')
+    .filter(Boolean)
+    .map((code) => Number.parseInt(code, 10));
+  if (codes.length === 0 || codes.includes(0)) {
+    return '';
+  }
+  let next = current;
+  for (const code of codes) {
+    if (code === 1) {
+      next = `${next} font-semibold`.trim();
+    } else if (code === 31) {
+      next = 'text-error';
+    } else if (code === 32) {
+      next = 'text-ok';
+    } else if (code === 33) {
+      next = 'text-warn';
+    } else if (code === 34) {
+      next = 'text-info';
+    } else if (code === 36) {
+      next = 'text-accent';
+    } else if (code === 90) {
+      next = 'text-text-muted';
+    }
+  }
+  return next;
+}
+
+function renderHighlightedText(text: string, query: string, keyPrefix: number) {
+  if (!query) {
+    return text;
+  }
+  const lower = text.toLowerCase();
+  const parts: JSX.Element[] = [];
+  let cursor = 0;
+  let index = lower.indexOf(query);
+  let key = 0;
+  while (index >= 0) {
+    if (index > cursor) {
+      parts.push(<span key={`${keyPrefix}-text-${key}`}>{text.slice(cursor, index)}</span>);
+      key += 1;
+    }
+    parts.push(
+      <mark
+        className="rounded bg-accent/30 px-0.5 text-text-primary"
+        key={`${keyPrefix}-mark-${key}`}
+      >
+        {text.slice(index, index + query.length)}
+      </mark>,
+    );
+    key += 1;
+    cursor = index + query.length;
+    index = lower.indexOf(query, cursor);
+  }
+  if (cursor < text.length) {
+    parts.push(<span key={`${keyPrefix}-text-${key}`}>{text.slice(cursor)}</span>);
+  }
+  return parts;
+}
+
+function logFilterSummary(
+  scope: LogScope,
+  ids: string[],
+  levels: Set<LogLevelFilter>,
+  source: string | null,
+  query: string,
+) {
+  const selectedLevels = logLevelOptions
+    .filter((level) => levels.has(level.id))
+    .map((level) => level.label)
+    .join(', ');
+  const parts = [
+    `scope ${scope}`,
+    `selected ${ids.length || 'all'}`,
+    `levels ${selectedLevels}`,
+  ];
+  if (source) {
+    parts.push(`source ${source}`);
+  }
+  if (query) {
+    parts.push(`search ${query}`);
+  }
+  return parts.join(' | ');
 }
 
 function InspectModal({
