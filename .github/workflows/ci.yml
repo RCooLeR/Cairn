@@ -41,7 +41,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             pkg-config gcc \
             libgtk-4-dev libwebkitgtk-6.0-dev libsoup-3.0-dev \
-            docker-buildx-plugin docker-compose-plugin
+            moby-buildx docker-compose-v2
           sudo systemctl start docker.service || sudo service docker start
           sudo chmod 666 /var/run/docker.sock
           timeout 60 bash -c 'until docker info >/dev/null 2>&1; do sleep 2; done'
