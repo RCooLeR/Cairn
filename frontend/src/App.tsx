@@ -3029,6 +3029,8 @@ function DashboardCountsStrip({
   onShowContainers: (filter: FilterID) => void;
 }) {
   const stopped = Math.max(0, containers.length - runningContainers);
+  const imageCounts = useMemo(() => imageFilterCounts(images, {}), [images]);
+  const volumeCounts = useMemo(() => volumeFilterCounts(volumes), [volumes]);
   return (
     <section
       className="grid gap-3 sm:grid-cols-2 2xl:grid-cols-5"
@@ -3047,13 +3049,13 @@ function DashboardCountsStrip({
         value={counts.containers}
       />
       <MetricButton
-        hint={`${imageDanglingCount(images)} dangling`}
+        hint={`${imageCounts.dangling} dangling`}
         label="Images"
         onClick={() => onNavigate('images')}
         value={counts.images}
       />
       <MetricButton
-        hint={`${volumes.filter((volume) => volume.inUse).length} in use`}
+        hint={`${volumeCounts.inUse} in use`}
         label="Volumes"
         onClick={() => onNavigate('volumes')}
         value={counts.volumes}
@@ -5899,6 +5901,7 @@ function ContainersPage({
     () => filterContainers(containers, search, filter),
     [containers, filter, search],
   );
+  const counts = useMemo(() => containerFilterCounts(containers), [containers]);
   if (loading && containers.length === 0) {
     return <TableSkeleton />;
   }
@@ -5907,36 +5910,12 @@ function ContainersPage({
       <FilterChips
         active={filter}
         items={[
-          ['all', 'All', containers.length],
-          [
-            'running',
-            'Running',
-            containers.filter((container) => container.state === 'running')
-              .length,
-          ],
-          [
-            'stopped',
-            'Stopped',
-            containers.filter((container) => container.state === 'exited')
-              .length,
-          ],
-          [
-            'paused',
-            'Paused',
-            containers.filter((container) => container.state === 'paused')
-              .length,
-          ],
-          [
-            'unhealthy',
-            'Unhealthy',
-            containers.filter((container) => container.health === 'unhealthy')
-              .length,
-          ],
-          [
-            'ungrouped',
-            'Ungrouped',
-            containers.filter((container) => !container.projectID).length,
-          ],
+          ['all', 'All', counts.all],
+          ['running', 'Running', counts.running],
+          ['stopped', 'Stopped', counts.stopped],
+          ['paused', 'Paused', counts.paused],
+          ['unhealthy', 'Unhealthy', counts.unhealthy],
+          ['ungrouped', 'Ungrouped', counts.ungrouped],
         ]}
         onChange={onFilterChange}
       />
@@ -6099,6 +6078,10 @@ function ImagesPage({
     () => filterImages(images, imageUseCounts, search, filter),
     [filter, imageUseCounts, images, search],
   );
+  const counts = useMemo(
+    () => imageFilterCounts(images, imageUseCounts),
+    [imageUseCounts, images],
+  );
   if (loading && images.length === 0) {
     return <TableSkeleton />;
   }
@@ -6108,31 +6091,11 @@ function ImagesPage({
         <FilterChips
           active={filter}
           items={[
-            ['all', 'All', images.length],
-            [
-              'in-use',
-              'In use',
-              images.filter(
-                (image) => (imageUseCounts[image.id] ?? 0) > 0 || image.inUse,
-              ).length,
-            ],
-            [
-              'unused',
-              'Unused',
-              images.filter(
-                (image) =>
-                  (imageUseCounts[image.id] ?? 0) === 0 && !image.inUse,
-              ).length,
-            ],
-            ['dangling', 'Dangling', imageDanglingCount(images)],
-            [
-              'updates',
-              'Update available',
-              images.filter(
-                (image) =>
-                  image.updateStatus && image.updateStatus !== 'unknown',
-              ).length,
-            ],
+            ['all', 'All', counts.all],
+            ['in-use', 'In use', counts.inUse],
+            ['unused', 'Unused', counts.unused],
+            ['dangling', 'Dangling', counts.dangling],
+            ['updates', 'Update available', counts.updates],
           ]}
           onChange={onFilterChange}
         />
@@ -6285,6 +6248,7 @@ function VolumesPage({
     () => filterVolumes(volumes, search, filter),
     [filter, search, volumes],
   );
+  const counts = useMemo(() => volumeFilterCounts(volumes), [volumes]);
   if (loading && volumes.length === 0) {
     return <TableSkeleton />;
   }
@@ -6294,17 +6258,9 @@ function VolumesPage({
         <FilterChips
           active={filter}
           items={[
-            ['all', 'All', volumes.length],
-            [
-              'in-use',
-              'In use',
-              volumes.filter((volume) => volume.inUse).length,
-            ],
-            [
-              'unused',
-              'Unused',
-              volumes.filter((volume) => !volume.inUse).length,
-            ],
+            ['all', 'All', counts.all],
+            ['in-use', 'In use', counts.inUse],
+            ['unused', 'Unused', counts.unused],
           ]}
           onChange={onFilterChange}
         />
@@ -8391,33 +8347,24 @@ function activeProviderSummary(
   return providers.find((provider) => provider.active) ?? providers[0] ?? null;
 }
 
-function filterContainers(
+export function filterContainers(
   containers: ContainerSummary[],
   search: string,
   filter: FilterID,
 ) {
   const needle = normalize(search);
   return containers.filter((container) => {
-    const matchesSearch = [
-      container.name,
-      container.image,
-      container.id,
-      container.projectID,
-      container.service,
-    ]
-      .filter(Boolean)
-      .some((value) => normalize(value).includes(needle));
     const matchesFilter =
       filter === 'all' ||
       (filter === 'stopped' && container.state === 'exited') ||
       (filter === 'ungrouped' && !container.projectID) ||
       container.state === filter ||
       (filter === 'unhealthy' && container.health === 'unhealthy');
-    return matchesSearch && matchesFilter;
+    return matchesFilter && matchesContainerSearch(container, needle);
   });
 }
 
-function filterImages(
+export function filterImages(
   images: ImageSummary[],
   counts: Record<string, number>,
   search: string,
@@ -8425,12 +8372,6 @@ function filterImages(
 ) {
   const needle = normalize(search);
   return images.filter((image) => {
-    const refs = imageRefs(image);
-    const matchesSearch = [
-      image.id,
-      ...refs,
-      ...(image.repoDigests ?? []),
-    ].some((value) => normalize(value).includes(needle));
     const inUse = (counts[image.id] ?? 0) > 0 || image.inUse;
     const matchesFilter =
       filter === 'all' ||
@@ -8439,44 +8380,162 @@ function filterImages(
       (filter === 'dangling' && imageDangling(image)) ||
       (filter === 'updates' &&
         Boolean(image.updateStatus && image.updateStatus !== 'unknown'));
-    return matchesSearch && matchesFilter;
+    return matchesFilter && matchesImageSearch(image, needle);
   });
 }
 
-function filterVolumes(
+export function filterVolumes(
   volumes: VolumeSummary[],
   search: string,
   filter: FilterID,
 ) {
   const needle = normalize(search);
   return volumes.filter((volume) => {
-    const matchesSearch = [
-      volume.name,
-      volume.driver,
-      volume.mountpoint,
-      volume.labels?.[composeProjectLabel],
-    ]
-      .filter(Boolean)
-      .some((value) => normalize(value).includes(needle));
     const matchesFilter =
       filter === 'all' ||
       (filter === 'in-use' && volume.inUse) ||
       (filter === 'unused' && !volume.inUse);
-    return matchesSearch && matchesFilter;
+    return matchesFilter && matchesVolumeSearch(volume, needle);
   });
 }
 
-function filterNetworks(networks: NetworkSummary[], search: string) {
+export function filterNetworks(networks: NetworkSummary[], search: string) {
   const needle = normalize(search);
-  return networks.filter((network) =>
-    [network.name, network.id, network.driver, network.scope]
-      .filter(Boolean)
-      .some((value) => normalize(value).includes(needle)),
-  );
+  return networks.filter((network) => matchesNetworkSearch(network, needle));
 }
 
 function normalize(value: unknown) {
   return String(value ?? '').toLowerCase();
+}
+
+function normalizedIncludes(value: unknown, needle: string) {
+  return needle === '' || normalize(value).includes(needle);
+}
+
+function matchesContainerSearch(container: ContainerSummary, needle: string) {
+  if (needle === '') {
+    return true;
+  }
+  return (
+    normalizedIncludes(container.name, needle) ||
+    normalizedIncludes(container.image, needle) ||
+    normalizedIncludes(container.id, needle) ||
+    normalizedIncludes(container.projectID, needle) ||
+    normalizedIncludes(container.service, needle)
+  );
+}
+
+function matchesImageSearch(image: ImageSummary, needle: string) {
+  if (needle === '') {
+    return true;
+  }
+  if (normalizedIncludes(image.id, needle)) {
+    return true;
+  }
+  for (const ref of image.repoTags ?? []) {
+    if (ref && normalizedIncludes(ref, needle)) {
+      return true;
+    }
+  }
+  for (const digest of image.repoDigests ?? []) {
+    if (digest && normalizedIncludes(digest, needle)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function matchesVolumeSearch(volume: VolumeSummary, needle: string) {
+  if (needle === '') {
+    return true;
+  }
+  return (
+    normalizedIncludes(volume.name, needle) ||
+    normalizedIncludes(volume.driver, needle) ||
+    normalizedIncludes(volume.mountpoint, needle) ||
+    normalizedIncludes(volume.labels?.[composeProjectLabel], needle)
+  );
+}
+
+function matchesNetworkSearch(network: NetworkSummary, needle: string) {
+  if (needle === '') {
+    return true;
+  }
+  return (
+    normalizedIncludes(network.name, needle) ||
+    normalizedIncludes(network.id, needle) ||
+    normalizedIncludes(network.driver, needle) ||
+    normalizedIncludes(network.scope, needle)
+  );
+}
+
+function containerFilterCounts(containers: ContainerSummary[]) {
+  const counts = {
+    all: containers.length,
+    running: 0,
+    stopped: 0,
+    paused: 0,
+    unhealthy: 0,
+    ungrouped: 0,
+  };
+  for (const container of containers) {
+    if (container.state === 'running') {
+      counts.running++;
+    }
+    if (container.state === 'exited') {
+      counts.stopped++;
+    }
+    if (container.state === 'paused') {
+      counts.paused++;
+    }
+    if (container.health === 'unhealthy') {
+      counts.unhealthy++;
+    }
+    if (!container.projectID) {
+      counts.ungrouped++;
+    }
+  }
+  return counts;
+}
+
+function imageFilterCounts(
+  images: ImageSummary[],
+  countsByID: Record<string, number>,
+) {
+  const counts = {
+    all: images.length,
+    inUse: 0,
+    unused: 0,
+    dangling: 0,
+    updates: 0,
+  };
+  for (const image of images) {
+    const inUse = (countsByID[image.id] ?? 0) > 0 || image.inUse;
+    if (inUse) {
+      counts.inUse++;
+    } else {
+      counts.unused++;
+    }
+    if (imageDangling(image)) {
+      counts.dangling++;
+    }
+    if (image.updateStatus && image.updateStatus !== 'unknown') {
+      counts.updates++;
+    }
+  }
+  return counts;
+}
+
+function volumeFilterCounts(volumes: VolumeSummary[]) {
+  const counts = { all: volumes.length, inUse: 0, unused: 0 };
+  for (const volume of volumes) {
+    if (volume.inUse) {
+      counts.inUse++;
+    } else {
+      counts.unused++;
+    }
+  }
+  return counts;
 }
 
 function normalizePermissionMode(value: unknown): PermissionMode {
@@ -8525,22 +8584,14 @@ function imageUsageCounts(containers: ContainerSummary[]) {
   }, {});
 }
 
-function filterProjects(
+export function filterProjects(
   projects: ProjectSummary[],
   search: string,
   filter: FilterID,
 ) {
   const query = search.trim().toLowerCase();
   return projects.filter((project) => {
-    const matchesSearch = [
-      project.name,
-      project.id,
-      project.providerID,
-      project.workingDir,
-    ]
-      .filter(Boolean)
-      .some((value) => value.toLowerCase().includes(query));
-    if (!matchesSearch) {
+    if (!matchesProjectSearch(project, query)) {
       return false;
     }
     switch (filter) {
@@ -8562,6 +8613,18 @@ function filterProjects(
         return true;
     }
   });
+}
+
+function matchesProjectSearch(project: ProjectSummary, query: string) {
+  if (query === '') {
+    return true;
+  }
+  return (
+    normalizedIncludes(project.name, query) ||
+    normalizedIncludes(project.id, query) ||
+    normalizedIncludes(project.providerID, query) ||
+    normalizedIncludes(project.workingDir, query)
+  );
 }
 
 function sortProjects(projects: ProjectSummary[], sort: ProjectSortID) {
@@ -9040,10 +9103,6 @@ function imageTag(image: ImageSummary) {
 
 function imageDangling(image: ImageSummary) {
   return imageRefs(image).length === 0;
-}
-
-function imageDanglingCount(images: ImageSummary[]) {
-  return images.filter(imageDangling).length;
 }
 
 function containerRows(container: ContainerSummary): Array<[string, string]> {

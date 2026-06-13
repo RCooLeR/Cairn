@@ -10,16 +10,20 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { InventorySnapshot } from './api/inventory';
 import type {
+  ContainerSummary,
   CommandPlan,
   DashboardMetrics,
   DiskUsageCategory,
   CheatsheetEntry,
+  ImageSummary,
   LogLine,
+  NetworkSummary,
   Notification,
   ProjectDetail,
   ProjectSummary,
   ProviderStatus,
   TerminalSessionInfo,
+  VolumeSummary,
 } from '../bindings/github.com/RCooLeR/Cairn/internal/models/models.js';
 import {
   HealthStatus,
@@ -28,7 +32,13 @@ import {
   UpdateStatus,
 } from '../bindings/github.com/RCooLeR/Cairn/internal/models/models.js';
 
-import App from './App';
+import App, {
+  filterContainers,
+  filterImages,
+  filterNetworks,
+  filterProjects,
+  filterVolumes,
+} from './App';
 import { useAppStore } from './state/appStore';
 import { useInventoryStore } from './state/inventoryStore';
 
@@ -427,6 +437,34 @@ describe('App inventory shell', () => {
     expect(screen.getByRole('button', { name: /Running1/ })).toHaveClass(
       'border-accent/40',
     );
+  });
+
+  it('meets Phase 4 seed-scale dashboard and filter budgets', async () => {
+    const projects = seedScaleProjects();
+    const snapshot = seedScaleSnapshot(projects);
+    inventoryMock.getInventorySnapshot.mockResolvedValue(snapshot);
+    projectServiceMock.RefreshProjects.mockResolvedValue(projects);
+    projectServiceMock.ListProjects.mockResolvedValue(projects);
+    metricsServiceMock.GetDashboardMetrics.mockResolvedValue(
+      seedScaleDashboardMetrics(snapshot, projects),
+    );
+
+    const renderStart = performance.now();
+    render(<App />);
+
+    expect(await screen.findByLabelText('Docker object counts')).toBeInTheDocument();
+    expect(performance.now() - renderStart).toBeLessThan(1500);
+
+    const counts = seedScaleImageUseCounts(snapshot.containers);
+    const filterStart = performance.now();
+    expect(filterContainers(snapshot.containers, 'service-42', 'all')).toHaveLength(1);
+    expect(filterContainers(snapshot.containers, '', 'running')).toHaveLength(50);
+    expect(filterImages(snapshot.images, counts, 'repo-499', 'all')).toHaveLength(1);
+    expect(filterImages(snapshot.images, counts, '', 'unused').length).toBeGreaterThan(300);
+    expect(filterVolumes(snapshot.volumes, 'volume-199', 'all')).toHaveLength(1);
+    expect(filterNetworks(snapshot.networks, 'network-19')).toHaveLength(1);
+    expect(filterProjects(projects, 'project-9', 'all')).toHaveLength(1);
+    expect(performance.now() - filterStart).toBeLessThan(100);
   });
 
   it('opens terminal sessions from the Terminal page', async () => {
@@ -1336,6 +1374,138 @@ function seededSnapshot(): InventorySnapshot {
     },
     degradedReason: null,
   };
+}
+
+function seedScaleSnapshot(projects: ProjectSummary[]): InventorySnapshot {
+  const base = seededSnapshot();
+  const containers = Array.from({ length: 100 }, (_, index): ContainerSummary => {
+    const project = projects[index % projects.length];
+    const state =
+      index % 10 === 0 ? 'paused' : index % 5 < 3 ? 'running' : 'exited';
+    return {
+      id: `container-${index}`,
+      name: `service-${index}`,
+      image: `cairn/repo-${index % 500}:latest`,
+      imageID: `sha256:image-${index % 150}`,
+      status: state === 'running' ? 'Up 5 minutes' : state,
+      state,
+      health:
+        index % 17 === 0
+          ? HealthStatus.HealthStatusUnhealthy
+          : HealthStatus.HealthStatusHealthy,
+      projectID: project.id,
+      service: `svc-${index % 12}`,
+      ports: [],
+      cpuPercent: index % 100,
+      memoryBytes: (32 + index) * 1024 * 1024,
+      memoryLimit: 512 * 1024 * 1024,
+      restarts: index % 4,
+      createdAt: `2026-06-13T08:${String(index % 60).padStart(2, '0')}:00Z`,
+    };
+  });
+  const images = Array.from({ length: 500 }, (_, index): ImageSummary => ({
+    id: `sha256:image-${index}`,
+    repoTags: [`cairn/repo-${index}:latest`],
+    repoDigests: [`cairn/repo-${index}@sha256:digest-${index}`],
+    sizeBytes: (16 + index) * 1024 * 1024,
+    createdAt: `2026-06-12T${String(index % 24).padStart(2, '0')}:00:00Z`,
+    inUse: index < 150,
+    updateStatus:
+      index % 25 === 0
+        ? UpdateStatus.UpdateStatusServiceImageUpdateAvailable
+        : UpdateStatus.UpdateStatusUnknown,
+  }));
+  const volumes = Array.from({ length: 200 }, (_, index): VolumeSummary => ({
+    name: `volume-${index}`,
+    driver: 'local',
+    mountpoint: `/var/lib/docker/volumes/volume-${index}/_data`,
+    labels: {
+      'com.docker.compose.project': projects[index % projects.length].name,
+    },
+    sizeBytes: index * 4096,
+    inUse: index % 2 === 0,
+  }));
+  const networks = Array.from({ length: 20 }, (_, index): NetworkSummary => ({
+    id: `network-${index}`,
+    name: `network-${index}`,
+    driver: 'bridge',
+    scope: 'local',
+    internal: index % 5 === 0,
+    attachable: true,
+    labels: {
+      'com.docker.compose.project': projects[index % projects.length].name,
+    },
+  }));
+
+  return {
+    ...base,
+    diskUsage: {
+      images: diskCategory(images.length, 150, 12 * 1024 * 1024 * 1024),
+      containers: diskCategory(containers.length, 60, 2 * 1024 * 1024 * 1024),
+      volumes: diskCategory(volumes.length, 100, 6 * 1024 * 1024 * 1024),
+      buildCache: diskCategory(12, 0, 512 * 1024 * 1024),
+      totalBytes: 20 * 1024 * 1024 * 1024,
+      reclaimable: 4 * 1024 * 1024 * 1024,
+    },
+    containers,
+    images,
+    volumes,
+    networks,
+    volumeDetails: {},
+    networkDetails: {},
+  };
+}
+
+function seedScaleProjects(): ProjectSummary[] {
+  return Array.from({ length: 10 }, (_, index): ProjectSummary => ({
+    ...seededProject(),
+    id: `linux_native/project-${index}`,
+    name: `project-${index}`,
+    status:
+      index % 3 === 0
+        ? ProjectStatus.ProjectStatusPartial
+        : ProjectStatus.ProjectStatusRunning,
+    health:
+      index % 4 === 0
+        ? HealthStatus.HealthStatusUnhealthy
+        : HealthStatus.HealthStatusHealthy,
+    servicesRunning: index % 3 === 0 ? 8 : 12,
+    servicesTotal: 12,
+    cpuPercent: index === 9 ? 92 : 10 + index,
+    memoryBytes: (256 + index * 32) * 1024 * 1024,
+    workingDir: `/home/cairn/projects/project-${index}`,
+    lastChangedAt: `2026-06-13T09:${String(index).padStart(2, '0')}:00Z`,
+  }));
+}
+
+function seedScaleDashboardMetrics(
+  snapshot: InventorySnapshot,
+  projects: ProjectSummary[],
+): DashboardMetrics {
+  return {
+    projects: projects.length,
+    containers: snapshot.containers.length,
+    images: snapshot.images.length,
+    volumes: snapshot.volumes.length,
+    diskUsage: snapshot.diskUsage ?? seededSnapshot().diskUsage,
+    top: snapshot.containers.slice(0, 10).map((container) => ({
+      id: container.id,
+      name: container.name,
+      kind: 'container',
+      cpuPercent: container.cpuPercent ?? 0,
+      memoryBytes: container.memoryBytes ?? 0,
+    })),
+    recentEvents: [],
+  } as DashboardMetrics;
+}
+
+function seedScaleImageUseCounts(containers: ContainerSummary[]) {
+  return containers.reduce<Record<string, number>>((counts, container) => {
+    if (container.imageID) {
+      counts[container.imageID] = (counts[container.imageID] ?? 0) + 1;
+    }
+    return counts;
+  }, {});
 }
 
 function seededProject(): ProjectSummary {

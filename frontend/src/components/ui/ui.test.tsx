@@ -129,4 +129,58 @@ describe('UI kit', () => {
     );
     expect(appErrorPresentation('E_NOT_FOUND').surface).toBe('toast');
   });
+
+  it('windows large table row sets for seed-scale inventory pages', () => {
+    const rows = Array.from({ length: 200 }, (_, index) => ({
+      id: `row-${index}`,
+      label: `Row ${index}`,
+    }));
+
+    render(
+      <DataTable
+        columns={[
+          {
+            id: 'label',
+            header: 'Label',
+            render: (row) => row.label,
+          },
+        ]}
+        getRowID={(row) => row.id}
+        rows={rows}
+      />,
+    );
+
+    expect(screen.getByText('Row 0')).toBeInTheDocument();
+    expect(screen.queryByText('Row 199')).not.toBeInTheDocument();
+  });
+
+  it('keeps the virtual table window inside shorter filtered row sets', () => {
+    const makeRows = (count: number) =>
+      Array.from({ length: count }, (_, index) => ({
+        id: `row-${index}`,
+        label: `Row ${index}`,
+      }));
+    const table = (rows: ReturnType<typeof makeRows>) => (
+      <DataTable
+        columns={[
+          {
+            id: 'label',
+            header: 'Label',
+            render: (row) => row.label,
+          },
+        ]}
+        getRowID={(row) => row.id}
+        rows={rows}
+      />
+    );
+
+    const { rerender } = render(table(makeRows(200)));
+    fireEvent.scroll(screen.getByRole('table').parentElement as HTMLElement, {
+      target: { scrollTop: 8000 },
+    });
+
+    rerender(table(makeRows(130)));
+
+    expect(screen.getByText('Row 129')).toBeInTheDocument();
+  });
 });

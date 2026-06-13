@@ -194,6 +194,9 @@ func TestManagerQueriesStopsFallbackAndScopes(t *testing.T) {
 type fakeMetricsDocker struct {
 	mu         sync.Mutex
 	containers []models.ContainerSummary
+	images     []models.ImageSummary
+	volumes    []models.VolumeSummary
+	diskUsage  *models.DiskUsage
 	stats      map[string][]container.StatsResponse
 	calls      []dockercore.StatsOptions
 }
@@ -207,6 +210,10 @@ func (f *fakeMetricsDocker) Info(context.Context) (*models.DockerInfo, error) {
 }
 
 func (f *fakeMetricsDocker) DiskUsage(context.Context) (*models.DiskUsage, error) {
+	if f.diskUsage != nil {
+		usage := *f.diskUsage
+		return &usage, nil
+	}
 	return &models.DiskUsage{TotalBytes: 1024}, nil
 }
 
@@ -215,10 +222,16 @@ func (f *fakeMetricsDocker) ListContainers(context.Context, models.ContainerList
 }
 
 func (f *fakeMetricsDocker) ListImages(context.Context) ([]models.ImageSummary, error) {
+	if f.images != nil {
+		return append([]models.ImageSummary(nil), f.images...), nil
+	}
 	return []models.ImageSummary{{ID: "image-1"}}, nil
 }
 
 func (f *fakeMetricsDocker) ListVolumes(context.Context) ([]models.VolumeSummary, error) {
+	if f.volumes != nil {
+		return append([]models.VolumeSummary(nil), f.volumes...), nil
+	}
 	return []models.VolumeSummary{{Name: "volume-1"}}, nil
 }
 

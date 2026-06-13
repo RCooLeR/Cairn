@@ -5,6 +5,11 @@ import { useMemo, useState } from 'react';
 
 import { cx } from './utils';
 
+const virtualRowHeight = 44;
+const virtualViewportHeight = 420;
+const virtualOverscanRows = 6;
+const virtualizeRowThreshold = 120;
+
 export type DataTableColumn<T> = {
   id: string;
   header: string;
@@ -39,6 +44,7 @@ export function DataTable<T>({
 }: DataTableProps<T>) {
   const hasSelection = selectedIDs.size > 0;
   const [sort, setSort] = useState<SortState | null>(null);
+  const [scrollTop, setScrollTop] = useState(0);
   const visibleRows = useMemo(() => {
     if (!sort) {
       return rows;
@@ -76,6 +82,27 @@ export function DataTable<T>({
         : { columnID: column.id, direction: 'asc' },
     );
   };
+  const virtualized = visibleRows.length > virtualizeRowThreshold;
+  const visibleCount = Math.ceil(virtualViewportHeight / virtualRowHeight);
+  const virtualWindowSize = visibleCount + virtualOverscanRows * 2;
+  const maxVirtualStart = Math.max(0, visibleRows.length - virtualWindowSize);
+  const virtualStart = virtualized
+    ? Math.min(
+        Math.max(0, Math.floor(scrollTop / virtualRowHeight) - virtualOverscanRows),
+        maxVirtualStart,
+      )
+    : 0;
+  const virtualEnd = virtualized
+    ? Math.min(visibleRows.length, virtualStart + virtualWindowSize)
+    : visibleRows.length;
+  const virtualRows = virtualized
+    ? visibleRows.slice(virtualStart, virtualEnd)
+    : visibleRows;
+  const topPadding = virtualized ? virtualStart * virtualRowHeight : 0;
+  const bottomPadding = virtualized
+    ? Math.max(0, (visibleRows.length - virtualEnd) * virtualRowHeight)
+    : 0;
+  const columnCount = columns.length + (onToggleRow ? 1 : 0);
 
   if (rows.length === 0 && empty) {
     return <>{empty}</>;
@@ -89,8 +116,18 @@ export function DataTable<T>({
           <div>{bulkActions}</div>
         </div>
       ) : null}
-      <div className="max-h-[420px] overflow-auto">
-        <table className="min-w-full table-fixed text-left text-sm">
+      <div
+        className="max-h-[420px] overflow-auto"
+        onScroll={(event) => {
+          if (virtualized) {
+            setScrollTop(event.currentTarget.scrollTop);
+          }
+        }}
+      >
+        <table
+          aria-rowcount={visibleRows.length}
+          className="min-w-full table-fixed text-left text-sm"
+        >
           <thead className="sticky top-0 z-10 bg-bg-inset text-xs text-text-muted">
             <tr>
               {onToggleRow ? <th className="w-10 px-3 py-2" scope="col" /> : null}
@@ -126,7 +163,12 @@ export function DataTable<T>({
             </tr>
           </thead>
           <tbody className="divide-y divide-border">
-            {visibleRows.map((row) => {
+            {topPadding > 0 ? (
+              <tr aria-hidden="true">
+                <td colSpan={columnCount} style={{ height: topPadding, padding: 0 }} />
+              </tr>
+            ) : null}
+            {virtualRows.map((row) => {
               const id = getRowID(row);
               const selected = selectedIDs.has(id);
               return (
@@ -149,6 +191,11 @@ export function DataTable<T>({
                 </tr>
               );
             })}
+            {bottomPadding > 0 ? (
+              <tr aria-hidden="true">
+                <td colSpan={columnCount} style={{ height: bottomPadding, padding: 0 }} />
+              </tr>
+            ) : null}
           </tbody>
         </table>
       </div>
