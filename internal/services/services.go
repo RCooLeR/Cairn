@@ -16,6 +16,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/bus"
 	composecore "github.com/RCooLeR/Cairn/internal/compose"
 	"github.com/RCooLeR/Cairn/internal/logsvc"
+	"github.com/RCooLeR/Cairn/internal/metrics"
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
 	"github.com/RCooLeR/Cairn/internal/security"
@@ -101,7 +102,9 @@ type ComposeService struct {
 	Client   *composecore.Client
 	Projects *store.ProjectRepository
 }
-type MetricsService struct{}
+type MetricsService struct {
+	Manager *metrics.Manager
+}
 type LogsService struct {
 	Manager *logsvc.Manager
 }
@@ -848,24 +851,39 @@ func (s *ComposeService) ScaleService(_ context.Context, projectID string, servi
 	return notReady()
 }
 
-func (s *MetricsService) GetDashboardMetrics(_ context.Context) (*models.DashboardMetrics, error) {
-	return nil, notReady()
+func (s *MetricsService) GetDashboardMetrics(ctx context.Context) (*models.DashboardMetrics, error) {
+	if s.Manager == nil {
+		return nil, notReady()
+	}
+	return s.Manager.GetDashboardMetrics(ctx)
 }
 
-func (s *MetricsService) GetProjectMetrics(_ context.Context, projectID string, r models.TimeRange) (*models.SeriesBundle, error) {
-	return nil, notReady()
+func (s *MetricsService) GetProjectMetrics(ctx context.Context, projectID string, r models.TimeRange) (*models.SeriesBundle, error) {
+	if s.Manager == nil {
+		return nil, notReady()
+	}
+	return s.Manager.GetProjectMetrics(ctx, projectID, r)
 }
 
-func (s *MetricsService) GetContainerMetrics(_ context.Context, containerID string, r models.TimeRange) (*models.SeriesBundle, error) {
-	return nil, notReady()
+func (s *MetricsService) GetContainerMetrics(ctx context.Context, containerID string, r models.TimeRange) (*models.SeriesBundle, error) {
+	if s.Manager == nil {
+		return nil, notReady()
+	}
+	return s.Manager.GetContainerMetrics(ctx, containerID, r)
 }
 
-func (s *MetricsService) StartStatsStream(_ context.Context, scope models.StatsScope) (string, error) {
-	return "", notReady()
+func (s *MetricsService) StartStatsStream(ctx context.Context, scope models.StatsScope) (string, error) {
+	if s.Manager == nil {
+		return "", notReady()
+	}
+	return s.Manager.StartStatsStream(ctx, scope)
 }
 
 func (s *MetricsService) StopStream(_ context.Context, streamID string) error {
-	return notReady()
+	if s.Manager == nil {
+		return notReady()
+	}
+	return s.Manager.StopStream(streamID)
 }
 
 func (s *LogsService) StartLogStream(ctx context.Context, req models.LogStreamRequest) (string, error) {

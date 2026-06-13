@@ -10,6 +10,7 @@ import (
 	composecore "github.com/RCooLeR/Cairn/internal/compose"
 	dockercore "github.com/RCooLeR/Cairn/internal/docker"
 	"github.com/RCooLeR/Cairn/internal/logsvc"
+	"github.com/RCooLeR/Cairn/internal/metrics"
 	"github.com/RCooLeR/Cairn/internal/providers"
 	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/services"
@@ -52,6 +53,7 @@ func Run(assets fs.FS) error {
 	var composeClient *composecore.Client
 	var projectDetector *composecore.ProjectDetector
 	var logsManager *logsvc.Manager
+	var metricsManager *metrics.Manager
 	if len(providerSet) > 0 {
 		dockerClient = dockercore.New(providerSet[0], eventBus)
 		dockerClient.SetObjectCache(db.Objects())
@@ -68,6 +70,8 @@ func Run(assets fs.FS) error {
 			Objects:     db.Objects(),
 		}
 		logsManager = logsvc.NewManager(dockerClient, eventBus, logsvc.Options{})
+		metricsManager = metrics.NewManager(dockerClient, db.Metrics(), projectRepo, auditRepo, eventBus, metrics.Options{})
+		metricsManager.Start(ctx)
 	}
 
 	app := application.New(application.Options{
@@ -90,7 +94,7 @@ func Run(assets fs.FS) error {
 				ContextName: "",
 			}),
 			application.NewService(&services.ComposeService{Client: composeClient, Projects: projectRepo}),
-			application.NewService(&services.MetricsService{}),
+			application.NewService(&services.MetricsService{Manager: metricsManager}),
 			application.NewService(&services.LogsService{Manager: logsManager}),
 			application.NewService(&services.TerminalService{}),
 			application.NewService(&services.UpdateService{}),
@@ -103,6 +107,9 @@ func Run(assets fs.FS) error {
 			cancel()
 			if logsManager != nil {
 				logsManager.StopAll()
+			}
+			if metricsManager != nil {
+				metricsManager.StopAll()
 			}
 			if dockerClient != nil {
 				_ = dockerClient.Close()
@@ -151,6 +158,7 @@ func Run(assets fs.FS) error {
 		bus.TopicLogsLines,
 		bus.TopicLogsEOF,
 		bus.TopicLogsError,
+		bus.TopicStatsSample,
 		bus.TopicJobProgress,
 		bus.TopicJobDone,
 	})

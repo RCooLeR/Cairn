@@ -57,6 +57,8 @@ type APIClient interface {
 	ContainerRemove(context.Context, string, container.RemoveOptions) error
 	ContainerUnpause(context.Context, string) error
 	ContainerLogs(context.Context, string, container.LogsOptions) (io.ReadCloser, error)
+	ContainerStats(context.Context, string, bool) (container.StatsResponseReader, error)
+	ContainerStatsOneShot(context.Context, string) (container.StatsResponseReader, error)
 	ContainerCreate(context.Context, *container.Config, *container.HostConfig, *network.NetworkingConfig, *ocispec.Platform, string) (container.CreateResponse, error)
 	ContainerRename(context.Context, string, string) error
 	ImageList(context.Context, image.ListOptions) ([]image.Summary, error)

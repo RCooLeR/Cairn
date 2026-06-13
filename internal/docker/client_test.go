@@ -130,6 +130,57 @@ func TestClientConnectAndDTOs(t *testing.T) {
 	}
 }
 
+func TestClientContainerStatsUsesStreamAndOneShot(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	read := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)
+	api.stats["abc123"] = []container.StatsResponse{{
+		ID:   "abc123",
+		Read: read,
+		CPUStats: container.CPUStats{
+			CPUUsage:    container.CPUUsage{TotalUsage: 100},
+			SystemUsage: 1000,
+		},
+	}}
+
+	client := New(fakeDockerProvider{}, nil)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	stream, err := client.ContainerStats(ctx, "abc123", StatsOptions{Stream: true})
+	if err != nil {
+		t.Fatalf("ContainerStats(stream) error = %v", err)
+	}
+	defer func() {
+		_ = stream.Body.Close()
+	}()
+	var streamStats container.StatsResponse
+	if err := json.NewDecoder(stream.Body).Decode(&streamStats); err != nil {
+		t.Fatalf("decode stream stats: %v", err)
+	}
+	if streamStats.ID != "abc123" {
+		t.Fatalf("stream stats = %#v", streamStats)
+	}
+
+	oneShot, err := client.ContainerStats(ctx, "abc123", StatsOptions{OneShot: true})
+	if err != nil {
+		t.Fatalf("ContainerStats(one-shot) error = %v", err)
+	}
+	defer func() {
+		_ = oneShot.Body.Close()
+	}()
+
+	if len(api.statsCalls) != 2 {
+		t.Fatalf("stats calls = %#v", api.statsCalls)
+	}
+	if !api.statsCalls[0].Stream || !api.statsCalls[1].OneShot {
+		t.Fatalf("stats calls = %#v", api.statsCalls)
+	}
+}
+
 func TestClientHealthLoopDisconnectsAndReconnects(t *testing.T) {
 	t.Parallel()
 	rootCtx, cancel := context.WithCancel(context.Background())
@@ -1392,6 +1443,8 @@ type fakeAPI struct {
 	networkRaw        map[string][]byte
 	events            chan events.Message
 	eventErrs         chan error
+	stats             map[string][]container.StatsResponse
+	statsCalls        []statsCall
 	started           []string
 	stopped           []string
 	restarted         []string
@@ -1421,6 +1474,12 @@ type networkCreateCall struct {
 	Options network.CreateOptions
 }
 
+type statsCall struct {
+	ID      string
+	Stream  bool
+	OneShot bool
+}
+
 func newFakeAPI() *fakeAPI {
 	return &fakeAPI{
 		ping:              dockertypes.Ping{APIVersion: "1.51"},
@@ -1434,6 +1493,7 @@ func newFakeAPI() *fakeAPI {
 		networkRaw:        map[string][]byte{},
 		events:            make(chan events.Message, 16),
 		eventErrs:         make(chan error, 4),
+		stats:             map[string][]container.StatsResponse{},
 	}
 }
 
@@ -1523,6 +1583,25 @@ func (a *fakeAPI) ContainerLogs(context.Context, string, container.LogsOptions) 
 	return io.NopCloser(strings.NewReader("")), nil
 }
 
+func (a *fakeAPI) ContainerStats(_ context.Context, id string, stream bool) (container.StatsResponseReader, error) {
+	a.mu.Lock()
+	a.statsCalls = append(a.statsCalls, statsCall{ID: id, Stream: stream})
+	entries := append([]container.StatsResponse(nil), a.stats[id]...)
+	a.mu.Unlock()
+	return container.StatsResponseReader{Body: statsReader(entries), OSType: "linux"}, nil
+}
+
+func (a *fakeAPI) ContainerStatsOneShot(_ context.Context, id string) (container.StatsResponseReader, error) {
+	a.mu.Lock()
+	a.statsCalls = append(a.statsCalls, statsCall{ID: id, OneShot: true})
+	entries := append([]container.StatsResponse(nil), a.stats[id]...)
+	a.mu.Unlock()
+	if len(entries) > 1 {
+		entries = entries[len(entries)-1:]
+	}
+	return container.StatsResponseReader{Body: statsReader(entries), OSType: "linux"}, nil
+}
+
 func (a *fakeAPI) ContainerCreate(_ context.Context, config *container.Config, hostConfig *container.HostConfig, networkingConfig *network.NetworkingConfig, _ *ocispec.Platform, name string) (container.CreateResponse, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -1554,6 +1633,15 @@ func (a *fakeAPI) ContainerCreate(_ context.Context, config *container.Config, h
 		State:   "created",
 	})
 	return container.CreateResponse{ID: id}, nil
+}
+
+func statsReader(entries []container.StatsResponse) io.ReadCloser {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	for _, entry := range entries {
+		_ = enc.Encode(entry)
+	}
+	return io.NopCloser(bytes.NewReader(buf.Bytes()))
 }
 
 func (a *fakeAPI) ContainerRename(_ context.Context, id string, name string) error {
