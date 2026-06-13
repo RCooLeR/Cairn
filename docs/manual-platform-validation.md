@@ -110,6 +110,19 @@ Current evidence: unit tests cover existing-context healthy detection, missing-c
 - [ ] Linux: unencrypted `tcp://` context shows the permanent warning chip in Settings.
 - [ ] Cross-platform E2E: switch Colima -> Desktop/remote context and back without app restart.
 
+## Phase 6.3 macOS Onboarding, Settings, and Terminal UX
+
+Current evidence: frontend tests cover the macOS Colima onboarding branch through checks and install planning, Colima profile/CPU/RAM/disk settings saves, Docker context listing, unencrypted `tcp://` warning badge rendering, and `ProviderService.SetDockerContext` activation from Settings. Local gates passed: frontend TypeScript, ESLint, Vitest (41 tests), Vite dev build, audit; `go test . ./internal/...`; `go vet . ./internal/...`; `go build . ./internal/...`; `golangci-lint v2.12.2 run --timeout=5m`. zsh host terminal and `colima ssh` backend terminal commands were implemented and unit-tested in Phase 6.1. A Colima-capable macOS VM is unavailable in this environment, so the runtime rows below remain manual TODOs.
+
+- [x] React-test macOS setup backend cards: Colima recommended, Existing Docker context, and disabled Remote host.
+- [x] React-test Colima setup checks with profile/CPU/RAM/disk fields and install-plan preview.
+- [x] React-test Settings macOS Colima profile/CPU/RAM/disk saves and provider detection refresh.
+- [x] React-test Docker context list/switch UI, including current/available badges and unencrypted `tcp://` warning chip.
+- [ ] macOS runner/VM E2E: first-launch no-provider flow defaults to Colima and reaches checks/install-plan preview.
+- [ ] macOS runner/VM E2E: Settings -> Providers updates Colima profile/resources, reruns detection, and notes restart-required resource changes.
+- [ ] macOS runner/VM E2E: switch Colima -> Docker Desktop/OrbStack context and back without app restart or changing `docker context show`.
+- [ ] macOS runner/VM E2E: host terminal opens zsh and backend terminal opens `colima ssh` for the selected profile.
+
 ## Full Platform Matrix TODO
 
 - [ ] Windows 11 x64: WSL present/absent, Ubuntu present/absent/multiple, Docker in Ubuntu present/absent, systemd on/off.

@@ -1,9 +1,10 @@
-import type { LucideIcon } from 'lucide-react';
+import type { LucideIcon } from "lucide-react";
 import type {
   AuditEntry,
   CommandPlan,
   ContainerSummary,
   DashboardMetrics,
+  DockerContextInfo,
   ExportResult,
   HubSearchResult,
   ImageDetail,
@@ -25,7 +26,7 @@ import type {
   StatsScope,
   VolumeDetail,
   VolumeSummary,
-} from '../bindings/github.com/RCooLeR/Cairn/internal/models/models.js';
+} from "../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
 
 import {
   Activity,
@@ -71,7 +72,7 @@ import {
   Wifi,
   Wrench,
   WrapText,
-} from 'lucide-react';
+} from "lucide-react";
 import {
   type ReactNode,
   useCallback,
@@ -79,7 +80,7 @@ import {
   useMemo,
   useRef,
   useState,
-} from 'react';
+} from "react";
 import {
   Area,
   AreaChart,
@@ -93,12 +94,12 @@ import {
   Tooltip as RechartsTooltip,
   XAxis,
   YAxis,
-} from 'recharts';
+} from "recharts";
 
-import Editor from '@monaco-editor/react';
-import { Clipboard, Dialogs, Events } from '@wailsio/runtime';
+import Editor from "@monaco-editor/react";
+import { Clipboard, Dialogs, Events } from "@wailsio/runtime";
 
-import { getAppVersion } from './api/app';
+import { getAppVersion } from "./api/app";
 import {
   DockerService,
   LogsService,
@@ -106,7 +107,7 @@ import {
   ProviderService,
   ProjectService,
   SettingsService,
-} from './api/services';
+} from "./api/services";
 import {
   Badge,
   Button,
@@ -120,38 +121,42 @@ import {
   StatusDot,
   Toast,
   Tooltip,
-} from './components/ui';
+} from "./components/ui";
 import {
   CommandPalette,
   TerminalPage,
   type TerminalCommandRequest,
-} from './components/terminal/TerminalPage';
-import { useAppStore } from './state/appStore';
-import { useInventoryStore } from './state/inventoryStore';
+} from "./components/terminal/TerminalPage";
+import { useAppStore } from "./state/appStore";
+import { useInventoryStore } from "./state/inventoryStore";
 
-const logoUrl = '/cairn-logo.png';
+const logoUrl = "/cairn-logo.png";
 
 type PageID =
-  | 'overview'
-  | 'projects'
-  | 'containers'
-  | 'images'
-  | 'volumes'
-  | 'networks'
-  | 'logs'
-  | 'terminal'
-  | 'settings';
+  | "overview"
+  | "projects"
+  | "containers"
+  | "images"
+  | "volumes"
+  | "networks"
+  | "logs"
+  | "terminal"
+  | "settings";
 type FilterID = string;
-type BadgeTone = 'ok' | 'warn' | 'error' | 'info' | 'neutral' | 'accent';
-type StatusToneID = 'ok' | 'warn' | 'error' | 'info' | 'neutral';
-type LoadStatus = 'idle' | 'loading' | 'ready' | 'error';
-type ProjectViewMode = 'grid' | 'list';
-type ProjectSortID = 'name' | 'activity' | 'cpu';
-type ProjectTabID = 'overview' | 'services' | 'containers' | 'compose';
-type LogScope = 'all' | 'project' | 'service' | 'container';
-type LogLevelFilter = 'error' | 'warn' | 'info' | 'debug' | 'unknown';
-type PermissionMode = 'ask' | 'group' | 'rootless';
-type SetupStepID = 'welcome' | 'backend' | 'checks' | 'install' | 'verify';
+type BadgeTone = "ok" | "warn" | "error" | "info" | "neutral" | "accent";
+type StatusToneID = "ok" | "warn" | "error" | "info" | "neutral";
+type LoadStatus = "idle" | "loading" | "ready" | "error";
+type ProjectViewMode = "grid" | "list";
+type ProjectSortID = "name" | "activity" | "cpu";
+type ProjectTabID = "overview" | "services" | "containers" | "compose";
+type LogScope = "all" | "project" | "service" | "container";
+type LogLevelFilter = "error" | "warn" | "info" | "debug" | "unknown";
+type PermissionMode = "ask" | "group" | "rootless";
+type SetupStepID = "welcome" | "backend" | "checks" | "install" | "verify";
+type SetupBackendID =
+  | "windows_wsl_ubuntu"
+  | "macos_colima"
+  | "existing_context";
 
 type NavItem = {
   id: PageID;
@@ -169,16 +174,16 @@ type InspectState = {
   error?: string;
 };
 
-type ContainerAction = 'start' | 'stop' | 'restart' | 'kill';
+type ContainerAction = "start" | "stop" | "restart" | "kill";
 type ProjectAction =
-  | 'start'
-  | 'stop'
-  | 'restart'
-  | 'pull'
-  | 'redeploy'
-  | 'down'
-  | 'down-volumes';
-type ConfirmPlanKind = 'container' | 'project';
+  | "start"
+  | "stop"
+  | "restart"
+  | "pull"
+  | "redeploy"
+  | "down"
+  | "down-volumes";
+type ConfirmPlanKind = "container" | "project";
 
 type ConfirmState = {
   open: boolean;
@@ -292,7 +297,12 @@ type ProviderInstallProgressPayload = {
 type ProviderSetupState = {
   open: boolean;
   step: SetupStepID;
+  backend: SetupBackendID;
   distro: string;
+  colimaProfile: string;
+  colimaCPU: number;
+  colimaMemoryGB: number;
+  colimaDiskGB: number;
   detecting: boolean;
   detection: ProviderStatus | null;
   detectError?: string;
@@ -307,8 +317,8 @@ type ProviderSetupState = {
 type ExportLogsState = {
   open: boolean;
   path: string;
-  format: 'log' | 'jsonl';
-  range: 'buffer' | 'tail';
+  format: "log" | "jsonl";
+  range: "buffer" | "tail";
   busy: boolean;
   error?: string;
   result?: ExportResult | null;
@@ -324,8 +334,8 @@ type LogErrorPayload = {
   error?: string;
 };
 
-type DashboardMetricID = 'cpu' | 'memory' | 'network';
-type DashboardRangeID = '5m' | '1h' | '24h';
+type DashboardMetricID = "cpu" | "memory" | "network";
+type DashboardRangeID = "5m" | "1h" | "24h";
 
 type StatsSample = {
   projectID?: string;
@@ -372,54 +382,54 @@ type CleanupState = {
 };
 
 const navItems: NavItem[] = [
-  { id: 'overview', label: 'Overview', icon: Gauge },
-  { id: 'projects', label: 'Projects', icon: LayoutGrid },
-  { id: 'containers', label: 'Containers', icon: Container },
-  { id: 'images', label: 'Images', icon: Box },
-  { id: 'volumes', label: 'Volumes', icon: Database },
-  { id: 'networks', label: 'Networks', icon: Network },
-  { id: 'logs', label: 'Logs', icon: ScrollText },
-  { id: 'terminal', label: 'Terminal', icon: Terminal },
-  { id: 'settings', label: 'Settings', icon: SettingsIcon },
+  { id: "overview", label: "Overview", icon: Gauge },
+  { id: "projects", label: "Projects", icon: LayoutGrid },
+  { id: "containers", label: "Containers", icon: Container },
+  { id: "images", label: "Images", icon: Box },
+  { id: "volumes", label: "Volumes", icon: Database },
+  { id: "networks", label: "Networks", icon: Network },
+  { id: "logs", label: "Logs", icon: ScrollText },
+  { id: "terminal", label: "Terminal", icon: Terminal },
+  { id: "settings", label: "Settings", icon: SettingsIcon },
 ];
 
 const emptyInspect: InspectState = {
   open: false,
-  title: '',
+  title: "",
   rows: [],
 };
 
 const emptyConfirm: ConfirmState = {
   open: false,
   plan: null,
-  planKind: 'container',
-  targetName: '',
-  typedName: '',
+  planKind: "container",
+  targetName: "",
+  typedName: "",
   busy: false,
 };
 
 const emptyRename: RenameState = {
   open: false,
   container: null,
-  name: '',
+  name: "",
   busy: false,
 };
 
 const emptyRunImage: RunImageState = {
   open: false,
   step: 1,
-  imageRef: '',
+  imageRef: "",
   imageLocked: false,
-  name: '',
+  name: "",
   pullIfMissing: true,
-  portsText: '',
-  envText: '',
-  volumesText: '',
-  networkID: '',
-  restartPolicy: 'no',
-  commandText: '',
-  user: '',
-  hubQuery: '',
+  portsText: "",
+  envText: "",
+  volumesText: "",
+  networkID: "",
+  restartPolicy: "no",
+  commandText: "",
+  user: "",
+  hubQuery: "",
   hubResults: [],
   hubLoading: false,
   busy: false,
@@ -427,9 +437,9 @@ const emptyRunImage: RunImageState = {
 
 const emptyPullImage: PullImageState = {
   open: false,
-  ref: '',
-  tag: 'latest',
-  query: '',
+  ref: "",
+  tag: "latest",
+  query: "",
   results: [],
   loadingResults: false,
   busy: false,
@@ -437,52 +447,58 @@ const emptyPullImage: PullImageState = {
 
 const emptySaveImage: SaveImageState = {
   open: false,
-  refsText: '',
-  destPath: '',
+  refsText: "",
+  destPath: "",
   busy: false,
 };
 
 const emptyLoadImage: LoadImageState = {
   open: false,
-  srcPath: '',
+  srcPath: "",
   busy: false,
 };
 
 const emptyCreateVolume: CreateVolumeState = {
   open: false,
-  name: '',
-  driver: 'local',
-  driverOptsText: '',
-  labelsText: '',
+  name: "",
+  driver: "local",
+  driverOptsText: "",
+  labelsText: "",
   busy: false,
 };
 
 const emptyCreateNetwork: CreateNetworkState = {
   open: false,
-  name: '',
-  driver: 'bridge',
-  customDriver: '',
-  subnet: '',
-  gateway: '',
+  name: "",
+  driver: "bridge",
+  customDriver: "",
+  subnet: "",
+  gateway: "",
   internal: false,
   attachable: false,
-  labelsText: '',
+  labelsText: "",
   busy: false,
 };
 
 const emptyImportProject: ImportProjectState = {
   open: false,
-  folderPath: '',
+  folderPath: "",
   busy: false,
   imported: null,
 };
 
-const windowsWSLProviderID = 'windows_wsl_ubuntu';
+const windowsWSLProviderID = "windows_wsl_ubuntu";
+const macOSColimaProviderID = "macos_colima";
 
 const emptyProviderSetup: ProviderSetupState = {
   open: false,
-  step: 'welcome',
-  distro: 'Ubuntu',
+  step: "welcome",
+  backend: "windows_wsl_ubuntu",
+  distro: "Ubuntu",
+  colimaProfile: "default",
+  colimaCPU: 2,
+  colimaMemoryGB: 4,
+  colimaDiskGB: 60,
   detecting: false,
   detection: null,
   plan: null,
@@ -493,9 +509,9 @@ const emptyProviderSetup: ProviderSetupState = {
 
 const emptyExportLogs: ExportLogsState = {
   open: false,
-  path: '',
-  format: 'jsonl',
-  range: 'buffer',
+  path: "",
+  format: "jsonl",
+  range: "buffer",
   busy: false,
   result: null,
 };
@@ -506,7 +522,7 @@ const emptyCleanup: CleanupState = {
   includeContainers: true,
   includeBuildCache: true,
   includeVolumes: false,
-  typedName: '',
+  typedName: "",
 };
 
 function App() {
@@ -529,30 +545,30 @@ function App() {
   const networkDetails = useInventoryStore((state) => state.networkDetails);
   const refreshInventory = useInventoryStore((state) => state.refresh);
 
-  const [activePage, setActivePage] = useState<PageID>('overview');
-  const [search, setSearch] = useState('');
+  const [activePage, setActivePage] = useState<PageID>("overview");
+  const [search, setSearch] = useState("");
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
-  const [projectsStatus, setProjectsStatus] = useState<LoadStatus>('idle');
+  const [projectsStatus, setProjectsStatus] = useState<LoadStatus>("idle");
   const [projectsError, setProjectsError] = useState<string | null>(null);
   const [activeProjectID, setActiveProjectID] = useState<string | null>(null);
   const [projectDetail, setProjectDetail] = useState<ProjectDetail | null>(
     null,
   );
   const [projectDetailStatus, setProjectDetailStatus] =
-    useState<LoadStatus>('idle');
+    useState<LoadStatus>("idle");
   const [projectDetailError, setProjectDetailError] = useState<string | null>(
     null,
   );
-  const [projectTab, setProjectTab] = useState<ProjectTabID>('overview');
-  const [projectFilter, setProjectFilter] = useState<FilterID>('all');
-  const [projectSort, setProjectSort] = useState<ProjectSortID>('name');
+  const [projectTab, setProjectTab] = useState<ProjectTabID>("overview");
+  const [projectFilter, setProjectFilter] = useState<FilterID>("all");
+  const [projectSort, setProjectSort] = useState<ProjectSortID>("name");
   const [projectView, setProjectView] = useState<ProjectViewMode>(() => {
-    const saved = window.localStorage.getItem('cairn.projects.view');
-    return saved === 'list' ? 'list' : 'grid';
+    const saved = window.localStorage.getItem("cairn.projects.view");
+    return saved === "list" ? "list" : "grid";
   });
-  const [containerFilter, setContainerFilter] = useState<FilterID>('all');
-  const [imageFilter, setImageFilter] = useState<FilterID>('all');
-  const [volumeFilter, setVolumeFilter] = useState<FilterID>('all');
+  const [containerFilter, setContainerFilter] = useState<FilterID>("all");
+  const [imageFilter, setImageFilter] = useState<FilterID>("all");
+  const [volumeFilter, setVolumeFilter] = useState<FilterID>("all");
   const [inspect, setInspect] = useState<InspectState>(emptyInspect);
   const [confirm, setConfirm] = useState<ConfirmState>(emptyConfirm);
   const [rename, setRename] = useState<RenameState>(emptyRename);
@@ -575,9 +591,18 @@ function App() {
   const [repairOpen, setRepairOpen] = useState(false);
   const [repairError, setRepairError] = useState<string | null>(null);
   const [repairSaving, setRepairSaving] = useState(false);
-  const [permissionMode, setPermissionMode] = useState<PermissionMode>('ask');
+  const [permissionMode, setPermissionMode] = useState<PermissionMode>("ask");
   const [appSettings, setAppSettings] = useState<Record<string, unknown>>({});
-  const [wslDistro, setWSLDistro] = useState('Ubuntu');
+  const [wslDistro, setWSLDistro] = useState("Ubuntu");
+  const [colimaProfile, setColimaProfile] = useState("default");
+  const [colimaCPU, setColimaCPU] = useState(2);
+  const [colimaMemoryGB, setColimaMemoryGB] = useState(4);
+  const [colimaDiskGB, setColimaDiskGB] = useState(60);
+  const [dockerContexts, setDockerContexts] = useState<DockerContextInfo[]>([]);
+  const [dockerContextsLoading, setDockerContextsLoading] = useState(false);
+  const [dockerContextsError, setDockerContextsError] = useState<string | null>(
+    null,
+  );
   const [providerAutostart, setProviderAutostart] = useState(true);
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [settingsMessage, setSettingsMessage] = useState<string | null>(null);
@@ -595,74 +620,74 @@ function App() {
 
   const navigate = useCallback((page: PageID) => {
     setActivePage(page);
-    setSearch('');
+    setSearch("");
   }, []);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
         setPaletteOpen(true);
       }
     };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
   }, []);
 
   const runPaletteCommand = useCallback(
     (command: string) => {
       setQueuedTerminalCommand({ id: Date.now(), command });
-      navigate('terminal');
+      navigate("terminal");
     },
     [navigate],
   );
 
   const showContainers = useCallback(
-    (filter: FilterID = 'all') => {
+    (filter: FilterID = "all") => {
       setContainerFilter(filter);
-      navigate('containers');
+      navigate("containers");
     },
     [navigate],
   );
 
   const refreshProjects = useCallback(async () => {
-    setProjectsStatus('loading');
+    setProjectsStatus("loading");
     setProjectsError(null);
     try {
       const nextProjects = await ProjectService.RefreshProjects();
       setProjects(nextProjects ?? []);
-      setProjectsStatus('ready');
+      setProjectsStatus("ready");
     } catch (error: unknown) {
       setProjectsError(
-        error instanceof Error ? error.message : 'Unable to refresh projects',
+        error instanceof Error ? error.message : "Unable to refresh projects",
       );
-      setProjectsStatus('error');
+      setProjectsStatus("error");
     }
   }, []);
 
   const refreshProjectDetail = useCallback(async (projectID: string) => {
-    setProjectDetailStatus('loading');
+    setProjectDetailStatus("loading");
     setProjectDetailError(null);
     try {
       const detail = await ProjectService.GetProject(projectID);
       if (!detail) {
-        throw new Error('Project was not found');
+        throw new Error("Project was not found");
       }
       setProjectDetail(detail);
-      setProjectDetailStatus('ready');
+      setProjectDetailStatus("ready");
     } catch (error: unknown) {
       setProjectDetail(null);
       setProjectDetailError(
-        error instanceof Error ? error.message : 'Unable to load project',
+        error instanceof Error ? error.message : "Unable to load project",
       );
-      setProjectDetailStatus('error');
+      setProjectDetailStatus("error");
     }
   }, []);
 
   const openProjectDetail = useCallback(
     (project: ProjectSummary) => {
       setActiveProjectID(project.id);
-      setProjectTab('overview');
+      setProjectTab("overview");
       void refreshProjectDetail(project.id);
     },
     [refreshProjectDetail],
@@ -671,7 +696,7 @@ function App() {
   const closeProjectDetail = useCallback(() => {
     setActiveProjectID(null);
     setProjectDetail(null);
-    setProjectDetailStatus('idle');
+    setProjectDetailStatus("idle");
     setProjectDetailError(null);
   }, []);
 
@@ -690,7 +715,7 @@ function App() {
           setVersionError(
             error instanceof Error
               ? error.message
-              : 'Unable to load app version',
+              : "Unable to load app version",
           );
         }
       })
@@ -715,14 +740,27 @@ function App() {
         const nextSettings = settings ?? {};
         setAppSettings(nextSettings);
         setPermissionMode(
-          normalizePermissionMode(nextSettings['linux.sudo_mode']),
+          normalizePermissionMode(nextSettings["linux.sudo_mode"]),
         );
         setWSLDistro(
-          normalizeStringSetting(nextSettings['windows.wsl_distro'], 'Ubuntu'),
+          normalizeStringSetting(nextSettings["windows.wsl_distro"], "Ubuntu"),
+        );
+        setColimaProfile(
+          normalizeStringSetting(
+            nextSettings["macos.colima_profile"],
+            "default",
+          ),
+        );
+        setColimaCPU(normalizeIntSetting(nextSettings["macos.colima_cpu"], 2));
+        setColimaMemoryGB(
+          normalizeIntSetting(nextSettings["macos.colima_memory_gb"], 4),
+        );
+        setColimaDiskGB(
+          normalizeIntSetting(nextSettings["macos.colima_disk_gb"], 60),
         );
         setProviderAutostart(
           normalizeBoolSetting(
-            nextSettings['provider.autostart_backend'],
+            nextSettings["provider.autostart_backend"],
             true,
           ),
         );
@@ -730,8 +768,12 @@ function App() {
       .catch(() => {
         if (active) {
           setAppSettings({});
-          setPermissionMode('ask');
-          setWSLDistro('Ubuntu');
+          setPermissionMode("ask");
+          setWSLDistro("Ubuntu");
+          setColimaProfile("default");
+          setColimaCPU(2);
+          setColimaMemoryGB(4);
+          setColimaDiskGB(60);
           setProviderAutostart(true);
         }
       });
@@ -744,14 +786,14 @@ function App() {
     if (!setup.installStreamID) {
       return undefined;
     }
-    const off = Events.On('provider:install:progress', (event) => {
+    const off = Events.On("provider:install:progress", (event) => {
       const payload = eventPayload<ProviderInstallProgressPayload>(event);
       if (!payload || payload.streamID !== setup.installStreamID) {
         return;
       }
       setSetup((current) => ({
         ...current,
-        step: payload.done && !payload.error ? 'verify' : current.step,
+        step: payload.done && !payload.error ? "verify" : current.step,
         installing: !payload.done,
         error: payload.error || current.error,
         progress: current.progress.concat(payload),
@@ -772,7 +814,7 @@ function App() {
       setNotifications(nextNotifications ?? []);
     } catch (error: unknown) {
       setNotificationsError(
-        error instanceof Error ? error.message : 'Unable to load notifications',
+        error instanceof Error ? error.message : "Unable to load notifications",
       );
     } finally {
       setNotificationsLoading(false);
@@ -796,7 +838,7 @@ function App() {
       setNotificationsError(
         error instanceof Error
           ? error.message
-          : 'Unable to mark notifications read',
+          : "Unable to mark notifications read",
       );
     } finally {
       setNotificationsLoading(false);
@@ -813,7 +855,7 @@ function App() {
 
   useEffect(() => {
     let timer: number | undefined;
-    const off = Events.On('objects:changed', () => {
+    const off = Events.On("objects:changed", () => {
       window.clearTimeout(timer);
       timer = window.setTimeout(() => {
         void refreshInventory();
@@ -868,7 +910,7 @@ function App() {
             searchError:
               error instanceof Error
                 ? error.message
-                : 'Docker Hub search is offline',
+                : "Docker Hub search is offline",
           }));
         });
     }, 300);
@@ -909,7 +951,7 @@ function App() {
             hubError:
               error instanceof Error
                 ? error.message
-                : 'Docker Hub search is offline',
+                : "Docker Hub search is offline",
           }));
         });
     }, 300);
@@ -921,29 +963,29 @@ function App() {
     [providers],
   );
   const runningContainers = containers.filter(
-    (container) => container.state === 'running',
+    (container) => container.state === "running",
   ).length;
   const unhealthyContainers = containers.filter(
-    (container) => container.health === 'unhealthy',
+    (container) => container.health === "unhealthy",
   ).length;
   const diskTotal = diskUsage?.totalBytes ?? 0;
   const diskReclaimable = diskUsage?.reclaimable ?? 0;
   const versionLabel = version?.version
     ? `v${version.version}`
-    : 'v1.0 workspace';
+    : "v1.0 workspace";
   const pageTitle =
-    navItems.find((item) => item.id === activePage)?.label ?? 'Overview';
+    navItems.find((item) => item.id === activePage)?.label ?? "Overview";
   const providerStatus = activeProvider?.status;
   const providerProblems = providerStatus?.problems ?? [];
   const providerWarnings = providerStatus?.warnings ?? [];
   const permissionProblem =
-    providerProblems.find((problem) => problem.code === 'PERM_SOCKET') ?? null;
+    providerProblems.find((problem) => problem.code === "PERM_SOCKET") ?? null;
   const providerRepairNeeded = providerProblems.length > 0;
   const dockerRunning =
     !inventoryError &&
     Boolean(dockerInfo || dockerVersion || providerStatus?.dockerRunning);
   const noProviderConfigured =
-    inventoryStatus !== 'loading' && providers.length === 0;
+    inventoryStatus !== "loading" && providers.length === 0;
   const dockerStopped =
     Boolean(activeProvider && providerStatus?.installed) &&
     !dockerRunning &&
@@ -959,23 +1001,23 @@ function App() {
       0;
   const mutationsDisabled = !dockerRunning;
   const mutationDisabledReason = providerRepairNeeded
-    ? 'Repair the Docker provider before running Docker actions'
+    ? "Repair the Docker provider before running Docker actions"
     : dockerStopped
-      ? 'Start Docker Engine before running Docker actions'
+      ? "Start Docker Engine before running Docker actions"
       : noProviderConfigured
-        ? 'Set up a Docker provider before running Docker actions'
-        : 'Docker is not reachable';
-  const providerName = activeProvider?.name ?? 'No provider selected';
+        ? "Set up a Docker provider before running Docker actions"
+        : "Docker is not reachable";
+  const providerName = activeProvider?.name ?? "No provider selected";
   const statusLabel = dockerRunning
-    ? 'Running'
+    ? "Running"
     : providerRepairNeeded
-      ? 'Error'
-      : 'Stopped';
+      ? "Error"
+      : "Stopped";
   const statusTone: StatusToneID = dockerRunning
-    ? 'ok'
+    ? "ok"
     : providerRepairNeeded
-      ? 'error'
-      : 'neutral';
+      ? "error"
+      : "neutral";
   const unreadNotifications = notifications.filter(
     (notification) => !notification.read,
   ).length;
@@ -1003,7 +1045,7 @@ function App() {
 
   const changeProjectView = useCallback((view: ProjectViewMode) => {
     setProjectView(view);
-    window.localStorage.setItem('cairn.projects.view', view);
+    window.localStorage.setItem("cairn.projects.view", view);
   }, []);
 
   const retryProviderDetection = useCallback(async () => {
@@ -1017,7 +1059,7 @@ function App() {
       await refreshProjects();
     } catch (error: unknown) {
       setActionError(
-        error instanceof Error ? error.message : 'Provider detection failed',
+        error instanceof Error ? error.message : "Provider detection failed",
       );
     } finally {
       setProviderActionBusy(false);
@@ -1038,7 +1080,7 @@ function App() {
       await refreshProjects();
     } catch (error: unknown) {
       setActionError(
-        error instanceof Error ? error.message : 'Unable to start Docker',
+        error instanceof Error ? error.message : "Unable to start Docker",
       );
     } finally {
       setProviderActionBusy(false);
@@ -1049,14 +1091,14 @@ function App() {
     setRepairSaving(true);
     setRepairError(null);
     try {
-      await SettingsService.SetSetting('linux.sudo_mode', permissionMode);
+      await SettingsService.SetSetting("linux.sudo_mode", permissionMode);
       setRepairOpen(false);
       await retryProviderDetection();
     } catch (error: unknown) {
       setRepairError(
         error instanceof Error
           ? error.message
-          : 'Unable to save permission mode',
+          : "Unable to save permission mode",
       );
     } finally {
       setRepairSaving(false);
@@ -1071,8 +1113,8 @@ function App() {
       try {
         await SettingsService.SetSetting(key, value);
         setAppSettings((current) => ({ ...current, [key]: value }));
-        setSettingsMessage('Setting saved');
-        if (key === 'windows.wsl_distro') {
+        setSettingsMessage("Setting saved");
+        if (key === "windows.wsl_distro") {
           if (activeProvider?.id) {
             await ProviderService.Detect(activeProvider.id);
           } else {
@@ -1083,9 +1125,14 @@ function App() {
           await refreshInventory();
           await refreshProjects();
         }
+        if (String(key).startsWith("macos.colima_")) {
+          await ProviderService.Detect(macOSColimaProviderID).catch(() => null);
+          await refreshInventory();
+          await refreshProjects();
+        }
       } catch (error: unknown) {
         setSettingsError(
-          error instanceof Error ? error.message : 'Unable to save setting',
+          error instanceof Error ? error.message : "Unable to save setting",
         );
       } finally {
         setSettingsSaving(false);
@@ -1095,54 +1142,177 @@ function App() {
   );
 
   const saveWSLDistro = useCallback(async () => {
-    const nextDistro = wslDistro.trim() || 'Ubuntu';
+    const nextDistro = wslDistro.trim() || "Ubuntu";
     setWSLDistro(nextDistro);
-    await saveSetting('windows.wsl_distro', nextDistro);
+    await saveSetting("windows.wsl_distro", nextDistro);
   }, [saveSetting, wslDistro]);
 
-  const changeProviderAutostart = useCallback(
-    (enabled: boolean) => {
-      setProviderAutostart(enabled);
-      void saveSetting('provider.autostart_backend', enabled);
+  const saveColimaProfile = useCallback(async () => {
+    const nextProfile = colimaProfile.trim() || "default";
+    setColimaProfile(nextProfile);
+    await saveSetting("macos.colima_profile", nextProfile);
+  }, [colimaProfile, saveSetting]);
+
+  const saveColimaNumberSetting = useCallback(
+    async (
+      key:
+        | "macos.colima_cpu"
+        | "macos.colima_memory_gb"
+        | "macos.colima_disk_gb",
+      value: number,
+      setter: (value: number) => void,
+      fallback: number,
+    ) => {
+      const nextValue = Number.isFinite(value) && value > 0 ? value : fallback;
+      setter(nextValue);
+      await saveSetting(key, nextValue);
     },
     [saveSetting],
   );
 
+  const refreshDockerContexts = useCallback(async () => {
+    setDockerContextsLoading(true);
+    setDockerContextsError(null);
+    try {
+      const contexts = await ProviderService.ListDockerContexts();
+      setDockerContexts(contexts ?? []);
+    } catch (error: unknown) {
+      setDockerContexts([]);
+      setDockerContextsError(
+        error instanceof Error
+          ? error.message
+          : "Unable to list Docker contexts",
+      );
+    } finally {
+      setDockerContextsLoading(false);
+    }
+  }, []);
+
+  const activateDockerContext = useCallback(
+    async (name: string) => {
+      setSettingsSaving(true);
+      setSettingsError(null);
+      setSettingsMessage(null);
+      try {
+        await ProviderService.SetDockerContext(name);
+        setSettingsMessage(`Using Docker context ${name}`);
+        await refreshDockerContexts();
+        await refreshInventory();
+        await refreshProjects();
+      } catch (error: unknown) {
+        setSettingsError(
+          error instanceof Error
+            ? error.message
+            : "Unable to use Docker context",
+        );
+      } finally {
+        setSettingsSaving(false);
+      }
+    },
+    [refreshDockerContexts, refreshInventory, refreshProjects],
+  );
+
+  const changeProviderAutostart = useCallback(
+    (enabled: boolean) => {
+      setProviderAutostart(enabled);
+      void saveSetting("provider.autostart_backend", enabled);
+    },
+    [saveSetting],
+  );
+
+  useEffect(() => {
+    if (activePage === "settings") {
+      void refreshDockerContexts();
+    }
+  }, [activePage, refreshDockerContexts]);
+
   const openProviderSetup = useCallback(() => {
+    const backend =
+      activeProvider?.kind === "macos_colima"
+        ? macOSColimaProviderID
+        : windowsWSLProviderID;
     setSetup({
       ...emptyProviderSetup,
       open: true,
-      distro: wslDistro.trim() || 'Ubuntu',
+      backend,
+      distro: wslDistro.trim() || "Ubuntu",
+      colimaProfile: colimaProfile.trim() || "default",
+      colimaCPU,
+      colimaMemoryGB,
+      colimaDiskGB,
     });
-  }, [wslDistro]);
+  }, [
+    activeProvider?.kind,
+    colimaCPU,
+    colimaDiskGB,
+    colimaMemoryGB,
+    colimaProfile,
+    wslDistro,
+  ]);
 
   const closeProviderSetup = useCallback(() => {
     setSetup(emptyProviderSetup);
   }, []);
 
+  const openDockerContextsSettings = useCallback(() => {
+    closeProviderSetup();
+    navigate("settings");
+    void refreshDockerContexts();
+  }, [closeProviderSetup, navigate, refreshDockerContexts]);
+
   const runWindowsSetupChecks = useCallback(async () => {
-    const distro = setup.distro.trim() || 'Ubuntu';
+    const distro = setup.distro.trim() || "Ubuntu";
+    const profile = setup.colimaProfile.trim() || "default";
+    const providerID =
+      setup.backend === "macos_colima"
+        ? macOSColimaProviderID
+        : windowsWSLProviderID;
     setSetup((current) => ({
       ...current,
       distro,
-      step: 'checks',
+      colimaProfile: profile,
+      step: "checks",
       detecting: true,
       detectError: undefined,
       error: undefined,
     }));
     try {
-      await SettingsService.SetSetting('windows.wsl_distro', distro);
-      setWSLDistro(distro);
-      setAppSettings((current) => ({
-        ...current,
-        'windows.wsl_distro': distro,
-      }));
-      const status = await ProviderService.Detect(windowsWSLProviderID);
+      if (setup.backend === "macos_colima") {
+        await SettingsService.SetSetting("macos.colima_profile", profile);
+        await SettingsService.SetSetting("macos.colima_cpu", setup.colimaCPU);
+        await SettingsService.SetSetting(
+          "macos.colima_memory_gb",
+          setup.colimaMemoryGB,
+        );
+        await SettingsService.SetSetting(
+          "macos.colima_disk_gb",
+          setup.colimaDiskGB,
+        );
+        setColimaProfile(profile);
+        setColimaCPU(setup.colimaCPU);
+        setColimaMemoryGB(setup.colimaMemoryGB);
+        setColimaDiskGB(setup.colimaDiskGB);
+        setAppSettings((current) => ({
+          ...current,
+          "macos.colima_profile": profile,
+          "macos.colima_cpu": setup.colimaCPU,
+          "macos.colima_memory_gb": setup.colimaMemoryGB,
+          "macos.colima_disk_gb": setup.colimaDiskGB,
+        }));
+      } else {
+        await SettingsService.SetSetting("windows.wsl_distro", distro);
+        setWSLDistro(distro);
+        setAppSettings((current) => ({
+          ...current,
+          "windows.wsl_distro": distro,
+        }));
+      }
+      const status = await ProviderService.Detect(providerID);
       setSetup((current) => ({
         ...current,
         detection: status ?? null,
         detecting: false,
-        step: status?.healthy ? 'verify' : 'checks',
+        step: status?.healthy ? "verify" : "checks",
       }));
       await refreshInventory();
     } catch (error: unknown) {
@@ -1150,30 +1320,52 @@ function App() {
         ...current,
         detecting: false,
         detectError:
-          error instanceof Error ? error.message : 'Provider checks failed',
+          error instanceof Error ? error.message : "Provider checks failed",
       }));
     }
-  }, [refreshInventory, setup.distro]);
+  }, [
+    refreshInventory,
+    setup.backend,
+    setup.colimaCPU,
+    setup.colimaDiskGB,
+    setup.colimaMemoryGB,
+    setup.colimaProfile,
+    setup.distro,
+  ]);
 
   const planWindowsInstall = useCallback(async () => {
-    const distro = setup.distro.trim() || 'Ubuntu';
+    const distro = setup.distro.trim() || "Ubuntu";
+    const profile = setup.colimaProfile.trim() || "default";
+    const providerID =
+      setup.backend === "macos_colima"
+        ? macOSColimaProviderID
+        : windowsWSLProviderID;
     setSetup((current) => ({
       ...current,
       distro,
+      colimaProfile: profile,
       planning: true,
       error: undefined,
     }));
     try {
-      const plan = await ProviderService.PlanInstall(windowsWSLProviderID, {
-        backend: 'windows_wsl_ubuntu',
-        extra: { distro },
+      const plan = await ProviderService.PlanInstall(providerID, {
+        backend: providerID,
+        extra:
+          setup.backend === "macos_colima"
+            ? {
+                profile,
+                cpu: String(setup.colimaCPU),
+                memoryGB: String(setup.colimaMemoryGB),
+                diskGB: String(setup.colimaDiskGB),
+              }
+            : { distro },
       });
       if (!plan) {
-        throw new Error('Install plan was empty');
+        throw new Error("Install plan was empty");
       }
       setSetup((current) => ({
         ...current,
-        step: 'install',
+        step: "install",
         plan,
         planning: false,
       }));
@@ -1184,10 +1376,17 @@ function App() {
         error:
           error instanceof Error
             ? error.message
-            : 'Unable to create install plan',
+            : "Unable to create install plan",
       }));
     }
-  }, [setup.distro]);
+  }, [
+    setup.backend,
+    setup.colimaCPU,
+    setup.colimaDiskGB,
+    setup.colimaMemoryGB,
+    setup.colimaProfile,
+    setup.distro,
+  ]);
 
   const applyWindowsInstall = useCallback(async () => {
     if (!setup.plan?.planID) {
@@ -1210,7 +1409,7 @@ function App() {
         ...current,
         installing: false,
         error:
-          error instanceof Error ? error.message : 'Unable to start install',
+          error instanceof Error ? error.message : "Unable to start install",
       }));
     }
   }, [setup.plan?.planID]);
@@ -1240,23 +1439,23 @@ function App() {
       setActionError(null);
       setActionBusy(key, true);
       try {
-        if (action === 'start') {
+        if (action === "start") {
           await DockerService.StartContainer(container.id);
-        } else if (action === 'stop') {
+        } else if (action === "stop") {
           await DockerService.StopContainer(container.id, 10);
-        } else if (action === 'restart') {
+        } else if (action === "restart") {
           await DockerService.RestartContainer(container.id, 10);
         } else {
           const plan = await DockerService.PlanKillContainer(container.id);
           if (!plan) {
-            throw new Error('Kill plan was empty');
+            throw new Error("Kill plan was empty");
           }
           setConfirm({
             open: true,
             plan,
-            planKind: 'container',
+            planKind: "container",
             targetName: container.name,
-            typedName: '',
+            typedName: "",
             busy: false,
           });
           return;
@@ -1269,7 +1468,7 @@ function App() {
         await refreshAfterAction();
       } catch (error: unknown) {
         setActionError(
-          error instanceof Error ? error.message : 'Container action failed',
+          error instanceof Error ? error.message : "Container action failed",
         );
       } finally {
         setActionBusy(key, false);
@@ -1279,7 +1478,7 @@ function App() {
   );
 
   const runBulkContainerAction = useCallback(
-    async (action: Exclude<ContainerAction, 'kill'>) => {
+    async (action: Exclude<ContainerAction, "kill">) => {
       if (!ensureDockerReady()) {
         return;
       }
@@ -1303,7 +1502,7 @@ function App() {
         setActionError(
           error instanceof Error
             ? error.message
-            : 'Bulk container action failed',
+            : "Bulk container action failed",
         );
       } finally {
         setActionBusy(key, false);
@@ -1323,7 +1522,7 @@ function App() {
     }
     setConfirm((current) => ({ ...current, busy: true, error: undefined }));
     try {
-      if (confirm.planKind === 'project') {
+      if (confirm.planKind === "project") {
         await ProjectService.ApplyProjectPlan(
           confirm.plan.planID,
           confirm.typedName,
@@ -1336,7 +1535,7 @@ function App() {
       }
       setConfirm(emptyConfirm);
       setSelectedContainerIDs(new Set<string>());
-      if (confirm.planKind === 'project') {
+      if (confirm.planKind === "project") {
         await refreshProjects();
         if (activeProjectID) {
           await refreshProjectDetail(activeProjectID);
@@ -1348,7 +1547,7 @@ function App() {
       setConfirm((current) => ({
         ...current,
         busy: false,
-        error: error instanceof Error ? error.message : 'Unable to apply plan',
+        error: error instanceof Error ? error.message : "Unable to apply plan",
       }));
     }
   }, [
@@ -1370,31 +1569,31 @@ function App() {
       setActionError(null);
       setActionBusy(key, true);
       try {
-        if (action === 'start') {
+        if (action === "start") {
           await ProjectService.StartProject(project.id);
-        } else if (action === 'stop') {
+        } else if (action === "stop") {
           await ProjectService.StopProject(project.id);
-        } else if (action === 'restart') {
+        } else if (action === "restart") {
           await ProjectService.RestartProject(project.id);
-        } else if (action === 'pull') {
+        } else if (action === "pull") {
           await ProjectService.PullProject(project.id);
         } else {
           const plan =
-            action === 'redeploy'
+            action === "redeploy"
               ? await ProjectService.PlanRedeployProject(project.id)
               : await ProjectService.PlanDownProject(
                   project.id,
-                  action === 'down-volumes',
+                  action === "down-volumes",
                 );
           if (!plan) {
-            throw new Error('Project plan was empty');
+            throw new Error("Project plan was empty");
           }
           setConfirm({
             open: true,
             plan,
-            planKind: 'project',
+            planKind: "project",
             targetName: project.name,
-            typedName: '',
+            typedName: "",
             busy: false,
           });
           return;
@@ -1405,7 +1604,7 @@ function App() {
         }
       } catch (error: unknown) {
         setActionError(
-          error instanceof Error ? error.message : 'Project action failed',
+          error instanceof Error ? error.message : "Project action failed",
         );
       } finally {
         setActionBusy(key, false);
@@ -1421,14 +1620,14 @@ function App() {
   );
 
   const openRunImageModal = useCallback((image?: ImageSummary) => {
-    const ref = image ? primaryImageRef(image) : '';
+    const ref = image ? primaryImageRef(image) : "";
     setRunImage({
       ...emptyRunImage,
       open: true,
       imageRef: ref,
       imageLocked: Boolean(image),
-      name: ref ? suggestContainerName(ref) : '',
-      hubQuery: ref ? '' : '',
+      name: ref ? suggestContainerName(ref) : "",
+      hubQuery: ref ? "" : "",
     });
   }, []);
 
@@ -1442,12 +1641,12 @@ function App() {
       await DockerService.RunImage(req);
       setRunImage(emptyRunImage);
       await refreshAfterAction();
-      setActivePage('containers');
+      setActivePage("containers");
     } catch (error: unknown) {
       setRunImage((current) => ({
         ...current,
         busy: false,
-        error: error instanceof Error ? error.message : 'Unable to run image',
+        error: error instanceof Error ? error.message : "Unable to run image",
       }));
     }
   }, [ensureDockerReady, refreshAfterAction, runImage]);
@@ -1478,7 +1677,7 @@ function App() {
         ...current,
         busy: false,
         error:
-          error instanceof Error ? error.message : 'Unable to rename container',
+          error instanceof Error ? error.message : "Unable to rename container",
       }));
     }
   }, [ensureDockerReady, refreshAfterAction, rename.container, rename.name]);
@@ -1497,7 +1696,7 @@ function App() {
       setPullImage((current) => ({
         ...current,
         busy: false,
-        error: error instanceof Error ? error.message : 'Unable to pull image',
+        error: error instanceof Error ? error.message : "Unable to pull image",
       }));
     }
   }, [ensureDockerReady, pullImage.ref, pullImage.tag, refreshAfterAction]);
@@ -1508,7 +1707,7 @@ function App() {
       ...emptySaveImage,
       open: true,
       refsText: ref,
-      destPath: `${ref.replace(/[/:@]/g, '_') || 'image'}.tar`,
+      destPath: `${ref.replace(/[/:@]/g, "_") || "image"}.tar`,
     });
   }, []);
 
@@ -1527,7 +1726,7 @@ function App() {
       setSaveImage((current) => ({
         ...current,
         busy: false,
-        error: error instanceof Error ? error.message : 'Unable to save image',
+        error: error instanceof Error ? error.message : "Unable to save image",
       }));
     }
   }, [ensureDockerReady, saveImage.destPath, saveImage.refsText]);
@@ -1545,7 +1744,7 @@ function App() {
       setLoadImage((current) => ({
         ...current,
         busy: false,
-        error: error instanceof Error ? error.message : 'Unable to load image',
+        error: error instanceof Error ? error.message : "Unable to load image",
       }));
     }
   }, [ensureDockerReady, loadImage.srcPath, refreshAfterAction]);
@@ -1573,7 +1772,7 @@ function App() {
         ...current,
         busy: false,
         error:
-          error instanceof Error ? error.message : 'Unable to create volume',
+          error instanceof Error ? error.message : "Unable to create volume",
       }));
     }
   }, [
@@ -1598,7 +1797,7 @@ function App() {
       await DockerService.CreateNetwork({
         name: createNetwork.name,
         driver:
-          createNetwork.driver === 'custom'
+          createNetwork.driver === "custom"
             ? createNetwork.customDriver
             : createNetwork.driver,
         subnet: createNetwork.subnet,
@@ -1614,7 +1813,7 @@ function App() {
         ...current,
         busy: false,
         error:
-          error instanceof Error ? error.message : 'Unable to create network',
+          error instanceof Error ? error.message : "Unable to create network",
       }));
     }
   }, [createNetwork, ensureDockerReady, refreshAfterAction]);
@@ -1622,9 +1821,9 @@ function App() {
   const browseImportFolder = useCallback(async () => {
     try {
       const selected = await Dialogs.OpenFile({
-        Title: 'Import Compose Project',
-        Message: 'Choose a Compose project folder',
-        ButtonText: 'Import',
+        Title: "Import Compose Project",
+        Message: "Choose a Compose project folder",
+        ButtonText: "Import",
         CanChooseDirectories: true,
         CanChooseFiles: false,
       });
@@ -1643,7 +1842,7 @@ function App() {
         error:
           error instanceof Error
             ? error.message
-            : 'Unable to open folder picker',
+            : "Unable to open folder picker",
       }));
     }
   }, []);
@@ -1653,7 +1852,7 @@ function App() {
     if (!folderPath) {
       setImportProject((current) => ({
         ...current,
-        error: 'Choose a project folder',
+        error: "Choose a project folder",
       }));
       return;
     }
@@ -1675,14 +1874,14 @@ function App() {
         error: undefined,
       }));
       await refreshProjects();
-      setActivePage('projects');
+      setActivePage("projects");
     } catch (error: unknown) {
       setImportProject((current) => ({
         ...current,
         busy: false,
         imported: null,
         error:
-          error instanceof Error ? error.message : 'Unable to import project',
+          error instanceof Error ? error.message : "Unable to import project",
       }));
     }
   }, [importProject.folderPath, refreshProjects]);
@@ -1726,7 +1925,7 @@ function App() {
           error:
             error instanceof Error
               ? error.message
-              : 'Unable to inspect container',
+              : "Unable to inspect container",
         });
       });
   }, []);
@@ -1743,7 +1942,7 @@ function App() {
       DockerService.GetImage(image.id)
         .then((detail) => {
           if (!detail) {
-            throw new Error('Image detail was empty');
+            throw new Error("Image detail was empty");
           }
           setInspect({
             open: true,
@@ -1762,7 +1961,7 @@ function App() {
             error:
               error instanceof Error
                 ? error.message
-                : 'Unable to inspect image',
+                : "Unable to inspect image",
           });
         });
     },
@@ -1802,7 +2001,7 @@ function App() {
             error:
               error instanceof Error
                 ? error.message
-                : 'Unable to inspect volume',
+                : "Unable to inspect volume",
           });
         });
     },
@@ -1842,7 +2041,7 @@ function App() {
             error:
               error instanceof Error
                 ? error.message
-                : 'Unable to inspect network',
+                : "Unable to inspect network",
           });
         });
     },
@@ -1851,14 +2050,14 @@ function App() {
 
   const content = (() => {
     switch (activePage) {
-      case 'projects':
+      case "projects":
         if (activeProjectID) {
           return (
             <ProjectDetailPage
               actionBusyIDs={busyActionIDs}
               detail={projectDetail}
               error={projectDetailError}
-              loading={projectDetailStatus === 'loading'}
+              loading={projectDetailStatus === "loading"}
               mutationsDisabled={mutationsDisabled}
               mutationDisabledReason={mutationDisabledReason}
               onAction={runProjectAction}
@@ -1876,7 +2075,7 @@ function App() {
             error={projectsError}
             actionBusyIDs={busyActionIDs}
             filter={projectFilter}
-            loading={projectsStatus === 'loading'}
+            loading={projectsStatus === "loading"}
             mutationsDisabled={mutationsDisabled}
             mutationDisabledReason={mutationDisabledReason}
             onAction={runProjectAction}
@@ -1894,17 +2093,17 @@ function App() {
             view={projectView}
           />
         );
-      case 'logs':
+      case "logs":
         return (
           <LogsPage
             containers={containers}
             dockerRunning={dockerRunning}
-            inventoryLoading={inventoryStatus === 'loading'}
+            inventoryLoading={inventoryStatus === "loading"}
             projects={projects}
-            projectsLoading={projectsStatus === 'loading'}
+            projectsLoading={projectsStatus === "loading"}
           />
         );
-      case 'terminal':
+      case "terminal":
         return (
           <TerminalPage
             containers={containers}
@@ -1917,20 +2116,64 @@ function App() {
             queuedCommand={queuedTerminalCommand}
           />
         );
-      case 'settings':
+      case "settings":
         return (
           <SettingsPage
             activeProvider={activeProvider}
             autostartBackend={providerAutostart}
+            colimaCPU={colimaCPU}
+            colimaDiskGB={colimaDiskGB}
+            colimaMemoryGB={colimaMemoryGB}
+            colimaProfile={colimaProfile}
+            dockerContexts={dockerContexts}
+            dockerContextsError={dockerContextsError}
+            dockerContextsLoading={dockerContextsLoading}
             error={settingsError}
             message={settingsMessage}
             onAutostartChange={changeProviderAutostart}
+            onColimaCPUChange={setColimaCPU}
+            onColimaDiskGBChange={setColimaDiskGB}
+            onColimaMemoryGBChange={setColimaMemoryGB}
+            onColimaProfileChange={setColimaProfile}
             onDetect={() => {
               void retryProviderDetection();
             }}
             onOpenSetup={openProviderSetup}
+            onRefreshDockerContexts={() => {
+              void refreshDockerContexts();
+            }}
+            onSaveColimaCPU={() => {
+              void saveColimaNumberSetting(
+                "macos.colima_cpu",
+                colimaCPU,
+                setColimaCPU,
+                2,
+              );
+            }}
+            onSaveColimaDiskGB={() => {
+              void saveColimaNumberSetting(
+                "macos.colima_disk_gb",
+                colimaDiskGB,
+                setColimaDiskGB,
+                60,
+              );
+            }}
+            onSaveColimaMemoryGB={() => {
+              void saveColimaNumberSetting(
+                "macos.colima_memory_gb",
+                colimaMemoryGB,
+                setColimaMemoryGB,
+                4,
+              );
+            }}
+            onSaveColimaProfile={() => {
+              void saveColimaProfile();
+            }}
             onSaveWSLDistro={() => {
               void saveWSLDistro();
+            }}
+            onUseDockerContext={(name) => {
+              void activateDockerContext(name);
             }}
             onWSLDistroChange={setWSLDistro}
             providers={providers}
@@ -1939,13 +2182,13 @@ function App() {
             wslDistro={wslDistro}
           />
         );
-      case 'containers':
+      case "containers":
         return (
           <ContainersPage
             actionBusyIDs={busyActionIDs}
             containers={containers}
             filter={containerFilter}
-            loading={inventoryStatus === 'loading'}
+            loading={inventoryStatus === "loading"}
             mutationsDisabled={mutationsDisabled}
             mutationDisabledReason={mutationDisabledReason}
             onAction={runContainerAction}
@@ -1958,13 +2201,13 @@ function App() {
             selectedIDs={selectedContainerIDs}
           />
         );
-      case 'images':
+      case "images":
         return (
           <ImagesPage
             filter={imageFilter}
             imageUseCounts={imageUseCounts}
             images={images}
-            loading={inventoryStatus === 'loading'}
+            loading={inventoryStatus === "loading"}
             mutationsDisabled={mutationsDisabled}
             mutationDisabledReason={mutationDisabledReason}
             onFilterChange={setImageFilter}
@@ -1976,11 +2219,11 @@ function App() {
             search={search}
           />
         );
-      case 'volumes':
+      case "volumes":
         return (
           <VolumesPage
             filter={volumeFilter}
-            loading={inventoryStatus === 'loading'}
+            loading={inventoryStatus === "loading"}
             mutationsDisabled={mutationsDisabled}
             mutationDisabledReason={mutationDisabledReason}
             onCreate={() =>
@@ -1993,10 +2236,10 @@ function App() {
             volumes={volumes}
           />
         );
-      case 'networks':
+      case "networks":
         return (
           <NetworksPage
-            loading={inventoryStatus === 'loading'}
+            loading={inventoryStatus === "loading"}
             mutationsDisabled={mutationsDisabled}
             mutationDisabledReason={mutationDisabledReason}
             networkDetails={networkDetails}
@@ -2022,12 +2265,12 @@ function App() {
               setImportProject({ ...emptyImportProject, open: true })
             }
             onNavigate={navigate}
-            onOpenTerminal={() => navigate('terminal')}
+            onOpenTerminal={() => navigate("terminal")}
             onOpenProject={openProjectDetail}
             onShowContainers={showContainers}
             provider={activeProvider}
             projects={projects}
-            projectsLoading={projectsStatus === 'loading'}
+            projectsLoading={projectsStatus === "loading"}
             runningContainers={runningContainers}
             unhealthyContainers={unhealthyContainers}
             volumes={volumes}
@@ -2062,18 +2305,18 @@ function App() {
               const Icon = item.icon;
               const active = activePage === item.id;
               const badge =
-                item.id === 'containers'
+                item.id === "containers"
                   ? String(containers.length)
                   : undefined;
               return (
                 <button
                   key={item.id}
                   className={[
-                    'flex h-10 w-auto shrink-0 items-center gap-3 rounded-control px-3 text-left text-sm transition lg:w-full',
+                    "flex h-10 w-auto shrink-0 items-center gap-3 rounded-control px-3 text-left text-sm transition lg:w-full",
                     active
-                      ? 'bg-accent/10 text-accent shadow-[inset_3px_0_0_rgb(45_212_167)]'
-                      : 'text-text-secondary hover:bg-bg-card hover:text-text-primary',
-                  ].join(' ')}
+                      ? "bg-accent/10 text-accent shadow-[inset_3px_0_0_rgb(45_212_167)]"
+                      : "text-text-secondary hover:bg-bg-card hover:text-text-primary",
+                  ].join(" ")}
                   onClick={() => navigate(item.id)}
                   type="button"
                 >
@@ -2100,7 +2343,7 @@ function App() {
               <div className="mt-2 truncate text-xs text-text-muted">
                 {dockerVersion?.serverVersion
                   ? `Engine ${dockerVersion.serverVersion}`
-                  : 'No engine version'}
+                  : "No engine version"}
               </div>
               {!dockerRunning ? (
                 <div className="mt-3 flex gap-2">
@@ -2120,10 +2363,10 @@ function App() {
                     variant="secondary"
                   >
                     {dockerStopped
-                      ? 'Start'
+                      ? "Start"
                       : noProviderConfigured
-                        ? 'Set up'
-                        : 'Repair'}
+                        ? "Set up"
+                        : "Repair"}
                   </Button>
                 </div>
               ) : null}
@@ -2141,7 +2384,7 @@ function App() {
                 {dockerInfo?.name ?? providerName}
                 {lastLoadedAt
                   ? ` - refreshed ${relativeTime(lastLoadedAt)}`
-                  : ''}
+                  : ""}
               </p>
             </div>
             <div className="flex w-full items-center gap-2 sm:w-auto">
@@ -2151,12 +2394,12 @@ function App() {
                   aria-label="Refresh"
                   icon={<RefreshCw size={17} />}
                   loading={
-                    activePage === 'projects'
-                      ? projectsStatus === 'loading'
-                      : inventoryStatus === 'loading'
+                    activePage === "projects"
+                      ? projectsStatus === "loading"
+                      : inventoryStatus === "loading"
                   }
                   onClick={() => {
-                    if (activePage === 'projects') {
+                    if (activePage === "projects") {
                       void refreshProjects();
                     } else {
                       void refreshInventory();
@@ -2172,7 +2415,7 @@ function App() {
                     aria-label={
                       unreadNotifications > 0
                         ? `Notifications ${unreadNotifications} unread`
-                        : 'Notifications'
+                        : "Notifications"
                     }
                     icon={<Bell size={17} />}
                     onClick={() => setNotificationsOpen((current) => !current)}
@@ -2182,7 +2425,7 @@ function App() {
                 </Tooltip>
                 {unreadNotifications > 0 ? (
                   <span className="absolute -right-1 -top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-warn px-1 text-[10px] font-semibold text-bg-app">
-                    {unreadNotifications > 9 ? '9+' : unreadNotifications}
+                    {unreadNotifications > 9 ? "9+" : unreadNotifications}
                   </span>
                 ) : null}
                 <NotificationCenter
@@ -2276,10 +2519,26 @@ function App() {
         onApplyInstall={() => {
           void applyWindowsInstall();
         }}
+        onChangeBackend={(backend) =>
+          setSetup((current) => ({ ...current, backend, step: "checks" }))
+        }
+        onChangeColimaCPU={(colimaCPU) =>
+          setSetup((current) => ({ ...current, colimaCPU }))
+        }
+        onChangeColimaDiskGB={(colimaDiskGB) =>
+          setSetup((current) => ({ ...current, colimaDiskGB }))
+        }
+        onChangeColimaMemoryGB={(colimaMemoryGB) =>
+          setSetup((current) => ({ ...current, colimaMemoryGB }))
+        }
+        onChangeColimaProfile={(colimaProfile) =>
+          setSetup((current) => ({ ...current, colimaProfile }))
+        }
         onChangeDistro={(distro) =>
           setSetup((current) => ({ ...current, distro }))
         }
         onClose={closeProviderSetup}
+        onOpenDockerContexts={openDockerContextsSettings}
         onPlanInstall={() => {
           void planWindowsInstall();
         }}
@@ -2303,7 +2562,7 @@ function App() {
         onAddAutoPort={() =>
           setRunImage((current) => ({
             ...current,
-            portsText: appendLine(current.portsText, '0:80/tcp'),
+            portsText: appendLine(current.portsText, "0:80/tcp"),
           }))
         }
         onBack={() => setRunImage((current) => ({ ...current, step: 1 }))}
@@ -2444,35 +2703,35 @@ function GlobalStateBanner({
   const warning = providerWarnings[0] ?? null;
   const state = providerRepairNeeded
     ? {
-        tone: 'error' as const,
+        tone: "error" as const,
         icon: <ShieldAlert size={17} />,
-        title: primaryProblem?.message ?? 'Provider repair is required',
+        title: primaryProblem?.message ?? "Provider repair is required",
         body:
           primaryProblem?.repairHint ??
-          'Review the provider checks and choose a repair path.',
+          "Review the provider checks and choose a repair path.",
       }
     : noProviderConfigured
       ? {
-          tone: 'warn' as const,
+          tone: "warn" as const,
           icon: <AlertTriangle size={17} />,
-          title: 'No Docker provider configured',
-          body: 'Set up a provider before running Docker actions.',
+          title: "No Docker provider configured",
+          body: "Set up a provider before running Docker actions.",
         }
       : dockerStopped || inventoryError
         ? {
-            tone: 'warn' as const,
+            tone: "warn" as const,
             icon: <AlertTriangle size={17} />,
-            title: 'Docker is not reachable',
+            title: "Docker is not reachable",
             body:
               inventoryError ??
-              'Cached data is visible; Docker actions are disabled until the engine is running.',
+              "Cached data is visible; Docker actions are disabled until the engine is running.",
           }
         : warning
           ? {
-              tone: 'info' as const,
+              tone: "info" as const,
               icon: <AlertTriangle size={17} />,
               title: warning.message,
-              body: 'Provider warning',
+              body: "Provider warning",
             }
           : null;
 
@@ -2481,11 +2740,11 @@ function GlobalStateBanner({
   }
 
   const toneClass =
-    state.tone === 'error'
-      ? 'border-error/30 bg-error/10 text-error'
-      : state.tone === 'warn'
-        ? 'border-warn/30 bg-warn/10 text-warn'
-        : 'border-info/30 bg-info/10 text-info';
+    state.tone === "error"
+      ? "border-error/30 bg-error/10 text-error"
+      : state.tone === "warn"
+        ? "border-warn/30 bg-warn/10 text-warn"
+        : "border-info/30 bg-info/10 text-info";
 
   return (
     <div className={`border-b px-6 py-3 ${toneClass}`}>
@@ -2610,12 +2869,12 @@ function NotificationCenter({
           return (
             <button
               className={[
-                'mb-2 block w-full rounded-control border p-3 text-left text-sm transition',
+                "mb-2 block w-full rounded-control border p-3 text-left text-sm transition",
                 notification.read
-                  ? 'border-border bg-bg-inset text-text-secondary'
-                  : 'border-accent/30 bg-accent/10 text-text-primary',
-                target ? 'hover:border-border-strong' : '',
-              ].join(' ')}
+                  ? "border-border bg-bg-inset text-text-secondary"
+                  : "border-accent/30 bg-accent/10 text-text-primary",
+                target ? "hover:border-border-strong" : "",
+              ].join(" ")}
               key={notification.id}
               onClick={() => {
                 if (target) {
@@ -2628,7 +2887,7 @@ function NotificationCenter({
                 <div className="min-w-0">
                   <div className="flex items-center gap-2">
                     <Badge tone={notificationTone(notification.level)}>
-                      {notification.level || 'info'}
+                      {notification.level || "info"}
                     </Badge>
                     <span className="truncate font-medium">
                       {notification.title}
@@ -2645,7 +2904,7 @@ function NotificationCenter({
                 ) : null}
               </div>
               <div className="mt-2 flex items-center justify-between gap-2 text-xs text-text-muted">
-                <span>{notification.topic || 'system'}</span>
+                <span>{notification.topic || "system"}</span>
                 <span>{relativeTime(dateMillis(notification.createdAt))}</span>
               </div>
             </button>
@@ -2713,7 +2972,7 @@ function RepairProviderModal({
           <Wrench className="mt-0.5 text-accent" size={19} />
           <div className="min-w-0">
             <div className="font-medium text-text-primary">
-              {provider?.name ?? 'No provider selected'}
+              {provider?.name ?? "No provider selected"}
             </div>
             <div className="mt-1 text-sm text-text-muted">
               Provider checks list the exact failure and repair hint from the
@@ -2765,24 +3024,24 @@ function RepairProviderModal({
             </div>
             <div className="grid gap-2">
               <PermissionOption
-                checked={permissionMode === 'ask'}
+                checked={permissionMode === "ask"}
                 description="Cairn prompts only when an action needs sudo. The sudo password is never stored."
                 label="Use sudo per action"
-                onChange={() => onChangePermissionMode('ask')}
+                onChange={() => onChangePermissionMode("ask")}
                 value="ask"
               />
               <PermissionOption
-                checked={permissionMode === 'group'}
+                checked={permissionMode === "group"}
                 description="Convenient, less isolated. The docker group is root-equivalent and requires signing out and back in."
                 label="Add user to docker group"
-                onChange={() => onChangePermissionMode('group')}
+                onChange={() => onChangePermissionMode("group")}
                 value="group"
               />
               <PermissionOption
-                checked={permissionMode === 'rootless'}
+                checked={permissionMode === "rootless"}
                 description="Use the rootless Docker socket when rootless Docker is already configured."
                 label="Use rootless Docker socket"
-                onChange={() => onChangePermissionMode('rootless')}
+                onChange={() => onChangePermissionMode("rootless")}
                 value="rootless"
               />
             </div>
@@ -2816,8 +3075,14 @@ function RepairProviderModal({
 
 function ProviderSetupModal({
   onApplyInstall,
+  onChangeBackend,
+  onChangeColimaCPU,
+  onChangeColimaDiskGB,
+  onChangeColimaMemoryGB,
+  onChangeColimaProfile,
   onChangeDistro,
   onClose,
+  onOpenDockerContexts,
   onPlanInstall,
   onRunChecks,
   onStep,
@@ -2827,18 +3092,28 @@ function ProviderSetupModal({
   open: boolean;
   setup: ProviderSetupState;
   onApplyInstall: () => void;
+  onChangeBackend: (backend: SetupBackendID) => void;
+  onChangeColimaCPU: (value: number) => void;
+  onChangeColimaDiskGB: (value: number) => void;
+  onChangeColimaMemoryGB: (value: number) => void;
+  onChangeColimaProfile: (profile: string) => void;
   onChangeDistro: (distro: string) => void;
   onClose: () => void;
+  onOpenDockerContexts: () => void;
   onPlanInstall: () => void;
   onRunChecks: () => void;
   onStep: (step: SetupStepID) => void;
 }) {
-  const rows = windowsSetupCheckRows(setup.detection);
+  const rows =
+    setup.backend === "macos_colima"
+      ? macOSSetupCheckRows(setup.detection)
+      : windowsSetupCheckRows(setup.detection);
   const hasProblems = Boolean(setup.detection?.problems?.length);
   const canPlan = !setup.detecting && Boolean(setup.detection) && hasProblems;
   const completed =
     setup.detection?.healthy ||
     setup.progress.some((entry) => entry.done && !entry.error);
+  const isMac = setup.backend === "macos_colima";
 
   return (
     <Modal
@@ -2851,20 +3126,20 @@ function ProviderSetupModal({
         <div className="flex flex-wrap gap-2">
           {(
             [
-              'welcome',
-              'backend',
-              'checks',
-              'install',
-              'verify',
+              "welcome",
+              "backend",
+              "checks",
+              "install",
+              "verify",
             ] as SetupStepID[]
           ).map((step, index) => (
             <button
               className={[
-                'flex h-8 items-center gap-2 rounded-control border px-3 text-xs font-medium',
+                "flex h-8 items-center gap-2 rounded-control border px-3 text-xs font-medium",
                 setup.step === step
-                  ? 'border-accent/40 bg-accent/10 text-accent'
-                  : 'border-border bg-bg-inset text-text-muted',
-              ].join(' ')}
+                  ? "border-accent/40 bg-accent/10 text-accent"
+                  : "border-border bg-bg-inset text-text-muted",
+              ].join(" ")}
               disabled={setup.installing}
               key={step}
               onClick={() => onStep(step)}
@@ -2876,7 +3151,7 @@ function ProviderSetupModal({
           ))}
         </div>
 
-        {setup.step === 'welcome' ? (
+        {setup.step === "welcome" ? (
           <section className="space-y-4">
             <div className="flex items-center gap-4">
               <img alt="Cairn" className="h-14 w-auto" src={logoUrl} />
@@ -2893,7 +3168,7 @@ function ProviderSetupModal({
             <div className="flex flex-wrap gap-2">
               <Button
                 icon={<Play size={15} />}
-                onClick={() => onStep('backend')}
+                onClick={() => onStep("backend")}
               >
                 Get started
               </Button>
@@ -2908,75 +3183,153 @@ function ProviderSetupModal({
           </section>
         ) : null}
 
-        {setup.step === 'backend' ? (
+        {setup.step === "backend" ? (
           <section className="grid gap-3 md:grid-cols-3">
-            <BackendChoiceCard
-              badge="Recommended"
-              body="Install or use Ubuntu on WSL2 with official Docker Engine packages inside the distro."
-              icon={<Server size={19} />}
-              onSelect={() => onStep('checks')}
-              title="Ubuntu on WSL2"
-            />
-            <BackendChoiceCard
-              body="Existing Docker context support arrives with the cross-provider context phase."
-              disabled
-              icon={<Terminal size={19} />}
-              title="Existing Docker context"
-            />
-            <BackendChoiceCard
-              body="Remote hosts are outside the v1 MVP setup flow."
-              disabled
-              icon={<Wifi size={19} />}
-              title="Remote host"
-            />
+            {isMac ? (
+              <>
+                <BackendChoiceCard
+                  badge="Recommended"
+                  body="Install or use Colima with Homebrew-managed Docker CLI, Compose, and Buildx."
+                  details="Docker CLI, Docker Compose, Colima, selected profile resources, Docker context, and hello-world verification."
+                  icon={<Server size={19} />}
+                  onSelect={() => onChangeBackend("macos_colima")}
+                  title="Colima"
+                />
+                <BackendChoiceCard
+                  body="Use a Docker Desktop, OrbStack, Rancher Desktop, or remote Docker context without changing your global context."
+                  details="No packages are installed. Cairn lists contexts, pings the selected one, and runs Docker with --context."
+                  icon={<Terminal size={19} />}
+                  onSelect={() => onChangeBackend("existing_context")}
+                  title="Existing Docker context"
+                />
+                <BackendChoiceCard
+                  body="Remote host setup is outside the v1 MVP flow."
+                  disabled
+                  icon={<Wifi size={19} />}
+                  title="Remote host"
+                />
+              </>
+            ) : (
+              <>
+                <BackendChoiceCard
+                  badge="Recommended"
+                  body="Install or use Ubuntu on WSL2 with official Docker Engine packages inside the distro."
+                  details="WSL2, Ubuntu, Docker Engine, Compose, Buildx, systemd service wiring, and docker-group access."
+                  icon={<Server size={19} />}
+                  onSelect={() => onChangeBackend("windows_wsl_ubuntu")}
+                  title="Ubuntu on WSL2"
+                />
+                <BackendChoiceCard
+                  body="Use an existing Docker context without changing your global Docker context."
+                  details="No packages are installed. Cairn runs Docker and Compose with --context."
+                  icon={<Terminal size={19} />}
+                  onSelect={() => onChangeBackend("existing_context")}
+                  title="Existing Docker context"
+                />
+                <BackendChoiceCard
+                  body="Remote hosts are outside the v1 MVP setup flow."
+                  disabled
+                  icon={<Wifi size={19} />}
+                  title="Remote host"
+                />
+              </>
+            )}
           </section>
         ) : null}
 
-        {setup.step === 'checks' ? (
+        {setup.step === "checks" ? (
           <section className="space-y-4">
-            <div className="grid gap-3 md:grid-cols-[1fr_auto] md:items-end">
-              <label className="block">
-                <span className="text-xs font-medium uppercase text-text-muted">
-                  WSL distro
-                </span>
-                <input
-                  className="mt-1 h-9 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
-                  onChange={(event) => onChangeDistro(event.target.value)}
-                  placeholder="Ubuntu"
-                  value={setup.distro}
-                />
-              </label>
-              <Button
-                icon={<RefreshCw size={15} />}
-                loading={setup.detecting}
-                onClick={onRunChecks}
-              >
-                Run checks
-              </Button>
-            </div>
-            <PathRecommendation />
+            {setup.backend === "existing_context" ? (
+              <EmptyState
+                body="Existing contexts are selected from Settings -> Docker contexts so Cairn can switch providers without changing docker context show."
+                icon={<Terminal size={28} />}
+                title="Use an existing Docker context"
+              />
+            ) : (
+              <>
+                <div className="grid gap-3 md:grid-cols-[1fr_auto] md:items-end">
+                  {isMac ? (
+                    <div className="grid gap-3 sm:grid-cols-4">
+                      <label className="block sm:col-span-1">
+                        <span className="text-xs font-medium uppercase text-text-muted">
+                          Profile
+                        </span>
+                        <input
+                          className="mt-1 h-9 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
+                          onChange={(event) =>
+                            onChangeColimaProfile(event.target.value)
+                          }
+                          placeholder="default"
+                          value={setup.colimaProfile}
+                        />
+                      </label>
+                      <SetupNumberField
+                        label="CPU"
+                        onChange={onChangeColimaCPU}
+                        value={setup.colimaCPU}
+                      />
+                      <SetupNumberField
+                        label="RAM GB"
+                        onChange={onChangeColimaMemoryGB}
+                        value={setup.colimaMemoryGB}
+                      />
+                      <SetupNumberField
+                        label="Disk GB"
+                        onChange={onChangeColimaDiskGB}
+                        value={setup.colimaDiskGB}
+                      />
+                    </div>
+                  ) : (
+                    <label className="block">
+                      <span className="text-xs font-medium uppercase text-text-muted">
+                        WSL distro
+                      </span>
+                      <input
+                        className="mt-1 h-9 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
+                        onChange={(event) => onChangeDistro(event.target.value)}
+                        placeholder="Ubuntu"
+                        value={setup.distro}
+                      />
+                    </label>
+                  )}
+                  <Button
+                    icon={<RefreshCw size={15} />}
+                    loading={setup.detecting}
+                    onClick={onRunChecks}
+                  >
+                    Run checks
+                  </Button>
+                </div>
+                {isMac ? <ColimaPathRecommendation /> : <PathRecommendation />}
+              </>
+            )}
             {setup.detectError ? (
               <div className="rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
                 {setup.detectError}
               </div>
             ) : null}
-            <div className="grid gap-2">
-              {rows.map((row) => (
-                <SetupCheckRow key={row.label} row={row} />
-              ))}
-            </div>
+            {setup.backend !== "existing_context" ? (
+              <div className="grid gap-2">
+                {rows.map((row) => (
+                  <SetupCheckRow key={row.label} row={row} />
+                ))}
+              </div>
+            ) : null}
             <div className="flex justify-end gap-2 border-t border-border pt-4">
-              <Button onClick={() => onStep('backend')} variant="secondary">
+              <Button onClick={() => onStep("backend")} variant="secondary">
                 Back
               </Button>
+              {setup.backend === "existing_context" ? (
+                <Button onClick={onOpenDockerContexts}>Open Settings</Button>
+              ) : null}
               {setup.detection?.healthy ? (
                 <Button
                   icon={<CheckCircle2 size={15} />}
-                  onClick={() => onStep('verify')}
+                  onClick={() => onStep("verify")}
                 >
                   Continue
                 </Button>
-              ) : (
+              ) : setup.backend !== "existing_context" ? (
                 <Button
                   disabled={!canPlan}
                   disabledReason="Run checks before creating an install plan"
@@ -2986,12 +3339,12 @@ function ProviderSetupModal({
                 >
                   Create install plan
                 </Button>
-              )}
+              ) : null}
             </div>
           </section>
         ) : null}
 
-        {setup.step === 'install' ? (
+        {setup.step === "install" ? (
           <section className="space-y-4">
             {setup.plan ? (
               <div className="space-y-3">
@@ -3000,8 +3353,9 @@ function ProviderSetupModal({
                     {setup.plan.title}
                   </h2>
                   <p className="mt-1 text-sm text-text-muted">
-                    Windows may ask for administrator approval when WSL features
-                    are enabled.
+                    {isMac
+                      ? "Homebrew may prompt for system approval while packages install."
+                      : "Windows may ask for administrator approval when WSL features are enabled."}
                   </p>
                 </div>
                 <div className="space-y-2">
@@ -3033,13 +3387,13 @@ function ProviderSetupModal({
                 {setup.progress.map((entry, index) => (
                   <div
                     className={[
-                      'rounded-card border px-3 py-2 text-sm',
+                      "rounded-card border px-3 py-2 text-sm",
                       entry.error
-                        ? 'border-error/30 bg-error/10 text-error'
+                        ? "border-error/30 bg-error/10 text-error"
                         : entry.done
-                          ? 'border-ok/30 bg-ok/10 text-ok'
-                          : 'border-info/30 bg-info/10 text-info',
-                    ].join(' ')}
+                          ? "border-ok/30 bg-ok/10 text-ok"
+                          : "border-info/30 bg-info/10 text-info",
+                    ].join(" ")}
                     key={`${entry.streamID}:${index}`}
                   >
                     {entry.message}
@@ -3063,7 +3417,7 @@ function ProviderSetupModal({
             <div className="flex justify-end gap-2 border-t border-border pt-4">
               <Button
                 disabled={setup.installing}
-                onClick={() => onStep('checks')}
+                onClick={() => onStep("checks")}
                 variant="secondary"
               >
                 Back
@@ -3081,33 +3435,45 @@ function ProviderSetupModal({
           </section>
         ) : null}
 
-        {setup.step === 'verify' ? (
+        {setup.step === "verify" ? (
           <section className="space-y-4">
             <div className="rounded-card border border-ok/30 bg-ok/10 p-4">
               <div className="flex items-center gap-2 font-medium text-ok">
                 <CheckCircle2 size={17} />
                 {completed
-                  ? 'Windows WSL backend is ready'
-                  : 'Provider checks complete'}
+                  ? isMac
+                    ? "macOS Colima backend is ready"
+                    : "Windows WSL backend is ready"
+                  : "Provider checks complete"}
               </div>
               <div className="mt-2 grid gap-2 text-sm text-text-secondary sm:grid-cols-2">
-                <span>Provider: Windows WSL Ubuntu</span>
-                <span>Distro: {setup.distro || 'Ubuntu'}</span>
                 <span>
-                  Docker:{' '}
-                  {setup.detection?.dockerVersion || 'verified after install'}
+                  Provider: {isMac ? "macOS Colima" : "Windows WSL Ubuntu"}
                 </span>
                 <span>
-                  Compose:{' '}
-                  {setup.detection?.composeVersion || 'verified after install'}
+                  {isMac
+                    ? `Profile: ${setup.colimaProfile || "default"}`
+                    : `Distro: ${setup.distro || "Ubuntu"}`}
                 </span>
                 <span>
-                  Context: {setup.detection?.currentContext || 'default'}
+                  Docker:{" "}
+                  {setup.detection?.dockerVersion || "verified after install"}
                 </span>
-                <span>Host: {setup.detection?.dockerHost || 'wsl+stdio'}</span>
+                <span>
+                  Compose:{" "}
+                  {setup.detection?.composeVersion || "verified after install"}
+                </span>
+                <span>
+                  Context: {setup.detection?.currentContext || "default"}
+                </span>
+                <span>
+                  Host:{" "}
+                  {setup.detection?.dockerHost ||
+                    (isMac ? "colima context" : "wsl+stdio")}
+                </span>
               </div>
             </div>
-            <PathRecommendation />
+            {isMac ? <ColimaPathRecommendation /> : <PathRecommendation />}
             <div className="flex justify-end gap-2 border-t border-border pt-4">
               <Button onClick={onClose}>Continue</Button>
             </div>
@@ -3121,6 +3487,7 @@ function ProviderSetupModal({
 function BackendChoiceCard({
   badge,
   body,
+  details,
   disabled = false,
   icon,
   onSelect,
@@ -3128,6 +3495,7 @@ function BackendChoiceCard({
 }: {
   badge?: string;
   body: string;
+  details?: string;
   disabled?: boolean;
   icon: ReactNode;
   onSelect?: () => void;
@@ -3136,11 +3504,11 @@ function BackendChoiceCard({
   return (
     <button
       className={[
-        'rounded-card border p-4 text-left transition',
+        "rounded-card border p-4 text-left transition",
         disabled
-          ? 'cursor-not-allowed border-border bg-bg-inset text-text-muted opacity-70'
-          : 'border-accent/30 bg-accent/10 text-text-primary hover:border-accent',
-      ].join(' ')}
+          ? "cursor-not-allowed border-border bg-bg-inset text-text-muted opacity-70"
+          : "border-accent/30 bg-accent/10 text-text-primary hover:border-accent",
+      ].join(" ")}
       disabled={disabled}
       onClick={onSelect}
       type="button"
@@ -3153,12 +3521,34 @@ function BackendChoiceCard({
       <div className="mt-3 text-sm text-text-secondary">{body}</div>
       <details className="mt-3 text-xs text-text-muted">
         <summary>What will be installed</summary>
-        <div className="mt-2">
-          WSL2, Ubuntu, Docker Engine, Compose, Buildx, systemd service wiring,
-          and docker-group access.
-        </div>
+        <div className="mt-2">{details ?? "No packages are installed."}</div>
       </details>
     </button>
+  );
+}
+
+function SetupNumberField({
+  label,
+  onChange,
+  value,
+}: {
+  label: string;
+  onChange: (value: number) => void;
+  value: number;
+}) {
+  return (
+    <label className="block">
+      <span className="text-xs font-medium uppercase text-text-muted">
+        {label}
+      </span>
+      <input
+        className="mt-1 h-9 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
+        min={1}
+        onChange={(event) => onChange(Number(event.target.value))}
+        type="number"
+        value={value}
+      />
+    </label>
   );
 }
 
@@ -3172,19 +3562,23 @@ function SetupCheckRow({
   };
 }) {
   const icon =
-    row.state === 'ok' ? (
+    row.state === "ok" ? (
       <CheckCircle2 size={16} />
-    ) : row.state === 'error' ? (
+    ) : row.state === "error" ? (
+      <AlertTriangle size={16} />
+    ) : row.state === "warn" ? (
       <AlertTriangle size={16} />
     ) : (
       <Clock3 size={16} />
     );
   const toneClass =
-    row.state === 'ok'
-      ? 'border-ok/25 bg-ok/10 text-ok'
-      : row.state === 'error'
-        ? 'border-error/25 bg-error/10 text-error'
-        : 'border-border bg-bg-inset text-text-muted';
+    row.state === "ok"
+      ? "border-ok/25 bg-ok/10 text-ok"
+      : row.state === "error"
+        ? "border-error/25 bg-error/10 text-error"
+        : row.state === "warn"
+          ? "border-warn/25 bg-warn/10 text-warn"
+          : "border-border bg-bg-inset text-text-muted";
   return (
     <div className={`rounded-card border px-3 py-2 text-sm ${toneClass}`}>
       <div className="flex items-center gap-2 font-medium">
@@ -3205,15 +3599,41 @@ function PathRecommendation() {
   );
 }
 
+function ColimaPathRecommendation() {
+  return (
+    <div className="rounded-card border border-info/30 bg-info/10 px-3 py-2 text-sm text-info">
+      Colima mounts your home directory by default; keep heavy Compose projects
+      under `$HOME` unless the profile mounts additional paths.
+    </div>
+  );
+}
+
 function SettingsPage({
   activeProvider,
   autostartBackend,
+  colimaCPU,
+  colimaDiskGB,
+  colimaMemoryGB,
+  colimaProfile,
+  dockerContexts,
+  dockerContextsError,
+  dockerContextsLoading,
   error,
   message,
   onAutostartChange,
+  onColimaCPUChange,
+  onColimaDiskGBChange,
+  onColimaMemoryGBChange,
+  onColimaProfileChange,
   onDetect,
   onOpenSetup,
+  onRefreshDockerContexts,
+  onSaveColimaCPU,
+  onSaveColimaDiskGB,
+  onSaveColimaMemoryGB,
+  onSaveColimaProfile,
   onSaveWSLDistro,
+  onUseDockerContext,
   onWSLDistroChange,
   providers,
   saving,
@@ -3222,12 +3642,29 @@ function SettingsPage({
 }: {
   activeProvider: ProviderSummary | null;
   autostartBackend: boolean;
+  colimaCPU: number;
+  colimaDiskGB: number;
+  colimaMemoryGB: number;
+  colimaProfile: string;
+  dockerContexts: DockerContextInfo[];
+  dockerContextsError: string | null;
+  dockerContextsLoading: boolean;
   error: string | null;
   message: string | null;
   onAutostartChange: (enabled: boolean) => void;
+  onColimaCPUChange: (value: number) => void;
+  onColimaDiskGBChange: (value: number) => void;
+  onColimaMemoryGBChange: (value: number) => void;
+  onColimaProfileChange: (profile: string) => void;
   onDetect: () => void;
   onOpenSetup: () => void;
+  onRefreshDockerContexts: () => void;
+  onSaveColimaCPU: () => void;
+  onSaveColimaDiskGB: () => void;
+  onSaveColimaMemoryGB: () => void;
+  onSaveColimaProfile: () => void;
   onSaveWSLDistro: () => void;
+  onUseDockerContext: (name: string) => void;
   onWSLDistroChange: (distro: string) => void;
   providers: ProviderSummary[];
   saving: boolean;
@@ -3235,25 +3672,25 @@ function SettingsPage({
   wslDistro: string;
 }) {
   const activeStatus = activeProvider?.status;
-  const providerKind = activeProvider?.kind || 'windows_wsl_ubuntu';
+  const providerKind = activeProvider?.kind || "windows_wsl_ubuntu";
   return (
     <div className="grid gap-4 xl:grid-cols-[220px_minmax(0,1fr)]">
       <div className="space-y-2">
         {[
-          'General',
-          'Providers',
-          'Docker contexts',
-          'Terminal',
-          'Security & Audit',
-          'About',
+          "General",
+          "Providers",
+          "Docker contexts",
+          "Terminal",
+          "Security & Audit",
+          "About",
         ].map((section) => (
           <button
             className={[
-              'block h-9 w-full rounded-control px-3 text-left text-sm',
-              section === 'Providers'
-                ? 'bg-accent/10 text-accent'
-                : 'text-text-secondary hover:bg-bg-card',
-            ].join(' ')}
+              "block h-9 w-full rounded-control px-3 text-left text-sm",
+              section === "Providers"
+                ? "bg-accent/10 text-accent"
+                : "text-text-secondary hover:bg-bg-card",
+            ].join(" ")}
             key={section}
             type="button"
           >
@@ -3277,8 +3714,8 @@ function SettingsPage({
         <Card>
           <CardHeader
             status={
-              <Badge tone={activeProvider?.healthy ? 'ok' : 'warn'}>
-                {activeProvider?.healthy ? 'Healthy' : 'Needs checks'}
+              <Badge tone={activeProvider?.healthy ? "ok" : "warn"}>
+                {activeProvider?.healthy ? "Healthy" : "Needs checks"}
               </Badge>
             }
             title="Providers"
@@ -3289,7 +3726,7 @@ function SettingsPage({
                 <Server className="text-accent" size={18} />
                 <div className="min-w-0 flex-1">
                   <div className="font-medium text-text-primary">
-                    {activeProvider?.name ?? 'Windows WSL Ubuntu'}
+                    {activeProvider?.name ?? "Windows WSL Ubuntu"}
                   </div>
                   <div className="truncate text-xs text-text-muted">
                     {providerKind}
@@ -3315,22 +3752,22 @@ function SettingsPage({
                 <StatusPill
                   label="Docker"
                   ok={Boolean(activeStatus?.dockerRunning)}
-                  value={activeStatus?.dockerVersion || '-'}
+                  value={activeStatus?.dockerVersion || "-"}
                 />
                 <StatusPill
                   label="Compose"
                   ok={Boolean(activeStatus?.composeInstalled)}
-                  value={activeStatus?.composeVersion || '-'}
+                  value={activeStatus?.composeVersion || "-"}
                 />
                 <StatusPill
                   label="Buildx"
                   ok={Boolean(activeStatus?.buildxInstalled)}
-                  value={activeStatus?.backendVersion || '-'}
+                  value={activeStatus?.backendVersion || "-"}
                 />
                 <StatusPill
                   label="Context"
                   ok={Boolean(activeStatus?.currentContext)}
-                  value={activeStatus?.currentContext || 'default'}
+                  value={activeStatus?.currentContext || "default"}
                 />
               </div>
             </div>
@@ -3355,7 +3792,7 @@ function SettingsPage({
                   onBlur={onSaveWSLDistro}
                   onChange={(event) => onWSLDistroChange(event.target.value)}
                   onKeyDown={(event) => {
-                    if (event.key === 'Enter') {
+                    if (event.key === "Enter") {
                       onSaveWSLDistro();
                     }
                   }}
@@ -3374,9 +3811,9 @@ function SettingsPage({
                     Start Docker backend on app launch
                   </span>
                   <span className="mt-1 block text-text-muted">
-                    Current setting:{' '}
+                    Current setting:{" "}
                     {String(
-                      settings['provider.autostart_backend'] ??
+                      settings["provider.autostart_backend"] ??
                         autostartBackend,
                     )}
                   </span>
@@ -3393,17 +3830,109 @@ function SettingsPage({
                 <div className="font-medium">Path mapping</div>
                 <div className="mt-2 grid gap-1 font-mono text-xs">
                   <span>
-                    {'C:\\Users\\Ada\\project -> /mnt/c/Users/Ada/project'}
+                    {"C:\\Users\\Ada\\project -> /mnt/c/Users/Ada/project"}
                   </span>
                   <span>
-                    {'\\\\wsl$\\' +
-                      (wslDistro || 'Ubuntu') +
-                      '\\home\\ada\\project -> /home/ada/project'}
+                    {"\\\\wsl$\\" +
+                      (wslDistro || "Ubuntu") +
+                      "\\home\\ada\\project -> /home/ada/project"}
                   </span>
                 </div>
               </div>
               <PathRecommendation />
             </section>
+
+            <section className="space-y-3 border-t border-border pt-4">
+              <div>
+                <h3 className="text-sm font-semibold text-text-primary">
+                  macOS Colima
+                </h3>
+                <p className="mt-1 text-sm text-text-muted">
+                  Resource changes require a Colima restart before they affect
+                  the VM.
+                </p>
+              </div>
+              <div className="grid gap-3 sm:grid-cols-4">
+                <label className="block">
+                  <span className="text-xs font-medium uppercase text-text-muted">
+                    Profile
+                  </span>
+                  <input
+                    className="mt-1 h-9 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
+                    onBlur={onSaveColimaProfile}
+                    onChange={(event) =>
+                      onColimaProfileChange(event.target.value)
+                    }
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        onSaveColimaProfile();
+                      }
+                    }}
+                    value={colimaProfile}
+                  />
+                </label>
+                <SettingsNumberField
+                  label="CPU"
+                  onBlur={onSaveColimaCPU}
+                  onChange={onColimaCPUChange}
+                  value={colimaCPU}
+                />
+                <SettingsNumberField
+                  label="RAM GB"
+                  onBlur={onSaveColimaMemoryGB}
+                  onChange={onColimaMemoryGBChange}
+                  value={colimaMemoryGB}
+                />
+                <SettingsNumberField
+                  label="Disk GB"
+                  onBlur={onSaveColimaDiskGB}
+                  onChange={onColimaDiskGBChange}
+                  value={colimaDiskGB}
+                />
+              </div>
+              <ColimaPathRecommendation />
+            </section>
+          </CardBody>
+        </Card>
+
+        <Card>
+          <CardHeader
+            status={
+              <Button
+                icon={<RefreshCw size={15} />}
+                loading={dockerContextsLoading}
+                onClick={onRefreshDockerContexts}
+                size="sm"
+                variant="secondary"
+              >
+                Refresh
+              </Button>
+            }
+            title="Docker Contexts"
+          />
+          <CardBody>
+            {dockerContextsError ? (
+              <div className="rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
+                {dockerContextsError}
+              </div>
+            ) : null}
+            {dockerContextsLoading && dockerContexts.length === 0 ? (
+              <TableSkeleton />
+            ) : null}
+            {!dockerContextsLoading && dockerContexts.length === 0 ? (
+              <EmptyState
+                body="Detected Docker contexts appear here when the Docker CLI is available."
+                icon={<Terminal size={28} />}
+                title="No Docker contexts"
+              />
+            ) : null}
+            {dockerContexts.length > 0 ? (
+              <DockerContextsTable
+                contexts={dockerContexts}
+                onUse={onUseDockerContext}
+                saving={saving}
+              />
+            ) : null}
           </CardBody>
         </Card>
 
@@ -3412,11 +3941,114 @@ function SettingsPage({
           <CardBody>
             <div className="text-sm text-text-muted">
               {providers.length} configured provider
-              {providers.length === 1 ? '' : 's'}.
+              {providers.length === 1 ? "" : "s"}.
             </div>
           </CardBody>
         </Card>
       </div>
+    </div>
+  );
+}
+
+function SettingsNumberField({
+  label,
+  onBlur,
+  onChange,
+  value,
+}: {
+  label: string;
+  onBlur: () => void;
+  onChange: (value: number) => void;
+  value: number;
+}) {
+  return (
+    <label className="block">
+      <span className="text-xs font-medium uppercase text-text-muted">
+        {label}
+      </span>
+      <input
+        className="mt-1 h-9 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
+        min={1}
+        onBlur={onBlur}
+        onChange={(event) => onChange(Number(event.target.value))}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") {
+            onBlur();
+          }
+        }}
+        type="number"
+        value={value}
+      />
+    </label>
+  );
+}
+
+function DockerContextsTable({
+  contexts,
+  onUse,
+  saving,
+}: {
+  contexts: DockerContextInfo[];
+  onUse: (name: string) => void;
+  saving: boolean;
+}) {
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full min-w-[620px] border-separate border-spacing-0 text-sm">
+        <thead>
+          <tr className="text-left text-xs uppercase text-text-muted">
+            <th className="border-b border-border px-3 py-2">Name</th>
+            <th className="border-b border-border px-3 py-2">Host</th>
+            <th className="border-b border-border px-3 py-2">Current</th>
+            <th className="border-b border-border px-3 py-2 text-right">
+              Action
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {contexts.map((context) => {
+            const insecure = isUnencryptedDockerHost(context.dockerHost);
+            return (
+              <tr key={context.name}>
+                <td className="border-b border-border/70 px-3 py-2 font-medium text-text-primary">
+                  {context.name}
+                  {context.description ? (
+                    <div className="mt-1 text-xs font-normal text-text-muted">
+                      {context.description}
+                    </div>
+                  ) : null}
+                </td>
+                <td className="border-b border-border/70 px-3 py-2">
+                  <div className="max-w-[280px] truncate font-mono text-xs text-text-secondary">
+                    {context.dockerHost || "-"}
+                  </div>
+                  {insecure ? (
+                    <Badge tone="error">unencrypted tcp://</Badge>
+                  ) : null}
+                </td>
+                <td className="border-b border-border/70 px-3 py-2">
+                  {context.current ? (
+                    <Badge tone="ok">current</Badge>
+                  ) : (
+                    <Badge tone="neutral">available</Badge>
+                  )}
+                </td>
+                <td className="border-b border-border/70 px-3 py-2 text-right">
+                  <Button
+                    disabled={saving}
+                    icon={<CheckCircle2 size={15} />}
+                    onClick={() => onUse(context.name)}
+                    size="sm"
+                    variant={context.current ? "secondary" : "primary"}
+                  >
+                    Use this context
+                  </Button>
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
     </div>
   );
 }
@@ -3494,10 +4126,10 @@ function OverviewPage({
   volumes,
 }: OverviewProps) {
   const [dashboard, setDashboard] = useState<DashboardMetrics | null>(null);
-  const [dashboardStatus, setDashboardStatus] = useState<LoadStatus>('loading');
+  const [dashboardStatus, setDashboardStatus] = useState<LoadStatus>("loading");
   const [dashboardError, setDashboardError] = useState<string | null>(null);
-  const [metric, setMetric] = useState<DashboardMetricID>('cpu');
-  const [range, setRange] = useState<DashboardRangeID>('5m');
+  const [metric, setMetric] = useState<DashboardMetricID>("cpu");
+  const [range, setRange] = useState<DashboardRangeID>("5m");
   const [stacked, setStacked] = useState(false);
   const [chartPaused, setChartPaused] = useState(false);
   const chartPausedRef = useRef(false);
@@ -3519,22 +4151,22 @@ function OverviewPage({
   const loadDashboard = useCallback(async () => {
     if (!dockerRunning) {
       setDashboardError(null);
-      setDashboardStatus('ready');
+      setDashboardStatus("ready");
       return;
     }
     setDashboardStatus((current) =>
-      current === 'ready' ? current : 'loading',
+      current === "ready" ? current : "loading",
     );
     setDashboardError(null);
     try {
       const nextDashboard = await MetricsService.GetDashboardMetrics();
       setDashboard(nextDashboard);
-      setDashboardStatus('ready');
+      setDashboardStatus("ready");
     } catch (error: unknown) {
       setDashboardError(
-        error instanceof Error ? error.message : 'Unable to load dashboard',
+        error instanceof Error ? error.message : "Unable to load dashboard",
       );
-      setDashboardStatus('error');
+      setDashboardStatus("error");
     }
   }, [dockerRunning]);
 
@@ -3547,7 +4179,7 @@ function OverviewPage({
 
   useEffect(() => {
     let timer: number | undefined;
-    const off = Events.On('objects:changed', () => {
+    const off = Events.On("objects:changed", () => {
       window.clearTimeout(timer);
       timer = window.setTimeout(() => {
         void loadDashboard();
@@ -3564,7 +4196,7 @@ function OverviewPage({
   }, [chartPaused]);
 
   useEffect(() => {
-    const off = Events.On('stats:sample', (event) => {
+    const off = Events.On("stats:sample", (event) => {
       const payload = eventPayload<StatsSamplePayload>(event);
       if (!payload || payload.streamID !== statsStreamIDRef.current) {
         return;
@@ -3609,7 +4241,7 @@ function OverviewPage({
     }
     let cancelled = false;
     let activeStreamID: string | null = null;
-    const scope: StatsScope = { kind: 'all', ids: [] };
+    const scope: StatsScope = { kind: "all", ids: [] };
     MetricsService.StartStatsStream(scope)
       .then((streamID) => {
         if (cancelled) {
@@ -3621,7 +4253,7 @@ function OverviewPage({
       })
       .catch((error: unknown) => {
         setDashboardError(
-          error instanceof Error ? error.message : 'Unable to start metrics',
+          error instanceof Error ? error.message : "Unable to start metrics",
         );
       });
     return () => {
@@ -3634,7 +4266,7 @@ function OverviewPage({
   }, [dockerRunning]);
 
   useEffect(() => {
-    const offLines = Events.On('logs:lines', (event) => {
+    const offLines = Events.On("logs:lines", (event) => {
       const payload = eventPayload<LogLinesPayload>(event);
       if (!payload || payload.streamID !== logStreamIDRef.current) {
         return;
@@ -3655,7 +4287,7 @@ function OverviewPage({
     let cancelled = false;
     let activeStreamID: string | null = null;
     LogsService.StartLogStream({
-      scope: 'all',
+      scope: "all",
       ids: [],
       follow: true,
       tail: 8,
@@ -3683,7 +4315,7 @@ function OverviewPage({
 
   const stopped = Math.max(0, containers.length - runningContainers);
   const paused = containers.filter(
-    (container) => container.state === 'paused',
+    (container) => container.state === "paused",
   ).length;
   const topRows = useMemo(
     () => dashboardTopRows(dashboard?.top ?? [], latestSamples),
@@ -3782,7 +4414,7 @@ function OverviewPage({
         </Button>
       </div>
 
-      {dashboardStatus === 'error' && dashboardError ? (
+      {dashboardStatus === "error" && dashboardError ? (
         <div className="rounded-card border border-warn/30 bg-warn/10 px-4 py-3 text-sm text-warn">
           {dashboardError}
         </div>
@@ -3845,7 +4477,7 @@ function OverviewPage({
         <ProjectsMiniList
           loading={projectsLoading}
           onOpenProject={onOpenProject}
-          onViewAll={() => onNavigate('projects')}
+          onViewAll={() => onNavigate("projects")}
           projectSparks={projectSparks}
           projects={liveProjects}
         />
@@ -3865,10 +4497,10 @@ function OverviewPage({
         <div className="space-y-4">
           <LogsPeekPanel
             lines={logPeek}
-            onOpenLogs={() => onNavigate('logs')}
+            onOpenLogs={() => onNavigate("logs")}
           />
           <UpdatesCard
-            onOpenProjects={() => onNavigate('projects')}
+            onOpenProjects={() => onNavigate("projects")}
             projects={projects}
             summary={updateSummary}
           />
@@ -3899,25 +4531,25 @@ function EngineHeroCard({
   dockerRunning: boolean;
   provider: ProviderSummary | null;
 }) {
-  const context = provider?.status?.currentContext || 'default';
-  const version = provider?.status?.dockerVersion || 'unknown';
+  const context = provider?.status?.currentContext || "default";
+  const version = provider?.status?.dockerVersion || "unknown";
   return (
     <Card
-      className={!dockerRunning ? 'border-neutral/30 bg-bg-inset' : undefined}
+      className={!dockerRunning ? "border-neutral/30 bg-bg-inset" : undefined}
     >
       <CardBody className="flex items-center justify-between gap-5">
         <div className="min-w-0">
           <div className="flex items-center gap-3">
             <StatusDot
               pulse={!dockerRunning && provider?.healthy}
-              tone={dockerRunning ? 'ok' : 'neutral'}
+              tone={dockerRunning ? "ok" : "neutral"}
             />
             <div className="min-w-0">
               <div className="text-lg font-semibold">
-                Docker Engine - {dockerRunning ? 'Running' : 'Stopped'}
+                Docker Engine - {dockerRunning ? "Running" : "Stopped"}
               </div>
               <div className="truncate text-sm text-text-muted">
-                {provider?.name ?? 'No provider selected'}
+                {provider?.name ?? "No provider selected"}
               </div>
             </div>
           </div>
@@ -3971,34 +4603,34 @@ function DashboardCountsStrip({
       <MetricButton
         hint="Compose stacks"
         label="Projects"
-        onClick={() => onNavigate('projects')}
+        onClick={() => onNavigate("projects")}
         value={counts.projects}
       />
       <MetricButton
         hint={`${runningContainers} running / ${stopped} stopped`}
         label="Containers"
-        onClick={() => onShowContainers('all')}
+        onClick={() => onShowContainers("all")}
         value={counts.containers}
       />
       <MetricButton
         hint={`${imageCounts.dangling} dangling`}
         label="Images"
-        onClick={() => onNavigate('images')}
+        onClick={() => onNavigate("images")}
         value={counts.images}
       />
       <MetricButton
         hint={`${volumeCounts.inUse} in use`}
         label="Volumes"
-        onClick={() => onNavigate('volumes')}
+        onClick={() => onNavigate("volumes")}
         value={counts.volumes}
       />
       <button
         className={[
-          'rounded-card border border-border bg-bg-card p-4 text-left transition',
+          "rounded-card border border-border bg-bg-card p-4 text-left transition",
           mutationsDisabled
-            ? 'cursor-not-allowed opacity-60'
-            : 'hover:border-border-strong hover:bg-bg-panel',
-        ].join(' ')}
+            ? "cursor-not-allowed opacity-60"
+            : "hover:border-border-strong hover:bg-bg-panel",
+        ].join(" ")}
         disabled={mutationsDisabled}
         title={mutationsDisabled ? mutationDisabledReason : undefined}
         onClick={onCleanUp}
@@ -4039,26 +4671,26 @@ function ResourceUsagePanel({
 }) {
   const latest = points[points.length - 1];
   const title =
-    metric === 'cpu'
+    metric === "cpu"
       ? `${(latest?.cpu ?? 0).toFixed(1)}% CPU`
-      : metric === 'memory'
+      : metric === "memory"
         ? `${formatBytes(latest?.memory ?? 0)} memory`
         : `${formatRate(latest?.netRx ?? 0)} RX / ${formatRate(latest?.netTx ?? 0)} TX`;
   const Icon =
-    metric === 'cpu' ? Cpu : metric === 'memory' ? MemoryStick : Wifi;
+    metric === "cpu" ? Cpu : metric === "memory" ? MemoryStick : Wifi;
   return (
     <Card>
       <CardHeader
         actions={
           <div className="flex flex-wrap items-center justify-end gap-2">
-            {(['5m', '1h', '24h'] as DashboardRangeID[]).map((item) => (
+            {(["5m", "1h", "24h"] as DashboardRangeID[]).map((item) => (
               <button
                 className={[
-                  'h-8 rounded-control border px-2 text-xs transition',
+                  "h-8 rounded-control border px-2 text-xs transition",
                   range === item
-                    ? 'border-accent/40 bg-accent/10 text-accent'
-                    : 'border-border bg-bg-inset text-text-secondary hover:text-text-primary',
-                ].join(' ')}
+                    ? "border-accent/40 bg-accent/10 text-accent"
+                    : "border-border bg-bg-inset text-text-secondary hover:text-text-primary",
+                ].join(" ")}
                 key={item}
                 onClick={() => onRangeChange(item)}
                 type="button"
@@ -4069,11 +4701,11 @@ function ResourceUsagePanel({
             <button
               aria-pressed={stacked}
               className={[
-                'h-8 rounded-control border px-2 text-xs transition',
+                "h-8 rounded-control border px-2 text-xs transition",
                 stacked
-                  ? 'border-accent/40 bg-accent/10 text-accent'
-                  : 'border-border bg-bg-inset text-text-secondary hover:text-text-primary',
-              ].join(' ')}
+                  ? "border-accent/40 bg-accent/10 text-accent"
+                  : "border-border bg-bg-inset text-text-secondary hover:text-text-primary",
+              ].join(" ")}
               onClick={() => onStackedChange(!stacked)}
               type="button"
             >
@@ -4092,20 +4724,20 @@ function ResourceUsagePanel({
             <div className="min-w-0">
               <div className="text-lg font-semibold">{title}</div>
               <div className="text-xs text-text-muted">
-                {paused ? 'Paused' : `${points.length}/300 points`}
+                {paused ? "Paused" : `${points.length}/300 points`}
               </div>
             </div>
           </div>
           <div className="flex rounded-control border border-border bg-bg-inset p-0.5">
-            {(['cpu', 'memory', 'network'] as DashboardMetricID[]).map(
+            {(["cpu", "memory", "network"] as DashboardMetricID[]).map(
               (item) => (
                 <button
                   className={[
-                    'h-8 rounded-control px-3 text-xs font-medium capitalize transition',
+                    "h-8 rounded-control px-3 text-xs font-medium capitalize transition",
                     metric === item
-                      ? 'bg-bg-card text-text-primary'
-                      : 'text-text-secondary hover:text-text-primary',
-                  ].join(' ')}
+                      ? "bg-bg-card text-text-primary"
+                      : "text-text-secondary hover:text-text-primary",
+                  ].join(" ")}
                   key={item}
                   onClick={() => onMetricChange(item)}
                   type="button"
@@ -4137,9 +4769,9 @@ function ResourceUsagePanel({
                 stroke="#8B949E"
                 tick={{ fontSize: 11 }}
                 tickFormatter={(value) =>
-                  metric === 'memory'
+                  metric === "memory"
                     ? formatBytes(Number(value))
-                    : metric === 'network'
+                    : metric === "network"
                       ? formatRate(Number(value))
                       : `${Number(value).toFixed(0)}%`
                 }
@@ -4148,7 +4780,7 @@ function ResourceUsagePanel({
               <RechartsTooltip
                 content={<DashboardChartTooltip metric={metric} />}
               />
-              {metric === 'cpu' ? (
+              {metric === "cpu" ? (
                 <Area
                   dataKey="cpu"
                   fill="#2DD4A7"
@@ -4160,7 +4792,7 @@ function ResourceUsagePanel({
                   type="monotone"
                 />
               ) : null}
-              {metric === 'memory' ? (
+              {metric === "memory" ? (
                 <Area
                   dataKey="memory"
                   fill="#A78BFA"
@@ -4172,7 +4804,7 @@ function ResourceUsagePanel({
                   type="monotone"
                 />
               ) : null}
-              {metric === 'network' ? (
+              {metric === "network" ? (
                 <>
                   <Area
                     dataKey="netRx"
@@ -4180,7 +4812,7 @@ function ResourceUsagePanel({
                     fillOpacity={0.18}
                     isAnimationActive={false}
                     name="RX"
-                    stackId={stacked ? 'network' : undefined}
+                    stackId={stacked ? "network" : undefined}
                     stroke="#4D9FFF"
                     strokeWidth={2}
                     type="monotone"
@@ -4191,7 +4823,7 @@ function ResourceUsagePanel({
                     fillOpacity={0.14}
                     isAnimationActive={false}
                     name="TX"
-                    stackId={stacked ? 'network' : undefined}
+                    stackId={stacked ? "network" : undefined}
                     stroke="#80B7FF"
                     strokeWidth={2}
                     type="monotone"
@@ -4225,7 +4857,7 @@ function DashboardChartTooltip({
       <div className="mb-1 font-medium text-text-primary">{label}</div>
       {payload.map((entry) => (
         <div className="text-text-secondary" key={entry.dataKey ?? entry.name}>
-          {entry.name}:{' '}
+          {entry.name}:{" "}
           {formatMetricValue(metric, Number(entry.value ?? 0), entry.dataKey)}
         </div>
       ))}
@@ -4323,21 +4955,21 @@ function ContainerHealthPanel({
   onShowContainers: (filter: FilterID) => void;
 }) {
   const data = [
-    { name: 'Running', value: running, color: '#2DD4A7', filter: 'running' },
-    { name: 'Stopped', value: stopped, color: '#8B949E', filter: 'stopped' },
+    { name: "Running", value: running, color: "#2DD4A7", filter: "running" },
+    { name: "Stopped", value: stopped, color: "#8B949E", filter: "stopped" },
     {
-      name: 'Unhealthy',
+      name: "Unhealthy",
       value: unhealthy,
-      color: '#F0605D',
-      filter: 'unhealthy',
+      color: "#F0605D",
+      filter: "unhealthy",
     },
-    { name: 'Paused', value: paused, color: '#F5B83D', filter: 'paused' },
+    { name: "Paused", value: paused, color: "#F5B83D", filter: "paused" },
   ].filter((item) => item.value > 0);
   return (
     <Card>
       <CardHeader
         actions={
-          <Badge tone={unhealthy > 0 ? 'error' : 'ok'}>
+          <Badge tone={unhealthy > 0 ? "error" : "ok"}>
             {unhealthy} unhealthy
           </Badge>
         }
@@ -4354,10 +4986,10 @@ function ContainerHealthPanel({
                       ? data
                       : [
                           {
-                            name: 'None',
+                            name: "None",
                             value: 1,
-                            color: '#8B949E',
-                            filter: 'all',
+                            color: "#8B949E",
+                            filter: "all",
                           },
                         ]
                   }
@@ -4371,10 +5003,10 @@ function ContainerHealthPanel({
                     ? data
                     : [
                         {
-                          name: 'None',
+                          name: "None",
                           value: 1,
-                          color: '#8B949E',
-                          filter: 'all',
+                          color: "#8B949E",
+                          filter: "all",
                         },
                       ]
                   ).map((item) => (
@@ -4386,15 +5018,15 @@ function ContainerHealthPanel({
           </div>
           <div className="min-w-0 space-y-2">
             {[
-              ['running', 'Running', running, 'ok'],
-              ['stopped', 'Stopped', stopped, 'neutral'],
+              ["running", "Running", running, "ok"],
+              ["stopped", "Stopped", stopped, "neutral"],
               [
-                'unhealthy',
-                'Unhealthy',
+                "unhealthy",
+                "Unhealthy",
                 unhealthy,
-                unhealthy > 0 ? 'error' : 'neutral',
+                unhealthy > 0 ? "error" : "neutral",
               ],
-              ['paused', 'Paused', paused, 'warn'],
+              ["paused", "Paused", paused, "warn"],
             ].map(([filter, label, value, tone]) => (
               <button
                 className="flex w-full items-center justify-between rounded-control border border-border bg-bg-inset px-3 py-2 text-sm transition hover:border-border-strong"
@@ -4433,11 +5065,11 @@ function ContainerHealthPanel({
                   >
                     <td className="truncate px-3 py-2">{container.name}</td>
                     <td className="truncate px-3 py-2 text-text-muted">
-                      {container.projectID || '-'}
+                      {container.projectID || "-"}
                     </td>
                     <td className="px-3 py-2">
                       <Badge tone={containerTone(container)}>
-                        {container.state || 'unknown'}
+                        {container.state || "unknown"}
                       </Badge>
                     </td>
                     <td className="px-3 py-2">
@@ -4646,12 +5278,12 @@ function RecentEventsPanel({ events }: { events: AuditEntry[] }) {
             >
               <div className="flex items-center justify-between gap-2">
                 <span className="min-w-0 truncate">{event.action}</span>
-                <Badge tone={event.result === 'success' ? 'ok' : 'neutral'}>
-                  {event.result || 'event'}
+                <Badge tone={event.result === "success" ? "ok" : "neutral"}>
+                  {event.result || "event"}
                 </Badge>
               </div>
               <div className="mt-1 truncate text-xs text-text-muted">
-                {event.target || event.actor || 'docker'} -{' '}
+                {event.target || event.actor || "docker"} -{" "}
                 {relativeTime(dateMillis(event.ts))}
               </div>
             </div>
@@ -4679,7 +5311,7 @@ function CleanupModal({
   onClose: () => void;
 }) {
   const requiresTypedName = state.includeVolumes;
-  const typedReady = !requiresTypedName || state.typedName === 'DELETE VOLUMES';
+  const typedReady = !requiresTypedName || state.typedName === "DELETE VOLUMES";
   return (
     <Modal
       onClose={onClose}
@@ -4693,10 +5325,10 @@ function CleanupModal({
         </div>
         <div className="grid gap-2">
           {[
-            ['includeImages', 'Unused images'],
-            ['includeContainers', 'Stopped containers'],
-            ['includeBuildCache', 'Build cache'],
-            ['includeVolumes', 'Unused volumes'],
+            ["includeImages", "Unused images"],
+            ["includeContainers", "Stopped containers"],
+            ["includeBuildCache", "Build cache"],
+            ["includeVolumes", "Unused volumes"],
           ].map(([key, label]) => (
             <label
               className="flex items-center gap-3 rounded-control border border-border bg-bg-inset px-3 py-2 text-sm"
@@ -4707,7 +5339,7 @@ function CleanupModal({
                 onChange={(event) =>
                   onChange({
                     [key]: event.target.checked,
-                    typedName: key === 'includeVolumes' ? '' : state.typedName,
+                    typedName: key === "includeVolumes" ? "" : state.typedName,
                   } as Partial<CleanupState>)
                 }
                 type="checkbox"
@@ -4752,7 +5384,7 @@ function CleanupModal({
 }
 
 function Sparkline({ color, points }: { points: SparkPoint[]; color: string }) {
-  const data = points.length > 0 ? points : [{ label: '0', value: 0 }];
+  const data = points.length > 0 ? points : [{ label: "0", value: 0 }];
   return (
     <div className="h-10 w-full min-w-0">
       <ResponsiveContainer height="100%" width="100%">
@@ -4779,11 +5411,11 @@ const logLevelOptions: Array<{
   label: string;
   tone: BadgeTone;
 }> = [
-  { id: 'error', label: 'ERROR', tone: 'error' },
-  { id: 'warn', label: 'WARN', tone: 'warn' },
-  { id: 'info', label: 'INFO', tone: 'info' },
-  { id: 'debug', label: 'DEBUG', tone: 'neutral' },
-  { id: 'unknown', label: 'unknown', tone: 'neutral' },
+  { id: "error", label: "ERROR", tone: "error" },
+  { id: "warn", label: "WARN", tone: "warn" },
+  { id: "info", label: "INFO", tone: "info" },
+  { id: "debug", label: "DEBUG", tone: "neutral" },
+  { id: "unknown", label: "unknown", tone: "neutral" },
 ];
 
 const logBufferLimit = 50000;
@@ -4810,16 +5442,16 @@ function LogsPage({
   projects,
   projectsLoading,
 }: LogsPageProps) {
-  const [scope, setScope] = useState<LogScope>('all');
-  const [selectedProjectID, setSelectedProjectID] = useState('');
-  const [selectedServiceID, setSelectedServiceID] = useState('');
+  const [scope, setScope] = useState<LogScope>("all");
+  const [selectedProjectID, setSelectedProjectID] = useState("");
+  const [selectedServiceID, setSelectedServiceID] = useState("");
   const [selectedContainerIDs, setSelectedContainerIDs] = useState<string[]>(
     [],
   );
   const [lines, setLines] = useState<LogLine[]>([]);
   const [streamID, setStreamID] = useState<string | null>(null);
   const streamIDRef = useRef<string | null>(null);
-  const [streamStatus, setStreamStatus] = useState<LoadStatus>('idle');
+  const [streamStatus, setStreamStatus] = useState<LoadStatus>("idle");
   const [streamError, setStreamError] = useState<string | null>(null);
   const [streamEnded, setStreamEnded] = useState(false);
   const [restartNonce, setRestartNonce] = useState(0);
@@ -4833,8 +5465,8 @@ function LogsPage({
   const [levelFilters, setLevelFilters] = useState<Set<LogLevelFilter>>(
     () => new Set(logLevelOptions.map((level) => level.id)),
   );
-  const [query, setQuery] = useState('');
-  const [debouncedQuery, setDebouncedQuery] = useState('');
+  const [query, setQuery] = useState("");
+  const [debouncedQuery, setDebouncedQuery] = useState("");
   const [hideNonMatching, setHideNonMatching] = useState(false);
   const [activeMatch, setActiveMatch] = useState(0);
   const [scrollTop, setScrollTop] = useState(0);
@@ -4885,14 +5517,14 @@ function LogsPage({
   );
 
   useEffect(() => {
-    if (scope === 'project' && !selectedProjectID && projectOptions[0]) {
+    if (scope === "project" && !selectedProjectID && projectOptions[0]) {
       setSelectedProjectID(projectOptions[0].id);
     }
-    if (scope === 'service' && !selectedServiceID && serviceOptions[0]) {
+    if (scope === "service" && !selectedServiceID && serviceOptions[0]) {
       setSelectedServiceID(serviceOptions[0].id);
     }
     if (
-      scope === 'container' &&
+      scope === "container" &&
       selectedContainerIDs.length === 0 &&
       containerOptions[0]
     ) {
@@ -4930,18 +5562,18 @@ function LogsPage({
     }
     const update = () => setViewportHeight(node.clientHeight || 520);
     update();
-    window.addEventListener('resize', update);
+    window.addEventListener("resize", update);
     const observer =
-      typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(update);
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(update);
     observer?.observe(node);
     return () => {
-      window.removeEventListener('resize', update);
+      window.removeEventListener("resize", update);
       observer?.disconnect();
     };
   }, []);
 
   useEffect(() => {
-    const offLines = Events.On('logs:lines', (event) => {
+    const offLines = Events.On("logs:lines", (event) => {
       const payload = eventPayload<LogLinesPayload>(event);
       if (!payload || payload.streamID !== streamIDRef.current) {
         return;
@@ -4957,21 +5589,21 @@ function LogsPage({
           : merged;
       });
     });
-    const offEOF = Events.On('logs:eof', (event) => {
+    const offEOF = Events.On("logs:eof", (event) => {
       const payload = eventPayload<LogErrorPayload>(event);
       if (!payload || payload.streamID !== streamIDRef.current) {
         return;
       }
       setStreamEnded(true);
-      setStreamStatus('ready');
+      setStreamStatus("ready");
     });
-    const offError = Events.On('logs:error', (event) => {
+    const offError = Events.On("logs:error", (event) => {
       const payload = eventPayload<LogErrorPayload>(event);
       if (!payload || payload.streamID !== streamIDRef.current) {
         return;
       }
-      setStreamError(payload.error ?? 'Log stream failed');
-      setStreamStatus('error');
+      setStreamError(payload.error ?? "Log stream failed");
+      setStreamStatus("error");
     });
     return () => {
       offLines();
@@ -4981,24 +5613,24 @@ function LogsPage({
   }, []);
 
   const streamIDs = useMemo(() => {
-    if (scope === 'project') {
+    if (scope === "project") {
       return selectedProjectID ? [selectedProjectID] : [];
     }
-    if (scope === 'service') {
+    if (scope === "service") {
       return selectedServiceID ? [selectedServiceID] : [];
     }
-    if (scope === 'container') {
+    if (scope === "container") {
       return selectedContainerIDs;
     }
     return [];
   }, [scope, selectedContainerIDs, selectedProjectID, selectedServiceID]);
-  const canStream = dockerRunning && (scope === 'all' || streamIDs.length > 0);
+  const canStream = dockerRunning && (scope === "all" || streamIDs.length > 0);
 
   useEffect(() => {
     if (!canStream) {
       setLines([]);
       setStreamID(null);
-      setStreamStatus('idle');
+      setStreamStatus("idle");
       setStreamError(null);
       setStreamEnded(false);
       return undefined;
@@ -5008,7 +5640,7 @@ function LogsPage({
     let activeStreamID: string | null = null;
     setLines([]);
     setStreamID(null);
-    setStreamStatus('loading');
+    setStreamStatus("loading");
     setStreamError(null);
     setStreamEnded(false);
     setPaused(false);
@@ -5030,14 +5662,14 @@ function LogsPage({
         }
         activeStreamID = nextStreamID;
         setStreamID(nextStreamID);
-        setStreamStatus('ready');
+        setStreamStatus("ready");
       })
       .catch((error: unknown) => {
         if (!cancelled) {
           setStreamError(
-            error instanceof Error ? error.message : 'Unable to start logs',
+            error instanceof Error ? error.message : "Unable to start logs",
           );
-          setStreamStatus('error');
+          setStreamStatus("error");
         }
       });
 
@@ -5169,14 +5801,14 @@ function LogsPage({
   const browseExportPath = useCallback(async () => {
     const format = exportLogs.format;
     const selected = await Dialogs.SaveFile({
-      Title: 'Export Logs',
-      Message: 'Choose a log export file',
-      ButtonText: 'Export',
+      Title: "Export Logs",
+      Message: "Choose a log export file",
+      ButtonText: "Export",
       Filename: `cairn-${scope}-logs.${format}`,
       Filters: [
         {
-          DisplayName: format === 'jsonl' ? 'JSON Lines' : 'Log file',
-          Pattern: format === 'jsonl' ? '*.jsonl' : '*.log',
+          DisplayName: format === "jsonl" ? "JSON Lines" : "Log file",
+          Pattern: format === "jsonl" ? "*.jsonl" : "*.log",
         },
       ],
     });
@@ -5199,22 +5831,22 @@ function LogsPage({
       setExportLogs((current) => ({
         ...current,
         busy: false,
-        error: error instanceof Error ? error.message : 'Unable to export logs',
+        error: error instanceof Error ? error.message : "Unable to export logs",
       }));
     }
   }, [exportLogs.path, scope, streamIDs]);
 
   const streamLabel =
-    scope === 'all'
-      ? 'All scopes'
+    scope === "all"
+      ? "All scopes"
       : streamIDs.length > 0
         ? `${streamIDs.length} selected`
-        : 'No scope selected';
+        : "No scope selected";
   const emptyTitle = !canStream
-    ? 'Pick a project, service, or container'
-    : streamStatus === 'loading'
-      ? 'Opening log stream'
-      : 'No visible logs';
+    ? "Pick a project, service, or container"
+    : streamStatus === "loading"
+      ? "Opening log stream"
+      : "No visible logs";
 
   return (
     <div className="relative min-h-full space-y-4">
@@ -5226,15 +5858,15 @@ function LogsPage({
               className="flex rounded-control border border-border bg-bg-inset p-1"
               role="group"
             >
-              {(['all', 'project', 'service', 'container'] as LogScope[]).map(
+              {(["all", "project", "service", "container"] as LogScope[]).map(
                 (nextScope) => (
                   <button
                     className={[
-                      'h-8 rounded-control px-3 text-xs font-medium capitalize transition',
+                      "h-8 rounded-control px-3 text-xs font-medium capitalize transition",
                       scope === nextScope
-                        ? 'bg-accent text-bg-app'
-                        : 'text-text-secondary hover:bg-bg-card hover:text-text-primary',
-                    ].join(' ')}
+                        ? "bg-accent text-bg-app"
+                        : "text-text-secondary hover:bg-bg-card hover:text-text-primary",
+                    ].join(" ")}
                     key={nextScope}
                     onClick={() => setScope(nextScope)}
                     type="button"
@@ -5245,7 +5877,7 @@ function LogsPage({
               )}
             </div>
 
-            {scope === 'project' ? (
+            {scope === "project" ? (
               <LogSelect
                 ariaLabel="Project scope"
                 disabled={projectsLoading}
@@ -5254,7 +5886,7 @@ function LogsPage({
                 value={selectedProjectID}
               />
             ) : null}
-            {scope === 'service' ? (
+            {scope === "service" ? (
               <LogSelect
                 ariaLabel="Service scope"
                 disabled={inventoryLoading}
@@ -5263,7 +5895,7 @@ function LogsPage({
                 value={selectedServiceID}
               />
             ) : null}
-            {scope === 'container' ? (
+            {scope === "container" ? (
               <select
                 aria-label="Container scope"
                 className="h-20 min-w-60 rounded-control border border-border bg-bg-inset px-3 py-2 text-sm text-text-primary"
@@ -5285,7 +5917,7 @@ function LogsPage({
               </select>
             ) : null}
 
-            <Badge tone={streamStatus === 'error' ? 'error' : 'info'}>
+            <Badge tone={streamStatus === "error" ? "error" : "info"}>
               {streamLabel}
             </Badge>
             {streamEnded ? <Badge tone="neutral">eof</Badge> : null}
@@ -5336,7 +5968,7 @@ function LogsPage({
               </Badge>
             </div>
 
-            <Tooltip label={paused ? 'Resume stream display' : 'Pause display'}>
+            <Tooltip label={paused ? "Resume stream display" : "Pause display"}>
               <Button
                 icon={paused ? <Play size={16} /> : <Pause size={16} />}
                 onClick={() => {
@@ -5349,16 +5981,16 @@ function LogsPage({
                     setPausedAt(lines.length);
                   }
                 }}
-                variant={paused ? 'primary' : 'secondary'}
+                variant={paused ? "primary" : "secondary"}
               >
-                {paused ? 'Resume' : 'Pause'}
+                {paused ? "Resume" : "Pause"}
               </Button>
             </Tooltip>
             <Tooltip label="Pin to newest logs">
               <Button
                 icon={<ArrowDown size={16} />}
                 onClick={scrollToBottom}
-                variant={follow ? 'primary' : 'secondary'}
+                variant={follow ? "primary" : "secondary"}
               >
                 Follow
               </Button>
@@ -5369,7 +6001,7 @@ function LogsPage({
                 icon={<Clock3 size={16} />}
                 onClick={() => setShowTimestamps((current) => !current)}
                 size="icon"
-                variant={showTimestamps ? 'primary' : 'secondary'}
+                variant={showTimestamps ? "primary" : "secondary"}
               />
             </Tooltip>
             <Tooltip label="Toggle line wrap">
@@ -5378,7 +6010,7 @@ function LogsPage({
                 icon={<WrapText size={16} />}
                 onClick={() => setWrapLines((current) => !current)}
                 size="icon"
-                variant={wrapLines ? 'primary' : 'secondary'}
+                variant={wrapLines ? "primary" : "secondary"}
               />
             </Tooltip>
             <Tooltip label="Export logs">
@@ -5402,11 +6034,11 @@ function LogsPage({
             {logLevelOptions.map((level) => (
               <button
                 className={[
-                  'h-7 rounded-control border px-2 text-xs font-medium transition',
+                  "h-7 rounded-control border px-2 text-xs font-medium transition",
                   levelFilters.has(level.id)
-                    ? 'border-accent bg-accent/10 text-text-primary'
-                    : 'border-border bg-bg-inset text-text-muted hover:text-text-primary',
-                ].join(' ')}
+                    ? "border-accent bg-accent/10 text-text-primary"
+                    : "border-border bg-bg-inset text-text-muted hover:text-text-primary",
+                ].join(" ")}
                 key={level.id}
                 onClick={() => toggleLevel(level.id)}
                 type="button"
@@ -5466,8 +6098,8 @@ function LogsPage({
             <EmptyState
               body={
                 canStream
-                  ? 'The selected stream has not produced visible lines.'
-                  : 'Select a scope before opening a stream.'
+                  ? "The selected stream has not produced visible lines."
+                  : "Select a scope before opening a stream."
               }
               icon={<ScrollText size={28} />}
               title={emptyTitle}
@@ -5496,13 +6128,13 @@ function LogsPage({
             ref={viewerRef}
             role="log"
           >
-            <div style={{ height: totalHeight, position: 'relative' }}>
+            <div style={{ height: totalHeight, position: "relative" }}>
               {virtualRows.map((line, offset) => {
                 const rowIndex = virtualStart + offset;
                 return (
                   <LogRow
                     activeSearch={matchRows[activeMatch] === rowIndex}
-                    key={`${rowIndex}:${line.ts}:${line.containerID ?? line.containerName ?? ''}:${line.text}`}
+                    key={`${rowIndex}:${line.ts}:${line.containerID ?? line.containerName ?? ""}:${line.text}`}
                     line={line}
                     onSourceClick={setSourceFilter}
                     query={debouncedQuery}
@@ -5626,7 +6258,7 @@ function LogRow({
 }) {
   const source = logSource(line);
   const isSkipMarker =
-    line.stream === 'system' && line.text.includes('skipped');
+    line.stream === "system" && line.text.includes("skipped");
   if (isSkipMarker) {
     return (
       <div
@@ -5641,13 +6273,13 @@ function LogRow({
   return (
     <div
       className={[
-        'absolute left-0 right-0 grid items-start gap-2 border-b border-border/60 px-3 py-1',
+        "absolute left-0 right-0 grid items-start gap-2 border-b border-border/60 px-3 py-1",
         showTimestamp
-          ? 'grid-cols-[96px_128px_64px_1fr]'
-          : 'grid-cols-[128px_64px_1fr]',
-        line.stream === 'stderr' ? 'border-l-2 border-l-error/70' : '',
-        activeSearch ? 'bg-accent/10' : 'hover:bg-bg-inset',
-      ].join(' ')}
+          ? "grid-cols-[96px_128px_64px_1fr]"
+          : "grid-cols-[128px_64px_1fr]",
+        line.stream === "stderr" ? "border-l-2 border-l-error/70" : "",
+        activeSearch ? "bg-accent/10" : "hover:bg-bg-inset",
+      ].join(" ")}
       style={{ height: rowHeight, top: style.top }}
     >
       {showTimestamp ? (
@@ -5665,18 +6297,18 @@ function LogRow({
       >
         {source}
       </button>
-      <Tooltip label={line.level ? 'detected' : 'undetected'}>
+      <Tooltip label={line.level ? "detected" : "undetected"}>
         <span>
           <Badge tone={levelTone(normalizeLogLevel(line.level))}>
-            {line.level || 'LOG'}
+            {line.level || "LOG"}
           </Badge>
         </span>
       </Tooltip>
       <span
         className={[
-          'min-w-0 text-text-primary',
-          wrap ? 'whitespace-pre-wrap break-words' : 'truncate whitespace-pre',
-        ].join(' ')}
+          "min-w-0 text-text-primary",
+          wrap ? "whitespace-pre-wrap break-words" : "truncate whitespace-pre",
+        ].join(" ")}
       >
         {renderAnsiText(line.text, query)}
       </span>
@@ -5725,7 +6357,7 @@ function LogsExportModal({
             className="h-9 rounded-control border border-border bg-bg-inset px-3 text-text-primary"
             id="logs-export-format"
             onChange={(event) => {
-              const format = event.currentTarget.value as 'log' | 'jsonl';
+              const format = event.currentTarget.value as "log" | "jsonl";
               onChange({
                 format,
                 path: state.path.replace(/\.(log|jsonl)$/i, `.${format}`),
@@ -5745,7 +6377,7 @@ function LogsExportModal({
             id="logs-export-range"
             onChange={(event) =>
               onChange({
-                range: event.currentTarget.value as 'buffer' | 'tail',
+                range: event.currentTarget.value as "buffer" | "tail",
               })
             }
             value={state.range}
@@ -5837,7 +6469,7 @@ function ProjectsPage({
     let cancelled = false;
     let activeStreamID: string | null = null;
     const streamIDRef = { current: null as string | null };
-    const off = Events.On('stats:sample', (event) => {
+    const off = Events.On("stats:sample", (event) => {
       const payload = eventPayload<StatsSamplePayload>(event);
       if (!payload || payload.streamID !== streamIDRef.current) {
         return;
@@ -5853,7 +6485,7 @@ function ProjectsPage({
         ),
       );
     });
-    MetricsService.StartStatsStream({ kind: 'all', ids: [] })
+    MetricsService.StartStatsStream({ kind: "all", ids: [] })
       .then((streamID) => {
         if (cancelled) {
           void MetricsService.StopStream(streamID);
@@ -5883,42 +6515,42 @@ function ProjectsPage({
         <FilterChips
           active={filter}
           items={[
-            ['all', 'All', projects.length],
+            ["all", "All", projects.length],
             [
-              'running',
-              'Running',
-              projects.filter((project) => project.status === 'running').length,
+              "running",
+              "Running",
+              projects.filter((project) => project.status === "running").length,
             ],
             [
-              'stopped',
-              'Stopped',
-              projects.filter((project) => project.status === 'stopped').length,
+              "stopped",
+              "Stopped",
+              projects.filter((project) => project.status === "stopped").length,
             ],
             [
-              'partial',
-              'Partial',
-              projects.filter((project) => project.status === 'partial').length,
+              "partial",
+              "Partial",
+              projects.filter((project) => project.status === "partial").length,
             ],
             [
-              'unhealthy',
-              'Unhealthy',
-              projects.filter((project) => project.health === 'unhealthy')
+              "unhealthy",
+              "Unhealthy",
+              projects.filter((project) => project.health === "unhealthy")
                 .length,
             ],
             [
-              'updates',
-              'Updates available',
+              "updates",
+              "Updates available",
               projects.filter((project) => projectUpdateCount(project) > 0)
                 .length,
             ],
             [
-              'high-cpu',
-              'High CPU',
+              "high-cpu",
+              "High CPU",
               projects.filter((project) => project.cpuPercent >= 80).length,
             ],
             [
-              'recent',
-              'Recently changed',
+              "recent",
+              "Recently changed",
               projects.filter((project) =>
                 isRecentlyChanged(project.lastChangedAt),
               ).length,
@@ -5944,18 +6576,18 @@ function ProjectsPage({
               <Button
                 aria-label="Grid view"
                 icon={<LayoutGrid size={16} />}
-                onClick={() => onViewChange('grid')}
+                onClick={() => onViewChange("grid")}
                 size="icon"
-                variant={view === 'grid' ? 'secondary' : 'ghost'}
+                variant={view === "grid" ? "secondary" : "ghost"}
               />
             </Tooltip>
             <Tooltip label="List view">
               <Button
                 aria-label="List view"
                 icon={<List size={16} />}
-                onClick={() => onViewChange('list')}
+                onClick={() => onViewChange("list")}
                 size="icon"
-                variant={view === 'list' ? 'secondary' : 'ghost'}
+                variant={view === "list" ? "secondary" : "ghost"}
               />
             </Tooltip>
           </div>
@@ -5981,7 +6613,7 @@ function ProjectsPage({
           icon={<LayoutGrid size={28} />}
           title="No projects found"
         />
-      ) : view === 'grid' ? (
+      ) : view === "grid" ? (
         <section
           className="grid grid-cols-[repeat(auto-fill,minmax(320px,1fr))] gap-4"
           aria-label="Compose projects"
@@ -6041,16 +6673,16 @@ function ProjectCard({
   onOpen: (project: ProjectSummary) => void;
 }) {
   const updates = projectUpdateCount(project);
-  const workdirMissing = project.status === 'error';
+  const workdirMissing = project.status === "error";
   const primaryAction: ProjectAction =
-    project.status === 'running' ? 'stop' : 'start';
+    project.status === "running" ? "stop" : "start";
   const lifecycleDisabled =
     mutationsDisabled || workdirMissing || !project.workingDir;
   const disabledReason = mutationsDisabled
     ? mutationDisabledReason
     : workdirMissing
-      ? 'Re-link folder before running project actions'
-      : 'No workdir';
+      ? "Re-link folder before running project actions"
+      : "No workdir";
   const busy = (action: ProjectAction) =>
     actionBusyIDs.has(projectActionBusyKey(action, project.id));
   return (
@@ -6072,11 +6704,11 @@ function ProjectCard({
                 </button>
               </h2>
               <Badge tone={projectStatusTone(project.status)}>
-                {project.status || 'unknown'}
+                {project.status || "unknown"}
               </Badge>
             </div>
             <div className="mt-1 truncate text-xs text-text-muted">
-              {project.workingDir || 'No workdir'}
+              {project.workingDir || "No workdir"}
             </div>
           </div>
           <Tooltip label="More">
@@ -6107,7 +6739,7 @@ function ProjectCard({
 
         <div className="flex flex-wrap items-center gap-2">
           <Badge tone={healthTone(project.health)}>
-            {project.health || 'unknown'}
+            {project.health || "unknown"}
           </Badge>
           {updates > 0 ? (
             <Badge tone="warn">{updates} updates</Badge>
@@ -6119,13 +6751,13 @@ function ProjectCard({
         </div>
 
         <div className="flex items-center gap-1 border-t border-border pt-3">
-          <Tooltip label={project.status === 'running' ? 'Stop' : 'Start'}>
+          <Tooltip label={project.status === "running" ? "Stop" : "Start"}>
             <Button
-              aria-label={`${project.status === 'running' ? 'Stop' : 'Start'} ${project.name}`}
+              aria-label={`${project.status === "running" ? "Stop" : "Start"} ${project.name}`}
               disabled={lifecycleDisabled}
               disabledReason={disabledReason}
               icon={
-                project.status === 'running' ? (
+                project.status === "running" ? (
                   <Square size={15} />
                 ) : (
                   <Play size={15} />
@@ -6143,8 +6775,8 @@ function ProjectCard({
               disabled={lifecycleDisabled}
               disabledReason={disabledReason}
               icon={<RotateCw size={15} />}
-              loading={busy('restart')}
-              onClick={() => onAction('restart', project)}
+              loading={busy("restart")}
+              onClick={() => onAction("restart", project)}
               size="icon"
               variant="ghost"
             />
@@ -6155,8 +6787,8 @@ function ProjectCard({
               disabled={lifecycleDisabled}
               disabledReason={disabledReason}
               icon={<Download size={15} />}
-              loading={busy('pull')}
-              onClick={() => onAction('pull', project)}
+              loading={busy("pull")}
+              onClick={() => onAction("pull", project)}
               size="icon"
               variant="ghost"
             />
@@ -6167,8 +6799,8 @@ function ProjectCard({
               disabled={lifecycleDisabled}
               disabledReason={disabledReason}
               icon={<PackagePlus size={15} />}
-              loading={busy('redeploy')}
-              onClick={() => onAction('redeploy', project)}
+              loading={busy("redeploy")}
+              onClick={() => onAction("redeploy", project)}
               size="icon"
               variant="ghost"
             />
@@ -6179,8 +6811,8 @@ function ProjectCard({
               disabled={lifecycleDisabled}
               disabledReason={disabledReason}
               icon={<Square size={15} />}
-              loading={busy('down')}
-              onClick={() => onAction('down', project)}
+              loading={busy("down")}
+              onClick={() => onAction("down", project)}
               size="icon"
               variant="danger"
             />
@@ -6191,8 +6823,8 @@ function ProjectCard({
               disabled={lifecycleDisabled}
               disabledReason={disabledReason}
               icon={<Skull size={15} />}
-              loading={busy('down-volumes')}
-              onClick={() => onAction('down-volumes', project)}
+              loading={busy("down-volumes")}
+              onClick={() => onAction("down-volumes", project)}
               size="icon"
               variant="danger"
             />
@@ -6234,8 +6866,8 @@ function ProjectList({
     <DataTable
       columns={[
         {
-          id: 'name',
-          header: 'Name',
+          id: "name",
+          header: "Name",
           render: (project) => (
             <button
               className="font-medium text-text-primary hover:text-accent"
@@ -6249,8 +6881,8 @@ function ProjectList({
           sortable: true,
         },
         {
-          id: 'status',
-          header: 'Status',
+          id: "status",
+          header: "Status",
           render: (project) => (
             <Badge tone={projectStatusTone(project.status)}>
               {project.status}
@@ -6260,16 +6892,16 @@ function ProjectList({
           sortable: true,
         },
         {
-          id: 'services',
-          header: 'Services',
+          id: "services",
+          header: "Services",
           render: (project) =>
             `${project.servicesRunning}/${project.servicesTotal}`,
           sortValue: (project) => project.servicesTotal,
           sortable: true,
         },
         {
-          id: 'health',
-          header: 'Health',
+          id: "health",
+          header: "Health",
           render: (project) => (
             <Badge tone={healthTone(project.health)}>{project.health}</Badge>
           ),
@@ -6277,41 +6909,41 @@ function ProjectList({
           sortable: true,
         },
         {
-          id: 'cpu',
-          header: 'CPU',
+          id: "cpu",
+          header: "CPU",
           render: (project) => `${project.cpuPercent.toFixed(1)}%`,
           sortValue: (project) => project.cpuPercent,
           sortable: true,
         },
         {
-          id: 'ram',
-          header: 'RAM',
+          id: "ram",
+          header: "RAM",
           render: (project) => formatBytes(project.memoryBytes),
           sortValue: (project) => project.memoryBytes,
           sortable: true,
         },
         {
-          id: 'ports',
-          header: 'Ports',
+          id: "ports",
+          header: "Ports",
           render: (project) => <PortList ports={project.ports ?? []} />,
         },
         {
-          id: 'changed',
-          header: 'Last changed',
+          id: "changed",
+          header: "Last changed",
           render: (project) => relativeTime(dateMillis(project.lastChangedAt)),
           sortValue: (project) => dateMillis(project.lastChangedAt),
           sortable: true,
         },
         {
-          id: 'workdir',
-          header: 'Workdir',
-          render: (project) => project.workingDir || '-',
-          sortValue: (project) => project.workingDir || '',
+          id: "workdir",
+          header: "Workdir",
+          render: (project) => project.workingDir || "-",
+          sortValue: (project) => project.workingDir || "",
           sortable: true,
         },
         {
-          id: 'actions',
-          header: '',
+          id: "actions",
+          header: "",
           render: (project) => (
             <ProjectRowActions
               actionBusyIDs={actionBusyIDs}
@@ -6349,27 +6981,27 @@ function ProjectRowActions({
   mutationDisabledReason: string;
   onAction: (action: ProjectAction, project: ProjectSummary) => void;
 }) {
-  const workdirMissing = project.status === 'error';
+  const workdirMissing = project.status === "error";
   const lifecycleDisabled =
     mutationsDisabled || workdirMissing || !project.workingDir;
   const disabledReason = mutationsDisabled
     ? mutationDisabledReason
     : workdirMissing
-      ? 'Re-link folder before running project actions'
-      : 'No workdir';
+      ? "Re-link folder before running project actions"
+      : "No workdir";
   const primaryAction: ProjectAction =
-    project.status === 'running' ? 'stop' : 'start';
+    project.status === "running" ? "stop" : "start";
   const busy = (action: ProjectAction) =>
     actionBusyIDs.has(projectActionBusyKey(action, project.id));
   return (
     <div className="flex justify-end gap-1">
-      <Tooltip label={primaryAction === 'stop' ? 'Stop' : 'Start'}>
+      <Tooltip label={primaryAction === "stop" ? "Stop" : "Start"}>
         <Button
-          aria-label={`${primaryAction === 'stop' ? 'Stop' : 'Start'} ${project.name}`}
+          aria-label={`${primaryAction === "stop" ? "Stop" : "Start"} ${project.name}`}
           disabled={lifecycleDisabled}
           disabledReason={disabledReason}
           icon={
-            primaryAction === 'stop' ? <Square size={15} /> : <Play size={15} />
+            primaryAction === "stop" ? <Square size={15} /> : <Play size={15} />
           }
           loading={busy(primaryAction)}
           onClick={() => onAction(primaryAction, project)}
@@ -6383,8 +7015,8 @@ function ProjectRowActions({
           disabled={lifecycleDisabled}
           disabledReason={disabledReason}
           icon={<RotateCw size={15} />}
-          loading={busy('restart')}
-          onClick={() => onAction('restart', project)}
+          loading={busy("restart")}
+          onClick={() => onAction("restart", project)}
           size="icon"
           variant="ghost"
         />
@@ -6395,8 +7027,8 @@ function ProjectRowActions({
           disabled={lifecycleDisabled}
           disabledReason={disabledReason}
           icon={<Download size={15} />}
-          loading={busy('pull')}
-          onClick={() => onAction('pull', project)}
+          loading={busy("pull")}
+          onClick={() => onAction("pull", project)}
           size="icon"
           variant="ghost"
         />
@@ -6407,8 +7039,8 @@ function ProjectRowActions({
           disabled={lifecycleDisabled}
           disabledReason={disabledReason}
           icon={<PackagePlus size={15} />}
-          loading={busy('redeploy')}
-          onClick={() => onAction('redeploy', project)}
+          loading={busy("redeploy")}
+          onClick={() => onAction("redeploy", project)}
           size="icon"
           variant="ghost"
         />
@@ -6419,8 +7051,8 @@ function ProjectRowActions({
           disabled={lifecycleDisabled}
           disabledReason={disabledReason}
           icon={<Skull size={15} />}
-          loading={busy('down-volumes')}
-          onClick={() => onAction('down-volumes', project)}
+          loading={busy("down-volumes")}
+          onClick={() => onAction("down-volumes", project)}
           size="icon"
           variant="danger"
         />
@@ -6430,10 +7062,10 @@ function ProjectRowActions({
 }
 
 const projectTabs: Array<[ProjectTabID, string]> = [
-  ['overview', 'Overview'],
-  ['services', 'Services'],
-  ['containers', 'Containers'],
-  ['compose', 'Compose'],
+  ["overview", "Overview"],
+  ["services", "Services"],
+  ["containers", "Containers"],
+  ["compose", "Compose"],
 ];
 
 function ProjectDetailPage({
@@ -6467,7 +7099,7 @@ function ProjectDetailPage({
   if (!detail) {
     return (
       <EmptyState
-        body={error ?? 'Project detail is unavailable.'}
+        body={error ?? "Project detail is unavailable."}
         icon={<LayoutGrid size={28} />}
         title="Project not found"
       />
@@ -6476,14 +7108,14 @@ function ProjectDetailPage({
 
   const project = detail.summary;
   const primaryAction: ProjectAction =
-    project.status === 'running' ? 'stop' : 'start';
+    project.status === "running" ? "stop" : "start";
   const lifecycleDisabled =
-    mutationsDisabled || project.status === 'error' || !project.workingDir;
+    mutationsDisabled || project.status === "error" || !project.workingDir;
   const disabledReason = mutationsDisabled
     ? mutationDisabledReason
-    : project.status === 'error'
-      ? 'Re-link folder before running project actions'
-      : 'No workdir';
+    : project.status === "error"
+      ? "Re-link folder before running project actions"
+      : "No workdir";
   const busy = (action: ProjectAction) =>
     actionBusyIDs.has(projectActionBusyKey(action, project.id));
 
@@ -6497,12 +7129,12 @@ function ProjectDetailPage({
           <div className="mt-2 flex flex-wrap items-center gap-2">
             <h2 className="truncate text-2xl font-semibold">{project.name}</h2>
             <Badge tone={projectStatusTone(project.status)}>
-              {project.status || 'unknown'}
+              {project.status || "unknown"}
             </Badge>
             <Badge tone="info">{project.providerID}</Badge>
           </div>
           <div className="mt-2 max-w-3xl truncate text-sm text-text-muted">
-            {project.workingDir || 'No workdir'} · changed{' '}
+            {project.workingDir || "No workdir"} · changed{" "}
             {relativeTime(dateMillis(project.lastChangedAt))}
           </div>
         </div>
@@ -6511,7 +7143,7 @@ function ProjectDetailPage({
             disabled={lifecycleDisabled}
             disabledReason={disabledReason}
             icon={
-              primaryAction === 'stop' ? (
+              primaryAction === "stop" ? (
                 <Square size={15} />
               ) : (
                 <Play size={15} />
@@ -6520,14 +7152,14 @@ function ProjectDetailPage({
             loading={busy(primaryAction)}
             onClick={() => onAction(primaryAction, project)}
           >
-            {primaryAction === 'stop' ? 'Stop' : 'Start'}
+            {primaryAction === "stop" ? "Stop" : "Start"}
           </Button>
           <Button
             disabled={lifecycleDisabled}
             disabledReason={disabledReason}
             icon={<RotateCw size={15} />}
-            loading={busy('restart')}
-            onClick={() => onAction('restart', project)}
+            loading={busy("restart")}
+            onClick={() => onAction("restart", project)}
           >
             Restart
           </Button>
@@ -6535,8 +7167,8 @@ function ProjectDetailPage({
             disabled={lifecycleDisabled}
             disabledReason={disabledReason}
             icon={<PackagePlus size={15} />}
-            loading={busy('redeploy')}
-            onClick={() => onAction('redeploy', project)}
+            loading={busy("redeploy")}
+            onClick={() => onAction("redeploy", project)}
           >
             Redeploy
           </Button>
@@ -6544,8 +7176,8 @@ function ProjectDetailPage({
             disabled={lifecycleDisabled}
             disabledReason={disabledReason}
             icon={<Download size={15} />}
-            loading={busy('pull')}
-            onClick={() => onAction('pull', project)}
+            loading={busy("pull")}
+            onClick={() => onAction("pull", project)}
           >
             Pull
           </Button>
@@ -6553,8 +7185,8 @@ function ProjectDetailPage({
             disabled={lifecycleDisabled}
             disabledReason={disabledReason}
             icon={<Skull size={15} />}
-            loading={busy('down-volumes')}
-            onClick={() => onAction('down-volumes', project)}
+            loading={busy("down-volumes")}
+            onClick={() => onAction("down-volumes", project)}
             variant="danger"
           >
             Down + volumes
@@ -6579,11 +7211,11 @@ function ProjectDetailPage({
         {projectTabs.map(([id, label]) => (
           <button
             className={[
-              'border-b-2 px-3 py-2 text-sm font-medium transition',
+              "border-b-2 px-3 py-2 text-sm font-medium transition",
               tab === id
-                ? 'border-accent text-accent'
-                : 'border-transparent text-text-secondary hover:text-text-primary',
-            ].join(' ')}
+                ? "border-accent text-accent"
+                : "border-transparent text-text-secondary hover:text-text-primary",
+            ].join(" ")}
             key={id}
             onClick={() => onTabChange(id)}
             type="button"
@@ -6593,10 +7225,10 @@ function ProjectDetailPage({
         ))}
       </div>
 
-      {tab === 'overview' ? <ProjectOverviewTab detail={detail} /> : null}
-      {tab === 'services' ? <ProjectServicesTab detail={detail} /> : null}
-      {tab === 'containers' ? <ProjectContainersTab detail={detail} /> : null}
-      {tab === 'compose' ? <ProjectComposeTab detail={detail} /> : null}
+      {tab === "overview" ? <ProjectOverviewTab detail={detail} /> : null}
+      {tab === "services" ? <ProjectServicesTab detail={detail} /> : null}
+      {tab === "containers" ? <ProjectContainersTab detail={detail} /> : null}
+      {tab === "compose" ? <ProjectComposeTab detail={detail} /> : null}
     </div>
   );
 }
@@ -6616,7 +7248,7 @@ function ProjectOverviewTab({ detail }: { detail: ProjectDetail }) {
         <StatusBlock
           label="Running"
           tone={
-            project.servicesRunning === project.servicesTotal ? 'ok' : 'warn'
+            project.servicesRunning === project.servicesTotal ? "ok" : "warn"
           }
           value={project.servicesRunning}
         />
@@ -6627,7 +7259,7 @@ function ProjectOverviewTab({ detail }: { detail: ProjectDetail }) {
         />
         <StatusBlock
           label="Updates"
-          tone={projectUpdateCount(project) > 0 ? 'warn' : 'ok'}
+          tone={projectUpdateCount(project) > 0 ? "warn" : "ok"}
           value={projectUpdateCount(project)}
         />
       </div>
@@ -6642,11 +7274,11 @@ function ProjectOverviewTab({ detail }: { detail: ProjectDetail }) {
                     {service.name}
                   </h3>
                   <div className="mt-1 truncate font-mono text-xs text-text-muted">
-                    {service.image || 'build'}
+                    {service.image || "build"}
                   </div>
                 </div>
                 <Badge tone={projectStatusTone(service.status)}>
-                  {service.status || 'unknown'}
+                  {service.status || "unknown"}
                 </Badge>
               </div>
               <div className="grid grid-cols-3 gap-2">
@@ -6665,7 +7297,7 @@ function ProjectOverviewTab({ detail }: { detail: ProjectDetail }) {
               </div>
               <div className="flex flex-wrap items-center gap-2">
                 <Badge tone={healthTone(service.health)}>
-                  {service.health || 'unknown'}
+                  {service.health || "unknown"}
                 </Badge>
                 <PortList ports={service.ports ?? []} />
               </div>
@@ -6682,8 +7314,8 @@ function ProjectServicesTab({ detail }: { detail: ProjectDetail }) {
     <DataTable
       columns={[
         {
-          id: 'name',
-          header: 'Name',
+          id: "name",
+          header: "Name",
           render: (service) => (
             <span className="font-medium text-text-primary">
               {service.name}
@@ -6693,22 +7325,22 @@ function ProjectServicesTab({ detail }: { detail: ProjectDetail }) {
           sortable: true,
         },
         {
-          id: 'image',
-          header: 'Image',
-          render: (service) => service.image || 'build',
-          sortValue: (service) => service.image || '',
+          id: "image",
+          header: "Image",
+          render: (service) => service.image || "build",
+          sortValue: (service) => service.image || "",
           sortable: true,
         },
         {
-          id: 'replicas',
-          header: 'Replicas',
+          id: "replicas",
+          header: "Replicas",
           render: (service) => `${service.running}/${service.replicas}`,
           sortValue: (service) => service.replicas,
           sortable: true,
         },
         {
-          id: 'status',
-          header: 'Status',
+          id: "status",
+          header: "Status",
           render: (service) => (
             <Badge tone={projectStatusTone(service.status)}>
               {service.status}
@@ -6718,8 +7350,8 @@ function ProjectServicesTab({ detail }: { detail: ProjectDetail }) {
           sortable: true,
         },
         {
-          id: 'health',
-          header: 'Health',
+          id: "health",
+          header: "Health",
           render: (service) => (
             <Badge tone={healthTone(service.health)}>{service.health}</Badge>
           ),
@@ -6727,8 +7359,8 @@ function ProjectServicesTab({ detail }: { detail: ProjectDetail }) {
           sortable: true,
         },
         {
-          id: 'ports',
-          header: 'Ports',
+          id: "ports",
+          header: "Ports",
           render: (service) => <PortList ports={service.ports ?? []} />,
         },
       ]}
@@ -6750,8 +7382,8 @@ function ProjectContainersTab({ detail }: { detail: ProjectDetail }) {
     <DataTable
       columns={[
         {
-          id: 'name',
-          header: 'Name',
+          id: "name",
+          header: "Name",
           render: (container) => (
             <span className="font-medium text-text-primary">
               {container.name}
@@ -6761,22 +7393,22 @@ function ProjectContainersTab({ detail }: { detail: ProjectDetail }) {
           sortable: true,
         },
         {
-          id: 'service',
-          header: 'Service',
-          render: (container) => container.service || '-',
-          sortValue: (container) => container.service || '',
+          id: "service",
+          header: "Service",
+          render: (container) => container.service || "-",
+          sortValue: (container) => container.service || "",
           sortable: true,
         },
         {
-          id: 'image',
-          header: 'Image',
+          id: "image",
+          header: "Image",
           render: (container) => container.image,
           sortValue: (container) => container.image,
           sortable: true,
         },
         {
-          id: 'state',
-          header: 'State',
+          id: "state",
+          header: "State",
           render: (container) => (
             <Badge tone={containerTone(container)}>
               {container.state || container.status}
@@ -6786,8 +7418,8 @@ function ProjectContainersTab({ detail }: { detail: ProjectDetail }) {
           sortable: true,
         },
         {
-          id: 'ports',
-          header: 'Ports',
+          id: "ports",
+          header: "Ports",
           render: (container) => <PortList ports={container.ports ?? []} />,
         },
       ]}
@@ -6806,21 +7438,21 @@ function ProjectContainersTab({ detail }: { detail: ProjectDetail }) {
 
 function ProjectComposeTab({ detail }: { detail: ProjectDetail }) {
   const rawFiles = detail.compose?.rawFiles ?? [];
-  const [selection, setSelection] = useState('resolved');
+  const [selection, setSelection] = useState("resolved");
   const activeSelection =
-    selection === 'resolved' || rawFiles.some((file) => file.path === selection)
+    selection === "resolved" || rawFiles.some((file) => file.path === selection)
       ? selection
-      : 'resolved';
+      : "resolved";
   const rawFile = rawFiles.find((file) => file.path === activeSelection);
   const value =
-    activeSelection === 'resolved'
-      ? (detail.compose?.resolvedYAML ?? '')
-      : (rawFile?.content ?? '');
+    activeSelection === "resolved"
+      ? (detail.compose?.resolvedYAML ?? "")
+      : (rawFile?.content ?? "");
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-2">
-        <Badge tone={detail.compose?.valid ? 'ok' : 'error'}>
-          {detail.compose?.valid ? 'valid' : 'invalid'}
+        <Badge tone={detail.compose?.valid ? "ok" : "error"}>
+          {detail.compose?.valid ? "valid" : "invalid"}
         </Badge>
         {(detail.compose?.envFiles ?? []).map((file) => (
           <Badge key={file} tone="neutral">
@@ -6830,13 +7462,13 @@ function ProjectComposeTab({ detail }: { detail: ProjectDetail }) {
       </div>
       {detail.compose?.errors?.length ? (
         <div className="rounded-card border border-error/30 bg-error/10 p-3 text-sm text-error">
-          {detail.compose.errors.join('\n')}
+          {detail.compose.errors.join("\n")}
         </div>
       ) : null}
       <div className="flex flex-wrap gap-2">
         <Button
-          onClick={() => setSelection('resolved')}
-          variant={activeSelection === 'resolved' ? 'primary' : 'secondary'}
+          onClick={() => setSelection("resolved")}
+          variant={activeSelection === "resolved" ? "primary" : "secondary"}
         >
           Resolved
         </Button>
@@ -6844,7 +7476,7 @@ function ProjectComposeTab({ detail }: { detail: ProjectDetail }) {
           <Button
             key={file.path}
             onClick={() => setSelection(file.path)}
-            variant={activeSelection === file.path ? 'primary' : 'secondary'}
+            variant={activeSelection === file.path ? "primary" : "secondary"}
           >
             {shortPath(file.path)}
           </Button>
@@ -6858,10 +7490,10 @@ function ProjectComposeTab({ detail }: { detail: ProjectDetail }) {
             minimap: { enabled: false },
             readOnly: true,
             scrollBeyondLastLine: false,
-            wordWrap: 'on',
+            wordWrap: "on",
           }}
           theme="vs-dark"
-          value={value || '# No Compose content available'}
+          value={value || "# No Compose content available"}
         />
       </div>
     </div>
@@ -6889,7 +7521,7 @@ type ContainersPageProps = {
   selectedIDs: Set<string>;
   actionBusyIDs: Set<string>;
   onAction: (action: ContainerAction, container: ContainerSummary) => void;
-  onBulkAction: (action: Exclude<ContainerAction, 'kill'>) => void;
+  onBulkAction: (action: Exclude<ContainerAction, "kill">) => void;
   onFilterChange: (filter: FilterID) => void;
   onInspect: (container: ContainerSummary) => void;
   onRename: (container: ContainerSummary) => void;
@@ -6925,20 +7557,20 @@ function ContainersPage({
       <FilterChips
         active={filter}
         items={[
-          ['all', 'All', counts.all],
-          ['running', 'Running', counts.running],
-          ['stopped', 'Stopped', counts.stopped],
-          ['paused', 'Paused', counts.paused],
-          ['unhealthy', 'Unhealthy', counts.unhealthy],
-          ['ungrouped', 'Ungrouped', counts.ungrouped],
+          ["all", "All", counts.all],
+          ["running", "Running", counts.running],
+          ["stopped", "Stopped", counts.stopped],
+          ["paused", "Paused", counts.paused],
+          ["unhealthy", "Unhealthy", counts.unhealthy],
+          ["ungrouped", "Ungrouped", counts.ungrouped],
         ]}
         onChange={onFilterChange}
       />
       <DataTable
         columns={[
           {
-            id: 'name',
-            header: 'Name',
+            id: "name",
+            header: "Name",
             render: (container) => (
               <div className="min-w-0">
                 <div className="truncate text-text-primary">
@@ -6953,26 +7585,26 @@ function ContainersPage({
             sortValue: (container) => container.name,
           },
           {
-            id: 'status',
-            header: 'Status',
+            id: "status",
+            header: "Status",
             render: (container) => (
               <Badge tone={containerTone(container)}>
-                {container.state || 'unknown'}
+                {container.state || "unknown"}
               </Badge>
             ),
             sortable: true,
             sortValue: (container) => container.state,
           },
           {
-            id: 'project',
-            header: 'Project',
-            render: (container) => container.projectID || '-',
+            id: "project",
+            header: "Project",
+            render: (container) => container.projectID || "-",
             sortable: true,
-            sortValue: (container) => container.projectID || '',
+            sortValue: (container) => container.projectID || "",
           },
           {
-            id: 'image',
-            header: 'Image',
+            id: "image",
+            header: "Image",
             render: (container) => (
               <span title={container.image}>{container.image}</span>
             ),
@@ -6980,36 +7612,36 @@ function ContainersPage({
             sortValue: (container) => container.image,
           },
           {
-            id: 'ports',
-            header: 'Ports',
+            id: "ports",
+            header: "Ports",
             render: (container) => <PortList ports={container.ports ?? []} />,
           },
           {
-            id: 'memory',
-            header: 'Memory',
+            id: "memory",
+            header: "Memory",
             render: (container) =>
               formatMemory(container.memoryBytes, container.memoryLimit),
             sortable: true,
             sortValue: (container) => container.memoryBytes ?? 0,
           },
           {
-            id: 'health',
-            header: 'Health',
+            id: "health",
+            header: "Health",
             render: (container) => (
               <Badge tone={healthTone(container.health)}>
-                {container.health || 'unknown'}
+                {container.health || "unknown"}
               </Badge>
             ),
             sortable: true,
             sortValue: (container) => container.health,
           },
           {
-            id: 'restarts',
-            header: 'Restarts',
+            id: "restarts",
+            header: "Restarts",
             render: (container) => (
               <span
                 className={
-                  (container.restarts ?? 0) > 3 ? 'text-error' : undefined
+                  (container.restarts ?? 0) > 3 ? "text-error" : undefined
                 }
               >
                 {container.restarts ?? 0}
@@ -7019,8 +7651,8 @@ function ContainersPage({
             sortValue: (container) => container.restarts ?? 0,
           },
           {
-            id: 'actions',
-            header: '',
+            id: "actions",
+            header: "",
             render: (container) => (
               <ContainerRowActions
                 busyIDs={actionBusyIDs}
@@ -7106,11 +7738,11 @@ function ImagesPage({
         <FilterChips
           active={filter}
           items={[
-            ['all', 'All', counts.all],
-            ['in-use', 'In use', counts.inUse],
-            ['unused', 'Unused', counts.unused],
-            ['dangling', 'Dangling', counts.dangling],
-            ['updates', 'Update available', counts.updates],
+            ["all", "All", counts.all],
+            ["in-use", "In use", counts.inUse],
+            ["unused", "Unused", counts.unused],
+            ["dangling", "Dangling", counts.dangling],
+            ["updates", "Update available", counts.updates],
           ]}
           onChange={onFilterChange}
         />
@@ -7147,67 +7779,67 @@ function ImagesPage({
       <DataTable
         columns={[
           {
-            id: 'repo',
-            header: 'Repository',
+            id: "repo",
+            header: "Repository",
             render: (image) => imageRepo(image),
             sortable: true,
             sortValue: (image) => imageRepo(image),
           },
           {
-            id: 'tag',
-            header: 'Tag',
+            id: "tag",
+            header: "Tag",
             render: (image) => imageTag(image),
             sortable: true,
             sortValue: (image) => imageTag(image),
           },
           {
-            id: 'id',
-            header: 'Image ID',
+            id: "id",
+            header: "Image ID",
             render: (image) => <MonoCopy value={image.id} />,
             sortable: true,
             sortValue: (image) => image.id,
           },
           {
-            id: 'size',
-            header: 'Size',
+            id: "size",
+            header: "Size",
             render: (image) => formatBytes(image.sizeBytes),
             sortable: true,
             sortValue: (image) => image.sizeBytes,
           },
           {
-            id: 'created',
-            header: 'Created',
+            id: "created",
+            header: "Created",
             render: (image) => formatDate(image.createdAt),
             sortable: true,
             sortValue: (image) => dateMillis(image.createdAt),
           },
           {
-            id: 'used-by',
-            header: 'Used by',
+            id: "used-by",
+            header: "Used by",
             render: (image) => (
               <Badge
                 tone={
                   (imageUseCounts[image.id] ?? 0) > 0 || image.inUse
-                    ? 'accent'
-                    : 'neutral'
+                    ? "accent"
+                    : "neutral"
                 }
               >
-                {imageUseCounts[image.id] ?? (image.inUse ? '>=1' : 0)}
+                {imageUseCounts[image.id] ?? (image.inUse ? ">=1" : 0)}
               </Badge>
             ),
           },
           {
-            id: 'update',
-            header: 'Update',
+            id: "update",
+            header: "Update",
             render: (image) => (
               <Badge tone={updateTone(image.updateStatus)}>
-                {image.updateStatus || 'unknown'}
+                {image.updateStatus || "unknown"}
               </Badge>
             ),
           },
           {
-            id: 'actions',
-            header: '',
+            id: "actions",
+            header: "",
             render: (image) => (
               <ImageRowActions
                 image={image}
@@ -7273,9 +7905,9 @@ function VolumesPage({
         <FilterChips
           active={filter}
           items={[
-            ['all', 'All', counts.all],
-            ['in-use', 'In use', counts.inUse],
-            ['unused', 'Unused', counts.unused],
+            ["all", "All", counts.all],
+            ["in-use", "In use", counts.inUse],
+            ["unused", "Unused", counts.unused],
           ]}
           onChange={onFilterChange}
         />
@@ -7292,8 +7924,8 @@ function VolumesPage({
       <DataTable
         columns={[
           {
-            id: 'name',
-            header: 'Name',
+            id: "name",
+            header: "Name",
             render: (volume) => (
               <span className="text-text-primary">{volume.name}</span>
             ),
@@ -7301,47 +7933,47 @@ function VolumesPage({
             sortValue: (volume) => volume.name,
           },
           {
-            id: 'driver',
-            header: 'Driver',
+            id: "driver",
+            header: "Driver",
             render: (volume) => volume.driver,
             sortable: true,
             sortValue: (volume) => volume.driver,
           },
           {
-            id: 'size',
-            header: 'Size',
+            id: "size",
+            header: "Size",
             render: (volume) =>
-              volume.sizeBytes ? formatBytes(volume.sizeBytes) : '-',
+              volume.sizeBytes ? formatBytes(volume.sizeBytes) : "-",
             sortable: true,
             sortValue: (volume) => volume.sizeBytes ?? 0,
           },
           {
-            id: 'project',
-            header: 'Project',
-            render: (volume) => volume.labels?.[composeProjectLabel] ?? '-',
+            id: "project",
+            header: "Project",
+            render: (volume) => volume.labels?.[composeProjectLabel] ?? "-",
             sortable: true,
-            sortValue: (volume) => volume.labels?.[composeProjectLabel] ?? '',
+            sortValue: (volume) => volume.labels?.[composeProjectLabel] ?? "",
           },
           {
-            id: 'used-by',
-            header: 'Used by',
+            id: "used-by",
+            header: "Used by",
             render: (volume) => (
-              <Badge tone={volume.inUse ? 'accent' : 'neutral'}>
+              <Badge tone={volume.inUse ? "accent" : "neutral"}>
                 {volumeDetails[volume.name]?.containers?.length ??
-                  (volume.inUse ? '>=1' : 0)}
+                  (volume.inUse ? ">=1" : 0)}
               </Badge>
             ),
           },
           {
-            id: 'mountpoint',
-            header: 'Mountpoint',
+            id: "mountpoint",
+            header: "Mountpoint",
             render: (volume) => (
-              <span title={volume.mountpoint}>{volume.mountpoint || '-'}</span>
+              <span title={volume.mountpoint}>{volume.mountpoint || "-"}</span>
             ),
           },
           {
-            id: 'actions',
-            header: '',
+            id: "actions",
+            header: "",
             render: (volume) => (
               <RowActions
                 id={volume.name}
@@ -7409,8 +8041,8 @@ function NetworksPage({
       <DataTable
         columns={[
           {
-            id: 'name',
-            header: 'Name',
+            id: "name",
+            header: "Name",
             render: (network) => (
               <span className="text-text-primary">{network.name}</span>
             ),
@@ -7418,32 +8050,32 @@ function NetworksPage({
             sortValue: (network) => network.name,
           },
           {
-            id: 'driver',
-            header: 'Driver',
+            id: "driver",
+            header: "Driver",
             render: (network) => network.driver,
             sortable: true,
             sortValue: (network) => network.driver,
           },
           {
-            id: 'scope',
-            header: 'Scope',
-            render: (network) => network.scope || '-',
+            id: "scope",
+            header: "Scope",
+            render: (network) => network.scope || "-",
             sortable: true,
-            sortValue: (network) => network.scope || '',
+            sortValue: (network) => network.scope || "",
           },
           {
-            id: 'subnet',
-            header: 'Subnet',
-            render: (network) => networkDetails[network.id]?.subnet || '-',
+            id: "subnet",
+            header: "Subnet",
+            render: (network) => networkDetails[network.id]?.subnet || "-",
           },
           {
-            id: 'gateway',
-            header: 'Gateway',
-            render: (network) => networkDetails[network.id]?.gateway || '-',
+            id: "gateway",
+            header: "Gateway",
+            render: (network) => networkDetails[network.id]?.gateway || "-",
           },
           {
-            id: 'containers',
-            header: 'Containers',
+            id: "containers",
+            header: "Containers",
             render: (network) => (
               <Badge tone="neutral">
                 {networkDetails[network.id]?.containers?.length ?? 0}
@@ -7451,19 +8083,19 @@ function NetworksPage({
             ),
           },
           {
-            id: 'internal',
-            header: 'Internal',
+            id: "internal",
+            header: "Internal",
             render: (network) => (
-              <Badge tone={network.internal ? 'info' : 'neutral'}>
-                {network.internal ? 'yes' : 'no'}
+              <Badge tone={network.internal ? "info" : "neutral"}>
+                {network.internal ? "yes" : "no"}
               </Badge>
             ),
             sortable: true,
             sortValue: (network) => (network.internal ? 1 : 0),
           },
           {
-            id: 'actions',
-            header: '',
+            id: "actions",
+            header: "",
             render: (network) => (
               <RowActions
                 id={network.id}
@@ -7522,11 +8154,11 @@ function FilterChips({
       {items.map(([id, label, count]) => (
         <button
           className={[
-            'inline-flex h-8 items-center gap-2 rounded-full border px-3 text-xs font-medium transition',
+            "inline-flex h-8 items-center gap-2 rounded-full border px-3 text-xs font-medium transition",
             active === id
-              ? 'border-accent/40 bg-accent/10 text-accent'
-              : 'border-border bg-bg-inset text-text-secondary hover:text-text-primary',
-          ].join(' ')}
+              ? "border-accent/40 bg-accent/10 text-accent"
+              : "border-border bg-bg-inset text-text-secondary hover:text-text-primary",
+          ].join(" ")}
           key={id}
           onClick={() => onChange(id)}
           type="button"
@@ -7637,23 +8269,23 @@ function ContainerRowActions({
   onRename: (container: ContainerSummary) => void;
 }) {
   const canStop =
-    container.state === 'running' ||
-    container.state === 'paused' ||
-    container.state === 'restarting';
+    container.state === "running" ||
+    container.state === "paused" ||
+    container.state === "restarting";
   const canStart =
-    container.state !== 'running' && container.state !== 'restarting';
+    container.state !== "running" && container.state !== "restarting";
   return (
     <div className="flex justify-end gap-1">
-      <Tooltip label={canStart ? 'Start' : 'Stop'}>
+      <Tooltip label={canStart ? "Start" : "Stop"}>
         <Button
-          aria-label={`${canStart ? 'Start' : 'Stop'} ${container.name}`}
+          aria-label={`${canStart ? "Start" : "Stop"} ${container.name}`}
           disabled={
             mutationsDisabled ||
-            busyIDs.has(`${canStart ? 'start' : 'stop'}:${container.id}`)
+            busyIDs.has(`${canStart ? "start" : "stop"}:${container.id}`)
           }
           disabledReason={mutationDisabledReason}
           icon={canStart ? <Play size={15} /> : <Square size={15} />}
-          onClick={() => onAction(canStart ? 'start' : 'stop', container)}
+          onClick={() => onAction(canStart ? "start" : "stop", container)}
           size="icon"
           variant="ghost"
         />
@@ -7669,10 +8301,10 @@ function ContainerRowActions({
           disabledReason={
             mutationsDisabled
               ? mutationDisabledReason
-              : 'Container is not running'
+              : "Container is not running"
           }
           icon={<RotateCw size={15} />}
-          onClick={() => onAction('restart', container)}
+          onClick={() => onAction("restart", container)}
           size="icon"
           variant="ghost"
         />
@@ -7686,10 +8318,10 @@ function ContainerRowActions({
           disabledReason={
             mutationsDisabled
               ? mutationDisabledReason
-              : 'Container is not running'
+              : "Container is not running"
           }
           icon={<Skull size={15} />}
-          onClick={() => onAction('kill', container)}
+          onClick={() => onAction("kill", container)}
           size="icon"
           variant="ghost"
         />
@@ -7723,7 +8355,7 @@ function ContainerBulkActions({
   busyIDs: Set<string>;
   mutationsDisabled: boolean;
   mutationDisabledReason: string;
-  onAction: (action: Exclude<ContainerAction, 'kill'>) => void;
+  onAction: (action: Exclude<ContainerAction, "kill">) => void;
 }) {
   return (
     <div className="flex items-center gap-1">
@@ -7731,8 +8363,8 @@ function ContainerBulkActions({
         icon={<Play size={15} />}
         disabled={mutationsDisabled}
         disabledReason={mutationDisabledReason}
-        loading={busyIDs.has('bulk:start')}
-        onClick={() => onAction('start')}
+        loading={busyIDs.has("bulk:start")}
+        onClick={() => onAction("start")}
         size="sm"
         variant="secondary"
       >
@@ -7742,8 +8374,8 @@ function ContainerBulkActions({
         icon={<Square size={15} />}
         disabled={mutationsDisabled}
         disabledReason={mutationDisabledReason}
-        loading={busyIDs.has('bulk:stop')}
-        onClick={() => onAction('stop')}
+        loading={busyIDs.has("bulk:stop")}
+        onClick={() => onAction("stop")}
         size="sm"
         variant="secondary"
       >
@@ -7751,8 +8383,8 @@ function ContainerBulkActions({
       </Button>
       <Button
         icon={<RotateCw size={15} />}
-        loading={busyIDs.has('bulk:restart')}
-        onClick={() => onAction('restart')}
+        loading={busyIDs.has("bulk:restart")}
+        onClick={() => onAction("restart")}
         size="sm"
         variant="secondary"
       >
@@ -7766,59 +8398,59 @@ function eventPayload<T>(event: unknown): T | null {
   if (!event) {
     return null;
   }
-  if (typeof event === 'object' && 'data' in event) {
+  if (typeof event === "object" && "data" in event) {
     return ((event as { data?: T }).data ?? null) as T | null;
   }
   return event as T;
 }
 
 function isLogLine(value: unknown): value is LogLine {
-  if (!value || typeof value !== 'object') {
+  if (!value || typeof value !== "object") {
     return false;
   }
   const candidate = value as Partial<LogLine>;
   return (
-    typeof candidate.text === 'string' && typeof candidate.stream === 'string'
+    typeof candidate.text === "string" && typeof candidate.stream === "string"
   );
 }
 
 function normalizeLogLevel(level?: string): LogLevelFilter {
   const value = level?.toLowerCase();
   if (
-    value === 'error' ||
-    value === 'warn' ||
-    value === 'info' ||
-    value === 'debug'
+    value === "error" ||
+    value === "warn" ||
+    value === "info" ||
+    value === "debug"
   ) {
     return value;
   }
-  return 'unknown';
+  return "unknown";
 }
 
 function levelTone(level: LogLevelFilter): BadgeTone {
-  if (level === 'error') {
-    return 'error';
+  if (level === "error") {
+    return "error";
   }
-  if (level === 'warn') {
-    return 'warn';
+  if (level === "warn") {
+    return "warn";
   }
-  if (level === 'info') {
-    return 'info';
+  if (level === "info") {
+    return "info";
   }
-  return 'neutral';
+  return "neutral";
 }
 
 function logSource(line: LogLine) {
   return (
     line.containerName ||
     line.service ||
-    shortID(line.containerID ?? '') ||
-    'system'
+    shortID(line.containerID ?? "") ||
+    "system"
   );
 }
 
 function logSourceKey(line: LogLine) {
-  return line.containerID || line.containerName || line.service || 'system';
+  return line.containerID || line.containerName || line.service || "system";
 }
 
 function projectName(projects: ProjectSummary[], id: string) {
@@ -7843,24 +8475,24 @@ function formatCount(value: number) {
 }
 
 function formatLogTimestamp(value: unknown) {
-  const date = value instanceof Date ? value : new Date(String(value ?? ''));
+  const date = value instanceof Date ? value : new Date(String(value ?? ""));
   if (Number.isNaN(date.getTime())) {
-    return '--:--:--.---';
+    return "--:--:--.---";
   }
-  const hh = String(date.getHours()).padStart(2, '0');
-  const mm = String(date.getMinutes()).padStart(2, '0');
-  const ss = String(date.getSeconds()).padStart(2, '0');
-  const ms = String(date.getMilliseconds()).padStart(3, '0');
+  const hh = String(date.getHours()).padStart(2, "0");
+  const mm = String(date.getMinutes()).padStart(2, "0");
+  const ss = String(date.getSeconds()).padStart(2, "0");
+  const ms = String(date.getMilliseconds()).padStart(3, "0");
   return `${hh}:${mm}:${ss}.${ms}`;
 }
 
 function renderAnsiText(text: string, query: string) {
   const ansiPattern = new RegExp(
     `${String.fromCharCode(27)}\\[([0-9;]*)m`,
-    'g',
+    "g",
   );
   const nodes: JSX.Element[] = [];
-  let className = '';
+  let className = "";
   let cursor = 0;
   let match: RegExpExecArray | null;
   let key = 0;
@@ -7892,28 +8524,28 @@ function renderAnsiText(text: string, query: string) {
 
 function ansiClass(codesText: string, current: string) {
   const codes = codesText
-    .split(';')
+    .split(";")
     .filter(Boolean)
     .map((code) => Number.parseInt(code, 10));
   if (codes.length === 0 || codes.includes(0)) {
-    return '';
+    return "";
   }
   let next = current;
   for (const code of codes) {
     if (code === 1) {
       next = `${next} font-semibold`.trim();
     } else if (code === 31) {
-      next = 'text-error';
+      next = "text-error";
     } else if (code === 32) {
-      next = 'text-ok';
+      next = "text-ok";
     } else if (code === 33) {
-      next = 'text-warn';
+      next = "text-warn";
     } else if (code === 34) {
-      next = 'text-info';
+      next = "text-info";
     } else if (code === 36) {
-      next = 'text-accent';
+      next = "text-accent";
     } else if (code === 90) {
-      next = 'text-text-muted';
+      next = "text-text-muted";
     }
   }
   return next;
@@ -7967,10 +8599,10 @@ function logFilterSummary(
   const selectedLevels = logLevelOptions
     .filter((level) => levels.has(level.id))
     .map((level) => level.label)
-    .join(', ');
+    .join(", ");
   const parts = [
     `scope ${scope}`,
-    `selected ${ids.length || 'all'}`,
+    `selected ${ids.length || "all"}`,
     `levels ${selectedLevels}`,
   ];
   if (source) {
@@ -7979,7 +8611,7 @@ function logFilterSummary(
   if (query) {
     parts.push(`search ${query}`);
   }
-  return parts.join(' | ');
+  return parts.join(" | ");
 }
 
 function InspectModal({
@@ -7994,7 +8626,7 @@ function InspectModal({
       open={inspect.open}
       onClose={onClose}
       size="lg"
-      title={inspect.title || 'Inspect'}
+      title={inspect.title || "Inspect"}
     >
       {inspect.subtitle ? (
         <div className="mb-3 font-mono text-xs text-text-muted">
@@ -8012,7 +8644,7 @@ function InspectModal({
               className="mt-1 truncate font-mono text-xs text-text-primary"
               title={value}
             >
-              {value || '-'}
+              {value || "-"}
             </div>
           </div>
         ))}
@@ -8060,12 +8692,12 @@ function ConfirmPlanModal({
   onClose: () => void;
 }) {
   const plan = confirm.plan;
-  const typedName = plan?.requiresTypedName ?? '';
+  const typedName = plan?.requiresTypedName ?? "";
   const typedReady = !typedName || confirm.typedName === typedName;
   return (
     <Modal
       busy={confirm.busy}
-      danger={plan?.risk === 'destructive' || plan?.risk === 'dangerous'}
+      danger={plan?.risk === "destructive" || plan?.risk === "dangerous"}
       footer={
         <div className="flex justify-end gap-2">
           <Button disabled={confirm.busy} onClick={onClose} variant="secondary">
@@ -8084,7 +8716,7 @@ function ConfirmPlanModal({
       onClose={onClose}
       open={confirm.open}
       size="lg"
-      title={plan?.title ?? 'Confirm action'}
+      title={plan?.title ?? "Confirm action"}
     >
       {plan ? (
         <div className="space-y-4">
@@ -8178,7 +8810,7 @@ function RenameContainerModal({
       }
       onClose={onClose}
       open={state.open}
-      title={`Rename ${state.container?.name ?? 'container'}`}
+      title={`Rename ${state.container?.name ?? "container"}`}
     >
       <div className="space-y-4">
         {composeManaged ? (
@@ -8194,9 +8826,9 @@ function RenameContainerModal({
         />
         <CodePreview
           value={joinPreview([
-            'docker',
-            'rename',
-            state.container?.name ?? '',
+            "docker",
+            "rename",
+            state.container?.name ?? "",
             state.name,
           ])}
         />
@@ -8249,7 +8881,7 @@ function RunImageModal({
               onClick={onSubmit}
               variant="primary"
             >
-              {state.step === 1 ? 'Next' : 'Run'}
+              {state.step === 1 ? "Next" : "Run"}
             </Button>
           </div>
         </div>
@@ -8337,7 +8969,7 @@ function RunImageModal({
                 label="Network"
                 onChange={(networkID) => onChange({ networkID })}
                 options={[
-                  ['', 'bridge'],
+                  ["", "bridge"],
                   ...networks.map(
                     (network) =>
                       [network.name, network.name] as [string, string],
@@ -8349,10 +8981,10 @@ function RunImageModal({
                 label="Restart"
                 onChange={(restartPolicy) => onChange({ restartPolicy })}
                 options={[
-                  ['no', 'no'],
-                  ['on-failure', 'on-failure'],
-                  ['unless-stopped', 'unless-stopped'],
-                  ['always', 'always'],
+                  ["no", "no"],
+                  ["on-failure", "on-failure"],
+                  ["unless-stopped", "unless-stopped"],
+                  ["always", "always"],
                 ]}
                 value={state.restartPolicy}
               />
@@ -8371,7 +9003,7 @@ function RunImageModal({
               <div className="rounded-control border border-border bg-bg-inset p-3">
                 <Badge tone="warn">masked</Badge>
                 <span className="ml-2 text-text-muted">
-                  {secretKeys(state.envText).join(', ')}
+                  {secretKeys(state.envText).join(", ")}
                 </span>
               </div>
             ) : null}
@@ -8445,7 +9077,7 @@ function PullImageModal({
             {state.searchError}
           </div>
         ) : null}
-        <CodePreview value={joinPreview(['docker', 'pull', ref])} />
+        <CodePreview value={joinPreview(["docker", "pull", ref])} />
         <FormError error={state.error} />
       </div>
     </Modal>
@@ -8493,7 +9125,7 @@ function SaveImageModal({
           value={state.destPath}
         />
         <CodePreview
-          value={joinPreview(['docker', 'save', '-o', state.destPath, ...refs])}
+          value={joinPreview(["docker", "save", "-o", state.destPath, ...refs])}
         />
         <FormError error={state.error} />
       </div>
@@ -8535,7 +9167,7 @@ function LoadImageModal({
           value={state.srcPath}
         />
         <CodePreview
-          value={joinPreview(['docker', 'load', '-i', state.srcPath])}
+          value={joinPreview(["docker", "load", "-i", state.srcPath])}
         />
         <FormError error={state.error} />
       </div>
@@ -8622,7 +9254,7 @@ function CreateNetworkModal({
   onClose: () => void;
   onSubmit: () => void;
 }) {
-  const customDriver = state.driver === 'custom';
+  const customDriver = state.driver === "custom";
   return (
     <Modal
       busy={state.busy}
@@ -8650,9 +9282,9 @@ function CreateNetworkModal({
           label="Driver"
           onChange={(nextDriver) => onChange({ driver: nextDriver })}
           options={[
-            ['bridge', 'bridge'],
-            ['overlay', 'overlay'],
-            ['custom', 'custom'],
+            ["bridge", "bridge"],
+            ["overlay", "overlay"],
+            ["custom", "custom"],
           ]}
           value={state.driver}
         />
@@ -8723,7 +9355,7 @@ function ImportProjectModal({
 }) {
   const previewName = projectNameFromPath(state.folderPath);
   const candidates = composeFileCandidates(state.folderPath);
-  const wslMount = state.folderPath.replace(/\\/g, '/').startsWith('/mnt/');
+  const wslMount = state.folderPath.replace(/\\/g, "/").startsWith("/mnt/");
   return (
     <Modal
       busy={state.busy}
@@ -8779,10 +9411,10 @@ function ImportProjectModal({
                 Project name
               </div>
               <div className="mt-2 truncate text-base font-semibold text-text-primary">
-                {previewName || '-'}
+                {previewName || "-"}
               </div>
               <div className="mt-3 text-xs text-text-muted">
-                {state.imported?.summary.id ?? 'Pending validation'}
+                {state.imported?.summary.id ?? "Pending validation"}
               </div>
             </div>
           </div>
@@ -8951,7 +9583,7 @@ function HubResultList({
               {result.official ? <Badge tone="ok">Official</Badge> : null}
             </div>
             <div className="mt-1 line-clamp-2 text-xs text-text-muted">
-              {result.description || '-'}
+              {result.description || "-"}
             </div>
           </div>
           <Badge tone="neutral">{result.stars}</Badge>
@@ -8964,7 +9596,7 @@ function HubResultList({
 function CodePreview({ value }: { value: string }) {
   return (
     <pre className="overflow-auto rounded-control border border-border bg-bg-inset p-3 font-mono text-xs text-text-secondary">
-      {value || '-'}
+      {value || "-"}
     </pre>
   );
 }
@@ -9013,7 +9645,7 @@ function StatusPill({
   return (
     <div className="rounded-control border border-border bg-bg-inset p-3">
       <div className="flex items-center gap-2">
-        <StatusDot tone={ok ? 'ok' : 'neutral'} />
+        <StatusDot tone={ok ? "ok" : "neutral"} />
         <span>{label}</span>
       </div>
       {value ? (
@@ -9059,7 +9691,7 @@ function PortList({ ports }: { ports: PortBinding[] }) {
         <Badge
           key={`${port.hostIP}-${port.hostPort}-${port.containerPort}-${port.protocol}`}
         >
-          {port.hostPort ? `${port.hostPort}->` : ''}
+          {port.hostPort ? `${port.hostPort}->` : ""}
           {port.containerPort}/{port.protocol}
         </Badge>
       ))}
@@ -9105,42 +9737,42 @@ function buildRunImageRequest(state: RunImageState): RunImageRequest {
 
 function runImageValidation(state: RunImageState) {
   if (!state.imageRef.trim()) {
-    return 'Image ref is required';
+    return "Image ref is required";
   }
   try {
     parsePorts(state.portsText);
     parseEnv(state.envText);
     parseMounts(state.volumesText);
   } catch (error) {
-    return error instanceof Error ? error.message : 'Invalid run configuration';
+    return error instanceof Error ? error.message : "Invalid run configuration";
   }
-  return '';
+  return "";
 }
 
 function parsePorts(value: string): PortMapping[] {
   return splitLines(value).map((line) => {
-    const [portPart, protocol = 'tcp'] = line.split('/');
-    const parts = portPart.split(':');
-    const containerPort = parts.pop()?.trim() ?? '';
-    const hostPort = parts.pop()?.trim() ?? '';
-    const hostIP = parts.join(':').trim();
+    const [portPart, protocol = "tcp"] = line.split("/");
+    const parts = portPart.split(":");
+    const containerPort = parts.pop()?.trim() ?? "";
+    const hostPort = parts.pop()?.trim() ?? "";
+    const hostIP = parts.join(":").trim();
     if (!containerPort) {
-      throw new Error('Container port is required');
+      throw new Error("Container port is required");
     }
     return {
       hostIP,
       hostPort,
       containerPort,
-      protocol: protocol.trim() || 'tcp',
+      protocol: protocol.trim() || "tcp",
     };
   });
 }
 
 function parseEnv(value: string) {
   return splitLines(value).map((line) => {
-    const [name, envValue = ''] = line.split(/=(.*)/s);
+    const [name, envValue = ""] = line.split(/=(.*)/s);
     if (!name.trim()) {
-      throw new Error('Environment key is required');
+      throw new Error("Environment key is required");
     }
     return { name: name.trim(), value: envValue };
   });
@@ -9148,39 +9780,39 @@ function parseEnv(value: string) {
 
 function parseMounts(value: string): MountSpec[] {
   return splitLines(value).map((line) => {
-    if (line.includes('type=') || line.includes('target=')) {
+    if (line.includes("type=") || line.includes("target=")) {
       const values = parseCommaKeyValue(line);
-      const mountType = values.type || 'volume';
-      const target = values.target || values.destination || '';
-      const source = values.source || values.src || '';
+      const mountType = values.type || "volume";
+      const target = values.target || values.destination || "";
+      const source = values.source || values.src || "";
       if (!target || !source) {
-        throw new Error('Mount source and target are required');
+        throw new Error("Mount source and target are required");
       }
       return {
         type: mountType,
         source,
         target,
-        volumeName: mountType === 'volume' ? source : '',
+        volumeName: mountType === "volume" ? source : "",
         readOnly:
-          values.ro === 'true' ||
-          values.readonly === 'true' ||
-          values.mode === 'ro',
+          values.ro === "true" ||
+          values.readonly === "true" ||
+          values.mode === "ro",
       };
     }
-    const parts = line.split(':');
-    const mode = parts.length > 3 ? parts.pop() : 'rw';
-    const target = parts.pop()?.trim() ?? '';
-    const source = parts.slice(1).join(':').trim();
-    const mountType = parts[0]?.trim() || 'volume';
+    const parts = line.split(":");
+    const mode = parts.length > 3 ? parts.pop() : "rw";
+    const target = parts.pop()?.trim() ?? "";
+    const source = parts.slice(1).join(":").trim();
+    const mountType = parts[0]?.trim() || "volume";
     if (!target || !source) {
-      throw new Error('Mount source and target are required');
+      throw new Error("Mount source and target are required");
     }
     return {
       type: mountType,
       source,
       target,
-      volumeName: mountType === 'volume' ? source : '',
-      readOnly: mode === 'ro',
+      volumeName: mountType === "volume" ? source : "",
+      readOnly: mode === "ro",
     };
   });
 }
@@ -9192,7 +9824,7 @@ function parseKeyValueLines(value: string) {
   }
   const out: Record<string, string> = {};
   for (const line of pairs) {
-    const [key, nextValue = ''] = line.split(/=(.*)/s);
+    const [key, nextValue = ""] = line.split(/=(.*)/s);
     if (key.trim()) {
       out[key.trim()] = nextValue;
     }
@@ -9202,8 +9834,8 @@ function parseKeyValueLines(value: string) {
 
 function parseCommaKeyValue(value: string) {
   const out: Record<string, string> = {};
-  for (const raw of value.split(',')) {
-    const [key, nextValue = ''] = raw.split(/=(.*)/s);
+  for (const raw of value.split(",")) {
+    const [key, nextValue = ""] = raw.split(/=(.*)/s);
     if (key.trim()) {
       out[key.trim().toLowerCase()] = nextValue.trim();
     }
@@ -9231,7 +9863,7 @@ function splitCommand(value: string) {
     return [];
   }
   const matches = trimmed.match(/"([^"]*)"|'([^']*)'|[^\s]+/g) ?? [];
-  return matches.map((part) => part.replace(/^["']|["']$/g, ''));
+  return matches.map((part) => part.replace(/^["']|["']$/g, ""));
 }
 
 function appendLine(current: string, line: string) {
@@ -9244,55 +9876,55 @@ function imageRefWithTag(ref: string, tag: string) {
   if (!cleanRef || !cleanTag) {
     return cleanRef;
   }
-  const slash = cleanRef.lastIndexOf('/');
-  const colon = cleanRef.lastIndexOf(':');
-  if (colon > slash || cleanRef.includes('@')) {
+  const slash = cleanRef.lastIndexOf("/");
+  const colon = cleanRef.lastIndexOf(":");
+  if (colon > slash || cleanRef.includes("@")) {
     return cleanRef;
   }
   return `${cleanRef}:${cleanTag}`;
 }
 
 function suggestContainerName(ref: string) {
-  const withoutDigest = ref.split('@')[0] ?? ref;
-  const withoutTag = withoutDigest.replace(/:[^/:]+$/, '');
-  const name = withoutTag.split('/').pop() || 'container';
-  return name.replace(/[^a-zA-Z0-9_.-]/g, '-');
+  const withoutDigest = ref.split("@")[0] ?? ref;
+  const withoutTag = withoutDigest.replace(/:[^/:]+$/, "");
+  const name = withoutTag.split("/").pop() || "container";
+  return name.replace(/[^a-zA-Z0-9_.-]/g, "-");
 }
 
 function dockerRunPreview(state: RunImageState) {
-  const args = ['docker', 'run', '-d'];
+  const args = ["docker", "run", "-d"];
   if (state.name.trim()) {
-    args.push('--name', state.name.trim());
+    args.push("--name", state.name.trim());
   }
   for (const port of parsePorts(state.portsText)) {
-    const host = [port.hostIP, port.hostPort].filter(Boolean).join(':');
+    const host = [port.hostIP, port.hostPort].filter(Boolean).join(":");
     args.push(
-      '-p',
-      `${host ? `${host}:` : ''}${port.containerPort}/${port.protocol || 'tcp'}`,
+      "-p",
+      `${host ? `${host}:` : ""}${port.containerPort}/${port.protocol || "tcp"}`,
     );
   }
   for (const env of parseEnv(state.envText)) {
     args.push(
-      '-e',
-      `${env.name}=${secretLikeKey(env.name) ? '********' : env.value}`,
+      "-e",
+      `${env.name}=${secretLikeKey(env.name) ? "********" : env.value}`,
     );
   }
   for (const mount of parseMounts(state.volumesText)) {
     args.push(
-      '--mount',
-      `type=${mount.type},source=${mount.source || mount.volumeName},target=${mount.target},${mount.readOnly ? 'ro' : 'rw'}`,
+      "--mount",
+      `type=${mount.type},source=${mount.source || mount.volumeName},target=${mount.target},${mount.readOnly ? "ro" : "rw"}`,
     );
   }
   if (state.networkID) {
-    args.push('--network', state.networkID);
+    args.push("--network", state.networkID);
   }
-  if (state.restartPolicy && state.restartPolicy !== 'no') {
-    args.push('--restart', state.restartPolicy);
+  if (state.restartPolicy && state.restartPolicy !== "no") {
+    args.push("--restart", state.restartPolicy);
   }
   if (state.user.trim()) {
-    args.push('--user', state.user.trim());
+    args.push("--user", state.user.trim());
   }
-  args.push(state.imageRef.trim() || '<image>');
+  args.push(state.imageRef.trim() || "<image>");
   args.push(...splitCommand(state.commandText));
   return joinPreview(args);
 }
@@ -9301,58 +9933,58 @@ function safeDockerRunPreview(state: RunImageState) {
   try {
     return dockerRunPreview(state);
   } catch {
-    return 'docker run -d';
+    return "docker run -d";
   }
 }
 
 function dockerVolumePreview(state: CreateVolumeState) {
-  const args = ['docker', 'volume', 'create'];
+  const args = ["docker", "volume", "create"];
   if (state.driver.trim()) {
-    args.push('--driver', state.driver.trim());
+    args.push("--driver", state.driver.trim());
   }
   for (const [key, value] of Object.entries(
     parseKeyValueLines(state.driverOptsText) ?? {},
   )) {
-    args.push('--opt', `${key}=${value}`);
+    args.push("--opt", `${key}=${value}`);
   }
   for (const [key, value] of Object.entries(
     parseKeyValueLines(state.labelsText) ?? {},
   )) {
-    args.push('--label', `${key}=${value}`);
+    args.push("--label", `${key}=${value}`);
   }
-  args.push(state.name.trim() || '<name>');
+  args.push(state.name.trim() || "<name>");
   return joinPreview(args);
 }
 
 function dockerNetworkPreview(state: CreateNetworkState) {
-  const args = ['docker', 'network', 'create'];
-  const driver = state.driver === 'custom' ? state.customDriver : state.driver;
+  const args = ["docker", "network", "create"];
+  const driver = state.driver === "custom" ? state.customDriver : state.driver;
   if (driver.trim()) {
-    args.push('--driver', driver.trim());
+    args.push("--driver", driver.trim());
   }
   if (state.subnet.trim()) {
-    args.push('--subnet', state.subnet.trim());
+    args.push("--subnet", state.subnet.trim());
   }
   if (state.gateway.trim()) {
-    args.push('--gateway', state.gateway.trim());
+    args.push("--gateway", state.gateway.trim());
   }
   if (state.internal) {
-    args.push('--internal');
+    args.push("--internal");
   }
   if (state.attachable) {
-    args.push('--attachable');
+    args.push("--attachable");
   }
   for (const [key, value] of Object.entries(
     parseKeyValueLines(state.labelsText) ?? {},
   )) {
-    args.push('--label', `${key}=${value}`);
+    args.push("--label", `${key}=${value}`);
   }
-  args.push(state.name.trim() || '<name>');
+  args.push(state.name.trim() || "<name>");
   return joinPreview(args);
 }
 
 function joinPreview(args: string[]) {
-  return args.filter(Boolean).map(quotePreviewArg).join(' ');
+  return args.filter(Boolean).map(quotePreviewArg).join(" ");
 }
 
 function quotePreviewArg(value: string) {
@@ -9374,7 +10006,7 @@ function secretKeys(value: string) {
 
 function secretLikeKey(name: string) {
   const lower = name.toLowerCase();
-  return ['pass', 'password', 'token', 'secret', 'key', 'auth'].some((marker) =>
+  return ["pass", "password", "token", "secret", "key", "auth"].some((marker) =>
     lower.includes(marker),
   );
 }
@@ -9393,11 +10025,11 @@ export function filterContainers(
   const needle = normalize(search);
   return containers.filter((container) => {
     const matchesFilter =
-      filter === 'all' ||
-      (filter === 'stopped' && container.state === 'exited') ||
-      (filter === 'ungrouped' && !container.projectID) ||
+      filter === "all" ||
+      (filter === "stopped" && container.state === "exited") ||
+      (filter === "ungrouped" && !container.projectID) ||
       container.state === filter ||
-      (filter === 'unhealthy' && container.health === 'unhealthy');
+      (filter === "unhealthy" && container.health === "unhealthy");
     return matchesFilter && matchesContainerSearch(container, needle);
   });
 }
@@ -9412,12 +10044,12 @@ export function filterImages(
   return images.filter((image) => {
     const inUse = (counts[image.id] ?? 0) > 0 || image.inUse;
     const matchesFilter =
-      filter === 'all' ||
-      (filter === 'in-use' && inUse) ||
-      (filter === 'unused' && !inUse) ||
-      (filter === 'dangling' && imageDangling(image)) ||
-      (filter === 'updates' &&
-        Boolean(image.updateStatus && image.updateStatus !== 'unknown'));
+      filter === "all" ||
+      (filter === "in-use" && inUse) ||
+      (filter === "unused" && !inUse) ||
+      (filter === "dangling" && imageDangling(image)) ||
+      (filter === "updates" &&
+        Boolean(image.updateStatus && image.updateStatus !== "unknown"));
     return matchesFilter && matchesImageSearch(image, needle);
   });
 }
@@ -9430,9 +10062,9 @@ export function filterVolumes(
   const needle = normalize(search);
   return volumes.filter((volume) => {
     const matchesFilter =
-      filter === 'all' ||
-      (filter === 'in-use' && volume.inUse) ||
-      (filter === 'unused' && !volume.inUse);
+      filter === "all" ||
+      (filter === "in-use" && volume.inUse) ||
+      (filter === "unused" && !volume.inUse);
     return matchesFilter && matchesVolumeSearch(volume, needle);
   });
 }
@@ -9443,15 +10075,15 @@ export function filterNetworks(networks: NetworkSummary[], search: string) {
 }
 
 function normalize(value: unknown) {
-  return String(value ?? '').toLowerCase();
+  return String(value ?? "").toLowerCase();
 }
 
 function normalizedIncludes(value: unknown, needle: string) {
-  return needle === '' || normalize(value).includes(needle);
+  return needle === "" || normalize(value).includes(needle);
 }
 
 function matchesContainerSearch(container: ContainerSummary, needle: string) {
-  if (needle === '') {
+  if (needle === "") {
     return true;
   }
   return (
@@ -9464,7 +10096,7 @@ function matchesContainerSearch(container: ContainerSummary, needle: string) {
 }
 
 function matchesImageSearch(image: ImageSummary, needle: string) {
-  if (needle === '') {
+  if (needle === "") {
     return true;
   }
   if (normalizedIncludes(image.id, needle)) {
@@ -9484,7 +10116,7 @@ function matchesImageSearch(image: ImageSummary, needle: string) {
 }
 
 function matchesVolumeSearch(volume: VolumeSummary, needle: string) {
-  if (needle === '') {
+  if (needle === "") {
     return true;
   }
   return (
@@ -9496,7 +10128,7 @@ function matchesVolumeSearch(volume: VolumeSummary, needle: string) {
 }
 
 function matchesNetworkSearch(network: NetworkSummary, needle: string) {
-  if (needle === '') {
+  if (needle === "") {
     return true;
   }
   return (
@@ -9517,16 +10149,16 @@ function containerFilterCounts(containers: ContainerSummary[]) {
     ungrouped: 0,
   };
   for (const container of containers) {
-    if (container.state === 'running') {
+    if (container.state === "running") {
       counts.running++;
     }
-    if (container.state === 'exited') {
+    if (container.state === "exited") {
       counts.stopped++;
     }
-    if (container.state === 'paused') {
+    if (container.state === "paused") {
       counts.paused++;
     }
-    if (container.health === 'unhealthy') {
+    if (container.health === "unhealthy") {
       counts.unhealthy++;
     }
     if (!container.projectID) {
@@ -9557,7 +10189,7 @@ function imageFilterCounts(
     if (imageDangling(image)) {
       counts.dangling++;
     }
-    if (image.updateStatus && image.updateStatus !== 'unknown') {
+    if (image.updateStatus && image.updateStatus !== "unknown") {
       counts.updates++;
     }
   }
@@ -9577,50 +10209,105 @@ function volumeFilterCounts(volumes: VolumeSummary[]) {
 }
 
 function normalizePermissionMode(value: unknown): PermissionMode {
-  return value === 'group' || value === 'rootless' ? value : 'ask';
+  return value === "group" || value === "rootless" ? value : "ask";
 }
 
 function normalizeStringSetting(value: unknown, fallback: string) {
-  return typeof value === 'string' && value.trim() ? value : fallback;
+  return typeof value === "string" && value.trim() ? value : fallback;
+}
+
+function normalizeIntSetting(value: unknown, fallback: number) {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
 function normalizeBoolSetting(value: unknown, fallback: boolean) {
-  return typeof value === 'boolean' ? value : fallback;
+  return typeof value === "boolean" ? value : fallback;
+}
+
+function macOSSetupCheckRows(status: ProviderStatus | null) {
+  const problem = (code: string) =>
+    status?.problems?.find((entry) => entry.code === code) ?? null;
+  const warning = (code: string) =>
+    status?.warnings?.find((entry) => entry.code === code) ?? null;
+  const brewWarning = warning("BREW_MISSING");
+  return [
+    brewWarning && status
+      ? {
+          label: "Homebrew available",
+          state: "warn" as StatusToneID,
+          detail: brewWarning.message,
+        }
+      : setupCheckRow("Homebrew available", status, null),
+    setupCheckRow(
+      "Docker CLI installed",
+      status,
+      problem("DOCKER_MISSING"),
+      status?.dockerInstalled,
+    ),
+    setupCheckRow(
+      "Compose installed",
+      status,
+      problem("COMPOSE_MISSING"),
+      status?.composeInstalled,
+    ),
+    setupCheckRow(
+      "Buildx installed",
+      status,
+      problem("BUILDX_MISSING"),
+      status?.buildxInstalled,
+    ),
+    setupCheckRow("Colima installed", status, problem("COLIMA_MISSING")),
+    setupCheckRow("Colima running", status, problem("COLIMA_STOPPED")),
+    setupCheckRow("Colima context ready", status, problem("CONTEXT_MISSING")),
+    setupCheckRow(
+      "Docker daemon reachable",
+      status,
+      problem("DOCKERD_DOWN"),
+      status?.dockerRunning,
+    ),
+  ];
 }
 
 function windowsSetupCheckRows(status: ProviderStatus | null) {
   const problem = (code: string) =>
     status?.problems?.find((entry) => entry.code === code) ?? null;
   return [
-    setupCheckRow('WSL installed', status, problem('WSL_MISSING')),
-    setupCheckRow('Ubuntu distro present', status, problem('UBUNTU_MISSING')),
-    setupCheckRow('WSL2 enabled', status, problem('WSL2_REQUIRED')),
-    setupCheckRow('systemd enabled', status, problem('SYSTEMD_OFF')),
+    setupCheckRow("WSL installed", status, problem("WSL_MISSING")),
+    setupCheckRow("Ubuntu distro present", status, problem("UBUNTU_MISSING")),
+    setupCheckRow("WSL2 enabled", status, problem("WSL2_REQUIRED")),
+    setupCheckRow("systemd enabled", status, problem("SYSTEMD_OFF")),
     setupCheckRow(
-      'Docker CLI installed',
+      "Docker CLI installed",
       status,
-      problem('DOCKER_MISSING'),
+      problem("DOCKER_MISSING"),
       status?.dockerInstalled,
     ),
     setupCheckRow(
-      'Compose plugin installed',
+      "Compose plugin installed",
       status,
-      problem('COMPOSE_MISSING'),
+      problem("COMPOSE_MISSING"),
       status?.composeInstalled,
     ),
     setupCheckRow(
-      'Buildx plugin installed',
+      "Buildx plugin installed",
       status,
-      problem('BUILDX_MISSING'),
+      problem("BUILDX_MISSING"),
       status?.buildxInstalled,
     ),
     setupCheckRow(
-      'Docker daemon reachable',
+      "Docker daemon reachable",
       status,
-      problem('DOCKERD_DOWN'),
+      problem("DOCKERD_DOWN"),
       status?.dockerRunning,
     ),
   ];
+}
+
+function isUnencryptedDockerHost(host?: string) {
+  return String(host ?? "")
+    .trim()
+    .toLowerCase()
+    .startsWith("tcp://");
 }
 
 function setupCheckRow(
@@ -9632,55 +10319,55 @@ function setupCheckRow(
   if (!status) {
     return {
       label,
-      state: 'neutral' as StatusToneID,
-      detail: 'Not checked yet',
+      state: "neutral" as StatusToneID,
+      detail: "Not checked yet",
     };
   }
   if (problem) {
     return {
       label,
-      state: 'error' as StatusToneID,
+      state: "error" as StatusToneID,
       detail: problem.repairHint || problem.message,
     };
   }
   if (okFlag === false) {
     return {
       label,
-      state: 'neutral' as StatusToneID,
-      detail: 'Not detected yet',
+      state: "neutral" as StatusToneID,
+      detail: "Not detected yet",
     };
   }
-  return { label, state: 'ok' as StatusToneID, detail: 'Ready' };
+  return { label, state: "ok" as StatusToneID, detail: "Ready" };
 }
 
 function notificationTone(level: string): BadgeTone {
   switch (level) {
-    case 'ok':
-    case 'success':
-      return 'ok';
-    case 'warn':
-    case 'warning':
-      return 'warn';
-    case 'error':
-      return 'error';
-    case 'info':
-      return 'info';
+    case "ok":
+    case "success":
+      return "ok";
+    case "warn":
+    case "warning":
+      return "warn";
+    case "error":
+      return "error";
+    case "info":
+      return "info";
     default:
-      return 'neutral';
+      return "neutral";
   }
 }
 
 function notificationTargetPage(topic: string): PageID | null {
   switch (topic) {
-    case 'backup':
-      return 'volumes';
-    case 'project':
-      return 'projects';
-    case 'provider':
-    case 'system':
-      return 'overview';
-    case 'update':
-      return 'projects';
+    case "backup":
+      return "volumes";
+    case "project":
+      return "projects";
+    case "provider":
+    case "system":
+      return "overview";
+    case "update":
+      return "projects";
     default:
       return null;
   }
@@ -9706,19 +10393,19 @@ export function filterProjects(
       return false;
     }
     switch (filter) {
-      case 'running':
-        return project.status === 'running';
-      case 'stopped':
-        return project.status === 'stopped';
-      case 'partial':
-        return project.status === 'partial';
-      case 'unhealthy':
-        return project.health === 'unhealthy';
-      case 'updates':
+      case "running":
+        return project.status === "running";
+      case "stopped":
+        return project.status === "stopped";
+      case "partial":
+        return project.status === "partial";
+      case "unhealthy":
+        return project.health === "unhealthy";
+      case "updates":
         return projectUpdateCount(project) > 0;
-      case 'high-cpu':
+      case "high-cpu":
         return project.cpuPercent >= 80;
-      case 'recent':
+      case "recent":
         return isRecentlyChanged(project.lastChangedAt);
       default:
         return true;
@@ -9727,7 +10414,7 @@ export function filterProjects(
 }
 
 function matchesProjectSearch(project: ProjectSummary, query: string) {
-  if (query === '') {
+  if (query === "") {
     return true;
   }
   return (
@@ -9740,15 +10427,15 @@ function matchesProjectSearch(project: ProjectSummary, query: string) {
 
 function sortProjects(projects: ProjectSummary[], sort: ProjectSortID) {
   return [...projects].sort((left, right) => {
-    if (sort === 'activity') {
+    if (sort === "activity") {
       return dateMillis(right.lastChangedAt) - dateMillis(left.lastChangedAt);
     }
-    if (sort === 'cpu') {
+    if (sort === "cpu") {
       return right.cpuPercent - left.cpuPercent;
     }
     return left.name.localeCompare(right.name, undefined, {
       numeric: true,
-      sensitivity: 'base',
+      sensitivity: "base",
     });
   });
 }
@@ -9829,23 +10516,23 @@ function projectUpdateBadges(project: ProjectSummary) {
 }
 
 function isStatsSample(value: unknown): value is StatsSample {
-  if (!value || typeof value !== 'object') {
+  if (!value || typeof value !== "object") {
     return false;
   }
   const sample = value as Partial<StatsSample>;
   return (
-    typeof sample.containerID === 'string' &&
-    typeof sample.cpuPercent === 'number' &&
-    typeof sample.memoryBytes === 'number'
+    typeof sample.containerID === "string" &&
+    typeof sample.cpuPercent === "number" &&
+    typeof sample.memoryBytes === "number"
   );
 }
 
 function sampleLabel(sample: StatsSample) {
   const date = toDate(sample.sampledAt) ?? new Date();
   return date.toLocaleTimeString(undefined, {
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
   });
 }
 
@@ -9914,7 +10601,7 @@ function dashboardTopRows(
       (sample): MetricRankItem => ({
         id: sample.containerID,
         name: sample.containerName || shortID(sample.containerID),
-        kind: 'container',
+        kind: "container",
         cpuPercent: sample.cpuPercent,
         memoryBytes: sample.memoryBytes,
       }),
@@ -9958,10 +10645,10 @@ function formatMetricValue(
   value: number,
   key?: string,
 ) {
-  if (metric === 'memory') {
+  if (metric === "memory") {
     return formatBytes(value);
   }
-  if (metric === 'network' || key === 'netRx' || key === 'netTx') {
+  if (metric === "network" || key === "netRx" || key === "netTx") {
     return formatRate(value);
   }
   return `${value.toFixed(1)}%`;
@@ -9984,32 +10671,32 @@ function formatDuration(seconds: number) {
 
 function logLevelClass(level: LogLevelFilter) {
   switch (level) {
-    case 'error':
-      return 'text-error';
-    case 'warn':
-      return 'text-warn';
-    case 'info':
-      return 'text-info';
+    case "error":
+      return "text-error";
+    case "warn":
+      return "text-warn";
+    case "info":
+      return "text-info";
     default:
-      return 'text-text-muted';
+      return "text-text-muted";
   }
 }
 
 function cleanupPreviewCommands(state: CleanupState) {
   const commands = [];
   if (state.includeImages) {
-    commands.push('docker image prune --all');
+    commands.push("docker image prune --all");
   }
   if (state.includeContainers) {
-    commands.push('docker container prune');
+    commands.push("docker container prune");
   }
   if (state.includeBuildCache) {
-    commands.push('docker builder prune');
+    commands.push("docker builder prune");
   }
   if (state.includeVolumes) {
-    commands.push('docker volume prune');
+    commands.push("docker volume prune");
   }
-  return commands.length > 0 ? commands : ['docker system df'];
+  return commands.length > 0 ? commands : ["docker system df"];
 }
 
 function projectActionBusyKey(action: ProjectAction, projectID: string) {
@@ -10023,25 +10710,25 @@ function isRecentlyChanged(value: unknown) {
 
 function projectStatusTone(status: string): BadgeTone {
   switch (status) {
-    case 'running':
-      return 'ok';
-    case 'partial':
-      return 'warn';
-    case 'error':
-      return 'error';
-    case 'stopped':
-      return 'neutral';
+    case "running":
+      return "ok";
+    case "partial":
+      return "warn";
+    case "error":
+      return "error";
+    case "stopped":
+      return "neutral";
     default:
-      return 'info';
+      return "info";
   }
 }
 
 function dotTone(tone: BadgeTone): StatusToneID {
-  return tone === 'accent' ? 'info' : tone;
+  return tone === "accent" ? "info" : tone;
 }
 
 function sparkBars(seed: string) {
-  const source = seed || 'project';
+  const source = seed || "project";
   return Array.from({ length: 24 }, (_, index) => {
     const code = source.charCodeAt(index % source.length) || 17;
     return 18 + ((code + index * 13) % 70);
@@ -10049,13 +10736,13 @@ function sparkBars(seed: string) {
 }
 
 function projectNameFromPath(path: string) {
-  const normalized = path.trim().replace(/\\/g, '/').replace(/\/+$/, '');
+  const normalized = path.trim().replace(/\\/g, "/").replace(/\/+$/, "");
   return (
     normalized
-      .split('/')
+      .split("/")
       .pop()
       ?.toLowerCase()
-      .replace(/[^a-z0-9_-]/g, '-') ?? ''
+      .replace(/[^a-z0-9_-]/g, "-") ?? ""
   );
 }
 
@@ -10063,82 +10750,82 @@ function composeFileCandidates(folderPath: string) {
   if (!folderPath.trim()) {
     return [];
   }
-  const separator = folderPath.includes('\\') ? '\\' : '/';
-  const base = folderPath.replace(/[\\/]+$/, '');
+  const separator = folderPath.includes("\\") ? "\\" : "/";
+  const base = folderPath.replace(/[\\/]+$/, "");
   return [
-    'compose.yaml',
-    'compose.yml',
-    'docker-compose.yml',
-    'docker-compose.yaml',
+    "compose.yaml",
+    "compose.yml",
+    "docker-compose.yml",
+    "docker-compose.yaml",
   ].map((name) => `${base}${separator}${name}`);
 }
 
 function containerTone(container: ContainerSummary): BadgeTone {
-  if (container.health === 'unhealthy') {
-    return 'error';
+  if (container.health === "unhealthy") {
+    return "error";
   }
   switch (container.state) {
-    case 'running':
-      return 'ok';
-    case 'paused':
-    case 'restarting':
-      return 'warn';
-    case 'dead':
-      return 'error';
+    case "running":
+      return "ok";
+    case "paused":
+    case "restarting":
+      return "warn";
+    case "dead":
+      return "error";
     default:
-      return 'neutral';
+      return "neutral";
   }
 }
 
 function healthTone(health: string): BadgeTone {
   switch (health) {
-    case 'healthy':
-      return 'ok';
-    case 'starting':
-      return 'warn';
-    case 'unhealthy':
-      return 'error';
+    case "healthy":
+      return "ok";
+    case "starting":
+      return "warn";
+    case "unhealthy":
+      return "error";
     default:
-      return 'neutral';
+      return "neutral";
   }
 }
 
 function updateTone(status?: string): BadgeTone {
-  if (!status || status === 'unknown') {
-    return 'neutral';
+  if (!status || status === "unknown") {
+    return "neutral";
   }
-  if (status === 'up_to_date') {
-    return 'ok';
+  if (status === "up_to_date") {
+    return "ok";
   }
   if (
-    status === 'error' ||
-    status === 'auth_required' ||
-    status === 'rate_limited'
+    status === "error" ||
+    status === "auth_required" ||
+    status === "rate_limited"
   ) {
-    return 'error';
+    return "error";
   }
-  return 'warn';
+  return "warn";
 }
 
 function riskTone(risk?: string): BadgeTone {
   switch (risk) {
-    case 'dangerous':
-    case 'destructive':
-      return 'error';
-    case 'needs_confirmation':
-      return 'warn';
-    case 'safe':
-      return 'ok';
+    case "dangerous":
+    case "destructive":
+      return "error";
+    case "needs_confirmation":
+      return "warn";
+    case "safe":
+      return "ok";
     default:
-      return 'neutral';
+      return "neutral";
   }
 }
 
 function formatBytes(value?: number) {
   if (!value || value <= 0) {
-    return '0 B';
+    return "0 B";
   }
-  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   let next = value;
   let unit = 0;
   while (next >= 1024 && unit < units.length - 1) {
@@ -10150,7 +10837,7 @@ function formatBytes(value?: number) {
 
 function formatMemory(used?: number, limit?: number) {
   if (!used) {
-    return '-';
+    return "-";
   }
   return limit
     ? `${formatBytes(used)} / ${formatBytes(limit)}`
@@ -10159,15 +10846,15 @@ function formatMemory(used?: number, limit?: number) {
 
 function shortID(value: string) {
   if (!value) {
-    return '-';
+    return "-";
   }
-  const clean = value.replace(/^sha256:/, '');
+  const clean = value.replace(/^sha256:/, "");
   return clean.length > 12 ? `${clean.slice(0, 12)}` : clean;
 }
 
 function shortPath(value: string) {
-  const normalized = value.replace(/\\/g, '/');
-  return normalized.split('/').filter(Boolean).slice(-2).join('/') || value;
+  const normalized = value.replace(/\\/g, "/");
+  return normalized.split("/").filter(Boolean).slice(-2).join("/") || value;
 }
 
 function dateMillis(value: unknown) {
@@ -10178,18 +10865,18 @@ function dateMillis(value: unknown) {
 function formatDate(value: unknown) {
   const date = toDate(value);
   if (!date) {
-    return '-';
+    return "-";
   }
   return date.toLocaleString(undefined, {
-    dateStyle: 'medium',
-    timeStyle: 'short',
+    dateStyle: "medium",
+    timeStyle: "short",
   });
 }
 
 function relativeTime(value: number) {
   const diff = Math.max(0, Date.now() - value);
   if (diff < 60_000) {
-    return 'just now';
+    return "just now";
   }
   const minutes = Math.floor(diff / 60_000);
   if (minutes < 60) {
@@ -10208,7 +10895,7 @@ function toDate(value: unknown): Date | null {
 
 function imageRefs(image: ImageSummary) {
   const tags =
-    image.repoTags?.filter((tag) => tag && tag !== '<none>:<none>') ?? [];
+    image.repoTags?.filter((tag) => tag && tag !== "<none>:<none>") ?? [];
   return tags.length > 0 ? tags : (image.repoDigests ?? []);
 }
 
@@ -10218,8 +10905,8 @@ function primaryImageRef(image: ImageSummary) {
 
 function imageRepo(image: ImageSummary) {
   const ref = primaryImageRef(image);
-  const slash = ref.includes('/') ? ref.lastIndexOf('/') : -1;
-  const colon = ref.lastIndexOf(':');
+  const slash = ref.includes("/") ? ref.lastIndexOf("/") : -1;
+  const colon = ref.lastIndexOf(":");
   if (colon > slash) {
     return ref.slice(0, colon);
   }
@@ -10228,12 +10915,12 @@ function imageRepo(image: ImageSummary) {
 
 function imageTag(image: ImageSummary) {
   const ref = primaryImageRef(image);
-  const slash = ref.includes('/') ? ref.lastIndexOf('/') : -1;
-  const colon = ref.lastIndexOf(':');
+  const slash = ref.includes("/") ? ref.lastIndexOf("/") : -1;
+  const colon = ref.lastIndexOf(":");
   if (colon > slash) {
     return ref.slice(colon + 1);
   }
-  return '<none>';
+  return "<none>";
 }
 
 function imageDangling(image: ImageSummary) {
@@ -10242,15 +10929,15 @@ function imageDangling(image: ImageSummary) {
 
 function containerRows(container: ContainerSummary): Array<[string, string]> {
   return [
-    ['ID', container.id],
-    ['Image', container.image],
-    ['Image ID', container.imageID ?? '-'],
-    ['Status', container.state],
-    ['Health', container.health],
-    ['Project', container.projectID ?? '-'],
-    ['Service', container.service ?? '-'],
-    ['Created', formatDate(container.createdAt)],
-    ['Restarts', String(container.restarts ?? 0)],
+    ["ID", container.id],
+    ["Image", container.image],
+    ["Image ID", container.imageID ?? "-"],
+    ["Status", container.state],
+    ["Health", container.health],
+    ["Project", container.projectID ?? "-"],
+    ["Service", container.service ?? "-"],
+    ["Created", formatDate(container.createdAt)],
+    ["Restarts", String(container.restarts ?? 0)],
   ];
 }
 
@@ -10259,12 +10946,12 @@ function imageRows(
   usedBy: number,
 ): Array<[string, string]> {
   return [
-    ['Image ID', image.id],
-    ['Reference', primaryImageRef(image)],
-    ['Size', formatBytes(image.sizeBytes)],
-    ['Created', formatDate(image.createdAt)],
-    ['Used by', String(usedBy || (image.inUse ? '>=1' : 0))],
-    ['Update', image.updateStatus ?? 'unknown'],
+    ["Image ID", image.id],
+    ["Reference", primaryImageRef(image)],
+    ["Size", formatBytes(image.sizeBytes)],
+    ["Created", formatDate(image.createdAt)],
+    ["Used by", String(usedBy || (image.inUse ? ">=1" : 0))],
+    ["Update", image.updateStatus ?? "unknown"],
   ];
 }
 
@@ -10274,10 +10961,10 @@ function imageDetailRows(
 ): Array<[string, string]> {
   return [
     ...imageRows(detail.summary, usedBy),
-    ['Architecture', detail.architecture || '-'],
-    ['OS', detail.os || '-'],
-    ['Author', detail.author || '-'],
-    ['Layers', String(detail.layers?.length ?? 0)],
+    ["Architecture", detail.architecture || "-"],
+    ["OS", detail.os || "-"],
+    ["Author", detail.author || "-"],
+    ["Layers", String(detail.layers?.length ?? 0)],
   ];
 }
 
@@ -10286,13 +10973,13 @@ function volumeRows(
   detail?: VolumeDetail,
 ): Array<[string, string]> {
   return [
-    ['Name', volume.name],
-    ['Driver', volume.driver],
-    ['Size', volume.sizeBytes ? formatBytes(volume.sizeBytes) : '-'],
-    ['In use', volume.inUse ? 'yes' : 'no'],
-    ['Containers', String(detail?.containers?.length ?? 0)],
-    ['Mountpoint', volume.mountpoint ?? '-'],
-    ['Project', volume.labels?.[composeProjectLabel] ?? '-'],
+    ["Name", volume.name],
+    ["Driver", volume.driver],
+    ["Size", volume.sizeBytes ? formatBytes(volume.sizeBytes) : "-"],
+    ["In use", volume.inUse ? "yes" : "no"],
+    ["Containers", String(detail?.containers?.length ?? 0)],
+    ["Mountpoint", volume.mountpoint ?? "-"],
+    ["Project", volume.labels?.[composeProjectLabel] ?? "-"],
   ];
 }
 
@@ -10301,15 +10988,15 @@ function networkRows(
   detail?: NetworkDetail,
 ): Array<[string, string]> {
   return [
-    ['ID', network.id],
-    ['Name', network.name],
-    ['Driver', network.driver],
-    ['Scope', network.scope ?? '-'],
-    ['Subnet', detail?.subnet ?? '-'],
-    ['Gateway', detail?.gateway ?? '-'],
-    ['Containers', String(detail?.containers?.length ?? 0)],
-    ['Internal', network.internal ? 'yes' : 'no'],
-    ['Attachable', network.attachable ? 'yes' : 'no'],
+    ["ID", network.id],
+    ["Name", network.name],
+    ["Driver", network.driver],
+    ["Scope", network.scope ?? "-"],
+    ["Subnet", detail?.subnet ?? "-"],
+    ["Gateway", detail?.gateway ?? "-"],
+    ["Containers", String(detail?.containers?.length ?? 0)],
+    ["Internal", network.internal ? "yes" : "no"],
+    ["Attachable", network.attachable ? "yes" : "no"],
   ];
 }
 
@@ -10321,6 +11008,6 @@ function formatJSON(raw: string) {
   }
 }
 
-const composeProjectLabel = 'com.docker.compose.project';
+const composeProjectLabel = "com.docker.compose.project";
 
 export default App;
