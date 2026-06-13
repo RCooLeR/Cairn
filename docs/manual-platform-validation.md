@@ -79,6 +79,22 @@ Current evidence: frontend tests cover the Windows setup modal path from no-prov
 - [ ] Windows runner/VM E2E smoke: Settings -> Providers updates `windows.wsl_distro`, reruns detection, and preserves Docker Desktop contexts.
 - [ ] Fresh clean Win11 manual checklist: run onboarding from WSL absent through working `cairn-dev` Docker backend, including reboot/resume guidance if Windows requires restart.
 
+## Phase 6.1 macOS Colima Provider
+
+Current evidence: parser/unit tests cover `colima status --json`, `docker context ls --format json`, healthy Colima detection, Docker/Colima/context failure mapping, Homebrew-required install guidance, Colima install CommandPlan preview/execution/progress, context-scoped Compose execution with workdir/env passthrough, lifecycle commands, zsh host shell, and `colima ssh` backend shell. Local gates passed: `go test ./internal/providers`, `go test . ./internal/...`, `go vet . ./internal/...`, `go build . ./internal/...`, `golangci-lint v2.12.2 run --timeout=5m`, frontend ESLint, Vitest, TypeScript, and audit. A Colima-capable macOS VM is unavailable in this environment, so the macOS runtime rows below remain manual TODOs.
+
+- [x] Unit-test `colima status --json` parsing.
+- [x] Unit-test Docker context list parsing, including line-delimited JSON and array fixtures.
+- [x] Unit-test healthy Colima detection with Docker CLI, Compose, Buildx, context, daemon ping, and socket host.
+- [x] Unit-test Homebrew-missing install guidance without silently scripting the curl-pipe installer.
+- [x] Unit-test `colima start|stop|restart -p <profile>` lifecycle and Colima terminal commands.
+- [ ] macOS Apple Silicon VM: Homebrew absent -> setup shows Homebrew guidance and command preview only.
+- [ ] macOS Apple Silicon VM: Homebrew present, Colima absent -> install plan installs Docker CLI, Docker Compose, and Colima, starts the configured profile, selects context, and verifies hello-world.
+- [ ] macOS Apple Silicon VM: Colima installed but stopped -> detection reports `COLIMA_STOPPED`, Start reaches healthy.
+- [ ] macOS Apple Silicon VM: custom profile/resource settings -> `colima start -p <profile> --cpu N --memory N --disk N` and context `colima-<profile>` are used.
+- [ ] macOS Apple Silicon VM: rerun the Phase 1-3 Docker integration suite against Colima.
+- [ ] macOS Intel best-effort: repeat healthy detection/start/stop and project import.
+
 ## Full Platform Matrix TODO
 
 - [ ] Windows 11 x64: WSL present/absent, Ubuntu present/absent/multiple, Docker in Ubuntu present/absent, systemd on/off.

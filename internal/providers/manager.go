@@ -39,6 +39,10 @@ type distroConfigurable interface {
 	SetDistro(string)
 }
 
+type colimaConfigurable interface {
+	SetColimaConfig(profile string, cpu, memoryGB, diskGB int)
+}
+
 func NewManager(repo *store.ProviderRepository, settings *store.SettingsRepository, providerSet []PlatformProvider) *Manager {
 	providersByID := make(map[string]PlatformProvider, len(providerSet))
 	order := make([]string, 0, len(providerSet))
@@ -61,8 +65,11 @@ func NewManager(repo *store.ProviderRepository, settings *store.SettingsReposito
 
 func NewDefaultManager(repo *store.ProviderRepository, settings *store.SettingsRepository, linuxSocketPath string) *Manager {
 	var providerSet []PlatformProvider
-	if runtime.GOOS == "linux" {
+	switch runtime.GOOS {
+	case "linux":
 		providerSet = append(providerSet, NewLinuxNative(LinuxNativeOptions{SocketPath: linuxSocketPath}))
+	case "darwin":
+		providerSet = append(providerSet, NewMacOSColima(MacOSColimaOptions{}))
 	}
 	return NewManager(repo, settings, providerSet)
 }
@@ -348,6 +355,25 @@ func (m *Manager) applyProviderSettings(ctx context.Context, provider PlatformPr
 		if distro, err := m.settings.GetString(ctx, "windows.wsl_distro"); err == nil && strings.TrimSpace(distro) != "" {
 			configurable.SetDistro(distro)
 		}
+	}
+	if configurable, ok := provider.(colimaConfigurable); ok && provider.Type() == TypeMacOSColima {
+		profile := ""
+		cpu := 0
+		memoryGB := 0
+		diskGB := 0
+		if value, err := m.settings.GetString(ctx, "macos.colima_profile"); err == nil {
+			profile = value
+		}
+		if value, err := m.settings.GetInt(ctx, "macos.colima_cpu"); err == nil {
+			cpu = value
+		}
+		if value, err := m.settings.GetInt(ctx, "macos.colima_memory_gb"); err == nil {
+			memoryGB = value
+		}
+		if value, err := m.settings.GetInt(ctx, "macos.colima_disk_gb"); err == nil {
+			diskGB = value
+		}
+		configurable.SetColimaConfig(profile, cpu, memoryGB, diskGB)
 	}
 }
 

@@ -344,7 +344,11 @@ func hasBlockingProblem(problems []models.ProviderProblem) bool {
 			ProblemDockerDown,
 			ProblemSocketPerm,
 			ProblemComposeMissing,
-			ProblemBuildxMissing:
+			ProblemBuildxMissing,
+			ProblemColimaMissing,
+			ProblemColimaStopped,
+			ProblemContextMissing,
+			ProblemContextNotSelected:
 			return true
 		}
 	}

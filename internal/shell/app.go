@@ -185,6 +185,8 @@ func defaultProviderSet() []providers.PlatformProvider {
 		return []providers.PlatformProvider{providers.NewLinuxNative(providers.LinuxNativeOptions{})}
 	case "windows":
 		return []providers.PlatformProvider{providers.NewWindowsWSL(providers.WindowsWSLOptions{})}
+	case "darwin":
+		return []providers.PlatformProvider{providers.NewMacOSColima(providers.MacOSColimaOptions{})}
 	}
 	return nil
 }

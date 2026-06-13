@@ -31,8 +31,13 @@ const (
 	ProblemSocketPerm                 = "PERM_SOCKET"
 	ProblemComposeMissing             = "COMPOSE_MISSING"
 	ProblemBuildxMissing              = "BUILDX_MISSING"
+	ProblemColimaMissing              = "COLIMA_MISSING"
+	ProblemColimaStopped              = "COLIMA_STOPPED"
+	ProblemContextMissing             = "CONTEXT_MISSING"
+	ProblemContextNotSelected         = "CONTEXT_NOT_SELECTED"
 
 	WarningSystemdMissing = "SYSTEMD_MISSING"
+	WarningBrewMissing    = "BREW_MISSING"
 )
 
 type CommandResult struct {

@@ -86,6 +86,33 @@ func TestManagerAppliesWindowsWSLDistroSetting(t *testing.T) {
 	}
 }
 
+func TestManagerAppliesMacOSColimaSettings(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openProviderTestStore(t, ctx)
+	provider := &fakeProvider{id: "macos_colima", kind: TypeMacOSColima, platform: PlatformMacOS, healthy: true}
+	manager := NewManager(db.Providers(), db.Settings(), []PlatformProvider{provider})
+	if err := db.Settings().SetString(ctx, "macos.colima_profile", "dev"); err != nil {
+		t.Fatalf("SetString profile error = %v", err)
+	}
+	if err := db.Settings().SetInt(ctx, "macos.colima_cpu", 6); err != nil {
+		t.Fatalf("SetInt cpu error = %v", err)
+	}
+	if err := db.Settings().SetInt(ctx, "macos.colima_memory_gb", 12); err != nil {
+		t.Fatalf("SetInt memory error = %v", err)
+	}
+	if err := db.Settings().SetInt(ctx, "macos.colima_disk_gb", 100); err != nil {
+		t.Fatalf("SetInt disk error = %v", err)
+	}
+
+	if _, err := manager.Detect(ctx, provider.ID()); err != nil {
+		t.Fatalf("Detect() error = %v", err)
+	}
+	if provider.colimaProfile != "dev" || provider.colimaCPU != 6 || provider.colimaMemoryGB != 12 || provider.colimaDiskGB != 100 {
+		t.Fatalf("colima settings = %q/%d/%d/%d", provider.colimaProfile, provider.colimaCPU, provider.colimaMemoryGB, provider.colimaDiskGB)
+	}
+}
+
 func openProviderTestStore(t *testing.T, ctx context.Context) *store.Store {
 	t.Helper()
 	db, err := store.Open(ctx, t.TempDir()+"/cairn.db")
@@ -107,6 +134,11 @@ type fakeProvider struct {
 	platform string
 	healthy  bool
 	distro   string
+
+	colimaProfile  string
+	colimaCPU      int
+	colimaMemoryGB int
+	colimaDiskGB   int
 }
 
 func (p *fakeProvider) ID() string          { return p.id }
@@ -126,6 +158,12 @@ func (p *fakeProvider) Detect(context.Context) (*models.ProviderStatus, error) {
 }
 func (p *fakeProvider) SetDistro(distro string) {
 	p.distro = distro
+}
+func (p *fakeProvider) SetColimaConfig(profile string, cpu, memoryGB, diskGB int) {
+	p.colimaProfile = profile
+	p.colimaCPU = cpu
+	p.colimaMemoryGB = memoryGB
+	p.colimaDiskGB = diskGB
 }
 func (p *fakeProvider) PlanInstall(context.Context, models.InstallOptions) (*models.CommandPlan, error) {
 	return nil, nil
