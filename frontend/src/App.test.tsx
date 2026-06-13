@@ -15,6 +15,7 @@ import type {
   DiskUsageCategory,
   CheatsheetEntry,
   LogLine,
+  Notification,
   ProjectDetail,
   ProjectSummary,
   ProviderStatus,
@@ -114,6 +115,8 @@ const terminalServiceMock = vi.hoisted(() => ({
 const settingsServiceMock = vi.hoisted(() => ({
   GetSettings: vi.fn(),
   SetSetting: vi.fn(),
+  GetNotifications: vi.fn(),
+  MarkNotificationsRead: vi.fn(),
   GetCheatsheet: vi.fn(),
 }));
 
@@ -296,6 +299,8 @@ describe('App inventory shell', () => {
       'linux.sudo_mode': 'ask',
     });
     settingsServiceMock.SetSetting.mockResolvedValue(undefined);
+    settingsServiceMock.GetNotifications.mockResolvedValue([]);
+    settingsServiceMock.MarkNotificationsRead.mockResolvedValue(undefined);
     settingsServiceMock.GetCheatsheet.mockResolvedValue(seededCheatsheet());
     runtimeMock.openFile.mockResolvedValue('');
     runtimeMock.saveFile.mockResolvedValue('/tmp/cairn-logs.jsonl');
@@ -354,6 +359,39 @@ describe('App inventory shell', () => {
     expect(runtimeMock.on).toHaveBeenCalledWith(
       'objects:changed',
       expect.any(Function),
+    );
+  });
+
+  it('opens the notification center and marks notifications read', async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    settingsServiceMock.GetNotifications.mockResolvedValue(
+      seededNotifications(),
+    );
+
+    render(<App />);
+
+    const bell = await screen.findByRole('button', {
+      name: 'Notifications 1 unread',
+    });
+    fireEvent.click(bell);
+
+    const dialog = await screen.findByRole('dialog', {
+      name: 'Notification center',
+    });
+    expect(within(dialog).getByText('Provider degraded')).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByText('Provider degraded'));
+    expect(
+      await screen.findByRole('heading', { name: 'Overview' }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(bell);
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Mark all read' }),
+    );
+    await waitFor(() =>
+      expect(settingsServiceMock.MarkNotificationsRead).toHaveBeenCalledWith(
+        [],
+      ),
     );
   });
 
@@ -1437,6 +1475,29 @@ function seededCheatsheet(): CheatsheetEntry[] {
       description: 'Remove unused Docker data',
       risk: Risk.RiskDangerous,
       runnable: false,
+    },
+  ];
+}
+
+function seededNotifications(): Notification[] {
+  return [
+    {
+      id: 1,
+      level: 'warn',
+      title: 'Provider degraded',
+      body: 'Docker daemon stopped',
+      topic: 'provider',
+      read: false,
+      createdAt: '2026-06-13T09:00:00Z',
+    },
+    {
+      id: 2,
+      level: 'info',
+      title: 'Update check complete',
+      body: 'No updates found',
+      topic: 'update',
+      read: true,
+      createdAt: '2026-06-13T08:55:00Z',
     },
   ];
 }

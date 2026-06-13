@@ -104,7 +104,11 @@ func Run(assets fs.FS) error {
 			application.NewService(&services.ImageLineageService{}),
 			application.NewService(&services.BackupService{}),
 			application.NewService(&services.RegistryService{}),
-			application.NewService(&services.SettingsService{Audit: auditRepo, Settings: db.Settings()}),
+			application.NewService(&services.SettingsService{
+				Audit:         auditRepo,
+				Notifications: db.Notifications(),
+				Settings:      db.Settings(),
+			}),
 		},
 		OnShutdown: func() {
 			cancel()

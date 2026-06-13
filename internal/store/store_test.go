@@ -200,6 +200,71 @@ func TestSettingsDefaultsAndRoundTrip(t *testing.T) {
 	}
 }
 
+func TestNotificationsRoundTripAndMarkRead(t *testing.T) {
+	ctx := context.Background()
+	s := openMigratedStore(t, ctx)
+	defer closeStore(t, s)
+
+	repo := s.Notifications()
+	firstID, err := repo.Insert(ctx, NotificationRecord{
+		Level: "warn",
+		Title: "Provider degraded",
+		Body:  "Docker daemon stopped",
+		Topic: "provider",
+	})
+	if err != nil {
+		t.Fatalf("Insert first notification: %v", err)
+	}
+	if _, err := repo.Insert(ctx, NotificationRecord{
+		Level: "info",
+		Title: "Update available",
+		Topic: "update",
+		Read:  true,
+	}); err != nil {
+		t.Fatalf("Insert second notification: %v", err)
+	}
+
+	all, err := repo.List(ctx, false, 10)
+	if err != nil {
+		t.Fatalf("List all: %v", err)
+	}
+	if len(all) != 2 || all[0].Title == "" {
+		t.Fatalf("all notifications = %#v", all)
+	}
+	unread, err := repo.List(ctx, true, 10)
+	if err != nil {
+		t.Fatalf("List unread: %v", err)
+	}
+	if len(unread) != 1 || unread[0].ID != firstID || unread[0].Read {
+		t.Fatalf("unread notifications = %#v", unread)
+	}
+
+	if err := repo.MarkRead(ctx, []int64{firstID}); err != nil {
+		t.Fatalf("MarkRead one: %v", err)
+	}
+	unread, err = repo.List(ctx, true, 10)
+	if err != nil {
+		t.Fatalf("List unread after mark: %v", err)
+	}
+	if len(unread) != 0 {
+		t.Fatalf("unread after mark = %#v, want empty", unread)
+	}
+
+	if _, err := repo.Insert(ctx, NotificationRecord{Level: "error", Title: "Action failed"}); err != nil {
+		t.Fatalf("Insert third notification: %v", err)
+	}
+	if err := repo.MarkRead(ctx, nil); err != nil {
+		t.Fatalf("MarkRead all: %v", err)
+	}
+	unread, err = repo.List(ctx, true, 10)
+	if err != nil {
+		t.Fatalf("List unread after mark all: %v", err)
+	}
+	if len(unread) != 0 {
+		t.Fatalf("unread after mark all = %#v, want empty", unread)
+	}
+}
+
 func openMigratedStore(t *testing.T, ctx context.Context) *Store {
 	t.Helper()
 

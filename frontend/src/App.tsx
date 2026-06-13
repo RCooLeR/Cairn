@@ -13,6 +13,7 @@ import type {
   MountSpec,
   NetworkDetail,
   NetworkSummary,
+  Notification,
   PortMapping,
   PortBinding,
   ProviderProblem,
@@ -532,6 +533,12 @@ function App() {
   const [repairSaving, setRepairSaving] = useState(false);
   const [permissionMode, setPermissionMode] =
     useState<PermissionMode>('ask');
+  const [notifications, setNotifications] = useState<Notification[]>([]);
+  const [notificationsOpen, setNotificationsOpen] = useState(false);
+  const [notificationsLoading, setNotificationsLoading] = useState(false);
+  const [notificationsError, setNotificationsError] = useState<string | null>(
+    null,
+  );
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [queuedTerminalCommand, setQueuedTerminalCommand] =
     useState<TerminalCommandRequest | null>(null);
@@ -668,6 +675,45 @@ function App() {
       active = false;
     };
   }, []);
+
+  const refreshNotifications = useCallback(async () => {
+    setNotificationsLoading(true);
+    setNotificationsError(null);
+    try {
+      const nextNotifications = await SettingsService.GetNotifications(false);
+      setNotifications(nextNotifications ?? []);
+    } catch (error: unknown) {
+      setNotificationsError(
+        error instanceof Error ? error.message : 'Unable to load notifications',
+      );
+    } finally {
+      setNotificationsLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshNotifications();
+  }, [refreshNotifications]);
+
+  const markAllNotificationsRead = useCallback(async () => {
+    setNotificationsLoading(true);
+    setNotificationsError(null);
+    try {
+      await SettingsService.MarkNotificationsRead([]);
+      setNotifications((current) =>
+        current.map((notification) => ({ ...notification, read: true })),
+      );
+      await refreshNotifications();
+    } catch (error: unknown) {
+      setNotificationsError(
+        error instanceof Error
+          ? error.message
+          : 'Unable to mark notifications read',
+      );
+    } finally {
+      setNotificationsLoading(false);
+    }
+  }, [refreshNotifications]);
 
   useEffect(() => {
     void refreshInventory();
@@ -837,6 +883,9 @@ function App() {
     : providerRepairNeeded
       ? 'error'
       : 'neutral';
+  const unreadNotifications = notifications.filter(
+    (notification) => !notification.read,
+  ).length;
 
   const imageUseCounts = useMemo(
     () => imageUsageCounts(containers),
@@ -1839,14 +1888,42 @@ function App() {
                   variant="secondary"
                 />
               </Tooltip>
-              <Tooltip label="Notifications">
-                <Button
-                  aria-label="Notifications"
-                  icon={<Bell size={17} />}
-                  size="icon"
-                  variant="secondary"
+              <div className="relative">
+                <Tooltip label="Notifications">
+                  <Button
+                    aria-label={
+                      unreadNotifications > 0
+                        ? `Notifications ${unreadNotifications} unread`
+                        : 'Notifications'
+                    }
+                    icon={<Bell size={17} />}
+                    onClick={() =>
+                      setNotificationsOpen((current) => !current)
+                    }
+                    size="icon"
+                    variant="secondary"
+                  />
+                </Tooltip>
+                {unreadNotifications > 0 ? (
+                  <span className="absolute -right-1 -top-1 flex h-4 min-w-4 items-center justify-center rounded-full bg-warn px-1 text-[10px] font-semibold text-bg-app">
+                    {unreadNotifications > 9 ? '9+' : unreadNotifications}
+                  </span>
+                ) : null}
+                <NotificationCenter
+                  error={notificationsError}
+                  loading={notificationsLoading}
+                  notifications={notifications}
+                  onClose={() => setNotificationsOpen(false)}
+                  onMarkAllRead={() => {
+                    void markAllNotificationsRead();
+                  }}
+                  onNavigate={(page) => {
+                    navigate(page);
+                    setNotificationsOpen(false);
+                  }}
+                  open={notificationsOpen}
                 />
-              </Tooltip>
+              </div>
             </div>
           </header>
 
@@ -2151,6 +2228,121 @@ function GlobalStateBanner({
         >
           Retry
         </Button>
+      </div>
+    </div>
+  );
+}
+
+function NotificationCenter({
+  error,
+  loading,
+  notifications,
+  onClose,
+  onMarkAllRead,
+  onNavigate,
+  open,
+}: {
+  error: string | null;
+  loading: boolean;
+  notifications: Notification[];
+  onClose: () => void;
+  onMarkAllRead: () => void;
+  onNavigate: (page: PageID) => void;
+  open: boolean;
+}) {
+  if (!open) {
+    return null;
+  }
+
+  const unread = notifications.filter((notification) => !notification.read)
+    .length;
+
+  return (
+    <div
+      aria-label="Notification center"
+      className="absolute right-0 top-11 z-40 w-[min(360px,calc(100vw-2rem))] rounded-card border border-border bg-bg-panel shadow-2xl"
+      role="dialog"
+    >
+      <div className="flex items-center justify-between gap-3 border-b border-border px-4 py-3">
+        <div>
+          <div className="font-medium text-text-primary">Notifications</div>
+          <div className="text-xs text-text-muted">{unread} unread</div>
+        </div>
+        <div className="flex gap-2">
+          <Button
+            disabled={unread === 0 || loading}
+            disabledReason="No unread notifications"
+            onClick={onMarkAllRead}
+            size="sm"
+            variant="secondary"
+          >
+            Mark all read
+          </Button>
+          <Button onClick={onClose} size="sm" variant="ghost">
+            Close
+          </Button>
+        </div>
+      </div>
+      <div className="max-h-[420px] overflow-y-auto p-2">
+        {error ? (
+          <div className="rounded-control border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
+            {error}
+          </div>
+        ) : null}
+        {loading && notifications.length === 0 ? <TableSkeleton /> : null}
+        {!loading && notifications.length === 0 ? (
+          <EmptyState
+            body="Provider, update, backup, and system messages appear here."
+            icon={<Bell size={26} />}
+            title="No notifications"
+          />
+        ) : null}
+        {notifications.map((notification) => {
+          const target = notificationTargetPage(notification.topic);
+          return (
+            <button
+              className={[
+                'mb-2 block w-full rounded-control border p-3 text-left text-sm transition',
+                notification.read
+                  ? 'border-border bg-bg-inset text-text-secondary'
+                  : 'border-accent/30 bg-accent/10 text-text-primary',
+                target ? 'hover:border-border-strong' : '',
+              ].join(' ')}
+              key={notification.id}
+              onClick={() => {
+                if (target) {
+                  onNavigate(target);
+                }
+              }}
+              type="button"
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="flex items-center gap-2">
+                    <Badge tone={notificationTone(notification.level)}>
+                      {notification.level || 'info'}
+                    </Badge>
+                    <span className="truncate font-medium">
+                      {notification.title}
+                    </span>
+                  </div>
+                  {notification.body ? (
+                    <div className="mt-2 text-text-muted">
+                      {notification.body}
+                    </div>
+                  ) : null}
+                </div>
+                {!notification.read ? (
+                  <span className="mt-1 h-2 w-2 rounded-full bg-warn" />
+                ) : null}
+              </div>
+              <div className="mt-2 flex items-center justify-between gap-2 text-xs text-text-muted">
+                <span>{notification.topic || 'system'}</span>
+                <span>{relativeTime(dateMillis(notification.createdAt))}</span>
+              </div>
+            </button>
+          );
+        })}
       </div>
     </div>
   );
@@ -8289,6 +8481,39 @@ function normalize(value: unknown) {
 
 function normalizePermissionMode(value: unknown): PermissionMode {
   return value === 'group' || value === 'rootless' ? value : 'ask';
+}
+
+function notificationTone(level: string): BadgeTone {
+  switch (level) {
+    case 'ok':
+    case 'success':
+      return 'ok';
+    case 'warn':
+    case 'warning':
+      return 'warn';
+    case 'error':
+      return 'error';
+    case 'info':
+      return 'info';
+    default:
+      return 'neutral';
+  }
+}
+
+function notificationTargetPage(topic: string): PageID | null {
+  switch (topic) {
+    case 'backup':
+      return 'volumes';
+    case 'project':
+      return 'projects';
+    case 'provider':
+    case 'system':
+      return 'overview';
+    case 'update':
+      return 'projects';
+    default:
+      return null;
+  }
 }
 
 function imageUsageCounts(containers: ContainerSummary[]) {

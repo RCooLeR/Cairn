@@ -83,6 +83,39 @@ func TestSettingsServiceRoundTripsPersistedSettings(t *testing.T) {
 	}
 }
 
+func TestSettingsServiceNotifications(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	service := &SettingsService{Notifications: db.Notifications()}
+
+	id, err := db.Notifications().Insert(ctx, store.NotificationRecord{
+		Level: "warn",
+		Title: "Provider degraded",
+		Body:  "Docker daemon stopped",
+		Topic: "provider",
+	})
+	if err != nil {
+		t.Fatalf("Insert notification: %v", err)
+	}
+	notifications, err := service.GetNotifications(ctx, false)
+	if err != nil {
+		t.Fatalf("GetNotifications() error = %v", err)
+	}
+	if len(notifications) != 1 || notifications[0].ID != id || notifications[0].Read {
+		t.Fatalf("notifications = %#v", notifications)
+	}
+	if err := service.MarkNotificationsRead(ctx, []int64{id}); err != nil {
+		t.Fatalf("MarkNotificationsRead() error = %v", err)
+	}
+	unread, err := service.GetNotifications(ctx, true)
+	if err != nil {
+		t.Fatalf("GetNotifications(unread) error = %v", err)
+	}
+	if len(unread) != 0 {
+		t.Fatalf("unread = %#v, want empty", unread)
+	}
+}
+
 func TestDockerServiceLifecycleAuditsAndPlans(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "cairn.db"))

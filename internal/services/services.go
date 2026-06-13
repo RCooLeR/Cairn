@@ -117,8 +117,9 @@ type ImageLineageService struct{}
 type BackupService struct{}
 type RegistryService struct{}
 type SettingsService struct {
-	Audit    *store.AuditRepository
-	Settings *store.SettingsRepository
+	Audit         *store.AuditRepository
+	Notifications *store.NotificationRepository
+	Settings      *store.SettingsRepository
 }
 
 func notReady() error {
@@ -1116,11 +1117,17 @@ func (s *SettingsService) GetAuditLog(ctx context.Context, filter models.AuditFi
 	return []models.AuditEntry{}, nil
 }
 
-func (s *SettingsService) GetNotifications(_ context.Context, unreadOnly bool) ([]models.Notification, error) {
+func (s *SettingsService) GetNotifications(ctx context.Context, unreadOnly bool) ([]models.Notification, error) {
+	if s.Notifications != nil {
+		return s.Notifications.List(ctx, unreadOnly, 100)
+	}
 	return []models.Notification{}, nil
 }
 
-func (s *SettingsService) MarkNotificationsRead(_ context.Context, ids []int64) error {
+func (s *SettingsService) MarkNotificationsRead(ctx context.Context, ids []int64) error {
+	if s.Notifications != nil {
+		return s.Notifications.MarkRead(ctx, ids)
+	}
 	return notReady()
 }
 

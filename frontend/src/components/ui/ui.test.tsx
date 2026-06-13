@@ -1,6 +1,10 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
+import {
+  APP_ERROR_CODES,
+  appErrorPresentation,
+} from '../../api/errors';
 import { Button, DataTable, Modal, StatusDot, Tabs } from '.';
 
 describe('UI kit', () => {
@@ -108,5 +112,21 @@ describe('UI kit', () => {
 
     fireEvent.keyDown(window, { key: 'Escape' });
     expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it('maps every contract AppError code to a UI surface', () => {
+    expect(APP_ERROR_CODES).toHaveLength(17);
+    for (const code of APP_ERROR_CODES) {
+      const presentation = appErrorPresentation(code);
+      expect(presentation.title).toBeTruthy();
+      expect(presentation.body).toBeTruthy();
+      expect(presentation.surface).toMatch(
+        /^(global|inline|modal|permission|row|toast)$/,
+      );
+    }
+    expect(appErrorPresentation('E_PERMISSION_DENIED').surface).toBe(
+      'permission',
+    );
+    expect(appErrorPresentation('E_NOT_FOUND').surface).toBe('toast');
   });
 });

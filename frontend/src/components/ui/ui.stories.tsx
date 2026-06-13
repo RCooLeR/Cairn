@@ -2,6 +2,10 @@ import { Database, RefreshCw } from 'lucide-react';
 import { useState } from 'react';
 
 import {
+  APP_ERROR_CODES,
+  appErrorPresentation,
+} from '../../api/errors';
+import {
   Badge,
   Button,
   Card,
@@ -20,6 +24,46 @@ type Row = {
   name: string;
   state: string;
 };
+
+export const AppErrorMatrix = () => (
+  <div className="min-h-screen bg-bg-app p-6 text-text-primary">
+    <div className="mb-4">
+      <h1 className="text-xl font-semibold">AppError Matrix</h1>
+      <p className="mt-1 text-sm text-text-muted">
+        Contract error codes mapped to their required UI surface.
+      </p>
+    </div>
+    <div className="grid gap-3">
+      {APP_ERROR_CODES.map((code) => {
+        const item = appErrorPresentation(code);
+        return (
+          <Card key={code}>
+            <CardBody>
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="font-mono text-xs text-text-muted">
+                    {item.code}
+                  </div>
+                  <div className="mt-1 font-medium text-text-primary">
+                    {item.title}
+                  </div>
+                  <div className="mt-1 text-sm text-text-secondary">
+                    {item.body}
+                  </div>
+                </div>
+                <div className="flex shrink-0 flex-wrap gap-2">
+                  <Badge tone={item.tone}>{item.tone}</Badge>
+                  <Badge tone="info">{item.surface}</Badge>
+                  <Badge tone="neutral">{item.action}</Badge>
+                </div>
+              </div>
+            </CardBody>
+          </Card>
+        );
+      })}
+    </div>
+  </div>
+);
 
 const rows: Row[] = [
   { id: 'api', name: 'api', state: 'running' },
