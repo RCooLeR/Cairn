@@ -11,6 +11,7 @@ import (
 type ringBuffer struct {
 	limit   int
 	lines   []models.LogLine
+	start   int
 	dropped int64
 }
 
@@ -22,17 +23,26 @@ func newRingBuffer(limit int) *ringBuffer {
 }
 
 func (r *ringBuffer) add(line models.LogLine) {
-	if len(r.lines) >= r.limit {
-		copy(r.lines, r.lines[1:])
-		r.lines[len(r.lines)-1] = line
-		r.dropped++
+	if len(r.lines) < r.limit {
+		r.lines = append(r.lines, line)
 		return
 	}
-	r.lines = append(r.lines, line)
+	r.lines[r.start] = line
+	r.start = (r.start + 1) % r.limit
+	r.dropped++
 }
 
 func (r *ringBuffer) snapshot() []models.LogLine {
-	return append([]models.LogLine(nil), r.lines...)
+	if len(r.lines) == 0 {
+		return []models.LogLine{}
+	}
+	if len(r.lines) < r.limit || r.start == 0 {
+		return append([]models.LogLine(nil), r.lines...)
+	}
+	lines := make([]models.LogLine, 0, len(r.lines))
+	lines = append(lines, r.lines[r.start:]...)
+	lines = append(lines, r.lines[:r.start]...)
+	return lines
 }
 
 func SortLines(lines []models.LogLine) {
