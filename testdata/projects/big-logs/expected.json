@@ -1,0 +1,7 @@
+{
+  "project": "big-logs",
+  "services": [
+    {"name": "logger", "image": "busybox:1.36"}
+  ],
+  "performance": {"linesPerSecond": 5000}
+}

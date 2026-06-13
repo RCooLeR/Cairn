@@ -1,0 +1,14 @@
+services:
+  image-a:
+    image: nginx:1.27-alpine
+  image-b:
+    image: postgres:16-alpine
+  build-a:
+    build:
+      context: ./build-a
+    image: cairn-test/mixed-build-a:latest
+  build-b:
+    build:
+      context: ./build-b
+      dockerfile: Dockerfile
+    image: cairn-test/mixed-build-b:latest

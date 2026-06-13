@@ -1,0 +1,9 @@
+{
+  "project": "build-simple",
+  "services": [
+    {"name": "web", "image": "cairn-test/build-simple:latest", "buildContext": "."}
+  ],
+  "lineage": [
+    {"service": "web", "baseImage": "nginx:alpine"}
+  ]
+}

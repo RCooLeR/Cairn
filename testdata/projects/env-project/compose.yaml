@@ -1,0 +1,9 @@
+services:
+  app:
+    image: "${APP_IMAGE:-nginx:alpine}"
+    env_file:
+      - app.env
+    environment:
+      APP_MODE: "${APP_MODE:-dev}"
+    ports:
+      - "${APP_PORT:-18083}:80"

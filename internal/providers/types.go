@@ -32,6 +32,7 @@ const (
 
 type CommandResult struct {
 	Command  []string
+	Workdir  string
 	Stdout   string
 	Stderr   string
 	ExitCode int

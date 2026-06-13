@@ -1,0 +1,12 @@
+[
+  {
+    "Name": "app-db",
+    "Status": "running(2)",
+    "ConfigFiles": "E:\\Development\\projects\\apps\\rcooler\\Cairn\\testdata\\projects\\app-db\\compose.yaml"
+  },
+  {
+    "Name": "single-web",
+    "Status": "exited(1)",
+    "ConfigFiles": "/workspace/Cairn/testdata/projects/single-web/compose.yaml"
+  }
+]

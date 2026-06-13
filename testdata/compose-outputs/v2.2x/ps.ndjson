@@ -1,0 +1,2 @@
+{"ID":"a1","Name":"app-db-web-1","Project":"app-db","Service":"web","State":"running","Health":"","Publishers":[{"URL":"0.0.0.0","TargetPort":8080,"PublishedPort":18080,"Protocol":"tcp"}]}
+{"ID":"b1","Name":"app-db-db-1","Project":"app-db","Service":"db","State":"running","Health":"healthy","ExitCode":0,"Publishers":[{"URL":"127.0.0.1","TargetPort":5432,"PublishedPort":15432,"Protocol":"tcp"}]}

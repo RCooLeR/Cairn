@@ -1,0 +1,21 @@
+services:
+  app:
+    image: nginx:alpine
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "18081:80"
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: example
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    volumes:
+      - db-data:/var/lib/postgresql/data
+volumes:
+  db-data: {}

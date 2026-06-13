@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -112,6 +113,29 @@ func TestLinuxNativeDetectRealDockerIntegration(t *testing.T) {
 	}
 }
 
+func TestLinuxNativeRunComposeUsesWorkdirEnvAndArgv(t *testing.T) {
+	t.Parallel()
+	runner := &composeOptionsRunner{}
+	provider := NewLinuxNative(LinuxNativeOptions{Runner: runner, Probe: &fakeLinuxProbe{}})
+
+	result, err := provider.RunComposeEnv(context.Background(), "/workspace/app", []string{"COMPOSE_PROJECT_NAME=demo"}, "-f", "compose.yaml", "config")
+	if err != nil {
+		t.Fatalf("RunComposeEnv() error = %v", err)
+	}
+	if got, want := result.Command, []string{"docker", "compose", "-f", "compose.yaml", "config"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("command = %#v, want %#v", got, want)
+	}
+	if runner.opts.Workdir != "/workspace/app" {
+		t.Fatalf("workdir = %q", runner.opts.Workdir)
+	}
+	if runner.opts.Timeout != composeCommandTimeout {
+		t.Fatalf("timeout = %s, want %s", runner.opts.Timeout, composeCommandTimeout)
+	}
+	if got := runner.opts.Env; len(got) != 1 || got[0] != "COMPOSE_PROJECT_NAME=demo" {
+		t.Fatalf("env = %#v", got)
+	}
+}
+
 type fakeRunner struct {
 	paths   map[string]string
 	outputs map[string]string
@@ -193,4 +217,24 @@ func assertProblem(t *testing.T, problems []models.ProviderProblem, code string)
 	}
 	t.Fatalf("problem %s not found in %#v", code, problems)
 	return models.ProviderProblem{}
+}
+
+type composeOptionsRunner struct {
+	opts CommandRunOptions
+}
+
+func (r *composeOptionsRunner) LookPath(file string) (string, error) {
+	return "/usr/bin/" + file, nil
+}
+
+func (r *composeOptionsRunner) Run(context.Context, time.Duration, string, ...string) (*CommandResult, error) {
+	return nil, errors.New("Run should not be used for compose when RunWithOptions is available")
+}
+
+func (r *composeOptionsRunner) RunWithOptions(_ context.Context, opts CommandRunOptions, name string, args ...string) (*CommandResult, error) {
+	r.opts = opts
+	return &CommandResult{
+		Command: append([]string{name}, args...),
+		Workdir: opts.Workdir,
+	}, nil
 }

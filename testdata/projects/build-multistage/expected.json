@@ -1,0 +1,10 @@
+{
+  "project": "build-multistage",
+  "services": [
+    {"name": "app", "image": "cairn-test/build-multistage:latest", "buildContext": ".", "buildTarget": "runtime"}
+  ],
+  "lineage": [
+    {"service": "app", "baseImage": "nginx:alpine"},
+    {"service": "app", "baseImage": "alpine:3.20"}
+  ]
+}

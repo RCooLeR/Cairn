@@ -1,0 +1,9 @@
+{
+  "project": "mixed-updates",
+  "services": [
+    {"name": "build-a", "image": "cairn-test/mixed-build-a:latest", "buildContext": "build-a"},
+    {"name": "build-b", "image": "cairn-test/mixed-build-b:latest", "buildContext": "build-b"},
+    {"name": "image-a", "image": "nginx:1.27-alpine"},
+    {"name": "image-b", "image": "postgres:16-alpine"}
+  ]
+}

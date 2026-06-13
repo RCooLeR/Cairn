@@ -18,6 +18,7 @@ const (
 	linuxNativeDisplayName = "Linux Native"
 	defaultDockerSocket    = "/var/run/docker.sock"
 	commandTimeout         = 2 * time.Second
+	composeCommandTimeout  = 30 * time.Second
 	socketTimeout          = time.Second
 )
 
@@ -245,10 +246,21 @@ func (p *LinuxNativeProvider) RunDocker(ctx context.Context, args ...string) (*C
 }
 
 func (p *LinuxNativeProvider) RunCompose(ctx context.Context, workdir string, args ...string) (*CommandResult, error) {
+	return p.RunComposeEnv(ctx, workdir, nil, args...)
+}
+
+func (p *LinuxNativeProvider) RunComposeEnv(ctx context.Context, workdir string, env []string, args ...string) (*CommandResult, error) {
 	composeArgs := append([]string{"compose"}, args...)
-	result, err := p.runner.Run(ctx, commandTimeout, "docker", composeArgs...)
+	if runner, ok := p.runner.(OptionsCommandRunner); ok {
+		return runner.RunWithOptions(ctx, CommandRunOptions{
+			Timeout: composeCommandTimeout,
+			Workdir: workdir,
+			Env:     env,
+		}, "docker", composeArgs...)
+	}
+	result, err := p.runner.Run(ctx, composeCommandTimeout, "docker", composeArgs...)
 	if result != nil && workdir != "" {
-		result.Command = append([]string{"(workdir=" + workdir + ")"}, result.Command...)
+		result.Workdir = workdir
 	}
 	return result, err
 }

@@ -1,0 +1,6 @@
+{
+  "project": "single-web",
+  "services": [
+    {"name": "web", "image": "nginx:alpine"}
+  ]
+}

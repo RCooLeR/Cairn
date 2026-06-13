@@ -1,0 +1,8 @@
+{
+  "project": "proxy-app",
+  "services": [
+    {"name": "app", "image": "hashicorp/http-echo:1.0"},
+    {"name": "proxy", "image": "nginx:alpine"}
+  ],
+  "networks": ["edge"]
+}

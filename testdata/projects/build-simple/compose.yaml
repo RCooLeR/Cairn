@@ -1,0 +1,8 @@
+services:
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: cairn-test/build-simple:latest
+    ports:
+      - "18084:80"

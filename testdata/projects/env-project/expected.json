@@ -1,0 +1,6 @@
+{
+  "project": "env-project",
+  "services": [
+    {"name": "app", "image": "nginx:alpine", "envFiles": ["app.env"]}
+  ]
+}

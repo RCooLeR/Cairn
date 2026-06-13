@@ -1,0 +1,21 @@
+services:
+  proxy:
+    image: nginx:alpine
+    depends_on:
+      - app
+    ports:
+      - "18082:80"
+    networks:
+      edge:
+        aliases:
+          - proxy.local
+  app:
+    image: hashicorp/http-echo:1.0
+    command: ["-text=hello"]
+    networks:
+      edge:
+        aliases:
+          - app.local
+networks:
+  edge:
+    driver: bridge

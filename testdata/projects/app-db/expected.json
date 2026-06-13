@@ -1,0 +1,8 @@
+{
+  "project": "app-db",
+  "services": [
+    {"name": "app", "image": "nginx:alpine"},
+    {"name": "db", "image": "postgres:16-alpine", "healthcheck": true}
+  ],
+  "volumes": ["db-data"]
+}
