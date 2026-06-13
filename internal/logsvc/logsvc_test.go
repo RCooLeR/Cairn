@@ -122,6 +122,45 @@ func TestManagerPublishesBatchesAndEOF(t *testing.T) {
 	}
 }
 
+func TestSessionEnqueueBackpressuresInsteadOfDropping(t *testing.T) {
+	manager := NewManager(nil, nil, Options{InputBuffer: 1})
+	s := newSession(manager, "stream-1", models.LogStreamRequest{})
+	first := models.LogLine{Text: "one"}
+	second := models.LogLine{Text: "two"}
+
+	if !s.enqueue(first) {
+		t.Fatal("first enqueue returned false")
+	}
+	done := make(chan bool, 1)
+	go func() {
+		done <- s.enqueue(second)
+	}()
+
+	select {
+	case ok := <-done:
+		t.Fatalf("second enqueue returned before capacity was available: %v", ok)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	if got := <-s.input; got.Text != "one" {
+		t.Fatalf("first line was dropped: %#v", got)
+	}
+	select {
+	case ok := <-done:
+		if !ok {
+			t.Fatal("second enqueue returned false")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second enqueue did not resume after capacity was available")
+	}
+	if got := <-s.input; got.Text != "two" {
+		t.Fatalf("second line was not queued: %#v", got)
+	}
+	if dropped := s.dropped.Load(); dropped != 0 {
+		t.Fatalf("dropped count = %d", dropped)
+	}
+}
+
 func TestManagerFetchPageAndExport(t *testing.T) {
 	ctx := context.Background()
 	docker := newFakeLogDocker()

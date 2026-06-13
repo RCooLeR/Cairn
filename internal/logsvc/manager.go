@@ -454,20 +454,6 @@ func (s *session) enqueue(line models.LogLine) bool {
 		return false
 	case s.input <- line:
 		return true
-	default:
-		s.dropped.Add(1)
-		select {
-		case <-s.input:
-		default:
-		}
-		select {
-		case <-s.ctx.Done():
-			return false
-		case s.input <- line:
-			return true
-		default:
-			return true
-		}
 	}
 }
 
