@@ -1045,7 +1045,7 @@ func TestClientRealDockerObjectsIntegration(t *testing.T) {
 	if len(containers) != 1 || !strings.HasPrefix(containers[0].ID, cliContainerID) {
 		t.Fatalf("containers = %#v, docker CLI id = %q", containers, cliContainerID)
 	}
-	if containers[0].ProjectID != "cairn-test" || containers[0].Service != "web" {
+	if containers[0].ProjectID != "linux_native/cairn-test" || containers[0].Service != "web" {
 		t.Fatalf("compose labels not mapped: %#v", containers[0])
 	}
 

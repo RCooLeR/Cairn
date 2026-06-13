@@ -7,6 +7,7 @@ import (
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/bus"
+	composecore "github.com/RCooLeR/Cairn/internal/compose"
 	dockercore "github.com/RCooLeR/Cairn/internal/docker"
 	"github.com/RCooLeR/Cairn/internal/providers"
 	"github.com/RCooLeR/Cairn/internal/security"
@@ -43,14 +44,26 @@ func Run(assets fs.FS) error {
 	providerSet := defaultProviderSet()
 	providerManager := providers.NewManager(db.Providers(), db.Settings(), providerSet)
 	auditRepo := db.Audit()
+	projectRepo := db.Projects()
 	containerPlans := security.NewPlanStore(nil)
 	var dockerClient *dockercore.Client
+	var composeClient *composecore.Client
+	var projectDetector *composecore.ProjectDetector
 	if len(providerSet) > 0 {
 		dockerClient = dockercore.New(providerSet[0], eventBus)
 		dockerClient.SetObjectCache(db.Objects())
 		dockerClient.StartHealthLoop(ctx)
 		dockerClient.StartObjectEventLoop(ctx)
 		dockerClient.StartReconcileLoop(ctx)
+		composeClient = composecore.NewClient(providerSet[0])
+		projectDetector = &composecore.ProjectDetector{
+			ProviderID:  providerSet[0].ID(),
+			ContextName: "",
+			Docker:      dockerClient,
+			Compose:     composeClient,
+			Projects:    projectRepo,
+			Objects:     db.Objects(),
+		}
 	}
 
 	app := application.New(application.Options{
@@ -61,8 +74,8 @@ func Run(assets fs.FS) error {
 		Services: []application.Service{
 			application.NewService(&services.ProviderService{Manager: providerManager}),
 			application.NewService(&services.DockerService{Client: dockerClient, Audit: auditRepo, Plans: containerPlans}),
-			application.NewService(&services.ProjectService{}),
-			application.NewService(&services.ComposeService{}),
+			application.NewService(&services.ProjectService{Detector: projectDetector, Projects: projectRepo}),
+			application.NewService(&services.ComposeService{Client: composeClient, Projects: projectRepo}),
 			application.NewService(&services.MetricsService{}),
 			application.NewService(&services.LogsService{}),
 			application.NewService(&services.TerminalService{}),

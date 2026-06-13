@@ -87,6 +87,76 @@ func (r *ObjectCacheRepository) SaveContainers(ctx context.Context, providerID s
 	return tx.Commit()
 }
 
+func (r *ObjectCacheRepository) ListContainers(ctx context.Context, providerID string) ([]ContainerCacheRecord, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT id, name, image_ref, image_id, status, health, restart_count,
+			project_id, service_id, ports_json, labels_json, created_at, started_at
+		FROM containers_cache
+		WHERE provider_id = ?
+		ORDER BY name
+	`, providerID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = rows.Close()
+	}()
+
+	var records []ContainerCacheRecord
+	for rows.Next() {
+		var (
+			projectID  sql.NullString
+			serviceID  sql.NullString
+			imageRef   sql.NullString
+			imageID    sql.NullString
+			status     sql.NullString
+			health     sql.NullString
+			createdAt  sql.NullString
+			startedAt  sql.NullString
+			portsJSON  string
+			labelsJSON string
+			record     ContainerCacheRecord
+		)
+		if err := rows.Scan(
+			&record.Summary.ID,
+			&record.Summary.Name,
+			&imageRef,
+			&imageID,
+			&status,
+			&health,
+			&record.Summary.Restarts,
+			&projectID,
+			&serviceID,
+			&portsJSON,
+			&labelsJSON,
+			&createdAt,
+			&startedAt,
+		); err != nil {
+			return nil, err
+		}
+		record.Summary.ProjectID = projectID.String
+		record.Summary.Service = serviceID.String
+		record.Summary.Image = imageRef.String
+		record.Summary.ImageID = imageID.String
+		record.Summary.Status = status.String
+		record.Summary.State = status.String
+		record.Summary.Health = models.HealthStatus(health.String)
+		record.Summary.CreatedAt = parseStoreTime(createdAt.String)
+		record.StartedAt = parseStoreTime(startedAt.String)
+		if record.Summary.Health == "" {
+			record.Summary.Health = models.HealthStatusUnknown
+		}
+		if err := json.Unmarshal([]byte(nullJSON(portsJSON, "[]")), &record.Summary.Ports); err != nil {
+			return nil, err
+		}
+		if err := json.Unmarshal([]byte(nullJSON(labelsJSON, "{}")), &record.Labels); err != nil {
+			return nil, err
+		}
+		records = append(records, record)
+	}
+	return records, rows.Err()
+}
+
 func (r *ObjectCacheRepository) SaveImages(ctx context.Context, providerID string, records []ImageCacheRecord, seenAt time.Time) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -225,4 +295,22 @@ func jsonText(value any, fallback string) string {
 		return fallback
 	}
 	return string(raw)
+}
+
+func nullJSON(value string, fallback string) string {
+	if value == "" {
+		return fallback
+	}
+	return value
+}
+
+func parseStoreTime(value string) time.Time {
+	if value == "" {
+		return time.Time{}
+	}
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return time.Time{}
+	}
+	return parsed
 }

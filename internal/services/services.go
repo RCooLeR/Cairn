@@ -2,13 +2,18 @@ package services
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"strings"
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
+	composecore "github.com/RCooLeR/Cairn/internal/compose"
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
 	"github.com/RCooLeR/Cairn/internal/security"
@@ -60,8 +65,19 @@ type DockerService struct {
 	Audit  *store.AuditRepository
 	Plans  *security.PlanStore
 }
-type ProjectService struct{}
-type ComposeService struct{}
+type ProjectDetector interface {
+	Reconcile(context.Context) ([]models.ProjectSummary, error)
+}
+
+type ProjectService struct {
+	Detector ProjectDetector
+	Projects *store.ProjectRepository
+}
+
+type ComposeService struct {
+	Client   *composecore.Client
+	Projects *store.ProjectRepository
+}
 type MetricsService struct{}
 type LogsService struct{}
 type TerminalService struct{}
@@ -599,12 +615,45 @@ func (s *DockerService) PlanRemoveNetwork(_ context.Context, id string) (*models
 	return nil, notReady()
 }
 
-func (s *ProjectService) ListProjects(_ context.Context) ([]models.ProjectSummary, error) {
-	return nil, notReady()
+func (s *ProjectService) ListProjects(ctx context.Context) ([]models.ProjectSummary, error) {
+	if s.Projects == nil {
+		return nil, notReady()
+	}
+	projects, err := s.Projects.List(ctx)
+	if err != nil {
+		return nil, apperror.Wrap(apperror.Internal, "List projects failed", err)
+	}
+	summaries := make([]models.ProjectSummary, 0, len(projects))
+	for _, project := range projects {
+		services, err := s.Projects.ListServices(ctx, project.ID)
+		if err != nil {
+			return nil, apperror.Wrap(apperror.Internal, "List project services failed", err)
+		}
+		summaries = append(summaries, projectSummaryFromRecord(project, services))
+	}
+	return summaries, nil
 }
 
-func (s *ProjectService) GetProject(_ context.Context, projectID string) (*models.ProjectDetail, error) {
-	return nil, notReady()
+func (s *ProjectService) GetProject(ctx context.Context, projectID string) (*models.ProjectDetail, error) {
+	if s.Projects == nil {
+		return nil, notReady()
+	}
+	project, err := s.Projects.Get(ctx, projectID)
+	if err != nil {
+		return nil, mapStoreNotFound(err, "Project was not found")
+	}
+	services, err := s.Projects.ListServices(ctx, projectID)
+	if err != nil {
+		return nil, apperror.Wrap(apperror.Internal, "List project services failed", err)
+	}
+	statuses := make([]models.ComposeServiceStatus, 0, len(services))
+	for _, service := range services {
+		statuses = append(statuses, serviceStatusFromRecord(service))
+	}
+	return &models.ProjectDetail{
+		Summary:  projectSummaryFromRecord(project, services),
+		Services: statuses,
+	}, nil
 }
 
 func (s *ProjectService) ImportProject(_ context.Context, req models.ImportProjectRequest) (*models.ProjectDetail, error) {
@@ -615,8 +664,11 @@ func (s *ProjectService) RemoveProjectFromList(_ context.Context, projectID stri
 	return notReady()
 }
 
-func (s *ProjectService) RefreshProjects(_ context.Context) ([]models.ProjectSummary, error) {
-	return nil, notReady()
+func (s *ProjectService) RefreshProjects(ctx context.Context) ([]models.ProjectSummary, error) {
+	if s.Detector == nil {
+		return nil, notReady()
+	}
+	return s.Detector.Reconcile(ctx)
 }
 
 func (s *ProjectService) StartProject(_ context.Context, projectID string) error {
@@ -643,12 +695,37 @@ func (s *ProjectService) PlanDownProject(_ context.Context, projectID string, re
 	return nil, notReady()
 }
 
-func (s *ComposeService) Config(_ context.Context, projectID string) (*models.ComposeConfigResult, error) {
-	return nil, notReady()
+func (s *ComposeService) Config(ctx context.Context, projectID string) (*models.ComposeConfigResult, error) {
+	if s.Client == nil || s.Projects == nil {
+		return nil, notReady()
+	}
+	project, err := s.Projects.Get(ctx, projectID)
+	if err != nil {
+		return nil, mapStoreNotFound(err, "Project was not found")
+	}
+	config, err := s.Client.Config(ctx, composeOptionsFromProject(project))
+	if config != nil {
+		config.API.RawFiles = readComposeRawFiles(project)
+		if err != nil {
+			return &config.API, nil
+		}
+		return &config.API, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return nil, apperror.New(apperror.ComposeInvalid, "Compose config returned no result")
 }
 
-func (s *ComposeService) Ps(_ context.Context, projectID string) ([]models.ComposeServiceStatus, error) {
-	return nil, notReady()
+func (s *ComposeService) Ps(ctx context.Context, projectID string) ([]models.ComposeServiceStatus, error) {
+	if s.Client == nil || s.Projects == nil {
+		return nil, notReady()
+	}
+	project, err := s.Projects.Get(ctx, projectID)
+	if err != nil {
+		return nil, mapStoreNotFound(err, "Project was not found")
+	}
+	return s.Client.Ps(ctx, composeOptionsFromProject(project))
 }
 
 func (s *ComposeService) StartServices(_ context.Context, projectID string, services []string) error {
@@ -1033,6 +1110,81 @@ func secretLike(name string) bool {
 		}
 	}
 	return false
+}
+
+func projectSummaryFromRecord(project store.ProjectRecord, services []store.ServiceRecord) models.ProjectSummary {
+	running := 0
+	for _, service := range services {
+		if service.ReplicasRunning > 0 {
+			running++
+		}
+	}
+	return models.ProjectSummary{
+		ID:              project.ID,
+		Name:            project.Name,
+		ProviderID:      project.ProviderID,
+		Status:          project.Status,
+		Health:          project.Health,
+		ServicesRunning: running,
+		ServicesTotal:   len(services),
+		WorkingDir:      project.WorkingDir,
+		LastChangedAt:   project.LastSeenAt,
+	}
+}
+
+func serviceStatusFromRecord(service store.ServiceRecord) models.ComposeServiceStatus {
+	return models.ComposeServiceStatus{
+		Name:     service.Name,
+		Image:    service.ImageRef,
+		Replicas: service.ReplicasTotal,
+		Running:  service.ReplicasRunning,
+		Status:   service.Status,
+		Health:   service.Health,
+	}
+}
+
+func composeOptionsFromProject(project store.ProjectRecord) composecore.ProjectOptions {
+	return composecore.ProjectOptions{
+		Workdir:     project.WorkingDir,
+		Files:       append([]string(nil), project.ComposeFiles...),
+		ProjectName: composecore.ProjectNameFromID(project.ProviderID, project.ID),
+	}
+}
+
+func readComposeRawFiles(project store.ProjectRecord) []models.ComposeRawFile {
+	files := project.ComposeFiles
+	if len(files) == 0 && project.WorkingDir != "" {
+		for _, name := range []string{"compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml"} {
+			path := filepath.Join(project.WorkingDir, name)
+			if _, err := os.Stat(path); err == nil {
+				files = []string{path}
+				break
+			}
+		}
+	}
+	rawFiles := make([]models.ComposeRawFile, 0, len(files))
+	for _, file := range files {
+		path := file
+		if project.WorkingDir != "" && !filepath.IsAbs(path) {
+			path = filepath.Join(project.WorkingDir, path)
+		}
+		content, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		rawFiles = append(rawFiles, models.ComposeRawFile{
+			Path:    path,
+			Content: string(content),
+		})
+	}
+	return rawFiles
+}
+
+func mapStoreNotFound(err error, message string) error {
+	if errors.Is(err, sql.ErrNoRows) {
+		return apperror.New(apperror.NotFound, message)
+	}
+	return apperror.Wrap(apperror.Internal, message, err)
 }
 
 func versionInfo() *models.VersionInfo {

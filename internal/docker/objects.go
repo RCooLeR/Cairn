@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/bus"
+	composecore "github.com/RCooLeR/Cairn/internal/compose"
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/store"
 	dockertypes "github.com/docker/docker/api/types"
@@ -47,7 +48,7 @@ func (c *Client) ListContainers(ctx context.Context, opts models.ContainerListOp
 
 	raw, err := api.ContainerList(callCtx, container.ListOptions{
 		All:     opts.All,
-		Filters: containerFilters(opts),
+		Filters: c.containerFilters(opts),
 	})
 	if err != nil {
 		return nil, mapDockerError("list containers", err)
@@ -57,6 +58,7 @@ func (c *Client) ListContainers(ctx context.Context, opts models.ContainerListOp
 	records := make([]store.ContainerCacheRecord, 0, len(raw))
 	for _, item := range raw {
 		summary := mapContainerSummary(item)
+		c.qualifyContainerSummary(&summary)
 		summaries = append(summaries, summary)
 		records = append(records, store.ContainerCacheRecord{
 			Summary: summary,
@@ -76,6 +78,7 @@ func (c *Client) GetContainer(ctx context.Context, id string) (*models.Container
 		return nil, err
 	}
 	detail := mapContainerDetail(raw)
+	c.qualifyContainerSummary(&detail.Summary)
 	if err := c.saveContainers(ctx, []store.ContainerCacheRecord{containerRecordFromInspect(raw, detail)}); err != nil {
 		return nil, err
 	}
@@ -207,7 +210,7 @@ func (c *Client) GetVolume(ctx context.Context, name string) (*models.VolumeDeta
 	if err != nil {
 		return nil, mapDockerError("inspect volume", err)
 	}
-	containers := containersForVolume(ctx, api, raw.Name)
+	containers := c.containersForVolume(ctx, api, raw.Name)
 	detail := mapVolumeDetail(raw, containers)
 	usedBy := containerIDs(containers)
 	if err := c.saveVolumes(ctx, []store.VolumeCacheRecord{{
@@ -265,7 +268,7 @@ func (c *Client) GetNetwork(ctx context.Context, id string) (*models.NetworkDeta
 	if err != nil {
 		return nil, mapDockerError("inspect network", err)
 	}
-	containers := containersForNetwork(ctx, api, raw)
+	containers := c.containersForNetwork(ctx, api, raw)
 	detail := mapNetworkDetail(raw, containers)
 	if err := c.saveNetworks(ctx, []store.NetworkCacheRecord{{
 		Summary:    detail.Summary,
@@ -504,10 +507,10 @@ func objectChangeFromEvent(msg events.Message) (objectChange, bool) {
 	return objectChange{kind: kind, id: id}, true
 }
 
-func containerFilters(opts models.ContainerListOptions) filters.Args {
+func (c *Client) containerFilters(opts models.ContainerListOptions) filters.Args {
 	args := filters.NewArgs()
 	if opts.ProjectID != "" {
-		args.Add("label", composeProjectLabel+"="+opts.ProjectID)
+		args.Add("label", composeProjectLabel+"="+composecore.ProjectNameFromID(c.providerID(), opts.ProjectID))
 	}
 	if opts.Service != "" {
 		args.Add("label", composeServiceLabel+"="+opts.Service)
@@ -519,6 +522,13 @@ func containerFilters(opts models.ContainerListOptions) filters.Args {
 		args.Add(key, value)
 	}
 	return args
+}
+
+func (c *Client) qualifyContainerSummary(summary *models.ContainerSummary) {
+	if summary == nil || summary.ProjectID == "" {
+		return
+	}
+	summary.ProjectID = composecore.ProjectID(c.providerID(), summary.ProjectID)
 }
 
 func containerRecordFromInspect(raw container.InspectResponse, detail *models.ContainerDetail) store.ContainerCacheRecord {
@@ -595,7 +605,7 @@ func volumeUsedBy(ctx context.Context, api APIClient) map[string][]string {
 	return usedBy
 }
 
-func containersForVolume(ctx context.Context, api APIClient, volumeName string) []models.ContainerSummary {
+func (c *Client) containersForVolume(ctx context.Context, api APIClient, volumeName string) []models.ContainerSummary {
 	callCtx, cancel := context.WithTimeout(ctx, defaultTimeout)
 	defer cancel()
 	containers, err := api.ContainerList(callCtx, container.ListOptions{All: true})
@@ -606,7 +616,9 @@ func containersForVolume(ctx context.Context, api APIClient, volumeName string) 
 	for _, item := range containers {
 		for _, mount := range item.Mounts {
 			if mount.Name == volumeName {
-				out = append(out, mapContainerSummary(item))
+				summary := mapContainerSummary(item)
+				c.qualifyContainerSummary(&summary)
+				out = append(out, summary)
 				break
 			}
 		}
@@ -615,7 +627,7 @@ func containersForVolume(ctx context.Context, api APIClient, volumeName string) 
 	return out
 }
 
-func containersForNetwork(ctx context.Context, api APIClient, nw network.Inspect) []models.ContainerSummary {
+func (c *Client) containersForNetwork(ctx context.Context, api APIClient, nw network.Inspect) []models.ContainerSummary {
 	callCtx, cancel := context.WithTimeout(ctx, defaultTimeout)
 	defer cancel()
 	containers, err := api.ContainerList(callCtx, container.ListOptions{All: true})
@@ -629,7 +641,9 @@ func containersForNetwork(ctx context.Context, api APIClient, nw network.Inspect
 		}
 		for name, endpoint := range item.NetworkSettings.Networks {
 			if name == nw.Name || (endpoint != nil && endpoint.NetworkID == nw.ID) {
-				out = append(out, mapContainerSummary(item))
+				summary := mapContainerSummary(item)
+				c.qualifyContainerSummary(&summary)
+				out = append(out, summary)
 				break
 			}
 		}
