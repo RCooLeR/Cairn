@@ -34,7 +34,7 @@ func TestManagerRealDockerStatsIntegration(t *testing.T) {
 	defer cancel()
 	name := fmt.Sprintf("cairn-metrics-%d", time.Now().UnixNano())
 	runDockerCommand(t, ctx, "run", "-d", "--rm", "--pull=missing", "--name", name,
-		"alpine:3.20", "sh", "-c", "while true; do i=0; while [ $i -lt 50000 ]; do i=$((i+1)); done; sleep 0.05; done")
+		"alpine:3.20", "sh", "-c", "yes > /dev/null")
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cleanupCancel()
