@@ -63,6 +63,26 @@ func TestSettingsServiceGetCheatsheetSafetyContract(t *testing.T) {
 	}
 }
 
+func TestSettingsServiceRoundTripsPersistedSettings(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	service := &SettingsService{Settings: db.Settings()}
+
+	if err := service.SetSetting(ctx, "linux.sudo_mode", "group"); err != nil {
+		t.Fatalf("SetSetting() error = %v", err)
+	}
+	settings, err := service.GetSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSettings() error = %v", err)
+	}
+	if settings["linux.sudo_mode"] != "group" {
+		t.Fatalf("linux.sudo_mode = %#v, want group", settings["linux.sudo_mode"])
+	}
+	if settings["security.confirm_destructive"] != true {
+		t.Fatalf("security.confirm_destructive = %#v, want true", settings["security.confirm_destructive"])
+	}
+}
+
 func TestDockerServiceLifecycleAuditsAndPlans(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "cairn.db"))

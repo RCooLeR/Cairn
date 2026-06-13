@@ -15,6 +15,7 @@ import type {
   NetworkSummary,
   PortMapping,
   PortBinding,
+  ProviderProblem,
   ProjectDetail,
   ProjectSummary,
   ProviderSummary,
@@ -26,10 +27,12 @@ import type {
 
 import {
   Activity,
+  AlertTriangle,
   ArrowDown,
   BarChart3,
   Bell,
   Box,
+  CheckCircle2,
   Clock3,
   Container,
   Copy,
@@ -56,15 +59,24 @@ import {
   ScrollText,
   Search,
   Server,
+  ShieldAlert,
   Skull,
   Square,
   Terminal,
   Trash2,
   Upload,
   Wifi,
+  Wrench,
   WrapText,
 } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import {
   Area,
   AreaChart,
@@ -88,7 +100,9 @@ import {
   DockerService,
   LogsService,
   MetricsService,
+  ProviderService,
   ProjectService,
+  SettingsService,
 } from './api/services';
 import {
   Badge,
@@ -132,6 +146,7 @@ type ProjectSortID = 'name' | 'activity' | 'cpu';
 type ProjectTabID = 'overview' | 'services' | 'containers' | 'compose';
 type LogScope = 'all' | 'project' | 'service' | 'container';
 type LogLevelFilter = 'error' | 'warn' | 'info' | 'debug' | 'unknown';
+type PermissionMode = 'ask' | 'group' | 'rootless';
 
 type NavItem = {
   id: PageID;
@@ -511,6 +526,12 @@ function App() {
   );
   const [busyActionIDs, setBusyActionIDs] = useState(() => new Set<string>());
   const [actionError, setActionError] = useState<string | null>(null);
+  const [providerActionBusy, setProviderActionBusy] = useState(false);
+  const [repairOpen, setRepairOpen] = useState(false);
+  const [repairError, setRepairError] = useState<string | null>(null);
+  const [repairSaving, setRepairSaving] = useState(false);
+  const [permissionMode, setPermissionMode] =
+    useState<PermissionMode>('ask');
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [queuedTerminalCommand, setQueuedTerminalCommand] =
     useState<TerminalCommandRequest | null>(null);
@@ -626,6 +647,27 @@ function App() {
       active = false;
     };
   }, [setVersion, setVersionError, setVersionLoading]);
+
+  useEffect(() => {
+    let active = true;
+    SettingsService.GetSettings()
+      .then((settings) => {
+        if (!active) {
+          return;
+        }
+        setPermissionMode(
+          normalizePermissionMode(settings?.['linux.sudo_mode']),
+        );
+      })
+      .catch(() => {
+        if (active) {
+          setPermissionMode('ask');
+        }
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   useEffect(() => {
     void refreshInventory();
@@ -752,9 +794,49 @@ function App() {
     : 'v1.0 workspace';
   const pageTitle =
     navItems.find((item) => item.id === activePage)?.label ?? 'Overview';
-  const dockerRunning = !inventoryError && Boolean(dockerInfo || dockerVersion);
+  const providerStatus = activeProvider?.status;
+  const providerProblems = providerStatus?.problems ?? [];
+  const providerWarnings = providerStatus?.warnings ?? [];
+  const permissionProblem =
+    providerProblems.find((problem) => problem.code === 'PERM_SOCKET') ?? null;
+  const providerRepairNeeded = providerProblems.length > 0;
+  const dockerRunning =
+    !inventoryError &&
+    Boolean(dockerInfo || dockerVersion || providerStatus?.dockerRunning);
+  const noProviderConfigured =
+    inventoryStatus !== 'loading' && providers.length === 0;
+  const dockerStopped =
+    Boolean(activeProvider && providerStatus?.installed) &&
+    !dockerRunning &&
+    !providerRepairNeeded;
+  const staleMode =
+    !dockerRunning &&
+    Boolean(lastLoadedAt) &&
+    containers.length +
+      images.length +
+      networks.length +
+      projects.length +
+      volumes.length >
+      0;
+  const mutationsDisabled = !dockerRunning;
+  const mutationDisabledReason = providerRepairNeeded
+    ? 'Repair the Docker provider before running Docker actions'
+    : dockerStopped
+      ? 'Start Docker Engine before running Docker actions'
+      : noProviderConfigured
+        ? 'Set up a Docker provider before running Docker actions'
+        : 'Docker is not reachable';
   const providerName = activeProvider?.name ?? 'No provider selected';
-  const statusLabel = dockerRunning ? 'Running' : 'Stopped';
+  const statusLabel = dockerRunning
+    ? 'Running'
+    : providerRepairNeeded
+      ? 'Error'
+      : 'Stopped';
+  const statusTone: StatusToneID = dockerRunning
+    ? 'ok'
+    : providerRepairNeeded
+      ? 'error'
+      : 'neutral';
 
   const imageUseCounts = useMemo(
     () => imageUsageCounts(containers),
@@ -782,8 +864,84 @@ function App() {
     window.localStorage.setItem('cairn.projects.view', view);
   }, []);
 
+  const retryProviderDetection = useCallback(async () => {
+    setProviderActionBusy(true);
+    setActionError(null);
+    try {
+      if (activeProvider?.id) {
+        await ProviderService.Detect(activeProvider.id);
+      }
+      await refreshInventory();
+      await refreshProjects();
+    } catch (error: unknown) {
+      setActionError(
+        error instanceof Error ? error.message : 'Provider detection failed',
+      );
+    } finally {
+      setProviderActionBusy(false);
+    }
+  }, [activeProvider?.id, refreshInventory, refreshProjects]);
+
+  const startProvider = useCallback(async () => {
+    if (!activeProvider?.id) {
+      setRepairOpen(true);
+      return;
+    }
+    setProviderActionBusy(true);
+    setActionError(null);
+    try {
+      await ProviderService.Start(activeProvider.id);
+      await ProviderService.Detect(activeProvider.id);
+      await refreshInventory();
+      await refreshProjects();
+    } catch (error: unknown) {
+      setActionError(
+        error instanceof Error ? error.message : 'Unable to start Docker',
+      );
+    } finally {
+      setProviderActionBusy(false);
+    }
+  }, [activeProvider?.id, refreshInventory, refreshProjects]);
+
+  const savePermissionMode = useCallback(async () => {
+    setRepairSaving(true);
+    setRepairError(null);
+    try {
+      await SettingsService.SetSetting('linux.sudo_mode', permissionMode);
+      setRepairOpen(false);
+      await retryProviderDetection();
+    } catch (error: unknown) {
+      setRepairError(
+        error instanceof Error
+          ? error.message
+          : 'Unable to save permission mode',
+      );
+    } finally {
+      setRepairSaving(false);
+    }
+  }, [permissionMode, retryProviderDetection]);
+
+  const ensureDockerReady = useCallback(() => {
+    if (!mutationsDisabled) {
+      return true;
+    }
+    setActionError(mutationDisabledReason);
+    if (providerRepairNeeded || noProviderConfigured) {
+      setRepairOpen(true);
+    }
+    return false;
+  }, [
+    mutationDisabledReason,
+    mutationsDisabled,
+    noProviderConfigured,
+    providerRepairNeeded,
+  ]);
+
   const runContainerAction = useCallback(
     async (action: ContainerAction, container: ContainerSummary) => {
+      if (!ensureDockerReady()) {
+        return;
+      }
       const key = `${action}:${container.id}`;
       setActionError(null);
       setActionBusy(key, true);
@@ -823,11 +981,14 @@ function App() {
         setActionBusy(key, false);
       }
     },
-    [refreshAfterAction, setActionBusy],
+    [ensureDockerReady, refreshAfterAction, setActionBusy],
   );
 
   const runBulkContainerAction = useCallback(
     async (action: Exclude<ContainerAction, 'kill'>) => {
+      if (!ensureDockerReady()) {
+        return;
+      }
       const ids = Array.from(selectedContainerIDs);
       if (ids.length === 0) {
         return;
@@ -854,7 +1015,7 @@ function App() {
         setActionBusy(key, false);
       }
     },
-    [refreshAfterAction, selectedContainerIDs, setActionBusy],
+    [ensureDockerReady, refreshAfterAction, selectedContainerIDs, setActionBusy],
   );
 
   const applyConfirmedPlan = useCallback(async () => {
@@ -903,6 +1064,9 @@ function App() {
 
   const runProjectAction = useCallback(
     async (action: ProjectAction, project: ProjectSummary) => {
+      if (!ensureDockerReady()) {
+        return;
+      }
       const key = projectActionBusyKey(action, project.id);
       setActionError(null);
       setActionBusy(key, true);
@@ -948,7 +1112,13 @@ function App() {
         setActionBusy(key, false);
       }
     },
-    [activeProjectID, refreshProjectDetail, refreshProjects, setActionBusy],
+    [
+      activeProjectID,
+      ensureDockerReady,
+      refreshProjectDetail,
+      refreshProjects,
+      setActionBusy,
+    ],
   );
 
   const openRunImageModal = useCallback((image?: ImageSummary) => {
@@ -964,6 +1134,9 @@ function App() {
   }, []);
 
   const submitRunImage = useCallback(async () => {
+    if (!ensureDockerReady()) {
+      return;
+    }
     setRunImage((current) => ({ ...current, busy: true, error: undefined }));
     try {
       const req = buildRunImageRequest(runImage);
@@ -978,7 +1151,7 @@ function App() {
         error: error instanceof Error ? error.message : 'Unable to run image',
       }));
     }
-  }, [refreshAfterAction, runImage]);
+  }, [ensureDockerReady, refreshAfterAction, runImage]);
 
   const openRenameModal = useCallback((container: ContainerSummary) => {
     setRename({
@@ -990,6 +1163,9 @@ function App() {
   }, []);
 
   const submitRename = useCallback(async () => {
+    if (!ensureDockerReady()) {
+      return;
+    }
     if (!rename.container) {
       return;
     }
@@ -1006,9 +1182,12 @@ function App() {
           error instanceof Error ? error.message : 'Unable to rename container',
       }));
     }
-  }, [refreshAfterAction, rename.container, rename.name]);
+  }, [ensureDockerReady, refreshAfterAction, rename.container, rename.name]);
 
   const submitPullImage = useCallback(async () => {
+    if (!ensureDockerReady()) {
+      return;
+    }
     const ref = imageRefWithTag(pullImage.ref, pullImage.tag);
     setPullImage((current) => ({ ...current, busy: true, error: undefined }));
     try {
@@ -1022,7 +1201,7 @@ function App() {
         error: error instanceof Error ? error.message : 'Unable to pull image',
       }));
     }
-  }, [pullImage.ref, pullImage.tag, refreshAfterAction]);
+  }, [ensureDockerReady, pullImage.ref, pullImage.tag, refreshAfterAction]);
 
   const openSaveImageModal = useCallback((image: ImageSummary) => {
     const ref = primaryImageRef(image);
@@ -1035,6 +1214,9 @@ function App() {
   }, []);
 
   const submitSaveImage = useCallback(async () => {
+    if (!ensureDockerReady()) {
+      return;
+    }
     setSaveImage((current) => ({ ...current, busy: true, error: undefined }));
     try {
       await DockerService.SaveImage(
@@ -1049,9 +1231,12 @@ function App() {
         error: error instanceof Error ? error.message : 'Unable to save image',
       }));
     }
-  }, [saveImage.destPath, saveImage.refsText]);
+  }, [ensureDockerReady, saveImage.destPath, saveImage.refsText]);
 
   const submitLoadImage = useCallback(async () => {
+    if (!ensureDockerReady()) {
+      return;
+    }
     setLoadImage((current) => ({ ...current, busy: true, error: undefined }));
     try {
       await DockerService.LoadImage(loadImage.srcPath);
@@ -1064,9 +1249,12 @@ function App() {
         error: error instanceof Error ? error.message : 'Unable to load image',
       }));
     }
-  }, [loadImage.srcPath, refreshAfterAction]);
+  }, [ensureDockerReady, loadImage.srcPath, refreshAfterAction]);
 
   const submitCreateVolume = useCallback(async () => {
+    if (!ensureDockerReady()) {
+      return;
+    }
     setCreateVolume((current) => ({
       ...current,
       busy: true,
@@ -1094,10 +1282,14 @@ function App() {
     createVolume.driverOptsText,
     createVolume.labelsText,
     createVolume.name,
+    ensureDockerReady,
     refreshAfterAction,
   ]);
 
   const submitCreateNetwork = useCallback(async () => {
+    if (!ensureDockerReady()) {
+      return;
+    }
     setCreateNetwork((current) => ({
       ...current,
       busy: true,
@@ -1126,7 +1318,7 @@ function App() {
           error instanceof Error ? error.message : 'Unable to create network',
       }));
     }
-  }, [createNetwork, refreshAfterAction]);
+  }, [createNetwork, ensureDockerReady, refreshAfterAction]);
 
   const browseImportFolder = useCallback(async () => {
     try {
@@ -1368,6 +1560,8 @@ function App() {
               detail={projectDetail}
               error={projectDetailError}
               loading={projectDetailStatus === 'loading'}
+              mutationsDisabled={mutationsDisabled}
+              mutationDisabledReason={mutationDisabledReason}
               onAction={runProjectAction}
               onBack={closeProjectDetail}
               onRefresh={() => {
@@ -1384,6 +1578,8 @@ function App() {
             actionBusyIDs={busyActionIDs}
             filter={projectFilter}
             loading={projectsStatus === 'loading'}
+            mutationsDisabled={mutationsDisabled}
+            mutationDisabledReason={mutationDisabledReason}
             onAction={runProjectAction}
             onFilterChange={setProjectFilter}
             onImport={() =>
@@ -1403,6 +1599,7 @@ function App() {
         return (
           <LogsPage
             containers={containers}
+            dockerRunning={dockerRunning}
             inventoryLoading={inventoryStatus === 'loading'}
             projects={projects}
             projectsLoading={projectsStatus === 'loading'}
@@ -1428,6 +1625,8 @@ function App() {
             containers={containers}
             filter={containerFilter}
             loading={inventoryStatus === 'loading'}
+            mutationsDisabled={mutationsDisabled}
+            mutationDisabledReason={mutationDisabledReason}
             onAction={runContainerAction}
             onBulkAction={runBulkContainerAction}
             onFilterChange={setContainerFilter}
@@ -1445,6 +1644,8 @@ function App() {
             imageUseCounts={imageUseCounts}
             images={images}
             loading={inventoryStatus === 'loading'}
+            mutationsDisabled={mutationsDisabled}
+            mutationDisabledReason={mutationDisabledReason}
             onFilterChange={setImageFilter}
             onInspect={openImageInspect}
             onLoad={() => setLoadImage({ ...emptyLoadImage, open: true })}
@@ -1459,6 +1660,8 @@ function App() {
           <VolumesPage
             filter={volumeFilter}
             loading={inventoryStatus === 'loading'}
+            mutationsDisabled={mutationsDisabled}
+            mutationDisabledReason={mutationDisabledReason}
             onCreate={() =>
               setCreateVolume({ ...emptyCreateVolume, open: true })
             }
@@ -1473,6 +1676,8 @@ function App() {
         return (
           <NetworksPage
             loading={inventoryStatus === 'loading'}
+            mutationsDisabled={mutationsDisabled}
+            mutationDisabledReason={mutationDisabledReason}
             networkDetails={networkDetails}
             networks={networks}
             onCreate={() =>
@@ -1490,6 +1695,8 @@ function App() {
             diskTotal={diskTotal}
             dockerRunning={dockerRunning}
             images={images}
+            mutationsDisabled={mutationsDisabled}
+            mutationDisabledReason={mutationDisabledReason}
             onImportProject={() =>
               setImportProject({ ...emptyImportProject, open: true })
             }
@@ -1560,7 +1767,7 @@ function App() {
           <div className="hidden border-t border-border p-3 lg:block">
             <div className="rounded-card border border-border bg-bg-inset p-3">
               <div className="flex items-center gap-2 text-sm">
-                <StatusDot tone={dockerRunning ? 'ok' : 'neutral'} />
+                <StatusDot tone={statusTone} />
                 <span className="font-medium">Docker Engine</span>
                 <span className="ml-auto text-xs text-text-muted">
                   {statusLabel}
@@ -1574,6 +1781,25 @@ function App() {
                   ? `Engine ${dockerVersion.serverVersion}`
                   : 'No engine version'}
               </div>
+              {!dockerRunning ? (
+                <div className="mt-3 flex gap-2">
+                  <Button
+                    icon={<Wrench size={14} />}
+                    loading={providerActionBusy}
+                    onClick={() => {
+                      if (dockerStopped) {
+                        void startProvider();
+                      } else {
+                        setRepairOpen(true);
+                      }
+                    }}
+                    size="sm"
+                    variant="secondary"
+                  >
+                    {dockerStopped ? 'Start' : 'Repair'}
+                  </Button>
+                </div>
+              ) : null}
             </div>
           </div>
         </aside>
@@ -1624,18 +1850,32 @@ function App() {
             </div>
           </header>
 
-          {inventoryError ? (
-            <div className="border-b border-border bg-warn/10 px-6 py-3 text-sm text-warn">
-              Docker is not reachable
-            </div>
-          ) : null}
+          <GlobalStateBanner
+            busy={providerActionBusy}
+            dockerStopped={dockerStopped}
+            inventoryError={inventoryError}
+            noProviderConfigured={noProviderConfigured}
+            onOpenRepair={() => setRepairOpen(true)}
+            onRetry={() => {
+              void retryProviderDetection();
+            }}
+            onStart={() => {
+              void startProvider();
+            }}
+            permissionProblem={permissionProblem}
+            providerProblems={providerProblems}
+            providerRepairNeeded={providerRepairNeeded}
+            providerWarnings={providerWarnings}
+          />
           {actionError ? (
             <div className="border-b border-border bg-error/10 px-6 py-3 text-sm text-error">
               {actionError}
             </div>
           ) : null}
 
-          <div className="min-h-0 flex-1 overflow-auto p-6">{content}</div>
+          <div className="min-h-0 flex-1 overflow-auto p-6">
+            <DegradedFrame stale={staleMode}>{content}</DegradedFrame>
+          </div>
         </section>
       </div>
 
@@ -1660,6 +1900,23 @@ function App() {
           setConfirm((current) => ({ ...current, typedName }))
         }
         onClose={() => setConfirm(emptyConfirm)}
+      />
+      <RepairProviderModal
+        busy={repairSaving || providerActionBusy}
+        error={repairError}
+        onChangePermissionMode={setPermissionMode}
+        onClose={() => setRepairOpen(false)}
+        onRetry={() => {
+          void retryProviderDetection();
+        }}
+        onSavePermission={() => {
+          void savePermissionMode();
+        }}
+        open={repairOpen}
+        permissionMode={permissionMode}
+        permissionProblem={permissionProblem}
+        problems={providerProblems}
+        provider={activeProvider}
       />
       <RenameContainerModal
         onChange={(name) => setRename((current) => ({ ...current, name }))}
@@ -1784,9 +2041,308 @@ function App() {
   );
 }
 
+function GlobalStateBanner({
+  busy,
+  dockerStopped,
+  inventoryError,
+  noProviderConfigured,
+  onOpenRepair,
+  onRetry,
+  onStart,
+  permissionProblem,
+  providerProblems,
+  providerRepairNeeded,
+  providerWarnings,
+}: {
+  busy: boolean;
+  dockerStopped: boolean;
+  inventoryError: string | null;
+  noProviderConfigured: boolean;
+  onOpenRepair: () => void;
+  onRetry: () => void;
+  onStart: () => void;
+  permissionProblem: ProviderProblem | null;
+  providerProblems: ProviderProblem[];
+  providerRepairNeeded: boolean;
+  providerWarnings: Array<{ code: string; message: string }>;
+}) {
+  const primaryProblem = permissionProblem ?? providerProblems[0] ?? null;
+  const warning = providerWarnings[0] ?? null;
+  const state = providerRepairNeeded
+    ? {
+        tone: 'error' as const,
+        icon: <ShieldAlert size={17} />,
+        title: primaryProblem?.message ?? 'Provider repair is required',
+        body:
+          primaryProblem?.repairHint ??
+          'Review the provider checks and choose a repair path.',
+      }
+    : noProviderConfigured
+      ? {
+          tone: 'warn' as const,
+          icon: <AlertTriangle size={17} />,
+          title: 'No Docker provider configured',
+          body: 'Set up a provider before running Docker actions.',
+        }
+      : dockerStopped || inventoryError
+        ? {
+            tone: 'warn' as const,
+            icon: <AlertTriangle size={17} />,
+            title: 'Docker is not reachable',
+            body:
+              inventoryError ??
+              'Cached data is visible; Docker actions are disabled until the engine is running.',
+          }
+        : warning
+          ? {
+              tone: 'info' as const,
+              icon: <AlertTriangle size={17} />,
+              title: warning.message,
+              body: 'Provider warning',
+            }
+          : null;
+
+  if (!state) {
+    return null;
+  }
+
+  const toneClass =
+    state.tone === 'error'
+      ? 'border-error/30 bg-error/10 text-error'
+      : state.tone === 'warn'
+        ? 'border-warn/30 bg-warn/10 text-warn'
+        : 'border-info/30 bg-info/10 text-info';
+
+  return (
+    <div className={`border-b px-6 py-3 ${toneClass}`}>
+      <div className="flex flex-wrap items-center gap-3 text-sm">
+        <span className="shrink-0">{state.icon}</span>
+        <div className="min-w-0 flex-1">
+          <div className="font-medium">{state.title}</div>
+          <div className="text-xs opacity-90">{state.body}</div>
+        </div>
+        {providerRepairNeeded || noProviderConfigured ? (
+          <Button
+            icon={<Wrench size={15} />}
+            onClick={onOpenRepair}
+            size="sm"
+            variant="secondary"
+          >
+            Repair
+          </Button>
+        ) : null}
+        {dockerStopped ? (
+          <Button
+            icon={<Play size={15} />}
+            loading={busy}
+            onClick={onStart}
+            size="sm"
+            variant="secondary"
+          >
+            Start
+          </Button>
+        ) : null}
+        <Button
+          icon={<RefreshCw size={15} />}
+          loading={busy}
+          onClick={onRetry}
+          size="sm"
+          variant="secondary"
+        >
+          Retry
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function DegradedFrame({
+  children,
+  stale,
+}: {
+  children: ReactNode;
+  stale: boolean;
+}) {
+  if (!stale) {
+    return <>{children}</>;
+  }
+  return (
+    <div className="relative">
+      <div className="pointer-events-none absolute right-3 top-3 z-10 rounded-control border border-neutral/30 bg-bg-panel/95 px-3 py-1 text-xs font-medium uppercase text-text-muted shadow-lg">
+        Stale cached data
+      </div>
+      <div className="opacity-80 grayscale-[0.25]">{children}</div>
+    </div>
+  );
+}
+
+function RepairProviderModal({
+  busy,
+  error,
+  onChangePermissionMode,
+  onClose,
+  onRetry,
+  onSavePermission,
+  open,
+  permissionMode,
+  permissionProblem,
+  problems,
+  provider,
+}: {
+  busy: boolean;
+  error: string | null;
+  onChangePermissionMode: (mode: PermissionMode) => void;
+  onClose: () => void;
+  onRetry: () => void;
+  onSavePermission: () => void;
+  open: boolean;
+  permissionMode: PermissionMode;
+  permissionProblem: ProviderProblem | null;
+  problems: ProviderProblem[];
+  provider: ProviderSummary | null;
+}) {
+  return (
+    <Modal onClose={onClose} open={open} size="lg" title="Repair Docker Provider">
+      <div className="space-y-5">
+        <div className="flex items-start gap-3 rounded-card border border-border bg-bg-inset p-4">
+          <Wrench className="mt-0.5 text-accent" size={19} />
+          <div className="min-w-0">
+            <div className="font-medium text-text-primary">
+              {provider?.name ?? 'No provider selected'}
+            </div>
+            <div className="mt-1 text-sm text-text-muted">
+              Provider checks list the exact failure and repair hint from the backend.
+            </div>
+          </div>
+        </div>
+
+        {problems.length > 0 ? (
+          <div className="space-y-2">
+            {problems.map((problem) => (
+              <div
+                className="rounded-card border border-error/25 bg-error/10 p-3 text-sm"
+                key={`${problem.code}:${problem.message}`}
+              >
+                <div className="flex items-center gap-2 font-medium text-error">
+                  <AlertTriangle size={16} />
+                  {problem.message}
+                </div>
+                {problem.repairHint ? (
+                  <div className="mt-2 text-text-secondary">
+                    {problem.repairHint}
+                  </div>
+                ) : null}
+                <div className="mt-2 text-xs uppercase text-text-muted">
+                  {problem.code}
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <EmptyState
+            body="Run detection again or set up a provider from onboarding when no provider exists."
+            icon={<CheckCircle2 size={28} />}
+            title="No provider problems recorded"
+          />
+        )}
+
+        {permissionProblem ? (
+          <section className="space-y-3">
+            <div>
+              <h3 className="text-sm font-semibold text-text-primary">
+                Linux Docker permission options
+              </h3>
+              <p className="mt-1 text-sm text-text-muted">
+                Socket access was denied. Pick how Cairn should work with this Linux backend.
+              </p>
+            </div>
+            <div className="grid gap-2">
+              <PermissionOption
+                checked={permissionMode === 'ask'}
+                description="Cairn prompts only when an action needs sudo. The sudo password is never stored."
+                label="Use sudo per action"
+                onChange={() => onChangePermissionMode('ask')}
+                value="ask"
+              />
+              <PermissionOption
+                checked={permissionMode === 'group'}
+                description="Convenient, less isolated. The docker group is root-equivalent and requires signing out and back in."
+                label="Add user to docker group"
+                onChange={() => onChangePermissionMode('group')}
+                value="group"
+              />
+              <PermissionOption
+                checked={permissionMode === 'rootless'}
+                description="Use the rootless Docker socket when rootless Docker is already configured."
+                label="Use rootless Docker socket"
+                onChange={() => onChangePermissionMode('rootless')}
+                value="rootless"
+              />
+            </div>
+          </section>
+        ) : null}
+
+        {error ? <div className="text-sm text-error">{error}</div> : null}
+
+        <div className="flex justify-end gap-2 border-t border-border pt-4">
+          <Button disabled={busy} onClick={onClose} variant="secondary">
+            Close
+          </Button>
+          <Button
+            icon={<RefreshCw size={15} />}
+            loading={busy}
+            onClick={onRetry}
+            variant="secondary"
+          >
+            Detect again
+          </Button>
+          {permissionProblem ? (
+            <Button loading={busy} onClick={onSavePermission} variant="primary">
+              Save permission mode
+            </Button>
+          ) : null}
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function PermissionOption({
+  checked,
+  description,
+  label,
+  onChange,
+  value,
+}: {
+  checked: boolean;
+  description: string;
+  label: string;
+  onChange: () => void;
+  value: PermissionMode;
+}) {
+  return (
+    <label className="flex cursor-pointer items-start gap-3 rounded-card border border-border bg-bg-card p-3 text-sm hover:border-border-strong">
+      <input
+        checked={checked}
+        className="mt-1"
+        name="linux-permission-mode"
+        onChange={onChange}
+        type="radio"
+        value={value}
+      />
+      <span>
+        <span className="block font-medium text-text-primary">{label}</span>
+        <span className="mt-1 block text-text-muted">{description}</span>
+      </span>
+    </label>
+  );
+}
+
 type OverviewProps = {
   provider: ProviderSummary | null;
   dockerRunning: boolean;
+  mutationsDisabled: boolean;
+  mutationDisabledReason: string;
   containers: ContainerSummary[];
   images: ImageSummary[];
   volumes: VolumeSummary[];
@@ -1809,6 +2365,8 @@ function OverviewPage({
   diskTotal,
   dockerRunning,
   images,
+  mutationsDisabled,
+  mutationDisabledReason,
   onImportProject,
   onNavigate,
   onOpenTerminal,
@@ -1846,6 +2404,11 @@ function OverviewPage({
   const logStreamIDRef = useRef<string | null>(null);
 
   const loadDashboard = useCallback(async () => {
+    if (!dockerRunning) {
+      setDashboardError(null);
+      setDashboardStatus('ready');
+      return;
+    }
     setDashboardStatus((current) => (current === 'ready' ? current : 'loading'));
     setDashboardError(null);
     try {
@@ -1858,7 +2421,7 @@ function OverviewPage({
       );
       setDashboardStatus('error');
     }
-  }, []);
+  }, [dockerRunning]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -1926,6 +2489,9 @@ function OverviewPage({
   }, []);
 
   useEffect(() => {
+    if (!dockerRunning) {
+      return undefined;
+    }
     let cancelled = false;
     let activeStreamID: string | null = null;
     const scope: StatsScope = { kind: 'all', ids: [] };
@@ -1950,7 +2516,7 @@ function OverviewPage({
         void MetricsService.StopStream(activeStreamID);
       }
     };
-  }, []);
+  }, [dockerRunning]);
 
   useEffect(() => {
     const offLines = Events.On('logs:lines', (event) => {
@@ -1968,6 +2534,9 @@ function OverviewPage({
   }, []);
 
   useEffect(() => {
+    if (!dockerRunning) {
+      return undefined;
+    }
     let cancelled = false;
     let activeStreamID: string | null = null;
     LogsService.StartLogStream({
@@ -1995,7 +2564,7 @@ function OverviewPage({
         void LogsService.StopStream(activeStreamID);
       }
     };
-  }, []);
+  }, [dockerRunning]);
 
   const stopped = Math.max(0, containers.length - runningContainers);
   const paused = containers.filter((container) => container.state === 'paused')
@@ -2072,6 +2641,8 @@ function OverviewPage({
           Import project
         </Button>
         <Button
+          disabled={mutationsDisabled}
+          disabledReason={mutationDisabledReason}
           icon={<Trash2 size={15} />}
           onClick={() => setCleanup({ ...emptyCleanup, open: true })}
           size="sm"
@@ -2103,6 +2674,8 @@ function OverviewPage({
           diskReclaimable={reclaimableBytes}
           diskTotal={diskBytes}
           images={images}
+          mutationsDisabled={mutationsDisabled}
+          mutationDisabledReason={mutationDisabledReason}
           onCleanUp={() => setCleanup({ ...emptyCleanup, open: true })}
           onNavigate={onNavigate}
           onShowContainers={onShowContainers}
@@ -2242,6 +2815,8 @@ function DashboardCountsStrip({
   diskReclaimable,
   diskTotal,
   images,
+  mutationsDisabled,
+  mutationDisabledReason,
   onCleanUp,
   onNavigate,
   onShowContainers,
@@ -2255,6 +2830,8 @@ function DashboardCountsStrip({
   runningContainers: number;
   diskTotal: number;
   diskReclaimable: number;
+  mutationsDisabled: boolean;
+  mutationDisabledReason: string;
   onCleanUp: () => void;
   onNavigate: (page: PageID) => void;
   onShowContainers: (filter: FilterID) => void;
@@ -2290,7 +2867,14 @@ function DashboardCountsStrip({
         value={counts.volumes}
       />
       <button
-        className="rounded-card border border-border bg-bg-card p-4 text-left transition hover:border-border-strong hover:bg-bg-panel"
+        className={[
+          'rounded-card border border-border bg-bg-card p-4 text-left transition',
+          mutationsDisabled
+            ? 'cursor-not-allowed opacity-60'
+            : 'hover:border-border-strong hover:bg-bg-panel',
+        ].join(' ')}
+        disabled={mutationsDisabled}
+        title={mutationsDisabled ? mutationDisabledReason : undefined}
         onClick={onCleanUp}
         type="button"
       >
@@ -3012,6 +3596,7 @@ const logRowOverscan = 8;
 
 type LogsPageProps = {
   containers: ContainerSummary[];
+  dockerRunning: boolean;
   projects: ProjectSummary[];
   inventoryLoading: boolean;
   projectsLoading: boolean;
@@ -3025,6 +3610,7 @@ type LogOption = {
 
 function LogsPage({
   containers,
+  dockerRunning,
   inventoryLoading,
   projects,
   projectsLoading,
@@ -3213,7 +3799,7 @@ function LogsPage({
     }
     return [];
   }, [scope, selectedContainerIDs, selectedProjectID, selectedServiceID]);
-  const canStream = scope === 'all' || streamIDs.length > 0;
+  const canStream = dockerRunning && (scope === 'all' || streamIDs.length > 0);
 
   useEffect(() => {
     if (!canStream) {
@@ -4003,6 +4589,8 @@ type ProjectsPageProps = {
   view: ProjectViewMode;
   loading: boolean;
   error: string | null;
+  mutationsDisabled: boolean;
+  mutationDisabledReason: string;
   onAction: (action: ProjectAction, project: ProjectSummary) => void;
   onFilterChange: (filter: FilterID) => void;
   onSortChange: (sort: ProjectSortID) => void;
@@ -4017,6 +4605,8 @@ function ProjectsPage({
   error,
   filter,
   loading,
+  mutationsDisabled,
+  mutationDisabledReason,
   onAction,
   onFilterChange,
   onImport,
@@ -4038,7 +4628,7 @@ function ProjectsPage({
   >({});
 
   useEffect(() => {
-    if (projects.length === 0) {
+    if (projects.length === 0 || mutationsDisabled) {
       return undefined;
     }
     let cancelled = false;
@@ -4079,7 +4669,7 @@ function ProjectsPage({
         void MetricsService.StopStream(activeStreamID);
       }
     };
-  }, [projects.length]);
+  }, [mutationsDisabled, projects.length]);
 
   if (loading && projects.length === 0) {
     return <TableSkeleton />;
@@ -4197,6 +4787,8 @@ function ProjectsPage({
             <ProjectCard
               actionBusyIDs={actionBusyIDs}
               key={project.id}
+              mutationsDisabled={mutationsDisabled}
+              mutationDisabledReason={mutationDisabledReason}
               onAction={onAction}
               onOpen={onOpen}
               project={project}
@@ -4207,6 +4799,8 @@ function ProjectsPage({
       ) : (
         <ProjectList
           actionBusyIDs={actionBusyIDs}
+          mutationsDisabled={mutationsDisabled}
+          mutationDisabledReason={mutationDisabledReason}
           onAction={onAction}
           onOpen={onOpen}
           projects={filtered}
@@ -4228,6 +4822,8 @@ function ProjectsPage({
 
 function ProjectCard({
   actionBusyIDs,
+  mutationsDisabled,
+  mutationDisabledReason,
   onAction,
   onOpen,
   project,
@@ -4236,6 +4832,8 @@ function ProjectCard({
   project: ProjectSummary;
   sparkPoints?: SparkPoint[];
   actionBusyIDs: Set<string>;
+  mutationsDisabled: boolean;
+  mutationDisabledReason: string;
   onAction: (action: ProjectAction, project: ProjectSummary) => void;
   onOpen: (project: ProjectSummary) => void;
 }) {
@@ -4243,10 +4841,13 @@ function ProjectCard({
   const workdirMissing = project.status === 'error';
   const primaryAction: ProjectAction =
     project.status === 'running' ? 'stop' : 'start';
-  const lifecycleDisabled = workdirMissing || !project.workingDir;
-  const disabledReason = workdirMissing
-    ? 'Re-link folder before running project actions'
-    : 'No workdir';
+  const lifecycleDisabled =
+    mutationsDisabled || workdirMissing || !project.workingDir;
+  const disabledReason = mutationsDisabled
+    ? mutationDisabledReason
+    : workdirMissing
+      ? 'Re-link folder before running project actions'
+      : 'No workdir';
   const busy = (action: ProjectAction) =>
     actionBusyIDs.has(projectActionBusyKey(action, project.id));
   return (
@@ -4413,12 +5014,16 @@ function ProjectCard({
 
 function ProjectList({
   actionBusyIDs,
+  mutationsDisabled,
+  mutationDisabledReason,
   onAction,
   onOpen,
   projects,
 }: {
   projects: ProjectSummary[];
   actionBusyIDs: Set<string>;
+  mutationsDisabled: boolean;
+  mutationDisabledReason: string;
   onAction: (action: ProjectAction, project: ProjectSummary) => void;
   onOpen: (project: ProjectSummary) => void;
 }) {
@@ -4507,6 +5112,8 @@ function ProjectList({
           render: (project) => (
             <ProjectRowActions
               actionBusyIDs={actionBusyIDs}
+              mutationsDisabled={mutationsDisabled}
+              mutationDisabledReason={mutationDisabledReason}
               onAction={onAction}
               project={project}
             />
@@ -4528,18 +5135,25 @@ function ProjectList({
 
 function ProjectRowActions({
   actionBusyIDs,
+  mutationsDisabled,
+  mutationDisabledReason,
   onAction,
   project,
 }: {
   project: ProjectSummary;
   actionBusyIDs: Set<string>;
+  mutationsDisabled: boolean;
+  mutationDisabledReason: string;
   onAction: (action: ProjectAction, project: ProjectSummary) => void;
 }) {
   const workdirMissing = project.status === 'error';
-  const lifecycleDisabled = workdirMissing || !project.workingDir;
-  const disabledReason = workdirMissing
-    ? 'Re-link folder before running project actions'
-    : 'No workdir';
+  const lifecycleDisabled =
+    mutationsDisabled || workdirMissing || !project.workingDir;
+  const disabledReason = mutationsDisabled
+    ? mutationDisabledReason
+    : workdirMissing
+      ? 'Re-link folder before running project actions'
+      : 'No workdir';
   const primaryAction: ProjectAction =
     project.status === 'running' ? 'stop' : 'start';
   const busy = (action: ProjectAction) =>
@@ -4624,6 +5238,8 @@ function ProjectDetailPage({
   detail,
   error,
   loading,
+  mutationsDisabled,
+  mutationDisabledReason,
   onAction,
   onBack,
   onRefresh,
@@ -4634,6 +5250,8 @@ function ProjectDetailPage({
   actionBusyIDs: Set<string>;
   loading: boolean;
   error: string | null;
+  mutationsDisabled: boolean;
+  mutationDisabledReason: string;
   tab: ProjectTabID;
   onAction: (action: ProjectAction, project: ProjectSummary) => void;
   onBack: () => void;
@@ -4656,9 +5274,11 @@ function ProjectDetailPage({
   const project = detail.summary;
   const primaryAction: ProjectAction =
     project.status === 'running' ? 'stop' : 'start';
-  const lifecycleDisabled = project.status === 'error' || !project.workingDir;
-  const disabledReason =
-    project.status === 'error'
+  const lifecycleDisabled =
+    mutationsDisabled || project.status === 'error' || !project.workingDir;
+  const disabledReason = mutationsDisabled
+    ? mutationDisabledReason
+    : project.status === 'error'
       ? 'Re-link folder before running project actions'
       : 'No workdir';
   const busy = (action: ProjectAction) =>
@@ -5055,6 +5675,8 @@ type ContainersPageProps = {
   filter: FilterID;
   search: string;
   loading: boolean;
+  mutationsDisabled: boolean;
+  mutationDisabledReason: string;
   selectedIDs: Set<string>;
   actionBusyIDs: Set<string>;
   onAction: (action: ContainerAction, container: ContainerSummary) => void;
@@ -5070,6 +5692,8 @@ function ContainersPage({
   containers,
   filter,
   loading,
+  mutationsDisabled,
+  mutationDisabledReason,
   onAction,
   onBulkAction,
   onFilterChange,
@@ -5215,6 +5839,8 @@ function ContainersPage({
               <ContainerRowActions
                 busyIDs={actionBusyIDs}
                 container={container}
+                mutationsDisabled={mutationsDisabled}
+                mutationDisabledReason={mutationDisabledReason}
                 onAction={onAction}
                 onInspect={onInspect}
                 onRename={onRename}
@@ -5225,6 +5851,8 @@ function ContainersPage({
         bulkActions={
           <ContainerBulkActions
             busyIDs={actionBusyIDs}
+            mutationsDisabled={mutationsDisabled}
+            mutationDisabledReason={mutationDisabledReason}
             onAction={onBulkAction}
           />
         }
@@ -5250,6 +5878,8 @@ type ImagesPageProps = {
   filter: FilterID;
   search: string;
   loading: boolean;
+  mutationsDisabled: boolean;
+  mutationDisabledReason: string;
   onFilterChange: (filter: FilterID) => void;
   onInspect: (image: ImageSummary) => void;
   onLoad: () => void;
@@ -5263,6 +5893,8 @@ function ImagesPage({
   imageUseCounts,
   images,
   loading,
+  mutationsDisabled,
+  mutationDisabledReason,
   onFilterChange,
   onInspect,
   onLoad,
@@ -5314,6 +5946,8 @@ function ImagesPage({
         />
         <div className="flex items-center gap-2">
           <Button
+            disabled={mutationsDisabled}
+            disabledReason={mutationDisabledReason}
             icon={<Download size={15} />}
             onClick={onPull}
             variant="secondary"
@@ -5321,6 +5955,8 @@ function ImagesPage({
             Pull image
           </Button>
           <Button
+            disabled={mutationsDisabled}
+            disabledReason={mutationDisabledReason}
             icon={<Upload size={15} />}
             onClick={onLoad}
             variant="secondary"
@@ -5328,6 +5964,8 @@ function ImagesPage({
             Load tar
           </Button>
           <Button
+            disabled={mutationsDisabled}
+            disabledReason={mutationDisabledReason}
             icon={<PackagePlus size={15} />}
             onClick={() => onRun()}
             variant="primary"
@@ -5403,6 +6041,8 @@ function ImagesPage({
             render: (image) => (
               <ImageRowActions
                 image={image}
+                mutationsDisabled={mutationsDisabled}
+                mutationDisabledReason={mutationDisabledReason}
                 onInspect={() => onInspect(image)}
                 onRun={() => onRun(image)}
                 onSave={() => onSave(image)}
@@ -5430,6 +6070,8 @@ type VolumesPageProps = {
   filter: FilterID;
   search: string;
   loading: boolean;
+  mutationsDisabled: boolean;
+  mutationDisabledReason: string;
   onCreate: () => void;
   onFilterChange: (filter: FilterID) => void;
   onInspect: (volume: VolumeSummary) => void;
@@ -5438,6 +6080,8 @@ type VolumesPageProps = {
 function VolumesPage({
   filter,
   loading,
+  mutationsDisabled,
+  mutationDisabledReason,
   onCreate,
   onFilterChange,
   onInspect,
@@ -5472,7 +6116,13 @@ function VolumesPage({
           ]}
           onChange={onFilterChange}
         />
-        <Button icon={<Plus size={15} />} onClick={onCreate} variant="primary">
+        <Button
+          disabled={mutationsDisabled}
+          disabledReason={mutationDisabledReason}
+          icon={<Plus size={15} />}
+          onClick={onCreate}
+          variant="primary"
+        >
           Create volume
         </Button>
       </div>
@@ -5557,12 +6207,16 @@ type NetworksPageProps = {
   networkDetails: Record<string, NetworkDetail>;
   search: string;
   loading: boolean;
+  mutationsDisabled: boolean;
+  mutationDisabledReason: string;
   onCreate: () => void;
   onInspect: (network: NetworkSummary) => void;
 };
 
 function NetworksPage({
   loading,
+  mutationsDisabled,
+  mutationDisabledReason,
   networkDetails,
   networks,
   onCreate,
@@ -5579,7 +6233,13 @@ function NetworksPage({
   return (
     <div className="space-y-4">
       <div className="flex justify-end">
-        <Button icon={<Plus size={15} />} onClick={onCreate} variant="primary">
+        <Button
+          disabled={mutationsDisabled}
+          disabledReason={mutationDisabledReason}
+          icon={<Plus size={15} />}
+          onClick={onCreate}
+          variant="primary"
+        >
           Create network
         </Button>
       </div>
@@ -5753,11 +6413,15 @@ function RowActions({
 
 function ImageRowActions({
   image,
+  mutationsDisabled,
+  mutationDisabledReason,
   onInspect,
   onRun,
   onSave,
 }: {
   image: ImageSummary;
+  mutationsDisabled: boolean;
+  mutationDisabledReason: string;
   onInspect: () => void;
   onRun: () => void;
   onSave: () => void;
@@ -5768,6 +6432,8 @@ function ImageRowActions({
       <Tooltip label="Run">
         <Button
           aria-label={`Run ${label}`}
+          disabled={mutationsDisabled}
+          disabledReason={mutationDisabledReason}
           icon={<Play size={15} />}
           onClick={onRun}
           size="icon"
@@ -5777,6 +6443,8 @@ function ImageRowActions({
       <Tooltip label="Save to tar">
         <Button
           aria-label={`Save ${label}`}
+          disabled={mutationsDisabled}
+          disabledReason={mutationDisabledReason}
           icon={<Download size={15} />}
           onClick={onSave}
           size="icon"
@@ -5791,12 +6459,16 @@ function ImageRowActions({
 function ContainerRowActions({
   busyIDs,
   container,
+  mutationsDisabled,
+  mutationDisabledReason,
   onAction,
   onInspect,
   onRename,
 }: {
   busyIDs: Set<string>;
   container: ContainerSummary;
+  mutationsDisabled: boolean;
+  mutationDisabledReason: string;
   onAction: (action: ContainerAction, container: ContainerSummary) => void;
   onInspect: (container: ContainerSummary) => void;
   onRename: (container: ContainerSummary) => void;
@@ -5812,9 +6484,11 @@ function ContainerRowActions({
       <Tooltip label={canStart ? 'Start' : 'Stop'}>
         <Button
           aria-label={`${canStart ? 'Start' : 'Stop'} ${container.name}`}
-          disabled={busyIDs.has(
-            `${canStart ? 'start' : 'stop'}:${container.id}`,
-          )}
+          disabled={
+            mutationsDisabled ||
+            busyIDs.has(`${canStart ? 'start' : 'stop'}:${container.id}`)
+          }
+          disabledReason={mutationDisabledReason}
           icon={canStart ? <Play size={15} /> : <Square size={15} />}
           onClick={() => onAction(canStart ? 'start' : 'stop', container)}
           size="icon"
@@ -5824,8 +6498,14 @@ function ContainerRowActions({
       <Tooltip label="Restart">
         <Button
           aria-label={`Restart ${container.name}`}
-          disabled={!canStop || busyIDs.has(`restart:${container.id}`)}
-          disabledReason="Container is not running"
+          disabled={
+            mutationsDisabled || !canStop || busyIDs.has(`restart:${container.id}`)
+          }
+          disabledReason={
+            mutationsDisabled
+              ? mutationDisabledReason
+              : 'Container is not running'
+          }
           icon={<RotateCw size={15} />}
           onClick={() => onAction('restart', container)}
           size="icon"
@@ -5835,8 +6515,14 @@ function ContainerRowActions({
       <Tooltip label="Kill">
         <Button
           aria-label={`Kill ${container.name}`}
-          disabled={!canStop || busyIDs.has(`kill:${container.id}`)}
-          disabledReason="Container is not running"
+          disabled={
+            mutationsDisabled || !canStop || busyIDs.has(`kill:${container.id}`)
+          }
+          disabledReason={
+            mutationsDisabled
+              ? mutationDisabledReason
+              : 'Container is not running'
+          }
           icon={<Skull size={15} />}
           onClick={() => onAction('kill', container)}
           size="icon"
@@ -5846,6 +6532,8 @@ function ContainerRowActions({
       <Tooltip label="Rename">
         <Button
           aria-label={`Rename ${container.name}`}
+          disabled={mutationsDisabled}
+          disabledReason={mutationDisabledReason}
           icon={<Pencil size={15} />}
           onClick={() => onRename(container)}
           size="icon"
@@ -5863,15 +6551,21 @@ function ContainerRowActions({
 
 function ContainerBulkActions({
   busyIDs,
+  mutationsDisabled,
+  mutationDisabledReason,
   onAction,
 }: {
   busyIDs: Set<string>;
+  mutationsDisabled: boolean;
+  mutationDisabledReason: string;
   onAction: (action: Exclude<ContainerAction, 'kill'>) => void;
 }) {
   return (
     <div className="flex items-center gap-1">
       <Button
         icon={<Play size={15} />}
+        disabled={mutationsDisabled}
+        disabledReason={mutationDisabledReason}
         loading={busyIDs.has('bulk:start')}
         onClick={() => onAction('start')}
         size="sm"
@@ -5881,6 +6575,8 @@ function ContainerBulkActions({
       </Button>
       <Button
         icon={<Square size={15} />}
+        disabled={mutationsDisabled}
+        disabledReason={mutationDisabledReason}
         loading={busyIDs.has('bulk:stop')}
         onClick={() => onAction('stop')}
         size="sm"
@@ -7589,6 +8285,10 @@ function filterNetworks(networks: NetworkSummary[], search: string) {
 
 function normalize(value: unknown) {
   return String(value ?? '').toLowerCase();
+}
+
+function normalizePermissionMode(value: unknown): PermissionMode {
+  return value === 'group' || value === 'rootless' ? value : 'ask';
 }
 
 function imageUsageCounts(containers: ContainerSummary[]) {

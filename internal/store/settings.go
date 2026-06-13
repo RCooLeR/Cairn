@@ -13,6 +13,7 @@ var (
 	ErrUnknownSetting = errors.New("unknown setting")
 	ErrInvalidJSON    = errors.New("invalid setting JSON")
 	ErrTypeMismatch   = errors.New("setting type mismatch")
+	ErrInvalidValue   = errors.New("invalid setting value")
 )
 
 type settingKind string
@@ -121,6 +122,56 @@ func (r *SettingsRepository) SetInt(ctx context.Context, key string, value int) 
 	return r.setTyped(ctx, key, kindInt, value)
 }
 
+func (r *SettingsRepository) All(ctx context.Context) (map[string]any, error) {
+	if err := r.EnsureDefaults(ctx); err != nil {
+		return nil, err
+	}
+
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT key, value
+		FROM settings
+		ORDER BY key
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = rows.Close()
+	}()
+
+	settings := make(map[string]any, len(settingDefaults))
+	for rows.Next() {
+		var key string
+		var raw string
+		if err := rows.Scan(&key, &raw); err != nil {
+			return nil, err
+		}
+		value, err := decodeSettingValue(key, raw)
+		if err != nil {
+			return nil, err
+		}
+		settings[key] = value
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return settings, nil
+}
+
+func (r *SettingsRepository) SetValue(ctx context.Context, key string, value any) error {
+	key = normalizeSettingKey(key)
+	spec, ok := settingDefaults[key]
+	if !ok {
+		return fmt.Errorf("%w: %s", ErrUnknownSetting, key)
+	}
+
+	normalized, err := normalizeSettingValue(key, spec.kind, value)
+	if err != nil {
+		return err
+	}
+	return r.setTyped(ctx, key, spec.kind, normalized)
+}
+
 func (r *SettingsRepository) SetRaw(ctx context.Context, key, rawJSON string) error {
 	key = normalizeSettingKey(key)
 	spec, ok := settingDefaults[key]
@@ -131,6 +182,9 @@ func (r *SettingsRepository) SetRaw(ctx context.Context, key, rawJSON string) er
 		return fmt.Errorf("%w: %s", ErrInvalidJSON, key)
 	}
 	if err := validateJSONKind(rawJSON, spec.kind); err != nil {
+		return err
+	}
+	if _, err := decodeSettingValue(key, rawJSON); err != nil {
 		return err
 	}
 
@@ -185,6 +239,93 @@ func (r *SettingsRepository) setTyped(ctx context.Context, key string, expected 
 		return err
 	}
 	return r.SetRaw(ctx, key, string(raw))
+}
+
+func decodeSettingValue(key, rawJSON string) (any, error) {
+	spec, ok := settingDefaults[normalizeSettingKey(key)]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrUnknownSetting, key)
+	}
+
+	var value any
+	if err := json.Unmarshal([]byte(rawJSON), &value); err != nil {
+		return nil, fmt.Errorf("%w: %s", ErrInvalidJSON, key)
+	}
+	return normalizeSettingValue(key, spec.kind, value)
+}
+
+func normalizeSettingValue(key string, expected settingKind, value any) (any, error) {
+	var normalized any
+	switch expected {
+	case kindBool:
+		boolValue, ok := value.(bool)
+		if !ok {
+			return nil, fmt.Errorf("%w: %s", ErrTypeMismatch, key)
+		}
+		normalized = boolValue
+	case kindInt:
+		intValue, ok := asSettingInt(value)
+		if !ok {
+			return nil, fmt.Errorf("%w: %s", ErrTypeMismatch, key)
+		}
+		normalized = intValue
+	case kindString:
+		stringValue, ok := value.(string)
+		if !ok {
+			return nil, fmt.Errorf("%w: %s", ErrTypeMismatch, key)
+		}
+		normalized = stringValue
+	default:
+		return nil, fmt.Errorf("%w: %s", ErrTypeMismatch, key)
+	}
+	if err := validateSettingEnum(key, normalized); err != nil {
+		return nil, err
+	}
+	return normalized, nil
+}
+
+func asSettingInt(value any) (int, bool) {
+	switch typed := value.(type) {
+	case int:
+		return typed, true
+	case int8:
+		return int(typed), true
+	case int16:
+		return int(typed), true
+	case int32:
+		return int(typed), true
+	case int64:
+		return int(typed), true
+	case float64:
+		asInt := int(typed)
+		return asInt, typed == float64(asInt)
+	case json.Number:
+		asInt, err := typed.Int64()
+		return int(asInt), err == nil
+	default:
+		return 0, false
+	}
+}
+
+func validateSettingEnum(key string, value any) error {
+	stringValue, ok := value.(string)
+	if !ok {
+		return nil
+	}
+	allowedValues := map[string]map[string]struct{}{
+		"general.theme":             {"dark": {}, "light": {}, "system": {}},
+		"general.language":          {"en": {}},
+		"registry.credentials_mode": {"docker_helper": {}, "none": {}},
+		"linux.sudo_mode":           {"ask": {}, "group": {}, "rootless": {}},
+	}
+	allowed, ok := allowedValues[normalizeSettingKey(key)]
+	if !ok {
+		return nil
+	}
+	if _, ok := allowed[stringValue]; ok {
+		return nil
+	}
+	return fmt.Errorf("%w: %s=%s", ErrInvalidValue, key, stringValue)
 }
 
 func validateJSONKind(rawJSON string, expected settingKind) error {

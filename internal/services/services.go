@@ -117,7 +117,8 @@ type ImageLineageService struct{}
 type BackupService struct{}
 type RegistryService struct{}
 type SettingsService struct {
-	Audit *store.AuditRepository
+	Audit    *store.AuditRepository
+	Settings *store.SettingsRepository
 }
 
 func notReady() error {
@@ -1094,11 +1095,17 @@ func (s *RegistryService) KnownRegistries(_ context.Context) ([]models.RegistryP
 	}, nil
 }
 
-func (s *SettingsService) GetSettings(_ context.Context) (map[string]any, error) {
+func (s *SettingsService) GetSettings(ctx context.Context) (map[string]any, error) {
+	if s.Settings != nil {
+		return s.Settings.All(ctx)
+	}
 	return map[string]any{}, nil
 }
 
-func (s *SettingsService) SetSetting(_ context.Context, key string, value any) error {
+func (s *SettingsService) SetSetting(ctx context.Context, key string, value any) error {
+	if s.Settings != nil {
+		return s.Settings.SetValue(ctx, key, value)
+	}
 	return notReady()
 }
 

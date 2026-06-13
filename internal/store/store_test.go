@@ -178,6 +178,26 @@ func TestSettingsDefaultsAndRoundTrip(t *testing.T) {
 	if err := settings.SetString(ctx, "missing.setting", "x"); !errors.Is(err, ErrUnknownSetting) {
 		t.Fatalf("SetString unknown key error = %v, want ErrUnknownSetting", err)
 	}
+
+	all, err := settings.All(ctx)
+	if err != nil {
+		t.Fatalf("All() error = %v", err)
+	}
+	if all["linux.sudo_mode"] != "ask" {
+		t.Fatalf("linux.sudo_mode default = %#v, want ask", all["linux.sudo_mode"])
+	}
+	if err := settings.SetValue(ctx, "linux.sudo_mode", "rootless"); err != nil {
+		t.Fatalf("SetValue linux.sudo_mode: %v", err)
+	}
+	if got, err := settings.GetString(ctx, "linux.sudo_mode"); err != nil || got != "rootless" {
+		t.Fatalf("linux.sudo_mode after set = %q, %v; want rootless, nil", got, err)
+	}
+	if err := settings.SetValue(ctx, "linux.sudo_mode", "silent-root"); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("SetValue invalid enum error = %v, want ErrInvalidValue", err)
+	}
+	if err := settings.SetValue(ctx, "metrics.sample_interval_seconds", float64(3.5)); !errors.Is(err, ErrTypeMismatch) {
+		t.Fatalf("SetValue fractional int error = %v, want ErrTypeMismatch", err)
+	}
 }
 
 func openMigratedStore(t *testing.T, ctx context.Context) *Store {

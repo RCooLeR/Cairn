@@ -79,6 +79,11 @@ const projectServiceMock = vi.hoisted(() => ({
   ApplyProjectPlan: vi.fn(),
 }));
 
+const providerServiceMock = vi.hoisted(() => ({
+  Detect: vi.fn(),
+  Start: vi.fn(),
+}));
+
 const logsServiceMock = vi.hoisted(() => ({
   StartLogStream: vi.fn(),
   StopStream: vi.fn(),
@@ -107,6 +112,8 @@ const terminalServiceMock = vi.hoisted(() => ({
 }));
 
 const settingsServiceMock = vi.hoisted(() => ({
+  GetSettings: vi.fn(),
+  SetSetting: vi.fn(),
   GetCheatsheet: vi.fn(),
 }));
 
@@ -125,6 +132,7 @@ vi.mock('./api/services', () => ({
   DockerService: dockerServiceMock,
   LogsService: logsServiceMock,
   MetricsService: metricsServiceMock,
+  ProviderService: providerServiceMock,
   ProjectService: projectServiceMock,
   SettingsService: settingsServiceMock,
   TerminalService: terminalServiceMock,
@@ -230,6 +238,8 @@ describe('App inventory shell', () => {
     projectServiceMock.PlanRedeployProject.mockResolvedValue(projectRedeployPlan());
     projectServiceMock.PlanDownProject.mockResolvedValue(projectDownVolumesPlan());
     projectServiceMock.ApplyProjectPlan.mockResolvedValue(undefined);
+    providerServiceMock.Detect.mockResolvedValue(healthyProviderStatus());
+    providerServiceMock.Start.mockResolvedValue(undefined);
     logsServiceMock.StartLogStream.mockResolvedValue('stream-1');
     logsServiceMock.StopStream.mockResolvedValue(undefined);
     logsServiceMock.FetchLogPage.mockResolvedValue({ lines: [] });
@@ -282,6 +292,10 @@ describe('App inventory shell', () => {
     terminalServiceMock.WriteTerminal.mockResolvedValue(undefined);
     terminalServiceMock.ResizeTerminal.mockResolvedValue(undefined);
     terminalServiceMock.CloseTerminal.mockResolvedValue(undefined);
+    settingsServiceMock.GetSettings.mockResolvedValue({
+      'linux.sudo_mode': 'ask',
+    });
+    settingsServiceMock.SetSetting.mockResolvedValue(undefined);
     settingsServiceMock.GetCheatsheet.mockResolvedValue(seededCheatsheet());
     runtimeMock.openFile.mockResolvedValue('');
     runtimeMock.saveFile.mockResolvedValue('/tmp/cairn-logs.jsonl');
@@ -1009,6 +1023,68 @@ describe('App inventory shell', () => {
     expect(screen.getByText('No images match')).toBeInTheDocument();
   });
 
+  it('renders stale cached data and disables Docker mutations when the daemon is stopped', async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(stoppedDaemonSnapshot());
+
+    render(<App />);
+
+    expect(await screen.findByText('Stale cached data')).toBeInTheDocument();
+    expect(screen.getByText('Docker is not reachable')).toBeInTheDocument();
+    expect(logsServiceMock.StartLogStream).not.toHaveBeenCalled();
+    expect(metricsServiceMock.StartStatsStream).not.toHaveBeenCalled();
+
+    fireEvent.click(
+      within(
+        screen.getByRole('navigation', { name: 'Main navigation' }),
+      ).getByRole('button', {
+        name: /Containers/,
+      }),
+    );
+
+    const stopButton = screen.getByRole('button', { name: 'Stop web' });
+    expect(stopButton).toBeDisabled();
+    fireEvent.click(stopButton);
+    expect(dockerServiceMock.StopContainer).not.toHaveBeenCalled();
+
+    fireEvent.click(
+      within(
+        screen.getByRole('navigation', { name: 'Main navigation' }),
+      ).getByRole('button', {
+        name: /Logs/,
+      }),
+    );
+    expect(logsServiceMock.StartLogStream).not.toHaveBeenCalled();
+  });
+
+  it('persists Linux socket permission choices from the provider repair dialog', async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(permissionDeniedSnapshot());
+
+    render(<App />);
+
+    expect(
+      await screen.findByText('Cairn cannot access the Docker socket.'),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getAllByRole('button', { name: 'Repair' })[0]);
+    const dialog = await screen.findByRole('dialog', {
+      name: 'Repair Docker Provider',
+    });
+    fireEvent.click(within(dialog).getByLabelText(/Add user to docker group/));
+    fireEvent.click(
+      within(dialog).getByRole('button', {
+        name: 'Save permission mode',
+      }),
+    );
+
+    await waitFor(() =>
+      expect(settingsServiceMock.SetSetting).toHaveBeenCalledWith(
+        'linux.sudo_mode',
+        'group',
+      ),
+    );
+    expect(providerServiceMock.Detect).toHaveBeenCalledWith('linux_native');
+  });
+
   it('refreshes inventory when Docker object events arrive', async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
 
@@ -1447,6 +1523,64 @@ function emptySnapshot(): InventorySnapshot {
     networks: [],
     volumeDetails: {},
     networkDetails: {},
+  };
+}
+
+function stoppedDaemonSnapshot(): InventorySnapshot {
+  const snapshot = seededSnapshot();
+  const provider = snapshot.providers[0]!;
+  return {
+    ...snapshot,
+    dockerInfo: null,
+    dockerVersion: null,
+    degradedReason: 'Docker daemon ping failed',
+    providers: [
+      {
+        ...provider,
+        id: 'linux_native',
+        name: 'Linux Native',
+        kind: 'linux_native',
+        status: {
+          ...healthyProviderStatus(),
+          running: false,
+          healthy: false,
+          dockerRunning: false,
+          dockerVersion: '',
+          problems: [],
+        },
+        healthy: false,
+      },
+    ],
+  };
+}
+
+function permissionDeniedSnapshot(): InventorySnapshot {
+  const snapshot = stoppedDaemonSnapshot();
+  const provider = snapshot.providers[0]!;
+  return {
+    ...snapshot,
+    degradedReason: 'permission denied while connecting to Docker socket',
+    providers: [
+      {
+        ...provider,
+        status: {
+          ...provider.status,
+          installed: true,
+          dockerInstalled: true,
+          composeInstalled: true,
+          buildxInstalled: true,
+          problems: [
+            {
+              code: 'PERM_SOCKET',
+              message: 'Cairn cannot access the Docker socket.',
+              repairHint:
+                'Choose sudo-per-action in Settings or add your Linux user to the docker group, then sign out and back in.',
+              recoverable: true,
+            },
+          ],
+        },
+      },
+    ],
   };
 }
 
