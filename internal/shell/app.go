@@ -78,6 +78,7 @@ func Run(assets fs.FS) error {
 			application.NewService(&services.ProjectService{
 				Detector:    projectDetector,
 				Projects:    projectRepo,
+				Objects:     db.Objects(),
 				Client:      composeClient,
 				Audit:       auditRepo,
 				Plans:       projectPlans,

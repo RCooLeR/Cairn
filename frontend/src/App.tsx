@@ -48,6 +48,7 @@ import {
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
+import Editor from '@monaco-editor/react';
 import { Dialogs, Events } from '@wailsio/runtime';
 
 import { getAppVersion } from './api/app';
@@ -82,6 +83,7 @@ type BadgeTone = 'ok' | 'warn' | 'error' | 'info' | 'neutral' | 'accent';
 type LoadStatus = 'idle' | 'loading' | 'ready' | 'error';
 type ProjectViewMode = 'grid' | 'list';
 type ProjectSortID = 'name' | 'activity' | 'cpu';
+type ProjectTabID = 'overview' | 'services' | 'containers' | 'compose';
 
 type NavItem = {
   id: PageID;
@@ -337,6 +339,16 @@ function App() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [projectsStatus, setProjectsStatus] = useState<LoadStatus>('idle');
   const [projectsError, setProjectsError] = useState<string | null>(null);
+  const [activeProjectID, setActiveProjectID] = useState<string | null>(null);
+  const [projectDetail, setProjectDetail] = useState<ProjectDetail | null>(
+    null,
+  );
+  const [projectDetailStatus, setProjectDetailStatus] =
+    useState<LoadStatus>('idle');
+  const [projectDetailError, setProjectDetailError] = useState<string | null>(
+    null,
+  );
+  const [projectTab, setProjectTab] = useState<ProjectTabID>('overview');
   const [projectFilter, setProjectFilter] = useState<FilterID>('all');
   const [projectSort, setProjectSort] = useState<ProjectSortID>('name');
   const [projectView, setProjectView] = useState<ProjectViewMode>(() => {
@@ -385,6 +397,41 @@ function App() {
     }
   }, []);
 
+  const refreshProjectDetail = useCallback(async (projectID: string) => {
+    setProjectDetailStatus('loading');
+    setProjectDetailError(null);
+    try {
+      const detail = await ProjectService.GetProject(projectID);
+      if (!detail) {
+        throw new Error('Project was not found');
+      }
+      setProjectDetail(detail);
+      setProjectDetailStatus('ready');
+    } catch (error: unknown) {
+      setProjectDetail(null);
+      setProjectDetailError(
+        error instanceof Error ? error.message : 'Unable to load project',
+      );
+      setProjectDetailStatus('error');
+    }
+  }, []);
+
+  const openProjectDetail = useCallback(
+    (project: ProjectSummary) => {
+      setActiveProjectID(project.id);
+      setProjectTab('overview');
+      void refreshProjectDetail(project.id);
+    },
+    [refreshProjectDetail],
+  );
+
+  const closeProjectDetail = useCallback(() => {
+    setActiveProjectID(null);
+    setProjectDetail(null);
+    setProjectDetailStatus('idle');
+    setProjectDetailError(null);
+  }, []);
+
   useEffect(() => {
     let active = true;
     setVersionLoading(true);
@@ -430,13 +477,16 @@ function App() {
       timer = window.setTimeout(() => {
         void refreshInventory();
         void refreshProjects();
+        if (activeProjectID) {
+          void refreshProjectDetail(activeProjectID);
+        }
       }, 500);
     });
     return () => {
       window.clearTimeout(timer);
       off();
     };
-  }, [refreshInventory, refreshProjects]);
+  }, [activeProjectID, refreshInventory, refreshProjectDetail, refreshProjects]);
 
   useEffect(() => {
     const query = pullImage.query.trim();
@@ -663,6 +713,9 @@ function App() {
       setSelectedContainerIDs(new Set<string>());
       if (confirm.planKind === 'project') {
         await refreshProjects();
+        if (activeProjectID) {
+          await refreshProjectDetail(activeProjectID);
+        }
       } else {
         await refreshAfterAction();
       }
@@ -677,7 +730,9 @@ function App() {
     confirm.plan,
     confirm.planKind,
     confirm.typedName,
+    activeProjectID,
     refreshAfterAction,
+    refreshProjectDetail,
     refreshProjects,
   ]);
 
@@ -717,6 +772,9 @@ function App() {
           return;
         }
         await refreshProjects();
+        if (activeProjectID === project.id) {
+          await refreshProjectDetail(project.id);
+        }
       } catch (error: unknown) {
         setActionError(
           error instanceof Error ? error.message : 'Project action failed',
@@ -725,7 +783,7 @@ function App() {
         setActionBusy(key, false);
       }
     },
-    [refreshProjects, setActionBusy],
+    [activeProjectID, refreshProjectDetail, refreshProjects, setActionBusy],
   );
 
   const openRunImageModal = useCallback((image?: ImageSummary) => {
@@ -1138,6 +1196,23 @@ function App() {
   const content = (() => {
     switch (activePage) {
       case 'projects':
+        if (activeProjectID) {
+          return (
+            <ProjectDetailPage
+              actionBusyIDs={busyActionIDs}
+              detail={projectDetail}
+              error={projectDetailError}
+              loading={projectDetailStatus === 'loading'}
+              onAction={runProjectAction}
+              onBack={closeProjectDetail}
+              onRefresh={() => {
+                void refreshProjectDetail(activeProjectID);
+              }}
+              onTabChange={setProjectTab}
+              tab={projectTab}
+            />
+          );
+        }
         return (
           <ProjectsPage
             error={projectsError}
@@ -1149,6 +1224,7 @@ function App() {
             onImport={() =>
               setImportProject({ ...emptyImportProject, open: true })
             }
+            onOpen={openProjectDetail}
             onRefresh={refreshProjects}
             onSortChange={setProjectSort}
             onViewChange={changeProjectView}
@@ -1701,6 +1777,7 @@ type ProjectsPageProps = {
   onSortChange: (sort: ProjectSortID) => void;
   onViewChange: (view: ProjectViewMode) => void;
   onImport: () => void;
+  onOpen: (project: ProjectSummary) => void;
   onRefresh: () => void;
 };
 
@@ -1712,6 +1789,7 @@ function ProjectsPage({
   onAction,
   onFilterChange,
   onImport,
+  onOpen,
   onRefresh,
   onSortChange,
   onViewChange,
@@ -1841,6 +1919,7 @@ function ProjectsPage({
               actionBusyIDs={actionBusyIDs}
               key={project.id}
               onAction={onAction}
+              onOpen={onOpen}
               project={project}
             />
           ))}
@@ -1849,6 +1928,7 @@ function ProjectsPage({
         <ProjectList
           actionBusyIDs={actionBusyIDs}
           onAction={onAction}
+          onOpen={onOpen}
           projects={filtered}
         />
       )}
@@ -1869,11 +1949,13 @@ function ProjectsPage({
 function ProjectCard({
   actionBusyIDs,
   onAction,
+  onOpen,
   project,
 }: {
   project: ProjectSummary;
   actionBusyIDs: Set<string>;
   onAction: (action: ProjectAction, project: ProjectSummary) => void;
+  onOpen: (project: ProjectSummary) => void;
 }) {
   const updates = projectUpdateCount(project);
   const workdirMissing = project.status === 'error';
@@ -1894,8 +1976,14 @@ function ProjectCard({
           </div>
           <div className="min-w-0 flex-1">
             <div className="flex items-center gap-2">
-              <h2 className="truncate text-base font-semibold">
-                {project.name}
+              <h2 className="min-w-0 text-base font-semibold">
+                <button
+                  className="block max-w-full truncate text-left hover:text-accent"
+                  onClick={() => onOpen(project)}
+                  type="button"
+                >
+                  {project.name}
+                </button>
               </h2>
               <Badge tone={projectStatusTone(project.status)}>
                 {project.status || 'unknown'}
@@ -2049,11 +2137,13 @@ function ProjectCard({
 function ProjectList({
   actionBusyIDs,
   onAction,
+  onOpen,
   projects,
 }: {
   projects: ProjectSummary[];
   actionBusyIDs: Set<string>;
   onAction: (action: ProjectAction, project: ProjectSummary) => void;
+  onOpen: (project: ProjectSummary) => void;
 }) {
   return (
     <DataTable
@@ -2062,9 +2152,13 @@ function ProjectList({
           id: 'name',
           header: 'Name',
           render: (project) => (
-            <span className="font-medium text-text-primary">
+            <button
+              className="font-medium text-text-primary hover:text-accent"
+              onClick={() => onOpen(project)}
+              type="button"
+            >
               {project.name}
-            </span>
+            </button>
           ),
           sortValue: (project) => project.name,
           sortable: true,
@@ -2237,6 +2331,433 @@ function ProjectRowActions({
           variant="danger"
         />
       </Tooltip>
+    </div>
+  );
+}
+
+const projectTabs: Array<[ProjectTabID, string]> = [
+  ['overview', 'Overview'],
+  ['services', 'Services'],
+  ['containers', 'Containers'],
+  ['compose', 'Compose'],
+];
+
+function ProjectDetailPage({
+  actionBusyIDs,
+  detail,
+  error,
+  loading,
+  onAction,
+  onBack,
+  onRefresh,
+  onTabChange,
+  tab,
+}: {
+  detail: ProjectDetail | null;
+  actionBusyIDs: Set<string>;
+  loading: boolean;
+  error: string | null;
+  tab: ProjectTabID;
+  onAction: (action: ProjectAction, project: ProjectSummary) => void;
+  onBack: () => void;
+  onRefresh: () => void;
+  onTabChange: (tab: ProjectTabID) => void;
+}) {
+  if (loading && !detail) {
+    return <TableSkeleton />;
+  }
+  if (!detail) {
+    return (
+      <EmptyState
+        body={error ?? 'Project detail is unavailable.'}
+        icon={<LayoutGrid size={28} />}
+        title="Project not found"
+      />
+    );
+  }
+
+  const project = detail.summary;
+  const primaryAction: ProjectAction =
+    project.status === 'running' ? 'stop' : 'start';
+  const lifecycleDisabled = project.status === 'error' || !project.workingDir;
+  const disabledReason =
+    project.status === 'error'
+      ? 'Re-link folder before running project actions'
+      : 'No workdir';
+  const busy = (action: ProjectAction) =>
+    actionBusyIDs.has(projectActionBusyKey(action, project.id));
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <Button onClick={onBack} size="sm" variant="ghost">
+            Back
+          </Button>
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <h2 className="truncate text-2xl font-semibold">{project.name}</h2>
+            <Badge tone={projectStatusTone(project.status)}>
+              {project.status || 'unknown'}
+            </Badge>
+            <Badge tone="info">{project.providerID}</Badge>
+          </div>
+          <div className="mt-2 max-w-3xl truncate text-sm text-text-muted">
+            {project.workingDir || 'No workdir'} · changed{' '}
+            {relativeTime(dateMillis(project.lastChangedAt))}
+          </div>
+        </div>
+        <div className="flex flex-wrap justify-end gap-2">
+          <Button
+            disabled={lifecycleDisabled}
+            disabledReason={disabledReason}
+            icon={primaryAction === 'stop' ? <Square size={15} /> : <Play size={15} />}
+            loading={busy(primaryAction)}
+            onClick={() => onAction(primaryAction, project)}
+          >
+            {primaryAction === 'stop' ? 'Stop' : 'Start'}
+          </Button>
+          <Button
+            disabled={lifecycleDisabled}
+            disabledReason={disabledReason}
+            icon={<RotateCw size={15} />}
+            loading={busy('restart')}
+            onClick={() => onAction('restart', project)}
+          >
+            Restart
+          </Button>
+          <Button
+            disabled={lifecycleDisabled}
+            disabledReason={disabledReason}
+            icon={<PackagePlus size={15} />}
+            loading={busy('redeploy')}
+            onClick={() => onAction('redeploy', project)}
+          >
+            Redeploy
+          </Button>
+          <Button
+            disabled={lifecycleDisabled}
+            disabledReason={disabledReason}
+            icon={<Download size={15} />}
+            loading={busy('pull')}
+            onClick={() => onAction('pull', project)}
+          >
+            Pull
+          </Button>
+          <Button
+            disabled={lifecycleDisabled}
+            disabledReason={disabledReason}
+            icon={<Skull size={15} />}
+            loading={busy('down-volumes')}
+            onClick={() => onAction('down-volumes', project)}
+            variant="danger"
+          >
+            Down + volumes
+          </Button>
+          <Button
+            icon={<RefreshCw size={15} />}
+            loading={loading}
+            onClick={onRefresh}
+          >
+            Refresh
+          </Button>
+        </div>
+      </div>
+
+      {error ? (
+        <div className="rounded-card border border-error/30 bg-error/10 px-4 py-3 text-sm text-error">
+          {error}
+        </div>
+      ) : null}
+
+      <div className="flex flex-wrap gap-2 border-b border-border">
+        {projectTabs.map(([id, label]) => (
+          <button
+            className={[
+              'border-b-2 px-3 py-2 text-sm font-medium transition',
+              tab === id
+                ? 'border-accent text-accent'
+                : 'border-transparent text-text-secondary hover:text-text-primary',
+            ].join(' ')}
+            key={id}
+            onClick={() => onTabChange(id)}
+            type="button"
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {tab === 'overview' ? (
+        <ProjectOverviewTab detail={detail} />
+      ) : null}
+      {tab === 'services' ? <ProjectServicesTab detail={detail} /> : null}
+      {tab === 'containers' ? <ProjectContainersTab detail={detail} /> : null}
+      {tab === 'compose' ? <ProjectComposeTab detail={detail} /> : null}
+    </div>
+  );
+}
+
+function ProjectOverviewTab({ detail }: { detail: ProjectDetail }) {
+  const project = detail.summary;
+  const services = detail.services ?? [];
+  const containers = detail.containers ?? [];
+  return (
+    <div className="space-y-4">
+      <div className="grid gap-3 md:grid-cols-4">
+        <StatusBlock
+          label="Services"
+          tone="info"
+          value={project.servicesTotal}
+        />
+        <StatusBlock
+          label="Running"
+          tone={project.servicesRunning === project.servicesTotal ? 'ok' : 'warn'}
+          value={project.servicesRunning}
+        />
+        <StatusBlock
+          label="Containers"
+          tone="neutral"
+          value={containers.length}
+        />
+        <StatusBlock
+          label="Updates"
+          tone={projectUpdateCount(project) > 0 ? 'warn' : 'ok'}
+          value={projectUpdateCount(project)}
+        />
+      </div>
+
+      <section className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+        {services.map((service) => (
+          <Card key={service.name}>
+            <CardBody className="space-y-3">
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <h3 className="truncate font-semibold text-text-primary">
+                    {service.name}
+                  </h3>
+                  <div className="mt-1 truncate font-mono text-xs text-text-muted">
+                    {service.image || 'build'}
+                  </div>
+                </div>
+                <Badge tone={projectStatusTone(service.status)}>
+                  {service.status || 'unknown'}
+                </Badge>
+              </div>
+              <div className="grid grid-cols-3 gap-2">
+                <MiniMetric
+                  label="Replicas"
+                  value={`${service.running}/${service.replicas}`}
+                />
+                <MiniMetric
+                  label="CPU"
+                  value={`${(service.cpuPercent ?? 0).toFixed(1)}%`}
+                />
+                <MiniMetric
+                  label="RAM"
+                  value={formatBytes(service.memoryBytes ?? 0)}
+                />
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <Badge tone={healthTone(service.health)}>
+                  {service.health || 'unknown'}
+                </Badge>
+                <PortList ports={service.ports ?? []} />
+              </div>
+            </CardBody>
+          </Card>
+        ))}
+      </section>
+    </div>
+  );
+}
+
+function ProjectServicesTab({ detail }: { detail: ProjectDetail }) {
+  return (
+    <DataTable
+      columns={[
+        {
+          id: 'name',
+          header: 'Name',
+          render: (service) => (
+            <span className="font-medium text-text-primary">
+              {service.name}
+            </span>
+          ),
+          sortValue: (service) => service.name,
+          sortable: true,
+        },
+        {
+          id: 'image',
+          header: 'Image',
+          render: (service) => service.image || 'build',
+          sortValue: (service) => service.image || '',
+          sortable: true,
+        },
+        {
+          id: 'replicas',
+          header: 'Replicas',
+          render: (service) => `${service.running}/${service.replicas}`,
+          sortValue: (service) => service.replicas,
+          sortable: true,
+        },
+        {
+          id: 'status',
+          header: 'Status',
+          render: (service) => (
+            <Badge tone={projectStatusTone(service.status)}>
+              {service.status}
+            </Badge>
+          ),
+          sortValue: (service) => service.status,
+          sortable: true,
+        },
+        {
+          id: 'health',
+          header: 'Health',
+          render: (service) => (
+            <Badge tone={healthTone(service.health)}>{service.health}</Badge>
+          ),
+          sortValue: (service) => service.health,
+          sortable: true,
+        },
+        {
+          id: 'ports',
+          header: 'Ports',
+          render: (service) => <PortList ports={service.ports ?? []} />,
+        },
+      ]}
+      empty={
+        <EmptyState
+          body="No Compose services are recorded for this project."
+          icon={<LayoutGrid size={28} />}
+          title="No services found"
+        />
+      }
+      getRowID={(service) => service.name}
+      rows={detail.services ?? []}
+    />
+  );
+}
+
+function ProjectContainersTab({ detail }: { detail: ProjectDetail }) {
+  return (
+    <DataTable
+      columns={[
+        {
+          id: 'name',
+          header: 'Name',
+          render: (container) => (
+            <span className="font-medium text-text-primary">
+              {container.name}
+            </span>
+          ),
+          sortValue: (container) => container.name,
+          sortable: true,
+        },
+        {
+          id: 'service',
+          header: 'Service',
+          render: (container) => container.service || '-',
+          sortValue: (container) => container.service || '',
+          sortable: true,
+        },
+        {
+          id: 'image',
+          header: 'Image',
+          render: (container) => container.image,
+          sortValue: (container) => container.image,
+          sortable: true,
+        },
+        {
+          id: 'state',
+          header: 'State',
+          render: (container) => (
+            <Badge tone={containerTone(container)}>
+              {container.state || container.status}
+            </Badge>
+          ),
+          sortValue: (container) => container.state,
+          sortable: true,
+        },
+        {
+          id: 'ports',
+          header: 'Ports',
+          render: (container) => <PortList ports={container.ports ?? []} />,
+        },
+      ]}
+      empty={
+        <EmptyState
+          body="No containers are currently associated with this project."
+          icon={<Container size={28} />}
+          title="No project containers"
+        />
+      }
+      getRowID={(container) => container.id}
+      rows={detail.containers ?? []}
+    />
+  );
+}
+
+function ProjectComposeTab({ detail }: { detail: ProjectDetail }) {
+  const rawFiles = detail.compose?.rawFiles ?? [];
+  const [selection, setSelection] = useState('resolved');
+  const activeSelection =
+    selection === 'resolved' || rawFiles.some((file) => file.path === selection)
+      ? selection
+      : 'resolved';
+  const rawFile = rawFiles.find((file) => file.path === activeSelection);
+  const value =
+    activeSelection === 'resolved'
+      ? detail.compose?.resolvedYAML ?? ''
+      : rawFile?.content ?? '';
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center gap-2">
+        <Badge tone={detail.compose?.valid ? 'ok' : 'error'}>
+          {detail.compose?.valid ? 'valid' : 'invalid'}
+        </Badge>
+        {(detail.compose?.envFiles ?? []).map((file) => (
+          <Badge key={file} tone="neutral">
+            {file}
+          </Badge>
+        ))}
+      </div>
+      {detail.compose?.errors?.length ? (
+        <div className="rounded-card border border-error/30 bg-error/10 p-3 text-sm text-error">
+          {detail.compose.errors.join('\n')}
+        </div>
+      ) : null}
+      <div className="flex flex-wrap gap-2">
+        <Button
+          onClick={() => setSelection('resolved')}
+          variant={activeSelection === 'resolved' ? 'primary' : 'secondary'}
+        >
+          Resolved
+        </Button>
+        {rawFiles.map((file) => (
+          <Button
+            key={file.path}
+            onClick={() => setSelection(file.path)}
+            variant={activeSelection === file.path ? 'primary' : 'secondary'}
+          >
+            {shortPath(file.path)}
+          </Button>
+        ))}
+      </div>
+      <div className="overflow-hidden rounded-card border border-border">
+        <Editor
+          height="420px"
+          language="yaml"
+          options={{
+            minimap: { enabled: false },
+            readOnly: true,
+            scrollBeyondLastLine: false,
+            wordWrap: 'on',
+          }}
+          theme="vs-dark"
+          value={value || '# No Compose content available'}
+        />
+      </div>
     </div>
   );
 }
@@ -4807,6 +5328,11 @@ function shortID(value: string) {
   }
   const clean = value.replace(/^sha256:/, '');
   return clean.length > 12 ? `${clean.slice(0, 12)}` : clean;
+}
+
+function shortPath(value: string) {
+  const normalized = value.replace(/\\/g, '/');
+  return normalized.split('/').filter(Boolean).slice(-2).join('/') || value;
 }
 
 function dateMillis(value: unknown) {

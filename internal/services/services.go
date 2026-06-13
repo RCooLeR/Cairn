@@ -86,6 +86,7 @@ type ProjectDetector interface {
 type ProjectService struct {
 	Detector    ProjectDetector
 	Projects    *store.ProjectRepository
+	Objects     *store.ObjectCacheRepository
 	Client      *composecore.Client
 	Audit       *store.AuditRepository
 	Plans       *security.ProjectPlanStore
@@ -671,9 +672,16 @@ func (s *ProjectService) GetProject(ctx context.Context, projectID string) (*mod
 	for _, service := range services {
 		statuses = append(statuses, serviceStatusFromRecord(service))
 	}
+	containers, err := s.projectContainers(ctx, project)
+	if err != nil {
+		return nil, err
+	}
+	composeConfig := s.projectComposeConfig(ctx, project)
 	return &models.ProjectDetail{
-		Summary:  projectSummaryFromRecord(project, services),
-		Services: statuses,
+		Summary:    projectSummaryFromRecord(project, services),
+		Services:   statuses,
+		Containers: containers,
+		Compose:    composeConfig,
 	}, nil
 }
 
@@ -1234,6 +1242,41 @@ func serviceStatusFromRecord(service store.ServiceRecord) models.ComposeServiceS
 		Status:   service.Status,
 		Health:   service.Health,
 	}
+}
+
+func (s *ProjectService) projectContainers(ctx context.Context, project store.ProjectRecord) ([]models.ContainerSummary, error) {
+	if s.Objects == nil {
+		return nil, nil
+	}
+	records, err := s.Objects.ListContainers(ctx, project.ProviderID)
+	if err != nil {
+		return nil, apperror.Wrap(apperror.Internal, "List project containers failed", err)
+	}
+	containers := make([]models.ContainerSummary, 0, len(records))
+	for _, record := range records {
+		if record.Summary.ProjectID == project.ID {
+			containers = append(containers, record.Summary)
+		}
+	}
+	return containers, nil
+}
+
+func (s *ProjectService) projectComposeConfig(ctx context.Context, project store.ProjectRecord) *models.ComposeConfigResult {
+	if s.Client == nil {
+		return nil
+	}
+	config, err := s.Client.Config(ctx, composeOptionsFromProject(project))
+	if config == nil {
+		return nil
+	}
+	config.API.RawFiles = readComposeRawFiles(project)
+	if err != nil {
+		config.API.Valid = false
+		if len(config.API.Errors) == 0 {
+			config.API.Errors = []string{err.Error()}
+		}
+	}
+	return &config.API
 }
 
 func composeOptionsFromProject(project store.ProjectRecord) composecore.ProjectOptions {

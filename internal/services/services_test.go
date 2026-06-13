@@ -208,6 +208,99 @@ func TestProjectServiceImportProject(t *testing.T) {
 	}
 }
 
+func TestProjectServiceGetProjectIncludesDetailPayload(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	root := serviceTestFixturePath(t, "testdata", "projects", "build-multistage")
+	composeFile := filepath.Join(root, "compose.yaml")
+	resolvedConfig := "name: build-multistage\nservices:\n  app:\n    build:\n      context: .\n      dockerfile: Dockerfile\n      target: runtime\n      args:\n        BASE_IMAGE: alpine:3.20\n    image: cairn-test/build-multistage:latest\n"
+	runner := newFakeComposeRunner()
+	runner.outputs[root+"|-f "+composeFile+" config"] = providers.CommandResult{
+		Stdout: resolvedConfig,
+	}
+	service := &ProjectService{
+		Client:     composecore.NewClient(runner),
+		Projects:   db.Projects(),
+		Objects:    db.Objects(),
+		ProviderID: "linux_native",
+		Now:        func() time.Time { return time.Date(2026, 6, 13, 6, 0, 0, 0, time.UTC) },
+	}
+
+	imported, err := service.ImportProject(ctx, models.ImportProjectRequest{FolderPath: root})
+	if err != nil {
+		t.Fatalf("ImportProject() error = %v", err)
+	}
+	if err := db.Objects().SaveContainers(ctx, "linux_native", []store.ContainerCacheRecord{
+		{
+			Summary: models.ContainerSummary{
+				ID:        "container-app",
+				Name:      "build-multistage-app-1",
+				Image:     "cairn-test/build-multistage:latest",
+				Status:    "Up 2 minutes",
+				State:     "running",
+				Health:    models.HealthStatusHealthy,
+				ProjectID: imported.Summary.ID,
+				Service:   "app",
+				Ports: []models.PortBinding{{
+					HostPort:      "18080",
+					ContainerPort: "80",
+					Protocol:      "tcp",
+				}},
+			},
+		},
+		{
+			Summary: models.ContainerSummary{
+				ID:        "container-other",
+				Name:      "other-app-1",
+				Image:     "nginx:alpine",
+				Status:    "Up",
+				State:     "running",
+				Health:    models.HealthStatusHealthy,
+				ProjectID: "linux_native/other",
+				Service:   "app",
+			},
+		},
+	}, time.Date(2026, 6, 13, 6, 5, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("SaveContainers() error = %v", err)
+	}
+
+	detail, err := service.GetProject(ctx, imported.Summary.ID)
+	if err != nil {
+		t.Fatalf("GetProject() error = %v", err)
+	}
+	if detail.Summary.ID != "linux_native/build-multistage" || detail.Summary.ServicesTotal != 1 {
+		t.Fatalf("summary = %#v", detail.Summary)
+	}
+	if len(detail.Services) != 1 || detail.Services[0].Name != "app" || detail.Services[0].Image != "cairn-test/build-multistage:latest" {
+		t.Fatalf("services = %#v", detail.Services)
+	}
+	if len(detail.Containers) != 1 || detail.Containers[0].ID != "container-app" {
+		t.Fatalf("containers = %#v", detail.Containers)
+	}
+	if detail.Compose == nil || !detail.Compose.Valid || detail.Compose.ResolvedYAML != resolvedConfig {
+		t.Fatalf("compose = %#v", detail.Compose)
+	}
+	if len(detail.Compose.RawFiles) != 1 || detail.Compose.RawFiles[0].Path != composeFile || !strings.Contains(detail.Compose.RawFiles[0].Content, "target: runtime") {
+		t.Fatalf("raw files = %#v", detail.Compose.RawFiles)
+	}
+
+	runner.outputs[root+"|-f "+composeFile+" config"] = providers.CommandResult{
+		Stdout:   "services:\n  app: [",
+		Stderr:   "yaml: line 2: did not find expected node content",
+		ExitCode: 1,
+	}
+	detail, err = service.GetProject(ctx, imported.Summary.ID)
+	if err != nil {
+		t.Fatalf("GetProject(invalid config) error = %v", err)
+	}
+	if detail.Compose == nil || detail.Compose.Valid || len(detail.Compose.Errors) == 0 {
+		t.Fatalf("invalid compose = %#v", detail.Compose)
+	}
+	if len(detail.Compose.RawFiles) != 1 {
+		t.Fatalf("invalid raw files = %#v", detail.Compose.RawFiles)
+	}
+}
+
 func TestProjectServiceImportProjectInvalidFolder(t *testing.T) {
 	db := openServiceTestStore(t)
 	service := &ProjectService{
@@ -556,6 +649,16 @@ func writeServiceComposeProject(t *testing.T, name string) (string, string) {
 		t.Fatalf("write compose file: %v", err)
 	}
 	return root, composeFile
+}
+
+func serviceTestFixturePath(t *testing.T, parts ...string) string {
+	t.Helper()
+	path := filepath.Join(append([]string{"..", ".."}, parts...)...)
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		t.Fatalf("Abs(%q) error = %v", path, err)
+	}
+	return abs
 }
 
 func receiveEventPayload(t *testing.T, events <-chan bus.Event, timeout time.Duration) any {

@@ -88,6 +88,12 @@ vi.mock('./api/services', () => ({
   ProjectService: projectServiceMock,
 }));
 
+vi.mock('@monaco-editor/react', () => ({
+  default: ({ value }: { value?: string }) => (
+    <pre data-testid="monaco-viewer">{value}</pre>
+  ),
+}));
+
 vi.mock('@wailsio/runtime', () => ({
   Create: {
     Any: (source: unknown) => source,
@@ -298,6 +304,44 @@ describe('App inventory shell', () => {
     );
     await waitFor(() =>
       expect(projectServiceMock.RefreshProjects).toHaveBeenCalledTimes(2),
+    );
+  });
+
+  it('opens project detail tabs with services, containers, and Compose config', async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
+    projectServiceMock.GetProject.mockResolvedValue(seededProjectDetail());
+
+    render(<App />);
+
+    await screen.findByText('Docker Engine - Running');
+    fireEvent.click(
+      within(
+        screen.getByRole('navigation', { name: 'Main navigation' }),
+      ).getByRole('button', {
+        name: /Projects/,
+      }),
+    );
+    fireEvent.click(await screen.findByRole('button', { name: 'app-db' }));
+
+    await waitFor(() =>
+      expect(projectServiceMock.GetProject).toHaveBeenCalledWith(
+        'linux_native/app-db',
+      ),
+    );
+    expect(await screen.findByText('linux_native')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Containers' })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Services' }));
+    expect(screen.getByText('postgres:16')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Containers' }));
+    expect(screen.getByText('container-app')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Compose' }));
+    expect(screen.getByText('valid')).toBeInTheDocument();
+    expect(screen.getByTestId('monaco-viewer')).toHaveTextContent(
+      'services:',
     );
   });
 
@@ -818,6 +862,46 @@ function seededProjectDetail(): ProjectDetail {
         health: HealthStatus.HealthStatusUnknown,
       },
     ],
+    containers: [
+      {
+        id: 'container-app',
+        name: 'container-app',
+        image: 'cairn/app:latest',
+        imageID: 'sha256:image-app',
+        status: 'running',
+        state: 'running',
+        health: HealthStatus.HealthStatusHealthy,
+        projectID: 'linux_native/app-db',
+        service: 'app',
+        ports: [
+          {
+            hostIP: '127.0.0.1',
+            hostPort: '8080',
+            containerPort: '80',
+            protocol: 'tcp',
+          },
+        ],
+        cpuPercent: 5,
+        memoryBytes: 64 * 1024 * 1024,
+        restarts: 0,
+        createdAt: '2026-06-13T08:00:00Z',
+      },
+    ],
+    compose: {
+      rawFiles: [
+        {
+          path: 'E:\\Development\\projects\\apps\\rcooler\\Cairn\\testdata\\projects\\app-db\\compose.yaml',
+          content: 'services:\n  app:\n    image: cairn/app:latest\n',
+        },
+      ],
+      resolvedYAML:
+        'services:\n  app:\n    image: cairn/app:latest\n  db:\n    image: postgres:16\n',
+      envFiles: [
+        'E:\\Development\\projects\\apps\\rcooler\\Cairn\\testdata\\projects\\app-db\\.env',
+      ],
+      valid: true,
+      errors: [],
+    },
   };
 }
 
