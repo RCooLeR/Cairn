@@ -154,7 +154,7 @@ Current evidence: automated tests cover the 14 normative update/lineage/registry
 
 ## Phase 10.4 Linux Native Release Matrix
 
-Current evidence: Ubuntu 24.04 CI is green for lint/unit/contract checks, real Docker reconnect/logs/metrics/terminal/backup/registry/tag-push integrations, package smoke for AppImage and `.deb`, `.deb` install/uninstall, and release validation smoke. CI run 27493199996 proved the fixed `.deb` install/uninstall smoke, and CI run 27495206501 repeated the full current-head matrix successfully after route-complete degraded release UI coverage landed. Debian stable and interactive installed-app degraded-mode rows are unavailable in this environment and remain manual TODOs.
+Current evidence: Ubuntu 24.04 CI is green for lint/unit/contract checks, real Docker reconnect/logs/metrics/terminal/backup/registry/tag-push integrations, package smoke for AppImage and `.deb`, `.deb` install/uninstall, and release validation smoke. CI run 27493199996 proved the fixed `.deb` install/uninstall smoke, and CI run 27495650306 repeated the full matrix successfully after the route-complete degraded release UI evidence refresh. Debian stable and interactive installed-app degraded-mode rows are unavailable in this environment and remain manual TODOs.
 
 - [x] Ubuntu 24.04 CI: generated bindings diff clean, frontend audit/lint/unit/catalog/build green, Go unit/vet/golangci green.
 - [x] Ubuntu 24.04 CI: real Docker reconnect integration covers daemon stop/start recovery.
