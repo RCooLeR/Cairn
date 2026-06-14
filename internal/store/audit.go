@@ -36,8 +36,8 @@ func (r *AuditRepository) Insert(ctx context.Context, record AuditRecord) (int64
 		record.CreatedAt = time.Now().UTC()
 	}
 	var durationMS any
-	if record.Duration > 0 {
-		durationMS = record.Duration.Milliseconds()
+	if millis := record.Duration.Milliseconds(); millis > 0 {
+		durationMS = millis
 	}
 	result, err := r.db.ExecContext(ctx, `
 		INSERT INTO audit_log (

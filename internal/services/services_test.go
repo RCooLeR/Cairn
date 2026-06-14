@@ -209,8 +209,21 @@ func TestDockerServiceLifecycleAuditsAndPlans(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAuditLog() error = %v", err)
 	}
-	if len(entries) != 2 || entries[0].Result != "success" || entries[1].Result != "started" {
+	if len(entries) != 2 {
 		t.Fatalf("audit entries = %#v", entries)
+	}
+	results := map[string]models.AuditEntry{}
+	for _, entry := range entries {
+		results[entry.Result] = entry
+	}
+	success, sawSuccess := results["success"]
+	if _, sawStarted := results["started"]; !sawSuccess || !sawStarted {
+		t.Fatalf("audit entries = %#v", entries)
+	}
+	if success.Metadata["command"] != "docker start web" ||
+		success.Metadata["risk"] != string(models.RiskSafe) ||
+		success.Metadata["targetType"] != "container" {
+		t.Fatalf("success audit metadata = %#v", success.Metadata)
 	}
 
 	if err := service.KillContainer(ctx, "container-1"); !apperror.IsCode(err, apperror.ConfirmationRequired) {
