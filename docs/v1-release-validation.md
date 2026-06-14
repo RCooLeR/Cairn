@@ -63,4 +63,4 @@ Minimum manual evidence to append here before v1.0:
 
 ## Current status
 
-Phase 10.3 packaging evidence is green: CI run 27487171104 and marker run 27487366493 passed lint/unit and package smoke on Ubuntu 24.04, Windows, and macOS. Phase 10.4 remains open until the 24 h soak, committed visual goldens, and manual platform rows above are recorded.
+Phase 10.3 packaging evidence is green: CI run 27487171104 and marker run 27487366493 passed lint/unit and package smoke on Ubuntu 24.04, Windows, and macOS. Phase 10.4 automated release smoke evidence is green in CI run 27488248685, including Ubuntu `security,performance,soak-smoke,ui-release` after package artifacts pass. Phase 10.4 remains open until the 24 h soak, committed visual goldens, and manual platform rows above are recorded.
