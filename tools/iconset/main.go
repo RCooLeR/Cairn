@@ -23,7 +23,11 @@ func main() {
 	if err != nil {
 		fatalf("open source icon: %v", err)
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			fatalf("close source icon: %v", err)
+		}
+	}()
 
 	src, _, err := image.Decode(file)
 	if err != nil {
@@ -83,8 +87,11 @@ func writePNG(path string, img image.Image) error {
 	if err != nil {
 		return err
 	}
-	defer file.Close()
-	return png.Encode(file, img)
+	if err := png.Encode(file, img); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
 }
 
 func fatalf(format string, args ...any) {
