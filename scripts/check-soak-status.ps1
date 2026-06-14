@@ -3,6 +3,7 @@ param(
   [string]$LogPath,
   [string]$StatusPath = "",
   [switch]$RequireComplete,
+  [double]$MinCompleteDurationHours = 24,
   [int]$MaxFinalGoroutineDelta = 8,
   [int]$MaxHeartbeatGoroutines = 128,
   [int]$MinLiveHeartbeats = 2,
@@ -43,6 +44,34 @@ function Assert-Increased([string]$Name, [int64]$Previous, [int64]$Current) {
   }
 }
 
+function Convert-GoDurationToTimeSpan([string]$Duration) {
+  $matches = [regex]::Matches($Duration, "(?<value>\d+(?:\.\d+)?)(?<unit>h|ms|us|µs|ns|m|s)")
+  if ($matches.Count -eq 0) {
+    throw "Could not parse soak completion duration: $Duration"
+  }
+
+  $covered = ""
+  $ticks = [double]0
+  foreach ($match in $matches) {
+    $covered += $match.Value
+    $value = [double]::Parse($match.Groups["value"].Value, [System.Globalization.CultureInfo]::InvariantCulture)
+    switch ($match.Groups["unit"].Value) {
+      "h" { $ticks += [TimeSpan]::FromHours($value).Ticks }
+      "m" { $ticks += [TimeSpan]::FromMinutes($value).Ticks }
+      "s" { $ticks += [TimeSpan]::FromSeconds($value).Ticks }
+      "ms" { $ticks += [TimeSpan]::FromMilliseconds($value).Ticks }
+      "us" { $ticks += $value * 10 }
+      "µs" { $ticks += $value * 10 }
+      "ns" { $ticks += $value / 100 }
+      default { throw "Unsupported duration unit: $($match.Groups["unit"].Value)" }
+    }
+  }
+  if ($covered -ne $Duration) {
+    throw "Could not parse entire soak completion duration: $Duration"
+  }
+  return [TimeSpan]::FromTicks([int64][Math]::Round($ticks))
+}
+
 if (!(Test-Path -LiteralPath $LogPath -PathType Leaf)) {
   throw "Soak log not found: $LogPath"
 }
@@ -62,6 +91,9 @@ $completions = [regex]::Matches($logText, $completePattern)
 
 if ($completions.Count -gt 0) {
   $complete = $completions[$completions.Count - 1]
+  $durationText = $complete.Groups[1].Value
+  $duration = Convert-GoDurationToTimeSpan $durationText
+  $minDuration = [TimeSpan]::FromHours($MinCompleteDurationHours)
   $logs = [int64]$complete.Groups[2].Value
   $stats = [int64]$complete.Groups[3].Value
   $terminalBytes = [int64]$complete.Groups[4].Value
@@ -74,6 +106,9 @@ if ($completions.Count -gt 0) {
   if ($logs -le 0 -or $stats -le 0 -or $terminalBytes -le 0 -or $dashboardReads -le 0) {
     throw "Soak completed without activity across every stream: logs=$logs stats=$stats terminal_bytes=$terminalBytes dashboard_reads=$dashboardReads"
   }
+  if ($duration -lt $minDuration) {
+    throw ("Soak completed before required duration: duration={0} required={1}" -f $durationText, $minDuration)
+  }
   if ($finalGoroutines -gt $allowedFinal) {
     throw "Soak final goroutines exceed threshold: baseline=$baselineGoroutines final=$finalGoroutines allowed=$allowedFinal"
   }
@@ -82,7 +117,7 @@ if ($completions.Count -gt 0) {
   }
 
   Write-Host ("Soak complete validated: duration={0} logs={1} stats={2} terminal_bytes={3} dashboard_reads={4} baseline_goroutines={5} peak_goroutines={6} final_goroutines={7}" -f
-    $complete.Groups[1].Value, $logs, $stats, $terminalBytes, $dashboardReads, $baselineGoroutines, $peakGoroutines, $finalGoroutines)
+    $durationText, $logs, $stats, $terminalBytes, $dashboardReads, $baselineGoroutines, $peakGoroutines, $finalGoroutines)
   exit 0
 }
 

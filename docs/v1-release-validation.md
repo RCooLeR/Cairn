@@ -26,7 +26,7 @@ Run on a Linux host with a real Docker Engine and enough free disk for transient
 ./scripts/run-release-validation.ps1 -Suite soak-24h -SoakDuration 24h -SoakTimeout 25h
 ```
 
-Acceptance: the test logs `phase 3 soak complete`, keeps logs/stats/terminal activity recent throughout the run, and exits with final goroutines within the allowed threshold. If it fails, keep the goroutine profile from the test output with the release report.
+Acceptance: the test logs `phase 3 soak complete`, keeps logs/stats/terminal activity recent throughout the run, runs for at least 24 h, and exits with final goroutines within the allowed threshold. If it fails, keep the goroutine profile from the test output with the release report.
 
 Live/final checker:
 
@@ -35,7 +35,7 @@ Live/final checker:
 ./scripts/check-soak-status.ps1 -LogPath .scratch/release-soak/phase10-24h-<stamp>.log -StatusPath .scratch/release-soak/phase10-24h-<stamp>.status -RequireComplete
 ```
 
-Without `-RequireComplete`, the checker validates that the last two heartbeats are fresh and that logs, stats, terminal bytes, and dashboard reads are all increasing. With `-RequireComplete`, it validates the completion line, non-zero activity counts, exit code 0, and `final_goroutines <= baseline_goroutines + 8`.
+Without `-RequireComplete`, the checker validates that the last two heartbeats are fresh and that logs, stats, terminal bytes, and dashboard reads are all increasing. With `-RequireComplete`, it validates the completion line, non-zero activity counts, exit code 0, duration >= 24 h by default, and `final_goroutines <= baseline_goroutines + 8`.
 
 Current run: a real WSL/Linux 24 h soak is in progress from `20260614T071038Z` against runtime commit `b51f57f25c8de764da92a837ff87d1240f012ec5` using Go 1.26.4, Docker Engine 29.5.3, and Docker Compose 5.1.4 in `cairn-dev`. Live evidence is under `.scratch/release-soak/phase10-24h-20260614T071038Z.*`; this does not satisfy the checklist until the log reaches `phase 3 soak complete` and exits with code 0. The earlier `20260614T053522Z` run was marked superseded because it started before the Windows WSL Compose-env fix landed.
 
