@@ -220,6 +220,11 @@ jobs:
         shell: pwsh
         run: ./scripts/check-release-artifacts.ps1 -Platform ${{ matrix.platform }}
 
+      - name: Linux deb install/uninstall smoke
+        if: runner.os == 'Linux'
+        shell: pwsh
+        run: ./scripts/test-linux-deb-install.ps1
+
       - name: Release validation smoke
         if: runner.os == 'Linux'
         shell: pwsh
