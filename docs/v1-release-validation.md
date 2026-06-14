@@ -26,6 +26,8 @@ Run on a Linux host with a real Docker Engine and enough free disk for transient
 
 Acceptance: the test logs `phase 3 soak complete`, keeps logs/stats/terminal activity recent throughout the run, and exits with final goroutines within the allowed threshold. If it fails, keep the goroutine profile from the test output with the release report.
 
+Current run: a real WSL/Linux 24 h soak is in progress from `20260614T053522Z` against commit `258ea5880b5beeb55d17ba8c4b1ceefa7f94c1c7` using Go 1.26.4, Docker Engine 29.5.3, and Docker Compose 5.1.4 in `cairn-dev`. Live evidence is under `.scratch/release-soak/phase10-24h-20260614T053522Z.*`; this does not satisfy the checklist until the log reaches `phase 3 soak complete` and exits with code 0.
+
 ## Performance re-verification
 
 Required evidence before v1.0:
@@ -42,14 +44,20 @@ Committed golden baselines live under `frontend/e2e/goldens/release-ui/` for Win
 
 ## Security review checklist
 
-- [ ] No destructive/dangerous action can execute without a fresh command plan and confirmation.
-- [ ] Dangerous actions require typed target confirmation.
-- [ ] `security.confirm_destructive` remains locked on in v1.
-- [ ] Registry secrets are sent through stdin only and never stored by Cairn.
-- [ ] Audit/log/DTO redaction masks password/token/key/auth environment values.
-- [ ] Cairn never configures Docker TCP exposure; existing unencrypted `tcp://` contexts show a warning only.
-- [ ] Linux Docker permission choices remain explicit; Cairn never silently adds the user to the Docker group.
-- [ ] Provider lifecycle and `needs_confirmation+` actions write audit rows with redacted command details.
+- [x] No destructive/dangerous action can execute without a fresh command plan and confirmation.
+- [x] Dangerous actions require typed target confirmation.
+- [x] `security.confirm_destructive` remains locked on in v1.
+- [x] Registry secrets are sent through stdin only and never stored by Cairn.
+- [x] Audit/log/DTO redaction masks password/token/key/auth environment values.
+- [x] Cairn never configures Docker TCP exposure; existing unencrypted `tcp://` contexts show a warning only.
+- [x] Linux Docker permission choices remain explicit; Cairn never silently adds the user to the Docker group.
+- [x] Provider lifecycle and `needs_confirmation+` actions write audit rows with redacted command details.
+
+Security review evidence on 2026-06-14:
+- `./scripts/run-release-validation.ps1 -Suite security` passed on Windows with the pinned Go 1.26.4 toolchain.
+- The same focused suite passed in `cairn-dev` WSL with Linux Go 1.26.4 while the 24 h soak was running.
+- The suite covers backend risk mapping and 10-minute plan expiry, typed-name requirements for dangerous plans, command-plan enforcement for container/project/restore/update paths, registry login via `--password-stdin`, redacted container env/audit command details, unencrypted `tcp://` context warnings, explicit Linux permission modes, provider-install audit rows, update rollback safety, restore overwrite confirmation, and cheatsheet risk-label parity.
+- The review found and fixed one enforcement gap: the UI already disabled `security.confirm_destructive`, but the backend settings repository now also rejects `security.confirm_destructive=false` through both typed and raw setting writes; the release security suite includes that regression check.
 
 ## Manual platform matrix
 
@@ -63,4 +71,4 @@ Minimum manual evidence to append here before v1.0:
 
 ## Current status
 
-Phase 10.3 packaging evidence is green: CI run 27487171104 and marker run 27487366493 passed lint/unit and package smoke on Ubuntu 24.04, Windows, and macOS. Phase 10.4 automated release smoke evidence is green in CI run 27488248685, including Ubuntu `security,performance,soak-smoke,ui-release` after package artifacts pass. CI run 27488974321 confirms the committed release UI visual goldens on the Ubuntu package-smoke release-validation path, with Windows, macOS, and Ubuntu lint/unit plus package-smoke jobs green. Phase 10.4 remains open until the 24 h soak and manual platform rows above are recorded.
+Phase 10.3 packaging evidence is green: CI run 27487171104 and marker run 27487366493 passed lint/unit and package smoke on Ubuntu 24.04, Windows, and macOS. Phase 10.4 automated release smoke evidence is green in CI run 27488248685, including Ubuntu `security,performance,soak-smoke,ui-release` after package artifacts pass. CI run 27488974321 confirms the committed release UI visual goldens on the Ubuntu package-smoke release-validation path, with Windows, macOS, and Ubuntu lint/unit plus package-smoke jobs green. The Phase 10.4 security checklist is reviewed and green after backend-locking `security.confirm_destructive`. A real 24 h Linux soak is currently running in `cairn-dev`; Phase 10.4 remains open until that soak completes successfully and the manual platform rows above are recorded.

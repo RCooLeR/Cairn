@@ -262,6 +262,9 @@ func normalizeSettingValue(key string, expected settingKind, value any) (any, er
 		if !ok {
 			return nil, fmt.Errorf("%w: %s", ErrTypeMismatch, key)
 		}
+		if normalizeSettingKey(key) == "security.confirm_destructive" && !boolValue {
+			return nil, fmt.Errorf("%w: %s=false", ErrInvalidValue, key)
+		}
 		normalized = boolValue
 	case kindInt:
 		intValue, ok := asSettingInt(value)

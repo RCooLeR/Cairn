@@ -198,6 +198,12 @@ func TestSettingsDefaultsAndRoundTrip(t *testing.T) {
 	if err := settings.SetValue(ctx, "linux.sudo_mode", "silent-root"); !errors.Is(err, ErrInvalidValue) {
 		t.Fatalf("SetValue invalid enum error = %v, want ErrInvalidValue", err)
 	}
+	if err := settings.SetValue(ctx, "security.confirm_destructive", false); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("SetValue security.confirm_destructive=false error = %v, want ErrInvalidValue", err)
+	}
+	if err := settings.SetRaw(ctx, "security.confirm_destructive", "false"); !errors.Is(err, ErrInvalidValue) {
+		t.Fatalf("SetRaw security.confirm_destructive=false error = %v, want ErrInvalidValue", err)
+	}
 	if err := settings.SetValue(ctx, "metrics.sample_interval_seconds", float64(3.5)); !errors.Is(err, ErrTypeMismatch) {
 		t.Fatalf("SetValue fractional int error = %v, want ErrTypeMismatch", err)
 	}
