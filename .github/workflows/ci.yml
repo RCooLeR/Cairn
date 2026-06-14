@@ -171,13 +171,6 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
-      - name: Install Wails CLI
-        shell: pwsh
-        run: |
-          go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha.99
-          $goBin = Join-Path (go env GOPATH) "bin"
-          Add-Content -Path $env:GITHUB_PATH -Value $goBin
-
       - name: Install Linux packaging dependencies
         if: runner.os == 'Linux'
         run: |
@@ -185,6 +178,13 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             pkg-config gcc fakeroot file desktop-file-utils libfuse2 \
             libgtk-4-dev libwebkitgtk-6.0-dev libsoup-3.0-dev
+
+      - name: Install Wails CLI
+        shell: pwsh
+        run: |
+          go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha.99
+          $goBin = Join-Path (go env GOPATH) "bin"
+          Add-Content -Path $env:GITHUB_PATH -Value $goBin
 
       - name: Install NSIS
         if: runner.os == 'Windows'
