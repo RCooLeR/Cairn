@@ -1,5 +1,5 @@
 param(
-  [ValidateSet("checklist", "manual-matrix", "soak-checker", "security", "performance", "soak-smoke", "soak-24h", "ui-release", "wsl-provider", "debian-deb-container")]
+  [ValidateSet("checklist", "manual-matrix", "soak-checker", "upgrade-fixtures", "security", "performance", "soak-smoke", "soak-24h", "ui-release", "wsl-provider", "debian-deb-container")]
   [string[]]$Suite = @("checklist", "manual-matrix", "soak-checker", "security", "performance", "soak-smoke"),
   [string]$SoakDuration = "30s",
   [string]$SoakTimeout = "5m"
@@ -67,6 +67,11 @@ foreach ($item in $Suite) {
         if (!$?) {
           throw "test-soak-status-checker failed"
         }
+      }
+    }
+    "upgrade-fixtures" {
+      Invoke-ReleaseStep "release DB upgrade fixtures" {
+        Invoke-GoTest -Packages @("./internal/store") -GoArgs @("-run", "TestReleaseDBFixtureUpgrade$", "-count=1", "-timeout=30s")
       }
     }
     "security" {

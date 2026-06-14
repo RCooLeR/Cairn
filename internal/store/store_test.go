@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"slices"
 	"testing"
@@ -105,6 +106,81 @@ func TestMigrateRefusesNewerSchema(t *testing.T) {
 
 	if err := s.Migrate(ctx); !errors.Is(err, ErrNewerSchema) {
 		t.Fatalf("Migrate error = %v, want ErrNewerSchema", err)
+	}
+}
+
+func TestReleaseDBFixtureUpgrade(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "cairn.db")
+	fixturePath := filepath.Join("..", "..", "testdata", "dbs", "v1.0.0-rc1-seed.sql")
+	seedSQL, err := os.ReadFile(fixturePath)
+	if err != nil {
+		t.Fatalf("read fixture seed: %v", err)
+	}
+
+	fixture, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("open fixture store: %v", err)
+	}
+	if err := fixture.Migrate(ctx); err != nil {
+		_ = fixture.Close()
+		t.Fatalf("prepare fixture schema: %v", err)
+	}
+	if _, err := fixture.writer.ExecContext(ctx, string(seedSQL)); err != nil {
+		_ = fixture.Close()
+		t.Fatalf("apply fixture seed: %v", err)
+	}
+	closeStore(t, fixture)
+
+	upgraded, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("reopen fixture store: %v", err)
+	}
+	defer closeStore(t, upgraded)
+	if err := upgraded.Migrate(ctx); err != nil {
+		t.Fatalf("migrate release fixture: %v", err)
+	}
+	if got := migrationCount(t, ctx, upgraded); got != 1 {
+		t.Fatalf("migration count = %d, want 1", got)
+	}
+
+	settings := upgraded.Settings()
+	if got, err := settings.GetString(ctx, "general.theme"); err != nil || got != "light" {
+		t.Fatalf("general.theme after upgrade = %q, %v; want light, nil", got, err)
+	}
+	if got, err := settings.GetString(ctx, "windows.wsl_distro"); err != nil || got != "cairn-dev" {
+		t.Fatalf("windows.wsl_distro after upgrade = %q, %v; want cairn-dev, nil", got, err)
+	}
+	if got, err := settings.GetInt(ctx, "macos.colima_disk_gb"); err != nil || got != 60 {
+		t.Fatalf("macos.colima_disk_gb after upgrade = %d, %v; want default 60, nil", got, err)
+	}
+
+	if got := queryString(t, ctx, upgraded, "SELECT display_name FROM providers WHERE id = ?", "linux_native"); got != "Linux native" {
+		t.Fatalf("provider display_name = %q, want Linux native", got)
+	}
+	if got := queryString(t, ctx, upgraded, "SELECT status FROM projects WHERE id = ?", "linux_native/app-db"); got != "running" {
+		t.Fatalf("project status = %q, want running", got)
+	}
+	if got := queryString(t, ctx, upgraded, "SELECT image_ref FROM services WHERE id = ?", "linux_native/app-db/web"); got != "nginx:1.25" {
+		t.Fatalf("service image_ref = %q, want nginx:1.25", got)
+	}
+	if got := queryString(t, ctx, upgraded, "SELECT status FROM image_update_checks WHERE image_ref = ?", "nginx:1.25"); got != "service_image_update_available" {
+		t.Fatalf("update check status = %q, want service_image_update_available", got)
+	}
+	if got := queryString(t, ctx, upgraded, "SELECT status FROM base_image_refs WHERE id = 1"); got != "base_image_update_available" {
+		t.Fatalf("base image status = %q, want base_image_update_available", got)
+	}
+	if got := queryString(t, ctx, upgraded, "SELECT result FROM update_history WHERE image_ref = ?", "nginx:1.25"); got != "success" {
+		t.Fatalf("update history result = %q, want success", got)
+	}
+	if got := queryString(t, ctx, upgraded, "SELECT result FROM backups WHERE id = ?", "backup-app-db-data"); got != "success" {
+		t.Fatalf("backup result = %q, want success", got)
+	}
+	if got := queryInt64(t, ctx, upgraded, "SELECT COUNT(*) FROM audit_log WHERE action = ?", "update.apply"); got != 1 {
+		t.Fatalf("audit row count = %d, want 1", got)
+	}
+	if got := queryInt64(t, ctx, upgraded, "SELECT read FROM notifications WHERE title = ?", "Update applied"); got != 0 {
+		t.Fatalf("notification read = %d, want 0", got)
 	}
 }
 
@@ -425,6 +501,26 @@ func queryPragmaString(t *testing.T, ctx context.Context, s *Store, name string)
 	var value string
 	if err := s.writer.QueryRowContext(ctx, "PRAGMA "+name).Scan(&value); err != nil {
 		t.Fatalf("PRAGMA %s: %v", name, err)
+	}
+	return value
+}
+
+func queryString(t *testing.T, ctx context.Context, s *Store, query string, args ...any) string {
+	t.Helper()
+
+	var value string
+	if err := s.writer.QueryRowContext(ctx, query, args...).Scan(&value); err != nil {
+		t.Fatalf("query string %q: %v", query, err)
+	}
+	return value
+}
+
+func queryInt64(t *testing.T, ctx context.Context, s *Store, query string, args ...any) int64 {
+	t.Helper()
+
+	var value int64
+	if err := s.writer.QueryRowContext(ctx, query, args...).Scan(&value); err != nil {
+		t.Fatalf("query int64 %q: %v", query, err)
 	}
 	return value
 }

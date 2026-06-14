@@ -233,4 +233,4 @@ jobs:
       - name: Release validation smoke
         if: runner.os == 'Linux'
         shell: pwsh
-        run: ./scripts/run-release-validation.ps1 -Suite checklist,manual-matrix,soak-checker,security,performance,soak-smoke,ui-release -SoakDuration 30s -SoakTimeout 5m
+        run: ./scripts/run-release-validation.ps1 -Suite checklist,manual-matrix,soak-checker,upgrade-fixtures,security,performance,soak-smoke,ui-release -SoakDuration 30s -SoakTimeout 5m

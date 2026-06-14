@@ -164,6 +164,10 @@ jobs:
         shell: pwsh
         run: ./scripts/check-release-artifacts.ps1 -Platform ${{ matrix.platform }}
 
+      - name: Upgrade fixture smoke
+        shell: pwsh
+        run: ./scripts/run-release-validation.ps1 -Suite upgrade-fixtures
+
       - name: Linux deb install/uninstall smoke
         if: runner.os == 'Linux'
         shell: pwsh

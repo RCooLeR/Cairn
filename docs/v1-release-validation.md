@@ -7,13 +7,14 @@ Source of truth: `dev-docs/06-testing.md`, `dev-docs/05-security.md`, and `dev-d
 Every push to `main` runs the normal CI matrix on Ubuntu 24.04, Windows, and macOS, then package smoke for NSIS, AppImage, deb, and dmg. The Linux package-smoke leg also installs and removes the generated `.deb` on Ubuntu, verifies the installed binary/desktop file/icon, checks that Docker package dependencies and the Docker group are untouched, and repeats the `.deb` install/remove smoke inside `debian:stable-slim`. It installs Chromium for Playwright and also runs:
 
 ```powershell
-./scripts/run-release-validation.ps1 -Suite checklist,manual-matrix,soak-checker,security,performance,soak-smoke,ui-release -SoakDuration 30s -SoakTimeout 5m
+./scripts/run-release-validation.ps1 -Suite checklist,manual-matrix,soak-checker,upgrade-fixtures,security,performance,soak-smoke,ui-release -SoakDuration 30s -SoakTimeout 5m
 ```
 
 That release smoke covers:
 - the v1 release checklist evidence ledger mirroring every normative checkbox from `dev-docs/06-testing.md section 9` with an allowed release status;
 - the manual platform TODO ledger retaining every Windows/Linux/macOS condition from `dev-docs/06-testing.md section 2`;
 - synthetic soak-status checker fixtures proving completed runs must be at least 24 h, active, exit 0, and within the goroutine threshold;
+- release DB upgrade fixtures that open a seeded v1.0.0-rc1 database through the current migrator and verify settings defaults plus representative provider, project, service, metrics, lineage, update, backup, audit, and notification data survive;
 - security policy review tests for confirmation, typed-name requirements, redaction, unencrypted TCP warnings, registry password stdin handling, update rollback, restore overwrite, and cheatsheet risk labels;
 - seed-scale performance for dashboard metrics at 100 containers, 500 images, 200 volumes, 20 networks, and 10 projects;
 - a short active-stream soak that opens logs, stats, terminal, and dashboard reads against a real Linux Docker daemon and checks goroutine cleanup.
@@ -34,6 +35,14 @@ The Debian container package smoke can also be run after building Linux packages
 ```
 
 This improves Debian stable package-install evidence, but it does not replace the required Debian desktop/AppImage/rootless manual rows in `docs/manual-platform-validation.md`.
+
+The release DB upgrade fixture can be run directly with:
+
+```powershell
+./scripts/run-release-validation.ps1 -Suite upgrade-fixtures
+```
+
+The seed lives in `testdata/dbs/v1.0.0-rc1-seed.sql` and represents the v1.0.0 release-candidate schema/data shape until the first post-v1 migration fixture is added.
 
 ## 24 h soak command
 
