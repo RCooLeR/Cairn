@@ -184,6 +184,19 @@ type SettingsToastState = {
   title: string;
   body?: string;
 };
+type AuditRangeID = "24h" | "7d" | "30d" | "90d" | "all";
+type AuditFilterState = {
+  range: AuditRangeID;
+  action: string;
+  status: string;
+  projectID: string;
+};
+type AppUpdateNotice = {
+  version: string;
+  url: string;
+  name?: string;
+  publishedAt?: string;
+};
 type FilterID = string;
 type BadgeTone = "ok" | "warn" | "error" | "info" | "neutral" | "accent";
 type StatusToneID = "ok" | "warn" | "error" | "info" | "neutral";
@@ -881,6 +894,20 @@ function App() {
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const [settingsToast, setSettingsToast] =
     useState<SettingsToastState | null>(null);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([]);
+  const [auditLoading, setAuditLoading] = useState(false);
+  const [auditError, setAuditError] = useState<string | null>(null);
+  const [auditFilter, setAuditFilter] = useState<AuditFilterState>({
+    range: "7d",
+    action: "",
+    status: "",
+    projectID: "",
+  });
+  const [appUpdateNotice, setAppUpdateNotice] =
+    useState<AppUpdateNotice | null>(null);
+  const [appUpdateNotificationRead, setAppUpdateNotificationRead] =
+    useState(false);
   const [setup, setSetup] = useState<ProviderSetupState>(emptyProviderSetup);
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
@@ -1142,6 +1169,7 @@ function App() {
             true,
           ),
         );
+        setSettingsLoaded(true);
       })
       .catch(() => {
         if (active) {
@@ -1153,6 +1181,7 @@ function App() {
           setColimaMemoryGB(4);
           setColimaDiskGB(60);
           setProviderAutostart(true);
+          setSettingsLoaded(true);
         }
       });
     return () => {
@@ -1206,6 +1235,7 @@ function App() {
   const markAllNotificationsRead = useCallback(async () => {
     setNotificationsLoading(true);
     setNotificationsError(null);
+    setAppUpdateNotificationRead(true);
     try {
       await SettingsService.MarkNotificationsRead([]);
       setNotifications((current) =>
@@ -1222,6 +1252,64 @@ function App() {
       setNotificationsLoading(false);
     }
   }, [refreshNotifications]);
+
+  const refreshAuditLog = useCallback(async () => {
+    setAuditLoading(true);
+    setAuditError(null);
+    try {
+      const entries = await SettingsService.GetAuditLog({
+        topic: auditFilter.action.trim(),
+        limit: 500,
+      });
+      setAuditEntries(entries ?? []);
+    } catch (error: unknown) {
+      setAuditError(
+        error instanceof Error ? error.message : "Unable to load audit log",
+      );
+    } finally {
+      setAuditLoading(false);
+    }
+  }, [auditFilter.action]);
+
+  useEffect(() => {
+    if (activePage === "settings") {
+      void refreshAuditLog();
+    }
+  }, [activePage, refreshAuditLog]);
+
+  useEffect(() => {
+    if (
+      !settingsLoaded ||
+      !version?.version ||
+      !normalizeBoolSetting(appSettings["updates.notify"], true)
+    ) {
+      return undefined;
+    }
+    let active = true;
+    const controller =
+      typeof AbortController === "undefined"
+        ? null
+        : new AbortController();
+    fetchLatestAppUpdate(version.version, controller?.signal)
+      .then((notice) => {
+        if (!active) {
+          return;
+        }
+        setAppUpdateNotice(notice);
+        if (notice) {
+          setAppUpdateNotificationRead(false);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setAppUpdateNotice(null);
+        }
+      });
+    return () => {
+      active = false;
+      controller?.abort();
+    };
+  }, [appSettings, settingsLoaded, version?.version]);
 
   useEffect(() => {
     void refreshInventory();
@@ -1527,9 +1615,34 @@ function App() {
     : providerRepairNeeded
       ? "error"
       : "neutral";
-  const unreadNotifications = notifications.filter(
+  const appUpdateNotification = useMemo<Notification | null>(() => {
+    if (!appUpdateNotice || appUpdateNotificationRead) {
+      return null;
+    }
+    return {
+      id: -1,
+      level: "info",
+      title: `Cairn ${appUpdateNotice.version} is available`,
+      body: "A new desktop app release is ready to download.",
+      topic: "app-update",
+      read: false,
+      createdAt: appUpdateNotice.publishedAt || new Date().toISOString(),
+    } as Notification;
+  }, [appUpdateNotice, appUpdateNotificationRead]);
+  const notificationsForDisplay = useMemo(
+    () =>
+      appUpdateNotification
+        ? [appUpdateNotification, ...notifications]
+        : notifications,
+    [appUpdateNotification, notifications],
+  );
+  const unreadNotifications = notificationsForDisplay.filter(
     (notification) => !notification.read,
   ).length;
+  const visibleAuditEntries = useMemo(
+    () => filterAuditEntries(auditEntries, auditFilter),
+    [auditEntries, auditFilter],
+  );
 
   const imageUseCounts = useMemo(
     () => imageUsageCounts(containers),
@@ -3332,6 +3445,10 @@ function App() {
         return (
           <SettingsPage
             activeProvider={activeProvider}
+            auditEntries={visibleAuditEntries}
+            auditError={auditError}
+            auditFilter={auditFilter}
+            auditLoading={auditLoading}
             autostartBackend={providerAutostart}
             colimaCPU={colimaCPU}
             colimaDiskGB={colimaDiskGB}
@@ -3363,6 +3480,12 @@ function App() {
             }}
             onRegistryTest={(registry) => {
               void testRegistryAuth(registry);
+            }}
+            onAuditFilterChange={(patch) => {
+              setAuditFilter((current) => ({ ...current, ...patch }));
+            }}
+            onRefreshAudit={() => {
+              void refreshAuditLog();
             }}
             onSettingChange={(key, value) => {
               void saveSetting(key, value);
@@ -3674,7 +3797,7 @@ function App() {
                 <NotificationCenter
                   error={notificationsError}
                   loading={notificationsLoading}
-                  notifications={notifications}
+                  notifications={notificationsForDisplay}
                   onClose={() => setNotificationsOpen(false)}
                   onMarkAllRead={() => {
                     void markAllNotificationsRead();
@@ -3690,10 +3813,16 @@ function App() {
           </header>
 
           <GlobalStateBanner
+            appUpdateNotice={appUpdateNotice}
             busy={providerActionBusy}
             dockerStopped={dockerStopped}
             inventoryError={inventoryError}
             noProviderConfigured={noProviderConfigured}
+            onOpenAppUpdate={() => {
+              if (appUpdateNotice) {
+                window.open(appUpdateNotice.url, "_blank", "noopener");
+              }
+            }}
             onOpenRepair={() => setRepairOpen(true)}
             onOpenSetup={openProviderSetup}
             onRetry={() => {
@@ -4006,10 +4135,12 @@ function App() {
 }
 
 function GlobalStateBanner({
+  appUpdateNotice,
   busy,
   dockerStopped,
   inventoryError,
   noProviderConfigured,
+  onOpenAppUpdate,
   onOpenRepair,
   onOpenSetup,
   onRetry,
@@ -4019,10 +4150,12 @@ function GlobalStateBanner({
   providerRepairNeeded,
   providerWarnings,
 }: {
+  appUpdateNotice: AppUpdateNotice | null;
   busy: boolean;
   dockerStopped: boolean;
   inventoryError: string | null;
   noProviderConfigured: boolean;
+  onOpenAppUpdate: () => void;
   onOpenRepair: () => void;
   onOpenSetup: () => void;
   onRetry: () => void;
@@ -4042,6 +4175,7 @@ function GlobalStateBanner({
         body:
           primaryProblem?.repairHint ??
           "Review the provider checks and choose a repair path.",
+        action: null,
       }
     : noProviderConfigured
       ? {
@@ -4049,6 +4183,7 @@ function GlobalStateBanner({
           icon: <AlertTriangle size={17} />,
           title: "No Docker provider configured",
           body: "Set up a provider before running Docker actions.",
+          action: null,
         }
       : dockerStopped || inventoryError
         ? {
@@ -4058,6 +4193,7 @@ function GlobalStateBanner({
             body:
               inventoryError ??
               "Cached data is visible; Docker actions are disabled until the engine is running.",
+            action: null,
           }
         : warning
           ? {
@@ -4065,8 +4201,22 @@ function GlobalStateBanner({
               icon: <AlertTriangle size={17} />,
               title: warning.message,
               body: "Provider warning",
+              action: null,
             }
-          : null;
+          : appUpdateNotice
+            ? {
+                tone: "info" as const,
+                icon: <Download size={17} />,
+                title: `Cairn ${appUpdateNotice.version} is available`,
+                body:
+                  appUpdateNotice.name ??
+                  "A new desktop app release is ready to download.",
+                action: {
+                  label: "Download",
+                  onClick: onOpenAppUpdate,
+                },
+              }
+            : null;
 
   if (!state) {
     return null;
@@ -4118,15 +4268,26 @@ function GlobalStateBanner({
             Start
           </Button>
         ) : null}
-        <Button
-          icon={<RefreshCw size={15} />}
-          loading={busy}
-          onClick={onRetry}
-          size="sm"
-          variant="secondary"
-        >
-          Retry
-        </Button>
+        {state.action ? (
+          <Button
+            icon={<Download size={15} />}
+            onClick={state.action.onClick}
+            size="sm"
+            variant="secondary"
+          >
+            {state.action.label}
+          </Button>
+        ) : (
+          <Button
+            icon={<RefreshCw size={15} />}
+            loading={busy}
+            onClick={onRetry}
+            size="sm"
+            variant="secondary"
+          >
+            Retry
+          </Button>
+        )}
       </div>
     </div>
   );
@@ -4943,6 +5104,10 @@ function ColimaPathRecommendation() {
 
 function SettingsPage({
   activeProvider,
+  auditEntries,
+  auditError,
+  auditFilter,
+  auditLoading,
   autostartBackend,
   colimaCPU,
   colimaDiskGB,
@@ -4961,10 +5126,12 @@ function SettingsPage({
   onDetect,
   onOpenSetup,
   onRefreshDockerContexts,
+  onRefreshAudit,
   onRefreshRegistries,
   onRegistryLogin,
   onRegistryLogout,
   onRegistryTest,
+  onAuditFilterChange,
   onSettingChange,
   onSaveColimaCPU,
   onSaveColimaDiskGB,
@@ -4985,6 +5152,10 @@ function SettingsPage({
   wslDistro,
 }: {
   activeProvider: ProviderSummary | null;
+  auditEntries: AuditEntry[];
+  auditError: string | null;
+  auditFilter: AuditFilterState;
+  auditLoading: boolean;
   autostartBackend: boolean;
   colimaCPU: number;
   colimaDiskGB: number;
@@ -5003,10 +5174,12 @@ function SettingsPage({
   onDetect: () => void;
   onOpenSetup: () => void;
   onRefreshDockerContexts: () => void;
+  onRefreshAudit: () => void;
   onRefreshRegistries: () => void;
   onRegistryLogin: (registry?: string) => void;
   onRegistryLogout: (registry: string) => void;
   onRegistryTest: (registry: string) => void;
+  onAuditFilterChange: (patch: Partial<AuditFilterState>) => void;
   onSettingChange: (key: string, value: unknown) => void;
   onSaveColimaCPU: () => void;
   onSaveColimaDiskGB: () => void;
@@ -5028,6 +5201,8 @@ function SettingsPage({
 }) {
   const [activeSection, setActiveSection] =
     useState<SettingsSectionID>("providers");
+  const [selectedAuditEntry, setSelectedAuditEntry] =
+    useState<AuditEntry | null>(null);
   const activeStatus = activeProvider?.status;
   const providerKind = activeProvider?.kind || "windows_wsl_ubuntu";
   const settingsSections: Array<[SettingsSectionID, string]> = [
@@ -5249,7 +5424,20 @@ function SettingsPage({
 
         {activeSection === "security" ? (
           <Card>
-            <CardHeader title="Security & Audit" />
+            <CardHeader
+              actions={
+                <Button
+                  icon={<RefreshCw size={15} />}
+                  loading={auditLoading}
+                  onClick={onRefreshAudit}
+                  size="sm"
+                  variant="secondary"
+                >
+                  Refresh
+                </Button>
+              }
+              title="Security & Audit"
+            />
             <CardBody className="space-y-3">
               <SettingsCheckboxField
                 checked={settingBool(
@@ -5264,7 +5452,100 @@ function SettingsPage({
                 label="Audit retention"
                 value="90 days or 50,000 rows"
               />
+              <div className="grid gap-3 md:grid-cols-4">
+                <SettingsSelectField
+                  disabled={auditLoading}
+                  label="Range"
+                  onChange={(value) =>
+                    onAuditFilterChange({ range: value as AuditRangeID })
+                  }
+                  options={[
+                    ["24h", "Last 24 hours"],
+                    ["7d", "Last 7 days"],
+                    ["30d", "Last 30 days"],
+                    ["90d", "Last 90 days"],
+                    ["all", "All retained"],
+                  ]}
+                  value={auditFilter.range}
+                />
+                <label className="block">
+                  <span className="text-xs font-medium uppercase text-text-muted">
+                    Action
+                  </span>
+                  <input
+                    className="mt-1 h-9 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
+                    onChange={(event) =>
+                      onAuditFilterChange({ action: event.target.value })
+                    }
+                    placeholder="update.apply"
+                    value={auditFilter.action}
+                  />
+                </label>
+                <SettingsSelectField
+                  disabled={auditLoading}
+                  label="Status"
+                  onChange={(value) => onAuditFilterChange({ status: value })}
+                  options={[
+                    ["", "Any status"],
+                    ["started", "Started"],
+                    ["success", "Success"],
+                    ["failed", "Failed"],
+                    ["cancelled", "Cancelled"],
+                  ]}
+                  value={auditFilter.status}
+                />
+                <label className="block">
+                  <span className="text-xs font-medium uppercase text-text-muted">
+                    Project
+                  </span>
+                  <input
+                    className="mt-1 h-9 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
+                    onChange={(event) =>
+                      onAuditFilterChange({ projectID: event.target.value })
+                    }
+                    placeholder="linux_native/app"
+                    value={auditFilter.projectID}
+                  />
+                </label>
+              </div>
+              <div className="flex justify-end">
+                <Button
+                  disabled={auditEntries.length === 0}
+                  disabledReason="No audit rows match the current filters"
+                  icon={<Download size={15} />}
+                  onClick={() => exportAuditCSV(auditEntries)}
+                  size="sm"
+                  variant="secondary"
+                >
+                  Export CSV
+                </Button>
+              </div>
+              {auditError ? (
+                <div className="rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
+                  {auditError}
+                </div>
+              ) : null}
+              {auditLoading && auditEntries.length === 0 ? (
+                <TableSkeleton />
+              ) : null}
+              {!auditLoading && auditEntries.length === 0 ? (
+                <EmptyState
+                  body="Confirmed actions and provider lifecycle events appear here."
+                  icon={<ShieldAlert size={28} />}
+                  title="No audit rows"
+                />
+              ) : null}
+              {auditEntries.length > 0 ? (
+                <AuditLogTable
+                  entries={auditEntries}
+                  onSelect={setSelectedAuditEntry}
+                />
+              ) : null}
             </CardBody>
+            <AuditEntryModal
+              entry={selectedAuditEntry}
+              onClose={() => setSelectedAuditEntry(null)}
+            />
           </Card>
         ) : null}
 
@@ -5873,6 +6154,221 @@ function ReadOnlySetting({ label, value }: { label: string; value: string }) {
       <div className="mt-1 text-text-primary">{value}</div>
     </div>
   );
+}
+
+function AuditLogTable({
+  entries,
+  onSelect,
+}: {
+  entries: AuditEntry[];
+  onSelect: (entry: AuditEntry) => void;
+}) {
+  return (
+    <div className="overflow-x-auto">
+      <table className="w-full min-w-[760px] border-separate border-spacing-0 text-sm">
+        <thead>
+          <tr className="text-left text-xs uppercase text-text-muted">
+            <th className="border-b border-border px-3 py-2">Time</th>
+            <th className="border-b border-border px-3 py-2">Action</th>
+            <th className="border-b border-border px-3 py-2">Target</th>
+            <th className="border-b border-border px-3 py-2">Risk</th>
+            <th className="border-b border-border px-3 py-2">Status</th>
+            <th className="border-b border-border px-3 py-2">Duration</th>
+            <th className="border-b border-border px-3 py-2 text-right">
+              Details
+            </th>
+          </tr>
+        </thead>
+        <tbody>
+          {entries.map((entry) => (
+            <tr key={entry.id}>
+              <td className="border-b border-border/70 px-3 py-2 text-text-secondary">
+                {formatAuditTime(entry.ts)}
+              </td>
+              <td className="border-b border-border/70 px-3 py-2 font-medium text-text-primary">
+                {entry.action}
+              </td>
+              <td className="border-b border-border/70 px-3 py-2">
+                <div className="max-w-[220px] truncate text-text-secondary">
+                  {entry.target || "-"}
+                </div>
+              </td>
+              <td className="border-b border-border/70 px-3 py-2">
+                <Badge tone={riskTone(auditMetadataString(entry, "risk"))}>
+                  {auditMetadataString(entry, "risk") || "unknown"}
+                </Badge>
+              </td>
+              <td className="border-b border-border/70 px-3 py-2">
+                <Badge tone={auditStatusTone(entry.result)}>
+                  {entry.result || "unknown"}
+                </Badge>
+              </td>
+              <td className="border-b border-border/70 px-3 py-2 text-text-secondary">
+                {formatDurationMS(auditMetadataNumber(entry, "durationMS"))}
+              </td>
+              <td className="border-b border-border/70 px-3 py-2 text-right">
+                <Button
+                  aria-label={`View audit ${entry.action}`}
+                  onClick={() => onSelect(entry)}
+                  size="sm"
+                  variant="secondary"
+                >
+                  View
+                </Button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function AuditEntryModal({
+  entry,
+  onClose,
+}: {
+  entry: AuditEntry | null;
+  onClose: () => void;
+}) {
+  const command = entry ? auditMetadataString(entry, "command") : "";
+  return (
+    <Modal onClose={onClose} open={Boolean(entry)} size="lg" title="Audit row">
+      {entry ? (
+        <div className="space-y-4">
+          <div className="grid gap-3 sm:grid-cols-2">
+            <ReadOnlySetting label="Action" value={entry.action || "-"} />
+            <ReadOnlySetting label="Status" value={entry.result || "-"} />
+            <ReadOnlySetting label="Target" value={entry.target || "-"} />
+            <ReadOnlySetting
+              label="Target type"
+              value={auditMetadataString(entry, "targetType") || "-"}
+            />
+            <ReadOnlySetting
+              label="Project"
+              value={auditMetadataString(entry, "projectID") || "-"}
+            />
+            <ReadOnlySetting
+              label="Provider"
+              value={auditMetadataString(entry, "providerID") || "-"}
+            />
+            <ReadOnlySetting
+              label="Duration"
+              value={formatDurationMS(auditMetadataNumber(entry, "durationMS"))}
+            />
+            <ReadOnlySetting label="Time" value={formatAuditTime(entry.ts)} />
+          </div>
+          <div>
+            <div className="text-xs font-medium uppercase text-text-muted">
+              Command
+            </div>
+            <pre className="mt-1 max-h-44 overflow-auto rounded-card border border-border bg-bg-inset p-3 font-mono text-xs text-text-primary">
+              {command || "No command recorded"}
+            </pre>
+          </div>
+          {entry.error ? (
+            <div className="rounded-card border border-error/30 bg-error/10 p-3 text-error">
+              {entry.error}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </Modal>
+  );
+}
+
+function exportAuditCSV(entries: AuditEntry[]) {
+  const header = [
+    "time",
+    "action",
+    "target",
+    "risk",
+    "status",
+    "duration_ms",
+    "project_id",
+    "provider_id",
+    "command",
+    "error",
+  ];
+  const rows = entries.map((entry) => [
+    formatAuditTime(entry.ts),
+    entry.action,
+    entry.target || "",
+    auditMetadataString(entry, "risk"),
+    entry.result,
+    String(auditMetadataNumber(entry, "durationMS") ?? ""),
+    auditMetadataString(entry, "projectID"),
+    auditMetadataString(entry, "providerID"),
+    auditMetadataString(entry, "command"),
+    entry.error || "",
+  ]);
+  const csv = [header, ...rows]
+    .map((row) => row.map(csvCell).join(","))
+    .join("\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `cairn-audit-${new Date().toISOString().slice(0, 10)}.csv`;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
+function csvCell(value: string) {
+  return `"${value.replace(/"/g, '""')}"`;
+}
+
+function auditMetadataString(entry: AuditEntry, key: string) {
+  const value = entry.metadata?.[key];
+  if (typeof value === "string") {
+    return value;
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value);
+  }
+  return "";
+}
+
+function auditMetadataNumber(entry: AuditEntry, key: string) {
+  const value = entry.metadata?.[key];
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
+
+function auditStatusTone(status: string): BadgeTone {
+  switch (status) {
+    case "success":
+      return "ok";
+    case "failed":
+      return "error";
+    case "cancelled":
+      return "warn";
+    case "started":
+      return "info";
+    default:
+      return "neutral";
+  }
+}
+
+function formatDurationMS(value: number | null) {
+  if (value === null) {
+    return "-";
+  }
+  if (value >= 1000) {
+    return `${(value / 1000).toFixed(value >= 10000 ? 0 : 1)} s`;
+  }
+  return `${value} ms`;
+}
+
+function formatAuditTime(value: unknown) {
+  const millis = dateMillis(value);
+  return millis ? new Date(millis).toLocaleString() : "-";
 }
 
 function settingString(
@@ -14370,8 +14866,59 @@ function notificationTone(level: string): BadgeTone {
   }
 }
 
+function filterAuditEntries(
+  entries: AuditEntry[],
+  filter: AuditFilterState,
+) {
+  const action = filter.action.trim().toLowerCase();
+  const projectID = filter.projectID.trim().toLowerCase();
+  const cutoff = auditRangeCutoff(filter.range);
+  return entries.filter((entry) => {
+    if (action && !entry.action.toLowerCase().startsWith(action)) {
+      return false;
+    }
+    if (filter.status && entry.result !== filter.status) {
+      return false;
+    }
+    if (projectID) {
+      const metadataProject = auditMetadataString(entry, "projectID");
+      if (
+        !metadataProject.toLowerCase().includes(projectID) &&
+        !(entry.target || "").toLowerCase().includes(projectID)
+      ) {
+        return false;
+      }
+    }
+    if (cutoff !== null) {
+      const timestamp = dateMillis(entry.ts);
+      if (!timestamp || timestamp < cutoff) {
+        return false;
+      }
+    }
+    return true;
+  });
+}
+
+function auditRangeCutoff(range: AuditRangeID) {
+  const now = Date.now();
+  switch (range) {
+    case "24h":
+      return now - 24 * 60 * 60 * 1000;
+    case "7d":
+      return now - 7 * 24 * 60 * 60 * 1000;
+    case "30d":
+      return now - 30 * 24 * 60 * 60 * 1000;
+    case "90d":
+      return now - 90 * 24 * 60 * 60 * 1000;
+    case "all":
+      return null;
+  }
+}
+
 function notificationTargetPage(topic: string): PageID | null {
   switch (topic) {
+    case "app-update":
+      return "settings";
     case "backup":
       return "volumes";
     case "project":
@@ -14384,6 +14931,72 @@ function notificationTargetPage(topic: string): PageID | null {
     default:
       return null;
   }
+}
+
+async function fetchLatestAppUpdate(
+  currentVersion: string,
+  signal?: AbortSignal,
+): Promise<AppUpdateNotice | null> {
+  if (typeof fetch !== "function") {
+    return null;
+  }
+  const response = await fetch(
+    "https://api.github.com/repos/RCooLeR/Cairn/releases/latest",
+    {
+      headers: { Accept: "application/vnd.github+json" },
+      signal,
+    },
+  );
+  if (!response.ok) {
+    return null;
+  }
+  const release = (await response.json()) as {
+    draft?: boolean;
+    prerelease?: boolean;
+    tag_name?: string;
+    name?: string;
+    html_url?: string;
+    published_at?: string;
+  };
+  if (
+    release.draft ||
+    release.prerelease ||
+    !release.tag_name ||
+    !release.html_url ||
+    !isNewerVersion(release.tag_name, currentVersion)
+  ) {
+    return null;
+  }
+  return {
+    version: normalizeVersionLabel(release.tag_name),
+    url: release.html_url,
+    name: release.name,
+    publishedAt: release.published_at,
+  };
+}
+
+function isNewerVersion(candidate: string, current: string) {
+  const candidateParts = versionParts(candidate);
+  const currentParts = versionParts(current);
+  for (let index = 0; index < 3; index += 1) {
+    if (candidateParts[index] > currentParts[index]) {
+      return true;
+    }
+    if (candidateParts[index] < currentParts[index]) {
+      return false;
+    }
+  }
+  return false;
+}
+
+function versionParts(value: string) {
+  const normalized = normalizeVersionLabel(value).split(/[+-]/)[0];
+  const parts = normalized.split(".").map((part) => Number.parseInt(part, 10));
+  return [parts[0] || 0, parts[1] || 0, parts[2] || 0];
+}
+
+function normalizeVersionLabel(value: string) {
+  return value.trim().replace(/^v/i, "");
 }
 
 function imageUsageCounts(containers: ContainerSummary[]) {

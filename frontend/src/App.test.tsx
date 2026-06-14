@@ -63,6 +63,8 @@ const runtimeMock = vi.hoisted(() => ({
   setClipboardText: vi.fn(),
 }));
 
+const fetchMock = vi.hoisted(() => vi.fn());
+
 const dockerServiceMock = vi.hoisted(() => ({
   InspectContainerRaw: vi.fn(),
   GetImage: vi.fn(),
@@ -148,6 +150,7 @@ const terminalServiceMock = vi.hoisted(() => ({
 const settingsServiceMock = vi.hoisted(() => ({
   GetSettings: vi.fn(),
   SetSetting: vi.fn(),
+  GetAuditLog: vi.fn(),
   GetNotifications: vi.fn(),
   MarkNotificationsRead: vi.fn(),
   GetCheatsheet: vi.fn(),
@@ -409,6 +412,7 @@ describe("App inventory shell", () => {
       "registry.credentials_mode": "docker_helper",
     });
     settingsServiceMock.SetSetting.mockResolvedValue(undefined);
+    settingsServiceMock.GetAuditLog.mockResolvedValue([]);
     settingsServiceMock.GetNotifications.mockResolvedValue([]);
     settingsServiceMock.MarkNotificationsRead.mockResolvedValue(undefined);
     settingsServiceMock.GetCheatsheet.mockResolvedValue(seededCheatsheet());
@@ -442,6 +446,18 @@ describe("App inventory shell", () => {
     runtimeMock.openFile.mockResolvedValue("");
     runtimeMock.saveFile.mockResolvedValue("/tmp/cairn-logs.jsonl");
     runtimeMock.setClipboardText.mockResolvedValue(undefined);
+    fetchMock.mockResolvedValue({
+      ok: true,
+      json: vi.fn().mockResolvedValue({
+        draft: false,
+        prerelease: false,
+        tag_name: "v0.1.0",
+        name: "Cairn v0.1.0",
+        html_url: "https://github.com/RCooLeR/Cairn/releases/tag/v0.1.0",
+        published_at: "2026-06-13T08:00:00Z",
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
 
     useAppStore.setState({
       version: null,
@@ -467,6 +483,7 @@ describe("App inventory shell", () => {
 
   afterEach(() => {
     vi.useRealTimers();
+    vi.unstubAllGlobals();
   });
 
   it("renders seeded Docker inventory and subscribes to object refresh events", async () => {
@@ -547,6 +564,43 @@ describe("App inventory shell", () => {
         [],
       ),
     );
+  });
+
+  it("shows an in-app app-update notice from GitHub releases", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      json: vi.fn().mockResolvedValue({
+        draft: false,
+        prerelease: false,
+        tag_name: "v9.9.9",
+        name: "Cairn v9.9.9",
+        html_url: "https://github.com/RCooLeR/Cairn/releases/tag/v9.9.9",
+        published_at: "2026-06-13T10:00:00Z",
+      }),
+    });
+
+    render(<App />);
+
+    expect(
+      await screen.findByText("Cairn 9.9.9 is available"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Cairn v9.9.9")).toBeInTheDocument();
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Notifications 1 unread" }),
+    );
+    const dialog = await screen.findByRole("dialog", {
+      name: "Notification center",
+    });
+    fireEvent.click(
+      within(dialog).getByRole("button", {
+        name: /Cairn 9.9.9 is available/,
+      }),
+    );
+    expect(
+      await screen.findByRole("heading", { name: "Settings" }),
+    ).toBeInTheDocument();
   });
 
   it("updates dashboard charts from stats samples and deep-links container filters", async () => {
@@ -1844,6 +1898,59 @@ describe("App inventory shell", () => {
     expect(screen.getByText("go1.26.4")).toBeInTheDocument();
   });
 
+  it("filters audit rows and opens audit details from Settings", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    settingsServiceMock.GetAuditLog.mockResolvedValue(seededAuditEntries());
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", {
+        name: /Settings/,
+      }),
+    );
+    clickSettingsSection("Security & Audit");
+
+    expect(await screen.findByText("update.apply")).toBeInTheDocument();
+    expect(screen.getByText("container.start")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(settingsServiceMock.GetAuditLog).toHaveBeenCalledWith({
+        topic: "",
+        limit: 500,
+      }),
+    );
+
+    fireEvent.change(screen.getByLabelText("Status"), {
+      target: { value: "success" },
+    });
+    expect(screen.getByText("update.apply")).toBeInTheDocument();
+    expect(screen.queryByText("container.start")).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText("Project"), {
+      target: { value: "linux_native/app" },
+    });
+    fireEvent.change(screen.getByLabelText("Action"), {
+      target: { value: "update." },
+    });
+    await waitFor(() =>
+      expect(settingsServiceMock.GetAuditLog).toHaveBeenCalledWith({
+        topic: "update.",
+        limit: 500,
+      }),
+    );
+
+    expect(screen.getByText("2.0 s")).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "View audit update.apply" }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: "Audit row" });
+    expect(within(dialog).getByText("docker compose up -d")).toBeInTheDocument();
+    expect(within(dialog).getByText("linux_native")).toBeInTheDocument();
+  });
+
   it("runs the macOS Colima setup branch through checks and install planning", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(macOSColimaSnapshot());
     providerServiceMock.Detect.mockResolvedValueOnce({
@@ -2532,6 +2639,39 @@ function seededNotifications(): Notification[] {
       topic: "update",
       read: true,
       createdAt: "2026-06-13T08:55:00Z",
+    },
+  ];
+}
+
+function seededAuditEntries() {
+  return [
+    {
+      id: 10,
+      ts: "2026-06-13T09:00:00Z",
+      action: "update.apply",
+      target: "linux_native/app",
+      result: "success",
+      metadata: {
+        command: "docker compose up -d",
+        durationMS: 2000,
+        projectID: "linux_native/app",
+        providerID: "linux_native",
+        risk: Risk.RiskNeedsConfirmation,
+        targetType: "project",
+      },
+    },
+    {
+      id: 9,
+      ts: "2026-06-13T08:55:00Z",
+      action: "container.start",
+      target: "web-1",
+      result: "started",
+      metadata: {
+        command: "docker start web-1",
+        projectID: "linux_native/app",
+        risk: Risk.RiskSafe,
+        targetType: "container",
+      },
     },
   ];
 }

@@ -6,6 +6,9 @@ import (
 	"path/filepath"
 	"slices"
 	"testing"
+	"time"
+
+	"github.com/RCooLeR/Cairn/internal/models"
 )
 
 func TestMigrateFreshDatabaseCreatesV1Schema(t *testing.T) {
@@ -262,6 +265,43 @@ func TestNotificationsRoundTripAndMarkRead(t *testing.T) {
 	}
 	if len(unread) != 0 {
 		t.Fatalf("unread after mark all = %#v, want empty", unread)
+	}
+}
+
+func TestAuditListIncludesViewerMetadata(t *testing.T) {
+	ctx := context.Background()
+	s := openMigratedStore(t, ctx)
+	defer closeStore(t, s)
+
+	if _, err := s.Audit().Insert(ctx, AuditRecord{
+		Action:     "update.apply",
+		TargetType: "project",
+		TargetID:   "linux_native/app",
+		ProviderID: "linux_native",
+		ProjectID:  "linux_native/app",
+		Command:    "docker compose up -d",
+		Risk:       models.RiskNeedsConfirmation,
+		Status:     "success",
+		Duration:   2 * time.Second,
+	}); err != nil {
+		t.Fatalf("Insert audit record: %v", err)
+	}
+
+	entries, err := s.Audit().List(ctx, models.AuditFilter{Topic: "update.", Limit: 10})
+	if err != nil {
+		t.Fatalf("List audit: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("entries = %#v, want one", entries)
+	}
+	metadata := entries[0].Metadata
+	if metadata["command"] != "docker compose up -d" ||
+		metadata["risk"] != string(models.RiskNeedsConfirmation) ||
+		metadata["providerID"] != "linux_native" ||
+		metadata["projectID"] != "linux_native/app" ||
+		metadata["targetType"] != "project" ||
+		metadata["durationMS"] != int64(2000) {
+		t.Fatalf("metadata = %#v", metadata)
 	}
 }
 

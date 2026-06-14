@@ -61,8 +61,10 @@ func (r *AuditRepository) List(ctx context.Context, filter models.AuditFilter) (
 		limit = 100
 	}
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, action, COALESCE(target_id, ''), status, COALESCE(error, ''), created_at,
-		       COALESCE(command, ''), COALESCE(risk, ''), COALESCE(provider_id, ''), COALESCE(project_id, '')
+		SELECT id, action, COALESCE(target_type, ''), COALESCE(target_id, ''), status,
+		       COALESCE(error, ''), created_at, COALESCE(command, ''),
+		       COALESCE(risk, ''), COALESCE(provider_id, ''), COALESCE(project_id, ''),
+		       duration_ms
 		FROM audit_log
 		WHERE (? = '' OR action LIKE ? || '%')
 		ORDER BY created_at DESC, id DESC
@@ -83,9 +85,12 @@ func (r *AuditRepository) List(ctx context.Context, filter models.AuditFilter) (
 		var risk string
 		var providerID string
 		var projectID string
+		var targetType string
+		var durationMS sql.NullInt64
 		if err := rows.Scan(
 			&entry.ID,
 			&entry.Action,
+			&targetType,
 			&entry.Target,
 			&entry.Result,
 			&entry.Error,
@@ -94,19 +99,20 @@ func (r *AuditRepository) List(ctx context.Context, filter models.AuditFilter) (
 			&risk,
 			&providerID,
 			&projectID,
+			&durationMS,
 		); err != nil {
 			return nil, err
 		}
 		if createdAt != "" {
 			entry.TS, _ = time.Parse(time.RFC3339Nano, createdAt)
 		}
-		entry.Metadata = auditMetadata(command, risk, providerID, projectID)
+		entry.Metadata = auditMetadata(command, risk, providerID, projectID, targetType, durationMS)
 		entries = append(entries, entry)
 	}
 	return entries, rows.Err()
 }
 
-func auditMetadata(command string, risk string, providerID string, projectID string) map[string]any {
+func auditMetadata(command string, risk string, providerID string, projectID string, targetType string, durationMS sql.NullInt64) map[string]any {
 	values := map[string]any{}
 	if command != "" {
 		values["command"] = command
@@ -119,6 +125,12 @@ func auditMetadata(command string, risk string, providerID string, projectID str
 	}
 	if projectID != "" {
 		values["projectID"] = projectID
+	}
+	if targetType != "" {
+		values["targetType"] = targetType
+	}
+	if durationMS.Valid {
+		values["durationMS"] = durationMS.Int64
 	}
 	if len(values) == 0 {
 		return nil

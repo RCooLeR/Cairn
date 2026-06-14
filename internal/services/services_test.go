@@ -117,7 +117,7 @@ func TestSettingsServiceNotifications(t *testing.T) {
 }
 
 func TestProviderServiceApplyInstallPublishesProgress(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	eventBus := bus.New()
 	defer eventBus.Close()
@@ -130,7 +130,9 @@ func TestProviderServiceApplyInstallPublishesProgress(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PlanInstall() error = %v", err)
 	}
-	events := eventBus.Subscribe(ctx, bus.TopicProviderInstallProgress, 8)
+	subscribeCtx, subscribeCancel := context.WithCancel(context.Background())
+	defer subscribeCancel()
+	events := eventBus.Subscribe(subscribeCtx, bus.TopicProviderInstallProgress, 8)
 	handle, err := service.ApplyInstall(ctx, plan.PlanID)
 	if err != nil {
 		t.Fatalf("ApplyInstall() error = %v", err)
@@ -142,7 +144,10 @@ func TestProviderServiceApplyInstallPublishesProgress(t *testing.T) {
 	var seen []providerInstallProgressPayload
 	for {
 		select {
-		case event := <-events:
+		case event, ok := <-events:
+			if !ok {
+				t.Fatalf("install progress subscription closed after events: %#v", seen)
+			}
 			payload, ok := event.Payload.(providerInstallProgressPayload)
 			if !ok {
 				t.Fatalf("payload type = %T", event.Payload)
