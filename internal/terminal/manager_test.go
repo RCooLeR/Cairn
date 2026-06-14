@@ -136,18 +136,121 @@ func TestCheatsheetEntriesAreSafeOnlyWhenRunnable(t *testing.T) {
 	if len(entries) < 60 {
 		t.Fatalf("entries = %d, want at least 60", len(entries))
 	}
+	allowedCategories := map[string]bool{
+		"cleanup":     true,
+		"compose":     true,
+		"containers":  true,
+		"exec":        true,
+		"images":      true,
+		"logs":        true,
+		"networks":    true,
+		"stats/debug": true,
+		"volumes":     true,
+	}
 	categories := map[string]bool{}
+	seenCommands := map[string]bool{}
 	for _, entry := range entries {
+		if entry.Category == "" || entry.Command == "" || entry.Description == "" {
+			t.Fatalf("incomplete cheatsheet entry = %#v", entry)
+		}
+		if !allowedCategories[entry.Category] {
+			t.Fatalf("unexpected cheatsheet category %q in %#v", entry.Category, entry)
+		}
 		categories[entry.Category] = true
+		if seenCommands[entry.Command] {
+			t.Fatalf("duplicate cheatsheet command %q", entry.Command)
+		}
+		seenCommands[entry.Command] = true
 		if entry.Runnable && entry.Risk != models.RiskSafe {
 			t.Fatalf("non-safe runnable entry = %#v", entry)
 		}
+		for _, placeholder := range entry.Placeholders {
+			if !strings.Contains(entry.Command, "<"+placeholder+">") {
+				t.Fatalf("placeholder %q missing from command %q", placeholder, entry.Command)
+			}
+		}
+		for _, placeholder := range commandPlaceholders(entry.Command) {
+			found := false
+			for _, declared := range entry.Placeholders {
+				if declared == placeholder {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("command %q uses undeclared placeholder %q", entry.Command, placeholder)
+			}
+		}
 	}
-	for _, category := range []string{"containers", "images", "compose", "volumes", "networks", "logs", "exec", "stats/debug", "cleanup"} {
+	for category := range allowedCategories {
 		if !categories[category] {
 			t.Fatalf("missing category %q", category)
 		}
 	}
+}
+
+func TestCheatsheetRisksMatchSecurityPolicy(t *testing.T) {
+	t.Parallel()
+	entries := map[string]models.CheatsheetEntry{}
+	for _, entry := range CheatsheetEntries() {
+		entries[entry.Command] = entry
+	}
+	want := map[string]models.Risk{
+		"docker start <container>":                        models.RiskSafe,
+		"docker stop <container>":                         models.RiskSafe,
+		"docker restart <container>":                      models.RiskSafe,
+		"docker pull <image>":                             models.RiskSafe,
+		"docker run -d --name <name> <image>":             models.RiskSafe,
+		"docker rename <container> <name>":                models.RiskSafe,
+		"docker volume create <volume>":                   models.RiskSafe,
+		"docker network create <network>":                 models.RiskSafe,
+		"docker tag <image> <target>":                     models.RiskSafe,
+		"docker save -o <path> <image>":                   models.RiskSafe,
+		"docker load -i <path>":                           models.RiskSafe,
+		"docker kill <container>":                         models.RiskNeedsConfirmation,
+		"docker rm <container>":                           models.RiskNeedsConfirmation,
+		"docker rmi <image>":                              models.RiskNeedsConfirmation,
+		"docker network rm <network>":                     models.RiskNeedsConfirmation,
+		"docker push <image>":                             models.RiskNeedsConfirmation,
+		"docker compose up -d <service>":                  models.RiskNeedsConfirmation,
+		"docker compose build --pull <service>":           models.RiskNeedsConfirmation,
+		"docker rm -f <container>":                        models.RiskDestructive,
+		"docker rmi -f <image>":                           models.RiskDestructive,
+		"docker container prune":                          models.RiskDestructive,
+		"docker image prune":                              models.RiskDestructive,
+		"docker image prune -a":                           models.RiskDestructive,
+		"docker builder prune":                            models.RiskDestructive,
+		"docker compose up -d --force-recreate <service>": models.RiskDestructive,
+		"docker compose down":                             models.RiskDestructive,
+		"docker volume rm <volume>":                       models.RiskDangerous,
+		"docker volume prune":                             models.RiskDangerous,
+		"docker system prune":                             models.RiskDangerous,
+		"docker system prune --volumes":                   models.RiskDangerous,
+		"docker compose down --volumes":                   models.RiskDangerous,
+	}
+	for command, risk := range want {
+		entry, ok := entries[command]
+		if !ok {
+			t.Fatalf("missing reviewed command %q", command)
+		}
+		if entry.Risk != risk {
+			t.Fatalf("%q risk = %q, want %q", command, entry.Risk, risk)
+		}
+		if risk != models.RiskSafe && entry.Runnable {
+			t.Fatalf("%q is runnable with non-safe risk %q", command, risk)
+		}
+	}
+}
+
+func commandPlaceholders(command string) []string {
+	var placeholders []string
+	for _, chunk := range strings.Split(command, "<")[1:] {
+		name, _, ok := strings.Cut(chunk, ">")
+		if ok && name != "" {
+			placeholders = append(placeholders, name)
+		}
+	}
+	return placeholders
 }
 
 type fakeProvider struct{}

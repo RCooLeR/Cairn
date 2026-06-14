@@ -728,6 +728,25 @@ describe("App inventory shell", () => {
     );
   });
 
+  it("command palette copies dangerous terminal commands without running them", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    fireEvent.click(await screen.findByText("docker system prune"));
+
+    await waitFor(() =>
+      expect(runtimeMock.setClipboardText).toHaveBeenCalledWith(
+        "docker system prune",
+      ),
+    );
+    expect(terminalServiceMock.OpenBackendTerminal).not.toHaveBeenCalled();
+    expect(terminalServiceMock.WriteTerminal).not.toHaveBeenCalled();
+  });
+
   it("requires typed confirmation when cleanup includes volumes", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
 
