@@ -172,6 +172,6 @@ Current evidence: Ubuntu 24.04 CI is green for lint/unit/contract checks, real D
 
 ## Full Platform Matrix TODO
 
-- [ ] Windows 11 x64: WSL present/absent, Ubuntu present/absent/multiple, Docker in Ubuntu present/absent, systemd on/off.
+- [ ] Windows 11 x64: WSL present/absent, Ubuntu present/absent/multiple, Docker in Ubuntu present/absent, systemd on/off, Docker Desktop installed coexistence with `docker-desktop*` distros excluded and `desktop-linux` context untouched.
 - [ ] Linux: Ubuntu LTS and Debian stable, Docker present/absent, user in/not in docker group, service stopped, rootless.
-- [ ] macOS: Apple Silicon, Homebrew present/absent, Colima present/absent, existing Docker Desktop context, remote context.
+- [ ] macOS: Apple Silicon, Intel best-effort, Homebrew present/absent, Colima present/absent, existing Docker Desktop context, remote context.
