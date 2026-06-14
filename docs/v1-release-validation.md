@@ -7,10 +7,11 @@ Source of truth: `dev-docs/06-testing.md`, `dev-docs/05-security.md`, and `dev-d
 Every push to `main` runs the normal CI matrix on Ubuntu 24.04, Windows, and macOS, then package smoke for NSIS, AppImage, deb, and dmg. The Linux package-smoke leg also installs and removes the generated `.deb`, verifies the installed binary/desktop file/icon, and checks that Docker package dependencies and the Docker group are untouched. It installs Chromium for Playwright and also runs:
 
 ```powershell
-./scripts/run-release-validation.ps1 -Suite security,performance,soak-smoke,ui-release -SoakDuration 30s -SoakTimeout 5m
+./scripts/run-release-validation.ps1 -Suite checklist,security,performance,soak-smoke,ui-release -SoakDuration 30s -SoakTimeout 5m
 ```
 
 That release smoke covers:
+- the v1 release checklist evidence ledger mirroring every normative checkbox from `dev-docs/06-testing.md section 9` with an allowed release status;
 - security policy review tests for confirmation, typed-name requirements, redaction, unencrypted TCP warnings, registry password stdin handling, update rollback, restore overwrite, and cheatsheet risk labels;
 - seed-scale performance for dashboard metrics at 100 containers, 500 images, 200 volumes, 20 networks, and 10 projects;
 - a short active-stream soak that opens logs, stats, terminal, and dashboard reads against a real Linux Docker daemon and checks goroutine cleanup.

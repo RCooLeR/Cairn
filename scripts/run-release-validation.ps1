@@ -1,6 +1,6 @@
 param(
-  [ValidateSet("security", "performance", "soak-smoke", "soak-24h", "ui-release")]
-  [string[]]$Suite = @("security", "performance", "soak-smoke"),
+  [ValidateSet("checklist", "security", "performance", "soak-smoke", "soak-24h", "ui-release")]
+  [string[]]$Suite = @("checklist", "security", "performance", "soak-smoke"),
   [string]$SoakDuration = "30s",
   [string]$SoakTimeout = "5m"
 )
@@ -45,6 +45,14 @@ function Invoke-FrontendNpm([string[]]$NpmArgs) {
 
 foreach ($item in $Suite) {
   switch ($item) {
+    "checklist" {
+      Invoke-ReleaseStep "v1 release checklist evidence ledger" {
+        & (Join-Path $scriptDir "check-v1-release-checklist.ps1")
+        if (!$?) {
+          throw "check-v1-release-checklist failed"
+        }
+      }
+    }
     "security" {
       Invoke-ReleaseStep "security policy review tests" {
         $packages = @(
