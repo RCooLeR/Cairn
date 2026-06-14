@@ -152,6 +152,22 @@ Current evidence: automated tests cover the 14 normative update/lineage/registry
 - [ ] macOS Colima VM: run local authenticated `registry:2` login, tag, push, pull-back digest, logout, and auth-required check.
 - [ ] Existing Docker context matrix: repeat update/rebuild/tag-push smoke against Docker Desktop/OrbStack/remote contexts without mutating global `docker context show`.
 
+## Phase 10.4 Linux Native Release Matrix
+
+Current evidence: Ubuntu 24.04 CI is green for lint/unit/contract checks, real Docker reconnect/logs/metrics/terminal/backup/registry/tag-push integrations, package smoke for AppImage and `.deb`, `.deb` install/uninstall, and release validation smoke. CI run 27493199996 proved the fixed `.deb` install/uninstall smoke, and CI run 27493467983 repeated the full current-head matrix successfully. Debian stable and interactive installed-app degraded-mode rows are unavailable in this environment and remain manual TODOs.
+
+- [x] Ubuntu 24.04 CI: generated bindings diff clean, frontend audit/lint/unit/catalog/build green, Go unit/vet/golangci green.
+- [x] Ubuntu 24.04 CI: real Docker reconnect integration covers daemon stop/start recovery.
+- [x] Ubuntu 24.04 CI: real Docker logs, metrics, terminal, backup, registry auth, and tag/push integrations green.
+- [x] Ubuntu 24.04 CI: package smoke produces non-empty AppImage and `.deb` artifacts.
+- [x] Ubuntu 24.04 CI: `.deb` installs and removes cleanly, verifies `/usr/bin/cairn`, desktop file, hicolor icon, no Docker package dependencies, no docker-group mutation, and no package-owned files left after remove.
+- [x] Ubuntu 24.04 CI: release validation smoke runs `security,performance,soak-smoke,ui-release`.
+- [ ] Ubuntu LTS manual desktop smoke: launch installed `.deb`, stop Docker, verify every page shows the degraded/stale state, repair/start affordances, and disabled mutations; restart Docker and verify auto-recovery.
+- [ ] Ubuntu LTS manual desktop smoke: launch the AppImage on a clean host with Docker present and repeat Dashboard, Projects, Containers, Images, Volumes, Networks, Logs, Terminal, Updates, Settings, and Audit navigation.
+- [ ] Ubuntu LTS manual permission matrix: user in docker group, user not in docker group with sudo-per-action, rootless Docker socket.
+- [ ] Debian stable VM: install/remove `.deb`, verify binary/desktop/icon paths and no Docker dependency/group mutation.
+- [ ] Debian stable VM: launch AppImage with Docker present, Docker absent, Docker stopped, and rootless Docker.
+
 ## Full Platform Matrix TODO
 
 - [ ] Windows 11 x64: WSL present/absent, Ubuntu present/absent/multiple, Docker in Ubuntu present/absent, systemd on/off.
