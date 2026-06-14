@@ -85,9 +85,14 @@ try {
   }
 }
 
-$queryOutput = & dpkg-query -W $packageName 2>$null
-if ($LASTEXITCODE -eq 0 -or $queryOutput) {
-  throw "Package still appears installed after remove: $queryOutput"
+$queryOutput = (& dpkg-query -W -f='${db:Status-Abbrev} ${Version}' $packageName 2>$null) -join "`n"
+if ($LASTEXITCODE -eq 0) {
+  $queryOutput = $queryOutput.Trim()
+  $packageState = if ($queryOutput.Length -ge 2) { [string]$queryOutput[1] } else { "" }
+  if ($packageState -notin @("n", "c")) {
+    throw "Package still appears active after remove: $queryOutput"
+  }
+  Write-Host "Package dpkg state after remove: $queryOutput"
 }
 Test-Absent "/usr/bin/cairn"
 Test-Absent "/usr/share/applications/cairn.desktop"
