@@ -168,6 +168,7 @@ func TestWindowsWSLRunDockerComposeAndShellCommands(t *testing.T) {
 	runner.paths["pwsh"] = `C:\Program Files\PowerShell\7\pwsh.exe`
 	runner.outputs[wslCommandName+" -d cairn-dev -- docker ps -a"] = "CONTAINER ID\n"
 	runner.outputs[wslCommandName+" -d cairn-dev -- sh -lc cd '/mnt/c/Users/Ada/Project One' && exec docker 'compose' '-f' 'compose.yaml' 'config'"] = "services: {}\n"
+	runner.outputs[wslCommandName+" -d cairn-dev -- sh -lc export COMPOSE_PROJECT_NAME='demo'; cd '/mnt/c/Users/Ada/Project One' && exec docker 'compose' '-f' 'compose.yaml' 'ps'"] = "[]\n"
 	provider := NewWindowsWSL(WindowsWSLOptions{Distro: "cairn-dev", Runner: runner})
 
 	result, err := provider.RunDocker(context.Background(), "ps", "-a")
@@ -184,6 +185,14 @@ func TestWindowsWSLRunDockerComposeAndShellCommands(t *testing.T) {
 	}
 	if result.Workdir != "/mnt/c/Users/Ada/Project One" {
 		t.Fatalf("RunCompose workdir = %q", result.Workdir)
+	}
+
+	result, err = provider.RunComposeEnv(context.Background(), `C:\Users\Ada\Project One`, []string{"COMPOSE_PROJECT_NAME=demo"}, "-f", "compose.yaml", "ps")
+	if err != nil {
+		t.Fatalf("RunComposeEnv() error = %v", err)
+	}
+	if result.Workdir != "/mnt/c/Users/Ada/Project One" {
+		t.Fatalf("RunComposeEnv workdir = %q", result.Workdir)
 	}
 
 	hostShell, err := provider.HostShellCommand(models.TerminalOptions{})

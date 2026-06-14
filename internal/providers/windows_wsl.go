@@ -361,15 +361,23 @@ func (p *WindowsWSLProvider) RunBackendCommand(ctx context.Context, input string
 }
 
 func (p *WindowsWSLProvider) RunCompose(ctx context.Context, workdir string, args ...string) (*CommandResult, error) {
+	return p.RunComposeEnv(ctx, workdir, nil, args...)
+}
+
+func (p *WindowsWSLProvider) RunComposeEnv(ctx context.Context, workdir string, env []string, args ...string) (*CommandResult, error) {
 	composeArgs := append([]string{"compose"}, args...)
 	if strings.TrimSpace(workdir) == "" {
-		return p.RunDocker(ctx, composeArgs...)
+		if len(env) == 0 {
+			return p.RunDocker(ctx, composeArgs...)
+		}
+		shellCommand := shellEnvExports(env) + "exec docker " + shellJoin(composeArgs)
+		return p.runWSL(ctx, p.configuredDistro(), "sh", "-lc", shellCommand)
 	}
 	backendWorkdir, err := p.MapPathToBackend(workdir)
 	if err != nil {
 		return nil, err
 	}
-	shellCommand := "cd " + shellQuote(backendWorkdir) + " && exec docker " + shellJoin(composeArgs)
+	shellCommand := shellEnvExports(env) + "cd " + shellQuote(backendWorkdir) + " && exec docker " + shellJoin(composeArgs)
 	result, err := p.runWSL(ctx, p.configuredDistro(), "sh", "-lc", shellCommand)
 	if result != nil {
 		result.Workdir = backendWorkdir
@@ -700,6 +708,38 @@ func shellJoin(args []string) string {
 		quoted = append(quoted, shellQuote(arg))
 	}
 	return strings.Join(quoted, " ")
+}
+
+func shellEnvExports(env []string) string {
+	exports := make([]string, 0, len(env))
+	for _, entry := range env {
+		key, value, ok := strings.Cut(entry, "=")
+		key = strings.TrimSpace(key)
+		if !ok || !isShellEnvName(key) {
+			continue
+		}
+		exports = append(exports, "export "+key+"="+shellQuote(value))
+	}
+	if len(exports) == 0 {
+		return ""
+	}
+	return strings.Join(exports, "; ") + "; "
+}
+
+func isShellEnvName(value string) bool {
+	if value == "" {
+		return false
+	}
+	for index, r := range value {
+		if r == '_' || (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') {
+			continue
+		}
+		if index > 0 && r >= '0' && r <= '9' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func shellQuote(value string) string {
