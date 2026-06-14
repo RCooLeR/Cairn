@@ -4,7 +4,7 @@ Source of truth: `dev-docs/06-testing.md`, `dev-docs/05-security.md`, and `dev-d
 
 ## Automated release smoke
 
-Every push to `main` runs the normal CI matrix on Ubuntu 24.04, Windows, and macOS, then package smoke for NSIS, AppImage, deb, and dmg. The Linux package-smoke leg also installs and removes the generated `.deb`, verifies the installed binary/desktop file/icon, and checks that Docker package dependencies and the Docker group are untouched. It installs Chromium for Playwright and also runs:
+Every push to `main` runs the normal CI matrix on Ubuntu 24.04, Windows, and macOS, then package smoke for NSIS, AppImage, deb, and dmg. The Linux package-smoke leg also installs and removes the generated `.deb` on Ubuntu, verifies the installed binary/desktop file/icon, checks that Docker package dependencies and the Docker group are untouched, and repeats the `.deb` install/remove smoke inside `debian:stable-slim`. It installs Chromium for Playwright and also runs:
 
 ```powershell
 ./scripts/run-release-validation.ps1 -Suite checklist,manual-matrix,soak-checker,security,performance,soak-smoke,ui-release -SoakDuration 30s -SoakTimeout 5m
@@ -26,6 +26,14 @@ On Windows developer machines with the dedicated `cairn-dev` distro, run the loc
 ```
 
 This suite is intentionally not part of default CI because hosted Windows runners do not have `cairn-dev`; it preflights WSL2/systemd/Docker/Compose/Buildx, asserts the pinned Go 1.26.4 toolchain, runs the real WSL SDK connection, backup/restore, registry tag/push, and update/rebuild smokes, and fails if the Windows Docker context changes.
+
+The Debian container package smoke can also be run after building Linux packages:
+
+```powershell
+./scripts/run-release-validation.ps1 -Suite debian-deb-container
+```
+
+This improves Debian stable package-install evidence, but it does not replace the required Debian desktop/AppImage/rootless manual rows in `docs/manual-platform-validation.md`.
 
 ## 24 h soak command
 

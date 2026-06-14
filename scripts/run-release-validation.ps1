@@ -1,5 +1,5 @@
 param(
-  [ValidateSet("checklist", "manual-matrix", "soak-checker", "security", "performance", "soak-smoke", "soak-24h", "ui-release", "wsl-provider")]
+  [ValidateSet("checklist", "manual-matrix", "soak-checker", "security", "performance", "soak-smoke", "soak-24h", "ui-release", "wsl-provider", "debian-deb-container")]
   [string[]]$Suite = @("checklist", "manual-matrix", "soak-checker", "security", "performance", "soak-smoke"),
   [string]$SoakDuration = "30s",
   [string]$SoakTimeout = "5m"
@@ -132,6 +132,14 @@ foreach ($item in $Suite) {
         & (Join-Path $scriptDir "run-wsl-provider-validation.ps1")
         if (!$?) {
           throw "run-wsl-provider-validation failed"
+        }
+      }
+    }
+    "debian-deb-container" {
+      Invoke-ReleaseStep "Debian stable container deb install/uninstall smoke" {
+        & (Join-Path $scriptDir "test-debian-container-deb-install.ps1")
+        if (!$?) {
+          throw "test-debian-container-deb-install failed"
         }
       }
     }

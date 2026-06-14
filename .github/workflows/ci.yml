@@ -225,6 +225,11 @@ jobs:
         shell: pwsh
         run: ./scripts/test-linux-deb-install.ps1
 
+      - name: Debian stable container deb install/uninstall smoke
+        if: runner.os == 'Linux'
+        shell: pwsh
+        run: ./scripts/run-release-validation.ps1 -Suite debian-deb-container
+
       - name: Release validation smoke
         if: runner.os == 'Linux'
         shell: pwsh
