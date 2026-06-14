@@ -214,3 +214,8 @@ jobs:
       - name: Check package artifacts
         shell: pwsh
         run: ./scripts/check-release-artifacts.ps1 -Platform ${{ matrix.platform }}
+
+      - name: Release validation smoke
+        if: runner.os == 'Linux'
+        shell: pwsh
+        run: ./scripts/run-release-validation.ps1 -Suite security,performance,soak-smoke -SoakDuration 30s -SoakTimeout 5m
