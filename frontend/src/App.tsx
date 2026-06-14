@@ -153,6 +153,7 @@ import {
 } from "./components/terminal/TerminalPage";
 import { useAppStore } from "./state/appStore";
 import { useInventoryStore } from "./state/inventoryStore";
+import { frontendVersion } from "./version";
 
 const logoUrl = "/cairn-logo.png";
 
@@ -1319,6 +1320,10 @@ function App() {
       })
       .catch((error: unknown) => {
         if (active) {
+          setVersion({
+            version: frontendVersion,
+            goVersion: "Unavailable",
+          });
           setVersionError(
             error instanceof Error
               ? error.message

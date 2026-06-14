@@ -186,11 +186,12 @@ const imageLineageServiceMock = vi.hoisted(() => ({
   RefreshServiceLineage: vi.fn(),
 }));
 
+const appApiMock = vi.hoisted(() => ({
+  getAppVersion: vi.fn(),
+}));
+
 vi.mock("./api/app", () => ({
-  getAppVersion: vi.fn().mockResolvedValue({
-    version: "0.1.0",
-    goVersion: "go1.26.4",
-  }),
+  getAppVersion: appApiMock.getAppVersion,
 }));
 
 vi.mock("./api/inventory", () => ({
@@ -270,6 +271,10 @@ describe("App inventory shell", () => {
       value: "Win32",
     });
     inventoryMock.getInventorySnapshot.mockReset();
+    appApiMock.getAppVersion.mockResolvedValue({
+      version: "0.1.0",
+      goVersion: "go1.26.4",
+    });
     dockerServiceMock.InspectContainerRaw.mockResolvedValue(
       '{"Id":"container-1"}',
     );
@@ -2134,6 +2139,26 @@ describe("App inventory shell", () => {
     clickSettingsSection("About");
     expect(await screen.findByText("0.1.0")).toBeInTheDocument();
     expect(screen.getByText("go1.26.4")).toBeInTheDocument();
+  });
+
+  it("uses the stamped frontend version if backend version loading fails", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    appApiMock.getAppVersion.mockRejectedValue(new Error("backend offline"));
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", {
+        name: /Settings/,
+      }),
+    );
+    clickSettingsSection("About");
+
+    expect(await screen.findByText("0.1.0")).toBeInTheDocument();
+    expect(screen.getByText("Unavailable")).toBeInTheDocument();
   });
 
   it("filters audit rows and opens audit details from Settings", async () => {

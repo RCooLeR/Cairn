@@ -3,26 +3,40 @@
 #
 # The lines below are called `modelines`. See `:help modeline`
 
-name: "cairn.exe"
+name: "cairn"
 arch: ${GOARCH}
 platform: "linux"
 version: "0.1.0"
-section: "default"
-priority: "extra"
-maintainer: ${GIT_COMMITTER_NAME} <${GIT_COMMITTER_EMAIL}>
+section: "utils"
+priority: "optional"
+maintainer: Cairn Maintainers <noreply@github.com>
 description: "A clean Compose-first Docker manager for Windows, macOS, and Linux"
 vendor: "Cairn"
-homepage: "https://wails.io"
-license: "MIT"
+homepage: "https://github.com/RCooLeR/Cairn"
+license: "Proprietary"
 release: "1"
 
 contents:
-  - src: "./bin/cairn.exe"
-    dst: "/usr/local/bin/cairn.exe"
-  - src: "./build/appicon.png"
-    dst: "/usr/share/icons/hicolor/128x128/apps/cairn.exe.png"
-  - src: "./build/linux/cairn.exe.desktop"
-    dst: "/usr/share/applications/cairn.exe.desktop"
+  - src: "./bin/cairn"
+    dst: "/usr/bin/cairn"
+  - src: "./build/linux/icons/hicolor/16x16/apps/cairn.png"
+    dst: "/usr/share/icons/hicolor/16x16/apps/cairn.png"
+  - src: "./build/linux/icons/hicolor/24x24/apps/cairn.png"
+    dst: "/usr/share/icons/hicolor/24x24/apps/cairn.png"
+  - src: "./build/linux/icons/hicolor/32x32/apps/cairn.png"
+    dst: "/usr/share/icons/hicolor/32x32/apps/cairn.png"
+  - src: "./build/linux/icons/hicolor/48x48/apps/cairn.png"
+    dst: "/usr/share/icons/hicolor/48x48/apps/cairn.png"
+  - src: "./build/linux/icons/hicolor/64x64/apps/cairn.png"
+    dst: "/usr/share/icons/hicolor/64x64/apps/cairn.png"
+  - src: "./build/linux/icons/hicolor/128x128/apps/cairn.png"
+    dst: "/usr/share/icons/hicolor/128x128/apps/cairn.png"
+  - src: "./build/linux/icons/hicolor/256x256/apps/cairn.png"
+    dst: "/usr/share/icons/hicolor/256x256/apps/cairn.png"
+  - src: "./build/linux/icons/hicolor/512x512/apps/cairn.png"
+    dst: "/usr/share/icons/hicolor/512x512/apps/cairn.png"
+  - src: "./build/linux/cairn.desktop"
+    dst: "/usr/share/applications/cairn.desktop"
 
 # Default dependencies for the GTK4 + WebKitGTK 6.0 stack (Ubuntu 24.04+ / Debian 13+)
 depends:
@@ -46,9 +60,7 @@ overrides:
 # scripts section to ensure desktop database is updated after install
 scripts:
   postinstall: "./build/linux/nfpm/scripts/postinstall.sh"
-  # You can also add preremove, postremove if needed
-  # preremove: "./build/linux/nfpm/scripts/preremove.sh"
-  # postremove: "./build/linux/nfpm/scripts/postremove.sh"
+  postremove: "./build/linux/nfpm/scripts/postremove.sh"
 
 # If you build your app with -tags gtk3 (legacy WebKit2GTK 4.1 stack — supported through v3.0.x, removed in v3.1),
 # replace the depends/overrides above with these:

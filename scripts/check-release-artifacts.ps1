@@ -1,0 +1,44 @@
+param(
+  [Parameter(Mandatory = $true)]
+  [ValidateSet("windows", "linux", "darwin")]
+  [string]$Platform,
+  [string]$Root = ""
+)
+
+$ErrorActionPreference = "Stop"
+
+if ([string]::IsNullOrWhiteSpace($Root)) {
+  $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
+  $Root = (Resolve-Path (Join-Path $scriptDir "..")).Path
+}
+
+function Require-Any([string]$Pattern, [string]$Description) {
+  $matches = Get-ChildItem -Path (Join-Path $Root "bin") -Filter $Pattern -File -ErrorAction SilentlyContinue
+  if (!$matches) {
+    throw "Missing $Description matching bin/$Pattern"
+  }
+  foreach ($match in $matches) {
+    if ($match.Length -le 0) {
+      throw "Artifact is empty: $($match.FullName)"
+    }
+  }
+  $matches | ForEach-Object { Write-Host "Found $Description: $($_.Name)" }
+}
+
+switch ($Platform) {
+  "windows" {
+    Require-Any "cairn-*-installer.exe" "NSIS installer"
+  }
+  "linux" {
+    Require-Any "*.AppImage" "AppImage"
+    Require-Any "*.deb" "Debian package"
+  }
+  "darwin" {
+    Require-Any "*.dmg" "macOS dmg"
+    $app = Join-Path $Root "bin/cairn.app/Contents/MacOS/cairn"
+    if (!(Test-Path -LiteralPath $app)) {
+      throw "Missing app bundle executable: $app"
+    }
+    Write-Host "Found app bundle executable: $app"
+  }
+}

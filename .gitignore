@@ -51,6 +51,9 @@ fyne-cross/
 # Local app data and generated artifacts
 .cairn/
 .scratch/
+.release-version.env
+build/linux/cairn.desktop
+build/linux/icons/
 frontend/node_modules/
 frontend/dist/*
 !frontend/dist/.gitkeep

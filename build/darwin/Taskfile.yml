@@ -48,7 +48,7 @@ tasks:
     cmds:
       - '{{if eq .OBFUSCATED "true"}}garble {{.GARBLE_ARGS}} build{{else}}go build{{end}} {{.BUILD_FLAGS}} -o "{{.OUTPUT}}"'
     vars:
-      BUILD_FLAGS: '{{if eq .DEV "true"}}{{if or .EXTRA_TAGS (eq .OBFUSCATED "true")}}-tags {{if eq .OBFUSCATED "true"}}wails_obfuscated{{if .EXTRA_TAGS}},{{end}}{{end}}{{.EXTRA_TAGS}} {{end}}-buildvcs=false -gcflags=all="-l"{{else}}-tags production{{if eq .OBFUSCATED "true"}},wails_obfuscated{{end}}{{if .EXTRA_TAGS}},{{.EXTRA_TAGS}}{{end}} -trimpath -buildvcs=false -ldflags="-w -s"{{end}}'
+      BUILD_FLAGS: '{{if eq .DEV "true"}}{{if or .EXTRA_TAGS (eq .OBFUSCATED "true")}}-tags {{if eq .OBFUSCATED "true"}}wails_obfuscated{{if .EXTRA_TAGS}},{{end}}{{end}}{{.EXTRA_TAGS}} {{end}}-buildvcs=false -gcflags=all="-l"{{else}}-tags production{{if eq .OBFUSCATED "true"}},wails_obfuscated{{end}}{{if .EXTRA_TAGS}},{{.EXTRA_TAGS}}{{end}} -trimpath -buildvcs=false -ldflags="-w -s -X github.com/RCooLeR/Cairn/internal/services.Version={{.APP_VERSION | default "0.1.0"}} -X github.com/RCooLeR/Cairn/internal/services.Commit={{.GIT_COMMIT | default ""}} -X github.com/RCooLeR/Cairn/internal/services.BuildDate={{.BUILD_DATE | default ""}}"{{end}}'
       DEFAULT_OUTPUT: '{{.BIN_DIR}}/{{.APP_NAME}}'
       OUTPUT: '{{ .OUTPUT | default .DEFAULT_OUTPUT }}'
     env:
@@ -119,18 +119,22 @@ tasks:
       - rm -f "{{.BIN_DIR}}/{{.APP_NAME}}-amd64" "{{.BIN_DIR}}/{{.APP_NAME}}-arm64"
 
   package:
-    summary: Packages the application into a `.app` bundle
+    summary: Packages the application into a `.app` bundle and `.dmg`
     deps:
       - task: build
     cmds:
       - task: create:app:bundle
+      - task: create:dmg
 
   package:universal:
-    summary: Packages darwin universal binary (arm64 + amd64)
+    summary: Packages darwin universal binary (arm64 + amd64) into a `.app` bundle and `.dmg`
     deps:
       - task: build:universal
     cmds:
       - task: create:app:bundle
+      - task: create:dmg
+        vars:
+          DMG_ARCH: universal
 
 
   create:app:bundle:
@@ -158,6 +162,17 @@ tasks:
     internal: true
     cmds:
       - 'echo "Skipping codesign (not available on {{OS}}). Sign the .app on macOS before distribution."'
+
+  create:dmg:
+    summary: Creates a compressed macOS dmg
+    platforms: [darwin]
+    deps:
+      - task: create:app:bundle
+    cmds:
+      - rm -f "{{.BIN_DIR}}/{{.APP_NAME}}-{{.DMG_ARCH}}.dmg"
+      - hdiutil create -volname "{{.APP_NAME}}" -srcfolder "{{.BIN_DIR}}/{{.APP_NAME}}.app" -ov -format UDZO "{{.BIN_DIR}}/{{.APP_NAME}}-{{.DMG_ARCH}}.dmg"
+    vars:
+      DMG_ARCH: '{{.ARCH | default ARCH}}'
 
   run:
     cmds:

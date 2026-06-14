@@ -59,7 +59,7 @@ tasks:
     cmds:
       - '{{if eq .OBFUSCATED "true"}}garble {{.GARBLE_ARGS}} build{{else}}go build{{end}} {{.BUILD_FLAGS}} -o {{.OUTPUT}}'
     vars:
-      BUILD_FLAGS: '{{if eq .DEV "true"}}{{if or .EXTRA_TAGS (eq .OBFUSCATED "true")}}-tags {{if eq .OBFUSCATED "true"}}wails_obfuscated{{if .EXTRA_TAGS}},{{end}}{{end}}{{.EXTRA_TAGS}} {{end}}-buildvcs=false -gcflags=all="-l"{{else}}-tags production{{if eq .OBFUSCATED "true"}},wails_obfuscated{{end}}{{if .EXTRA_TAGS}},{{.EXTRA_TAGS}}{{end}} -trimpath -buildvcs=false -ldflags="-w -s"{{end}}'
+      BUILD_FLAGS: '{{if eq .DEV "true"}}{{if or .EXTRA_TAGS (eq .OBFUSCATED "true")}}-tags {{if eq .OBFUSCATED "true"}}wails_obfuscated{{if .EXTRA_TAGS}},{{end}}{{end}}{{.EXTRA_TAGS}} {{end}}-buildvcs=false -gcflags=all="-l"{{else}}-tags production{{if eq .OBFUSCATED "true"}},wails_obfuscated{{end}}{{if .EXTRA_TAGS}},{{.EXTRA_TAGS}}{{end}} -trimpath -buildvcs=false -ldflags="-w -s -X github.com/RCooLeR/Cairn/internal/services.Version={{.APP_VERSION | default "0.1.0"}} -X github.com/RCooLeR/Cairn/internal/services.Commit={{.GIT_COMMIT | default ""}} -X github.com/RCooLeR/Cairn/internal/services.BuildDate={{.BUILD_DATE | default ""}}"{{end}}'
       DEFAULT_OUTPUT: '{{.BIN_DIR}}/{{.APP_NAME}}'
       OUTPUT: '{{ .OUTPUT | default .DEFAULT_OUTPUT }}'
     env:
@@ -106,8 +106,6 @@ tasks:
     cmds:
       - task: create:appimage
       - task: create:deb
-      - task: create:rpm
-      - task: create:aur
 
   create:appimage:
     summary: Creates an AppImage
@@ -211,14 +209,13 @@ tasks:
         msg: "PGP_KEY is required. Set it in the vars section at the top of build/linux/Taskfile.yml"
 
   sign:packages:
-    summary: Signs all Linux packages (DEB and RPM)
+    summary: Signs all Linux packages (DEB)
     desc: |
-      Signs both .deb and .rpm packages with a PGP key.
+      Signs the .deb package with a PGP key.
       Configure PGP_KEY in the vars section at the top of this file.
       Password is retrieved from system keychain (run: wails3 setup signing)
     cmds:
       - task: sign:deb
-      - task: sign:rpm
     preconditions:
       - sh: '[ -n "{{.PGP_KEY}}" ]'
         msg: "PGP_KEY is required. Set it in the vars section at the top of build/linux/Taskfile.yml"

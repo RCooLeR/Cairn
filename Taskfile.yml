@@ -23,7 +23,7 @@ tasks:
   assets:sync:
     summary: Syncs Cairn source artwork into Wails build inputs
     cmds:
-      - powershell -NoProfile -Command "Copy-Item -LiteralPath assets/cairn-icon.png -Destination build/appicon.png -Force; Copy-Item -LiteralPath assets/cairn-logo.png,assets/cairn-icon.png -Destination frontend/public -Force"
+      - powershell -NoProfile -ExecutionPolicy Bypass -File scripts/sync-assets.ps1 -SkipLinuxIcons
 
   frontend:install:
     summary: Installs frontend dependencies

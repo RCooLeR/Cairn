@@ -3,11 +3,11 @@ Version=1.0
 Name=Cairn
 Comment=A clean Compose-first Docker manager for Windows, macOS, and Linux
 # The Exec line includes %u to pass the URL to the application
-Exec=/usr/local/bin/cairn.exe %u
+Exec=/usr/bin/cairn %u
 Terminal=false
 Type=Application
-Icon=cairn.exe
+Icon=cairn
 Categories=Utility;
-StartupWMClass=cairn.exe
+StartupWMClass=cairn
 
  
