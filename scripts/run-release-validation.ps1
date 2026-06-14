@@ -1,6 +1,6 @@
 param(
-  [ValidateSet("checklist", "manual-matrix", "security", "performance", "soak-smoke", "soak-24h", "ui-release")]
-  [string[]]$Suite = @("checklist", "manual-matrix", "security", "performance", "soak-smoke"),
+  [ValidateSet("checklist", "manual-matrix", "soak-checker", "security", "performance", "soak-smoke", "soak-24h", "ui-release")]
+  [string[]]$Suite = @("checklist", "manual-matrix", "soak-checker", "security", "performance", "soak-smoke"),
   [string]$SoakDuration = "30s",
   [string]$SoakTimeout = "5m"
 )
@@ -58,6 +58,14 @@ foreach ($item in $Suite) {
         & (Join-Path $scriptDir "check-manual-platform-matrix.ps1")
         if (!$?) {
           throw "check-manual-platform-matrix failed"
+        }
+      }
+    }
+    "soak-checker" {
+      Invoke-ReleaseStep "soak status checker smoke" {
+        & (Join-Path $scriptDir "test-soak-status-checker.ps1")
+        if (!$?) {
+          throw "test-soak-status-checker failed"
         }
       }
     }
