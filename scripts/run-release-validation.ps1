@@ -9,7 +9,7 @@ $ErrorActionPreference = "Stop"
 
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 $root = (Resolve-Path (Join-Path $scriptDir "..")).Path
-$isLinux = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Linux)
+$runningOnLinux = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Linux)
 
 function Invoke-ReleaseStep([string]$Name, [scriptblock]$Step) {
   Write-Host "==> $Name"
@@ -56,7 +56,7 @@ foreach ($item in $Suite) {
     }
     "soak-smoke" {
       Invoke-ReleaseStep "short active-stream soak smoke" {
-        if (!$isLinux) {
+        if (!$runningOnLinux) {
           Write-Host "Skipping soak-smoke on non-Linux runner; the soak harness is Linux-native."
           return
         }
@@ -72,7 +72,7 @@ foreach ($item in $Suite) {
     }
     "soak-24h" {
       Invoke-ReleaseStep "24h active-stream soak" {
-        if (!$isLinux) {
+        if (!$runningOnLinux) {
           throw "soak-24h must run on a Linux host with Docker Engine available"
         }
         $env:CAIRN_PHASE3_SOAK = "1"
