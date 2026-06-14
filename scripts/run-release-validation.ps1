@@ -1,5 +1,5 @@
 param(
-  [ValidateSet("checklist", "manual-matrix", "soak-checker", "security", "performance", "soak-smoke", "soak-24h", "ui-release")]
+  [ValidateSet("checklist", "manual-matrix", "soak-checker", "security", "performance", "soak-smoke", "soak-24h", "ui-release", "wsl-provider")]
   [string[]]$Suite = @("checklist", "manual-matrix", "soak-checker", "security", "performance", "soak-smoke"),
   [string]$SoakDuration = "30s",
   [string]$SoakTimeout = "5m"
@@ -125,6 +125,14 @@ foreach ($item in $Suite) {
     "ui-release" {
       Invoke-ReleaseStep "release UI visual and axe smoke" {
         Invoke-FrontendNpm -NpmArgs @("run", "test:release-ui")
+      }
+    }
+    "wsl-provider" {
+      Invoke-ReleaseStep "Windows WSL provider validation" {
+        & (Join-Path $scriptDir "run-wsl-provider-validation.ps1")
+        if (!$?) {
+          throw "run-wsl-provider-validation failed"
+        }
       }
     }
   }

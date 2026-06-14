@@ -55,13 +55,14 @@ Current evidence: unit tests cover the generated WSL install command plan, custo
 
 ## Phase 5.3 Windows WSL Docker Connection
 
-Current evidence: `internal/docker.Client` now accepts provider-supplied Docker SDK dialers, and `WindowsWSLProvider` keeps the SDK host as `unix:///var/run/docker.sock` while routing the transport through `wsl.exe -d <distro> -- docker system dial-stdio`. If the Docker CLI lacks `dial-stdio`, the provider falls back to `wsl.exe -d <distro> -- socat UNIX-CONNECT:/var/run/docker.sock -`; if neither transport exists it returns `E_PROVIDER_NOT_READY` with repair hints. Local `CAIRN_REAL_WSL_DOCKER=1 go test ./internal/docker -run TestWindowsWSLDockerConnection -count=1 -v` passed against the dedicated `cairn-dev` distro, covering Connect/Ping/Info/Version/ListContainers through the WSL stdio path. A frontend test verifies that `/mnt/...` import paths show the performance warning.
+Current evidence: `internal/docker.Client` now accepts provider-supplied Docker SDK dialers, and `WindowsWSLProvider` keeps the SDK host as `unix:///var/run/docker.sock` while routing the transport through `wsl.exe -d <distro> -- docker system dial-stdio`. If the Docker CLI lacks `dial-stdio`, the provider falls back to `wsl.exe -d <distro> -- socat UNIX-CONNECT:/var/run/docker.sock -`; if neither transport exists it returns `E_PROVIDER_NOT_READY` with repair hints. Local `CAIRN_REAL_WSL_DOCKER=1 go test ./internal/docker -run TestWindowsWSLDockerConnection -count=1 -v` passed against the dedicated `cairn-dev` distro, covering Connect/Ping/Info/Version/ListContainers through the WSL stdio path. Local `./scripts/run-release-validation.ps1 -Suite wsl-provider` also passed, preflighting `cairn-dev`, asserting Go 1.26.4, running the WSL SDK connection, backup/restore, registry tag/push, and update/rebuild smokes, and verifying the Windows Docker context was unchanged. A frontend test verifies that `/mnt/...` import paths show the performance warning.
 
 - [x] Verify the Docker SDK connection uses WSL stdio, not localhost TCP, npipe, Docker Desktop, or `desktop-linux`.
 - [x] Verify `docker system dial-stdio` is preferred when available.
 - [x] Verify `socat UNIX-CONNECT:/var/run/docker.sock -` is the fallback when `dial-stdio` is unavailable.
 - [x] Verify missing stdio transports return `E_PROVIDER_NOT_READY` with repair hints.
 - [x] Run the real local connection test against `cairn-dev`.
+- [x] Run the consolidated local WSL provider validation harness against `cairn-dev` without mutating Windows Docker contexts.
 - [x] Verify `/mnt/...` import paths show the WSL mount performance warning.
 - [ ] Clean Win11 VM: rerun the full Phase 1-3 Docker integration suite through the Windows WSL provider.
 - [ ] Clean Win11 VM: import a path-heavy Compose project under `/mnt/c` and verify the warning appears in the running desktop app.
