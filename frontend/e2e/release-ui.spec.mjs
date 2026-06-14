@@ -90,6 +90,37 @@ test.describe('release UI validation', () => {
   });
 });
 
+test('daemon-stopped fixture renders degraded stale mode safely', async ({
+  page,
+}) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem('cairn.release.fixture', 'degraded');
+  });
+
+  await page.goto('/');
+  await disableMotion(page);
+  await expect(page.getByRole('img', { name: 'Cairn' })).toBeVisible();
+  await expect(page.getByText('Docker is not reachable')).toBeVisible();
+  await expect(page.getByText('Stale cached data')).toBeVisible();
+  await assertNoSeriousAxeViolations(page, 'Degraded overview');
+
+  await openRoute(page, {
+    label: 'Containers',
+    heading: 'Containers',
+    slug: 'containers',
+  });
+  await expect(page.getByRole('button', { name: 'Stop web' })).toBeDisabled();
+
+  await openRoute(page, { label: 'Logs', heading: 'Logs', slug: 'logs' });
+
+  const calls = await page.evaluate(
+    () => window.__cairnReleaseMockCalls ?? {},
+  );
+  expect(calls['DockerService.StopContainer'] ?? 0).toBe(0);
+  expect(calls['LogsService.StartLogStream'] ?? 0).toBe(0);
+  expect(calls['MetricsService.StartStatsStream'] ?? 0).toBe(0);
+});
+
 async function openRoute(page, route) {
   const nav = page.getByRole('navigation', { name: 'Main navigation' });
   await nav

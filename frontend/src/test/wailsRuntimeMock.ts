@@ -81,9 +81,14 @@ export const Dialogs = {
 
 export const Call = {
   ByID(id: number, ...args: unknown[]) {
-    const handler = callHandlers[id];
-    const result = handler ? handler(...args) : null;
-    return Promise.resolve(result);
+    recordCall(id);
+    try {
+      const handler = callHandlers[id];
+      const result = handler ? handler(...args) : null;
+      return Promise.resolve(result);
+    } catch (error) {
+      return Promise.reject(error);
+    }
   },
 };
 
@@ -120,18 +125,49 @@ const risk = {
 };
 
 function providerStatus() {
+  const degraded = isDegradedFixture();
   return {
     installed: true,
-    running: true,
-    healthy: true,
+    running: !degraded,
+    healthy: !degraded,
     dockerInstalled: true,
-    dockerRunning: true,
+    dockerRunning: !degraded,
     composeInstalled: true,
     buildxInstalled: true,
     dockerVersion: "26.1.0",
     composeVersion: "v2.27.0",
     currentContext: "default",
   };
+}
+
+function isDegradedFixture() {
+  try {
+    return globalThis.localStorage?.getItem("cairn.release.fixture") === "degraded";
+  } catch {
+    return false;
+  }
+}
+
+function dockerStopped<T>(value: T): T | Promise<never> {
+  return isDegradedFixture()
+    ? Promise.reject(new Error("Docker daemon ping failed"))
+    : value;
+}
+
+const callNames: Record<number, string> = {
+  1752754799: "DockerService.StopContainer",
+  3715102761: "LogsService.StartLogStream",
+  48603856: "MetricsService.StartStatsStream",
+};
+
+function recordCall(id: number) {
+  const state = globalThis as unknown as {
+    __cairnReleaseMockCalls?: Record<string, number>;
+  };
+  const calls = state.__cairnReleaseMockCalls ?? {};
+  const name = callNames[id] ?? String(id);
+  calls[name] = (calls[name] ?? 0) + 1;
+  state.__cairnReleaseMockCalls = calls;
 }
 
 const container = {
@@ -508,7 +544,7 @@ const callHandlers: Record<number, (...args: unknown[]) => unknown> = {
   }),
   3605792666: () => network,
   500118806: () => volume,
-  2345440464: diskUsage,
+  2345440464: () => dockerStopped(diskUsage()),
   3255901267: () => ({
     summary: container,
     command: ["nginx", "-g", "daemon off;"],
@@ -528,16 +564,17 @@ const callHandlers: Record<number, (...args: unknown[]) => unknown> = {
     containers: [container],
   }),
   3594940286: () => ({ summary: volume, containers: [container] }),
-  364380892: () => ({
-    id: "engine-1",
-    name: "cairn-dev",
-    serverVersion: "26.1.0",
-    storageDriver: "overlay2",
-    operatingSystem: "Ubuntu 24.04",
-    architecture: "x86_64",
-    cpus: 8,
-    memoryBytes: 8 * 1024 * 1024 * 1024,
-  }),
+  364380892: () =>
+    dockerStopped({
+      id: "engine-1",
+      name: "cairn-dev",
+      serverVersion: "26.1.0",
+      storageDriver: "overlay2",
+      operatingSystem: "Ubuntu 24.04",
+      architecture: "x86_64",
+      cpus: 8,
+      memoryBytes: 8 * 1024 * 1024 * 1024,
+    }),
   978203467: () => JSON.stringify({ Id: container.id, Name: container.name }),
   4209014116: () => [container],
   54024818: () => [image],
@@ -567,11 +604,13 @@ const callHandlers: Record<number, (...args: unknown[]) => unknown> = {
       automated: false,
     },
   ],
-  2954904332: () => ({
-    clientVersion: "26.1.0",
-    serverVersion: "26.1.0",
-    apiVersion: "1.45",
-  }),
+  2954904332: () =>
+    dockerStopped({
+      clientVersion: "26.1.0",
+      serverVersion: "26.1.0",
+      apiVersion: "1.45",
+    }),
+  1987249976: () => dockerStopped(undefined),
   3838558739: lineage,
   3200582322: () => lineage()[0],
   2932089088: lineage,
