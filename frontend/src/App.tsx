@@ -213,9 +213,18 @@ type ProjectTabID =
 type LogScope = "all" | "project" | "service" | "container";
 type LogLevelFilter = "error" | "warn" | "info" | "debug" | "unknown";
 type PermissionMode = "ask" | "group" | "rootless";
-type SetupStepID = "welcome" | "backend" | "checks" | "install" | "verify";
+type SetupStepID =
+  | "welcome"
+  | "backend"
+  | "checks"
+  | "install"
+  | "verify"
+  | "projects"
+  | "done";
+type SetupPlatformID = "windows" | "linux" | "macos";
 type SetupBackendID =
   | "windows_wsl_ubuntu"
+  | "linux_native"
   | "macos_colima"
   | "existing_context";
 
@@ -458,6 +467,7 @@ type ProviderInstallProgressPayload = {
 type ProviderSetupState = {
   open: boolean;
   step: SetupStepID;
+  platform: SetupPlatformID;
   backend: SetupBackendID;
   distro: string;
   colimaProfile: string;
@@ -472,6 +482,10 @@ type ProviderSetupState = {
   installing: boolean;
   installStreamID?: string;
   progress: ProviderInstallProgressPayload[];
+  detectedProjects: ProjectSummary[];
+  selectedProjectIDs: string[];
+  detectingProjects: boolean;
+  projectDetectError?: string;
   error?: string;
 };
 
@@ -716,10 +730,12 @@ const emptyImportProject: ImportProjectState = {
 const windowsWSLProviderID = "windows_wsl_ubuntu";
 const linuxNativeProviderID = "linux_native";
 const macOSColimaProviderID = "macos_colima";
+const providerSetupStorageKey = "cairn.providerSetup.v1";
 
 const emptyProviderSetup: ProviderSetupState = {
   open: false,
   step: "welcome",
+  platform: "windows",
   backend: "windows_wsl_ubuntu",
   distro: "Ubuntu",
   colimaProfile: "default",
@@ -732,7 +748,176 @@ const emptyProviderSetup: ProviderSetupState = {
   planning: false,
   installing: false,
   progress: [],
+  detectedProjects: [],
+  selectedProjectIDs: [],
+  detectingProjects: false,
 };
+
+function detectClientSetupPlatform(): SetupPlatformID {
+  const platform =
+    (navigator as Navigator & { userAgentData?: { platform?: string } })
+      .userAgentData?.platform ||
+    navigator.platform ||
+    navigator.userAgent ||
+    "";
+  const lower = platform.toLowerCase();
+  if (lower.includes("mac")) {
+    return "macos";
+  }
+  if (lower.includes("linux")) {
+    return "linux";
+  }
+  return "windows";
+}
+
+function setupPlatformFromProvider(
+  provider: ProviderSummary | null | undefined,
+): SetupPlatformID | null {
+  switch (provider?.kind) {
+    case "macos_colima":
+      return "macos";
+    case "linux_native":
+      return "linux";
+    case "wsl":
+    case "windows_wsl_ubuntu":
+      return "windows";
+    default:
+      return null;
+  }
+}
+
+function recommendedSetupBackend(platform: SetupPlatformID): SetupBackendID {
+  switch (platform) {
+    case "macos":
+      return "macos_colima";
+    case "linux":
+      return "linux_native";
+    default:
+      return "windows_wsl_ubuntu";
+  }
+}
+
+function setupPlatformForBackend(
+  backend: SetupBackendID,
+  current: SetupPlatformID,
+): SetupPlatformID {
+  switch (backend) {
+    case "macos_colima":
+      return "macos";
+    case "linux_native":
+      return "linux";
+    case "windows_wsl_ubuntu":
+      return "windows";
+    default:
+      return current;
+  }
+}
+
+function providerIDForSetupBackend(backend: SetupBackendID): string | null {
+  switch (backend) {
+    case "windows_wsl_ubuntu":
+      return windowsWSLProviderID;
+    case "linux_native":
+      return linuxNativeProviderID;
+    case "macos_colima":
+      return macOSColimaProviderID;
+    default:
+      return null;
+  }
+}
+
+function normalizedSetupStep(value: unknown): SetupStepID {
+  return value === "backend" ||
+    value === "checks" ||
+    value === "install" ||
+    value === "verify" ||
+    value === "projects" ||
+    value === "done"
+    ? value
+    : "welcome";
+}
+
+function normalizedSetupPlatform(value: unknown): SetupPlatformID {
+  return value === "linux" || value === "macos" || value === "windows"
+    ? value
+    : "windows";
+}
+
+function normalizedSetupBackend(value: unknown): SetupBackendID {
+  return value === "linux_native" ||
+    value === "macos_colima" ||
+    value === "existing_context" ||
+    value === "windows_wsl_ubuntu"
+    ? value
+    : "windows_wsl_ubuntu";
+}
+
+function restoreProviderSetupState(): ProviderSetupState {
+  try {
+    const raw = window.localStorage.getItem(providerSetupStorageKey);
+    if (!raw) {
+      return emptyProviderSetup;
+    }
+    const parsed = JSON.parse(raw) as Partial<ProviderSetupState>;
+    const platform = normalizedSetupPlatform(parsed.platform);
+    return {
+      ...emptyProviderSetup,
+      ...parsed,
+      open: Boolean(parsed.open),
+      step: normalizedSetupStep(parsed.step),
+      platform,
+      backend: normalizedSetupBackend(parsed.backend),
+      distro:
+        typeof parsed.distro === "string" && parsed.distro.trim()
+          ? parsed.distro
+          : "Ubuntu",
+      colimaProfile:
+        typeof parsed.colimaProfile === "string" &&
+        parsed.colimaProfile.trim()
+          ? parsed.colimaProfile
+          : "default",
+      colimaCPU: Number.isFinite(parsed.colimaCPU) ? parsed.colimaCPU! : 2,
+      colimaMemoryGB: Number.isFinite(parsed.colimaMemoryGB)
+        ? parsed.colimaMemoryGB!
+        : 4,
+      colimaDiskGB: Number.isFinite(parsed.colimaDiskGB)
+        ? parsed.colimaDiskGB!
+        : 60,
+      detecting: false,
+      planning: false,
+      installing: false,
+      detectingProjects: false,
+      detectedProjects: Array.isArray(parsed.detectedProjects)
+        ? parsed.detectedProjects
+        : [],
+      selectedProjectIDs: Array.isArray(parsed.selectedProjectIDs)
+        ? parsed.selectedProjectIDs
+        : [],
+    };
+  } catch {
+    window.localStorage.removeItem(providerSetupStorageKey);
+    return emptyProviderSetup;
+  }
+}
+
+function persistProviderSetupState(setup: ProviderSetupState) {
+  if (!setup.open) {
+    window.localStorage.removeItem(providerSetupStorageKey);
+    return;
+  }
+  const persistable: ProviderSetupState = {
+    ...setup,
+    detecting: false,
+    planning: false,
+    installing: false,
+    installStreamID: undefined,
+    detectingProjects: false,
+  };
+  window.localStorage.setItem(
+    providerSetupStorageKey,
+    JSON.stringify(persistable),
+  );
+}
 
 const emptyExportLogs: ExportLogsState = {
   open: false,
@@ -773,6 +958,8 @@ function App() {
   const refreshInventory = useInventoryStore((state) => state.refresh);
 
   const [activePage, setActivePage] = useState<PageID>("overview");
+  const [settingsSection, setSettingsSection] =
+    useState<SettingsSectionID>("providers");
   const [search, setSearch] = useState("");
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [projectsStatus, setProjectsStatus] = useState<LoadStatus>("idle");
@@ -908,7 +1095,9 @@ function App() {
     useState<AppUpdateNotice | null>(null);
   const [appUpdateNotificationRead, setAppUpdateNotificationRead] =
     useState(false);
-  const [setup, setSetup] = useState<ProviderSetupState>(emptyProviderSetup);
+  const [setup, setSetup] = useState<ProviderSetupState>(
+    restoreProviderSetupState,
+  );
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [notificationsLoading, setNotificationsLoading] = useState(false);
@@ -2011,14 +2200,18 @@ function App() {
     }
   }, [activePage, pushImage.open, refreshRegistryAccounts]);
 
+  useEffect(() => {
+    persistProviderSetupState(setup);
+  }, [setup]);
+
   const openProviderSetup = useCallback(() => {
-    const backend =
-      activeProvider?.kind === "macos_colima"
-        ? macOSColimaProviderID
-        : windowsWSLProviderID;
+    const platform =
+      setupPlatformFromProvider(activeProvider) ?? detectClientSetupPlatform();
+    const backend = recommendedSetupBackend(platform);
     setSetup({
       ...emptyProviderSetup,
       open: true,
+      platform,
       backend,
       distro: wslDistro.trim() || "Ubuntu",
       colimaProfile: colimaProfile.trim() || "default",
@@ -2027,7 +2220,7 @@ function App() {
       colimaDiskGB,
     });
   }, [
-    activeProvider?.kind,
+    activeProvider,
     colimaCPU,
     colimaDiskGB,
     colimaMemoryGB,
@@ -2036,22 +2229,52 @@ function App() {
   ]);
 
   const closeProviderSetup = useCallback(() => {
+    window.localStorage.removeItem(providerSetupStorageKey);
     setSetup(emptyProviderSetup);
   }, []);
 
+  const finishProviderSetup = useCallback(() => {
+    window.localStorage.removeItem(providerSetupStorageKey);
+    setSetup(emptyProviderSetup);
+    navigate("overview");
+  }, [navigate]);
+
+  const changeSetupBackend = useCallback((backend: SetupBackendID) => {
+    setSetup((current) => ({
+      ...current,
+      backend,
+      platform: setupPlatformForBackend(backend, current.platform),
+      step: "checks",
+      detection: null,
+      detectError: undefined,
+      plan: null,
+      progress: [],
+      detectedProjects: [],
+      selectedProjectIDs: [],
+      projectDetectError: undefined,
+      error: undefined,
+    }));
+  }, []);
+
+  const useExistingDockerContext = useCallback(() => {
+    changeSetupBackend("existing_context");
+  }, [changeSetupBackend]);
+
   const openDockerContextsSettings = useCallback(() => {
     closeProviderSetup();
+    setSettingsSection("contexts");
     navigate("settings");
     void refreshDockerContexts();
   }, [closeProviderSetup, navigate, refreshDockerContexts]);
 
-  const runWindowsSetupChecks = useCallback(async () => {
+  const runProviderSetupChecks = useCallback(async () => {
+    const providerID = providerIDForSetupBackend(setup.backend);
+    if (!providerID) {
+      setSetup((current) => ({ ...current, step: "checks" }));
+      return;
+    }
     const distro = setup.distro.trim() || "Ubuntu";
     const profile = setup.colimaProfile.trim() || "default";
-    const providerID =
-      setup.backend === "macos_colima"
-        ? macOSColimaProviderID
-        : windowsWSLProviderID;
     setSetup((current) => ({
       ...current,
       distro,
@@ -2059,6 +2282,9 @@ function App() {
       step: "checks",
       detecting: true,
       detectError: undefined,
+      detection: null,
+      plan: null,
+      progress: [],
       error: undefined,
     }));
     try {
@@ -2084,7 +2310,7 @@ function App() {
           "macos.colima_memory_gb": setup.colimaMemoryGB,
           "macos.colima_disk_gb": setup.colimaDiskGB,
         }));
-      } else {
+      } else if (setup.backend === "windows_wsl_ubuntu") {
         await SettingsService.SetSetting("windows.wsl_distro", distro);
         setWSLDistro(distro);
         setAppSettings((current) => ({
@@ -2118,13 +2344,13 @@ function App() {
     setup.distro,
   ]);
 
-  const planWindowsInstall = useCallback(async () => {
+  const planProviderInstall = useCallback(async () => {
+    const providerID = providerIDForSetupBackend(setup.backend);
+    if (!providerID) {
+      return;
+    }
     const distro = setup.distro.trim() || "Ubuntu";
     const profile = setup.colimaProfile.trim() || "default";
-    const providerID =
-      setup.backend === "macos_colima"
-        ? macOSColimaProviderID
-        : windowsWSLProviderID;
     setSetup((current) => ({
       ...current,
       distro,
@@ -2133,17 +2359,26 @@ function App() {
       error: undefined,
     }));
     try {
+      const extra =
+        setup.backend === "macos_colima"
+          ? {
+              profile,
+              cpu: String(setup.colimaCPU),
+              memoryGB: String(setup.colimaMemoryGB),
+              diskGB: String(setup.colimaDiskGB),
+            }
+          : setup.backend === "linux_native"
+            ? {
+                socketPath: settingString(
+                  appSettings,
+                  "linux.socket_path",
+                  "/var/run/docker.sock",
+                ),
+              }
+            : { distro };
       const plan = await ProviderService.PlanInstall(providerID, {
         backend: providerID,
-        extra:
-          setup.backend === "macos_colima"
-            ? {
-                profile,
-                cpu: String(setup.colimaCPU),
-                memoryGB: String(setup.colimaMemoryGB),
-                diskGB: String(setup.colimaDiskGB),
-              }
-            : { distro },
+        extra,
       });
       if (!plan) {
         throw new Error("Install plan was empty");
@@ -2165,6 +2400,7 @@ function App() {
       }));
     }
   }, [
+    appSettings,
     setup.backend,
     setup.colimaCPU,
     setup.colimaDiskGB,
@@ -2173,7 +2409,7 @@ function App() {
     setup.distro,
   ]);
 
-  const applyWindowsInstall = useCallback(async () => {
+  const applyProviderInstall = useCallback(async () => {
     if (!setup.plan?.planID) {
       return;
     }
@@ -2198,6 +2434,59 @@ function App() {
       }));
     }
   }, [setup.plan?.planID]);
+
+  const detectSetupProjects = useCallback(async () => {
+    setSetup((current) => ({
+      ...current,
+      step: "projects",
+      detectingProjects: true,
+      projectDetectError: undefined,
+    }));
+    setProjectsStatus("loading");
+    setProjectsError(null);
+    try {
+      const nextProjects = await ProjectService.RefreshProjects();
+      const detected = nextProjects ?? [];
+      setProjects(detected);
+      setProjectsStatus("ready");
+      setSetup((current) => ({
+        ...current,
+        detectedProjects: detected,
+        selectedProjectIDs: detected.map((project) => project.id),
+        detectingProjects: false,
+      }));
+    } catch (error: unknown) {
+      const message =
+        error instanceof Error ? error.message : "Unable to detect projects";
+      setProjectsError(message);
+      setProjectsStatus("error");
+      setSetup((current) => ({
+        ...current,
+        detectingProjects: false,
+        projectDetectError: message,
+      }));
+    }
+  }, []);
+
+  const toggleSetupProjectSelection = useCallback((projectID: string) => {
+    setSetup((current) => {
+      const selected = new Set(current.selectedProjectIDs);
+      if (selected.has(projectID)) {
+        selected.delete(projectID);
+      } else {
+        selected.add(projectID);
+      }
+      return {
+        ...current,
+        selectedProjectIDs: Array.from(selected),
+      };
+    });
+  }, []);
+
+  const openSetupProjectImport = useCallback(() => {
+    closeProviderSetup();
+    setImportProject({ ...emptyImportProject, open: true });
+  }, [closeProviderSetup]);
 
   const ensureDockerReady = useCallback(() => {
     if (!mutationsDisabled) {
@@ -3531,7 +3820,9 @@ function App() {
             registryBusyKeys={registryBusyKeys}
             registryStatuses={registryStatuses}
             saving={settingsSaving}
+            section={settingsSection}
             settings={appSettings}
+            onSectionChange={setSettingsSection}
             version={version}
             wslDistro={wslDistro}
           />
@@ -3919,11 +4210,10 @@ function App() {
       />
       <ProviderSetupModal
         onApplyInstall={() => {
-          void applyWindowsInstall();
+          void applyProviderInstall();
         }}
-        onChangeBackend={(backend) =>
-          setSetup((current) => ({ ...current, backend, step: "checks" }))
-        }
+        onAddProjectFolder={openSetupProjectImport}
+        onChangeBackend={changeSetupBackend}
         onChangeColimaCPU={(colimaCPU) =>
           setSetup((current) => ({ ...current, colimaCPU }))
         }
@@ -3939,16 +4229,29 @@ function App() {
         onChangeDistro={(distro) =>
           setSetup((current) => ({ ...current, distro }))
         }
+        onChangePermissionMode={setPermissionMode}
         onClose={closeProviderSetup}
+        onDetectProjects={() => {
+          void detectSetupProjects();
+        }}
+        onFinish={finishProviderSetup}
         onOpenDockerContexts={openDockerContextsSettings}
         onPlanInstall={() => {
-          void planWindowsInstall();
+          void planProviderInstall();
         }}
         onRunChecks={() => {
-          void runWindowsSetupChecks();
+          void runProviderSetupChecks();
+        }}
+        onSavePermission={() => {
+          void saveSetting("linux.sudo_mode", permissionMode);
         }}
         onStep={(step) => setSetup((current) => ({ ...current, step }))}
+        onToggleProject={toggleSetupProjectSelection}
+        onUseExistingContext={useExistingDockerContext}
         open={setup.open}
+        permissionError={settingsError}
+        permissionMode={permissionMode}
+        permissionSaving={settingsSaving}
         setup={setup}
       />
       <RenameContainerModal
@@ -4569,37 +4872,59 @@ function RepairProviderModal({
 
 function ProviderSetupModal({
   onApplyInstall,
+  onAddProjectFolder,
   onChangeBackend,
   onChangeColimaCPU,
   onChangeColimaDiskGB,
   onChangeColimaMemoryGB,
   onChangeColimaProfile,
   onChangeDistro,
+  onChangePermissionMode,
   onClose,
+  onDetectProjects,
+  onFinish,
   onOpenDockerContexts,
   onPlanInstall,
   onRunChecks,
+  onSavePermission,
   onStep,
+  onToggleProject,
+  onUseExistingContext,
   open,
+  permissionError,
+  permissionMode,
+  permissionSaving,
   setup,
 }: {
   open: boolean;
   setup: ProviderSetupState;
   onApplyInstall: () => void;
+  onAddProjectFolder: () => void;
   onChangeBackend: (backend: SetupBackendID) => void;
   onChangeColimaCPU: (value: number) => void;
   onChangeColimaDiskGB: (value: number) => void;
   onChangeColimaMemoryGB: (value: number) => void;
   onChangeColimaProfile: (profile: string) => void;
   onChangeDistro: (distro: string) => void;
+  onChangePermissionMode: (mode: PermissionMode) => void;
   onClose: () => void;
+  onDetectProjects: () => void;
+  onFinish: () => void;
   onOpenDockerContexts: () => void;
   onPlanInstall: () => void;
   onRunChecks: () => void;
+  onSavePermission: () => void;
   onStep: (step: SetupStepID) => void;
+  onToggleProject: (projectID: string) => void;
+  onUseExistingContext: () => void;
+  permissionError: string | null;
+  permissionMode: PermissionMode;
+  permissionSaving: boolean;
 }) {
   const rows =
-    setup.backend === "macos_colima"
+    setup.backend === "linux_native"
+      ? linuxSetupCheckRows(setup.detection)
+      : setup.backend === "macos_colima"
       ? macOSSetupCheckRows(setup.detection)
       : windowsSetupCheckRows(setup.detection);
   const hasProblems = Boolean(setup.detection?.problems?.length);
@@ -4608,6 +4933,23 @@ function ProviderSetupModal({
     setup.detection?.healthy ||
     setup.progress.some((entry) => entry.done && !entry.error);
   const isMac = setup.backend === "macos_colima";
+  const isLinux = setup.backend === "linux_native";
+  const isWindows = setup.backend === "windows_wsl_ubuntu";
+  const permissionProblem =
+    setup.detection?.problems?.find((problem) => problem.code === "PERM_SOCKET") ??
+    null;
+  const selectedProjects = setup.detectedProjects.filter((project) =>
+    setup.selectedProjectIDs.includes(project.id),
+  );
+  const setupSteps: SetupStepID[] = [
+    "welcome",
+    "backend",
+    "checks",
+    "install",
+    "verify",
+    "projects",
+    "done",
+  ];
 
   return (
     <Modal
@@ -4618,15 +4960,7 @@ function ProviderSetupModal({
     >
       <div className="space-y-5">
         <div className="flex flex-wrap gap-2">
-          {(
-            [
-              "welcome",
-              "backend",
-              "checks",
-              "install",
-              "verify",
-            ] as SetupStepID[]
-          ).map((step, index) => (
+          {setupSteps.map((step, index) => (
             <button
               className={[
                 "flex h-8 items-center gap-2 rounded-control border px-3 text-xs font-medium",
@@ -4640,7 +4974,7 @@ function ProviderSetupModal({
               type="button"
             >
               <span>{index + 1}</span>
-              <span className="capitalize">{step}</span>
+              <span>{setupStepLabel(step)}</span>
             </button>
           ))}
         </div>
@@ -4668,7 +5002,7 @@ function ProviderSetupModal({
               </Button>
               <Button
                 icon={<RefreshCw size={15} />}
-                onClick={onRunChecks}
+                onClick={onUseExistingContext}
                 variant="secondary"
               >
                 I already have Docker running
@@ -4679,7 +5013,7 @@ function ProviderSetupModal({
 
         {setup.step === "backend" ? (
           <section className="grid gap-3 md:grid-cols-3">
-            {isMac ? (
+            {setup.platform === "macos" ? (
               <>
                 <BackendChoiceCard
                   badge="Recommended"
@@ -4698,6 +5032,30 @@ function ProviderSetupModal({
                 />
                 <BackendChoiceCard
                   body="Remote host setup is outside the v1 MVP flow."
+                  disabled
+                  icon={<Wifi size={19} />}
+                  title="Remote host"
+                />
+              </>
+            ) : setup.platform === "linux" ? (
+              <>
+                <BackendChoiceCard
+                  badge="Recommended"
+                  body="Install or use Docker Engine directly on this Linux host with the official apt repository."
+                  details="Docker CLI, Docker Engine, containerd, Compose, Buildx, systemd service wiring, socket access, and hello-world verification."
+                  icon={<Server size={19} />}
+                  onSelect={() => onChangeBackend("linux_native")}
+                  title="Native Docker Engine"
+                />
+                <BackendChoiceCard
+                  body="Use an existing Docker context without changing your global Docker context."
+                  details="No packages are installed. Cairn runs Docker and Compose with --context."
+                  icon={<Terminal size={19} />}
+                  onSelect={() => onChangeBackend("existing_context")}
+                  title="Existing Docker context"
+                />
+                <BackendChoiceCard
+                  body="Remote hosts are outside the v1 MVP setup flow."
                   disabled
                   icon={<Wifi size={19} />}
                   title="Remote host"
@@ -4773,7 +5131,7 @@ function ProviderSetupModal({
                         value={setup.colimaDiskGB}
                       />
                     </div>
-                  ) : (
+                  ) : isWindows ? (
                     <label className="block">
                       <span className="text-xs font-medium uppercase text-text-muted">
                         WSL distro
@@ -4785,6 +5143,17 @@ function ProviderSetupModal({
                         value={setup.distro}
                       />
                     </label>
+                  ) : (
+                    <div className="rounded-card border border-border bg-bg-inset p-3 text-sm text-text-secondary">
+                      <div className="font-medium text-text-primary">
+                        Linux socket
+                      </div>
+                      <div className="mt-1">
+                        Cairn checks the configured Linux socket and Docker
+                        Engine packages. Socket path and sudo mode remain in
+                        Settings so they apply across repairs and future runs.
+                      </div>
+                    </div>
                   )}
                   <Button
                     icon={<RefreshCw size={15} />}
@@ -4794,7 +5163,62 @@ function ProviderSetupModal({
                     Run checks
                   </Button>
                 </div>
-                {isMac ? <ColimaPathRecommendation /> : <PathRecommendation />}
+                {isMac ? (
+                  <ColimaPathRecommendation />
+                ) : isLinux ? (
+                  <LinuxPathRecommendation />
+                ) : (
+                  <PathRecommendation />
+                )}
+                {isLinux && permissionProblem ? (
+                  <section className="space-y-3 rounded-card border border-warn/30 bg-warn/10 p-3">
+                    <div>
+                      <h3 className="text-sm font-semibold text-text-primary">
+                        Linux Docker permission options
+                      </h3>
+                      <p className="mt-1 text-sm text-text-muted">
+                        Socket access was denied. Pick how Cairn should work
+                        with this Linux backend, then rerun checks.
+                      </p>
+                    </div>
+                    <div className="grid gap-2">
+                      <PermissionOption
+                        checked={permissionMode === "ask"}
+                        description="Cairn prompts only when an action needs sudo. The sudo password is never stored."
+                        label="Use sudo per action"
+                        onChange={() => onChangePermissionMode("ask")}
+                        value="ask"
+                      />
+                      <PermissionOption
+                        checked={permissionMode === "group"}
+                        description="Convenient, less isolated. The docker group is root-equivalent and requires signing out and back in."
+                        label="Add user to docker group"
+                        onChange={() => onChangePermissionMode("group")}
+                        value="group"
+                      />
+                      <PermissionOption
+                        checked={permissionMode === "rootless"}
+                        description="Use the rootless Docker socket when rootless Docker is already configured."
+                        label="Use rootless Docker socket"
+                        onChange={() => onChangePermissionMode("rootless")}
+                        value="rootless"
+                      />
+                    </div>
+                    {permissionError ? (
+                      <div className="text-sm text-error">
+                        {permissionError}
+                      </div>
+                    ) : null}
+                    <div className="flex justify-end">
+                      <Button
+                        loading={permissionSaving}
+                        onClick={onSavePermission}
+                      >
+                        Save permission mode
+                      </Button>
+                    </div>
+                  </section>
+                ) : null}
               </>
             )}
             {setup.detectError ? (
@@ -4849,7 +5273,9 @@ function ProviderSetupModal({
                   <p className="mt-1 text-sm text-text-muted">
                     {isMac
                       ? "Homebrew may prompt for system approval while packages install."
-                      : "Windows may ask for administrator approval when WSL features are enabled."}
+                      : isLinux
+                        ? "Linux may ask for sudo approval while packages install."
+                        : "Windows may ask for administrator approval when WSL features are enabled."}
                   </p>
                 </div>
                 <div className="space-y-2">
@@ -4934,21 +5360,11 @@ function ProviderSetupModal({
             <div className="rounded-card border border-ok/30 bg-ok/10 p-4">
               <div className="flex items-center gap-2 font-medium text-ok">
                 <CheckCircle2 size={17} />
-                {completed
-                  ? isMac
-                    ? "macOS Colima backend is ready"
-                    : "Windows WSL backend is ready"
-                  : "Provider checks complete"}
+                {completed ? setupReadyMessage(setup.backend) : "Provider checks complete"}
               </div>
               <div className="mt-2 grid gap-2 text-sm text-text-secondary sm:grid-cols-2">
-                <span>
-                  Provider: {isMac ? "macOS Colima" : "Windows WSL Ubuntu"}
-                </span>
-                <span>
-                  {isMac
-                    ? `Profile: ${setup.colimaProfile || "default"}`
-                    : `Distro: ${setup.distro || "Ubuntu"}`}
-                </span>
+                <span>Provider: {setupBackendLabel(setup.backend)}</span>
+                <span>{setupBackendDetail(setup)}</span>
                 <span>
                   Docker:{" "}
                   {setup.detection?.dockerVersion || "verified after install"}
@@ -4963,19 +5379,227 @@ function ProviderSetupModal({
                 <span>
                   Host:{" "}
                   {setup.detection?.dockerHost ||
-                    (isMac ? "colima context" : "wsl+stdio")}
+                    setupBackendHostFallback(setup.backend)}
+                </span>
+                <span>
+                  Hello-world: {completed ? "Passed" : "Pending"}
                 </span>
               </div>
             </div>
-            {isMac ? <ColimaPathRecommendation /> : <PathRecommendation />}
+            {isMac ? (
+              <ColimaPathRecommendation />
+            ) : isLinux ? (
+              <LinuxPathRecommendation />
+            ) : (
+              <PathRecommendation />
+            )}
             <div className="flex justify-end gap-2 border-t border-border pt-4">
-              <Button onClick={onClose}>Continue</Button>
+              <Button
+                onClick={() => onStep(setup.plan ? "install" : "checks")}
+                variant="secondary"
+              >
+                Back
+              </Button>
+              <Button
+                icon={<FolderOpen size={15} />}
+                loading={setup.detectingProjects}
+                onClick={onDetectProjects}
+              >
+                Detect projects
+              </Button>
+            </div>
+          </section>
+        ) : null}
+
+        {setup.step === "projects" ? (
+          <section className="space-y-4">
+            <div>
+              <h2 className="text-base font-semibold text-text-primary">
+                Detect Compose projects
+              </h2>
+              <p className="mt-1 text-sm text-text-muted">
+                Cairn refreshes known Compose projects for the selected backend.
+                You can keep the detected projects selected, import another
+                folder, or skip this step.
+              </p>
+            </div>
+            <div className="flex flex-wrap gap-2">
+              <Button
+                icon={<RefreshCw size={15} />}
+                loading={setup.detectingProjects}
+                onClick={onDetectProjects}
+                variant="secondary"
+              >
+                Refresh detection
+              </Button>
+              <Button
+                icon={<FolderOpen size={15} />}
+                onClick={onAddProjectFolder}
+                variant="secondary"
+              >
+                Add folder...
+              </Button>
+            </div>
+            {setup.projectDetectError ? (
+              <div className="rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
+                {setup.projectDetectError}
+              </div>
+            ) : null}
+            {setup.detectedProjects.length > 0 ? (
+              <div className="space-y-2">
+                <div className="text-sm font-medium text-text-primary">
+                  Found {setup.detectedProjects.length} Compose{" "}
+                  {setup.detectedProjects.length === 1 ? "project" : "projects"}
+                </div>
+                {setup.detectedProjects.map((project) => (
+                  <label
+                    className="flex items-start gap-3 rounded-card border border-border bg-bg-inset p-3 text-sm"
+                    key={project.id}
+                  >
+                    <input
+                      checked={setup.selectedProjectIDs.includes(project.id)}
+                      className="mt-1"
+                      onChange={() => onToggleProject(project.id)}
+                      type="checkbox"
+                    />
+                    <span className="min-w-0">
+                      <span className="block font-medium text-text-primary">
+                        {project.name}
+                      </span>
+                      <span className="block truncate text-text-muted">
+                        {project.workingDir || project.id}
+                      </span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+            ) : (
+              <EmptyState
+                body="No Compose projects are registered yet. You can import a folder manually or continue to the dashboard."
+                icon={<FolderOpen size={28} />}
+                title="No projects detected"
+              />
+            )}
+            <div className="flex justify-end gap-2 border-t border-border pt-4">
+              <Button onClick={() => onStep("verify")} variant="secondary">
+                Back
+              </Button>
+              <Button onClick={() => onStep("done")} variant="secondary">
+                Skip
+              </Button>
+              <Button
+                icon={<CheckCircle2 size={15} />}
+                onClick={() => onStep("done")}
+              >
+                Finish
+              </Button>
+            </div>
+          </section>
+        ) : null}
+
+        {setup.step === "done" ? (
+          <section className="space-y-4">
+            <div className="rounded-card border border-ok/30 bg-ok/10 p-4">
+              <div className="flex items-center gap-2 font-medium text-ok">
+                <CheckCircle2 size={17} />
+                Cairn is ready
+              </div>
+              <div className="mt-3 grid gap-2 text-sm text-text-secondary sm:grid-cols-2">
+                <span>Provider: {setupBackendLabel(setup.backend)}</span>
+                <span>{setupBackendDetail(setup)}</span>
+                <span>
+                  Projects selected: {selectedProjects.length}
+                </span>
+                <span>
+                  Docker:{" "}
+                  {setup.detection?.dockerVersion || "verified after install"}
+                </span>
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 border-t border-border pt-4">
+              <Button onClick={() => onStep("projects")} variant="secondary">
+                Back
+              </Button>
+              <Button onClick={onFinish}>Continue</Button>
             </div>
           </section>
         ) : null}
       </div>
     </Modal>
   );
+}
+
+function setupStepLabel(step: SetupStepID) {
+  switch (step) {
+    case "welcome":
+      return "Welcome";
+    case "backend":
+      return "Backend";
+    case "checks":
+      return "Checks";
+    case "install":
+      return "Install";
+    case "verify":
+      return "Verify";
+    case "projects":
+      return "Projects";
+    case "done":
+      return "Done";
+    default:
+      return step;
+  }
+}
+
+function setupBackendLabel(backend: SetupBackendID) {
+  switch (backend) {
+    case "macos_colima":
+      return "macOS Colima";
+    case "linux_native":
+      return "Linux native Docker";
+    case "existing_context":
+      return "Existing Docker context";
+    default:
+      return "Windows WSL Ubuntu";
+  }
+}
+
+function setupReadyMessage(backend: SetupBackendID) {
+  switch (backend) {
+    case "macos_colima":
+      return "macOS Colima backend is ready";
+    case "linux_native":
+      return "Linux native backend is ready";
+    case "existing_context":
+      return "Existing Docker context is ready";
+    default:
+      return "Windows WSL backend is ready";
+  }
+}
+
+function setupBackendDetail(setup: ProviderSetupState) {
+  switch (setup.backend) {
+    case "macos_colima":
+      return `Profile: ${setup.colimaProfile || "default"}`;
+    case "linux_native":
+      return "Socket: Linux Docker socket";
+    case "existing_context":
+      return `Context: ${setup.detection?.currentContext || "selected in Settings"}`;
+    default:
+      return `Distro: ${setup.distro || "Ubuntu"}`;
+  }
+}
+
+function setupBackendHostFallback(backend: SetupBackendID) {
+  switch (backend) {
+    case "macos_colima":
+      return "colima context";
+    case "linux_native":
+      return "unix:///var/run/docker.sock";
+    case "existing_context":
+      return "selected Docker context";
+    default:
+      return "wsl+stdio";
+  }
 }
 
 function BackendChoiceCard({
@@ -5102,6 +5726,15 @@ function ColimaPathRecommendation() {
   );
 }
 
+function LinuxPathRecommendation() {
+  return (
+    <div className="rounded-card border border-info/30 bg-info/10 px-3 py-2 text-sm text-info">
+      Keep Compose projects on the local Linux filesystem for predictable file
+      watching, bind mounts, and rebuild performance.
+    </div>
+  );
+}
+
 function SettingsPage({
   activeProvider,
   auditEntries,
@@ -5147,7 +5780,9 @@ function SettingsPage({
   registryBusyKeys,
   registryStatuses,
   saving,
+  section,
   settings,
+  onSectionChange,
   version,
   wslDistro,
 }: {
@@ -5195,12 +5830,12 @@ function SettingsPage({
   registryBusyKeys: Set<string>;
   registryStatuses: Record<string, RegistryAuthStatus>;
   saving: boolean;
+  section: SettingsSectionID;
   settings: Record<string, unknown>;
+  onSectionChange: (section: SettingsSectionID) => void;
   version: VersionInfo | null;
   wslDistro: string;
 }) {
-  const [activeSection, setActiveSection] =
-    useState<SettingsSectionID>("providers");
   const [selectedAuditEntry, setSelectedAuditEntry] =
     useState<AuditEntry | null>(null);
   const activeStatus = activeProvider?.status;
@@ -5226,12 +5861,12 @@ function SettingsPage({
           <button
             className={[
               "block h-9 w-full rounded-control px-3 text-left text-sm",
-              activeSection === id
+              section === id
                 ? "bg-accent/10 text-accent"
                 : "text-text-secondary hover:bg-bg-card",
             ].join(" ")}
             key={id}
-            onClick={() => setActiveSection(id)}
+            onClick={() => onSectionChange(id)}
             type="button"
           >
             {section}
@@ -5251,7 +5886,7 @@ function SettingsPage({
           </div>
         ) : null}
 
-        {activeSection === "general" ? (
+        {section === "general" ? (
           <Card>
             <CardHeader title="General" />
             <CardBody className="space-y-3">
@@ -5295,7 +5930,7 @@ function SettingsPage({
           </Card>
         ) : null}
 
-        {activeSection === "updates" ? (
+        {section === "updates" ? (
           <Card>
             <CardHeader title="Updates" />
             <CardBody className="space-y-3">
@@ -5331,7 +5966,7 @@ function SettingsPage({
           </Card>
         ) : null}
 
-        {activeSection === "metrics" ? (
+        {section === "metrics" ? (
           <Card>
             <CardHeader title="Metrics" />
             <CardBody className="space-y-3">
@@ -5364,7 +5999,7 @@ function SettingsPage({
           </Card>
         ) : null}
 
-        {activeSection === "terminal" ? (
+        {section === "terminal" ? (
           <Card>
             <CardHeader title="Terminal" />
             <CardBody className="space-y-3">
@@ -5382,7 +6017,7 @@ function SettingsPage({
           </Card>
         ) : null}
 
-        {activeSection === "appearance" ? (
+        {section === "appearance" ? (
           <Card>
             <CardHeader title="Appearance" />
             <CardBody className="space-y-3">
@@ -5403,7 +6038,7 @@ function SettingsPage({
           </Card>
         ) : null}
 
-        {activeSection === "backups" ? (
+        {section === "backups" ? (
           <Card>
             <CardHeader title="Backups" />
             <CardBody className="space-y-3">
@@ -5422,7 +6057,7 @@ function SettingsPage({
           </Card>
         ) : null}
 
-        {activeSection === "security" ? (
+        {section === "security" ? (
           <Card>
             <CardHeader
               actions={
@@ -5549,7 +6184,7 @@ function SettingsPage({
           </Card>
         ) : null}
 
-        {activeSection === "advanced" ? (
+        {section === "advanced" ? (
           <Card>
             <CardHeader title="Advanced" />
             <CardBody className="space-y-3">
@@ -5561,7 +6196,7 @@ function SettingsPage({
           </Card>
         ) : null}
 
-        {activeSection === "about" ? (
+        {section === "about" ? (
           <Card>
             <CardHeader title="About" />
             <CardBody className="grid gap-3 sm:grid-cols-2">
@@ -5579,7 +6214,7 @@ function SettingsPage({
           </Card>
         ) : null}
 
-        {activeSection === "providers" ? (
+        {section === "providers" ? (
           <Card>
             <CardHeader
               status={
@@ -5846,7 +6481,7 @@ function SettingsPage({
           </Card>
         ) : null}
 
-        {activeSection === "contexts" ? (
+        {section === "contexts" ? (
           <Card>
             <CardHeader
               status={
@@ -5889,7 +6524,7 @@ function SettingsPage({
           </Card>
         ) : null}
 
-        {activeSection === "registries" ? (
+        {section === "registries" ? (
           <Card>
             <CardHeader
               actions={
@@ -14768,6 +15403,53 @@ function macOSSetupCheckRows(status: ProviderStatus | null) {
     setupCheckRow("Colima installed", status, problem("COLIMA_MISSING")),
     setupCheckRow("Colima running", status, problem("COLIMA_STOPPED")),
     setupCheckRow("Colima context ready", status, problem("CONTEXT_MISSING")),
+    setupCheckRow(
+      "Docker daemon reachable",
+      status,
+      problem("DOCKERD_DOWN"),
+      status?.dockerRunning,
+    ),
+  ];
+}
+
+function linuxSetupCheckRows(status: ProviderStatus | null) {
+  const problem = (code: string) =>
+    status?.problems?.find((entry) => entry.code === code) ?? null;
+  const warning = (code: string) =>
+    status?.warnings?.find((entry) => entry.code === code) ?? null;
+  const systemdWarning = warning("SYSTEMD_MISSING");
+  return [
+    systemdWarning && status
+      ? {
+          label: "systemd available",
+          state: "warn" as StatusToneID,
+          detail: systemdWarning.message,
+        }
+      : setupCheckRow("systemd available", status, null),
+    setupCheckRow(
+      "Docker CLI installed",
+      status,
+      problem("DOCKER_MISSING"),
+      status?.dockerInstalled,
+    ),
+    setupCheckRow(
+      "Compose plugin installed",
+      status,
+      problem("COMPOSE_MISSING"),
+      status?.composeInstalled,
+    ),
+    setupCheckRow(
+      "Buildx plugin installed",
+      status,
+      problem("BUILDX_MISSING"),
+      status?.buildxInstalled,
+    ),
+    setupCheckRow(
+      "Docker socket accessible",
+      status,
+      problem("PERM_SOCKET"),
+      Boolean(status?.dockerHost),
+    ),
     setupCheckRow(
       "Docker daemon reachable",
       status,

@@ -7,10 +7,12 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/security"
 )
 
 const (
@@ -64,6 +66,19 @@ type LinuxNativeProvider struct {
 	socketPath string
 	runner     CommandRunner
 	probe      LinuxProbe
+	installMu  sync.Mutex
+	plans      map[string]linuxInstallPlan
+}
+
+type linuxInstallPlan struct {
+	Steps []linuxInstallStep
+}
+
+type linuxInstallStep struct {
+	Message     string
+	Timeout     time.Duration
+	Command     []string
+	RepairHints []string
 }
 
 func NewLinuxNative(opts LinuxNativeOptions) *LinuxNativeProvider {
@@ -79,6 +94,7 @@ func NewLinuxNative(opts LinuxNativeOptions) *LinuxNativeProvider {
 		socketPath: opts.SocketPath,
 		runner:     runner,
 		probe:      probe,
+		plans:      map[string]linuxInstallPlan{},
 	}
 }
 
@@ -204,11 +220,68 @@ func (p *LinuxNativeProvider) Detect(ctx context.Context) (*models.ProviderStatu
 }
 
 func (p *LinuxNativeProvider) PlanInstall(context.Context, models.InstallOptions) (*models.CommandPlan, error) {
-	return nil, apperror.New(apperror.ProviderNotReady, "Linux provider install plans are not implemented yet")
+	steps := buildLinuxInstallSteps()
+	planID := security.NewPlanID()
+	commands := make([]models.PlannedCommand, 0, len(steps))
+	for index, step := range steps {
+		commands = append(commands, models.PlannedCommand{
+			Order:       index + 1,
+			Command:     displayCommand(step.Command),
+			Risk:        models.RiskNeedsConfirmation,
+			Explanation: step.Message,
+		})
+	}
+	plan := &models.CommandPlan{
+		PlanID:   planID,
+		Title:    "Install Docker Engine on Linux",
+		Risk:     models.RiskNeedsConfirmation,
+		Commands: commands,
+		Effects: []string{
+			"Install apt prerequisites required by Docker's official repository.",
+			"Add Docker's official apt signing key and repository for this distribution.",
+			"Install Docker Engine, containerd, Compose, and Buildx packages.",
+			"Enable and start the Docker service with systemd.",
+			"Verify Docker Engine, Compose, Buildx, and hello-world.",
+		},
+		ExpiresAt: time.Now().UTC().Add(security.DefaultPlanTTL),
+	}
+	p.installMu.Lock()
+	p.plans[planID] = linuxInstallPlan{Steps: steps}
+	p.installMu.Unlock()
+	return plan, nil
 }
 
-func (p *LinuxNativeProvider) ExecuteInstallStep(context.Context, string, int, chan<- InstallProgress) error {
-	return apperror.New(apperror.ProviderNotReady, "Linux provider install execution is not implemented yet")
+func (p *LinuxNativeProvider) ExecuteInstallStep(ctx context.Context, planID string, step int, progress chan<- InstallProgress) error {
+	p.installMu.Lock()
+	plan, ok := p.plans[planID]
+	p.installMu.Unlock()
+	if !ok || step < 0 || step >= len(plan.Steps) {
+		return apperror.New(apperror.PlanExpired, "Install plan expired or was not found")
+	}
+	installStep := plan.Steps[step]
+	sendInstallProgress(progress, step+1, len(plan.Steps), "Running: "+installStep.Message, false)
+	result, err := p.runner.Run(ctx, installStep.Timeout, installStep.Command[0], installStep.Command[1:]...)
+	if err != nil || result == nil || result.ExitCode != 0 {
+		detail := ""
+		if result != nil {
+			detail = strings.TrimSpace(result.Stderr)
+			if detail == "" {
+				detail = strings.TrimSpace(result.Stdout)
+			}
+		}
+		opts := []apperror.Option{apperror.WithDetail(detail)}
+		if len(installStep.RepairHints) > 0 {
+			opts = append(opts, apperror.WithRepairHints(installStep.RepairHints...))
+		}
+		return apperror.Wrap(apperror.ProviderNotReady, "Linux install step failed", err, opts...)
+	}
+	if step == len(plan.Steps)-1 {
+		p.installMu.Lock()
+		delete(p.plans, planID)
+		p.installMu.Unlock()
+	}
+	sendInstallProgress(progress, step+1, len(plan.Steps), "Done: "+installStep.Message, false)
+	return nil
 }
 
 func (p *LinuxNativeProvider) Start(ctx context.Context) error {
@@ -310,6 +383,88 @@ func (p *LinuxNativeProvider) MapPathToBackend(hostPath string) (string, error) 
 
 func (p *LinuxNativeProvider) MapPathToHost(backendPath string) (string, error) {
 	return backendPath, nil
+}
+
+func buildLinuxInstallSteps() []linuxInstallStep {
+	repositoryCommand := strings.Join([]string{
+		"set -e",
+		"install -m 0755 -d /etc/apt/keyrings",
+		"rm -f /etc/apt/keyrings/docker.gpg",
+		"curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg",
+		"chmod a+r /etc/apt/keyrings/docker.gpg",
+		`. /etc/os-release`,
+		`echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" > /etc/apt/sources.list.d/docker.list`,
+	}, " && ")
+	verifyCommand := strings.Join([]string{
+		"docker info >/dev/null",
+		"docker compose version",
+		"docker buildx version",
+		"docker run --rm hello-world",
+	}, " && ")
+	return []linuxInstallStep{
+		{
+			Message: "Refresh apt package indexes",
+			Timeout: 10 * time.Minute,
+			Command: []string{"sudo", "apt-get", "update"},
+			RepairHints: []string{
+				"Check internet access and apt repository health, then retry.",
+				"If apt is locked, wait for the other package operation to finish and retry.",
+			},
+		},
+		{
+			Message: "Install apt prerequisites for Docker's repository",
+			Timeout: 10 * time.Minute,
+			Command: []string{"sudo", "apt-get", "install", "-y", "ca-certificates", "curl", "gnupg"},
+			RepairHints: []string{
+				"Check internet access and retry the package installation.",
+				"If sudo prompts fail, run Cairn from a session that can authenticate sudo.",
+			},
+		},
+		{
+			Message: "Add Docker's official apt signing key and repository",
+			Timeout: commandTimeout,
+			Command: []string{"sudo", "sh", "-lc", repositoryCommand},
+			RepairHints: []string{
+				"Confirm this host is an Ubuntu or Debian-family distribution with /etc/os-release.",
+				"Check network access to download.docker.com and retry.",
+			},
+		},
+		{
+			Message: "Refresh apt indexes after adding Docker's repository",
+			Timeout: 10 * time.Minute,
+			Command: []string{"sudo", "apt-get", "update"},
+			RepairHints: []string{
+				"Inspect Docker apt repository errors and retry after repository metadata is reachable.",
+			},
+		},
+		{
+			Message: "Install Docker Engine, containerd, Compose, and Buildx",
+			Timeout: 20 * time.Minute,
+			Command: []string{"sudo", "apt-get", "install", "-y", "docker-ce", "docker-ce-cli", "containerd.io", "docker-buildx-plugin", "docker-compose-plugin"},
+			RepairHints: []string{
+				"If packages cannot be located, verify the Docker apt repository step completed successfully.",
+				"If apt is locked, wait for the other package operation to finish and retry.",
+			},
+		},
+		{
+			Message: "Enable and start the Docker service",
+			Timeout: commandTimeout,
+			Command: []string{"sudo", "systemctl", "enable", "--now", "docker"},
+			RepairHints: []string{
+				"Make sure this Linux host uses systemd and retry.",
+				"Run `systemctl status docker` to inspect service errors.",
+			},
+		},
+		{
+			Message: "Verify Docker Engine, Compose, Buildx, and hello-world",
+			Timeout: 5 * time.Minute,
+			Command: []string{"sh", "-lc", verifyCommand},
+			RepairHints: []string{
+				"If Docker access is denied, choose a Linux permission mode in Settings and retry.",
+				"Run `docker info` to inspect daemon or socket errors.",
+			},
+		},
+	}
 }
 
 func (p *LinuxNativeProvider) detectSocketPath() string {

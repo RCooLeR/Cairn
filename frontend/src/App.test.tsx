@@ -264,6 +264,11 @@ describe("App inventory shell", () => {
   beforeEach(() => {
     vi.useRealTimers();
     vi.clearAllMocks();
+    window.localStorage.clear();
+    Object.defineProperty(window.navigator, "platform", {
+      configurable: true,
+      value: "Win32",
+    });
     inventoryMock.getInventorySnapshot.mockReset();
     dockerServiceMock.InspectContainerRaw.mockResolvedValue(
       '{"Id":"container-1"}',
@@ -1735,6 +1740,217 @@ describe("App inventory shell", () => {
     ).toBeInTheDocument();
   });
 
+  it("opens existing Docker context setup from the onboarding shortcut", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(noProviderSnapshot());
+
+    render(<App />);
+
+    expect(
+      await screen.findByText("No Docker provider configured"),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole("button", { name: "Set up" })[0]);
+    const dialog = await screen.findByRole("dialog", {
+      name: "Set Up Docker Backend",
+    });
+
+    fireEvent.click(
+      within(dialog).getByRole("button", {
+        name: "I already have Docker running",
+      }),
+    );
+
+    expect(
+      await within(dialog).findByText("Use an existing Docker context"),
+    ).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Open Settings" }));
+
+    expect(await screen.findByText("Docker Contexts")).toBeInTheDocument();
+    expect(providerServiceMock.ListDockerContexts).toHaveBeenCalled();
+  });
+
+  it("detects projects before completing onboarding", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(noProviderSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
+
+    render(<App />);
+
+    expect(
+      await screen.findByText("No Docker provider configured"),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole("button", { name: "Set up" })[0]);
+    const dialog = await screen.findByRole("dialog", {
+      name: "Set Up Docker Backend",
+    });
+
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Get started" }),
+    );
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: /Ubuntu on WSL2/ }),
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: "Run checks" }));
+
+    expect(
+      await within(dialog).findByText("Windows WSL backend is ready"),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Detect projects" }),
+    );
+
+    expect(
+      await within(dialog).findByText("Found 1 Compose project"),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByLabelText(/app-db/)).toBeChecked();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Finish" }));
+    expect(await within(dialog).findByText("Cairn is ready")).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Continue" }));
+
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: "Set Up Docker Backend" }),
+      ).not.toBeInTheDocument(),
+    );
+  });
+
+  it("runs the Linux native onboarding branch with permission persistence", async () => {
+    Object.defineProperty(window.navigator, "platform", {
+      configurable: true,
+      value: "Linux x86_64",
+    });
+    inventoryMock.getInventorySnapshot.mockResolvedValue(noProviderSnapshot());
+    providerServiceMock.Detect.mockResolvedValueOnce({
+      ...healthyProviderStatus(),
+      installed: true,
+      running: false,
+      healthy: false,
+      dockerHost: "unix:///var/run/docker.sock",
+      dockerRunning: false,
+      problems: [
+        {
+          code: "PERM_SOCKET",
+          message: "Cairn cannot access the Docker socket.",
+          repairHint:
+            "Choose sudo-per-action in Settings or add your Linux user to the docker group, then sign out and back in.",
+          recoverable: true,
+        },
+      ],
+    });
+    providerServiceMock.PlanInstall.mockResolvedValue(linuxInstallPlan());
+    providerServiceMock.ApplyInstall.mockResolvedValue({
+      planID: "plan-linux-install",
+      streamID: "setup-stream",
+    });
+
+    render(<App />);
+
+    expect(
+      await screen.findByText("No Docker provider configured"),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole("button", { name: "Set up" })[0]);
+    const dialog = await screen.findByRole("dialog", {
+      name: "Set Up Docker Backend",
+    });
+
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Get started" }),
+    );
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: /Native Docker Engine/ }),
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: "Run checks" }));
+
+    await waitFor(() =>
+      expect(providerServiceMock.Detect).toHaveBeenCalledWith("linux_native"),
+    );
+    expect(
+      await within(dialog).findByText(/add your Linux user to the docker group/),
+    ).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByLabelText(/Add user to docker group/));
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Save permission mode" }),
+    );
+    await waitFor(() =>
+      expect(settingsServiceMock.SetSetting).toHaveBeenCalledWith(
+        "linux.sudo_mode",
+        "group",
+      ),
+    );
+
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Create install plan" }),
+    );
+    await waitFor(() =>
+      expect(providerServiceMock.PlanInstall).toHaveBeenCalledWith(
+        "linux_native",
+        expect.objectContaining({
+          backend: "linux_native",
+          extra: { socketPath: "/var/run/docker.sock" },
+        }),
+      ),
+    );
+    expect(
+      await within(dialog).findByText("sudo apt-get update"),
+    ).toBeInTheDocument();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Install" }));
+    await waitFor(() =>
+      expect(providerServiceMock.ApplyInstall).toHaveBeenCalledWith(
+        "plan-linux-install",
+      ),
+    );
+    emitRuntimeEvent("provider:install:progress", {
+      planID: "plan-linux-install",
+      streamID: "setup-stream",
+      step: 1,
+      totalSteps: 1,
+      message: "Install complete",
+      done: true,
+    });
+
+    expect(
+      await within(dialog).findByText("Linux native backend is ready"),
+    ).toBeInTheDocument();
+  });
+
+  it("resumes onboarding from a stored install plan", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    window.localStorage.setItem(
+      "cairn.providerSetup.v1",
+      JSON.stringify({
+        open: true,
+        step: "install",
+        platform: "windows",
+        backend: "windows_wsl_ubuntu",
+        distro: "Ubuntu",
+        colimaProfile: "default",
+        colimaCPU: 2,
+        colimaMemoryGB: 4,
+        colimaDiskGB: 60,
+        detecting: false,
+        detection: null,
+        plan: wslInstallPlan(),
+        planning: false,
+        installing: false,
+        progress: [],
+        detectedProjects: [],
+        selectedProjectIDs: [],
+        detectingProjects: false,
+      }),
+    );
+
+    render(<App />);
+
+    const dialog = await screen.findByRole("dialog", {
+      name: "Set Up Docker Backend",
+    });
+    expect(
+      within(dialog).getByText("Install Docker Engine in Ubuntu on WSL"),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByText("wsl.exe --install Ubuntu --name cairn-dev"),
+    ).toBeInTheDocument();
+  });
+
   it("saves Windows WSL settings and shows the path mapping panel", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
 
@@ -3007,6 +3223,24 @@ function colimaInstallPlan(): CommandPlan {
       },
     ],
     effects: ["Install Colima and verify hello-world."],
+    expiresAt: "2026-06-13T08:10:00Z",
+  };
+}
+
+function linuxInstallPlan(): CommandPlan {
+  return {
+    planID: "plan-linux-install",
+    title: "Install Docker Engine on Linux",
+    risk: Risk.RiskNeedsConfirmation,
+    commands: [
+      {
+        order: 1,
+        command: "sudo apt-get update",
+        risk: Risk.RiskNeedsConfirmation,
+        explanation: "Refresh apt package indexes",
+      },
+    ],
+    effects: ["Install Docker Engine and verify hello-world."],
     expiresAt: "2026-06-13T08:10:00Z",
   };
 }

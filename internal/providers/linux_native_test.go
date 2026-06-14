@@ -113,6 +113,95 @@ func TestLinuxNativeDetectRealDockerIntegration(t *testing.T) {
 	}
 }
 
+func TestLinuxNativePlanInstallBuildsUbuntuDockerAptSteps(t *testing.T) {
+	t.Parallel()
+	provider := NewLinuxNative(LinuxNativeOptions{
+		Runner: newFakeRunner(),
+		Probe:  &fakeLinuxProbe{},
+	})
+
+	plan, err := provider.PlanInstall(context.Background(), models.InstallOptions{Backend: linuxNativeID})
+	if err != nil {
+		t.Fatalf("PlanInstall() error = %v", err)
+	}
+
+	if plan.Title != "Install Docker Engine on Linux" {
+		t.Fatalf("Title = %q", plan.Title)
+	}
+	if plan.Risk != models.RiskNeedsConfirmation {
+		t.Fatalf("Risk = %q, want %q", plan.Risk, models.RiskNeedsConfirmation)
+	}
+	if len(plan.Commands) != 7 {
+		t.Fatalf("commands = %d, want 7: %#v", len(plan.Commands), plan.Commands)
+	}
+	wantCommands := []string{
+		"'sudo' 'apt-get' 'update'",
+		"'sudo' 'apt-get' 'install' '-y' 'ca-certificates' 'curl' 'gnupg'",
+		"'sudo' 'sh' '-lc'",
+		"'sudo' 'apt-get' 'update'",
+		"'sudo' 'apt-get' 'install' '-y' 'docker-ce' 'docker-ce-cli' 'containerd.io' 'docker-buildx-plugin' 'docker-compose-plugin'",
+		"'sudo' 'systemctl' 'enable' '--now' 'docker'",
+		"'sh' '-lc'",
+	}
+	for index, want := range wantCommands {
+		if !strings.Contains(plan.Commands[index].Command, want) {
+			t.Fatalf("command[%d] = %q, want it to contain %q", index, plan.Commands[index].Command, want)
+		}
+		if plan.Commands[index].Risk != models.RiskNeedsConfirmation {
+			t.Fatalf("command[%d].Risk = %q", index, plan.Commands[index].Risk)
+		}
+	}
+	if !strings.Contains(plan.Commands[2].Command, "download.docker.com/linux/ubuntu") {
+		t.Fatalf("repository command missing Docker apt source: %q", plan.Commands[2].Command)
+	}
+	if !strings.Contains(plan.Commands[6].Command, "docker run --rm hello-world") {
+		t.Fatalf("verify command missing hello-world: %q", plan.Commands[6].Command)
+	}
+	if len(plan.Effects) != 5 {
+		t.Fatalf("effects = %#v", plan.Effects)
+	}
+	if plan.ExpiresAt.IsZero() {
+		t.Fatalf("ExpiresAt was not set")
+	}
+}
+
+func TestLinuxNativeExecuteInstallStepRunsAndClearsPlan(t *testing.T) {
+	t.Parallel()
+	runner := newFakeRunner()
+	provider := NewLinuxNative(LinuxNativeOptions{
+		Runner: runner,
+		Probe:  &fakeLinuxProbe{},
+	})
+	plan, err := provider.PlanInstall(context.Background(), models.InstallOptions{Backend: linuxNativeID})
+	if err != nil {
+		t.Fatalf("PlanInstall() error = %v", err)
+	}
+	provider.installMu.Lock()
+	stored := provider.plans[plan.PlanID]
+	provider.installMu.Unlock()
+	for _, step := range stored.Steps {
+		key := strings.Join(step.Command, " ")
+		runner.outputs[key] = "ok\n"
+	}
+
+	progress := make(chan InstallProgress, len(stored.Steps)*2)
+	for index := range stored.Steps {
+		if err := provider.ExecuteInstallStep(context.Background(), plan.PlanID, index, progress); err != nil {
+			t.Fatalf("ExecuteInstallStep(%d) error = %v", index, err)
+		}
+	}
+
+	provider.installMu.Lock()
+	_, ok := provider.plans[plan.PlanID]
+	provider.installMu.Unlock()
+	if ok {
+		t.Fatalf("install plan %q was not cleared", plan.PlanID)
+	}
+	if got, want := len(progress), len(stored.Steps)*2; got != want {
+		t.Fatalf("progress entries = %d, want %d", got, want)
+	}
+}
+
 func TestLinuxNativeRunComposeUsesWorkdirEnvAndArgv(t *testing.T) {
 	t.Parallel()
 	runner := &composeOptionsRunner{}
