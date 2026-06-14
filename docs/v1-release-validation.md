@@ -14,7 +14,7 @@ That release smoke covers:
 - security policy review tests for confirmation, typed-name requirements, redaction, unencrypted TCP warnings, registry password stdin handling, update rollback, restore overwrite, and cheatsheet risk labels;
 - seed-scale performance for dashboard metrics at 100 containers, 500 images, 200 volumes, 20 networks, and 10 projects;
 - a short active-stream soak that opens logs, stats, terminal, and dashboard reads against a real Linux Docker daemon and checks goroutine cleanup.
-- release UI browser smoke against the built Vite app with Wails runtime/service fixtures: axe scans on every route plus command palette, notification center, import modal, and every route in daemon-stopped degraded state; screenshot stability checks and committed-golden visual regression checks on every route with a 0.2 % changed-pixel ceiling.
+- release UI browser smoke against the built Vite app with Wails runtime/service fixtures: axe scans on every route plus command palette, notification center, import modal, and every route in daemon-stopped degraded state; screenshot stability checks and committed-golden visual regression checks on every route with a 0.2 % changed-pixel ceiling; a seeded browser performance fixture at 100 containers, 500 images, 200 volumes, 20 networks, and 10 projects that checks dashboard first meaningful render, route-switch latency, inventory filter latency, and 5,000-line log virtualization.
 
 ## 24 h soak command
 
@@ -42,12 +42,13 @@ Current run: a real WSL/Linux 24 h soak is in progress from `20260614T071038Z` a
 Required evidence before v1.0:
 - CI `Release validation smoke` green on Linux for the seed-scale backend target.
 - Frontend Vitest dashboard/search performance assertions green in `frontend/src/App.test.tsx`.
+- Browser-level release UI seeded fixture green for dashboard first meaningful render, page switches, inventory filtering, and 5,000-line virtualized log rendering at the v1 scale target.
 - Real Docker log, stats, terminal, backup, registry auth, and tag/push integration jobs green on Ubuntu 24.04.
 - Manual UI observation during soak: log viewer remains responsive and dashboard page switches do not visibly stall.
 
 ## Visual and accessibility evidence
 
-Automated local evidence: `npm run test:release-ui` passed on Windows with 14 Playwright checks: 10 route axe scans, command palette/notification/import-modal axe scans, route screenshot stability, route visual regression against committed goldens, and a daemon-stopped degraded-mode browser check that verifies every route shows the degraded banner/stale cached-data watermark with no serious axe violations, disables the container mutation, and does not start log/stats streams. The same current 14-check suite passed inside the `cairn-dev` WSL Docker daemon using `mcr.microsoft.com/playwright:v1.60.0-noble` from a throwaway container-local repo copy.
+Automated local evidence: `npm run test:release-ui` passed on Windows with 15 Playwright checks: 10 route axe scans, command palette/notification/import-modal axe scans, route screenshot stability, route visual regression against committed goldens, a daemon-stopped degraded-mode browser check that verifies every route shows the degraded banner/stale cached-data watermark with no serious axe violations, disables the container mutation, and does not start log/stats streams, plus the seeded browser performance fixture for dashboard, route-switch, inventory-search, and 5,000-line log virtualization budgets. The previous 14-check route/degraded/visual suite passed inside the `cairn-dev` WSL Docker daemon using `mcr.microsoft.com/playwright:v1.60.0-noble` from a throwaway container-local repo copy before the seeded fixture was added.
 
 Committed golden baselines live under `frontend/e2e/goldens/release-ui/` for Windows local validation and Linux/Ubuntu CI validation. To intentionally update them, run the suite with `CAIRN_UPDATE_VISUALS=1` on the target platform and review the PNG diff before committing.
 

@@ -21,6 +21,9 @@ const routes = [
 const visualThreshold = 0.002;
 const updateVisuals = process.env.CAIRN_UPDATE_VISUALS === '1';
 const visualPlatform = process.env.CAIRN_VISUAL_PLATFORM || process.platform;
+const firstRenderBudgetMs = 1500;
+const routeSwitchBudgetMs = 200;
+const filterBudgetMs = 100;
 const goldenDir = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
   'goldens',
@@ -119,23 +122,164 @@ test('daemon-stopped fixture renders degraded stale mode safely on every route',
 
   await openRoute(page, { label: 'Logs', heading: 'Logs', slug: 'logs' });
 
-  const calls = await page.evaluate(
-    () => window.__cairnReleaseMockCalls ?? {},
-  );
+  const calls = await page.evaluate(() => window.__cairnReleaseMockCalls ?? {});
   expect(calls['DockerService.StopContainer'] ?? 0).toBe(0);
   expect(calls['LogsService.StartLogStream'] ?? 0).toBe(0);
   expect(calls['MetricsService.StartStatsStream'] ?? 0).toBe(0);
 });
 
+test('seed-scale fixture meets release responsiveness budgets', async ({
+  page,
+}, testInfo) => {
+  await page.addInitScript(() => {
+    window.localStorage.setItem('cairn.release.fixture', 'seeded');
+  });
+
+  await page.goto('/');
+  await disableMotion(page);
+  await expect(page.getByRole('img', { name: 'Cairn' })).toBeVisible();
+  await expect(
+    page.getByRole('heading', { name: 'Overview', level: 1 }),
+  ).toBeVisible();
+  await expect(page.getByLabel('Docker object counts')).toContainText('100');
+
+  const firstRenderMs = await page.evaluate(() => performance.now());
+  annotatePerf(
+    testInfo,
+    'seed dashboard first meaningful render',
+    firstRenderMs,
+  );
+  expect(
+    firstRenderMs,
+    `seed dashboard first meaningful render took ${firstRenderMs.toFixed(1)}ms`,
+  ).toBeLessThanOrEqual(firstRenderBudgetMs);
+
+  for (const label of [
+    'Projects',
+    'Containers',
+    'Images',
+    'Volumes',
+    'Networks',
+  ]) {
+    const route = routes.find((candidate) => candidate.label === label);
+    const elapsed = await openRouteForBudget(page, route);
+    annotatePerf(testInfo, `${label} route switch`, elapsed);
+    expect(
+      elapsed,
+      `${label} route switch took ${elapsed.toFixed(1)}ms`,
+    ).toBeLessThanOrEqual(routeSwitchBudgetMs);
+  }
+
+  await openRoute(page, {
+    label: 'Containers',
+    heading: 'Containers',
+    slug: 'containers',
+  });
+  const filterMs = await fillInputAndMeasureFrame(
+    page,
+    'Search inventory',
+    'service-042',
+  );
+  annotatePerf(testInfo, 'container inventory filter', filterMs);
+  expect(
+    filterMs,
+    `container inventory filter took ${filterMs.toFixed(1)}ms`,
+  ).toBeLessThanOrEqual(filterBudgetMs);
+  await expect(page.getByText('service-042').first()).toBeVisible();
+
+  const logsElapsed = await openRouteForBudget(page, {
+    label: 'Logs',
+    heading: 'Logs',
+    slug: 'logs',
+  });
+  annotatePerf(testInfo, 'Logs route switch', logsElapsed);
+  expect(
+    logsElapsed,
+    `Logs route switch took ${logsElapsed.toFixed(1)}ms`,
+  ).toBeLessThanOrEqual(routeSwitchBudgetMs);
+
+  await expect(page.getByText(/5[,. ]000 buffered/)).toBeVisible({
+    timeout: 3000,
+  });
+  await expect(page.getByText(/5[,. ]000 visible lines/)).toBeVisible();
+
+  const viewer = page.getByRole('log', { name: 'Log lines' });
+  await expect(
+    viewer.getByText('INFO release validation log line 4999'),
+  ).toBeVisible();
+
+  const renderedRows = await viewer.locator('div.absolute').count();
+  annotatePerf(testInfo, 'rendered log rows', renderedRows, 'rows');
+  expect(renderedRows).toBeLessThanOrEqual(80);
+});
+
 async function openRoute(page, route) {
   const nav = page.getByRole('navigation', { name: 'Main navigation' });
   await nav
-    .getByRole('button', { name: new RegExp(`^${escapeRegExp(route.label)}\\b`) })
+    .getByRole('button', {
+      name: new RegExp(`^${escapeRegExp(route.label)}\\b`),
+    })
     .click();
   await expect(
     page.getByRole('heading', { name: route.heading, level: 1 }),
   ).toBeVisible();
   await page.waitForLoadState('networkidle');
+}
+
+async function openRouteForBudget(page, route) {
+  return page.evaluate(async ({ heading, label }) => {
+    const buttons = Array.from(document.querySelectorAll('nav button'));
+    const button = buttons.find((item) =>
+      item.textContent?.trim().startsWith(label),
+    );
+    if (!button) {
+      throw new Error(`Missing navigation button for ${label}`);
+    }
+
+    const start = performance.now();
+    button.click();
+    for (let frame = 0; frame < 30; frame += 1) {
+      await new Promise(requestAnimationFrame);
+      const headingNode = Array.from(document.querySelectorAll('h1')).find(
+        (node) => node.textContent?.trim() === heading,
+      );
+      if (headingNode) {
+        return performance.now() - start;
+      }
+    }
+    throw new Error(`Timed out waiting for ${heading}`);
+  }, route);
+}
+
+async function fillInputAndMeasureFrame(page, label, value) {
+  return page.evaluate(
+    async ({ label: inputLabel, value: nextValue }) => {
+      const input = Array.from(document.querySelectorAll('input')).find(
+        (candidate) => candidate.getAttribute('aria-label') === inputLabel,
+      );
+      if (!(input instanceof HTMLInputElement)) {
+        throw new Error(`Missing input with label ${inputLabel}`);
+      }
+
+      const valueSetter = Object.getOwnPropertyDescriptor(
+        HTMLInputElement.prototype,
+        'value',
+      )?.set;
+      const start = performance.now();
+      input.focus();
+      valueSetter?.call(input, nextValue);
+      input.dispatchEvent(
+        new InputEvent('input', {
+          bubbles: true,
+          data: nextValue,
+          inputType: 'insertText',
+        }),
+      );
+      await new Promise(requestAnimationFrame);
+      return performance.now() - start;
+    },
+    { label, value },
+  );
 }
 
 async function disableMotion(page) {
@@ -264,6 +408,13 @@ async function assertMatchesGolden(page, route, testInfo) {
   expect(ratio, `${route.label} changed pixel ratio`).toBeLessThanOrEqual(
     visualThreshold,
   );
+}
+
+function annotatePerf(testInfo, label, value, unit = 'ms') {
+  testInfo.annotations.push({
+    type: 'perf',
+    description: `${label}: ${Number(value).toFixed(1)}${unit}`,
+  });
 }
 
 function escapeRegExp(value) {

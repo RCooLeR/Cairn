@@ -140,12 +140,20 @@ function providerStatus() {
   };
 }
 
-function isDegradedFixture() {
+function releaseFixtureMode() {
   try {
-    return globalThis.localStorage?.getItem("cairn.release.fixture") === "degraded";
+    return globalThis.localStorage?.getItem("cairn.release.fixture") ?? "";
   } catch {
-    return false;
+    return "";
   }
+}
+
+function isDegradedFixture() {
+  return releaseFixtureMode() === "degraded";
+}
+
+function isSeededFixture() {
+  return releaseFixtureMode() === "seeded";
 }
 
 function dockerStopped<T>(value: T): T | Promise<never> {
@@ -224,8 +232,131 @@ const image = {
   updateStatus: update.upToDate,
 };
 
+const seededCounts = {
+  containers: 100,
+  images: 500,
+  networks: 20,
+  projects: 10,
+  volumes: 200,
+};
+
 function diskCategory(count: number, active: number, sizeBytes: number) {
   return { count, active, sizeBytes, reclaimable: 0 };
+}
+
+function padded(value: number, width: number) {
+  return String(value).padStart(width, "0");
+}
+
+function seededProjectID(index: number) {
+  return `linux_native/project-${index}`;
+}
+
+function seededProjects() {
+  return Array.from({ length: seededCounts.projects }, (_, index) => ({
+    id: seededProjectID(index),
+    name: `project-${index}`,
+    providerID: "linux_native",
+    status: projectStatus.running,
+    health: index % 6 === 0 ? health.unknown : health.healthy,
+    servicesRunning: 8,
+    servicesTotal: 10,
+    cpuPercent: 10 + index,
+    memoryBytes: (192 + index * 8) * 1024 * 1024,
+    netRxRate: index * 512,
+    netTxRate: index * 384,
+    updateBadges: {
+      imageUpdates: index % 3,
+      baseUpdates: index % 2,
+      rebuildNeeded: index % 4 === 0 ? 1 : 0,
+      pinned: index % 5 === 0 ? 1 : 0,
+      unknownBase: index % 7 === 0 ? 1 : 0,
+    },
+    ports: [
+      {
+        hostIP: "127.0.0.1",
+        hostPort: String(8400 + index),
+        containerPort: "80",
+        protocol: "tcp",
+      },
+    ],
+    workingDir: `/home/cairn/projects/project-${index}`,
+    lastChangedAt: "2026-06-13T08:00:00Z",
+  }));
+}
+
+function seededContainers() {
+  return Array.from({ length: seededCounts.containers }, (_, index) => {
+    const projectIndex = index % seededCounts.projects;
+    const running = index % 5 !== 0;
+    return {
+      id: `container-${padded(index, 3)}`,
+      name: `service-${padded(index, 3)}`,
+      image: `cairn/repo-${padded(index % seededCounts.images, 3)}:latest`,
+      imageID: `sha256:image-${padded(index, 3)}`,
+      status: running ? `Up ${index + 1} minutes` : "Exited (0) 1 hour ago",
+      state: running ? "running" : "exited",
+      health: running && index % 9 !== 0 ? health.healthy : health.unknown,
+      projectID: seededProjectID(projectIndex),
+      service: `service-${padded(index % 10, 2)}`,
+      ports:
+        index % 3 === 0
+          ? [
+              {
+                hostIP: "127.0.0.1",
+                hostPort: String(8000 + index),
+                containerPort: "80",
+                protocol: "tcp",
+              },
+            ]
+          : [],
+      cpuPercent: Number((index % 20) + 0.5),
+      memoryBytes: (64 + (index % 12) * 16) * 1024 * 1024,
+      memoryLimit: 512 * 1024 * 1024,
+      restarts: index % 4,
+      createdAt: "2026-06-13T08:00:00Z",
+    };
+  });
+}
+
+function seededImages() {
+  return Array.from({ length: seededCounts.images }, (_, index) => ({
+    id: `sha256:image-${padded(index, 3)}`,
+    repoTags: index % 17 === 0 ? [] : [`cairn/repo-${padded(index, 3)}:latest`],
+    repoDigests: [`cairn/repo-${padded(index, 3)}@sha256:digest-${index}`],
+    sizeBytes: (24 + (index % 48)) * 1024 * 1024,
+    createdAt: "2026-06-12T08:00:00Z",
+    inUse: index < seededCounts.containers,
+    updateStatus:
+      index % 19 === 0 ? update.serviceImageAvailable : update.upToDate,
+  }));
+}
+
+function seededVolumes() {
+  return Array.from({ length: seededCounts.volumes }, (_, index) => ({
+    name: `volume-${padded(index, 3)}`,
+    driver: "local",
+    mountpoint: `/var/lib/docker/volumes/volume-${padded(index, 3)}/_data`,
+    labels: {
+      "com.docker.compose.project": `project-${index % seededCounts.projects}`,
+    },
+    sizeBytes: (1 + (index % 10)) * 1024 * 1024,
+    inUse: index % 4 !== 0,
+  }));
+}
+
+function seededNetworks() {
+  return Array.from({ length: seededCounts.networks }, (_, index) => ({
+    id: `network-${padded(index, 2)}`,
+    name: `network-${padded(index, 2)}`,
+    driver: "bridge",
+    scope: "local",
+    internal: index % 10 === 0,
+    attachable: true,
+    labels: {
+      "com.docker.compose.project": `project-${index % seededCounts.projects}`,
+    },
+  }));
 }
 
 function projectSummary() {
@@ -324,6 +455,25 @@ function dashboardMetrics() {
   };
 }
 
+function seededDashboardMetrics() {
+  const containers = seededContainers();
+  return {
+    projects: seededCounts.projects,
+    containers: seededCounts.containers,
+    images: seededCounts.images,
+    volumes: seededCounts.volumes,
+    diskUsage: seededDiskUsage(),
+    top: containers.slice(0, 8).map((item) => ({
+      id: item.id,
+      name: item.name,
+      kind: "container",
+      cpuPercent: item.cpuPercent,
+      memoryBytes: item.memoryBytes,
+    })),
+    recentEvents: auditEntries(),
+  };
+}
+
 function diskUsage() {
   return {
     images: diskCategory(1, 1, 128 * 1024 * 1024),
@@ -332,6 +482,33 @@ function diskUsage() {
     buildCache: diskCategory(0, 0, 0),
     totalBytes: 136 * 1024 * 1024,
     reclaimable: 4 * 1024 * 1024,
+  };
+}
+
+function seededDiskUsage() {
+  const imagesBytes = 19 * 1024 * 1024 * 1024;
+  const containerBytes = 2 * 1024 * 1024 * 1024;
+  const volumeBytes = 8 * 1024 * 1024 * 1024;
+  const cacheBytes = 3 * 1024 * 1024 * 1024;
+  return {
+    images: diskCategory(
+      seededCounts.images,
+      seededCounts.containers,
+      imagesBytes,
+    ),
+    containers: diskCategory(
+      seededCounts.containers,
+      seededCounts.containers,
+      containerBytes,
+    ),
+    volumes: diskCategory(
+      seededCounts.volumes,
+      seededCounts.volumes - 50,
+      volumeBytes,
+    ),
+    buildCache: diskCategory(24, 8, cacheBytes),
+    totalBytes: imagesBytes + containerBytes + volumeBytes + cacheBytes,
+    reclaimable: 4 * 1024 * 1024 * 1024,
   };
 }
 
@@ -515,6 +692,18 @@ function terminalSession(kind = "host") {
   };
 }
 
+function seededLogLines(count: number) {
+  return Array.from({ length: count }, (_, index) => ({
+    ts: `2026-06-13T09:${padded(Math.floor(index / 60) % 60, 2)}:${padded(index % 60, 2)}Z`,
+    containerID: `container-${padded(index % seededCounts.containers, 3)}`,
+    containerName: `service-${padded(index % seededCounts.containers, 3)}`,
+    service: `service-${padded(index % 10, 2)}`,
+    stream: "stdout",
+    level: "info",
+    text: `INFO release validation log line ${padded(index, 4)}`,
+  }));
+}
+
 function callListCurrentUpdates(filter?: { status?: string[] }) {
   if (filter?.status?.includes(update.ignored)) {
     return ignoredUpdates();
@@ -544,7 +733,8 @@ const callHandlers: Record<number, (...args: unknown[]) => unknown> = {
   }),
   3605792666: () => network,
   500118806: () => volume,
-  2345440464: () => dockerStopped(diskUsage()),
+  2345440464: () =>
+    dockerStopped(isSeededFixture() ? seededDiskUsage() : diskUsage()),
   3255901267: () => ({
     summary: container,
     command: ["nginx", "-g", "daemon off;"],
@@ -576,16 +766,15 @@ const callHandlers: Record<number, (...args: unknown[]) => unknown> = {
       memoryBytes: 8 * 1024 * 1024 * 1024,
     }),
   978203467: () => JSON.stringify({ Id: container.id, Name: container.name }),
-  4209014116: () => [container],
-  54024818: () => [image],
-  3981221319: () => [network],
-  4113921307: () => [volume],
+  4209014116: () => (isSeededFixture() ? seededContainers() : [container]),
+  54024818: () => (isSeededFixture() ? seededImages() : [image]),
+  3981221319: () => (isSeededFixture() ? seededNetworks() : [network]),
+  4113921307: () => (isSeededFixture() ? seededVolumes() : [volume]),
   2286805465: () => "load-job",
   795801790: () => commandPlan("Kill web", "docker kill web"),
   3091027417: (kind) =>
     commandPlan(`Prune ${String(kind)}`, `docker ${String(kind)} prune`),
-  783154554: () =>
-    commandPlan("Remove web", "docker rm web", risk.destructive),
+  783154554: () => commandPlan("Remove web", "docker rm web", risk.destructive),
   590018692: () =>
     commandPlan("Remove image", "docker image rm cairn/web:latest"),
   3243822551: () => commandPlan("Remove network", "docker network rm cairn"),
@@ -635,25 +824,35 @@ const callHandlers: Record<number, (...args: unknown[]) => unknown> = {
     ],
     nextCursor: "",
   }),
-  3715102761: () => "logs-stream-1",
+  3715102761: () => {
+    const streamID = "logs-stream-1";
+    if (isSeededFixture()) {
+      globalThis.setTimeout(() => {
+        Events.Emit("logs:lines", {
+          streamID,
+          lines: seededLogLines(5000),
+        });
+      }, 75);
+    }
+    return streamID;
+  },
   3200869941: () => ({ series: [] }),
-  4233896820: dashboardMetrics,
+  4233896820: () =>
+    isSeededFixture() ? seededDashboardMetrics() : dashboardMetrics(),
   4269150979: () => ({ series: [] }),
   48603856: () => "stats-stream-1",
   595764834: projectDetail,
   3126173247: projectDetail,
-  1261700661: () => [projectSummary()],
+  1261700661: () => (isSeededFixture() ? seededProjects() : [projectSummary()]),
   2130027865: (_projectID, removeVolumes) =>
     commandPlan(
       removeVolumes ? "Down app-db with volumes" : "Down app-db",
-      removeVolumes
-        ? "docker compose down --volumes"
-        : "docker compose down",
+      removeVolumes ? "docker compose down --volumes" : "docker compose down",
       removeVolumes ? risk.dangerous : risk.destructive,
     ),
   2512814603: () =>
     commandPlan("Redeploy app-db", "docker compose up -d --force-recreate"),
-  2709840416: () => [projectSummary()],
+  2709840416: () => (isSeededFixture() ? seededProjects() : [projectSummary()]),
   1257602498: () => ({ streamID: "install-stream-1" }),
   2594388346: providerStatus,
   1325877761: () => ({ linux_native: providerStatus() }),
@@ -769,7 +968,8 @@ const callHandlers: Record<number, (...args: unknown[]) => unknown> = {
   3172433760: () => "updates-check-job",
   1025649146: updates,
   3527487467: () => updates()[0],
-  1290489764: (filter) => callListCurrentUpdates(filter as { status?: string[] }),
+  1290489764: (filter) =>
+    callListCurrentUpdates(filter as { status?: string[] }),
   1871912704: () => [
     {
       id: 301,
