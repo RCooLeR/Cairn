@@ -777,6 +777,7 @@ export function CommandPalette<T extends string>({
 
   return (
     <div
+      aria-label="Command palette"
       aria-modal="true"
       className="fixed inset-0 z-50 flex items-start justify-center bg-black/55 px-4 py-20"
       role="dialog"

@@ -58,6 +58,8 @@ frontend/node_modules/
 frontend/dist/*
 !frontend/dist/.gitkeep
 !frontend/dist/embed-placeholder.txt
+frontend/test-results/
+frontend/playwright-report/
 *.db
 *.db-shm
 *.db-wal

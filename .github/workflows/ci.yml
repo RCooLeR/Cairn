@@ -197,6 +197,11 @@ jobs:
         working-directory: frontend
         run: npm ci
 
+      - name: Install Playwright browser
+        if: runner.os == 'Linux'
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+
       - name: Stamp smoke version and assets
         shell: pwsh
         run: |
@@ -218,4 +223,4 @@ jobs:
       - name: Release validation smoke
         if: runner.os == 'Linux'
         shell: pwsh
-        run: ./scripts/run-release-validation.ps1 -Suite security,performance,soak-smoke -SoakDuration 30s -SoakTimeout 5m
+        run: ./scripts/run-release-validation.ps1 -Suite security,performance,soak-smoke,ui-release -SoakDuration 30s -SoakTimeout 5m

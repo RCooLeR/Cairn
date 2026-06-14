@@ -1,5 +1,5 @@
 param(
-  [ValidateSet("security", "performance", "soak-smoke", "soak-24h")]
+  [ValidateSet("security", "performance", "soak-smoke", "soak-24h", "ui-release")]
   [string[]]$Suite = @("security", "performance", "soak-smoke"),
   [string]$SoakDuration = "30s",
   [string]$SoakTimeout = "5m"
@@ -19,12 +19,24 @@ function Invoke-ReleaseStep([string]$Name, [scriptblock]$Step) {
   Write-Host ("<== {0} passed in {1}" -f $Name, $elapsed.ToString("c"))
 }
 
-function Invoke-GoTest([string[]]$Packages, [string[]]$Args) {
+function Invoke-GoTest([string[]]$Packages, [string[]]$GoArgs) {
   Push-Location $root
   try {
-    & go test @Packages @Args
+    & go test @Packages @GoArgs
     if ($LASTEXITCODE -ne 0) {
       throw "go test failed with exit code $LASTEXITCODE"
+    }
+  } finally {
+    Pop-Location
+  }
+}
+
+function Invoke-FrontendNpm([string[]]$NpmArgs) {
+  Push-Location (Join-Path $root "frontend")
+  try {
+    & npm @NpmArgs
+    if ($LASTEXITCODE -ne 0) {
+      throw "npm failed with exit code $LASTEXITCODE"
     }
   } finally {
     Pop-Location
@@ -46,12 +58,12 @@ foreach ($item in $Suite) {
           "./internal/terminal"
         )
         $run = "Test(ContainerRiskMapping|PlanStoreExpiresAndRequiresTypedName|ExistingContextDetectHealthyWithUnencryptedTCPWarning|LoginPipesSecretThroughStdin|ClientObjectsDTOsRawInspectAndCacheReconcile|DockerServiceLifecycleAuditsAndPlans|ProjectServicePlanDownWithVolumesRequiresTypedName|ManagerApplyUpdateHealthFailureRollsBack|RestoreOverwriteRequiresTypedNameAndRunsHelper|CheatsheetRisksMatchSecurityPolicy)$"
-        Invoke-GoTest $packages @("-run", $run, "-count=1", "-timeout=3m")
+        Invoke-GoTest -Packages $packages -GoArgs @("-run", $run, "-count=1", "-timeout=3m")
       }
     }
     "performance" {
       Invoke-ReleaseStep "seed-scale performance tests" {
-        Invoke-GoTest @("./internal/metrics") @("-run", "TestManagerSeedScaleDashboardPerformanceAndGoroutines$", "-count=1", "-timeout=30s")
+        Invoke-GoTest -Packages @("./internal/metrics") -GoArgs @("-run", "TestManagerSeedScaleDashboardPerformanceAndGoroutines$", "-count=1", "-timeout=30s")
       }
     }
     "soak-smoke" {
@@ -63,7 +75,7 @@ foreach ($item in $Suite) {
         $env:CAIRN_PHASE3_SOAK = "1"
         $env:CAIRN_PHASE3_SOAK_DURATION = $SoakDuration
         try {
-          Invoke-GoTest @("./internal/soak") @("-run", "TestPhase3StreamsTerminalDashboardSoak$", "-count=1", "-timeout=$SoakTimeout")
+          Invoke-GoTest -Packages @("./internal/soak") -GoArgs @("-run", "TestPhase3StreamsTerminalDashboardSoak$", "-count=1", "-timeout=$SoakTimeout")
         } finally {
           Remove-Item Env:\CAIRN_PHASE3_SOAK -ErrorAction SilentlyContinue
           Remove-Item Env:\CAIRN_PHASE3_SOAK_DURATION -ErrorAction SilentlyContinue
@@ -78,11 +90,16 @@ foreach ($item in $Suite) {
         $env:CAIRN_PHASE3_SOAK = "1"
         $env:CAIRN_PHASE3_SOAK_DURATION = $SoakDuration
         try {
-          Invoke-GoTest @("./internal/soak") @("-run", "TestPhase3StreamsTerminalDashboardSoak$", "-count=1", "-timeout=$SoakTimeout")
+          Invoke-GoTest -Packages @("./internal/soak") -GoArgs @("-run", "TestPhase3StreamsTerminalDashboardSoak$", "-count=1", "-timeout=$SoakTimeout")
         } finally {
           Remove-Item Env:\CAIRN_PHASE3_SOAK -ErrorAction SilentlyContinue
           Remove-Item Env:\CAIRN_PHASE3_SOAK_DURATION -ErrorAction SilentlyContinue
         }
+      }
+    }
+    "ui-release" {
+      Invoke-ReleaseStep "release UI visual and axe smoke" {
+        Invoke-FrontendNpm -NpmArgs @("run", "test:release-ui")
       }
     }
   }
