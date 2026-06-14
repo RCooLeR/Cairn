@@ -162,7 +162,7 @@ Current evidence: Ubuntu 24.04 CI is green for lint/unit/contract checks, real D
 - [x] Ubuntu 24.04 CI: package smoke produces non-empty AppImage and `.deb` artifacts.
 - [x] Ubuntu 24.04 CI: `.deb` installs and removes cleanly, verifies `/usr/bin/cairn`, desktop file, hicolor icon, no Docker package dependencies, no docker-group mutation, and no package-owned files left after remove.
 - [x] Ubuntu 24.04 CI: release validation smoke runs `security,performance,soak-smoke,ui-release`.
-- [x] Browser release smoke: daemon-stopped fixture shows the global degraded banner and stale cached-data watermark, disables the `Stop web` container mutation, and does not start log/stats streams.
+- [x] Browser release smoke: daemon-stopped fixture shows the global degraded banner and stale cached-data watermark on every release route, keeps those degraded route states free of serious axe violations, disables the `Stop web` container mutation, and does not start log/stats streams.
 - [ ] Ubuntu LTS manual desktop smoke: launch installed `.deb`, stop Docker, verify every page shows the degraded/stale state, repair/start affordances, and disabled mutations; restart Docker and verify auto-recovery.
 - [ ] Ubuntu LTS manual desktop smoke: launch the AppImage on a clean host with Docker present and repeat Dashboard, Projects, Containers, Images, Volumes, Networks, Logs, Terminal, Updates, Settings, and Audit navigation.
 - [ ] Ubuntu LTS manual permission matrix: user in docker group, user not in docker group with sudo-per-action, rootless Docker socket.

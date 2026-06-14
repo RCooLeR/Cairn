@@ -90,7 +90,7 @@ test.describe('release UI validation', () => {
   });
 });
 
-test('daemon-stopped fixture renders degraded stale mode safely', async ({
+test('daemon-stopped fixture renders degraded stale mode safely on every route', async ({
   page,
 }) => {
   await page.addInitScript(() => {
@@ -102,7 +102,13 @@ test('daemon-stopped fixture renders degraded stale mode safely', async ({
   await expect(page.getByRole('img', { name: 'Cairn' })).toBeVisible();
   await expect(page.getByText('Docker is not reachable')).toBeVisible();
   await expect(page.getByText('Stale cached data')).toBeVisible();
-  await assertNoSeriousAxeViolations(page, 'Degraded overview');
+
+  for (const route of routes) {
+    await openRoute(page, route);
+    await expect(page.getByText('Docker is not reachable')).toBeVisible();
+    await expect(page.getByText('Stale cached data')).toBeVisible();
+    await assertNoSeriousAxeViolations(page, `Degraded ${route.label}`);
+  }
 
   await openRoute(page, {
     label: 'Containers',

@@ -14,7 +14,7 @@ That release smoke covers:
 - security policy review tests for confirmation, typed-name requirements, redaction, unencrypted TCP warnings, registry password stdin handling, update rollback, restore overwrite, and cheatsheet risk labels;
 - seed-scale performance for dashboard metrics at 100 containers, 500 images, 200 volumes, 20 networks, and 10 projects;
 - a short active-stream soak that opens logs, stats, terminal, and dashboard reads against a real Linux Docker daemon and checks goroutine cleanup.
-- release UI browser smoke against the built Vite app with Wails runtime/service fixtures: axe scans on every route plus command palette, notification center, import modal, and daemon-stopped degraded states; screenshot stability checks and committed-golden visual regression checks on every route with a 0.2 % changed-pixel ceiling.
+- release UI browser smoke against the built Vite app with Wails runtime/service fixtures: axe scans on every route plus command palette, notification center, import modal, and every route in daemon-stopped degraded state; screenshot stability checks and committed-golden visual regression checks on every route with a 0.2 % changed-pixel ceiling.
 
 ## 24 h soak command
 
@@ -38,7 +38,7 @@ Required evidence before v1.0:
 
 ## Visual and accessibility evidence
 
-Automated local evidence: `npm run test:release-ui` passed on Windows with 14 Playwright checks: 10 route axe scans, command palette/notification/import-modal axe scans, route screenshot stability, route visual regression against committed goldens, and a daemon-stopped degraded-mode browser check that verifies the stale banner, disabled container mutation, and no log/stats stream startup.
+Automated local evidence: `npm run test:release-ui` passed on Windows with 14 Playwright checks: 10 route axe scans, command palette/notification/import-modal axe scans, route screenshot stability, route visual regression against committed goldens, and a daemon-stopped degraded-mode browser check that verifies every route shows the degraded banner/stale cached-data watermark with no serious axe violations, disables the container mutation, and does not start log/stats streams.
 
 Committed golden baselines live under `frontend/e2e/goldens/release-ui/` for Windows local validation and Linux/Ubuntu CI validation. To intentionally update them, run the suite with `CAIRN_UPDATE_VISUALS=1` on the target platform and review the PNG diff before committing.
 
