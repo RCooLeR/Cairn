@@ -96,6 +96,7 @@ Security review evidence on 2026-06-14:
 - The same focused suite passed in `cairn-dev` WSL with Linux Go 1.26.4 while the 24 h soak was running.
 - CI run 27489793646 passed on Ubuntu 24.04, Windows, and macOS for commit `84f3293`; the Ubuntu package-smoke job also passed `Release validation smoke` with the updated security suite.
 - The suite covers backend risk mapping and 10-minute plan expiry, typed-name requirements for dangerous plans, command-plan enforcement for container/project/restore/update paths, registry login via `--password-stdin`, redacted container env/audit command details, unencrypted `tcp://` context warnings, explicit Linux permission modes, provider-install audit rows, update rollback safety, restore overwrite confirmation, and cheatsheet risk-label parity.
+- The focused `internal/security` command-plan package coverage is 92.4% statements after adding direct plan-construction, confirmation, expiry, context-cancel, fallback-label, and project-plan-store tests to the release security suite.
 - The review found and fixed one enforcement gap: the UI already disabled `security.confirm_destructive`, but the backend settings repository now also rejects `security.confirm_destructive=false` through both typed and raw setting writes; the release security suite includes that regression check.
 
 ## Manual platform matrix

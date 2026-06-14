@@ -87,7 +87,7 @@ foreach ($item in $Suite) {
           "./internal/backups",
           "./internal/terminal"
         )
-        $run = "Test(ContainerRiskMapping|PlanStoreExpiresAndRequiresTypedName|ExistingContextDetectHealthyWithUnencryptedTCPWarning|LoginPipesSecretThroughStdin|ClientObjectsDTOsRawInspectAndCacheReconcile|DockerServiceLifecycleAuditsAndPlans|ProjectServicePlanDownWithVolumesRequiresTypedName|SettingsDefaultsAndRoundTrip|ManagerApplyUpdateHealthFailureRollsBack|RestoreOverwriteRequiresTypedNameAndRunsHelper|CheatsheetRisksMatchSecurityPolicy)$"
+        $run = "Test(ContainerRiskMapping|PlanStore.*|RequireConfirmation.*|NewContainerActionPlan.*|ProjectPlanStoreTake|ExistingContextDetectHealthyWithUnencryptedTCPWarning|LoginPipesSecretThroughStdin|ClientObjectsDTOsRawInspectAndCacheReconcile|DockerServiceLifecycleAuditsAndPlans|ProjectServicePlanDownWithVolumesRequiresTypedName|SettingsDefaultsAndRoundTrip|ManagerApplyUpdateHealthFailureRollsBack|RestoreOverwriteRequiresTypedNameAndRunsHelper|CheatsheetRisksMatchSecurityPolicy)$"
         Invoke-GoTest -Packages $packages -GoArgs @("-run", $run, "-count=1", "-timeout=3m")
       }
     }
