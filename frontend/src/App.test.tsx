@@ -387,13 +387,26 @@ describe("App inventory shell", () => {
     terminalServiceMock.ResizeTerminal.mockResolvedValue(undefined);
     terminalServiceMock.CloseTerminal.mockResolvedValue(undefined);
     settingsServiceMock.GetSettings.mockResolvedValue({
+      "general.theme": "dark",
+      "general.autostart_app": false,
+      "general.language": "en",
       "linux.sudo_mode": "ask",
+      "linux.socket_path": "/var/run/docker.sock",
       "provider.autostart_backend": true,
+      "provider.active_id": "windows_wsl_ubuntu",
       "windows.wsl_distro": "Ubuntu",
       "macos.colima_profile": "default",
       "macos.colima_cpu": 2,
       "macos.colima_memory_gb": 4,
       "macos.colima_disk_gb": 60,
+      "updates.check_interval_hours": 24,
+      "updates.notify": true,
+      "metrics.retention_raw_minutes": 60,
+      "metrics.sample_interval_seconds": 2,
+      "terminal.default_shell": "",
+      "security.confirm_destructive": true,
+      "backups.directory": "",
+      "registry.credentials_mode": "docker_helper",
     });
     settingsServiceMock.SetSetting.mockResolvedValue(undefined);
     settingsServiceMock.GetNotifications.mockResolvedValue([]);
@@ -1688,6 +1701,149 @@ describe("App inventory shell", () => {
     );
   });
 
+  it("round-trips settings from every Settings section", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", {
+        name: /Settings/,
+      }),
+    );
+
+    const socketInput = await screen.findByLabelText("Socket path");
+    fireEvent.change(socketInput, {
+      target: { value: "/run/user/1000/docker.sock" },
+    });
+    fireEvent.blur(socketInput);
+    await waitFor(() =>
+      expect(settingsServiceMock.SetSetting).toHaveBeenCalledWith(
+        "linux.socket_path",
+        "/run/user/1000/docker.sock",
+      ),
+    );
+
+    fireEvent.change(screen.getByLabelText("Permission mode"), {
+      target: { value: "group" },
+    });
+    await waitFor(() =>
+      expect(settingsServiceMock.SetSetting).toHaveBeenCalledWith(
+        "linux.sudo_mode",
+        "group",
+      ),
+    );
+
+    clickSettingsSection("General");
+    fireEvent.change(await screen.findByLabelText("Theme"), {
+      target: { value: "light" },
+    });
+    await waitFor(() =>
+      expect(settingsServiceMock.SetSetting).toHaveBeenCalledWith(
+        "general.theme",
+        "light",
+      ),
+    );
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "Launch Cairn at login" }),
+    );
+    await waitFor(() =>
+      expect(settingsServiceMock.SetSetting).toHaveBeenCalledWith(
+        "general.autostart_app",
+        true,
+      ),
+    );
+
+    clickSettingsSection("Updates");
+    fireEvent.change(await screen.findByLabelText("Check interval"), {
+      target: { value: "6" },
+    });
+    await waitFor(() =>
+      expect(settingsServiceMock.SetSetting).toHaveBeenCalledWith(
+        "updates.check_interval_hours",
+        6,
+      ),
+    );
+    fireEvent.click(
+      screen.getByRole("checkbox", { name: "Notify on available updates" }),
+    );
+    await waitFor(() =>
+      expect(settingsServiceMock.SetSetting).toHaveBeenCalledWith(
+        "updates.notify",
+        false,
+      ),
+    );
+
+    clickSettingsSection("Metrics");
+    const sampleInput = await screen.findByLabelText("Sample interval seconds");
+    fireEvent.change(sampleInput, { target: { value: "5" } });
+    fireEvent.blur(sampleInput);
+    await waitFor(() =>
+      expect(settingsServiceMock.SetSetting).toHaveBeenCalledWith(
+        "metrics.sample_interval_seconds",
+        5,
+      ),
+    );
+
+    clickSettingsSection("Terminal");
+    const shellInput = await screen.findByLabelText("Default shell");
+    fireEvent.change(shellInput, { target: { value: "/bin/zsh" } });
+    fireEvent.blur(shellInput);
+    await waitFor(() =>
+      expect(settingsServiceMock.SetSetting).toHaveBeenCalledWith(
+        "terminal.default_shell",
+        "/bin/zsh",
+      ),
+    );
+
+    clickSettingsSection("Appearance");
+    fireEvent.change(await screen.findByLabelText("Theme"), {
+      target: { value: "system" },
+    });
+    await waitFor(() =>
+      expect(settingsServiceMock.SetSetting).toHaveBeenCalledWith(
+        "general.theme",
+        "system",
+      ),
+    );
+
+    clickSettingsSection("Backups");
+    const backupInput = await screen.findByLabelText("Backup directory");
+    fireEvent.change(backupInput, { target: { value: "/data/backups" } });
+    fireEvent.blur(backupInput);
+    await waitFor(() =>
+      expect(settingsServiceMock.SetSetting).toHaveBeenCalledWith(
+        "backups.directory",
+        "/data/backups",
+      ),
+    );
+
+    clickSettingsSection("Registries");
+    fireEvent.change(await screen.findByLabelText("Credential mode"), {
+      target: { value: "none" },
+    });
+    await waitFor(() =>
+      expect(settingsServiceMock.SetSetting).toHaveBeenCalledWith(
+        "registry.credentials_mode",
+        "none",
+      ),
+    );
+
+    clickSettingsSection("Security & Audit");
+    expect(
+      await screen.findByRole("checkbox", {
+        name: "Destructive-action confirmation",
+      }),
+    ).toBeDisabled();
+
+    clickSettingsSection("About");
+    expect(await screen.findByText("0.1.0")).toBeInTheDocument();
+    expect(screen.getByText("go1.26.4")).toBeInTheDocument();
+  });
+
   it("runs the macOS Colima setup branch through checks and install planning", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(macOSColimaSnapshot());
     providerServiceMock.Detect.mockResolvedValueOnce({
@@ -1834,6 +1990,7 @@ describe("App inventory shell", () => {
       ),
     );
 
+    clickSettingsSection("Docker contexts");
     expect(await screen.findByText("remote-prod")).toBeInTheDocument();
     expect(screen.getByText("unencrypted tcp://")).toBeInTheDocument();
     fireEvent.click(
@@ -1872,6 +2029,11 @@ describe("App inventory shell", () => {
     expect(inventoryMock.getInventorySnapshot).toHaveBeenCalledTimes(2);
   });
 });
+
+function clickSettingsSection(name: string) {
+  const buttons = screen.getAllByRole("button", { name });
+  fireEvent.click(buttons[buttons.length - 1]);
+}
 
 function emitRuntimeEvent(eventName: string, data: unknown) {
   const callback = [...runtimeMock.on.mock.calls]

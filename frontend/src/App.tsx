@@ -32,6 +32,7 @@ import type {
   StatsScope,
   UpdateHistoryItem,
   UpdatePlan,
+  VersionInfo,
   VolumeDetail,
   VolumeSummary,
 } from "../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
@@ -165,6 +166,24 @@ type PageID =
   | "logs"
   | "terminal"
   | "settings";
+type SettingsSectionID =
+  | "general"
+  | "providers"
+  | "contexts"
+  | "updates"
+  | "registries"
+  | "metrics"
+  | "terminal"
+  | "appearance"
+  | "backups"
+  | "security"
+  | "advanced"
+  | "about";
+type SettingsToastState = {
+  level: "ok" | "error";
+  title: string;
+  body?: string;
+};
 type FilterID = string;
 type BadgeTone = "ok" | "warn" | "error" | "info" | "neutral" | "accent";
 type StatusToneID = "ok" | "warn" | "error" | "info" | "neutral";
@@ -682,6 +701,7 @@ const emptyImportProject: ImportProjectState = {
 };
 
 const windowsWSLProviderID = "windows_wsl_ubuntu";
+const linuxNativeProviderID = "linux_native";
 const macOSColimaProviderID = "macos_colima";
 
 const emptyProviderSetup: ProviderSetupState = {
@@ -859,6 +879,8 @@ function App() {
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [settingsMessage, setSettingsMessage] = useState<string | null>(null);
   const [settingsError, setSettingsError] = useState<string | null>(null);
+  const [settingsToast, setSettingsToast] =
+    useState<SettingsToastState | null>(null);
   const [setup, setSetup] = useState<ProviderSetupState>(emptyProviderSetup);
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
@@ -874,6 +896,14 @@ function App() {
     setActivePage(page);
     setSearch("");
   }, []);
+
+  useEffect(() => {
+    if (!settingsToast) {
+      return undefined;
+    }
+    const timer = window.setTimeout(() => setSettingsToast(null), 3200);
+    return () => window.clearTimeout(timer);
+  }, [settingsToast]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -1604,7 +1634,15 @@ function App() {
       try {
         await SettingsService.SetSetting(key, value);
         setAppSettings((current) => ({ ...current, [key]: value }));
+        if (key === "linux.sudo_mode") {
+          setPermissionMode(normalizePermissionMode(value));
+        }
         setSettingsMessage("Setting saved");
+        setSettingsToast({
+          body: "Your preference was saved.",
+          level: "ok",
+          title: "Setting saved",
+        });
         if (key === "windows.wsl_distro") {
           if (activeProvider?.id) {
             await ProviderService.Detect(activeProvider.id);
@@ -1616,15 +1654,25 @@ function App() {
           await refreshInventory();
           await refreshProjects();
         }
+        if (key === "linux.sudo_mode" || key === "linux.socket_path") {
+          await ProviderService.Detect(linuxNativeProviderID).catch(() => null);
+          await refreshInventory();
+          await refreshProjects();
+        }
         if (String(key).startsWith("macos.colima_")) {
           await ProviderService.Detect(macOSColimaProviderID).catch(() => null);
           await refreshInventory();
           await refreshProjects();
         }
       } catch (error: unknown) {
-        setSettingsError(
-          error instanceof Error ? error.message : "Unable to save setting",
-        );
+        const message =
+          error instanceof Error ? error.message : "Unable to save setting";
+        setSettingsError(message);
+        setSettingsToast({
+          body: message,
+          level: "error",
+          title: "Setting failed",
+        });
       } finally {
         setSettingsSaving(false);
       }
@@ -1798,15 +1846,25 @@ function App() {
       try {
         await ProviderService.SetDockerContext(name);
         setSettingsMessage(`Using Docker context ${name}`);
+        setSettingsToast({
+          body: `Using Docker context ${name}.`,
+          level: "ok",
+          title: "Docker context saved",
+        });
         await refreshDockerContexts();
         await refreshInventory();
         await refreshProjects();
       } catch (error: unknown) {
-        setSettingsError(
+        const message =
           error instanceof Error
             ? error.message
-            : "Unable to use Docker context",
-        );
+            : "Unable to use Docker context";
+        setSettingsError(message);
+        setSettingsToast({
+          body: message,
+          level: "error",
+          title: "Docker context failed",
+        });
       } finally {
         setSettingsSaving(false);
       }
@@ -3306,6 +3364,9 @@ function App() {
             onRegistryTest={(registry) => {
               void testRegistryAuth(registry);
             }}
+            onSettingChange={(key, value) => {
+              void saveSetting(key, value);
+            }}
             onSaveColimaCPU={() => {
               void saveColimaNumberSetting(
                 "macos.colima_cpu",
@@ -3348,6 +3409,7 @@ function App() {
             registryStatuses={registryStatuses}
             saving={settingsSaving}
             settings={appSettings}
+            version={version}
             wslDistro={wslDistro}
           />
         );
@@ -3656,6 +3718,16 @@ function App() {
           </div>
         </section>
       </div>
+
+      {settingsToast ? (
+        <div className="fixed bottom-5 right-5 z-50">
+          <Toast
+            body={settingsToast.body}
+            level={settingsToast.level}
+            title={settingsToast.title}
+          />
+        </div>
+      ) : null}
 
       <InspectModal
         inspect={inspect}
@@ -4893,6 +4965,7 @@ function SettingsPage({
   onRegistryLogin,
   onRegistryLogout,
   onRegistryTest,
+  onSettingChange,
   onSaveColimaCPU,
   onSaveColimaDiskGB,
   onSaveColimaMemoryGB,
@@ -4908,6 +4981,7 @@ function SettingsPage({
   registryStatuses,
   saving,
   settings,
+  version,
   wslDistro,
 }: {
   activeProvider: ProviderSummary | null;
@@ -4933,6 +5007,7 @@ function SettingsPage({
   onRegistryLogin: (registry?: string) => void;
   onRegistryLogout: (registry: string) => void;
   onRegistryTest: (registry: string) => void;
+  onSettingChange: (key: string, value: unknown) => void;
   onSaveColimaCPU: () => void;
   onSaveColimaDiskGB: () => void;
   onSaveColimaMemoryGB: () => void;
@@ -4948,30 +5023,40 @@ function SettingsPage({
   registryStatuses: Record<string, RegistryAuthStatus>;
   saving: boolean;
   settings: Record<string, unknown>;
+  version: VersionInfo | null;
   wslDistro: string;
 }) {
+  const [activeSection, setActiveSection] =
+    useState<SettingsSectionID>("providers");
   const activeStatus = activeProvider?.status;
   const providerKind = activeProvider?.kind || "windows_wsl_ubuntu";
+  const settingsSections: Array<[SettingsSectionID, string]> = [
+    ["general", "General"],
+    ["providers", "Providers"],
+    ["contexts", "Docker contexts"],
+    ["updates", "Updates"],
+    ["registries", "Registries"],
+    ["metrics", "Metrics"],
+    ["terminal", "Terminal"],
+    ["appearance", "Appearance"],
+    ["backups", "Backups"],
+    ["security", "Security & Audit"],
+    ["advanced", "Advanced"],
+    ["about", "About"],
+  ];
   return (
     <div className="grid gap-4 xl:grid-cols-[220px_minmax(0,1fr)]">
       <div className="space-y-2">
-        {[
-          "General",
-          "Providers",
-          "Docker contexts",
-          "Registries",
-          "Terminal",
-          "Security & Audit",
-          "About",
-        ].map((section) => (
+        {settingsSections.map(([id, section]) => (
           <button
             className={[
               "block h-9 w-full rounded-control px-3 text-left text-sm",
-              section === "Providers"
+              activeSection === id
                 ? "bg-accent/10 text-accent"
                 : "text-text-secondary hover:bg-bg-card",
             ].join(" ")}
-            key={section}
+            key={id}
+            onClick={() => setActiveSection(id)}
             type="button"
           >
             {section}
@@ -4991,296 +5076,611 @@ function SettingsPage({
           </div>
         ) : null}
 
-        <Card>
-          <CardHeader
-            status={
-              <Badge tone={activeProvider?.healthy ? "ok" : "warn"}>
-                {activeProvider?.healthy ? "Healthy" : "Needs checks"}
-              </Badge>
-            }
-            title="Providers"
-          />
-          <CardBody className="space-y-4">
-            <div className="rounded-card border border-border bg-bg-inset p-3">
-              <div className="flex flex-wrap items-center gap-3">
-                <Server className="text-accent" size={18} />
-                <div className="min-w-0 flex-1">
-                  <div className="font-medium text-text-primary">
-                    {activeProvider?.name ?? "Windows WSL Ubuntu"}
+        {activeSection === "general" ? (
+          <Card>
+            <CardHeader title="General" />
+            <CardBody className="space-y-3">
+              <SettingsSelectField
+                disabled={saving}
+                label="Theme"
+                onChange={(value) => onSettingChange("general.theme", value)}
+                options={[
+                  ["dark", "Dark"],
+                  ["light", "Light"],
+                  ["system", "System"],
+                ]}
+                value={settingString(settings, "general.theme", "dark")}
+              />
+              <SettingsCheckboxField
+                checked={settingBool(
+                  settings,
+                  "general.autostart_app",
+                  false,
+                )}
+                disabled={saving}
+                label="Launch Cairn at login"
+                onChange={(checked) =>
+                  onSettingChange("general.autostart_app", checked)
+                }
+              />
+              <SettingsCheckboxField
+                checked={autostartBackend}
+                disabled={saving}
+                label="Auto-start Docker backend on app launch"
+                onChange={onAutostartChange}
+              />
+              <SettingsSelectField
+                disabled
+                label="Language"
+                onChange={() => undefined}
+                options={[["en", "English"]]}
+                value={settingString(settings, "general.language", "en")}
+              />
+            </CardBody>
+          </Card>
+        ) : null}
+
+        {activeSection === "updates" ? (
+          <Card>
+            <CardHeader title="Updates" />
+            <CardBody className="space-y-3">
+              <SettingsSelectField
+                disabled={saving}
+                label="Check interval"
+                onChange={(value) =>
+                  onSettingChange("updates.check_interval_hours", Number(value))
+                }
+                options={[
+                  ["0", "Manual only"],
+                  ["6", "Every 6 hours"],
+                  ["24", "Daily"],
+                  ["168", "Weekly"],
+                ]}
+                value={String(
+                  settingInt(settings, "updates.check_interval_hours", 24),
+                )}
+              />
+              <SettingsCheckboxField
+                checked={settingBool(settings, "updates.notify", true)}
+                disabled={saving}
+                label="Notify on available updates"
+                onChange={(checked) =>
+                  onSettingChange("updates.notify", checked)
+                }
+              />
+              <ReadOnlySetting
+                label="Default health watch"
+                value="Enabled in update confirmations"
+              />
+            </CardBody>
+          </Card>
+        ) : null}
+
+        {activeSection === "metrics" ? (
+          <Card>
+            <CardHeader title="Metrics" />
+            <CardBody className="space-y-3">
+              <SettingsNumberSetting
+                disabled={saving}
+                label="Sample interval seconds"
+                max={10}
+                min={1}
+                onSave={(value) =>
+                  onSettingChange("metrics.sample_interval_seconds", value)
+                }
+                value={settingInt(
+                  settings,
+                  "metrics.sample_interval_seconds",
+                  2,
+                )}
+              />
+              <ReadOnlySetting
+                label="Retention"
+                value={`${settingInt(
+                  settings,
+                  "metrics.retention_raw_minutes",
+                  60,
+                )} min raw -> 24 h / 1 m -> 7 d / 15 m`}
+              />
+              <Button disabled disabledReason="Metrics compaction runs automatically">
+                Compact now
+              </Button>
+            </CardBody>
+          </Card>
+        ) : null}
+
+        {activeSection === "terminal" ? (
+          <Card>
+            <CardHeader title="Terminal" />
+            <CardBody className="space-y-3">
+              <SettingsTextSetting
+                disabled={saving}
+                label="Default shell"
+                onSave={(value) =>
+                  onSettingChange("terminal.default_shell", value)
+                }
+                placeholder="Auto-detect"
+                value={settingString(settings, "terminal.default_shell", "")}
+              />
+              <ReadOnlySetting label="Paste guard" value="Enabled" />
+            </CardBody>
+          </Card>
+        ) : null}
+
+        {activeSection === "appearance" ? (
+          <Card>
+            <CardHeader title="Appearance" />
+            <CardBody className="space-y-3">
+              <SettingsSelectField
+                disabled={saving}
+                label="Theme"
+                onChange={(value) => onSettingChange("general.theme", value)}
+                options={[
+                  ["dark", "Dark"],
+                  ["light", "Light"],
+                  ["system", "System"],
+                ]}
+                value={settingString(settings, "general.theme", "dark")}
+              />
+              <ReadOnlySetting label="Density" value="Comfortable" />
+              <ReadOnlySetting label="Reduced motion" value="System" />
+            </CardBody>
+          </Card>
+        ) : null}
+
+        {activeSection === "backups" ? (
+          <Card>
+            <CardHeader title="Backups" />
+            <CardBody className="space-y-3">
+              <SettingsTextSetting
+                disabled={saving}
+                label="Backup directory"
+                onSave={(value) => onSettingChange("backups.directory", value)}
+                placeholder="Default app data folder"
+                value={settingString(settings, "backups.directory", "")}
+              />
+              <ReadOnlySetting
+                label="Provider-mapped path"
+                value="Resolved by backup plans"
+              />
+            </CardBody>
+          </Card>
+        ) : null}
+
+        {activeSection === "security" ? (
+          <Card>
+            <CardHeader title="Security & Audit" />
+            <CardBody className="space-y-3">
+              <SettingsCheckboxField
+                checked={settingBool(
+                  settings,
+                  "security.confirm_destructive",
+                  true,
+                )}
+                disabled
+                label="Destructive-action confirmation"
+              />
+              <ReadOnlySetting
+                label="Audit retention"
+                value="90 days or 50,000 rows"
+              />
+            </CardBody>
+          </Card>
+        ) : null}
+
+        {activeSection === "advanced" ? (
+          <Card>
+            <CardHeader title="Advanced" />
+            <CardBody className="space-y-3">
+              <ReadOnlySetting label="Runtime cache" value="Managed by Cairn" />
+              <Button disabled disabledReason="No cached data is ready to reset">
+                Reset all caches
+              </Button>
+            </CardBody>
+          </Card>
+        ) : null}
+
+        {activeSection === "about" ? (
+          <Card>
+            <CardHeader title="About" />
+            <CardBody className="grid gap-3 sm:grid-cols-2">
+              <ReadOnlySetting
+                label="Version"
+                value={version?.version ?? "Unknown"}
+              />
+              <ReadOnlySetting
+                label="Go"
+                value={version?.goVersion ?? "Unknown"}
+              />
+              <ReadOnlySetting label="Wails" value="v3.0.0-alpha.99" />
+              <ReadOnlySetting label="Updates" value="Not checked" />
+            </CardBody>
+          </Card>
+        ) : null}
+
+        {activeSection === "providers" ? (
+          <Card>
+            <CardHeader
+              status={
+                <Badge tone={activeProvider?.healthy ? "ok" : "warn"}>
+                  {activeProvider?.healthy ? "Healthy" : "Needs checks"}
+                </Badge>
+              }
+              title="Providers"
+            />
+            <CardBody className="space-y-4">
+              <div className="rounded-card border border-border bg-bg-inset p-3">
+                <div className="flex flex-wrap items-center gap-3">
+                  <Server className="text-accent" size={18} />
+                  <div className="min-w-0 flex-1">
+                    <div className="font-medium text-text-primary">
+                      {activeProvider?.name ?? "Windows WSL Ubuntu"}
+                    </div>
+                    <div className="truncate text-xs text-text-muted">
+                      {providerKind}
+                    </div>
                   </div>
-                  <div className="truncate text-xs text-text-muted">
-                    {providerKind}
+                  <Button
+                    icon={<RefreshCw size={15} />}
+                    onClick={onDetect}
+                    size="sm"
+                    variant="secondary"
+                  >
+                    Detect again
+                  </Button>
+                  <Button
+                    icon={<Wrench size={15} />}
+                    onClick={onOpenSetup}
+                    size="sm"
+                  >
+                    Set up new backend
+                  </Button>
+                </div>
+                <div className="mt-3 grid gap-2 text-sm sm:grid-cols-4">
+                  <StatusPill
+                    label="Docker"
+                    ok={Boolean(activeStatus?.dockerRunning)}
+                    value={activeStatus?.dockerVersion || "-"}
+                  />
+                  <StatusPill
+                    label="Compose"
+                    ok={Boolean(activeStatus?.composeInstalled)}
+                    value={activeStatus?.composeVersion || "-"}
+                  />
+                  <StatusPill
+                    label="Buildx"
+                    ok={Boolean(activeStatus?.buildxInstalled)}
+                    value={activeStatus?.backendVersion || "-"}
+                  />
+                  <StatusPill
+                    label="Context"
+                    ok={Boolean(activeStatus?.currentContext)}
+                    value={activeStatus?.currentContext || "default"}
+                  />
+                </div>
+              </div>
+
+              <div className="grid gap-2 sm:grid-cols-2">
+                {providers.map((provider) => (
+                  <div
+                    className="rounded-card border border-border bg-bg-inset p-3"
+                    key={provider.id}
+                  >
+                    <div className="flex items-center justify-between gap-3">
+                      <div className="min-w-0">
+                        <div className="truncate font-medium text-text-primary">
+                          {provider.name}
+                        </div>
+                        <div className="truncate text-xs text-text-muted">
+                          {provider.kind}
+                        </div>
+                      </div>
+                      <div className="flex shrink-0 gap-2">
+                        {provider.active ? (
+                          <Badge tone="accent">active</Badge>
+                        ) : null}
+                        <Badge tone={provider.healthy ? "ok" : "warn"}>
+                          {provider.healthy ? "healthy" : "needs checks"}
+                        </Badge>
+                      </div>
+                    </div>
                   </div>
+                ))}
+                {providers.length === 0 ? (
+                  <div className="rounded-card border border-border bg-bg-inset p-3 text-sm text-text-muted">
+                    No providers configured.
+                  </div>
+                ) : null}
+              </div>
+
+              <section className="space-y-3">
+                <div>
+                  <h3 className="text-sm font-semibold text-text-primary">
+                    Windows WSL
+                  </h3>
+                  <p className="mt-1 text-sm text-text-muted">
+                    Active WSL provider settings save to Cairn settings and
+                    rerun detection.
+                  </p>
                 </div>
-                <Button
-                  icon={<RefreshCw size={15} />}
-                  onClick={onDetect}
-                  size="sm"
-                  variant="secondary"
-                >
-                  Detect again
-                </Button>
-                <Button
-                  icon={<Wrench size={15} />}
-                  onClick={onOpenSetup}
-                  size="sm"
-                >
-                  Set up new backend
-                </Button>
-              </div>
-              <div className="mt-3 grid gap-2 text-sm sm:grid-cols-4">
-                <StatusPill
-                  label="Docker"
-                  ok={Boolean(activeStatus?.dockerRunning)}
-                  value={activeStatus?.dockerVersion || "-"}
-                />
-                <StatusPill
-                  label="Compose"
-                  ok={Boolean(activeStatus?.composeInstalled)}
-                  value={activeStatus?.composeVersion || "-"}
-                />
-                <StatusPill
-                  label="Buildx"
-                  ok={Boolean(activeStatus?.buildxInstalled)}
-                  value={activeStatus?.backendVersion || "-"}
-                />
-                <StatusPill
-                  label="Context"
-                  ok={Boolean(activeStatus?.currentContext)}
-                  value={activeStatus?.currentContext || "default"}
-                />
-              </div>
-            </div>
-
-            <section className="space-y-3">
-              <div>
-                <h3 className="text-sm font-semibold text-text-primary">
-                  Windows WSL
-                </h3>
-                <p className="mt-1 text-sm text-text-muted">
-                  Active WSL provider settings save to Cairn settings and rerun
-                  detection.
-                </p>
-              </div>
-              <label className="block">
-                <span className="text-xs font-medium uppercase text-text-muted">
-                  WSL distro
-                </span>
-                <input
-                  className="mt-1 h-9 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
-                  list="wsl-distro-options"
-                  onBlur={onSaveWSLDistro}
-                  onChange={(event) => onWSLDistroChange(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") {
-                      onSaveWSLDistro();
-                    }
-                  }}
-                  value={wslDistro}
-                />
-                <datalist id="wsl-distro-options">
-                  <option value={wslDistro} />
-                  <option value="Ubuntu" />
-                  <option value="cairn-dev" />
-                </datalist>
-              </label>
-
-              <label className="flex items-center justify-between gap-3 rounded-card border border-border bg-bg-inset p-3 text-sm">
-                <span>
-                  <span className="block font-medium text-text-primary">
-                    Start Docker backend on app launch
-                  </span>
-                  <span className="mt-1 block text-text-muted">
-                    Current setting:{" "}
-                    {String(
-                      settings["provider.autostart_backend"] ??
-                        autostartBackend,
-                    )}
-                  </span>
-                </span>
-                <input
-                  checked={autostartBackend}
-                  disabled={saving}
-                  onChange={(event) => onAutostartChange(event.target.checked)}
-                  type="checkbox"
-                />
-              </label>
-
-              <div className="rounded-card border border-info/30 bg-info/10 p-3 text-sm text-info">
-                <div className="font-medium">Path mapping</div>
-                <div className="mt-2 grid gap-1 font-mono text-xs">
-                  <span>
-                    {"C:\\Users\\Ada\\project -> /mnt/c/Users/Ada/project"}
-                  </span>
-                  <span>
-                    {"\\\\wsl$\\" +
-                      (wslDistro || "Ubuntu") +
-                      "\\home\\ada\\project -> /home/ada/project"}
-                  </span>
-                </div>
-              </div>
-              <PathRecommendation />
-            </section>
-
-            <section className="space-y-3 border-t border-border pt-4">
-              <div>
-                <h3 className="text-sm font-semibold text-text-primary">
-                  macOS Colima
-                </h3>
-                <p className="mt-1 text-sm text-text-muted">
-                  Resource changes require a Colima restart before they affect
-                  the VM.
-                </p>
-              </div>
-              <div className="grid gap-3 sm:grid-cols-4">
                 <label className="block">
                   <span className="text-xs font-medium uppercase text-text-muted">
-                    Profile
+                    WSL distro
                   </span>
                   <input
                     className="mt-1 h-9 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
-                    onBlur={onSaveColimaProfile}
-                    onChange={(event) =>
-                      onColimaProfileChange(event.target.value)
-                    }
+                    list="wsl-distro-options"
+                    onBlur={onSaveWSLDistro}
+                    onChange={(event) => onWSLDistroChange(event.target.value)}
                     onKeyDown={(event) => {
                       if (event.key === "Enter") {
-                        onSaveColimaProfile();
+                        onSaveWSLDistro();
                       }
                     }}
-                    value={colimaProfile}
+                    value={wslDistro}
+                  />
+                  <datalist id="wsl-distro-options">
+                    <option value={wslDistro} />
+                    <option value="Ubuntu" />
+                    <option value="cairn-dev" />
+                  </datalist>
+                </label>
+
+                <label className="flex items-center justify-between gap-3 rounded-card border border-border bg-bg-inset p-3 text-sm">
+                  <span>
+                    <span className="block font-medium text-text-primary">
+                      Start Docker backend on app launch
+                    </span>
+                    <span className="mt-1 block text-text-muted">
+                      Current setting:{" "}
+                      {String(
+                        settings["provider.autostart_backend"] ??
+                          autostartBackend,
+                      )}
+                    </span>
+                  </span>
+                  <input
+                    checked={autostartBackend}
+                    disabled={saving}
+                    onChange={(event) =>
+                      onAutostartChange(event.target.checked)
+                    }
+                    type="checkbox"
                   />
                 </label>
-                <SettingsNumberField
-                  label="CPU"
-                  onBlur={onSaveColimaCPU}
-                  onChange={onColimaCPUChange}
-                  value={colimaCPU}
-                />
-                <SettingsNumberField
-                  label="RAM GB"
-                  onBlur={onSaveColimaMemoryGB}
-                  onChange={onColimaMemoryGBChange}
-                  value={colimaMemoryGB}
-                />
-                <SettingsNumberField
-                  label="Disk GB"
-                  onBlur={onSaveColimaDiskGB}
-                  onChange={onColimaDiskGBChange}
-                  value={colimaDiskGB}
-                />
-              </div>
-              <ColimaPathRecommendation />
-            </section>
-          </CardBody>
-        </Card>
 
-        <Card>
-          <CardHeader
-            status={
-              <Button
-                icon={<RefreshCw size={15} />}
-                loading={dockerContextsLoading}
-                onClick={onRefreshDockerContexts}
-                size="sm"
-                variant="secondary"
-              >
-                Refresh
-              </Button>
-            }
-            title="Docker Contexts"
-          />
-          <CardBody>
-            {dockerContextsError ? (
-              <div className="rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
-                {dockerContextsError}
-              </div>
-            ) : null}
-            {dockerContextsLoading && dockerContexts.length === 0 ? (
-              <TableSkeleton />
-            ) : null}
-            {!dockerContextsLoading && dockerContexts.length === 0 ? (
-              <EmptyState
-                body="Detected Docker contexts appear here when the Docker CLI is available."
-                icon={<Terminal size={28} />}
-                title="No Docker contexts"
-              />
-            ) : null}
-            {dockerContexts.length > 0 ? (
-              <DockerContextsTable
-                contexts={dockerContexts}
-                onUse={onUseDockerContext}
-                saving={saving}
-              />
-            ) : null}
-          </CardBody>
-        </Card>
+                <div className="rounded-card border border-info/30 bg-info/10 p-3 text-sm text-info">
+                  <div className="font-medium">Path mapping</div>
+                  <div className="mt-2 grid gap-1 font-mono text-xs">
+                    <span>
+                      {"C:\\Users\\Ada\\project -> /mnt/c/Users/Ada/project"}
+                    </span>
+                    <span>
+                      {"\\\\wsl$\\" +
+                        (wslDistro || "Ubuntu") +
+                        "\\home\\ada\\project -> /home/ada/project"}
+                    </span>
+                  </div>
+                </div>
+                <PathRecommendation />
+              </section>
 
-        <Card>
-          <CardHeader
-            actions={
-              <div className="flex gap-2">
+              <section className="space-y-3 border-t border-border pt-4">
+                <div>
+                  <h3 className="text-sm font-semibold text-text-primary">
+                    Linux native
+                  </h3>
+                  <p className="mt-1 text-sm text-text-muted">
+                    Native Docker socket and permission settings apply before
+                    the next provider detection.
+                  </p>
+                </div>
+                <SettingsTextSetting
+                  disabled={saving}
+                  label="Socket path"
+                  onSave={(value) =>
+                    onSettingChange(
+                      "linux.socket_path",
+                      value.trim() || "/var/run/docker.sock",
+                    )
+                  }
+                  value={settingString(
+                    settings,
+                    "linux.socket_path",
+                    "/var/run/docker.sock",
+                  )}
+                />
+                <SettingsSelectField
+                  disabled={saving}
+                  label="Permission mode"
+                  onChange={(value) =>
+                    onSettingChange("linux.sudo_mode", value)
+                  }
+                  options={[
+                    ["ask", "Ask each time"],
+                    ["group", "Docker group"],
+                    ["rootless", "Rootless Docker"],
+                  ]}
+                  value={settingString(settings, "linux.sudo_mode", "ask")}
+                />
+                <ReadOnlySetting
+                  label="Systemd service"
+                  value={
+                    activeStatus?.dockerRunning ? "Docker running" : "Pending"
+                  }
+                />
+              </section>
+
+              <section className="space-y-3 border-t border-border pt-4">
+                <div>
+                  <h3 className="text-sm font-semibold text-text-primary">
+                    macOS Colima
+                  </h3>
+                  <p className="mt-1 text-sm text-text-muted">
+                    Resource changes require a Colima restart before they affect
+                    the VM.
+                  </p>
+                </div>
+                <div className="grid gap-3 sm:grid-cols-4">
+                  <label className="block">
+                    <span className="text-xs font-medium uppercase text-text-muted">
+                      Profile
+                    </span>
+                    <input
+                      className="mt-1 h-9 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
+                      onBlur={onSaveColimaProfile}
+                      onChange={(event) =>
+                        onColimaProfileChange(event.target.value)
+                      }
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter") {
+                          onSaveColimaProfile();
+                        }
+                      }}
+                      value={colimaProfile}
+                    />
+                  </label>
+                  <SettingsNumberField
+                    label="CPU"
+                    onBlur={onSaveColimaCPU}
+                    onChange={onColimaCPUChange}
+                    value={colimaCPU}
+                  />
+                  <SettingsNumberField
+                    label="RAM GB"
+                    onBlur={onSaveColimaMemoryGB}
+                    onChange={onColimaMemoryGBChange}
+                    value={colimaMemoryGB}
+                  />
+                  <SettingsNumberField
+                    label="Disk GB"
+                    onBlur={onSaveColimaDiskGB}
+                    onChange={onColimaDiskGBChange}
+                    value={colimaDiskGB}
+                  />
+                </div>
+                <ColimaPathRecommendation />
+              </section>
+            </CardBody>
+          </Card>
+        ) : null}
+
+        {activeSection === "contexts" ? (
+          <Card>
+            <CardHeader
+              status={
                 <Button
                   icon={<RefreshCw size={15} />}
-                  loading={registryAccountsLoading}
-                  onClick={onRefreshRegistries}
+                  loading={dockerContextsLoading}
+                  onClick={onRefreshDockerContexts}
                   size="sm"
                   variant="secondary"
                 >
                   Refresh
                 </Button>
-                <Button
-                  icon={<LogIn size={15} />}
-                  onClick={() => onRegistryLogin("docker.io")}
-                  size="sm"
-                >
-                  Log in
-                </Button>
-              </div>
-            }
-            title="Registries"
-          />
-          <CardBody className="space-y-3">
-            <div className="text-sm text-text-muted">
-              Credentials stay in Docker's backend credential store. Cairn only
-              reads account metadata and sends secrets to `docker login` via
-              stdin.
-            </div>
-            {registryAccountsError ? (
-              <div className="rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
-                {registryAccountsError}
-              </div>
-            ) : null}
-            {registryAccountsLoading && registryAccounts.length === 0 ? (
-              <TableSkeleton />
-            ) : registryAccounts.length === 0 ? (
-              <EmptyState
-                body="Log in to a registry before pushing private images."
-                icon={<KeyRound size={28} />}
-                title="No registry accounts"
-              />
-            ) : (
-              <RegistryAccountsTable
-                accounts={registryAccounts}
-                busyKeys={registryBusyKeys}
-                onLogin={onRegistryLogin}
-                onLogout={onRegistryLogout}
-                onTest={onRegistryTest}
-                statuses={registryStatuses}
-              />
-            )}
-          </CardBody>
-        </Card>
+              }
+              title="Docker Contexts"
+            />
+            <CardBody>
+              {dockerContextsError ? (
+                <div className="rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
+                  {dockerContextsError}
+                </div>
+              ) : null}
+              {dockerContextsLoading && dockerContexts.length === 0 ? (
+                <TableSkeleton />
+              ) : null}
+              {!dockerContextsLoading && dockerContexts.length === 0 ? (
+                <EmptyState
+                  body="Detected Docker contexts appear here when the Docker CLI is available."
+                  icon={<Terminal size={28} />}
+                  title="No Docker contexts"
+                />
+              ) : null}
+              {dockerContexts.length > 0 ? (
+                <DockerContextsTable
+                  contexts={dockerContexts}
+                  onUse={onUseDockerContext}
+                  saving={saving}
+                />
+              ) : null}
+            </CardBody>
+          </Card>
+        ) : null}
 
-        <Card>
-          <CardHeader title="Provider Inventory" />
-          <CardBody>
-            <div className="text-sm text-text-muted">
-              {providers.length} configured provider
-              {providers.length === 1 ? "" : "s"}.
-            </div>
-          </CardBody>
-        </Card>
+        {activeSection === "registries" ? (
+          <Card>
+            <CardHeader
+              actions={
+                <div className="flex gap-2">
+                  <Button
+                    icon={<RefreshCw size={15} />}
+                    loading={registryAccountsLoading}
+                    onClick={onRefreshRegistries}
+                    size="sm"
+                    variant="secondary"
+                  >
+                    Refresh
+                  </Button>
+                  <Button
+                    icon={<LogIn size={15} />}
+                    onClick={() => onRegistryLogin("docker.io")}
+                    size="sm"
+                  >
+                    Log in
+                  </Button>
+                </div>
+              }
+              title="Registries"
+            />
+            <CardBody className="space-y-3">
+              <div className="text-sm text-text-muted">
+                Credentials stay in Docker's backend credential store. Cairn
+                only reads account metadata and sends secrets to `docker login`
+                via stdin.
+              </div>
+              <SettingsSelectField
+                disabled={saving}
+                label="Credential mode"
+                onChange={(value) =>
+                  onSettingChange("registry.credentials_mode", value)
+                }
+                options={[
+                  ["docker_helper", "Docker credential helper"],
+                  ["none", "No Cairn-managed credentials"],
+                ]}
+                value={settingString(
+                  settings,
+                  "registry.credentials_mode",
+                  "docker_helper",
+                )}
+              />
+              {registryAccountsError ? (
+                <div className="rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
+                  {registryAccountsError}
+                </div>
+              ) : null}
+              {registryAccountsLoading && registryAccounts.length === 0 ? (
+                <TableSkeleton />
+              ) : registryAccounts.length === 0 ? (
+                <EmptyState
+                  body="Log in to a registry before pushing private images."
+                  icon={<KeyRound size={28} />}
+                  title="No registry accounts"
+                />
+              ) : (
+                <RegistryAccountsTable
+                  accounts={registryAccounts}
+                  busyKeys={registryBusyKeys}
+                  onLogin={onRegistryLogin}
+                  onLogout={onRegistryLogout}
+                  onTest={onRegistryTest}
+                  statuses={registryStatuses}
+                />
+              )}
+            </CardBody>
+          </Card>
+        ) : null}
       </div>
     </div>
   );
@@ -5317,6 +5717,187 @@ function SettingsNumberField({
       />
     </label>
   );
+}
+
+function SettingsSelectField({
+  disabled,
+  label,
+  onChange,
+  options,
+  value,
+}: {
+  disabled?: boolean;
+  label: string;
+  onChange: (value: string) => void;
+  options: Array<[string, string]>;
+  value: string;
+}) {
+  return (
+    <label className="block">
+      <span className="text-xs font-medium uppercase text-text-muted">
+        {label}
+      </span>
+      <select
+        className="mt-1 h-9 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
+        disabled={disabled}
+        onChange={(event) => onChange(event.target.value)}
+        value={value}
+      >
+        {options.map(([id, name]) => (
+          <option key={id} value={id}>
+            {name}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+function SettingsCheckboxField({
+  checked,
+  disabled,
+  label,
+  onChange,
+}: {
+  checked: boolean;
+  disabled?: boolean;
+  label: string;
+  onChange?: (checked: boolean) => void;
+}) {
+  return (
+    <label className="flex items-center justify-between gap-3 rounded-card border border-border bg-bg-inset p-3 text-sm">
+      <span className="font-medium text-text-primary">{label}</span>
+      <input
+        checked={checked}
+        disabled={disabled}
+        onChange={(event) => onChange?.(event.target.checked)}
+        type="checkbox"
+      />
+    </label>
+  );
+}
+
+function SettingsTextSetting({
+  disabled,
+  label,
+  onSave,
+  placeholder,
+  value,
+}: {
+  disabled?: boolean;
+  label: string;
+  onSave: (value: string) => void;
+  placeholder?: string;
+  value: string;
+}) {
+  const save = (input: HTMLInputElement) => onSave(input.value);
+  return (
+    <label className="block">
+      <span className="text-xs font-medium uppercase text-text-muted">
+        {label}
+      </span>
+      <input
+        className="mt-1 h-9 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
+        defaultValue={value}
+        disabled={disabled}
+        key={value}
+        onBlur={(event) => save(event.currentTarget)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") {
+            save(event.currentTarget);
+          }
+        }}
+        placeholder={placeholder}
+      />
+    </label>
+  );
+}
+
+function SettingsNumberSetting({
+  disabled,
+  label,
+  max,
+  min,
+  onSave,
+  value,
+}: {
+  disabled?: boolean;
+  label: string;
+  max?: number;
+  min?: number;
+  onSave: (value: number) => void;
+  value: number;
+}) {
+  const save = (input: HTMLInputElement) => {
+    const parsed = Number(input.value);
+    if (!Number.isFinite(parsed)) {
+      input.value = String(value);
+      return;
+    }
+    const lowerBounded = min === undefined ? parsed : Math.max(min, parsed);
+    const nextValue =
+      max === undefined ? lowerBounded : Math.min(max, lowerBounded);
+    input.value = String(nextValue);
+    onSave(nextValue);
+  };
+  return (
+    <label className="block">
+      <span className="text-xs font-medium uppercase text-text-muted">
+        {label}
+      </span>
+      <input
+        className="mt-1 h-9 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
+        defaultValue={String(value)}
+        disabled={disabled}
+        key={value}
+        max={max}
+        min={min}
+        onBlur={(event) => save(event.currentTarget)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") {
+            save(event.currentTarget);
+          }
+        }}
+        type="number"
+      />
+    </label>
+  );
+}
+
+function ReadOnlySetting({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-card border border-border bg-bg-inset p-3 text-sm">
+      <div className="text-xs font-medium uppercase text-text-muted">
+        {label}
+      </div>
+      <div className="mt-1 text-text-primary">{value}</div>
+    </div>
+  );
+}
+
+function settingString(
+  settings: Record<string, unknown>,
+  key: string,
+  fallback: string,
+) {
+  return typeof settings[key] === "string" ? settings[key] : fallback;
+}
+
+function settingBool(
+  settings: Record<string, unknown>,
+  key: string,
+  fallback: boolean,
+) {
+  return typeof settings[key] === "boolean" ? settings[key] : fallback;
+}
+
+function settingInt(
+  settings: Record<string, unknown>,
+  key: string,
+  fallback: number,
+) {
+  const value = settings[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
 function DockerContextsTable({
