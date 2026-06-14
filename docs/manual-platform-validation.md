@@ -155,20 +155,21 @@ Current evidence: automated tests cover the 14 normative update/lineage/registry
 
 ## Phase 10.4 Linux Native Release Matrix
 
-Current evidence: Ubuntu 24.04 CI is green for lint/unit/contract checks, real Docker reconnect/logs/metrics/terminal/backup/registry/tag-push integrations, package smoke for AppImage and `.deb`, `.deb` install/uninstall, and release validation smoke. CI run 27493199996 proved the fixed `.deb` install/uninstall smoke, CI run 27495650306 repeated the full matrix after the route-complete degraded release UI evidence refresh, CI run 27496699180 repeated the full matrix after adding the seeded browser performance fixture to release UI validation, and CI run 27499807123 repeated the current full matrix at commit `6e3dc6a`. Debian stable and interactive installed-app degraded-mode rows are unavailable in this environment and remain manual TODOs.
+Current evidence: Ubuntu 24.04 CI is green for lint/unit/contract checks, real Docker reconnect/logs/metrics/terminal/backup/registry/tag-push integrations, package smoke for AppImage and `.deb`, `.deb` install/uninstall, Debian stable container `.deb` install/uninstall, and release validation smoke. CI run 27493199996 proved the fixed `.deb` install/uninstall smoke, CI run 27495650306 repeated the full matrix after the route-complete degraded release UI evidence refresh, CI run 27496699180 repeated the full matrix after adding the seeded browser performance fixture to release UI validation, CI run 27499807123 repeated the matrix after adding the explicit Windows WSL provider validation harness, and CI run 27500726482 repeated the current full matrix after adding the Debian stable container package smoke. Debian stable desktop/AppImage/rootless and interactive installed-app degraded-mode rows are unavailable in this environment and remain manual TODOs.
 
 - [x] Ubuntu 24.04 CI: generated bindings diff clean, frontend audit/lint/unit/catalog/build green, Go unit/vet/golangci green.
 - [x] Ubuntu 24.04 CI: real Docker reconnect integration covers daemon stop/start recovery.
 - [x] Ubuntu 24.04 CI: real Docker logs, metrics, terminal, backup, registry auth, and tag/push integrations green.
 - [x] Ubuntu 24.04 CI: package smoke produces non-empty AppImage and `.deb` artifacts.
 - [x] Ubuntu 24.04 CI: `.deb` installs and removes cleanly, verifies `/usr/bin/cairn`, desktop file, hicolor icon, no Docker package dependencies, no docker-group mutation, and no package-owned files left after remove.
+- [x] Debian stable container: `.deb` installs and removes cleanly, verifies `/usr/bin/cairn`, desktop file, hicolor icon, no Docker package dependencies, no docker-group mutation, and `ldd` dependency resolution.
 - [x] Ubuntu 24.04 CI: release validation smoke runs `security,performance,soak-smoke,ui-release`.
 - [x] Browser release smoke: daemon-stopped fixture shows the global degraded banner and stale cached-data watermark on every release route, keeps those degraded route states free of serious axe violations, disables the `Stop web` container mutation, and does not start log/stats streams; the current 15-check suite passed on Windows and in Ubuntu CI, and the previous 14-check route/degraded suite passed inside a WSL Docker Playwright container.
 - [x] Browser release performance smoke: seeded fixture covers 100 containers, 500 images, 200 volumes, 20 networks, 10 projects, and 5,000 virtualized log lines with first-render, route-switch, and filter budgets; green in Ubuntu CI run 27496699180 and local Windows `npm run test:release-ui`.
 - [ ] Ubuntu LTS manual desktop smoke: launch installed `.deb`, stop Docker, verify every page shows the degraded/stale state, repair/start affordances, and disabled mutations; restart Docker and verify auto-recovery.
 - [ ] Ubuntu LTS manual desktop smoke: launch the AppImage on a clean host with Docker present and repeat Dashboard, Projects, Containers, Images, Volumes, Networks, Logs, Terminal, Updates, Settings, and Audit navigation.
 - [ ] Ubuntu LTS manual permission matrix: user in docker group, user not in docker group with sudo-per-action, rootless Docker socket.
-- [ ] Debian stable VM: install/remove `.deb`, verify binary/desktop/icon paths and no Docker dependency/group mutation.
+- [ ] Debian stable VM: install/remove `.deb` on a real desktop VM, verify binary/desktop/icon paths and no Docker dependency/group mutation.
 - [ ] Debian stable VM: launch AppImage with Docker present, Docker absent, Docker stopped, and rootless Docker.
 
 ## Full Platform Matrix TODO
