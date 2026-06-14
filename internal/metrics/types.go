@@ -74,6 +74,7 @@ type Manager struct {
 	pending      []store.MetricsSampleRecord
 	lastRetain   time.Time
 	onlineCPUs   uint32
+	flushMu      sync.Mutex
 }
 
 type Sample struct {

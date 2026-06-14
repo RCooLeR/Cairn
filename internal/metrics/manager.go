@@ -428,11 +428,23 @@ func (m *Manager) flush(ctx context.Context) error {
 	if m.Repository == nil {
 		return nil
 	}
+	m.flushMu.Lock()
+	defer m.flushMu.Unlock()
+
 	m.mu.Lock()
 	pending := append([]store.MetricsSampleRecord(nil), m.pending...)
 	m.pending = nil
 	m.mu.Unlock()
-	return m.Repository.InsertBatch(ctx, pending)
+	if len(pending) == 0 {
+		return nil
+	}
+	if err := m.Repository.InsertBatch(ctx, pending); err != nil {
+		m.mu.Lock()
+		m.pending = append(pending, m.pending...)
+		m.mu.Unlock()
+		return err
+	}
+	return nil
 }
 
 func (m *Manager) maybeRetain(ctx context.Context) {

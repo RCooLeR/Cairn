@@ -115,6 +115,52 @@ func TestManagerStreamsPersistsAndRanksSamples(t *testing.T) {
 	}
 }
 
+func TestManagerFlushRetainsPendingOnCanceledContext(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir()+"/cairn.db")
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	now := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)
+	manager := NewManager(nil, db.Metrics(), nil, nil, nil, Options{})
+	manager.pending = []store.MetricsSampleRecord{{
+		ProviderID:  "linux_native",
+		ProjectID:   "linux_native/demo",
+		ServiceID:   "linux_native/demo::web",
+		ContainerID: "c1",
+		CPUPercent:  42,
+		Resolution:  store.MetricsResolutionRaw,
+		SampledAt:   now,
+	}}
+
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	_ = manager.flush(canceled)
+	if err := manager.flush(ctx); err != nil {
+		t.Fatalf("flush retry error = %v", err)
+	}
+
+	series, err := db.Metrics().QuerySeries(ctx, store.MetricsSeriesFilter{
+		ContainerID: "c1",
+		Resolution:  store.MetricsResolutionRaw,
+		From:        now.Add(-time.Minute),
+		To:          now.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("QuerySeries() error = %v", err)
+	}
+	if points := series.Series[0].Points; len(points) != 1 || points[0].Value != 42 {
+		t.Fatalf("persisted CPU points = %#v, want 42", points)
+	}
+}
+
 func TestManagerQueriesStopsFallbackAndScopes(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)
