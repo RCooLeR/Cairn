@@ -61,12 +61,15 @@ describe('UI kit', () => {
           },
         ]}
         getRowID={(row) => row.name}
+        ariaLabel="Workers"
         rows={[{ name: 'worker' }, { name: 'api' }]}
       />,
     );
 
-    fireEvent.click(screen.getByRole('button', { name: 'Name' }));
+    expect(screen.getByRole('table', { name: 'Workers' })).toHaveAttribute('aria-rowcount', '2');
+    fireEvent.click(screen.getByRole('button', { name: 'Sort by Name, not sorted' }));
     expect(screen.getAllByRole('cell').map((cell) => cell.textContent)).toEqual(['api', 'worker']);
+    expect(screen.getByRole('button', { name: 'Sort by Name, sorted ascending' })).toBeInTheDocument();
   });
 
   it('shows selected rows and bulk actions', async () => {
@@ -78,13 +81,14 @@ describe('UI kit', () => {
         columns={[{ id: 'name', header: 'Name', render: (row: { name: string }) => row.name }]}
         getRowID={(row) => row.name}
         onToggleRow={onToggle}
+        rowLabel={(row) => row.name}
         rows={[{ name: 'api' }]}
         selectedIDs={new Set(['api'])}
       />,
     );
 
     expect(screen.getByText('1 selected')).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('checkbox', { name: 'Select row api' }));
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Select api' }));
     expect(onToggle).toHaveBeenCalledWith('api');
   });
 

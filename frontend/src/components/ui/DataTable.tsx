@@ -22,8 +22,10 @@ type DataTableProps<T> = {
   columns: Array<DataTableColumn<T>>;
   rows: T[];
   getRowID: (row: T) => string;
+  ariaLabel?: string;
   selectedIDs?: Set<string>;
   onToggleRow?: (id: string) => void;
+  rowLabel?: (row: T) => string;
   bulkActions?: ReactNode;
   empty?: ReactNode;
 };
@@ -34,11 +36,13 @@ type SortState = {
 };
 
 export function DataTable<T>({
+  ariaLabel = 'Data table',
   bulkActions,
   columns,
   empty,
   getRowID,
   onToggleRow,
+  rowLabel,
   rows,
   selectedIDs = new Set<string>(),
 }: DataTableProps<T>) {
@@ -125,12 +129,16 @@ export function DataTable<T>({
         }}
       >
         <table
+          aria-label={ariaLabel}
+          aria-colcount={columnCount}
           aria-rowcount={visibleRows.length}
           className="min-w-full table-fixed text-left text-sm"
         >
           <thead className="sticky top-0 z-10 bg-bg-inset text-xs text-text-muted">
             <tr>
-              {onToggleRow ? <th className="w-10 px-3 py-2" scope="col" /> : null}
+              {onToggleRow ? (
+                <th aria-label="Selection" className="w-10 px-3 py-2" scope="col" />
+              ) : null}
               {columns.map((column) => (
                 <th
                   aria-sort={
@@ -148,6 +156,7 @@ export function DataTable<T>({
                 >
                   {column.sortable ? (
                     <button
+                      aria-label={sortButtonLabel(column.header, sort, column.id)}
                       className="inline-flex items-center gap-1 text-left hover:text-text-primary"
                       onClick={() => toggleSort(column)}
                       type="button"
@@ -171,12 +180,13 @@ export function DataTable<T>({
             {virtualRows.map((row) => {
               const id = getRowID(row);
               const selected = selectedIDs.has(id);
+              const label = rowLabel?.(row) || id;
               return (
                 <tr className={cx('hover:bg-bg-inset', selected && 'bg-accent/10')} key={id}>
                   {onToggleRow ? (
                     <td className="px-3 py-2">
                       <input
-                        aria-label={`Select row ${id}`}
+                        aria-label={`Select ${label}`}
                         checked={selected}
                         onChange={() => onToggleRow(id)}
                         type="checkbox"
@@ -201,4 +211,15 @@ export function DataTable<T>({
       </div>
     </div>
   );
+}
+
+function sortButtonLabel(
+  header: string,
+  sort: SortState | null,
+  columnID: string,
+) {
+  if (sort?.columnID !== columnID) {
+    return `Sort by ${header}, not sorted`;
+  }
+  return `Sort by ${header}, sorted ${sort.direction === 'asc' ? 'ascending' : 'descending'}`;
 }

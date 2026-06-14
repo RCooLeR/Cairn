@@ -519,6 +519,9 @@ describe("App inventory shell", () => {
       "objects:changed",
       expect.any(Function),
     );
+    const searchInput = screen.getByLabelText("Search inventory");
+    fireEvent.keyDown(window, { key: "/" });
+    expect(searchInput).toHaveFocus();
   });
 
   it("opens the notification center and marks notifications read", async () => {

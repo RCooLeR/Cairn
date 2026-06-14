@@ -93,6 +93,7 @@ import {
   WrapText,
 } from "lucide-react";
 import {
+  type RefObject,
   type ReactNode,
   useCallback,
   useEffect,
@@ -961,6 +962,7 @@ function App() {
   const [settingsSection, setSettingsSection] =
     useState<SettingsSectionID>("providers");
   const [search, setSearch] = useState("");
+  const searchInputRef = useRef<HTMLInputElement>(null);
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [projectsStatus, setProjectsStatus] = useState<LoadStatus>("idle");
   const [projectsError, setProjectsError] = useState<string | null>(null);
@@ -1126,6 +1128,17 @@ function App() {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
         setPaletteOpen(true);
+        return;
+      }
+      if (
+        event.key === "/" &&
+        !event.ctrlKey &&
+        !event.metaKey &&
+        !event.altKey &&
+        !isEditableElement(event.target)
+      ) {
+        event.preventDefault();
+        searchInputRef.current?.focus();
       }
     };
     window.addEventListener("keydown", onKeyDown);
@@ -4039,7 +4052,11 @@ function App() {
               </p>
             </div>
             <div className="flex w-full items-center gap-2 sm:w-auto">
-              <SearchBox value={search} onChange={setSearch} />
+              <SearchBox
+                inputRef={searchInputRef}
+                value={search}
+                onChange={setSearch}
+              />
               <Tooltip label="Refresh">
                 <Button
                   aria-label="Refresh"
@@ -10000,6 +10017,7 @@ function UpdatesPage({
                 />
                 <CardBody>
                   <DataTable
+                    ariaLabel={`${group.projectName} updates`}
                     columns={[
                       {
                         id: "service",
@@ -10173,6 +10191,7 @@ function UpdateHistoryTable({
       ) : null}
       {loading && history.length === 0 ? <TableSkeleton /> : null}
       <DataTable
+        ariaLabel="Update history"
         columns={[
           {
             id: "time",
@@ -10281,6 +10300,7 @@ function IgnoredUpdatesTable({
       ) : null}
       {loading && ignored.length === 0 ? <TableSkeleton /> : null}
       <DataTable
+        ariaLabel="Ignored updates"
         columns={[
           {
             id: "project",
@@ -10579,6 +10599,7 @@ function ProjectList({
 }) {
   return (
     <DataTable
+      ariaLabel="Projects list"
       columns={[
         {
           id: "name",
@@ -11079,6 +11100,7 @@ function ProjectOverviewTab({ detail }: { detail: ProjectDetail }) {
 function ProjectServicesTab({ detail }: { detail: ProjectDetail }) {
   return (
     <DataTable
+      ariaLabel={`${detail.summary.name} services`}
       columns={[
         {
           id: "name",
@@ -11147,6 +11169,7 @@ function ProjectServicesTab({ detail }: { detail: ProjectDetail }) {
 function ProjectContainersTab({ detail }: { detail: ProjectDetail }) {
   return (
     <DataTable
+      ariaLabel={`${detail.summary.name} containers`}
       columns={[
         {
           id: "name",
@@ -11500,6 +11523,7 @@ function ProjectBackupsTab({
       </Card>
 
       <DataTable
+        ariaLabel="Project backups"
         columns={[
           {
             id: "volume",
@@ -11647,6 +11671,7 @@ function ContainersPage({
         onChange={onFilterChange}
       />
       <DataTable
+        ariaLabel="Containers inventory"
         columns={[
           {
             id: "name",
@@ -11763,6 +11788,7 @@ function ContainersPage({
         }
         getRowID={(container) => container.id}
         onToggleRow={onToggleSelection}
+        rowLabel={(container) => container.name || shortID(container.id)}
         rows={filtered}
         selectedIDs={selectedIDs}
       />
@@ -11861,6 +11887,7 @@ function ImagesPage({
         </div>
       </div>
       <DataTable
+        ariaLabel="Images inventory"
         columns={[
           {
             id: "repo",
@@ -12012,6 +12039,7 @@ function VolumesPage({
         </Button>
       </div>
       <DataTable
+        ariaLabel="Volumes inventory"
         columns={[
           {
             id: "name",
@@ -12153,6 +12181,7 @@ function NetworksPage({
         </Button>
       </div>
       <DataTable
+        ariaLabel="Networks inventory"
         columns={[
           {
             id: "name",
@@ -12234,9 +12263,11 @@ function NetworksPage({
 }
 
 function SearchBox({
+  inputRef,
   onChange,
   value,
 }: {
+  inputRef?: RefObject<HTMLInputElement>;
   value: string;
   onChange: (value: string) => void;
 }) {
@@ -12248,6 +12279,7 @@ function SearchBox({
         className="min-w-0 flex-1 bg-transparent text-text-primary outline-none placeholder:text-text-muted"
         onChange={(event) => onChange(event.target.value)}
         placeholder="Search"
+        ref={inputRef}
         value={value}
       />
     </label>
@@ -15499,6 +15531,19 @@ function isUnencryptedDockerHost(host?: string) {
     .trim()
     .toLowerCase()
     .startsWith("tcp://");
+}
+
+function isEditableElement(target: EventTarget | null) {
+  if (!(target instanceof HTMLElement)) {
+    return false;
+  }
+  const tag = target.tagName.toLowerCase();
+  return (
+    target.isContentEditable ||
+    tag === "input" ||
+    tag === "textarea" ||
+    tag === "select"
+  );
 }
 
 function setupCheckRow(
