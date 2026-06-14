@@ -22,7 +22,7 @@ function Require-Any([string]$Pattern, [string]$Description) {
       throw "Artifact is empty: $($match.FullName)"
     }
   }
-  $matches | ForEach-Object { Write-Host "Found $Description: $($_.Name)" }
+  $matches | ForEach-Object { Write-Host "Found ${Description}: $($_.Name)" }
 }
 
 switch ($Platform) {
