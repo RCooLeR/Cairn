@@ -24,6 +24,7 @@ func dialCommandStdio(ctx context.Context, command []string) (net.Conn, error) {
 		return nil, exec.ErrNotFound
 	}
 	cmd := exec.CommandContext(ctx, command[0], command[1:]...)
+	configureBackgroundCommand(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err

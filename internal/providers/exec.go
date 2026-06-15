@@ -46,6 +46,7 @@ func (ExecRunner) RunWithOptions(ctx context.Context, opts CommandRunOptions, na
 
 	started := time.Now()
 	cmd := exec.CommandContext(runCtx, name, args...)
+	configureBackgroundCommand(cmd)
 	cmd.Dir = opts.Workdir
 	if len(opts.Env) > 0 {
 		cmd.Env = mergeEnv(os.Environ(), opts.Env)
