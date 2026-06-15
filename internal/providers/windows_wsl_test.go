@@ -71,7 +71,7 @@ func TestWindowsWSLDetectHealthyCustomDistro(t *testing.T) {
 	runner.paths[wslCommandName] = `C:\Windows\System32\wsl.exe`
 	runner.outputs[wslCommandName+" --status"] = "Default Version: 2\n"
 	runner.outputs[wslCommandName+" -l -v"] = utf16LE("  NAME       STATE      VERSION\n  cairn-dev  Running    2\n")
-	runner.outputs[wslCommandName+" -d cairn-dev -- sh -lc cat /etc/os-release"] = "ID=ubuntu\nID_LIKE=debian\n"
+	runner.outputs[wslCommandName+" -d cairn-dev -- sh -lc cat /etc/os-release"] = "ID=arch\nID_LIKE=arch\n"
 	runner.outputs[wslCommandName+" -d cairn-dev -- test -d /run/systemd/system"] = ""
 	runner.outputs[wslCommandName+" -d cairn-dev -- sh -lc readlink -f /usr/bin/docker 2>/dev/null || true"] = "/usr/bin/docker\n"
 	runner.outputs[wslCommandName+" -d cairn-dev -- sh -lc command -v docker >/dev/null 2>&1"] = "/usr/bin/docker\n"
@@ -87,6 +87,7 @@ func TestWindowsWSLDetectHealthyCustomDistro(t *testing.T) {
 	if !status.Healthy {
 		t.Fatalf("Healthy = false, problems = %#v", status.Problems)
 	}
+	assertNoProblem(t, status.Problems, ProblemUbuntuMissing)
 	if !status.DockerInstalled || !status.ComposeInstalled || !status.BuildxInstalled || !status.DockerRunning {
 		t.Fatalf("status missing installed/running flags: %#v", status)
 	}
@@ -144,6 +145,19 @@ func TestWindowsWSLDetectProblemCases(t *testing.T) {
 				r.outputs[wslCommandName+" -d Ubuntu -- sh -lc readlink -f /usr/bin/docker 2>/dev/null || true"] = "/mnt/wsl/docker-desktop/cli-tools/usr/bin/docker\n"
 			},
 			want: ProblemDesktopIntegrationConflict,
+		},
+		{
+			name: "custom non ubuntu distro missing docker",
+			configure: func(r *fakeRunner) {
+				r.paths[wslCommandName] = `C:\Windows\System32\wsl.exe`
+				r.outputs[wslCommandName+" --status"] = "Default Version: 2\n"
+				r.outputs[wslCommandName+" -l -v"] = "  NAME       STATE      VERSION\n  cairn-dev  Running    2\n"
+				r.outputs[wslCommandName+" -d cairn-dev -- sh -lc cat /etc/os-release"] = "ID=arch\nID_LIKE=arch\n"
+				r.outputs[wslCommandName+" -d cairn-dev -- test -d /run/systemd/system"] = ""
+				r.outputs[wslCommandName+" -d cairn-dev -- sh -lc readlink -f /usr/bin/docker 2>/dev/null || true"] = ""
+				r.errors[wslCommandName+" -d cairn-dev -- sh -lc command -v docker >/dev/null 2>&1"] = errors.New("missing")
+			},
+			want: ProblemDockerMissing,
 		},
 	}
 
@@ -462,4 +476,13 @@ func utf16LE(value string) string {
 		binary.LittleEndian.PutUint16(raw[2+i*2:], unit)
 	}
 	return string(raw)
+}
+
+func assertNoProblem(t *testing.T, problems []models.ProviderProblem, code string) {
+	t.Helper()
+	for _, problem := range problems {
+		if problem.Code == code {
+			t.Fatalf("unexpected problem %s in %#v", code, problems)
+		}
+	}
 }

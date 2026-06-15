@@ -107,7 +107,7 @@ func (p *WindowsWSLProvider) Detect(ctx context.Context) (*models.ProviderStatus
 		status.Problems = append(status.Problems, providerProblem(
 			ProblemWSLMissing,
 			"WSL is not installed or wsl.exe is not on PATH.",
-			"Install WSL 2 with an Ubuntu distribution, then reopen Cairn.",
+			"Install WSL 2 with a Docker-capable Linux distribution, then reopen Cairn.",
 			true,
 		))
 		return status, nil
@@ -123,7 +123,7 @@ func (p *WindowsWSLProvider) Detect(ctx context.Context) (*models.ProviderStatus
 		status.Problems = append(status.Problems, providerProblem(
 			ProblemUbuntuMissing,
 			"No usable WSL distro was found.",
-			"Install Ubuntu on WSL 2, or select a Docker-capable Ubuntu distro in Settings.",
+			"Install a WSL 2 Linux distro with Docker, or select one in Settings.",
 			true,
 		))
 		return status, nil
@@ -134,7 +134,7 @@ func (p *WindowsWSLProvider) Detect(ctx context.Context) (*models.ProviderStatus
 		status.Problems = append(status.Problems, providerProblem(
 			ProblemUbuntuMissing,
 			fmt.Sprintf("Configured WSL distro %q was not found.", p.configuredDistro()),
-			"Select an installed Ubuntu WSL 2 distro in Settings.",
+			"Select an installed WSL 2 distro in Settings.",
 			true,
 		))
 		return status, nil
@@ -151,14 +151,19 @@ func (p *WindowsWSLProvider) Detect(ctx context.Context) (*models.ProviderStatus
 		return status, nil
 	}
 
-	if release, ok := p.runWSLText(ctx, selected.Name, "sh", "-lc", "cat /etc/os-release"); !ok || !isUbuntuOSRelease(release) {
-		status.Problems = append(status.Problems, providerProblem(
-			ProblemUbuntuMissing,
-			fmt.Sprintf("WSL distro %q is not an Ubuntu-family distro.", selected.Name),
-			"Install Ubuntu on WSL 2, or select an Ubuntu-family distro in Settings.",
-			true,
-		))
-		return status, nil
+	ubuntuFamily := false
+	if release, ok := p.runWSLText(ctx, selected.Name, "sh", "-lc", "cat /etc/os-release"); ok {
+		ubuntuFamily = isUbuntuOSRelease(release)
+	}
+	dockerInstallHint := "Install Docker Engine and the docker CLI inside the selected WSL distro."
+	composeInstallHint := "Install the Docker Compose plugin inside the selected WSL distro."
+	buildxInstallHint := "Install the Docker Buildx plugin inside the selected WSL distro."
+	dockerStartHint := "Start Docker Engine inside the selected WSL distro with `sudo systemctl start docker`."
+	if !ubuntuFamily {
+		dockerInstallHint = "Install Docker Engine manually for this WSL distro, or select an Ubuntu-family distro if you want Cairn's automatic installer."
+		composeInstallHint = "Install the Docker Compose plugin for this WSL distro, or use an Ubuntu-family distro for Cairn's automatic installer."
+		buildxInstallHint = "Install the Docker Buildx plugin for this WSL distro, or use an Ubuntu-family distro for Cairn's automatic installer."
+		dockerStartHint = "Start Docker Engine inside the selected WSL distro, or check that its service manager is configured."
 	}
 
 	if !p.runWSLOK(ctx, selected.Name, "test", "-d", "/run/systemd/system") {
@@ -184,7 +189,7 @@ func (p *WindowsWSLProvider) Detect(ctx context.Context) (*models.ProviderStatus
 		status.Problems = append(status.Problems, providerProblem(
 			ProblemDockerMissing,
 			fmt.Sprintf("Docker CLI is missing inside WSL distro %q.", selected.Name),
-			"Install Docker Engine and the docker CLI inside the selected Ubuntu WSL distro.",
+			dockerInstallHint,
 			true,
 		))
 		return status, nil
@@ -201,7 +206,7 @@ func (p *WindowsWSLProvider) Detect(ctx context.Context) (*models.ProviderStatus
 		status.Problems = append(status.Problems, providerProblem(
 			ProblemComposeMissing,
 			"Docker Compose plugin is missing inside the selected WSL distro.",
-			"Install the docker-compose-plugin package inside Ubuntu.",
+			composeInstallHint,
 			true,
 		))
 	}
@@ -212,7 +217,7 @@ func (p *WindowsWSLProvider) Detect(ctx context.Context) (*models.ProviderStatus
 		status.Problems = append(status.Problems, providerProblem(
 			ProblemBuildxMissing,
 			"Docker Buildx plugin is missing inside the selected WSL distro.",
-			"Install the docker-buildx-plugin package inside Ubuntu.",
+			buildxInstallHint,
 			true,
 		))
 	}
@@ -224,7 +229,7 @@ func (p *WindowsWSLProvider) Detect(ctx context.Context) (*models.ProviderStatus
 		status.Problems = append(status.Problems, providerProblem(
 			ProblemDockerDown,
 			"Docker daemon is not reachable inside the selected WSL distro.",
-			"Start Docker Engine inside Ubuntu with `sudo systemctl start docker`.",
+			dockerStartHint,
 			true,
 		))
 	}
