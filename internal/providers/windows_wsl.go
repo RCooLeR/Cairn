@@ -401,7 +401,16 @@ func (p *WindowsWSLProvider) BackendShellCommand(opts models.TerminalOptions) ([
 	if shell == "" {
 		shell = "/bin/bash"
 	}
-	return []string{wslCommandName, "-d", p.configuredDistro(), "--", shell}, nil
+	argv := []string{wslCommandName, "-d", p.configuredDistro()}
+	if workdir := strings.TrimSpace(opts.WorkingDir); workdir != "" {
+		backendWorkdir, err := p.MapPathToBackend(workdir)
+		if err != nil {
+			return nil, err
+		}
+		argv = append(argv, "--cd", backendWorkdir)
+	}
+	argv = append(argv, "--", shell)
+	return argv, nil
 }
 
 func (p *WindowsWSLProvider) MapPathToBackend(hostPath string) (string, error) {

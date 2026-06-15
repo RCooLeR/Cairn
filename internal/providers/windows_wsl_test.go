@@ -209,6 +209,14 @@ func TestWindowsWSLRunDockerComposeAndShellCommands(t *testing.T) {
 	if got, want := backendShell, []string{wslCommandName, "-d", "cairn-dev", "--", "/bin/zsh"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("BackendShellCommand() = %#v, want %#v", got, want)
 	}
+
+	backendShell, err = provider.BackendShellCommand(models.TerminalOptions{WorkingDir: `C:\Users\Ada\Project One`})
+	if err != nil {
+		t.Fatalf("BackendShellCommand(workdir) error = %v", err)
+	}
+	if got, want := backendShell, []string{wslCommandName, "-d", "cairn-dev", "--cd", "/mnt/c/Users/Ada/Project One", "--", "/bin/bash"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("BackendShellCommand(workdir) = %#v, want %#v", got, want)
+	}
 }
 
 func TestWindowsWSLDockerDialerUsesDockerDialStdio(t *testing.T) {
