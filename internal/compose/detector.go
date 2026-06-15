@@ -24,6 +24,7 @@ type ProjectDetector struct {
 	ContextName string
 	Docker      DockerInventory
 	Compose     *Client
+	PathMapper  PathMapper
 	Projects    *store.ProjectRepository
 	Objects     *store.ObjectCacheRepository
 	Now         func() time.Time
@@ -116,10 +117,10 @@ func (d *ProjectDetector) mergeContainer(record store.ContainerCacheRecord, dete
 	project := d.ensureProject(detected, projectName, store.ProjectSourceLabels, now)
 	project.record.Source = store.ProjectSourceLabels
 	project.record.LastSeenAt = now
-	if workdir := strings.TrimSpace(record.Labels[LabelWorkingDir]); project.record.WorkingDir == "" && workdir != "" {
+	if workdir := d.hostPath(record.Labels[LabelWorkingDir]); project.record.WorkingDir == "" && workdir != "" {
 		project.record.WorkingDir = workdir
 	}
-	if files := splitConfigFiles(record.Labels[LabelConfigFiles]); len(project.record.ComposeFiles) == 0 && len(files) > 0 {
+	if files := d.hostPaths(splitConfigFiles(record.Labels[LabelConfigFiles])); len(project.record.ComposeFiles) == 0 && len(files) > 0 {
 		project.record.ComposeFiles = files
 	}
 	project.states = append(project.states, record.Summary.State)
@@ -155,10 +156,10 @@ func (d *ProjectDetector) mergeComposeLS(project Project, detected map[string]*d
 		record.record.Source = store.ProjectSourceComposeLS
 	}
 	if len(record.record.ComposeFiles) == 0 {
-		record.record.ComposeFiles = append([]string(nil), project.ConfigFiles...)
+		record.record.ComposeFiles = d.hostPaths(project.ConfigFiles)
 	}
 	if record.record.WorkingDir == "" {
-		record.record.WorkingDir = workdirFromFiles(project.ConfigFiles)
+		record.record.WorkingDir = d.hostPath(workdirFromFiles(project.ConfigFiles))
 	}
 	if len(record.states) == 0 {
 		record.record.Status = statusFromComposeLS(project.Status)
@@ -176,6 +177,7 @@ func (d *ProjectDetector) mergeImported(project store.ProjectRecord, detected ma
 	}
 	existing := detected[name]
 	if existing != nil {
+		project.WorkingDir = d.hostPath(project.WorkingDir)
 		if project.WorkingDir != "" && existing.record.WorkingDir != "" && !samePath(project.WorkingDir, existing.record.WorkingDir) {
 			existing.metadata()["warnings"] = appendStringMeta(existing.metadata()["warnings"], "IMPORTED_WORKDIR_MISMATCH")
 		}
@@ -183,8 +185,8 @@ func (d *ProjectDetector) mergeImported(project store.ProjectRecord, detected ma
 		return
 	}
 	imported := d.ensureProject(detected, name, store.ProjectSourceImported, now)
-	imported.record.WorkingDir = project.WorkingDir
-	imported.record.ComposeFiles = append([]string(nil), project.ComposeFiles...)
+	imported.record.WorkingDir = d.hostPath(project.WorkingDir)
+	imported.record.ComposeFiles = d.hostPaths(project.ComposeFiles)
 	imported.record.Pinned = project.Pinned
 	imported.record.Metadata = cloneMeta(project.Metadata)
 	imported.record.LastSeenAt = now
@@ -194,6 +196,8 @@ func (d *ProjectDetector) enrichFromConfig(ctx context.Context, project *detecte
 	if project == nil || d.Compose == nil {
 		return
 	}
+	project.record.WorkingDir = d.hostPath(project.record.WorkingDir)
+	project.record.ComposeFiles = d.hostPaths(project.record.ComposeFiles)
 	if project.record.WorkingDir != "" {
 		if info, err := os.Stat(project.record.WorkingDir); err != nil || !info.IsDir() {
 			project.metadata()["errorCode"] = string(apperror.WorkdirMissing)
@@ -229,6 +233,31 @@ func (d *ProjectDetector) enrichFromConfig(ctx context.Context, project *detecte
 		service.record.BuildTarget = serviceConfig.BuildTarget
 		service.record.Metadata = serviceConfigMetadata(serviceConfig)
 	}
+}
+
+func (d *ProjectDetector) hostPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" || d.PathMapper == nil {
+		return path
+	}
+	mapped, err := d.PathMapper.MapPathToHost(path)
+	if err != nil || strings.TrimSpace(mapped) == "" {
+		return path
+	}
+	return mapped
+}
+
+func (d *ProjectDetector) hostPaths(paths []string) []string {
+	if len(paths) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if path := d.hostPath(path); path != "" {
+			out = append(out, path)
+		}
+	}
+	return out
 }
 
 func (d *ProjectDetector) ensureProject(detected map[string]*detectedProject, name string, source string, seenAt time.Time) *detectedProject {

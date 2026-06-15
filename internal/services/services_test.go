@@ -817,6 +817,51 @@ func TestProjectServiceLifecycleWorkdirMissing(t *testing.T) {
 	}
 }
 
+func TestProjectServiceLifecycleMapsBackendPaths(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	hostWorkdir := t.TempDir()
+	hostFile := filepath.Join(hostWorkdir, "compose.yaml")
+	if err := os.WriteFile(hostFile, []byte("services:\n  app:\n    image: nginx:alpine\n"), 0o600); err != nil {
+		t.Fatalf("write compose file: %v", err)
+	}
+	backendWorkdir := "/mnt/e/Development/project"
+	backendFile := "/mnt/e/Development/project/compose.yaml"
+	now := time.Date(2026, 6, 13, 6, 30, 0, 0, time.UTC)
+	if err := db.Projects().SaveSnapshot(ctx, "windows_wsl_ubuntu", []store.ProjectRecord{{
+		ID:           "windows_wsl_ubuntu/demo",
+		ProviderID:   "windows_wsl_ubuntu",
+		ContextName:  "wsl:cairn-dev",
+		Name:         "demo",
+		WorkingDir:   backendWorkdir,
+		ComposeFiles: []string{backendFile},
+		Status:       models.ProjectStatusRunning,
+		Health:       models.HealthStatusHealthy,
+		LastSeenAt:   now,
+	}}, nil, now, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot() error = %v", err)
+	}
+	runner := newFakeComposeRunner()
+	runner.backendToHost[backendWorkdir] = hostWorkdir
+	runner.backendToHost[backendFile] = hostFile
+	runner.hostToBackend[hostWorkdir] = backendWorkdir
+	runner.hostToBackend[hostFile] = backendFile
+	service := &ProjectService{
+		Client:      composecore.NewClient(runner),
+		PathMapper:  runner,
+		Projects:    db.Projects(),
+		ProviderID:  "windows_wsl_ubuntu",
+		ContextName: "wsl:cairn-dev",
+	}
+
+	if err := service.StartProject(ctx, "windows_wsl_ubuntu/demo"); err != nil {
+		t.Fatalf("StartProject() error = %v", err)
+	}
+	if !runner.hasCall(backendWorkdir + "|-f " + backendFile + " start") {
+		t.Fatalf("compose calls = %#v, want backend mapped start", runner.calls)
+	}
+}
+
 type fakeDockerClient struct {
 	container       models.ContainerSummary
 	image           models.ImageSummary
@@ -1027,12 +1072,18 @@ func (f *fakeDockerClient) RemoveNetwork(_ context.Context, id string) error {
 }
 
 type fakeComposeRunner struct {
-	outputs map[string]providers.CommandResult
-	calls   []string
+	outputs       map[string]providers.CommandResult
+	calls         []string
+	hostToBackend map[string]string
+	backendToHost map[string]string
 }
 
 func newFakeComposeRunner() *fakeComposeRunner {
-	return &fakeComposeRunner{outputs: map[string]providers.CommandResult{}}
+	return &fakeComposeRunner{
+		outputs:       map[string]providers.CommandResult{},
+		hostToBackend: map[string]string{},
+		backendToHost: map[string]string{},
+	}
 }
 
 func (r *fakeComposeRunner) RunCompose(ctx context.Context, workdir string, args ...string) (*providers.CommandResult, error) {
@@ -1055,6 +1106,20 @@ func (r *fakeComposeRunner) hasCall(want string) bool {
 		}
 	}
 	return false
+}
+
+func (r *fakeComposeRunner) MapPathToBackend(path string) (string, error) {
+	if mapped, ok := r.hostToBackend[path]; ok {
+		return mapped, nil
+	}
+	return path, nil
+}
+
+func (r *fakeComposeRunner) MapPathToHost(path string) (string, error) {
+	if mapped, ok := r.backendToHost[path]; ok {
+		return mapped, nil
+	}
+	return path, nil
 }
 
 type fakeInstallProvider struct {

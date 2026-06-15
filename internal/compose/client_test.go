@@ -46,6 +46,31 @@ func TestClientRunsProviderWithArgvWorkdirEnv(t *testing.T) {
 	}
 }
 
+func TestClientMapsHostProjectPathsBeforeComposeRun(t *testing.T) {
+	t.Parallel()
+	runner := newFakeRunner()
+	hostWorkdir := `E:\Development\project`
+	hostFile := `E:\Development\project\compose.yaml`
+	backendWorkdir := "/mnt/e/Development/project"
+	backendFile := "/mnt/e/Development/project/compose.yaml"
+	runner.hostToBackend[hostWorkdir] = backendWorkdir
+	runner.hostToBackend[hostFile] = backendFile
+	runner.outputs[backendWorkdir+"|-f "+backendFile+" config"] = providers.CommandResult{
+		Stdout: "services:\n  web:\n    image: nginx:alpine\n",
+	}
+	client := NewClient(runner)
+
+	if _, err := client.Config(context.Background(), ProjectOptions{Workdir: hostWorkdir, Files: []string{hostFile}}); err != nil {
+		t.Fatalf("Config() error = %v", err)
+	}
+	if got := runner.calls[0].workdir; got != backendWorkdir {
+		t.Fatalf("workdir = %q, want %q", got, backendWorkdir)
+	}
+	if got, want := runner.calls[0].args, []string{"-f", backendFile, "config"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("args = %#v, want %#v", got, want)
+	}
+}
+
 func TestClientBuildAddsCairnLabelsDeterministically(t *testing.T) {
 	t.Parallel()
 	runner := newFakeRunner()
@@ -157,9 +182,11 @@ func TestClientConfigAllTestdataProjectsIntegration(t *testing.T) {
 }
 
 type fakeRunner struct {
-	outputs map[string]providers.CommandResult
-	errors  map[string]error
-	calls   []fakeCall
+	outputs       map[string]providers.CommandResult
+	errors        map[string]error
+	calls         []fakeCall
+	hostToBackend map[string]string
+	backendToHost map[string]string
 }
 
 type fakeCall struct {
@@ -170,13 +197,29 @@ type fakeCall struct {
 
 func newFakeRunner() *fakeRunner {
 	return &fakeRunner{
-		outputs: map[string]providers.CommandResult{},
-		errors:  map[string]error{},
+		outputs:       map[string]providers.CommandResult{},
+		errors:        map[string]error{},
+		hostToBackend: map[string]string{},
+		backendToHost: map[string]string{},
 	}
 }
 
 func (r *fakeRunner) RunCompose(_ context.Context, workdir string, args ...string) (*providers.CommandResult, error) {
 	return r.RunComposeEnv(context.Background(), workdir, nil, args...)
+}
+
+func (r *fakeRunner) MapPathToBackend(path string) (string, error) {
+	if mapped, ok := r.hostToBackend[path]; ok {
+		return mapped, nil
+	}
+	return path, nil
+}
+
+func (r *fakeRunner) MapPathToHost(path string) (string, error) {
+	if mapped, ok := r.backendToHost[path]; ok {
+		return mapped, nil
+	}
+	return path, nil
 }
 
 func (r *fakeRunner) RunComposeEnv(_ context.Context, workdir string, env []string, args ...string) (*providers.CommandResult, error) {
@@ -193,6 +236,15 @@ func (r *fakeRunner) RunComposeEnv(_ context.Context, workdir string, env []stri
 		result.ExitCode = 0
 	}
 	return &result, r.errors[key]
+}
+
+func (r *fakeRunner) hasCall(key string) bool {
+	for _, call := range r.calls {
+		if call.workdir+"|"+strings.Join(call.args, " ") == key {
+			return true
+		}
+	}
+	return false
 }
 
 func contains(values []string, want string) bool {

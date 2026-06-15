@@ -17,6 +17,11 @@ type EnvRunner interface {
 	RunComposeEnv(context.Context, string, []string, ...string) (*providers.CommandResult, error)
 }
 
+type PathMapper interface {
+	MapPathToBackend(string) (string, error)
+	MapPathToHost(string) (string, error)
+}
+
 type Client struct {
 	runner Runner
 }

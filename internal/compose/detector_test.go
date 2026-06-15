@@ -143,6 +143,88 @@ func TestProjectDetectorIgnoresObjectCacheWhenLiveDockerIsEmpty(t *testing.T) {
 	}
 }
 
+func TestProjectDetectorMapsBackendLabelPathsToHost(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openProjectTestStore(t)
+	if err := db.Providers().Upsert(ctx, store.ProviderRecord{
+		ID:          "windows_wsl_ubuntu",
+		Type:        "windows_wsl_ubuntu",
+		Platform:    "windows",
+		DisplayName: "Windows WSL Ubuntu",
+		Enabled:     true,
+	}); err != nil {
+		t.Fatalf("seed windows provider: %v", err)
+	}
+	hostWorkdir := t.TempDir()
+	hostFile := filepath.Join(hostWorkdir, "compose.yaml")
+	writeProjectFile(t, hostFile, "services:\n  web:\n    image: nginx:alpine\n")
+	backendWorkdir := "/mnt/e/Development/project"
+	backendFile := "/mnt/e/Development/project/compose.yaml"
+	now := time.Date(2026, 6, 13, 1, 45, 0, 0, time.UTC)
+
+	if err := db.Objects().SaveContainers(ctx, "windows_wsl_ubuntu", []store.ContainerCacheRecord{{
+		Summary: models.ContainerSummary{
+			ID:        "abc",
+			Name:      "demo-web-1",
+			Image:     "nginx:alpine",
+			State:     "running",
+			Status:    "running",
+			Health:    models.HealthStatusHealthy,
+			CreatedAt: now,
+		},
+		Labels: map[string]string{
+			LabelProject:     "demo",
+			LabelService:     "web",
+			LabelWorkingDir:  backendWorkdir,
+			LabelConfigFiles: backendFile,
+		},
+	}}, now); err != nil {
+		t.Fatalf("SaveContainers() error = %v", err)
+	}
+
+	runner := newFakeRunner()
+	runner.backendToHost[backendWorkdir] = hostWorkdir
+	runner.backendToHost[backendFile] = hostFile
+	runner.hostToBackend[hostWorkdir] = backendWorkdir
+	runner.hostToBackend[hostFile] = backendFile
+	runner.outputs["|ls --format json --all"] = commandResult(`[]`)
+	runner.outputs[backendWorkdir+"|-f "+backendFile+" config"] = commandResult("services:\n  web:\n    image: nginx:alpine\n")
+	detector := &ProjectDetector{
+		ProviderID:  "windows_wsl_ubuntu",
+		ContextName: "default",
+		Compose:     NewClient(runner),
+		PathMapper:  runner,
+		Projects:    db.Projects(),
+		Objects:     db.Objects(),
+		Now:         func() time.Time { return now },
+	}
+
+	summaries, err := detector.Reconcile(ctx)
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if len(summaries) != 1 {
+		t.Fatalf("summaries = %#v", summaries)
+	}
+	if summaries[0].Status != models.ProjectStatusRunning || summaries[0].WorkingDir != hostWorkdir {
+		t.Fatalf("summary = %#v", summaries[0])
+	}
+	record, err := db.Projects().Get(ctx, "windows_wsl_ubuntu/demo")
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if record.WorkingDir != hostWorkdir || len(record.ComposeFiles) != 1 || record.ComposeFiles[0] != hostFile {
+		t.Fatalf("record paths = %q %#v", record.WorkingDir, record.ComposeFiles)
+	}
+	if _, ok := record.Metadata["errorCode"]; ok {
+		t.Fatalf("metadata = %#v, want no errorCode", record.Metadata)
+	}
+	if !runner.hasCall(backendWorkdir + "|-f " + backendFile + " config") {
+		t.Fatalf("compose calls = %#v, want backend mapped config call", runner.calls)
+	}
+}
+
 func TestProjectDetectorComposeLSAddsZeroContainerProject(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

@@ -101,6 +101,7 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 		ContextName: contextName,
 		Docker:      dockerClient,
 		Compose:     composeClient,
+		PathMapper:  provider,
 		Projects:    r.projects,
 		Objects:     r.db.Objects(),
 	}
@@ -131,9 +132,11 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 	r.dockerService.Client = dockerClient
 	r.projectService.Detector = projectDetector
 	r.projectService.Client = composeClient
+	r.projectService.PathMapper = provider
 	r.projectService.ProviderID = provider.ID()
 	r.projectService.ContextName = contextName
 	r.composeService.Client = composeClient
+	r.composeService.PathMapper = provider
 	r.metricsService.Manager = metricsManager
 	r.logsService.Manager = logsManager
 	r.terminalService.Manager = terminalManager
@@ -203,9 +206,11 @@ func (r *appRuntime) clearServicesLocked() {
 	r.dockerService.Client = nil
 	r.projectService.Detector = nil
 	r.projectService.Client = nil
+	r.projectService.PathMapper = nil
 	r.projectService.ProviderID = ""
 	r.projectService.ContextName = ""
 	r.composeService.Client = nil
+	r.composeService.PathMapper = nil
 	r.metricsService.Manager = nil
 	r.logsService.Manager = nil
 	r.terminalService.Manager = nil

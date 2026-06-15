@@ -125,6 +125,7 @@ type ProjectService struct {
 	Objects     *store.ObjectCacheRepository
 	Updates     *store.UpdateRepository
 	Client      *composecore.Client
+	PathMapper  composecore.PathMapper
 	Audit       *store.AuditRepository
 	Plans       *security.ProjectPlanStore
 	Events      bus.Bus
@@ -135,9 +136,10 @@ type ProjectService struct {
 }
 
 type ComposeService struct {
-	Client    *composecore.Client
-	Projects  *store.ProjectRepository
-	RuntimeMu *sync.RWMutex
+	Client     *composecore.Client
+	Projects   *store.ProjectRepository
+	PathMapper composecore.PathMapper
+	RuntimeMu  *sync.RWMutex
 }
 type MetricsService struct {
 	Manager   *metrics.Manager
@@ -1228,6 +1230,7 @@ func (s *ProjectService) getProject(ctx context.Context, projectID string) (*mod
 	if !s.projectInCurrentContext(project) {
 		return nil, apperror.New(apperror.NotFound, "Project was not found")
 	}
+	project = normalizeProjectHostPaths(project, s.PathMapper)
 	services, err := s.Projects.ListServices(ctx, projectID)
 	if err != nil {
 		return nil, apperror.Wrap(apperror.Internal, "List project services failed", err)
@@ -1401,6 +1404,7 @@ func (s *ComposeService) Config(ctx context.Context, projectID string) (*models.
 	if err != nil {
 		return nil, mapStoreNotFound(err, "Project was not found")
 	}
+	project = normalizeProjectHostPaths(project, s.PathMapper)
 	config, err := s.Client.Config(ctx, composeOptionsFromProject(project))
 	if config != nil {
 		config.API.RawFiles = readComposeRawFiles(project)
@@ -1425,6 +1429,7 @@ func (s *ComposeService) Ps(ctx context.Context, projectID string) ([]models.Com
 	if err != nil {
 		return nil, mapStoreNotFound(err, "Project was not found")
 	}
+	project = normalizeProjectHostPaths(project, s.PathMapper)
 	return s.Client.Ps(ctx, composeOptionsFromProject(project))
 }
 
@@ -2138,6 +2143,7 @@ func (s *ProjectService) projectComposeConfig(ctx context.Context, project store
 	if s.Client == nil {
 		return nil
 	}
+	project = normalizeProjectHostPaths(project, s.PathMapper)
 	config, err := s.Client.Config(ctx, composeOptionsFromProject(project))
 	if config == nil {
 		return nil
@@ -2229,6 +2235,7 @@ func (s *ProjectService) projectForAction(ctx context.Context, projectID string)
 	if !s.projectInCurrentContext(project) {
 		return store.ProjectRecord{}, apperror.New(apperror.NotFound, "Project was not found")
 	}
+	project = normalizeProjectHostPaths(project, s.PathMapper)
 	workdir := strings.TrimSpace(project.WorkingDir)
 	if workdir == "" {
 		return store.ProjectRecord{}, apperror.New(apperror.WorkdirMissing, "Project working directory is missing")
@@ -2244,6 +2251,32 @@ func (s *ProjectService) projectForAction(ctx context.Context, projectID string)
 		}
 	}
 	return project, nil
+}
+
+func normalizeProjectHostPaths(project store.ProjectRecord, mapper composecore.PathMapper) store.ProjectRecord {
+	project.WorkingDir = hostMappedPath(project.WorkingDir, mapper)
+	if len(project.ComposeFiles) > 0 {
+		files := make([]string, 0, len(project.ComposeFiles))
+		for _, file := range project.ComposeFiles {
+			if mapped := hostMappedPath(file, mapper); mapped != "" {
+				files = append(files, mapped)
+			}
+		}
+		project.ComposeFiles = files
+	}
+	return project
+}
+
+func hostMappedPath(path string, mapper composecore.PathMapper) string {
+	path = strings.TrimSpace(path)
+	if path == "" || mapper == nil {
+		return path
+	}
+	mapped, err := mapper.MapPathToHost(path)
+	if err != nil || strings.TrimSpace(mapped) == "" {
+		return path
+	}
+	return mapped
 }
 
 func (s *ProjectService) executeProjectAction(ctx context.Context, action string, project store.ProjectRecord, removeVolumes bool) (*providers.CommandResult, error) {
