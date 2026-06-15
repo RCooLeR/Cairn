@@ -324,7 +324,7 @@ func (m *Manager) ingest(containerID string, raw container.StatsResponse) {
 	m.lastAccepted[containerID] = sample.SampledAt
 	m.latest[containerID] = sample
 	if m.Repository != nil {
-		m.pending = append(m.pending, recordFromSample(sample))
+		m.pending = appendPendingMetrics(m.pending, recordFromSample(sample))
 	}
 	m.mu.Unlock()
 }
@@ -440,11 +440,26 @@ func (m *Manager) flush(ctx context.Context) error {
 	}
 	if err := m.Repository.InsertBatch(ctx, pending); err != nil {
 		m.mu.Lock()
-		m.pending = append(pending, m.pending...)
+		m.pending = appendPendingMetrics(pending, m.pending...)
 		m.mu.Unlock()
 		return err
 	}
 	return nil
+}
+
+func appendPendingMetrics(existing []store.MetricsSampleRecord, records ...store.MetricsSampleRecord) []store.MetricsSampleRecord {
+	if len(records) == 0 {
+		return trimPendingMetrics(existing)
+	}
+	existing = append(existing, records...)
+	return trimPendingMetrics(existing)
+}
+
+func trimPendingMetrics(records []store.MetricsSampleRecord) []store.MetricsSampleRecord {
+	if len(records) <= maxPendingPersistSamples {
+		return records
+	}
+	return append([]store.MetricsSampleRecord(nil), records[len(records)-maxPendingPersistSamples:]...)
 }
 
 func (m *Manager) maybeRetain(ctx context.Context) {

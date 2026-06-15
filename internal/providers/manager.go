@@ -11,6 +11,7 @@ import (
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/store"
 )
 
@@ -331,6 +332,28 @@ func (m *Manager) Restart(ctx context.Context, providerID string) error {
 	}
 	m.applyProviderSettings(ctx, provider)
 	return provider.Restart(ctx)
+}
+
+func (m *Manager) PlanLifecycle(ctx context.Context, action string, providerID string) (security.ProviderPlan, error) {
+	provider, ok := m.providers[providerID]
+	if !ok {
+		return security.ProviderPlan{}, apperror.New(apperror.NotFound, "Provider was not found")
+	}
+	m.applyProviderSettings(ctx, provider)
+	command, err := lifecycleCommand(provider, action)
+	if err != nil {
+		return security.ProviderPlan{}, err
+	}
+	return security.NewProviderLifecyclePlan(action, providerID, provider.DisplayName(), command, models.RiskNeedsConfirmation, m.now())
+}
+
+func (m *Manager) LifecycleCommand(ctx context.Context, action string, providerID string) (string, error) {
+	provider, ok := m.providers[providerID]
+	if !ok {
+		return "", apperror.New(apperror.NotFound, "Provider was not found")
+	}
+	m.applyProviderSettings(ctx, provider)
+	return lifecycleCommand(provider, action)
 }
 
 func (m *Manager) ListDockerContexts(ctx context.Context) ([]models.DockerContextInfo, error) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/models"
@@ -67,14 +68,15 @@ func (r *ObjectCacheRepository) saveContainers(ctx context.Context, providerID s
 
 	for _, record := range records {
 		summary := record.Summary
+		state := cacheContainerState(summary)
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO containers_cache (
 				id, provider_id, project_id, service_id, name, image_ref, image_id,
-				status, health, restart_count, ports_json, labels_json, created_at,
+				status, state, health, restart_count, ports_json, labels_json, created_at,
 				started_at, last_seen_at
 			)
 			VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, NULLIF(?, ''), NULLIF(?, ''),
-				NULLIF(?, ''), NULLIF(?, ''), ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?)
+				NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?)
 			ON CONFLICT(id) DO UPDATE SET
 				provider_id = excluded.provider_id,
 				project_id = excluded.project_id,
@@ -83,6 +85,7 @@ func (r *ObjectCacheRepository) saveContainers(ctx context.Context, providerID s
 				image_ref = excluded.image_ref,
 				image_id = excluded.image_id,
 				status = excluded.status,
+				state = excluded.state,
 				health = excluded.health,
 				restart_count = excluded.restart_count,
 				ports_json = excluded.ports_json,
@@ -91,7 +94,7 @@ func (r *ObjectCacheRepository) saveContainers(ctx context.Context, providerID s
 				started_at = excluded.started_at,
 				last_seen_at = excluded.last_seen_at
 		`, summary.ID, providerID, summary.ProjectID, summary.Service, summary.Name, summary.Image,
-			summary.ImageID, summary.Status, string(summary.Health), summary.Restarts,
+			summary.ImageID, summary.Status, state, string(summary.Health), summary.Restarts,
 			jsonText(summary.Ports, "[]"), jsonText(record.Labels, "{}"), formatTime(summary.CreatedAt),
 			formatTime(record.StartedAt), formatTime(seenAt)); err != nil {
 			return err
@@ -103,7 +106,7 @@ func (r *ObjectCacheRepository) saveContainers(ctx context.Context, providerID s
 
 func (r *ObjectCacheRepository) ListContainers(ctx context.Context, providerID string) ([]ContainerCacheRecord, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, name, image_ref, image_id, status, health, restart_count,
+		SELECT id, name, image_ref, image_id, status, state, health, restart_count,
 			project_id, service_id, ports_json, labels_json, created_at, started_at
 		FROM containers_cache
 		WHERE provider_id = ?
@@ -124,6 +127,7 @@ func (r *ObjectCacheRepository) ListContainers(ctx context.Context, providerID s
 			imageRef   sql.NullString
 			imageID    sql.NullString
 			status     sql.NullString
+			state      sql.NullString
 			health     sql.NullString
 			createdAt  sql.NullString
 			startedAt  sql.NullString
@@ -137,6 +141,7 @@ func (r *ObjectCacheRepository) ListContainers(ctx context.Context, providerID s
 			&imageRef,
 			&imageID,
 			&status,
+			&state,
 			&health,
 			&record.Summary.Restarts,
 			&projectID,
@@ -153,7 +158,7 @@ func (r *ObjectCacheRepository) ListContainers(ctx context.Context, providerID s
 		record.Summary.Image = imageRef.String
 		record.Summary.ImageID = imageID.String
 		record.Summary.Status = status.String
-		record.Summary.State = status.String
+		record.Summary.State = cacheContainerState(models.ContainerSummary{State: state.String, Status: status.String})
 		record.Summary.Health = models.HealthStatus(health.String)
 		record.Summary.CreatedAt = parseStoreTime(createdAt.String)
 		record.StartedAt = parseStoreTime(startedAt.String)
@@ -169,6 +174,37 @@ func (r *ObjectCacheRepository) ListContainers(ctx context.Context, providerID s
 		records = append(records, record)
 	}
 	return records, rows.Err()
+}
+
+func cacheContainerState(summary models.ContainerSummary) string {
+	if state := strings.TrimSpace(summary.State); state != "" {
+		return state
+	}
+	return normalizeCachedContainerState(summary.Status)
+}
+
+func normalizeCachedContainerState(status string) string {
+	value := strings.ToLower(strings.TrimSpace(status))
+	switch {
+	case value == "":
+		return ""
+	case value == "running" || strings.HasPrefix(value, "up "):
+		return "running"
+	case value == "exited" || strings.HasPrefix(value, "exited "):
+		return "exited"
+	case value == "paused" || strings.HasPrefix(value, "paused"):
+		return "paused"
+	case value == "restarting" || strings.HasPrefix(value, "restarting"):
+		return "restarting"
+	case value == "removing" || strings.HasPrefix(value, "removing"):
+		return "removing"
+	case value == "created" || strings.HasPrefix(value, "created"):
+		return "created"
+	case value == "dead" || strings.HasPrefix(value, "dead"):
+		return "dead"
+	default:
+		return value
+	}
 }
 
 func (r *ObjectCacheRepository) SaveImages(ctx context.Context, providerID string, records []ImageCacheRecord, seenAt time.Time) error {

@@ -67,7 +67,7 @@ CREATE TABLE services (
     build_context TEXT,             -- NULL when service uses image: only
     dockerfile_path TEXT,
     build_target TEXT,
-    status TEXT, health TEXT,
+    status TEXT, state TEXT, health TEXT,
     replicas_running INTEGER, replicas_total INTEGER,
     metadata_json TEXT,
     last_seen_at DATETIME

@@ -19,7 +19,9 @@ PlanInstall(providerID string, opts InstallOptions) (*CommandPlan, error)
 ApplyInstall(planID string) (*InstallProgressHandle, error)  // progress via provider:install:progress
 Start(providerID string) error
 Stop(providerID string) error
-Restart(providerID string) error
+Restart(providerID string) error                         // returns E_CONFIRMATION_REQUIRED; use plan/apply
+PlanRestart(providerID string) (*CommandPlan, error)     // required confirmation preview for Restart
+ApplyProviderPlan(planID string, typedName string) error
 SetActiveProvider(providerID string) error                 // reconnects Docker client; emits provider:changed
 ListDockerContexts() ([]DockerContextInfo, error)
 SetDockerContext(name string) error

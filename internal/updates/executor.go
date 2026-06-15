@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,6 +21,13 @@ import (
 	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/store"
 )
+
+var fatalLogPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?m)(^|\s)panic:\s+`),
+	regexp.MustCompile(`(?mi)^\s*fatal error:\s+`),
+	regexp.MustCompile(`Exception in thread "[^"]+"`),
+	regexp.MustCompile(`(?i)\bexit-on-start\b`),
+}
 
 const (
 	updateResultStarted      = "started"
@@ -115,7 +123,9 @@ func (m *Manager) ApplyUpdate(ctx context.Context, req models.ApplyUpdateRequest
 		return "", notReady()
 	}
 	jobID := "updates-" + m.newID()
-	go m.runUpdate(context.Background(), jobID, record, req)
+	m.startJob(jobID, func(jobCtx context.Context) {
+		m.runUpdate(jobCtx, jobID, record, req)
+	})
 	return jobID, nil
 }
 
@@ -139,7 +149,9 @@ func (m *Manager) Rollback(ctx context.Context, historyID int64) (string, error)
 		return "", err
 	}
 	jobID := "updates-" + m.newID()
-	go m.runManualRollback(context.Background(), jobID, project, history)
+	m.startJob(jobID, func(jobCtx context.Context) {
+		m.runManualRollback(jobCtx, jobID, project, history)
+	})
 	return jobID, nil
 }
 
@@ -1041,11 +1053,12 @@ func containerRunning(container models.ContainerSummary) bool {
 }
 
 func fatalLogDetected(logs string) bool {
-	lower := strings.ToLower(logs)
-	return strings.Contains(lower, "panic:") ||
-		strings.Contains(logs, "Fatal") ||
-		strings.Contains(logs, "Exception in thread") ||
-		strings.Contains(lower, "exit-on-start")
+	for _, pattern := range fatalLogPatterns {
+		if pattern.MatchString(logs) {
+			return true
+		}
+	}
+	return false
 }
 
 func plannedCommandText(commands []models.PlannedCommand) string {

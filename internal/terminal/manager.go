@@ -298,7 +298,7 @@ func (m *Manager) OpenContainerTerminal(ctx context.Context, containerID string,
 			}
 			return inspect.ExitCode
 		},
-		closeContext: ctx,
+		closeContext: terminalCloseContext(ctx),
 	}
 	if err := m.register(active); err != nil {
 		_ = execSession.Close()
@@ -434,6 +434,13 @@ func (m *Manager) pump(active *session) {
 			return
 		}
 	}
+}
+
+func terminalCloseContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return context.WithoutCancel(ctx)
 }
 
 func (m *Manager) finish(sessionID string, exitCode int) {

@@ -29,6 +29,7 @@ import (
 	"github.com/docker/docker/api/types/build"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
@@ -153,6 +154,85 @@ func TestClientConnectUsesProviderDialer(t *testing.T) {
 	}
 	if gotHost != "unix:///var/run/docker.sock" || !gotDialer {
 		t.Fatalf("factory host=%q dialer=%t", gotHost, gotDialer)
+	}
+}
+
+func TestClientConcurrentConnectSerializesReplacement(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	client := New(fakeDockerProvider{}, nil)
+	releaseFactory := make(chan struct{})
+	factoryStarted := make(chan struct{}, 2)
+	var mu sync.Mutex
+	inFlight := 0
+	maxInFlight := 0
+	apis := []*fakeAPI{}
+	client.factory = func(string) (APIClient, error) {
+		api := newFakeAPI()
+		mu.Lock()
+		inFlight++
+		if inFlight > maxInFlight {
+			maxInFlight = inFlight
+		}
+		apis = append(apis, api)
+		mu.Unlock()
+		factoryStarted <- struct{}{}
+		select {
+		case <-releaseFactory:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
+		return api, nil
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() {
+			<-start
+			errs <- client.Connect(ctx)
+		}()
+	}
+	close(start)
+	select {
+	case <-factoryStarted:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for first factory call")
+	}
+	select {
+	case <-factoryStarted:
+		t.Fatal("second factory call started before the first connect completed")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(releaseFactory)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("Connect() error = %v", err)
+		}
+	}
+
+	mu.Lock()
+	gotMax := maxInFlight
+	gotAPIs := append([]*fakeAPI(nil), apis...)
+	mu.Unlock()
+	if gotMax != 1 {
+		t.Fatalf("concurrent factory calls = %d, want 1", gotMax)
+	}
+	if len(gotAPIs) != 2 {
+		t.Fatalf("API clients created = %d, want 2", len(gotAPIs))
+	}
+	gotAPIs[0].mu.Lock()
+	firstClosed := gotAPIs[0].closed
+	gotAPIs[0].mu.Unlock()
+	gotAPIs[1].mu.Lock()
+	secondClosed := gotAPIs[1].closed
+	gotAPIs[1].mu.Unlock()
+	if !firstClosed || secondClosed {
+		t.Fatalf("closed clients first=%t second=%t, want first superseded only", firstClosed, secondClosed)
 	}
 }
 
@@ -1642,8 +1722,12 @@ type fakeAPI struct {
 	saved             [][]string
 	loadedBytes       []int
 	searches          []string
+	removedImages     []string
+	pruned            []string
 	createdVolumes    []volume.CreateOptions
+	removedVolumes    []string
 	createdNetworks   []networkCreateCall
+	removedNetworks   []string
 	closed            bool
 }
 
@@ -2031,6 +2115,34 @@ func (a *fakeAPI) ImageSearch(_ context.Context, term string, _ registry.SearchO
 	}}, nil
 }
 
+func (a *fakeAPI) ImageRemove(_ context.Context, id string, _ image.RemoveOptions) ([]image.DeleteResponse, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.removedImages = append(a.removedImages, id)
+	return []image.DeleteResponse{{Deleted: id}}, nil
+}
+
+func (a *fakeAPI) ImagesPrune(context.Context, filters.Args) (image.PruneReport, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.pruned = append(a.pruned, "images")
+	return image.PruneReport{}, nil
+}
+
+func (a *fakeAPI) ContainersPrune(context.Context, filters.Args) (container.PruneReport, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.pruned = append(a.pruned, "containers")
+	return container.PruneReport{}, nil
+}
+
+func (a *fakeAPI) BuildCachePrune(context.Context, build.CachePruneOptions) (*build.CachePruneReport, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.pruned = append(a.pruned, "build-cache")
+	return &build.CachePruneReport{}, nil
+}
+
 func (a *fakeAPI) VolumeList(context.Context, volume.ListOptions) (volume.ListResponse, error) {
 	return volume.ListResponse{Volumes: append([]*volume.Volume(nil), a.volumes...)}, nil
 }
@@ -2059,6 +2171,20 @@ func (a *fakeAPI) VolumeCreate(_ context.Context, options volume.CreateOptions) 
 	a.volumes = append(a.volumes, &created)
 	a.volumeInspects[options.Name] = created
 	return created, nil
+}
+
+func (a *fakeAPI) VolumeRemove(_ context.Context, name string, _ bool) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.removedVolumes = append(a.removedVolumes, name)
+	return nil
+}
+
+func (a *fakeAPI) VolumesPrune(context.Context, filters.Args) (volume.PruneReport, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.pruned = append(a.pruned, "volumes")
+	return volume.PruneReport{}, nil
 }
 
 func (a *fakeAPI) NetworkList(context.Context, network.ListOptions) ([]network.Summary, error) {
@@ -2094,6 +2220,20 @@ func (a *fakeAPI) NetworkCreate(_ context.Context, name string, options network.
 	a.networks = append(a.networks, created)
 	a.networkInspects[id] = created
 	return network.CreateResponse{ID: id}, nil
+}
+
+func (a *fakeAPI) NetworkRemove(_ context.Context, id string) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.removedNetworks = append(a.removedNetworks, id)
+	return nil
+}
+
+func (a *fakeAPI) NetworksPrune(context.Context, filters.Args) (network.PruneReport, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.pruned = append(a.pruned, "networks")
+	return network.PruneReport{}, nil
 }
 
 func (a *fakeAPI) Events(context.Context, events.ListOptions) (<-chan events.Message, <-chan error) {

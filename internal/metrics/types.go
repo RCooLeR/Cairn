@@ -24,6 +24,7 @@ const (
 	defaultPersistInterval    = 10 * time.Second
 	defaultRetainInterval     = time.Hour
 	defaultTopN               = 8
+	maxPendingPersistSamples  = 10000
 )
 
 type DockerClient interface {

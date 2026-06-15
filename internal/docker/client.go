@@ -17,8 +17,10 @@ import (
 	"github.com/RCooLeR/Cairn/internal/store"
 	cerrdefs "github.com/containerd/errdefs"
 	dockertypes "github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/build"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/events"
+	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/api/types/registry"
@@ -78,12 +80,20 @@ type APIClient interface {
 	ImageSave(context.Context, []string, ...dockerclient.ImageSaveOption) (io.ReadCloser, error)
 	ImageLoad(context.Context, io.Reader, ...dockerclient.ImageLoadOption) (image.LoadResponse, error)
 	ImageSearch(context.Context, string, registry.SearchOptions) ([]registry.SearchResult, error)
+	ImageRemove(context.Context, string, image.RemoveOptions) ([]image.DeleteResponse, error)
+	ImagesPrune(context.Context, filters.Args) (image.PruneReport, error)
+	ContainersPrune(context.Context, filters.Args) (container.PruneReport, error)
+	BuildCachePrune(context.Context, build.CachePruneOptions) (*build.CachePruneReport, error)
 	VolumeList(context.Context, volume.ListOptions) (volume.ListResponse, error)
 	VolumeInspectWithRaw(context.Context, string) (volume.Volume, []byte, error)
 	VolumeCreate(context.Context, volume.CreateOptions) (volume.Volume, error)
+	VolumeRemove(context.Context, string, bool) error
+	VolumesPrune(context.Context, filters.Args) (volume.PruneReport, error)
 	NetworkList(context.Context, network.ListOptions) ([]network.Summary, error)
 	NetworkInspectWithRaw(context.Context, string, network.InspectOptions) (network.Inspect, []byte, error)
 	NetworkCreate(context.Context, string, network.CreateOptions) (network.CreateResponse, error)
+	NetworkRemove(context.Context, string) error
+	NetworksPrune(context.Context, filters.Args) (network.PruneReport, error)
 	Events(context.Context, events.ListOptions) (<-chan events.Message, <-chan error)
 	Close() error
 }
@@ -110,6 +120,7 @@ type Client struct {
 	factory           func(string) (APIClient, error)
 	factoryWithDialer func(string, func(context.Context, string, string) (net.Conn, error)) (APIClient, error)
 
+	reconnectMu    sync.Mutex
 	mu             sync.RWMutex
 	api            APIClient
 	host           string
@@ -147,6 +158,9 @@ func (c *Client) SetObjectCache(cache *store.ObjectCacheRepository) {
 }
 
 func (c *Client) Connect(ctx context.Context) error {
+	c.reconnectMu.Lock()
+	defer c.reconnectMu.Unlock()
+
 	host, err := c.provider.DockerHost(ctx)
 	if err != nil {
 		return mapDockerError("resolve Docker host", err)
@@ -197,14 +211,17 @@ func (c *Client) Connect(ctx context.Context) error {
 }
 
 func (c *Client) Close() error {
+	c.reconnectMu.Lock()
+	defer c.reconnectMu.Unlock()
+
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.api == nil {
+	api := c.api
+	c.api = nil
+	c.mu.Unlock()
+	if api == nil {
 		return nil
 	}
-	err := c.api.Close()
-	c.api = nil
-	return err
+	return api.Close()
 }
 
 func (c *Client) Ping(ctx context.Context) error {
@@ -328,6 +345,9 @@ func (c *Client) ensureConnected(ctx context.Context) (APIClient, error) {
 }
 
 func (c *Client) disconnect(err error) {
+	c.reconnectMu.Lock()
+	defer c.reconnectMu.Unlock()
+
 	c.mu.Lock()
 	api := c.api
 	c.api = nil

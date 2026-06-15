@@ -122,7 +122,7 @@ func TestManagerPublishesBatchesAndEOF(t *testing.T) {
 	}
 }
 
-func TestSessionEnqueueBackpressuresInsteadOfDropping(t *testing.T) {
+func TestSessionEnqueueDropsAndReportsWhenInputFull(t *testing.T) {
 	manager := NewManager(nil, nil, Options{InputBuffer: 1})
 	s := newSession(manager, "stream-1", models.LogStreamRequest{})
 	first := models.LogLine{Text: "one"}
@@ -131,33 +131,20 @@ func TestSessionEnqueueBackpressuresInsteadOfDropping(t *testing.T) {
 	if !s.enqueue(first) {
 		t.Fatal("first enqueue returned false")
 	}
-	done := make(chan bool, 1)
-	go func() {
-		done <- s.enqueue(second)
-	}()
-
-	select {
-	case ok := <-done:
-		t.Fatalf("second enqueue returned before capacity was available: %v", ok)
-	case <-time.After(25 * time.Millisecond):
+	if !s.enqueue(second) {
+		t.Fatal("second enqueue returned false")
 	}
 
 	if got := <-s.input; got.Text != "one" {
 		t.Fatalf("first line was dropped: %#v", got)
 	}
 	select {
-	case ok := <-done:
-		if !ok {
-			t.Fatal("second enqueue returned false")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("second enqueue did not resume after capacity was available")
+	case got := <-s.input:
+		t.Fatalf("unexpected queued overflow line: %#v", got)
+	default:
 	}
-	if got := <-s.input; got.Text != "two" {
-		t.Fatalf("second line was not queued: %#v", got)
-	}
-	if dropped := s.dropped.Load(); dropped != 0 {
-		t.Fatalf("dropped count = %d", dropped)
+	if dropped := s.dropped.Load(); dropped != 1 {
+		t.Fatalf("dropped count = %d, want 1", dropped)
 	}
 }
 

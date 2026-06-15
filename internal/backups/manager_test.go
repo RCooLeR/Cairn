@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -52,7 +54,10 @@ func TestBackupSidecarAndFilenameCollision(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	ts := time.Date(2026, 6, 13, 16, 0, 0, 0, time.UTC)
-	archive, archivePath, metadataPath := backupPaths(dir, "app/db", ts)
+	archive, archivePath, metadataPath, err := backupPaths(dir, "app/db", ts)
+	if err != nil {
+		t.Fatalf("backupPaths() error = %v", err)
+	}
 	if archive != "app-db-20260613T160000Z.tar.gz" {
 		t.Fatalf("archive = %q", archive)
 	}
@@ -62,7 +67,10 @@ func TestBackupSidecarAndFilenameCollision(t *testing.T) {
 	if err := os.WriteFile(metadataPath, []byte("{}"), 0o600); err != nil {
 		t.Fatalf("write sidecar: %v", err)
 	}
-	archive, _, _ = backupPaths(dir, "app/db", ts)
+	archive, _, _, err = backupPaths(dir, "app/db", ts)
+	if err != nil {
+		t.Fatalf("backupPaths(collision) error = %v", err)
+	}
 	if archive != "app-db-20260613T160000Z-2.tar.gz" {
 		t.Fatalf("collision archive = %q", archive)
 	}
@@ -90,6 +98,37 @@ func TestBackupSidecarAndFilenameCollision(t *testing.T) {
 	}
 	if err := verifyArchiveChecksum(path, "bad"); !apperror.IsCode(err, apperror.Conflict) {
 		t.Fatalf("checksum mismatch error = %v", err)
+	}
+}
+
+func TestBackupPathsReturnStatErrorsAndCapCollisions(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	ts := time.Date(2026, 6, 13, 16, 0, 0, 0, time.UTC)
+	_, _, _, err := backupPathsWithStat(dir, "app/db", ts, func(string) (os.FileInfo, error) {
+		return nil, os.ErrPermission
+	}, 3)
+	if !apperror.IsCode(err, apperror.Internal) {
+		t.Fatalf("stat error = %v", err)
+	}
+
+	_, _, _, err = backupPathsWithStat(dir, "app/db", ts, func(string) (os.FileInfo, error) {
+		return nil, nil
+	}, 3)
+	if !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("collision cap error = %v", err)
+	}
+}
+
+func TestRestoreHelperRequiresSuccessfulWipeBeforeExtract(t *testing.T) {
+	t.Parallel()
+	args := dockerRunRestoreArgs("app-db", "/tmp/backups", "app-db.tar.gz")
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, "rm -rf /restore/* /restore/..?* /restore/.[!.]* && tar xzf /backup/app-db.tar.gz -C /restore") {
+		t.Fatalf("restore args = %q", joined)
+	}
+	if strings.Contains(joined, " ; tar ") {
+		t.Fatalf("restore args still allow extract after wipe failure: %q", joined)
 	}
 }
 
@@ -126,6 +165,48 @@ func TestApplyBackupWritesMetadataAndRepositoryRow(t *testing.T) {
 	}
 	if !provider.hasRunArg("tar") {
 		t.Fatalf("provider calls = %#v", provider.calls)
+	}
+}
+
+func TestApplyBackupStopsWithManager(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	mgr, events, provider := newTestManager(t)
+	rootCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	mgr.Start(rootCtx)
+	provider.blockRun = make(chan struct{})
+	provider.runStarted = make(chan struct{}, 1)
+	provider.runCanceled = make(chan error, 1)
+	dest := t.TempDir()
+	mgr.Docker.(*fakeBackupDocker).volumes["app-db"] = &models.VolumeDetail{Summary: models.VolumeSummary{Name: "app-db"}}
+	done := events.Subscribe(ctx, bus.TopicJobDone, 4)
+
+	plan, err := mgr.PlanBackupVolume(ctx, models.BackupVolumeRequest{VolumeName: "app-db", DestPath: dest})
+	if err != nil {
+		t.Fatalf("PlanBackupVolume() error = %v", err)
+	}
+	jobID, err := mgr.ApplyBackup(ctx, plan.PlanID)
+	if err != nil {
+		t.Fatalf("ApplyBackup() error = %v", err)
+	}
+	select {
+	case <-provider.runStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for backup helper to start")
+	}
+	mgr.StopAll()
+	select {
+	case err := <-provider.runCanceled:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("provider context error = %v, want context canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for provider context cancellation")
+	}
+	payload := waitJobDonePayload(t, done, jobID)
+	if payload.Error == "" {
+		t.Fatalf("job error is empty, want cancellation failure")
 	}
 }
 
@@ -215,7 +296,11 @@ func (r fakeProviderResolver) ActiveProvider(context.Context) (providers.Platfor
 }
 
 type fakeBackupProvider struct {
-	calls [][]string
+	mu          sync.Mutex
+	calls       [][]string
+	blockRun    chan struct{}
+	runStarted  chan struct{}
+	runCanceled chan error
 }
 
 func (p *fakeBackupProvider) ID() string          { return "linux_native" }
@@ -238,8 +323,29 @@ func (p *fakeBackupProvider) DockerHost(context.Context) (string, error) {
 	return "unix:///var/run/docker.sock", nil
 }
 func (p *fakeBackupProvider) DockerContext(context.Context) (string, error) { return "default", nil }
-func (p *fakeBackupProvider) RunDocker(_ context.Context, args ...string) (*providers.CommandResult, error) {
+func (p *fakeBackupProvider) RunDocker(ctx context.Context, args ...string) (*providers.CommandResult, error) {
+	p.mu.Lock()
 	p.calls = append(p.calls, append([]string(nil), args...))
+	blockRun := p.blockRun
+	runStarted := p.runStarted
+	runCanceled := p.runCanceled
+	p.mu.Unlock()
+	if runStarted != nil {
+		select {
+		case runStarted <- struct{}{}:
+		default:
+		}
+	}
+	if blockRun != nil {
+		select {
+		case <-blockRun:
+		case <-ctx.Done():
+			if runCanceled != nil {
+				runCanceled <- ctx.Err()
+			}
+			return &providers.CommandResult{ExitCode: 1, Stderr: ctx.Err().Error()}, ctx.Err()
+		}
+	}
 	if slices.Contains(args, "czf") {
 		archive := ""
 		backupDir := ""
@@ -271,6 +377,8 @@ func (p *fakeBackupProvider) BackendShellCommand(models.TerminalOptions) ([]stri
 func (p *fakeBackupProvider) MapPathToBackend(path string) (string, error) { return path, nil }
 func (p *fakeBackupProvider) MapPathToHost(path string) (string, error)    { return path, nil }
 func (p *fakeBackupProvider) hasRunArg(value string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	for _, call := range p.calls {
 		joined := strings.Join(call, " ")
 		if strings.Contains(joined, value) {
@@ -300,16 +408,21 @@ func (d *fakeBackupDocker) CreateVolume(_ context.Context, req models.CreateVolu
 
 func waitJobDone(t *testing.T, events <-chan bus.Event, jobID string) {
 	t.Helper()
+	payload := waitJobDonePayload(t, events, jobID)
+	if payload.Error != "" {
+		t.Fatalf("job %s failed: %s", jobID, payload.Error)
+	}
+}
+
+func waitJobDonePayload(t *testing.T, events <-chan bus.Event, jobID string) jobDonePayload {
+	t.Helper()
 	deadline := time.After(2 * time.Second)
 	for {
 		select {
 		case event := <-events:
 			payload, ok := event.Payload.(jobDonePayload)
 			if ok && payload.JobID == jobID {
-				if payload.Error != "" {
-					t.Fatalf("job %s failed: %s", jobID, payload.Error)
-				}
-				return
+				return payload
 			}
 		case <-deadline:
 			t.Fatalf("timed out waiting for job %s", jobID)

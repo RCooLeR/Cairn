@@ -15,6 +15,10 @@ export function ApplyInstall(planID: string): $CancellablePromise<models$0.Insta
     });
 }
 
+export function ApplyProviderPlan(planID: string, typedName: string): $CancellablePromise<void> {
+    return $Call.ByID(3550597673, planID, typedName);
+}
+
 export function Detect(providerID: string): $CancellablePromise<models$0.ProviderStatus | null> {
     return $Call.ByID(2594388346, providerID).then(($result: any) => {
         return $$createType3($result);
@@ -47,6 +51,12 @@ export function ListProviders(): $CancellablePromise<models$0.ProviderSummary[]>
 
 export function PlanInstall(providerID: string, opts: models$0.InstallOptions): $CancellablePromise<models$0.CommandPlan | null> {
     return $Call.ByID(1372038617, providerID, opts).then(($result: any) => {
+        return $$createType12($result);
+    });
+}
+
+export function PlanRestart(providerID: string): $CancellablePromise<models$0.CommandPlan | null> {
+    return $Call.ByID(1935115277, providerID).then(($result: any) => {
         return $$createType12($result);
     });
 }

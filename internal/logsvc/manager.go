@@ -454,6 +454,9 @@ func (s *session) enqueue(line models.LogLine) bool {
 		return false
 	case s.input <- line:
 		return true
+	default:
+		s.dropped.Add(1)
+		return true
 	}
 }
 

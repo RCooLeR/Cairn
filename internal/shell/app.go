@@ -5,22 +5,15 @@ import (
 	"io/fs"
 	"runtime"
 	"strings"
+	"sync"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
-	backupcore "github.com/RCooLeR/Cairn/internal/backups"
 	"github.com/RCooLeR/Cairn/internal/bus"
-	composecore "github.com/RCooLeR/Cairn/internal/compose"
-	dockercore "github.com/RCooLeR/Cairn/internal/docker"
-	lineagecore "github.com/RCooLeR/Cairn/internal/lineage"
-	"github.com/RCooLeR/Cairn/internal/logsvc"
-	"github.com/RCooLeR/Cairn/internal/metrics"
 	"github.com/RCooLeR/Cairn/internal/providers"
 	registrycore "github.com/RCooLeR/Cairn/internal/registry"
 	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/services"
 	"github.com/RCooLeR/Cairn/internal/store"
-	"github.com/RCooLeR/Cairn/internal/terminal"
-	updatescore "github.com/RCooLeR/Cairn/internal/updates"
 	"github.com/wailsapp/wails/v3/pkg/application"
 )
 
@@ -55,56 +48,44 @@ func Run(assets fs.FS) error {
 	auditRepo := db.Audit()
 	projectRepo := db.Projects()
 	containerPlans := security.NewPlanStore(nil)
+	objectPlans := security.NewDockerObjectPlanStore(nil)
+	providerPlans := security.NewProviderPlanStore(nil)
 	projectPlans := security.NewProjectPlanStore(nil)
-	var dockerClient *dockercore.Client
-	var composeClient *composecore.Client
-	var projectDetector *composecore.ProjectDetector
-	var logsManager *logsvc.Manager
-	var metricsManager *metrics.Manager
-	var terminalManager *terminal.Manager
-	var backupManager *backupcore.Manager
 	var registryManager *registrycore.Manager
-	var lineageManager *lineagecore.Manager
-	var updateManager *updatescore.Manager
-	var runtimeProvider providers.PlatformProvider
-	runtimeProviderID := ""
-	runtimeContextName := ""
+	registryManager = registrycore.NewManager(providerManager, auditRepo)
+	providerService := &services.ProviderService{Manager: providerManager, Events: eventBus, Audit: auditRepo, Plans: providerPlans}
+	runtimeMu := &sync.RWMutex{}
+	dockerService := &services.DockerService{Audit: auditRepo, Plans: containerPlans, ObjectPlans: objectPlans, RuntimeMu: runtimeMu}
+	projectService := &services.ProjectService{
+		Projects:  db.Projects(),
+		Objects:   db.Objects(),
+		Updates:   db.Updates(),
+		Audit:     auditRepo,
+		Plans:     projectPlans,
+		Events:    eventBus,
+		RuntimeMu: runtimeMu,
+	}
+	composeService := &services.ComposeService{Projects: projectRepo, RuntimeMu: runtimeMu}
+	metricsService := &services.MetricsService{RuntimeMu: runtimeMu}
+	logsService := &services.LogsService{RuntimeMu: runtimeMu}
+	terminalService := &services.TerminalService{RuntimeMu: runtimeMu}
+	updateService := &services.UpdateService{RuntimeMu: runtimeMu}
+	lineageService := &services.ImageLineageService{RuntimeMu: runtimeMu}
+	backupService := &services.BackupService{RuntimeMu: runtimeMu}
+	registryService := &services.RegistryService{Manager: registryManager}
+	runtimeController := newAppRuntime(ctx, db, providerManager, registryManager, auditRepo, projectRepo, eventBus, runtimeMu, dockerService, projectService, composeService, metricsService, logsService, terminalService, updateService, lineageService, backupService)
+	providerService.Runtime = runtimeController
 	if len(providerSet) > 0 {
-		runtimeProvider = providerSet[0]
+		runtimeProvider := providerSet[0]
 		if activeProvider, err := providerManager.ActiveProvider(ctx); err == nil && activeProvider != nil {
 			runtimeProvider = activeProvider
 		}
-		runtimeProviderID = runtimeProvider.ID()
-		runtimeContextName = backendContextName(ctx, runtimeProvider)
-		dockerClient = dockercore.New(runtimeProvider, eventBus)
-		dockerClient.SetObjectCache(db.Objects())
-		dockerClient.StartHealthLoop(ctx)
-		dockerClient.StartObjectEventLoop(ctx)
-		dockerClient.StartReconcileLoop(ctx)
-		composeClient = composecore.NewClient(runtimeProvider)
-		projectDetector = &composecore.ProjectDetector{
-			ProviderID:  runtimeProvider.ID(),
-			ContextName: runtimeContextName,
-			Docker:      dockerClient,
-			Compose:     composeClient,
-			Projects:    projectRepo,
-			Objects:     db.Objects(),
+		if _, err := runtimeController.RebindProvider(ctx, runtimeProvider); err != nil {
+			cancel()
+			eventBus.Close()
+			_ = db.Close()
+			return err
 		}
-		logsManager = logsvc.NewManager(dockerClient, eventBus, logsvc.Options{})
-		metricsManager = metrics.NewManager(dockerClient, db.Metrics(), projectRepo, auditRepo, eventBus, metrics.Options{})
-		metricsManager.ContextName = runtimeContextName
-		metricsManager.Start(ctx)
-		terminalManager = terminal.NewManager(runtimeProvider, dockerClient, projectRepo, eventBus, terminal.Options{})
-		backupManager = backupcore.NewManager(providerManager, dockerClient, db.Settings(), db.Backups(), auditRepo, eventBus, services.Version)
-		registryManager = registrycore.NewManager(providerManager, auditRepo)
-		lineageManager = lineagecore.NewManager(projectRepo, db.Lineage(), db.Objects(), dockerClient)
-		updateManager = updatescore.NewManager(projectRepo, db.Lineage(), db.Updates(), db.Objects(), dockerClient, registryManager, db.Settings(), eventBus, lineageManager)
-		updateManager.Compose = composeClient
-		updateManager.Backups = backupManager
-		updateManager.Audit = auditRepo
-		updateManager.Notify = db.Notifications()
-		updateManager.ContextName = runtimeContextName
-		updateManager.Start(ctx)
 	}
 
 	app := application.New(application.Options{
@@ -113,28 +94,17 @@ func Run(assets fs.FS) error {
 		Icon:         icon,
 		MarshalError: apperror.Marshal,
 		Services: []application.Service{
-			application.NewService(&services.ProviderService{Manager: providerManager, Events: eventBus, Audit: auditRepo}),
-			application.NewService(&services.DockerService{Client: dockerClient, Audit: auditRepo, Plans: containerPlans}),
-			application.NewService(&services.ProjectService{
-				Detector:    projectDetector,
-				Projects:    projectRepo,
-				Objects:     db.Objects(),
-				Updates:     db.Updates(),
-				Client:      composeClient,
-				Audit:       auditRepo,
-				Plans:       projectPlans,
-				Events:      eventBus,
-				ProviderID:  runtimeProviderID,
-				ContextName: runtimeContextName,
-			}),
-			application.NewService(&services.ComposeService{Client: composeClient, Projects: projectRepo}),
-			application.NewService(&services.MetricsService{Manager: metricsManager}),
-			application.NewService(&services.LogsService{Manager: logsManager}),
-			application.NewService(&services.TerminalService{Manager: terminalManager}),
-			application.NewService(&services.UpdateService{Manager: updateManager}),
-			application.NewService(&services.ImageLineageService{Manager: lineageManager}),
-			application.NewService(&services.BackupService{Manager: backupManager}),
-			application.NewService(&services.RegistryService{Manager: registryManager}),
+			application.NewService(providerService),
+			application.NewService(dockerService),
+			application.NewService(projectService),
+			application.NewService(composeService),
+			application.NewService(metricsService),
+			application.NewService(logsService),
+			application.NewService(terminalService),
+			application.NewService(updateService),
+			application.NewService(lineageService),
+			application.NewService(backupService),
+			application.NewService(registryService),
 			application.NewService(&services.SettingsService{
 				Audit:         auditRepo,
 				Notifications: db.Notifications(),
@@ -143,18 +113,7 @@ func Run(assets fs.FS) error {
 		},
 		OnShutdown: func() {
 			cancel()
-			if logsManager != nil {
-				logsManager.StopAll()
-			}
-			if metricsManager != nil {
-				metricsManager.StopAll()
-			}
-			if terminalManager != nil {
-				terminalManager.StopAll()
-			}
-			if dockerClient != nil {
-				_ = dockerClient.Close()
-			}
+			runtimeController.StopAll()
 			eventBus.Close()
 			_ = db.Close()
 		},
@@ -191,6 +150,7 @@ func Run(assets fs.FS) error {
 		},
 	})
 	forwardBusEvents(ctx, eventBus, mainWindow, []bus.Topic{
+		bus.TopicProviderChanged,
 		bus.TopicDockerConnected,
 		bus.TopicDockerDisconnected,
 		bus.TopicObjectsChanged,

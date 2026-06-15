@@ -16,6 +16,8 @@ import (
 	"github.com/RCooLeR/Cairn/internal/models"
 )
 
+type terminalContextKey string
+
 func TestManagerHostPTYLifecycle(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -69,6 +71,19 @@ func TestManagerHostPTYLifecycle(t *testing.T) {
 	}
 	if sessions := manager.ListTerminalSessions(); len(sessions) != 0 {
 		t.Fatalf("sessions after exit = %#v", sessions)
+	}
+}
+
+func TestTerminalCloseContextOutlivesRequestCancellation(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), terminalContextKey("trace"), "kept"))
+	closeCtx := terminalCloseContext(ctx)
+	cancel()
+	if err := closeCtx.Err(); err != nil {
+		t.Fatalf("close context err = %v, want nil after request cancel", err)
+	}
+	if got := closeCtx.Value(terminalContextKey("trace")); got != "kept" {
+		t.Fatalf("close context value = %#v, want kept", got)
 	}
 }
 

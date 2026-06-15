@@ -153,6 +153,13 @@ import {
 } from "./components/terminal/TerminalPage";
 import { useAppStore } from "./state/appStore";
 import { useInventoryStore } from "./state/inventoryStore";
+import { useDebouncedRuntimeEvent } from "./hooks/useDebouncedRuntimeEvent";
+import {
+  chartColors,
+  containerStatusChartSegments,
+  dashboardTopRows,
+  emptyContainerStatusChartSegment,
+} from "./overview/dashboardData";
 import { frontendVersion } from "./version";
 
 const logoUrl = "/cairn-logo.png";
@@ -297,7 +304,12 @@ type ProjectAction =
   | "redeploy"
   | "down"
   | "down-volumes";
-type ConfirmPlanKind = "container" | "project" | "backup" | "restore";
+type ConfirmPlanKind =
+  | "container"
+  | "project"
+  | "backup"
+  | "restore"
+  | "provider";
 
 type ConfirmState = {
   open: boolean;
@@ -557,6 +569,8 @@ type CleanupState = {
   includeBuildCache: boolean;
   includeVolumes: boolean;
   typedName: string;
+  busy: boolean;
+  error?: string;
 };
 
 const navItems: NavItem[] = [
@@ -938,6 +952,7 @@ const emptyCleanup: CleanupState = {
   includeBuildCache: true,
   includeVolumes: false,
   typedName: "",
+  busy: false,
 };
 
 function App() {
@@ -961,6 +976,7 @@ function App() {
   const refreshInventory = useInventoryStore((state) => state.refresh);
 
   const [activePage, setActivePage] = useState<PageID>("overview");
+  const [dashboardRefreshToken, setDashboardRefreshToken] = useState(0);
   const [settingsSection, setSettingsSection] =
     useState<SettingsSectionID>("providers");
   const [search, setSearch] = useState("");
@@ -1571,25 +1587,16 @@ function App() {
     void refreshUpdateSurfaces();
   }, [refreshUpdateSurfaces]);
 
-  useEffect(() => {
-    let timer: number | undefined;
-    const off = Events.On("objects:changed", () => {
-      window.clearTimeout(timer);
-      timer = window.setTimeout(() => {
-        void refreshInventory();
-        void refreshProjects();
-        void refreshBackups();
-        void refreshUpdateSurfaces();
-        if (activeProjectID) {
-          void refreshProjectDetail(activeProjectID);
-          void refreshProjectLineage(activeProjectID);
-        }
-      }, 500);
-    });
-    return () => {
-      window.clearTimeout(timer);
-      off();
-    };
+  const refreshRuntimeSurfaces = useCallback(() => {
+    void refreshInventory();
+    void refreshProjects();
+    void refreshBackups();
+    void refreshUpdateSurfaces();
+    setDashboardRefreshToken((current) => current + 1);
+    if (activeProjectID) {
+      void refreshProjectDetail(activeProjectID);
+      void refreshProjectLineage(activeProjectID);
+    }
   }, [
     activeProjectID,
     refreshBackups,
@@ -1599,6 +1606,17 @@ function App() {
     refreshProjects,
     refreshUpdateSurfaces,
   ]);
+
+  useDebouncedRuntimeEvent(
+    "objects:changed",
+    500,
+    refreshRuntimeSurfaces,
+  );
+  useDebouncedRuntimeEvent(
+    "provider:changed",
+    250,
+    refreshRuntimeSurfaces,
+  );
 
   useEffect(() => {
     const offCheck = Events.On("updates:check:progress", (event) => {
@@ -1965,6 +1983,33 @@ function App() {
     }
   }, [activeProvider?.id, refreshInventory, refreshProjects]);
 
+  const restartProvider = useCallback(async () => {
+    if (!activeProvider?.id) {
+      setRepairOpen(true);
+      return;
+    }
+    setProviderActionBusy(true);
+    setActionError(null);
+    try {
+      const plan = await ProviderService.PlanRestart(activeProvider.id);
+      setConfirm({
+        ...emptyConfirm,
+        open: true,
+        plan,
+        planKind: "provider",
+        targetName: activeProvider.name,
+      });
+    } catch (error: unknown) {
+      setActionError(
+        error instanceof Error
+          ? error.message
+          : "Unable to plan Docker restart",
+      );
+    } finally {
+      setProviderActionBusy(false);
+    }
+  }, [activeProvider?.id, activeProvider?.name]);
+
   const savePermissionMode = useCallback(async () => {
     setRepairSaving(true);
     setRepairError(null);
@@ -2001,10 +2046,16 @@ function App() {
           title: "Setting saved",
         });
         if (key === "windows.wsl_distro") {
-          if (activeProvider?.id) {
-            await ProviderService.Detect(activeProvider.id);
+          await ProviderService.SetActiveProvider(windowsWSLProviderID);
+          await refreshInventory();
+          await refreshProjects();
+          await refreshUpdateSurfaces();
+        }
+        if (key === "linux.sudo_mode" || key === "linux.socket_path") {
+          if (activeProvider?.id === linuxNativeProviderID) {
+            await ProviderService.SetActiveProvider(linuxNativeProviderID);
           } else {
-            await ProviderService.Detect(windowsWSLProviderID).catch(
+            await ProviderService.Detect(linuxNativeProviderID).catch(
               () => null,
             );
           }
@@ -2012,14 +2063,14 @@ function App() {
           await refreshProjects();
           await refreshUpdateSurfaces();
         }
-        if (key === "linux.sudo_mode" || key === "linux.socket_path") {
-          await ProviderService.Detect(linuxNativeProviderID).catch(() => null);
-          await refreshInventory();
-          await refreshProjects();
-          await refreshUpdateSurfaces();
-        }
         if (String(key).startsWith("macos.colima_")) {
-          await ProviderService.Detect(macOSColimaProviderID).catch(() => null);
+          if (activeProvider?.id === macOSColimaProviderID) {
+            await ProviderService.SetActiveProvider(macOSColimaProviderID);
+          } else {
+            await ProviderService.Detect(macOSColimaProviderID).catch(
+              () => null,
+            );
+          }
           await refreshInventory();
           await refreshProjects();
           await refreshUpdateSurfaces();
@@ -2872,6 +2923,11 @@ function App() {
           confirm.plan.planID,
           confirm.typedName,
         );
+      } else if (confirm.planKind === "provider") {
+        await ProviderService.ApplyProviderPlan(
+          confirm.plan.planID,
+          confirm.typedName,
+        );
       } else {
         await DockerService.ApplyContainerPlan(
           confirm.plan.planID,
@@ -2885,6 +2941,10 @@ function App() {
         if (activeProjectID) {
           await refreshProjectDetail(activeProjectID);
         }
+      } else if (confirm.planKind === "provider") {
+        await refreshInventory();
+        await refreshProjects();
+        await refreshUpdateSurfaces();
       } else if (
         confirm.planKind === "backup" ||
         confirm.planKind === "restore"
@@ -2914,6 +2974,7 @@ function App() {
     refreshAfterAction,
     refreshProjectDetail,
     refreshProjects,
+    refreshUpdateSurfaces,
   ]);
 
   const runProjectAction = useCallback(
@@ -3174,6 +3235,37 @@ function App() {
     }
   }, [ensureDockerReady, loadImage.srcPath, refreshAfterAction]);
 
+  const openRemoveImagePlan = useCallback(
+    async (image: ImageSummary) => {
+      if (!ensureDockerReady()) {
+        return;
+      }
+      const label = primaryImageRef(image);
+      setActionError(null);
+      try {
+        const inUse = image.inUse || (imageUseCounts[image.id] ?? 0) > 0;
+        const plan = await DockerService.PlanRemoveImage(image.id, inUse);
+        if (!plan) {
+          throw new Error("Image removal plan was empty");
+        }
+        setConfirm({
+          ...emptyConfirm,
+          open: true,
+          plan,
+          planKind: "container",
+          targetName: label,
+        });
+      } catch (error: unknown) {
+        setActionError(
+          error instanceof Error
+            ? error.message
+            : "Unable to plan image removal",
+        );
+      }
+    },
+    [ensureDockerReady, imageUseCounts],
+  );
+
   const submitCreateVolume = useCallback(async () => {
     if (!ensureDockerReady()) {
       return;
@@ -3208,6 +3300,35 @@ function App() {
     ensureDockerReady,
     refreshAfterAction,
   ]);
+
+  const openRemoveVolumePlan = useCallback(
+    async (volume: VolumeSummary) => {
+      if (!ensureDockerReady()) {
+        return;
+      }
+      setActionError(null);
+      try {
+        const plan = await DockerService.PlanRemoveVolume(volume.name, false);
+        if (!plan) {
+          throw new Error("Volume removal plan was empty");
+        }
+        setConfirm({
+          ...emptyConfirm,
+          open: true,
+          plan,
+          planKind: "container",
+          targetName: volume.name,
+        });
+      } catch (error: unknown) {
+        setActionError(
+          error instanceof Error
+            ? error.message
+            : "Unable to plan volume removal",
+        );
+      }
+    },
+    [ensureDockerReady],
+  );
 
   const openBackupVolume = useCallback(
     (volume: VolumeSummary) => {
@@ -3379,6 +3500,35 @@ function App() {
       }));
     }
   }, [createNetwork, ensureDockerReady, refreshAfterAction]);
+
+  const openRemoveNetworkPlan = useCallback(
+    async (network: NetworkSummary) => {
+      if (!ensureDockerReady()) {
+        return;
+      }
+      setActionError(null);
+      try {
+        const plan = await DockerService.PlanRemoveNetwork(network.id);
+        if (!plan) {
+          throw new Error("Network removal plan was empty");
+        }
+        setConfirm({
+          ...emptyConfirm,
+          open: true,
+          plan,
+          planKind: "container",
+          targetName: network.name,
+        });
+      } catch (error: unknown) {
+        setActionError(
+          error instanceof Error
+            ? error.message
+            : "Unable to plan network removal",
+        );
+      }
+    },
+    [ensureDockerReady],
+  );
 
   const browseImportFolder = useCallback(async () => {
     try {
@@ -3923,6 +4073,7 @@ function App() {
             onLoad={() => setLoadImage({ ...emptyLoadImage, open: true })}
             onPull={() => setPullImage({ ...emptyPullImage, open: true })}
             onPush={openPushImageModal}
+            onRemove={openRemoveImagePlan}
             onRun={openRunImageModal}
             onSave={openSaveImageModal}
             onTag={openTagImageModal}
@@ -3942,6 +4093,7 @@ function App() {
             }
             onFilterChange={setVolumeFilter}
             onInspect={openVolumeInspect}
+            onRemove={openRemoveVolumePlan}
             onRestore={(volume) => {
               void openRestoreVolume(volume);
             }}
@@ -3962,6 +4114,7 @@ function App() {
               setCreateNetwork({ ...emptyCreateNetwork, open: true })
             }
             onInspect={openNetworkInspect}
+            onRemove={openRemoveNetworkPlan}
             search={search}
           />
         );
@@ -3978,13 +4131,21 @@ function App() {
             onImportProject={() =>
               setImportProject({ ...emptyImportProject, open: true })
             }
+            onCheckUpdates={checkAllUpdates}
+            onCleanupApplied={async () => {
+              await refreshInventory();
+              await refreshProjects();
+              await refreshUpdateSurfaces();
+            }}
             onNavigate={navigate}
             onOpenTerminal={() => navigate("terminal")}
             onOpenProject={openProjectDetail}
+            onRestartDocker={restartProvider}
             onShowContainers={showContainers}
             provider={activeProvider}
             projects={projects}
             projectsLoading={projectsStatus === "loading"}
+            refreshToken={dashboardRefreshToken}
             runningContainers={runningContainers}
             unhealthyContainers={unhealthyContainers}
             volumes={volumes}
@@ -7319,14 +7480,18 @@ type OverviewProps = {
   volumes: VolumeSummary[];
   projects: ProjectSummary[];
   projectsLoading: boolean;
+  refreshToken: number;
   runningContainers: number;
   unhealthyContainers: number;
   diskTotal: number;
   diskReclaimable: number;
   onImportProject: () => void;
+  onCheckUpdates: () => void;
+  onCleanupApplied: () => Promise<void>;
   onNavigate: (page: PageID) => void;
   onOpenTerminal: () => void;
   onOpenProject: (project: ProjectSummary) => void;
+  onRestartDocker: () => void;
   onShowContainers: (filter: FilterID) => void;
 };
 
@@ -7338,14 +7503,18 @@ function OverviewPage({
   images,
   mutationsDisabled,
   mutationDisabledReason,
+  onCheckUpdates,
+  onCleanupApplied,
   onImportProject,
   onNavigate,
   onOpenTerminal,
   onOpenProject,
+  onRestartDocker,
   onShowContainers,
   provider,
   projects,
   projectsLoading,
+  refreshToken,
   runningContainers,
   unhealthyContainers,
   volumes,
@@ -7395,26 +7564,41 @@ function OverviewPage({
     }
   }, [dockerRunning]);
 
+  const applyCleanup = useCallback(
+    async (state: CleanupState) => {
+      setCleanup((current) => ({ ...current, busy: true, error: undefined }));
+      try {
+        for (const kind of cleanupKinds(state)) {
+          const plan = await DockerService.PlanPrune(kind);
+          if (!plan) {
+            throw new Error("Cleanup plan was empty");
+          }
+          await DockerService.ApplyContainerPlan(
+            plan.planID,
+            kind === "volumes" ? "prune" : "",
+          );
+        }
+        await onCleanupApplied();
+        await loadDashboard();
+        setCleanup(emptyCleanup);
+      } catch (error: unknown) {
+        setCleanup((current) => ({
+          ...current,
+          busy: false,
+          error:
+            error instanceof Error ? error.message : "Unable to clean up Docker",
+        }));
+      }
+    },
+    [loadDashboard, onCleanupApplied],
+  );
+
   useEffect(() => {
     const timer = window.setTimeout(() => {
       void loadDashboard();
     }, 0);
     return () => window.clearTimeout(timer);
-  }, [loadDashboard]);
-
-  useEffect(() => {
-    let timer: number | undefined;
-    const off = Events.On("objects:changed", () => {
-      window.clearTimeout(timer);
-      timer = window.setTimeout(() => {
-        void loadDashboard();
-      }, 500);
-    });
-    return () => {
-      window.clearTimeout(timer);
-      off();
-    };
-  }, [loadDashboard]);
+  }, [loadDashboard, refreshToken]);
 
   useEffect(() => {
     chartPausedRef.current = chartPaused;
@@ -7609,9 +7793,10 @@ function OverviewPage({
           Open terminal
         </Button>
         <Button
-          disabled
-          disabledReason="Update checks begin in Phase 8"
+          disabled={mutationsDisabled}
+          disabledReason={mutationDisabledReason}
           icon={<RefreshCw size={15} />}
+          onClick={onCheckUpdates}
           size="sm"
         >
           Check updates
@@ -7630,9 +7815,10 @@ function OverviewPage({
           Prune
         </Button>
         <Button
-          disabled
-          disabledReason="Engine restart requires provider command planning"
+          disabled={mutationsDisabled}
+          disabledReason={mutationDisabledReason}
           icon={<RotateCw size={15} />}
+          onClick={onRestartDocker}
           size="sm"
         >
           Restart Docker
@@ -7725,6 +7911,7 @@ function OverviewPage({
             onOpenLogs={() => onNavigate("logs")}
           />
           <UpdatesCard
+            onCheckNow={onCheckUpdates}
             onOpenProjects={() => onNavigate("projects")}
             projects={projects}
             summary={updateSummary}
@@ -7742,6 +7929,7 @@ function OverviewPage({
         onChange={(patch) =>
           setCleanup((current) => ({ ...current, ...patch }))
         }
+        onConfirm={applyCleanup}
         onClose={() => setCleanup(emptyCleanup)}
         state={cleanup}
       />
@@ -7983,15 +8171,15 @@ function ResourceUsagePanel({
               data={points}
               margin={{ bottom: 0, left: 0, right: 8, top: 8 }}
             >
-              <CartesianGrid stroke="rgba(255,255,255,0.1)" vertical={false} />
+              <CartesianGrid stroke={chartColors.grid} vertical={false} />
               <XAxis
                 dataKey="label"
                 minTickGap={28}
-                stroke="#8B949E"
+                stroke={chartColors.axis}
                 tick={{ fontSize: 11 }}
               />
               <YAxis
-                stroke="#8B949E"
+                stroke={chartColors.axis}
                 tick={{ fontSize: 11 }}
                 tickFormatter={(value) =>
                   metric === "memory"
@@ -8008,11 +8196,11 @@ function ResourceUsagePanel({
               {metric === "cpu" ? (
                 <Area
                   dataKey="cpu"
-                  fill="#2DD4A7"
+                  fill={chartColors.cpu}
                   fillOpacity={0.22}
                   isAnimationActive={false}
                   name="CPU"
-                  stroke="#2DD4A7"
+                  stroke={chartColors.cpu}
                   strokeWidth={2}
                   type="monotone"
                 />
@@ -8020,11 +8208,11 @@ function ResourceUsagePanel({
               {metric === "memory" ? (
                 <Area
                   dataKey="memory"
-                  fill="#A78BFA"
+                  fill={chartColors.memory}
                   fillOpacity={0.2}
                   isAnimationActive={false}
                   name="Memory"
-                  stroke="#A78BFA"
+                  stroke={chartColors.memory}
                   strokeWidth={2}
                   type="monotone"
                 />
@@ -8033,23 +8221,23 @@ function ResourceUsagePanel({
                 <>
                   <Area
                     dataKey="netRx"
-                    fill="#4D9FFF"
+                    fill={chartColors.networkRx}
                     fillOpacity={0.18}
                     isAnimationActive={false}
                     name="RX"
                     stackId={stacked ? "network" : undefined}
-                    stroke="#4D9FFF"
+                    stroke={chartColors.networkRx}
                     strokeWidth={2}
                     type="monotone"
                   />
                   <Area
                     dataKey="netTx"
-                    fill="#80B7FF"
+                    fill={chartColors.networkTx}
                     fillOpacity={0.14}
                     isAnimationActive={false}
                     name="TX"
                     stackId={stacked ? "network" : undefined}
-                    stroke="#80B7FF"
+                    stroke={chartColors.networkTx}
                     strokeWidth={2}
                     type="monotone"
                   />
@@ -8147,7 +8335,7 @@ function ProjectsMiniList({
                 </div>
               </div>
               <Sparkline
-                color="#2DD4A7"
+                color={chartColors.spark}
                 points={
                   projectSparks[project.id] ?? projectSparkPoints(project)
                 }
@@ -8179,17 +8367,14 @@ function ContainerHealthPanel({
   paused: number;
   onShowContainers: (filter: FilterID) => void;
 }) {
-  const data = [
-    { name: "Running", value: running, color: "#2DD4A7", filter: "running" },
-    { name: "Stopped", value: stopped, color: "#8B949E", filter: "stopped" },
-    {
-      name: "Unhealthy",
-      value: unhealthy,
-      color: "#F0605D",
-      filter: "unhealthy",
-    },
-    { name: "Paused", value: paused, color: "#F5B83D", filter: "paused" },
-  ].filter((item) => item.value > 0);
+  const data = containerStatusChartSegments({
+    paused,
+    running,
+    stopped,
+    unhealthy,
+  });
+  const pieData =
+    data.length > 0 ? data : [emptyContainerStatusChartSegment];
   return (
     <Card>
       <CardHeader
@@ -8206,35 +8391,14 @@ function ContainerHealthPanel({
             <ResponsiveContainer height="100%" width="100%">
               <RechartsPieChart>
                 <Pie
-                  data={
-                    data.length > 0
-                      ? data
-                      : [
-                          {
-                            name: "None",
-                            value: 1,
-                            color: "#8B949E",
-                            filter: "all",
-                          },
-                        ]
-                  }
+                  data={pieData}
                   dataKey="value"
                   innerRadius={58}
                   isAnimationActive={false}
                   nameKey="name"
                   outerRadius={86}
                 >
-                  {(data.length > 0
-                    ? data
-                    : [
-                        {
-                          name: "None",
-                          value: 1,
-                          color: "#8B949E",
-                          filter: "all",
-                        },
-                      ]
-                  ).map((item) => (
+                  {pieData.map((item) => (
                     <Cell fill={item.color} key={item.name} />
                   ))}
                 </Pie>
@@ -8299,7 +8463,7 @@ function ContainerHealthPanel({
                     </td>
                     <td className="px-3 py-2">
                       <Sparkline
-                        color="#2DD4A7"
+                        color={chartColors.spark}
                         points={
                           containerSparks[container.id] ??
                           containerSparkPoints(container)
@@ -8383,12 +8547,14 @@ function LogsPeekPanel({
 }
 
 function UpdatesCard({
+  onCheckNow,
   onOpenProjects,
   projects,
   summary,
 }: {
   projects: ProjectSummary[];
   summary: { image: number; base: number; rebuild: number };
+  onCheckNow: () => void;
   onOpenProjects: () => void;
 }) {
   const updateProjects = projects
@@ -8400,9 +8566,8 @@ function UpdatesCard({
       <CardHeader
         actions={
           <Button
-            disabled
-            disabledReason="Registry update checks begin in Phase 8"
             icon={<RefreshCw size={15} />}
+            onClick={onCheckNow}
             size="sm"
           >
             Check now
@@ -8527,18 +8692,28 @@ function RecentEventsPanel({ events }: { events: AuditEntry[] }) {
 function CleanupModal({
   diskReclaimable,
   onChange,
+  onConfirm,
   onClose,
   state,
 }: {
   state: CleanupState;
   diskReclaimable: number;
   onChange: (patch: Partial<CleanupState>) => void;
+  onConfirm: (state: CleanupState) => void;
   onClose: () => void;
 }) {
   const requiresTypedName = state.includeVolumes;
-  const typedReady = !requiresTypedName || state.typedName === "DELETE VOLUMES";
+  const typedReady = !requiresTypedName || state.typedName === "prune";
+  const selectedKinds = cleanupKinds(state);
+  const hasSelection = selectedKinds.length > 0;
+  const disabledReason = !hasSelection
+    ? "Choose at least one cleanup target"
+    : requiresTypedName && !typedReady
+      ? "Type prune to confirm"
+      : undefined;
   return (
     <Modal
+      busy={state.busy}
       onClose={onClose}
       open={state.open}
       size="md"
@@ -8576,7 +8751,7 @@ function CleanupModal({
         {requiresTypedName ? (
           <label className="block text-sm">
             <span className="mb-1 block text-text-secondary">
-              Type DELETE VOLUMES to confirm
+              Type prune to confirm
             </span>
             <input
               className="h-10 w-full rounded-control border border-border bg-bg-inset px-3 text-text-primary outline-none"
@@ -8590,17 +8765,23 @@ function CleanupModal({
             <div key={line}>$ {line}</div>
           ))}
         </div>
+        {state.error ? (
+          <div className="rounded-control border border-error/30 bg-error/10 p-3 text-sm text-error">
+            {state.error}
+          </div>
+        ) : null}
         <div className="flex justify-end gap-2">
-          <Button onClick={onClose} variant="ghost">
+          <Button disabled={state.busy} onClick={onClose} variant="ghost">
             Cancel
           </Button>
           <Button
-            disabled={!typedReady}
-            disabledReason="Type the confirmation text first"
-            onClick={onClose}
+            disabled={!hasSelection || !typedReady || state.busy}
+            disabledReason={disabledReason}
+            loading={state.busy}
+            onClick={() => onConfirm(state)}
             variant="danger"
           >
-            Confirm preview
+            Clean up
           </Button>
         </div>
       </div>
@@ -10520,7 +10701,7 @@ function ProjectCard({
 
         <div className="h-10 overflow-hidden rounded-control border border-border bg-bg-inset px-2 py-2">
           <Sparkline
-            color="#2DD4A7"
+            color={chartColors.spark}
             points={sparkPoints ?? projectSparkPoints(project)}
           />
         </div>
@@ -11862,6 +12043,7 @@ type ImagesPageProps = {
   onLoad: () => void;
   onPull: () => void;
   onPush: (image: ImageSummary) => void;
+  onRemove: (image: ImageSummary) => void;
   onRun: (image?: ImageSummary) => void;
   onSave: (image: ImageSummary) => void;
   onTag: (image: ImageSummary) => void;
@@ -11879,6 +12061,7 @@ function ImagesPage({
   onLoad,
   onPull,
   onPush,
+  onRemove,
   onRun,
   onSave,
   onTag,
@@ -12011,6 +12194,7 @@ function ImagesPage({
                 mutationDisabledReason={mutationDisabledReason}
                 onInspect={() => onInspect(image)}
                 onPush={() => onPush(image)}
+                onRemove={() => onRemove(image)}
                 onRun={() => onRun(image)}
                 onSave={() => onSave(image)}
                 onTag={() => onTag(image)}
@@ -12044,6 +12228,7 @@ type VolumesPageProps = {
   onCreate: () => void;
   onFilterChange: (filter: FilterID) => void;
   onInspect: (volume: VolumeSummary) => void;
+  onRemove: (volume: VolumeSummary) => void;
   onRestore: (volume: VolumeSummary) => void;
 };
 
@@ -12056,6 +12241,7 @@ function VolumesPage({
   onCreate,
   onFilterChange,
   onInspect,
+  onRemove,
   onRestore,
   search,
   volumeDetails,
@@ -12172,7 +12358,10 @@ function VolumesPage({
                 <RowActions
                   id={volume.name}
                   label={volume.name}
+                  mutationsDisabled={mutationsDisabled}
+                  mutationDisabledReason={mutationDisabledReason}
                   onInspect={() => onInspect(volume)}
+                  onRemove={() => onRemove(volume)}
                 />
               </div>
             ),
@@ -12201,6 +12390,7 @@ type NetworksPageProps = {
   mutationDisabledReason: string;
   onCreate: () => void;
   onInspect: (network: NetworkSummary) => void;
+  onRemove: (network: NetworkSummary) => void;
 };
 
 function NetworksPage({
@@ -12211,6 +12401,7 @@ function NetworksPage({
   networks,
   onCreate,
   onInspect,
+  onRemove,
   search,
 }: NetworksPageProps) {
   const filtered = useMemo(
@@ -12296,7 +12487,10 @@ function NetworksPage({
               <RowActions
                 id={network.id}
                 label={network.name}
+                mutationsDisabled={mutationsDisabled}
+                mutationDisabledReason={mutationDisabledReason}
                 onInspect={() => onInspect(network)}
+                onRemove={() => onRemove(network)}
               />
             ),
           },
@@ -12373,11 +12567,17 @@ function FilterChips({
 function RowActions({
   id,
   label,
+  mutationsDisabled = false,
+  mutationDisabledReason = "",
   onInspect,
+  onRemove,
 }: {
   id: string;
   label: string;
+  mutationsDisabled?: boolean;
+  mutationDisabledReason?: string;
   onInspect: () => void;
+  onRemove?: () => void;
 }) {
   return (
     <div className="flex justify-end gap-1">
@@ -12390,6 +12590,19 @@ function RowActions({
           variant="ghost"
         />
       </Tooltip>
+      {onRemove ? (
+        <Tooltip label="Remove">
+          <Button
+            aria-label={`Remove ${label}`}
+            disabled={mutationsDisabled}
+            disabledReason={mutationDisabledReason}
+            icon={<Trash2 size={15} />}
+            onClick={onRemove}
+            size="icon"
+            variant="ghost"
+          />
+        </Tooltip>
+      ) : null}
       <Tooltip label="Copy ID">
         <Button
           aria-label={`Copy ${label}`}
@@ -12411,6 +12624,7 @@ function ImageRowActions({
   mutationDisabledReason,
   onInspect,
   onPush,
+  onRemove,
   onRun,
   onSave,
   onTag,
@@ -12420,6 +12634,7 @@ function ImageRowActions({
   mutationDisabledReason: string;
   onInspect: () => void;
   onPush: () => void;
+  onRemove: () => void;
   onRun: () => void;
   onSave: () => void;
   onTag: () => void;
@@ -12471,7 +12686,14 @@ function ImageRowActions({
           variant="ghost"
         />
       </Tooltip>
-      <RowActions id={image.id} label={label} onInspect={onInspect} />
+      <RowActions
+        id={image.id}
+        label={label}
+        mutationsDisabled={mutationsDisabled}
+        mutationDisabledReason={mutationDisabledReason}
+        onInspect={onInspect}
+        onRemove={onRemove}
+      />
     </div>
   );
 }
@@ -16002,29 +16224,6 @@ function projectSparkEntries(samples: StatsSample[], label: string) {
   }));
 }
 
-function dashboardTopRows(
-  dashboardTop: MetricRankItem[],
-  latestSamples: Record<string, StatsSample>,
-) {
-  const liveRows = Object.values(latestSamples)
-    .map(
-      (sample): MetricRankItem => ({
-        id: sample.containerID,
-        name: sample.containerName || shortID(sample.containerID),
-        kind: "container",
-        cpuPercent: sample.cpuPercent,
-        memoryBytes: sample.memoryBytes,
-      }),
-    )
-    .sort(
-      (left, right) =>
-        (right.cpuPercent ?? 0) - (left.cpuPercent ?? 0) ||
-        (right.memoryBytes ?? 0) - (left.memoryBytes ?? 0),
-    )
-    .slice(0, 8);
-  return liveRows.length > 0 ? liveRows : dashboardTop.slice(0, 8);
-}
-
 function projectActivityScore(project: ProjectSummary, points?: SparkPoint[]) {
   const latest = points?.[points.length - 1]?.value ?? project.cpuPercent;
   return latest + project.memoryBytes / 1024 / 1024 / 1024;
@@ -16092,20 +16291,38 @@ function logLevelClass(level: LogLevelFilter) {
   }
 }
 
-function cleanupPreviewCommands(state: CleanupState) {
-  const commands = [];
+function cleanupKinds(state: CleanupState) {
+  const kinds: string[] = [];
   if (state.includeImages) {
-    commands.push("docker image prune --all");
+    kinds.push("images");
   }
   if (state.includeContainers) {
-    commands.push("docker container prune");
+    kinds.push("containers");
   }
   if (state.includeBuildCache) {
-    commands.push("docker builder prune");
+    kinds.push("build-cache");
   }
   if (state.includeVolumes) {
-    commands.push("docker volume prune");
+    kinds.push("volumes");
   }
+  return kinds;
+}
+
+function cleanupPreviewCommands(state: CleanupState) {
+  const commands = cleanupKinds(state).map((kind) => {
+    switch (kind) {
+      case "images":
+        return "docker image prune --all";
+      case "containers":
+        return "docker container prune";
+      case "build-cache":
+        return "docker builder prune";
+      case "volumes":
+        return "docker volume prune";
+      default:
+        return `docker ${kind} prune`;
+    }
+  });
   return commands.length > 0 ? commands : ["docker system df"];
 }
 

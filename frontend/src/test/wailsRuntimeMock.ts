@@ -888,6 +888,18 @@ const callHandlers: Record<number, (...args: unknown[]) => unknown> = {
   ],
   1372038617: () =>
     commandPlan("Install Docker Engine on Linux", "sudo apt-get update"),
+  1935115277: () =>
+    commandPlan(
+      "Restart Docker backend",
+      "systemctl --user restart docker",
+      risk.destructive,
+    ),
+  3550597673: () => undefined,
+  3893040676: () => undefined,
+  229778316: () => undefined,
+  256096338: () => undefined,
+  1386500759: () => undefined,
+  1617116029: () => undefined,
   572168877: () => [
     { registry: "docker.io", displayName: "Docker Hub", defaultNamespace: "" },
     { registry: "ghcr.io", displayName: "GitHub Container Registry" },

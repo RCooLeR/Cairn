@@ -85,7 +85,11 @@ const dockerServiceMock = vi.hoisted(() => ({
   LoadImage: vi.fn(),
   SearchHub: vi.fn(),
   CreateVolume: vi.fn(),
+  PlanRemoveImage: vi.fn(),
+  PlanPrune: vi.fn(),
+  PlanRemoveVolume: vi.fn(),
   CreateNetwork: vi.fn(),
+  PlanRemoveNetwork: vi.fn(),
 }));
 
 const projectServiceMock = vi.hoisted(() => ({
@@ -117,6 +121,9 @@ const providerServiceMock = vi.hoisted(() => ({
   PlanInstall: vi.fn(),
   ApplyInstall: vi.fn(),
   SetDockerContext: vi.fn(),
+  SetActiveProvider: vi.fn(),
+  PlanRestart: vi.fn(),
+  ApplyProviderPlan: vi.fn(),
   Start: vi.fn(),
 }));
 
@@ -305,6 +312,11 @@ describe("App inventory shell", () => {
       driver: "local",
       inUse: false,
     });
+    dockerServiceMock.PlanRemoveImage.mockResolvedValue(removeImagePlan());
+    dockerServiceMock.PlanPrune.mockImplementation((kind: string) =>
+      Promise.resolve(prunePlan(kind)),
+    );
+    dockerServiceMock.PlanRemoveVolume.mockResolvedValue(removeVolumePlan());
     dockerServiceMock.CreateNetwork.mockResolvedValue({
       id: "network-new",
       name: "created_network",
@@ -312,6 +324,7 @@ describe("App inventory shell", () => {
       internal: false,
       attachable: false,
     });
+    dockerServiceMock.PlanRemoveNetwork.mockResolvedValue(removeNetworkPlan());
     projectServiceMock.RefreshProjects.mockResolvedValue([]);
     projectServiceMock.ListProjects.mockResolvedValue([]);
     projectServiceMock.GetProject.mockResolvedValue(null);
@@ -348,6 +361,9 @@ describe("App inventory shell", () => {
       streamID: "setup-stream",
     });
     providerServiceMock.SetDockerContext.mockResolvedValue(undefined);
+    providerServiceMock.SetActiveProvider.mockResolvedValue(undefined);
+    providerServiceMock.PlanRestart.mockResolvedValue(providerRestartPlan());
+    providerServiceMock.ApplyProviderPlan.mockResolvedValue(undefined);
     providerServiceMock.Start.mockResolvedValue(undefined);
     logsServiceMock.StartLogStream.mockResolvedValue("stream-1");
     logsServiceMock.StopStream.mockResolvedValue(undefined);
@@ -776,18 +792,28 @@ describe("App inventory shell", () => {
     fireEvent.click(within(dialog).getByLabelText("Unused volumes"));
 
     expect(
-      within(dialog).getByRole("button", { name: "Confirm preview" }),
+      within(dialog).getByRole("button", { name: "Clean up" }),
     ).toBeDisabled();
     fireEvent.change(
-      within(dialog).getByLabelText("Type DELETE VOLUMES to confirm"),
+      within(dialog).getByLabelText("Type prune to confirm"),
       {
-        target: { value: "DELETE VOLUMES" },
+        target: { value: "prune" },
       },
     );
 
-    expect(
-      within(dialog).getByRole("button", { name: "Confirm preview" }),
-    ).toBeEnabled();
+    const cleanUpButton = within(dialog).getByRole("button", {
+      name: "Clean up",
+    });
+    expect(cleanUpButton).toBeEnabled();
+    fireEvent.click(cleanUpButton);
+
+    await waitFor(() =>
+      expect(dockerServiceMock.PlanPrune).toHaveBeenCalledWith("volumes"),
+    );
+    expect(dockerServiceMock.ApplyContainerPlan).toHaveBeenCalledWith(
+      "plan-prune-volumes",
+      "prune",
+    );
   });
 
   it("lists containers and applies search without leaving the table view", async () => {
@@ -2394,7 +2420,7 @@ describe("App inventory shell", () => {
     const callbacks = runtimeMock.on.mock.calls
       .filter(([name]) => name === "objects:changed")
       .map(([, callback]) => callback as (event?: unknown) => void);
-    expect(callbacks.length).toBeGreaterThan(0);
+    expect(callbacks).toHaveLength(1);
     act(() => {
       callbacks.forEach((callback) =>
         callback({ name: "objects:changed", data: undefined }),
@@ -3177,6 +3203,106 @@ function killPlan(): CommandPlan {
       },
     ],
     effects: ["web: Immediately sends SIGKILL to the selected container."],
+    expiresAt: "2026-06-13T08:10:00Z",
+  };
+}
+
+function removeImagePlan(): CommandPlan {
+  return {
+    planID: "plan-remove-image",
+    title: "Remove image cairn/web:latest",
+    risk: Risk.RiskDestructive,
+    commands: [
+      {
+        order: 1,
+        command: "docker image rm --force cairn/web:latest",
+        risk: Risk.RiskDestructive,
+        explanation: "Removes the selected image from the Docker backend.",
+      },
+    ],
+    effects: [
+      "Image cairn/web:latest will be removed from the active Docker backend.",
+    ],
+    expiresAt: "2026-06-13T08:10:00Z",
+  };
+}
+
+function prunePlan(kind: string): CommandPlan {
+  const dangerous = kind === "volumes";
+  return {
+    planID: `plan-prune-${kind}`,
+    title: `Prune ${kind}`,
+    risk: dangerous ? Risk.RiskDangerous : Risk.RiskDestructive,
+    commands: [
+      {
+        order: 1,
+        command:
+          kind === "build-cache"
+            ? "docker builder prune"
+            : `docker ${kind.slice(0, -1)} prune`,
+        risk: dangerous ? Risk.RiskDangerous : Risk.RiskDestructive,
+        explanation: `Prune ${kind}`,
+      },
+    ],
+    effects: [`Unused ${kind} will be removed.`],
+    requiresTypedName: dangerous ? "prune" : undefined,
+    expiresAt: "2026-06-13T08:10:00Z",
+  };
+}
+
+function removeVolumePlan(): CommandPlan {
+  return {
+    planID: "plan-remove-volume",
+    title: "Delete volume cairn_data",
+    risk: Risk.RiskDangerous,
+    commands: [
+      {
+        order: 1,
+        command: "docker volume rm cairn_data",
+        risk: Risk.RiskDangerous,
+        explanation: "Deletes the selected Docker volume.",
+      },
+    ],
+    effects: [
+      "Volume cairn_data and its data will be deleted from the active Docker backend.",
+    ],
+    requiresTypedName: "cairn_data",
+    expiresAt: "2026-06-13T08:10:00Z",
+  };
+}
+
+function removeNetworkPlan(): CommandPlan {
+  return {
+    planID: "plan-remove-network",
+    title: "Remove network cairn",
+    risk: Risk.RiskNeedsConfirmation,
+    commands: [
+      {
+        order: 1,
+        command: "docker network rm cairn",
+        risk: Risk.RiskNeedsConfirmation,
+        explanation: "Removes the selected Docker network.",
+      },
+    ],
+    effects: ["Network cairn will be removed from the active Docker backend."],
+    expiresAt: "2026-06-13T08:10:00Z",
+  };
+}
+
+function providerRestartPlan(): CommandPlan {
+  return {
+    planID: "plan-provider-restart",
+    title: "Restart Docker backend",
+    risk: Risk.RiskDestructive,
+    commands: [
+      {
+        order: 1,
+        command: "systemctl --user restart docker",
+        risk: Risk.RiskDestructive,
+        explanation: "Restart the active Docker backend.",
+      },
+    ],
+    effects: ["Docker backend will be restarted."],
     expiresAt: "2026-06-13T08:10:00Z",
   };
 }

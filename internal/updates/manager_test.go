@@ -27,6 +27,32 @@ const (
 	digestD = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 )
 
+func TestManagerStopAllCancelsManagedJobs(t *testing.T) {
+	t.Parallel()
+	manager := NewManager(nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	manager.startJob("updates-test", func(ctx context.Context) {
+		close(started)
+		<-ctx.Done()
+		done <- ctx.Err()
+	})
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for managed job to start")
+	}
+	manager.StopAll()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("job context error = %v, want context canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for managed job cancellation")
+	}
+}
+
 func TestManagerServiceImageStatusMachine(t *testing.T) {
 	ctx := context.Background()
 	db := openUpdatesStore(t)
@@ -807,13 +833,15 @@ func TestExecutorHelperBranches(t *testing.T) {
 }
 
 func TestFatalLogDetected(t *testing.T) {
-	for _, input := range []string{"panic: boom", "Fatal error", "Exception in thread main", "exit-on-start"} {
+	for _, input := range []string{"panic: boom", "Fatal error: failed to boot", `Exception in thread "main"`, "exit-on-start"} {
 		if !fatalLogDetected(input) {
 			t.Fatalf("fatalLogDetected(%q) = false", input)
 		}
 	}
-	if fatalLogDetected("server started normally") {
-		t.Fatalf("fatalLogDetected(normal) = true")
+	for _, input := range []string{"server started normally", "FatalErrorCode=0", "Exception in thread pool size is configured"} {
+		if fatalLogDetected(input) {
+			t.Fatalf("fatalLogDetected(%q) = true", input)
+		}
 	}
 }
 
@@ -1116,9 +1144,9 @@ func TestManagerRemainingErrorAndDefaultBranches(t *testing.T) {
 	if !enabled || interval != 24*time.Hour {
 		t.Fatalf("nil-settings scheduler interval = %v/%v", interval, enabled)
 	}
-	manager.Now = func() time.Time { return time.Unix(0, int64(5*time.Minute)).UTC() }
-	if got := manager.jitter(time.Hour); got != 5*time.Minute {
-		t.Fatalf("default jitter = %v, want 5m", got)
+	got := manager.jitter(time.Hour)
+	if got < 0 || got >= 6*time.Minute {
+		t.Fatalf("default jitter = %v, want [0, 6m)", got)
 	}
 	cancelCtx, cancel := context.WithCancel(ctx)
 	cancel()

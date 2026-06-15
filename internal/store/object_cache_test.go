@@ -31,7 +31,8 @@ func TestObjectCacheRepositoryUpsertAndDeleteStale(t *testing.T) {
 			ID:        "container-1",
 			Name:      "web",
 			Image:     "example/web:latest",
-			Status:    "running",
+			Status:    "Up 3 hours",
+			State:     "running",
 			Health:    models.HealthStatusHealthy,
 			CreatedAt: oldSeen,
 		},
@@ -44,7 +45,8 @@ func TestObjectCacheRepositoryUpsertAndDeleteStale(t *testing.T) {
 			ID:        "container-2",
 			Name:      "worker",
 			Image:     "example/worker:latest",
-			Status:    "exited",
+			Status:    "Exited (0) 1 hour ago",
+			State:     "exited",
 			Health:    models.HealthStatusUnknown,
 			CreatedAt: freshSeen,
 		},
@@ -54,6 +56,19 @@ func TestObjectCacheRepositoryUpsertAndDeleteStale(t *testing.T) {
 
 	if got := countRows(t, ctx, db, "containers_cache"); got != 2 {
 		t.Fatalf("containers before prune = %d, want 2", got)
+	}
+	containers, err := repo.ListContainers(ctx, "linux_native")
+	if err != nil {
+		t.Fatalf("ListContainers() error = %v", err)
+	}
+	if len(containers) != 2 {
+		t.Fatalf("containers = %#v, want 2 records", containers)
+	}
+	if containers[0].Summary.Name != "web" || containers[0].Summary.Status != "Up 3 hours" || containers[0].Summary.State != "running" {
+		t.Fatalf("first cached container = %#v, want web with status and state preserved", containers[0].Summary)
+	}
+	if containers[1].Summary.Name != "worker" || containers[1].Summary.Status != "Exited (0) 1 hour ago" || containers[1].Summary.State != "exited" {
+		t.Fatalf("second cached container = %#v, want worker with status and state preserved", containers[1].Summary)
 	}
 	if err := repo.DeleteStale(ctx, "linux_native", oldSeen.Add(24*time.Hour)); err != nil {
 		t.Fatalf("DeleteStale() error = %v", err)

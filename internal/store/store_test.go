@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"testing"
 	"time"
@@ -66,8 +67,8 @@ func TestMigrateFreshDatabaseCreatesV1Schema(t *testing.T) {
 		}
 	}
 
-	if got := migrationCount(t, ctx, s); got != 1 {
-		t.Fatalf("migration count = %d, want 1", got)
+	if got := migrationCount(t, ctx, s); got != 2 {
+		t.Fatalf("migration count = %d, want 2", got)
 	}
 }
 
@@ -79,8 +80,8 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	if err := s.Migrate(ctx); err != nil {
 		t.Fatalf("second migrate: %v", err)
 	}
-	if got := migrationCount(t, ctx, s); got != 1 {
-		t.Fatalf("migration count after rerun = %d, want 1", got)
+	if got := migrationCount(t, ctx, s); got != 2 {
+		t.Fatalf("migration count after rerun = %d, want 2", got)
 	}
 }
 
@@ -106,6 +107,32 @@ func TestMigrateRefusesNewerSchema(t *testing.T) {
 
 	if err := s.Migrate(ctx); !errors.Is(err, ErrNewerSchema) {
 		t.Fatalf("Migrate error = %v, want ErrNewerSchema", err)
+	}
+}
+
+func TestCopyFilePublishesAtomicallyAndDoesNotOverwrite(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	src := filepath.Join(dir, "source.db")
+	dst := filepath.Join(dir, "source.db.bak-test")
+	if err := os.WriteFile(src, []byte("backup-data"), 0o600); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	if err := copyFile(src, dst); err != nil {
+		t.Fatalf("copyFile() error = %v", err)
+	}
+	if got, err := os.ReadFile(dst); err != nil || string(got) != "backup-data" {
+		t.Fatalf("backup content = %q, %v", got, err)
+	}
+	matches, err := filepath.Glob(dst + ".tmp-*")
+	if err != nil {
+		t.Fatalf("glob temp files: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("temporary files left behind: %v", matches)
+	}
+	if err := copyFile(src, dst); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("copyFile(existing) error = %v, want os.ErrExist", err)
 	}
 }
 
@@ -140,8 +167,8 @@ func TestReleaseDBFixtureUpgrade(t *testing.T) {
 	if err := upgraded.Migrate(ctx); err != nil {
 		t.Fatalf("migrate release fixture: %v", err)
 	}
-	if got := migrationCount(t, ctx, upgraded); got != 1 {
-		t.Fatalf("migration count = %d, want 1", got)
+	if got := migrationCount(t, ctx, upgraded); got != 2 {
+		t.Fatalf("migration count = %d, want 2", got)
 	}
 
 	settings := upgraded.Settings()
@@ -181,6 +208,26 @@ func TestReleaseDBFixtureUpgrade(t *testing.T) {
 	}
 	if got := queryInt64(t, ctx, upgraded, "SELECT read FROM notifications WHERE title = ?", "Update applied"); got != 0 {
 		t.Fatalf("notification read = %d, want 0", got)
+	}
+}
+
+func TestOpenCreatesPrivateStoreDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows ACLs do not map cleanly to Unix permission bits")
+	}
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "private", "cairn.db")
+	s, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	closeStore(t, s)
+	info, err := os.Stat(filepath.Dir(path))
+	if err != nil {
+		t.Fatalf("Stat() error = %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o700 {
+		t.Fatalf("store directory mode = %o, want 700", got)
 	}
 }
 

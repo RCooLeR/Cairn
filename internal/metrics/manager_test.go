@@ -161,6 +161,25 @@ func TestManagerFlushRetainsPendingOnCanceledContext(t *testing.T) {
 	}
 }
 
+func TestTrimPendingMetricsKeepsNewestSamples(t *testing.T) {
+	records := make([]store.MetricsSampleRecord, maxPendingPersistSamples+2)
+	for i := range records {
+		records[i].ContainerID = string(rune('a' + i%26))
+		records[i].CPUPercent = float64(i)
+	}
+
+	trimmed := trimPendingMetrics(records)
+	if len(trimmed) != maxPendingPersistSamples {
+		t.Fatalf("trimmed pending len = %d, want %d", len(trimmed), maxPendingPersistSamples)
+	}
+	if trimmed[0].CPUPercent != 2 {
+		t.Fatalf("first retained sample CPU = %.1f, want 2", trimmed[0].CPUPercent)
+	}
+	if trimmed[len(trimmed)-1].CPUPercent != float64(maxPendingPersistSamples+1) {
+		t.Fatalf("last retained sample CPU = %.1f, want newest sample", trimmed[len(trimmed)-1].CPUPercent)
+	}
+}
+
 func TestManagerQueriesStopsFallbackAndScopes(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)

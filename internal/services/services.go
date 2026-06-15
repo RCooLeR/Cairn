@@ -9,7 +9,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
@@ -62,6 +64,12 @@ type ProviderService struct {
 	Manager *providers.Manager
 	Events  bus.Bus
 	Audit   *store.AuditRepository
+	Plans   *security.ProviderPlanStore
+	Runtime ProviderRuntime
+}
+
+type ProviderRuntime interface {
+	RebindProvider(context.Context, providers.PlatformProvider) (*models.ProviderSummary, error)
 }
 
 type DockerClient interface {
@@ -88,18 +96,24 @@ type DockerClient interface {
 	SaveImage(context.Context, []string, string) (string, error)
 	LoadImage(context.Context, string) (string, error)
 	SearchHub(context.Context, string, int) ([]models.HubSearchResult, error)
+	RemoveImage(context.Context, string, bool) error
+	Prune(context.Context, string) error
 	ListVolumes(context.Context) ([]models.VolumeSummary, error)
 	GetVolume(context.Context, string) (*models.VolumeDetail, error)
 	CreateVolume(context.Context, models.CreateVolumeRequest) (*models.VolumeSummary, error)
+	RemoveVolume(context.Context, string, bool) error
 	ListNetworks(context.Context) ([]models.NetworkSummary, error)
 	GetNetwork(context.Context, string) (*models.NetworkDetail, error)
 	CreateNetwork(context.Context, models.CreateNetworkRequest) (*models.NetworkSummary, error)
+	RemoveNetwork(context.Context, string) error
 }
 
 type DockerService struct {
-	Client DockerClient
-	Audit  *store.AuditRepository
-	Plans  *security.PlanStore
+	Client      DockerClient
+	Audit       *store.AuditRepository
+	Plans       *security.PlanStore
+	ObjectPlans *security.DockerObjectPlanStore
+	RuntimeMu   *sync.RWMutex
 }
 type ProjectDetector interface {
 	Reconcile(context.Context) ([]models.ProjectSummary, error)
@@ -117,29 +131,37 @@ type ProjectService struct {
 	ProviderID  string
 	ContextName string
 	Now         func() time.Time
+	RuntimeMu   *sync.RWMutex
 }
 
 type ComposeService struct {
-	Client   *composecore.Client
-	Projects *store.ProjectRepository
+	Client    *composecore.Client
+	Projects  *store.ProjectRepository
+	RuntimeMu *sync.RWMutex
 }
 type MetricsService struct {
-	Manager *metrics.Manager
+	Manager   *metrics.Manager
+	RuntimeMu *sync.RWMutex
 }
 type LogsService struct {
-	Manager *logsvc.Manager
+	Manager   *logsvc.Manager
+	RuntimeMu *sync.RWMutex
 }
 type TerminalService struct {
-	Manager *terminal.Manager
+	Manager   *terminal.Manager
+	RuntimeMu *sync.RWMutex
 }
 type UpdateService struct {
-	Manager *updatescore.Manager
+	Manager   *updatescore.Manager
+	RuntimeMu *sync.RWMutex
 }
 type ImageLineageService struct {
-	Manager *lineagecore.Manager
+	Manager   *lineagecore.Manager
+	RuntimeMu *sync.RWMutex
 }
 type BackupService struct {
-	Manager *backups.Manager
+	Manager   *backups.Manager
+	RuntimeMu *sync.RWMutex
 }
 type RegistryService struct {
 	Manager *registrycore.Manager
@@ -157,6 +179,24 @@ func notReady() error {
 		apperror.WithRepairHints("Connect a Docker provider from onboarding."),
 	)
 }
+
+func lockRuntime(mu *sync.RWMutex) func() {
+	if mu == nil {
+		return func() {}
+	}
+	mu.RLock()
+	return mu.RUnlock
+}
+
+func (s *DockerService) lockRuntime() func()       { return lockRuntime(s.RuntimeMu) }
+func (s *ProjectService) lockRuntime() func()      { return lockRuntime(s.RuntimeMu) }
+func (s *ComposeService) lockRuntime() func()      { return lockRuntime(s.RuntimeMu) }
+func (s *MetricsService) lockRuntime() func()      { return lockRuntime(s.RuntimeMu) }
+func (s *LogsService) lockRuntime() func()         { return lockRuntime(s.RuntimeMu) }
+func (s *TerminalService) lockRuntime() func()     { return lockRuntime(s.RuntimeMu) }
+func (s *UpdateService) lockRuntime() func()       { return lockRuntime(s.RuntimeMu) }
+func (s *ImageLineageService) lockRuntime() func() { return lockRuntime(s.RuntimeMu) }
+func (s *BackupService) lockRuntime() func()       { return lockRuntime(s.RuntimeMu) }
 
 func (s *ProviderService) ListProviders(ctx context.Context) ([]models.ProviderSummary, error) {
 	if s.Manager != nil {
@@ -193,19 +233,22 @@ func (s *ProviderService) PlanInstall(ctx context.Context, providerID string, op
 	return nil, notReady()
 }
 
-func (s *ProviderService) ApplyInstall(_ context.Context, planID string) (*models.InstallProgressHandle, error) {
+func (s *ProviderService) ApplyInstall(ctx context.Context, planID string) (*models.InstallProgressHandle, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if s.Manager == nil {
 		return nil, notReady()
 	}
 	streamID := uuid.NewString()
 	progress := make(chan providers.InstallProgress, 8)
 	providerID, command, risk := s.Manager.InstallPlanAuditContext(planID)
-	go s.runProviderInstall(planID, streamID, providerID, command, risk, progress)
+	go s.runProviderInstall(ctx, planID, streamID, providerID, command, risk, progress)
 	return &models.InstallProgressHandle{PlanID: planID, StreamID: streamID}, nil
 }
 
-func (s *ProviderService) runProviderInstall(planID string, streamID string, providerID string, command string, risk models.Risk, progress chan providers.InstallProgress) {
-	ctx := context.Background()
+func (s *ProviderService) runProviderInstall(ctx context.Context, planID string, streamID string, providerID string, command string, risk models.Risk, progress chan providers.InstallProgress) {
+	auditCtx := context.WithoutCancel(ctx)
 	done := make(chan error, 1)
 	started := time.Now()
 	go func() {
@@ -218,7 +261,7 @@ func (s *ProviderService) runProviderInstall(planID string, streamID string, pro
 		s.publishProviderInstallProgress(planID, streamID, item, "")
 	}
 	if err := <-done; err != nil {
-		if auditErr := s.recordProviderInstallAudit(ctx, planID, providerID, command, risk, "failed", time.Since(started), err); auditErr != nil {
+		if auditErr := s.recordProviderInstallAudit(auditCtx, planID, providerID, command, risk, "failed", time.Since(started), err); auditErr != nil {
 			err = errors.Join(err, auditErr)
 		}
 		s.publishProviderInstallProgress(planID, streamID, providers.InstallProgress{
@@ -228,7 +271,7 @@ func (s *ProviderService) runProviderInstall(planID string, streamID string, pro
 			Done:       true,
 		}, err.Error())
 	} else {
-		if auditErr := s.recordProviderInstallAudit(ctx, planID, providerID, command, risk, "success", time.Since(started), nil); auditErr != nil {
+		if auditErr := s.recordProviderInstallAudit(auditCtx, planID, providerID, command, risk, "success", time.Since(started), nil); auditErr != nil {
 			s.publishProviderInstallProgress(planID, streamID, providers.InstallProgress{
 				Step:       last.Step,
 				TotalSteps: last.TotalSteps,
@@ -303,32 +346,150 @@ func (s *ProviderService) recordProviderInstallAudit(ctx context.Context, planID
 	return nil
 }
 
-func (s *ProviderService) Start(ctx context.Context, providerID string) error {
-	if s.Manager != nil {
-		return s.Manager.Start(ctx, providerID)
+func (s *ProviderService) providerPlanStore() *security.ProviderPlanStore {
+	if s.Plans == nil {
+		s.Plans = security.NewProviderPlanStore(nil)
 	}
-	return notReady()
+	return s.Plans
+}
+
+func (s *ProviderService) runProviderLifecycle(ctx context.Context, action string, providerID string, risk models.Risk) error {
+	if s.Manager == nil {
+		return notReady()
+	}
+	command, commandErr := s.Manager.LifecycleCommand(ctx, action, providerID)
+	if commandErr != nil {
+		return commandErr
+	}
+	started := time.Now().UTC()
+	if err := s.recordProviderLifecycleAudit(ctx, action, providerID, command, risk, "started", 0, nil); err != nil {
+		return err
+	}
+	var err error
+	switch action {
+	case "start":
+		err = s.Manager.Start(ctx, providerID)
+	case "stop":
+		err = s.Manager.Stop(ctx, providerID)
+	case "restart":
+		err = s.Manager.Restart(ctx, providerID)
+	default:
+		err = apperror.New(apperror.Conflict, "Unsupported provider action", apperror.WithDetail(action))
+	}
+	duration := time.Since(started)
+	if err != nil {
+		_ = s.recordProviderLifecycleAudit(ctx, action, providerID, command, risk, "failed", duration, err)
+		return err
+	}
+	if err := s.recordProviderLifecycleAudit(ctx, action, providerID, command, risk, "success", duration, nil); err != nil {
+		return err
+	}
+	if action == "start" || action == "restart" {
+		return s.rebindActiveProvider(ctx)
+	}
+	return nil
+}
+
+func (s *ProviderService) recordProviderLifecycleAudit(ctx context.Context, action string, providerID string, command string, risk models.Risk, status string, duration time.Duration, actionErr error) error {
+	if s.Audit == nil {
+		return nil
+	}
+	if risk == "" {
+		risk = models.RiskSafe
+	}
+	var exitCode *int
+	if status == "success" {
+		code := 0
+		exitCode = &code
+	}
+	message := ""
+	if actionErr != nil {
+		message = actionErr.Error()
+	}
+	_, err := s.Audit.Insert(ctx, store.AuditRecord{
+		Action:     "provider." + action,
+		TargetType: "provider",
+		TargetID:   providerID,
+		ProviderID: providerID,
+		Command:    command,
+		Risk:       risk,
+		Status:     status,
+		ExitCode:   exitCode,
+		Duration:   duration,
+		Error:      message,
+		CreatedAt:  time.Now().UTC(),
+	})
+	if err != nil {
+		return apperror.Wrap(apperror.Internal, "Record provider lifecycle audit entry failed", err)
+	}
+	return nil
+}
+
+func (s *ProviderService) rebindActiveProvider(ctx context.Context) error {
+	if s.Runtime == nil || s.Manager == nil {
+		return nil
+	}
+	activeProvider, err := s.Manager.ActiveProvider(ctx)
+	if err != nil {
+		return err
+	}
+	_, err = s.Runtime.RebindProvider(ctx, activeProvider)
+	return err
+}
+
+func (s *ProviderService) Start(ctx context.Context, providerID string) error {
+	if s.Manager == nil {
+		return notReady()
+	}
+	return s.runProviderLifecycle(ctx, "start", providerID, models.RiskSafe)
 }
 
 func (s *ProviderService) Stop(ctx context.Context, providerID string) error {
-	if s.Manager != nil {
-		return s.Manager.Stop(ctx, providerID)
+	if s.Manager == nil {
+		return notReady()
 	}
-	return notReady()
+	return s.runProviderLifecycle(ctx, "stop", providerID, models.RiskSafe)
 }
 
-func (s *ProviderService) Restart(ctx context.Context, providerID string) error {
-	if s.Manager != nil {
-		return s.Manager.Restart(ctx, providerID)
+func (s *ProviderService) Restart(_ context.Context, providerID string) error {
+	return apperror.New(
+		apperror.ConfirmationRequired,
+		"Restart Docker backend requires a confirmed plan",
+		apperror.WithDetail("Provider "+providerID+" must be restarted through PlanRestart and ApplyProviderPlan."),
+	)
+}
+
+func (s *ProviderService) PlanRestart(ctx context.Context, providerID string) (*models.CommandPlan, error) {
+	if s.Manager == nil {
+		return nil, notReady()
 	}
-	return notReady()
+	plan, err := s.Manager.PlanLifecycle(ctx, "restart", providerID)
+	if err != nil {
+		return nil, err
+	}
+	s.providerPlanStore().Save(plan)
+	return &plan.Plan, nil
+}
+
+func (s *ProviderService) ApplyProviderPlan(ctx context.Context, planID string, typedName string) error {
+	if s.Manager == nil {
+		return notReady()
+	}
+	plan, err := s.providerPlanStore().Take(ctx, planID, typedName)
+	if err != nil {
+		return err
+	}
+	return s.runProviderLifecycle(ctx, plan.Action, plan.ProviderID, plan.Plan.Risk)
 }
 
 func (s *ProviderService) SetActiveProvider(ctx context.Context, providerID string) error {
-	if s.Manager != nil {
-		return s.Manager.SetActiveProvider(ctx, providerID)
+	if s.Manager == nil {
+		return notReady()
 	}
-	return notReady()
+	if err := s.Manager.SetActiveProvider(ctx, providerID); err != nil {
+		return err
+	}
+	return s.rebindActiveProvider(ctx)
 }
 
 func (s *ProviderService) ListDockerContexts(ctx context.Context) ([]models.DockerContextInfo, error) {
@@ -339,13 +500,18 @@ func (s *ProviderService) ListDockerContexts(ctx context.Context) ([]models.Dock
 }
 
 func (s *ProviderService) SetDockerContext(ctx context.Context, name string) error {
-	if s.Manager != nil {
-		return s.Manager.SetDockerContext(ctx, name)
+	if s.Manager == nil {
+		return notReady()
 	}
-	return notReady()
+	if err := s.Manager.SetDockerContext(ctx, name); err != nil {
+		return err
+	}
+	return s.rebindActiveProvider(ctx)
 }
 
 func (s *DockerService) Ping(ctx context.Context) error {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Client != nil {
 		return s.Client.Ping(ctx)
 	}
@@ -353,6 +519,8 @@ func (s *DockerService) Ping(ctx context.Context) error {
 }
 
 func (s *DockerService) Info(ctx context.Context) (*models.DockerInfo, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Client != nil {
 		return s.Client.Info(ctx)
 	}
@@ -360,6 +528,8 @@ func (s *DockerService) Info(ctx context.Context) (*models.DockerInfo, error) {
 }
 
 func (s *DockerService) Version(ctx context.Context) (*models.DockerVersion, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Client != nil {
 		return s.Client.Version(ctx)
 	}
@@ -367,6 +537,8 @@ func (s *DockerService) Version(ctx context.Context) (*models.DockerVersion, err
 }
 
 func (s *DockerService) DiskUsage(ctx context.Context) (*models.DiskUsage, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Client != nil {
 		return s.Client.DiskUsage(ctx)
 	}
@@ -374,6 +546,8 @@ func (s *DockerService) DiskUsage(ctx context.Context) (*models.DiskUsage, error
 }
 
 func (s *DockerService) ListContainers(ctx context.Context, opts models.ContainerListOptions) ([]models.ContainerSummary, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Client != nil {
 		return s.Client.ListContainers(ctx, opts)
 	}
@@ -381,6 +555,8 @@ func (s *DockerService) ListContainers(ctx context.Context, opts models.Containe
 }
 
 func (s *DockerService) GetContainer(ctx context.Context, id string) (*models.ContainerDetail, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Client != nil {
 		return s.Client.GetContainer(ctx, id)
 	}
@@ -388,6 +564,8 @@ func (s *DockerService) GetContainer(ctx context.Context, id string) (*models.Co
 }
 
 func (s *DockerService) InspectContainerRaw(ctx context.Context, id string) (string, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Client != nil {
 		return s.Client.InspectContainerRaw(ctx, id)
 	}
@@ -395,18 +573,26 @@ func (s *DockerService) InspectContainerRaw(ctx context.Context, id string) (str
 }
 
 func (s *DockerService) StartContainer(ctx context.Context, id string) error {
+	unlock := s.lockRuntime()
+	defer unlock()
 	return s.runContainerAction(ctx, security.ContainerActionStart, id, 0, models.RemoveContainerOptions{})
 }
 
 func (s *DockerService) StopContainer(ctx context.Context, id string, timeoutSeconds int) error {
+	unlock := s.lockRuntime()
+	defer unlock()
 	return s.runContainerAction(ctx, security.ContainerActionStop, id, timeoutSeconds, models.RemoveContainerOptions{})
 }
 
 func (s *DockerService) RestartContainer(ctx context.Context, id string, timeoutSeconds int) error {
+	unlock := s.lockRuntime()
+	defer unlock()
 	return s.runContainerAction(ctx, security.ContainerActionRestart, id, timeoutSeconds, models.RemoveContainerOptions{})
 }
 
 func (s *DockerService) KillContainer(_ context.Context, id string) error {
+	unlock := s.lockRuntime()
+	defer unlock()
 	return apperror.New(
 		apperror.ConfirmationRequired,
 		"Kill container requires a confirmed plan",
@@ -415,6 +601,8 @@ func (s *DockerService) KillContainer(_ context.Context, id string) error {
 }
 
 func (s *DockerService) RenameContainer(ctx context.Context, id string, newName string) error {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Client == nil {
 		return notReady()
 	}
@@ -437,6 +625,8 @@ func (s *DockerService) RenameContainer(ctx context.Context, id string, newName 
 }
 
 func (s *DockerService) RunImage(ctx context.Context, req models.RunImageRequest) (string, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Client == nil {
 		return "", notReady()
 	}
@@ -459,21 +649,37 @@ func (s *DockerService) RunImage(ctx context.Context, req models.RunImageRequest
 }
 
 func (s *DockerService) PlanKillContainer(ctx context.Context, id string) (*models.CommandPlan, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	return s.planContainerAction(ctx, security.ContainerActionKill, []string{id}, 0, models.RemoveContainerOptions{})
 }
 
 func (s *DockerService) PlanRemoveContainer(ctx context.Context, id string, opts models.RemoveContainerOptions) (*models.CommandPlan, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	return s.planContainerAction(ctx, security.ContainerActionRemove, []string{id}, 0, opts)
 }
 
 func (s *DockerService) ApplyContainerPlan(ctx context.Context, planID string, typedName string) error {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Client == nil {
 		return notReady()
 	}
 	plans := s.planStore()
 	plan, err := plans.Take(ctx, planID, typedName)
 	if err != nil {
-		return err
+		if !apperror.IsCode(err, apperror.PlanExpired) {
+			return err
+		}
+		objectPlan, objectErr := s.objectPlanStore().Take(ctx, planID, typedName)
+		if objectErr != nil {
+			if !apperror.IsCode(objectErr, apperror.PlanExpired) {
+				return objectErr
+			}
+			return err
+		}
+		return s.runDockerObjectPlan(ctx, objectPlan)
 	}
 	for _, id := range plan.IDs {
 		if err := s.runContainerAction(ctx, plan.Action, id, plan.TimeoutSeconds, plan.RemoveOptions); err != nil {
@@ -484,6 +690,8 @@ func (s *DockerService) ApplyContainerPlan(ctx context.Context, planID string, t
 }
 
 func (s *DockerService) BulkContainerAction(ctx context.Context, ids []string, action string) (*models.BulkResult, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Client == nil {
 		return nil, notReady()
 	}
@@ -621,7 +829,124 @@ func (s *DockerService) planStore() *security.PlanStore {
 	return s.Plans
 }
 
+func (s *DockerService) objectPlanStore() *security.DockerObjectPlanStore {
+	if s.ObjectPlans == nil {
+		s.ObjectPlans = security.NewDockerObjectPlanStore(nil)
+	}
+	return s.ObjectPlans
+}
+
+func (s *DockerService) planRemoveImage(ctx context.Context, imageID string, force bool) (*models.CommandPlan, error) {
+	if s.Client == nil {
+		return nil, notReady()
+	}
+	detail, err := s.Client.GetImage(ctx, imageID)
+	if err != nil {
+		return nil, err
+	}
+	plan, err := security.NewRemoveImagePlan(detail.Summary, force, time.Now().UTC())
+	if err != nil {
+		return nil, err
+	}
+	plan.TargetID = imageID
+	s.objectPlanStore().Save(plan)
+	return &plan.Plan, nil
+}
+
+func (s *DockerService) planRemoveVolume(ctx context.Context, name string, force bool) (*models.CommandPlan, error) {
+	if s.Client == nil {
+		return nil, notReady()
+	}
+	detail, err := s.Client.GetVolume(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	plan, err := security.NewRemoveVolumePlan(detail.Summary, force, time.Now().UTC())
+	if err != nil {
+		return nil, err
+	}
+	s.objectPlanStore().Save(plan)
+	return &plan.Plan, nil
+}
+
+func (s *DockerService) planRemoveNetwork(ctx context.Context, id string) (*models.CommandPlan, error) {
+	if s.Client == nil {
+		return nil, notReady()
+	}
+	detail, err := s.Client.GetNetwork(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	plan, err := security.NewRemoveNetworkPlan(detail.Summary, time.Now().UTC())
+	if err != nil {
+		return nil, err
+	}
+	plan.TargetID = id
+	s.objectPlanStore().Save(plan)
+	return &plan.Plan, nil
+}
+
+func (s *DockerService) runDockerObjectPlan(ctx context.Context, plan security.DockerObjectPlan) error {
+	command := ""
+	if len(plan.Plan.Commands) > 0 {
+		command = plan.Plan.Commands[0].Command
+	}
+	targetType := plan.Kind
+	targetID := plan.TargetID
+	if targetType == "prune" {
+		targetType = "docker"
+		targetID = plan.PruneKind
+	}
+	action := dockerObjectAuditAction(plan)
+	started := time.Now().UTC()
+	if err := s.recordAudit(ctx, action, targetType, targetID, "", command, plan.Plan.Risk, "started", 0, nil); err != nil {
+		return err
+	}
+	err := s.executeDockerObjectPlan(ctx, plan)
+	duration := time.Since(started)
+	if err != nil {
+		_ = s.recordAudit(ctx, action, targetType, targetID, "", command, plan.Plan.Risk, "failed", duration, err)
+		return err
+	}
+	return s.recordAudit(ctx, action, targetType, targetID, "", command, plan.Plan.Risk, "success", duration, nil)
+}
+
+func (s *DockerService) executeDockerObjectPlan(ctx context.Context, plan security.DockerObjectPlan) error {
+	switch plan.Action {
+	case security.DockerActionRemoveImage:
+		return s.Client.RemoveImage(ctx, plan.TargetID, plan.Force)
+	case security.DockerActionRemoveVolume:
+		return s.Client.RemoveVolume(ctx, plan.TargetID, plan.Force)
+	case security.DockerActionRemoveNetwork:
+		return s.Client.RemoveNetwork(ctx, plan.TargetID)
+	case security.DockerActionPrune:
+		return s.Client.Prune(ctx, plan.PruneKind)
+	default:
+		return apperror.New(apperror.Conflict, "Unsupported Docker object action", apperror.WithDetail(plan.Action))
+	}
+}
+
+func dockerObjectAuditAction(plan security.DockerObjectPlan) string {
+	switch plan.Action {
+	case security.DockerActionRemoveImage:
+		return "image.remove"
+	case security.DockerActionRemoveVolume:
+		return "volume.remove"
+	case security.DockerActionRemoveNetwork:
+		return "network.remove"
+	case security.DockerActionPrune:
+		if plan.PruneKind != "" {
+			return "docker.prune." + strings.ReplaceAll(plan.PruneKind, "-", "_")
+		}
+		return "docker.prune"
+	default:
+		return "docker." + plan.Action
+	}
+}
+
 func (s *DockerService) ListImages(ctx context.Context) ([]models.ImageSummary, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Client != nil {
 		return s.Client.ListImages(ctx)
 	}
@@ -629,6 +954,8 @@ func (s *DockerService) ListImages(ctx context.Context) ([]models.ImageSummary, 
 }
 
 func (s *DockerService) GetImage(ctx context.Context, id string) (*models.ImageDetail, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Client != nil {
 		return s.Client.GetImage(ctx, id)
 	}
@@ -636,6 +963,8 @@ func (s *DockerService) GetImage(ctx context.Context, id string) (*models.ImageD
 }
 
 func (s *DockerService) PullImage(ctx context.Context, imageRef string) (string, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Client == nil {
 		return "", notReady()
 	}
@@ -654,6 +983,8 @@ func (s *DockerService) PullImage(ctx context.Context, imageRef string) (string,
 }
 
 func (s *DockerService) TagImage(ctx context.Context, imageID string, newRef string) error {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Client == nil {
 		return notReady()
 	}
@@ -672,6 +1003,8 @@ func (s *DockerService) TagImage(ctx context.Context, imageID string, newRef str
 }
 
 func (s *DockerService) PushImage(ctx context.Context, imageRef string) (string, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Client == nil {
 		return "", notReady()
 	}
@@ -690,6 +1023,8 @@ func (s *DockerService) PushImage(ctx context.Context, imageRef string) (string,
 }
 
 func (s *DockerService) SaveImage(ctx context.Context, imageRefs []string, destPath string) (string, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Client == nil {
 		return "", notReady()
 	}
@@ -709,6 +1044,8 @@ func (s *DockerService) SaveImage(ctx context.Context, imageRefs []string, destP
 }
 
 func (s *DockerService) LoadImage(ctx context.Context, srcPath string) (string, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Client == nil {
 		return "", notReady()
 	}
@@ -727,21 +1064,37 @@ func (s *DockerService) LoadImage(ctx context.Context, srcPath string) (string, 
 }
 
 func (s *DockerService) SearchHub(ctx context.Context, query string, limit int) ([]models.HubSearchResult, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Client != nil {
 		return s.Client.SearchHub(ctx, query, limit)
 	}
 	return nil, notReady()
 }
 
-func (s *DockerService) PlanRemoveImage(_ context.Context, imageID string, force bool) (*models.CommandPlan, error) {
-	return nil, notReady()
+func (s *DockerService) PlanRemoveImage(ctx context.Context, imageID string, force bool) (*models.CommandPlan, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
+	return s.planRemoveImage(ctx, imageID, force)
 }
 
 func (s *DockerService) PlanPrune(_ context.Context, kind string) (*models.CommandPlan, error) {
-	return nil, notReady()
+	unlock := s.lockRuntime()
+	defer unlock()
+	if s.Client == nil {
+		return nil, notReady()
+	}
+	plan, err := security.NewPrunePlan(kind, time.Now().UTC())
+	if err != nil {
+		return nil, err
+	}
+	s.objectPlanStore().Save(plan)
+	return &plan.Plan, nil
 }
 
 func (s *DockerService) ListVolumes(ctx context.Context) ([]models.VolumeSummary, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Client != nil {
 		return s.Client.ListVolumes(ctx)
 	}
@@ -749,6 +1102,8 @@ func (s *DockerService) ListVolumes(ctx context.Context) ([]models.VolumeSummary
 }
 
 func (s *DockerService) GetVolume(ctx context.Context, name string) (*models.VolumeDetail, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Client != nil {
 		return s.Client.GetVolume(ctx, name)
 	}
@@ -756,6 +1111,8 @@ func (s *DockerService) GetVolume(ctx context.Context, name string) (*models.Vol
 }
 
 func (s *DockerService) CreateVolume(ctx context.Context, req models.CreateVolumeRequest) (*models.VolumeSummary, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Client == nil {
 		return nil, notReady()
 	}
@@ -773,11 +1130,15 @@ func (s *DockerService) CreateVolume(ctx context.Context, req models.CreateVolum
 	return summary, s.recordAudit(ctx, "volume.create", "volume", summary.Name, "", command, models.RiskSafe, "success", duration, nil)
 }
 
-func (s *DockerService) PlanRemoveVolume(_ context.Context, name string, force bool) (*models.CommandPlan, error) {
-	return nil, notReady()
+func (s *DockerService) PlanRemoveVolume(ctx context.Context, name string, force bool) (*models.CommandPlan, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
+	return s.planRemoveVolume(ctx, name, force)
 }
 
 func (s *DockerService) ListNetworks(ctx context.Context) ([]models.NetworkSummary, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Client != nil {
 		return s.Client.ListNetworks(ctx)
 	}
@@ -785,6 +1146,8 @@ func (s *DockerService) ListNetworks(ctx context.Context) ([]models.NetworkSumma
 }
 
 func (s *DockerService) GetNetwork(ctx context.Context, id string) (*models.NetworkDetail, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Client != nil {
 		return s.Client.GetNetwork(ctx, id)
 	}
@@ -792,6 +1155,8 @@ func (s *DockerService) GetNetwork(ctx context.Context, id string) (*models.Netw
 }
 
 func (s *DockerService) CreateNetwork(ctx context.Context, req models.CreateNetworkRequest) (*models.NetworkSummary, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Client == nil {
 		return nil, notReady()
 	}
@@ -809,11 +1174,15 @@ func (s *DockerService) CreateNetwork(ctx context.Context, req models.CreateNetw
 	return summary, s.recordAudit(ctx, "network.create", "network", summary.ID, "", command, models.RiskSafe, "success", duration, nil)
 }
 
-func (s *DockerService) PlanRemoveNetwork(_ context.Context, id string) (*models.CommandPlan, error) {
-	return nil, notReady()
+func (s *DockerService) PlanRemoveNetwork(ctx context.Context, id string) (*models.CommandPlan, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
+	return s.planRemoveNetwork(ctx, id)
 }
 
 func (s *ProjectService) ListProjects(ctx context.Context) ([]models.ProjectSummary, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Projects == nil {
 		return nil, notReady()
 	}
@@ -843,6 +1212,12 @@ func (s *ProjectService) listCurrentProviderProjects(ctx context.Context) ([]sto
 }
 
 func (s *ProjectService) GetProject(ctx context.Context, projectID string) (*models.ProjectDetail, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
+	return s.getProject(ctx, projectID)
+}
+
+func (s *ProjectService) getProject(ctx context.Context, projectID string) (*models.ProjectDetail, error) {
 	if s.Projects == nil {
 		return nil, notReady()
 	}
@@ -879,6 +1254,8 @@ func (s *ProjectService) GetProject(ctx context.Context, projectID string) (*mod
 }
 
 func (s *ProjectService) ImportProject(ctx context.Context, req models.ImportProjectRequest) (*models.ProjectDetail, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Client == nil || s.Projects == nil || strings.TrimSpace(s.ProviderID) == "" {
 		return nil, notReady()
 	}
@@ -943,14 +1320,18 @@ func (s *ProjectService) ImportProject(ctx context.Context, req models.ImportPro
 	if s.Detector != nil {
 		_, _ = s.Detector.Reconcile(ctx)
 	}
-	return s.GetProject(ctx, projectID)
+	return s.getProject(ctx, projectID)
 }
 
 func (s *ProjectService) RemoveProjectFromList(_ context.Context, projectID string) error {
+	unlock := s.lockRuntime()
+	defer unlock()
 	return notReady()
 }
 
 func (s *ProjectService) RefreshProjects(ctx context.Context) ([]models.ProjectSummary, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Detector == nil {
 		return nil, notReady()
 	}
@@ -965,30 +1346,44 @@ func (s *ProjectService) RefreshProjects(ctx context.Context) ([]models.ProjectS
 }
 
 func (s *ProjectService) StartProject(ctx context.Context, projectID string) error {
+	unlock := s.lockRuntime()
+	defer unlock()
 	return s.runProjectAction(ctx, security.ProjectActionStart, projectID, false, nil)
 }
 
 func (s *ProjectService) StopProject(ctx context.Context, projectID string) error {
+	unlock := s.lockRuntime()
+	defer unlock()
 	return s.runProjectAction(ctx, security.ProjectActionStop, projectID, false, nil)
 }
 
 func (s *ProjectService) RestartProject(ctx context.Context, projectID string) error {
+	unlock := s.lockRuntime()
+	defer unlock()
 	return s.runProjectAction(ctx, security.ProjectActionRestart, projectID, false, nil)
 }
 
 func (s *ProjectService) PullProject(ctx context.Context, projectID string) error {
+	unlock := s.lockRuntime()
+	defer unlock()
 	return s.runProjectAction(ctx, security.ProjectActionPull, projectID, false, nil)
 }
 
 func (s *ProjectService) PlanRedeployProject(ctx context.Context, projectID string) (*models.CommandPlan, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	return s.planProjectAction(ctx, security.ProjectActionRedeploy, projectID, false)
 }
 
 func (s *ProjectService) PlanDownProject(ctx context.Context, projectID string, removeVolumes bool) (*models.CommandPlan, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	return s.planProjectAction(ctx, security.ProjectActionDown, projectID, removeVolumes)
 }
 
 func (s *ProjectService) ApplyProjectPlan(ctx context.Context, planID string, typedName string) error {
+	unlock := s.lockRuntime()
+	defer unlock()
 	plan, err := s.projectPlanStore().Take(ctx, planID, typedName)
 	if err != nil {
 		return err
@@ -997,6 +1392,8 @@ func (s *ProjectService) ApplyProjectPlan(ctx context.Context, planID string, ty
 }
 
 func (s *ComposeService) Config(ctx context.Context, projectID string) (*models.ComposeConfigResult, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Client == nil || s.Projects == nil {
 		return nil, notReady()
 	}
@@ -1019,6 +1416,8 @@ func (s *ComposeService) Config(ctx context.Context, projectID string) (*models.
 }
 
 func (s *ComposeService) Ps(ctx context.Context, projectID string) ([]models.ComposeServiceStatus, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Client == nil || s.Projects == nil {
 		return nil, notReady()
 	}
@@ -1030,22 +1429,32 @@ func (s *ComposeService) Ps(ctx context.Context, projectID string) ([]models.Com
 }
 
 func (s *ComposeService) StartServices(_ context.Context, projectID string, services []string) error {
+	unlock := s.lockRuntime()
+	defer unlock()
 	return notReady()
 }
 
 func (s *ComposeService) StopServices(_ context.Context, projectID string, services []string) error {
+	unlock := s.lockRuntime()
+	defer unlock()
 	return notReady()
 }
 
 func (s *ComposeService) RestartServices(_ context.Context, projectID string, services []string) error {
+	unlock := s.lockRuntime()
+	defer unlock()
 	return notReady()
 }
 
 func (s *ComposeService) ScaleService(_ context.Context, projectID string, service string, replicas int) error {
+	unlock := s.lockRuntime()
+	defer unlock()
 	return notReady()
 }
 
 func (s *MetricsService) GetDashboardMetrics(ctx context.Context) (*models.DashboardMetrics, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager == nil {
 		return nil, notReady()
 	}
@@ -1053,6 +1462,8 @@ func (s *MetricsService) GetDashboardMetrics(ctx context.Context) (*models.Dashb
 }
 
 func (s *MetricsService) GetProjectMetrics(ctx context.Context, projectID string, r models.TimeRange) (*models.SeriesBundle, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager == nil {
 		return nil, notReady()
 	}
@@ -1060,6 +1471,8 @@ func (s *MetricsService) GetProjectMetrics(ctx context.Context, projectID string
 }
 
 func (s *MetricsService) GetContainerMetrics(ctx context.Context, containerID string, r models.TimeRange) (*models.SeriesBundle, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager == nil {
 		return nil, notReady()
 	}
@@ -1067,6 +1480,8 @@ func (s *MetricsService) GetContainerMetrics(ctx context.Context, containerID st
 }
 
 func (s *MetricsService) StartStatsStream(ctx context.Context, scope models.StatsScope) (string, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager == nil {
 		return "", notReady()
 	}
@@ -1074,6 +1489,8 @@ func (s *MetricsService) StartStatsStream(ctx context.Context, scope models.Stat
 }
 
 func (s *MetricsService) StopStream(_ context.Context, streamID string) error {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager == nil {
 		return notReady()
 	}
@@ -1081,6 +1498,8 @@ func (s *MetricsService) StopStream(_ context.Context, streamID string) error {
 }
 
 func (s *LogsService) StartLogStream(ctx context.Context, req models.LogStreamRequest) (string, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager == nil {
 		return "", notReady()
 	}
@@ -1088,6 +1507,8 @@ func (s *LogsService) StartLogStream(ctx context.Context, req models.LogStreamRe
 }
 
 func (s *LogsService) StopStream(_ context.Context, streamID string) error {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager == nil {
 		return notReady()
 	}
@@ -1095,6 +1516,8 @@ func (s *LogsService) StopStream(_ context.Context, streamID string) error {
 }
 
 func (s *LogsService) FetchLogPage(ctx context.Context, req models.LogPageRequest) (*models.LogPage, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager == nil {
 		return nil, notReady()
 	}
@@ -1102,6 +1525,8 @@ func (s *LogsService) FetchLogPage(ctx context.Context, req models.LogPageReques
 }
 
 func (s *LogsService) ExportLogs(ctx context.Context, req models.ExportLogsRequest) (*models.ExportResult, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager == nil {
 		return nil, notReady()
 	}
@@ -1109,6 +1534,8 @@ func (s *LogsService) ExportLogs(ctx context.Context, req models.ExportLogsReque
 }
 
 func (s *TerminalService) OpenHostTerminal(ctx context.Context, opts models.TerminalOptions) (*models.TerminalSessionInfo, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager == nil {
 		return nil, notReady()
 	}
@@ -1116,6 +1543,8 @@ func (s *TerminalService) OpenHostTerminal(ctx context.Context, opts models.Term
 }
 
 func (s *TerminalService) OpenBackendTerminal(ctx context.Context, opts models.TerminalOptions) (*models.TerminalSessionInfo, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager == nil {
 		return nil, notReady()
 	}
@@ -1123,6 +1552,8 @@ func (s *TerminalService) OpenBackendTerminal(ctx context.Context, opts models.T
 }
 
 func (s *TerminalService) OpenProjectTerminal(ctx context.Context, projectID string, opts models.TerminalOptions) (*models.TerminalSessionInfo, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager == nil {
 		return nil, notReady()
 	}
@@ -1130,6 +1561,8 @@ func (s *TerminalService) OpenProjectTerminal(ctx context.Context, projectID str
 }
 
 func (s *TerminalService) OpenContainerTerminal(ctx context.Context, containerID string, opts models.ContainerTerminalOptions) (*models.TerminalSessionInfo, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager == nil {
 		return nil, notReady()
 	}
@@ -1137,6 +1570,8 @@ func (s *TerminalService) OpenContainerTerminal(ctx context.Context, containerID
 }
 
 func (s *TerminalService) DetectContainerShells(ctx context.Context, containerID string) ([]string, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager == nil {
 		return nil, notReady()
 	}
@@ -1144,6 +1579,8 @@ func (s *TerminalService) DetectContainerShells(ctx context.Context, containerID
 }
 
 func (s *TerminalService) WriteTerminal(ctx context.Context, sessionID string, data []byte) error {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager == nil {
 		return notReady()
 	}
@@ -1151,6 +1588,8 @@ func (s *TerminalService) WriteTerminal(ctx context.Context, sessionID string, d
 }
 
 func (s *TerminalService) ResizeTerminal(ctx context.Context, sessionID string, cols int, rows int) error {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager == nil {
 		return notReady()
 	}
@@ -1158,6 +1597,8 @@ func (s *TerminalService) ResizeTerminal(ctx context.Context, sessionID string, 
 }
 
 func (s *TerminalService) CloseTerminal(_ context.Context, sessionID string) error {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager == nil {
 		return notReady()
 	}
@@ -1165,6 +1606,8 @@ func (s *TerminalService) CloseTerminal(_ context.Context, sessionID string) err
 }
 
 func (s *TerminalService) ListTerminalSessions(_ context.Context) ([]models.TerminalSessionInfo, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager == nil {
 		return nil, notReady()
 	}
@@ -1172,6 +1615,8 @@ func (s *TerminalService) ListTerminalSessions(_ context.Context) ([]models.Term
 }
 
 func (s *UpdateService) CheckAllUpdates(ctx context.Context) (string, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager == nil {
 		return "", notReady()
 	}
@@ -1179,6 +1624,8 @@ func (s *UpdateService) CheckAllUpdates(ctx context.Context) (string, error) {
 }
 
 func (s *UpdateService) CheckProjectUpdates(ctx context.Context, projectID string) ([]models.ImageUpdate, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager == nil {
 		return nil, notReady()
 	}
@@ -1186,6 +1633,8 @@ func (s *UpdateService) CheckProjectUpdates(ctx context.Context, projectID strin
 }
 
 func (s *UpdateService) CheckServiceUpdate(ctx context.Context, projectID string, service string) (*models.ImageUpdate, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager == nil {
 		return nil, notReady()
 	}
@@ -1193,6 +1642,8 @@ func (s *UpdateService) CheckServiceUpdate(ctx context.Context, projectID string
 }
 
 func (s *UpdateService) ListCurrentUpdates(ctx context.Context, filter models.UpdateFilter) ([]models.ImageUpdate, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager == nil {
 		return nil, notReady()
 	}
@@ -1200,6 +1651,8 @@ func (s *UpdateService) ListCurrentUpdates(ctx context.Context, filter models.Up
 }
 
 func (s *UpdateService) PlanServiceUpdate(ctx context.Context, projectID string, service string) (*models.UpdatePlan, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager == nil {
 		return nil, notReady()
 	}
@@ -1207,6 +1660,8 @@ func (s *UpdateService) PlanServiceUpdate(ctx context.Context, projectID string,
 }
 
 func (s *UpdateService) PlanProjectUpdate(ctx context.Context, projectID string) (*models.UpdatePlan, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager == nil {
 		return nil, notReady()
 	}
@@ -1214,6 +1669,8 @@ func (s *UpdateService) PlanProjectUpdate(ctx context.Context, projectID string)
 }
 
 func (s *UpdateService) ApplyUpdate(ctx context.Context, req models.ApplyUpdateRequest) (string, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager == nil {
 		return "", notReady()
 	}
@@ -1221,6 +1678,8 @@ func (s *UpdateService) ApplyUpdate(ctx context.Context, req models.ApplyUpdateR
 }
 
 func (s *UpdateService) IgnoreUpdate(ctx context.Context, req models.IgnoreUpdateRequest) error {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager == nil {
 		return notReady()
 	}
@@ -1228,6 +1687,8 @@ func (s *UpdateService) IgnoreUpdate(ctx context.Context, req models.IgnoreUpdat
 }
 
 func (s *UpdateService) UnignoreUpdate(ctx context.Context, id int64) error {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager == nil {
 		return notReady()
 	}
@@ -1235,6 +1696,8 @@ func (s *UpdateService) UnignoreUpdate(ctx context.Context, id int64) error {
 }
 
 func (s *UpdateService) ListUpdateHistory(ctx context.Context, filter models.UpdateHistoryFilter) ([]models.UpdateHistoryItem, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager == nil {
 		return nil, notReady()
 	}
@@ -1242,6 +1705,8 @@ func (s *UpdateService) ListUpdateHistory(ctx context.Context, filter models.Upd
 }
 
 func (s *UpdateService) Rollback(ctx context.Context, historyID int64) (string, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager == nil {
 		return "", notReady()
 	}
@@ -1249,6 +1714,8 @@ func (s *UpdateService) Rollback(ctx context.Context, historyID int64) (string, 
 }
 
 func (s *ImageLineageService) DiscoverProjectLineage(ctx context.Context, projectID string) ([]models.ImageLineage, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager != nil {
 		return s.Manager.DiscoverProjectLineage(ctx, projectID)
 	}
@@ -1256,6 +1723,8 @@ func (s *ImageLineageService) DiscoverProjectLineage(ctx context.Context, projec
 }
 
 func (s *ImageLineageService) GetProjectLineage(ctx context.Context, projectID string) ([]models.ImageLineage, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager != nil {
 		return s.Manager.GetProjectLineage(ctx, projectID)
 	}
@@ -1263,6 +1732,8 @@ func (s *ImageLineageService) GetProjectLineage(ctx context.Context, projectID s
 }
 
 func (s *ImageLineageService) GetServiceLineage(ctx context.Context, projectID string, service string) (*models.ImageLineage, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager != nil {
 		return s.Manager.GetServiceLineage(ctx, projectID, service)
 	}
@@ -1270,6 +1741,8 @@ func (s *ImageLineageService) GetServiceLineage(ctx context.Context, projectID s
 }
 
 func (s *ImageLineageService) GetContainerLineage(ctx context.Context, containerID string) (*models.ImageLineage, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager != nil {
 		return s.Manager.GetContainerLineage(ctx, containerID)
 	}
@@ -1277,6 +1750,8 @@ func (s *ImageLineageService) GetContainerLineage(ctx context.Context, container
 }
 
 func (s *ImageLineageService) RefreshServiceLineage(ctx context.Context, projectID string, service string) (*models.ImageLineage, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager != nil {
 		return s.Manager.RefreshServiceLineage(ctx, projectID, service)
 	}
@@ -1284,6 +1759,8 @@ func (s *ImageLineageService) RefreshServiceLineage(ctx context.Context, project
 }
 
 func (s *BackupService) PlanBackupVolume(ctx context.Context, req models.BackupVolumeRequest) (*models.CommandPlan, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager != nil {
 		return s.Manager.PlanBackupVolume(ctx, req)
 	}
@@ -1291,6 +1768,8 @@ func (s *BackupService) PlanBackupVolume(ctx context.Context, req models.BackupV
 }
 
 func (s *BackupService) ApplyBackup(ctx context.Context, planID string) (string, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager != nil {
 		return s.Manager.ApplyBackup(ctx, planID)
 	}
@@ -1298,6 +1777,8 @@ func (s *BackupService) ApplyBackup(ctx context.Context, planID string) (string,
 }
 
 func (s *BackupService) PlanRestoreVolume(ctx context.Context, req models.RestoreVolumeRequest) (*models.CommandPlan, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager != nil {
 		return s.Manager.PlanRestoreVolume(ctx, req)
 	}
@@ -1305,6 +1786,8 @@ func (s *BackupService) PlanRestoreVolume(ctx context.Context, req models.Restor
 }
 
 func (s *BackupService) ApplyRestore(ctx context.Context, planID string, typedName string) (string, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager != nil {
 		return s.Manager.ApplyRestore(ctx, planID, typedName)
 	}
@@ -1312,6 +1795,8 @@ func (s *BackupService) ApplyRestore(ctx context.Context, planID string, typedNa
 }
 
 func (s *BackupService) ListBackups(ctx context.Context, filter models.BackupFilter) ([]models.BackupSummary, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager != nil {
 		return s.Manager.ListBackups(ctx, filter)
 	}
@@ -1319,6 +1804,8 @@ func (s *BackupService) ListBackups(ctx context.Context, filter models.BackupFil
 }
 
 func (s *BackupService) DeleteBackup(ctx context.Context, backupID string) error {
+	unlock := s.lockRuntime()
+	defer unlock()
 	if s.Manager != nil {
 		return s.Manager.DeleteBackup(ctx, backupID)
 	}
@@ -1416,19 +1903,10 @@ func dockerRunCommand(req models.RunImageRequest) string {
 		args = append(args, "--name", req.Name)
 	}
 	for _, port := range req.Ports {
-		containerPort := strings.TrimSpace(port.ContainerPort)
-		if containerPort == "" {
-			continue
+		publish := dockerPortPublish(port)
+		if publish != "" {
+			args = append(args, "-p", publish)
 		}
-		protocol := strings.TrimSpace(port.Protocol)
-		if protocol == "" {
-			protocol = "tcp"
-		}
-		host := strings.TrimSpace(port.HostPort)
-		if port.HostIP != "" || host != "" {
-			host = strings.TrimSpace(port.HostIP) + ":" + host
-		}
-		args = append(args, "-p", strings.TrimPrefix(host+":"+containerPort+"/"+protocol, ":"))
 	}
 	for _, env := range req.Env {
 		name := strings.TrimSpace(env.Name)
@@ -1492,12 +1970,8 @@ func dockerVolumeCreateCommand(req models.CreateVolumeRequest) string {
 	if req.Driver != "" {
 		args = append(args, "--driver", req.Driver)
 	}
-	for key, value := range req.DriverOpts {
-		args = append(args, "--opt", key+"="+value)
-	}
-	for key, value := range req.Labels {
-		args = append(args, "--label", key+"="+value)
-	}
+	args = appendSortedMapArgs(args, "--opt", req.DriverOpts)
+	args = appendSortedMapArgs(args, "--label", req.Labels)
 	args = append(args, req.Name)
 	return joinCommand(args)
 }
@@ -1519,11 +1993,52 @@ func dockerNetworkCreateCommand(req models.CreateNetworkRequest) string {
 	if req.Attachable {
 		args = append(args, "--attachable")
 	}
-	for key, value := range req.Labels {
-		args = append(args, "--label", key+"="+value)
-	}
+	args = appendSortedMapArgs(args, "--label", req.Labels)
 	args = append(args, req.Name)
 	return joinCommand(args)
+}
+
+func appendSortedMapArgs(args []string, flag string, values map[string]string) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		args = append(args, flag, key+"="+values[key])
+	}
+	return args
+}
+
+func dockerPortPublish(port models.PortMapping) string {
+	containerPort := strings.TrimSpace(port.ContainerPort)
+	if containerPort == "" {
+		return ""
+	}
+	protocol := strings.TrimSpace(port.Protocol)
+	if protocol == "" {
+		protocol = "tcp"
+	}
+	target := containerPort + "/" + protocol
+	hostIP := formatPublishHostIP(strings.TrimSpace(port.HostIP))
+	hostPort := strings.TrimSpace(port.HostPort)
+	switch {
+	case hostIP == "" && hostPort == "":
+		return target
+	case hostIP == "":
+		return hostPort + ":" + target
+	case hostPort == "":
+		return hostIP + "::" + target
+	default:
+		return hostIP + ":" + hostPort + ":" + target
+	}
+}
+
+func formatPublishHostIP(hostIP string) string {
+	if hostIP == "" || strings.HasPrefix(hostIP, "[") || !strings.Contains(hostIP, ":") {
+		return hostIP
+	}
+	return "[" + hostIP + "]"
 }
 
 func joinCommand(args []string) string {

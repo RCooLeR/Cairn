@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -184,6 +185,61 @@ func TestProviderServiceApplyInstallPublishesProgress(t *testing.T) {
 	}
 }
 
+func TestProviderServiceApplyInstallCancelsRunningProvider(t *testing.T) {
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer waitCancel()
+	installCtx, cancelInstall := context.WithCancel(context.Background())
+	eventBus := bus.New()
+	defer eventBus.Close()
+	db := openServiceTestStore(t)
+	provider := &fakeInstallProvider{blockUntilCancel: true, started: make(chan struct{})}
+	manager := providers.NewManager(nil, nil, []providers.PlatformProvider{provider})
+	service := &ProviderService{Manager: manager, Events: eventBus, Audit: db.Audit()}
+
+	plan, err := service.PlanInstall(waitCtx, provider.ID(), models.InstallOptions{})
+	if err != nil {
+		t.Fatalf("PlanInstall() error = %v", err)
+	}
+	events := eventBus.Subscribe(waitCtx, bus.TopicProviderInstallProgress, 8)
+	if _, err := service.ApplyInstall(installCtx, plan.PlanID); err != nil {
+		t.Fatalf("ApplyInstall() error = %v", err)
+	}
+	select {
+	case <-provider.started:
+	case <-waitCtx.Done():
+		t.Fatalf("timed out waiting for install to start: %v", waitCtx.Err())
+	}
+	cancelInstall()
+
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				t.Fatal("install progress subscription closed")
+			}
+			payload, ok := event.Payload.(providerInstallProgressPayload)
+			if !ok {
+				t.Fatalf("payload type = %T", event.Payload)
+			}
+			if payload.Done {
+				if payload.Error == "" || !strings.Contains(payload.Error, "context canceled") {
+					t.Fatalf("final payload error = %q, want context canceled", payload.Error)
+				}
+				entries, err := (&SettingsService{Audit: db.Audit()}).GetAuditLog(context.Background(), models.AuditFilter{Topic: "provider.install", Limit: 5})
+				if err != nil {
+					t.Fatalf("GetAuditLog() error = %v", err)
+				}
+				if len(entries) != 1 || entries[0].Result != "failed" {
+					t.Fatalf("provider install audit entries = %#v, want failed entry", entries)
+				}
+				return
+			}
+		case <-waitCtx.Done():
+			t.Fatalf("timed out waiting for canceled install progress: %v", waitCtx.Err())
+		}
+	}
+}
+
 func TestDockerServiceLifecycleAuditsAndPlans(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "cairn.db"))
@@ -241,6 +297,41 @@ func TestDockerServiceLifecycleAuditsAndPlans(t *testing.T) {
 	}
 	if len(client.killed) != 1 || client.killed[0] != "container-1" {
 		t.Fatalf("killed = %#v", client.killed)
+	}
+}
+
+func TestDockerCommandBuildersAreStableAndIPv6Safe(t *testing.T) {
+	runCommand := dockerRunCommand(models.RunImageRequest{
+		ImageRef: "nginx:alpine",
+		Ports: []models.PortMapping{{
+			HostIP:        "::1",
+			HostPort:      "8080",
+			ContainerPort: "80",
+			Protocol:      "tcp",
+		}},
+	})
+	if !strings.Contains(runCommand, "-p [::1]:8080:80/tcp") {
+		t.Fatalf("dockerRunCommand() = %q, want bracketed IPv6 publish", runCommand)
+	}
+
+	volumeCommand := dockerVolumeCreateCommand(models.CreateVolumeRequest{
+		Name:       "demo",
+		Driver:     "local",
+		DriverOpts: map[string]string{"zeta": "last", "alpha": "first"},
+		Labels:     map[string]string{"team": "platform", "app": "cairn"},
+	})
+	wantVolume := "docker volume create --driver local --opt alpha=first --opt zeta=last --label app=cairn --label team=platform demo"
+	if volumeCommand != wantVolume {
+		t.Fatalf("dockerVolumeCreateCommand() = %q, want %q", volumeCommand, wantVolume)
+	}
+
+	networkCommand := dockerNetworkCreateCommand(models.CreateNetworkRequest{
+		Name:   "demo_net",
+		Labels: map[string]string{"team": "platform", "app": "cairn"},
+	})
+	wantNetwork := "docker network create --label app=cairn --label team=platform demo_net"
+	if networkCommand != wantNetwork {
+		t.Fatalf("dockerNetworkCreateCommand() = %q, want %q", networkCommand, wantNetwork)
 	}
 }
 
@@ -328,6 +419,88 @@ func TestDockerServiceObjectCreationAudits(t *testing.T) {
 	}
 	if !sawPush {
 		t.Fatalf("missing successful image.push audit in %#v", entries)
+	}
+}
+
+func TestDockerServiceObjectPlansAuditAndExecute(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	client := newFakeDockerClient()
+	service := &DockerService{Client: client, Audit: db.Audit()}
+
+	imagePlan, err := service.PlanRemoveImage(ctx, client.image.ID, false)
+	if err != nil {
+		t.Fatalf("PlanRemoveImage() error = %v", err)
+	}
+	if imagePlan.Risk != models.RiskNeedsConfirmation || !strings.Contains(imagePlan.Commands[0].Command, "docker image rm") {
+		t.Fatalf("image plan = %#v", imagePlan)
+	}
+	if err := service.ApplyContainerPlan(ctx, imagePlan.PlanID, ""); err != nil {
+		t.Fatalf("ApplyContainerPlan(image) error = %v", err)
+	}
+	if len(client.removedImages) != 1 || client.removedImages[0] != client.image.ID {
+		t.Fatalf("removed images = %#v", client.removedImages)
+	}
+
+	prunePlan, err := service.PlanPrune(ctx, "images")
+	if err != nil {
+		t.Fatalf("PlanPrune() error = %v", err)
+	}
+	if prunePlan.Risk != models.RiskDestructive || prunePlan.Commands[0].Command != "docker image prune --all" {
+		t.Fatalf("prune plan = %#v", prunePlan)
+	}
+	if err := service.ApplyContainerPlan(ctx, prunePlan.PlanID, ""); err != nil {
+		t.Fatalf("ApplyContainerPlan(prune) error = %v", err)
+	}
+	if len(client.pruned) != 1 || client.pruned[0] != "images" {
+		t.Fatalf("pruned = %#v", client.pruned)
+	}
+
+	volumePlan, err := service.PlanRemoveVolume(ctx, client.volume.Name, false)
+	if err != nil {
+		t.Fatalf("PlanRemoveVolume() error = %v", err)
+	}
+	if volumePlan.Risk != models.RiskDangerous || volumePlan.RequiresTypedName != client.volume.Name {
+		t.Fatalf("volume plan = %#v", volumePlan)
+	}
+	if err := service.ApplyContainerPlan(ctx, volumePlan.PlanID, "wrong"); !apperror.IsCode(err, apperror.ConfirmationRequired) {
+		t.Fatalf("ApplyContainerPlan(volume wrong) error = %v, want confirmation", err)
+	}
+	if err := service.ApplyContainerPlan(ctx, volumePlan.PlanID, client.volume.Name); err != nil {
+		t.Fatalf("ApplyContainerPlan(volume) error = %v", err)
+	}
+	if len(client.removedVolumes) != 1 || client.removedVolumes[0] != client.volume.Name {
+		t.Fatalf("removed volumes = %#v", client.removedVolumes)
+	}
+
+	networkPlan, err := service.PlanRemoveNetwork(ctx, client.network.ID)
+	if err != nil {
+		t.Fatalf("PlanRemoveNetwork() error = %v", err)
+	}
+	if networkPlan.Risk != models.RiskNeedsConfirmation || !strings.Contains(networkPlan.Commands[0].Command, "docker network rm") {
+		t.Fatalf("network plan = %#v", networkPlan)
+	}
+	if err := service.ApplyContainerPlan(ctx, networkPlan.PlanID, ""); err != nil {
+		t.Fatalf("ApplyContainerPlan(network) error = %v", err)
+	}
+	if len(client.removedNetworks) != 1 || client.removedNetworks[0] != client.network.ID {
+		t.Fatalf("removed networks = %#v", client.removedNetworks)
+	}
+
+	entries, err := (&SettingsService{Audit: db.Audit()}).GetAuditLog(ctx, models.AuditFilter{Limit: 20})
+	if err != nil {
+		t.Fatalf("GetAuditLog() error = %v", err)
+	}
+	seen := map[string]bool{}
+	for _, entry := range entries {
+		if entry.Result == "success" {
+			seen[entry.Action] = true
+		}
+	}
+	for _, action := range []string{"image.remove", "docker.prune.images", "volume.remove", "network.remove"} {
+		if !seen[action] {
+			t.Fatalf("missing audit action %s in %#v", action, entries)
+		}
 	}
 }
 
@@ -645,34 +818,61 @@ func TestProjectServiceLifecycleWorkdirMissing(t *testing.T) {
 }
 
 type fakeDockerClient struct {
-	container  models.ContainerSummary
-	started    []string
-	stopped    []string
-	restarted  []string
-	killed     []string
-	removed    []string
-	renamed    []string
-	runImages  []models.RunImageRequest
-	pulled     []string
-	tagged     []string
-	pushed     []string
-	saved      []string
-	loaded     []string
-	volumes    []models.CreateVolumeRequest
-	networks   []models.CreateNetworkRequest
-	searchTerm string
+	container       models.ContainerSummary
+	image           models.ImageSummary
+	volume          models.VolumeSummary
+	network         models.NetworkSummary
+	started         []string
+	stopped         []string
+	restarted       []string
+	killed          []string
+	removed         []string
+	renamed         []string
+	runImages       []models.RunImageRequest
+	pulled          []string
+	tagged          []string
+	pushed          []string
+	saved           []string
+	loaded          []string
+	removedImages   []string
+	pruned          []string
+	volumes         []models.CreateVolumeRequest
+	removedVolumes  []string
+	networks        []models.CreateNetworkRequest
+	removedNetworks []string
+	searchTerm      string
 }
 
 func newFakeDockerClient() *fakeDockerClient {
-	return &fakeDockerClient{container: models.ContainerSummary{
-		ID:        "container-1",
-		Name:      "web",
-		Image:     "cairn/web:latest",
-		Status:    "Up",
-		State:     "running",
-		Health:    models.HealthStatusHealthy,
-		ProjectID: "cairn",
-	}}
+	return &fakeDockerClient{
+		container: models.ContainerSummary{
+			ID:        "container-1",
+			Name:      "web",
+			Image:     "cairn/web:latest",
+			Status:    "Up",
+			State:     "running",
+			Health:    models.HealthStatusHealthy,
+			ProjectID: "cairn",
+		},
+		image: models.ImageSummary{
+			ID:        "sha256:local",
+			RepoTags:  []string{"cairn/web:latest"},
+			SizeBytes: 1024,
+			InUse:     false,
+			CreatedAt: time.Now().UTC(),
+		},
+		volume: models.VolumeSummary{
+			Name:   "demo_data",
+			Driver: "local",
+			InUse:  false,
+		},
+		network: models.NetworkSummary{
+			ID:     "network-1",
+			Name:   "demo_net",
+			Driver: "bridge",
+			Scope:  "local",
+		},
+	}
 }
 
 func (f *fakeDockerClient) ProviderID() string {
@@ -743,11 +943,11 @@ func (f *fakeDockerClient) RunImage(_ context.Context, req models.RunImageReques
 }
 
 func (f *fakeDockerClient) ListImages(context.Context) ([]models.ImageSummary, error) {
-	return nil, nil
+	return []models.ImageSummary{f.image}, nil
 }
 
 func (f *fakeDockerClient) GetImage(context.Context, string) (*models.ImageDetail, error) {
-	return nil, nil
+	return &models.ImageDetail{Summary: f.image}, nil
 }
 
 func (f *fakeDockerClient) PullImage(_ context.Context, ref string) (string, error) {
@@ -780,12 +980,22 @@ func (f *fakeDockerClient) SearchHub(_ context.Context, query string, _ int) ([]
 	return []models.HubSearchResult{{Name: "library/" + query, Stars: 1, Official: true}}, nil
 }
 
+func (f *fakeDockerClient) RemoveImage(_ context.Context, id string, _ bool) error {
+	f.removedImages = append(f.removedImages, id)
+	return nil
+}
+
+func (f *fakeDockerClient) Prune(_ context.Context, kind string) error {
+	f.pruned = append(f.pruned, kind)
+	return nil
+}
+
 func (f *fakeDockerClient) ListVolumes(context.Context) ([]models.VolumeSummary, error) {
-	return nil, nil
+	return []models.VolumeSummary{f.volume}, nil
 }
 
 func (f *fakeDockerClient) GetVolume(context.Context, string) (*models.VolumeDetail, error) {
-	return nil, nil
+	return &models.VolumeDetail{Summary: f.volume}, nil
 }
 
 func (f *fakeDockerClient) CreateVolume(_ context.Context, req models.CreateVolumeRequest) (*models.VolumeSummary, error) {
@@ -793,17 +1003,27 @@ func (f *fakeDockerClient) CreateVolume(_ context.Context, req models.CreateVolu
 	return &models.VolumeSummary{Name: req.Name, Driver: req.Driver}, nil
 }
 
+func (f *fakeDockerClient) RemoveVolume(_ context.Context, name string, _ bool) error {
+	f.removedVolumes = append(f.removedVolumes, name)
+	return nil
+}
+
 func (f *fakeDockerClient) ListNetworks(context.Context) ([]models.NetworkSummary, error) {
-	return nil, nil
+	return []models.NetworkSummary{f.network}, nil
 }
 
 func (f *fakeDockerClient) GetNetwork(context.Context, string) (*models.NetworkDetail, error) {
-	return nil, nil
+	return &models.NetworkDetail{Summary: f.network}, nil
 }
 
 func (f *fakeDockerClient) CreateNetwork(_ context.Context, req models.CreateNetworkRequest) (*models.NetworkSummary, error) {
 	f.networks = append(f.networks, req)
 	return &models.NetworkSummary{ID: "network-created", Name: req.Name, Driver: req.Driver, Attachable: req.Attachable}, nil
+}
+
+func (f *fakeDockerClient) RemoveNetwork(_ context.Context, id string) error {
+	f.removedNetworks = append(f.removedNetworks, id)
+	return nil
 }
 
 type fakeComposeRunner struct {
@@ -838,7 +1058,10 @@ func (r *fakeComposeRunner) hasCall(want string) bool {
 }
 
 type fakeInstallProvider struct {
-	executed []int
+	executed         []int
+	blockUntilCancel bool
+	started          chan struct{}
+	startOnce        sync.Once
 }
 
 func (p *fakeInstallProvider) ID() string          { return "windows_wsl_ubuntu" }
@@ -860,14 +1083,23 @@ func (p *fakeInstallProvider) PlanInstall(context.Context, models.InstallOptions
 		ExpiresAt: time.Now().Add(time.Minute),
 	}, nil
 }
-func (p *fakeInstallProvider) ExecuteInstallStep(_ context.Context, _ string, step int, progress chan<- providers.InstallProgress) error {
+func (p *fakeInstallProvider) ExecuteInstallStep(ctx context.Context, _ string, step int, progress chan<- providers.InstallProgress) error {
 	p.executed = append(p.executed, step)
+	if p.started != nil {
+		p.startOnce.Do(func() {
+			close(p.started)
+		})
+	}
 	if progress != nil {
 		progress <- providers.InstallProgress{
 			Step:       step + 1,
 			TotalSteps: 2,
 			Message:    "step complete",
 		}
+	}
+	if p.blockUntilCancel {
+		<-ctx.Done()
+		return ctx.Err()
 	}
 	return nil
 }

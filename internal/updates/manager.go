@@ -2,7 +2,9 @@ package updates
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
+	"math/big"
 	"strings"
 	"sync"
 	"time"
@@ -56,6 +58,10 @@ type Manager struct {
 	startOnce sync.Once
 	planMu    sync.Mutex
 	plans     map[string]updatePlanRecord
+
+	jobsMu  sync.Mutex
+	rootCtx context.Context
+	jobs    map[string]context.CancelFunc
 }
 
 type checkProgressPayload struct {
@@ -79,6 +85,7 @@ func NewManager(projects *store.ProjectRepository, lineage *store.LineageReposit
 		Now:      func() time.Time { return time.Now().UTC() },
 		NewID:    uuid.NewString,
 		plans:    map[string]updatePlanRecord{},
+		jobs:     map[string]context.CancelFunc{},
 	}
 	if dockerRuntime, ok := images.(DockerRuntime); ok {
 		manager.Docker = dockerRuntime
@@ -90,9 +97,28 @@ func (m *Manager) Start(ctx context.Context) {
 	if m == nil {
 		return
 	}
+	m.jobsMu.Lock()
+	m.rootCtx = ctx
+	m.jobsMu.Unlock()
 	m.startOnce.Do(func() {
 		go m.runScheduler(ctx)
 	})
+}
+
+func (m *Manager) StopAll() {
+	if m == nil {
+		return
+	}
+	m.jobsMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(m.jobs))
+	for jobID, cancel := range m.jobs {
+		cancels = append(cancels, cancel)
+		delete(m.jobs, jobID)
+	}
+	m.jobsMu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
 }
 
 func (m *Manager) CheckAllUpdates(ctx context.Context) (string, error) {
@@ -104,7 +130,9 @@ func (m *Manager) CheckAllUpdates(ctx context.Context) (string, error) {
 		return "", apperror.Wrap(apperror.Internal, "List projects for update check failed", err)
 	}
 	jobID := "updates-" + m.newID()
-	go m.runAllChecks(context.Background(), jobID, projects)
+	m.startJob(jobID, func(jobCtx context.Context) {
+		m.runAllChecks(jobCtx, jobID, projects)
+	})
 	return jobID, nil
 }
 
@@ -172,6 +200,32 @@ func (m *Manager) CheckServiceUpdate(ctx context.Context, projectID string, serv
 		return &model, nil
 	}
 	return nil, apperror.New(apperror.NotFound, "Service was not found", apperror.WithDetail(serviceName))
+}
+
+func (m *Manager) startJob(jobID string, run func(context.Context)) {
+	base := context.Background()
+	m.jobsMu.Lock()
+	if m.rootCtx != nil {
+		base = m.rootCtx
+	}
+	ctx, cancel := context.WithCancel(base)
+	if m.jobs == nil {
+		m.jobs = map[string]context.CancelFunc{}
+	}
+	m.jobs[jobID] = cancel
+	m.jobsMu.Unlock()
+
+	go func() {
+		defer cancel()
+		defer m.forgetJob(jobID)
+		run(ctx)
+	}()
+}
+
+func (m *Manager) forgetJob(jobID string) {
+	m.jobsMu.Lock()
+	defer m.jobsMu.Unlock()
+	delete(m.jobs, jobID)
 }
 
 func (m *Manager) ListCurrentUpdates(ctx context.Context, filter models.UpdateFilter) ([]models.ImageUpdate, error) {
@@ -413,6 +467,9 @@ func (m *Manager) runAllChecks(ctx context.Context, jobID string, projects []sto
 	m.publishCheckProgress(jobID, 0, total, "")
 	done := 0
 	for _, project := range projects {
+		if ctx.Err() != nil {
+			return
+		}
 		m.publishCheckProgress(jobID, done, total, project.Name)
 		if !m.offline(ctx) {
 			_, _ = m.CheckProjectUpdates(ctx, project.ID)
@@ -591,7 +648,11 @@ func (m *Manager) jitter(interval time.Duration) time.Duration {
 	if m.JitterFor != nil {
 		return m.JitterFor(max)
 	}
-	return time.Duration(m.now().UnixNano() % int64(max))
+	value, err := rand.Int(rand.Reader, big.NewInt(int64(max)))
+	if err != nil {
+		return 0
+	}
+	return time.Duration(value.Int64())
 }
 
 func (m *Manager) offline(ctx context.Context) bool {

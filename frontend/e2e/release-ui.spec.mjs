@@ -319,6 +319,23 @@ async function disableMotion(page) {
         transition-delay: 0s !important;
         transition-duration: 0s !important;
       }
+      html[data-cairn-visual-fullpage],
+      html[data-cairn-visual-fullpage] body,
+      html[data-cairn-visual-fullpage] #root,
+      html[data-cairn-visual-fullpage] main,
+      html[data-cairn-visual-fullpage] main > div,
+      html[data-cairn-visual-fullpage] main > div > section {
+        height: auto !important;
+        min-height: 960px !important;
+        overflow: visible !important;
+      }
+
+      html[data-cairn-visual-fullpage] [data-testid="app-scroll-region"] {
+        flex: none !important;
+        height: auto !important;
+        min-height: 0 !important;
+        overflow: visible !important;
+      }
     `,
   });
 }
@@ -366,15 +383,9 @@ async function scrollRegionMetrics(page) {
 }
 
 async function assertScreenshotStable(page, label) {
-  const first = await page.screenshot({
-    animations: 'disabled',
-    fullPage: true,
-  });
+  const first = await captureFullRouteScreenshot(page);
   await page.waitForTimeout(150);
-  const second = await page.screenshot({
-    animations: 'disabled',
-    fullPage: true,
-  });
+  const second = await captureFullRouteScreenshot(page);
   const firstImage = PNG.sync.read(first);
   const secondImage = PNG.sync.read(second);
   expect(firstImage.width, `${label} screenshot width changed`).toBe(
@@ -400,10 +411,7 @@ async function assertScreenshotStable(page, label) {
 }
 
 async function assertMatchesGolden(page, route, testInfo) {
-  const actual = await page.screenshot({
-    animations: 'disabled',
-    fullPage: true,
-  });
+  const actual = await captureFullRouteScreenshot(page);
   const goldenPath = path.join(goldenDir, `${route.slug}.png`);
 
   if (updateVisuals) {
@@ -458,6 +466,24 @@ async function assertMatchesGolden(page, route, testInfo) {
   expect(ratio, `${route.label} changed pixel ratio`).toBeLessThanOrEqual(
     visualThreshold,
   );
+}
+
+async function captureFullRouteScreenshot(page) {
+  await page.getByTestId('app-scroll-region').evaluate((node) => {
+    node.scrollTop = 0;
+    document.documentElement.dataset.cairnVisualFullpage = 'true';
+  });
+  await page.waitForTimeout(0);
+  try {
+    return await page.screenshot({
+      animations: 'disabled',
+      fullPage: true,
+    });
+  } finally {
+    await page.evaluate(() => {
+      delete document.documentElement.dataset.cairnVisualFullpage;
+    });
+  }
 }
 
 function annotatePerf(testInfo, label, value, unit = 'ms') {

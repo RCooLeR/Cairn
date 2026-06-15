@@ -98,7 +98,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		path = defaultPath
 	}
 
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, err
 	}
 
@@ -366,18 +366,42 @@ func copyFile(src, dst string) error {
 		_ = in.Close()
 	}()
 
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if _, err := os.Stat(dst); err == nil {
+		return os.ErrExist
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+
+	dir := filepath.Dir(dst)
+	pattern := filepath.Base(dst) + ".tmp-*"
+	out, err := os.CreateTemp(dir, pattern)
 	if err != nil {
 		return err
 	}
+	tmpPath := out.Name()
+	keepTemp := false
 	defer func() {
-		_ = out.Close()
+		if !keepTemp {
+			_ = os.Remove(tmpPath)
+		}
 	}()
 
 	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
 		return err
 	}
-	return out.Sync()
+	if err := out.Sync(); err != nil {
+		_ = out.Close()
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, dst); err != nil {
+		return err
+	}
+	keepTemp = true
+	return nil
 }
 
 func retainBackups(dbPath string, keep int) error {

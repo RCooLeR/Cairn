@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+	"syscall"
+	"time"
 
 	"github.com/creack/pty"
 )
@@ -49,6 +51,8 @@ func (s *localPTYSession) Write(p []byte) (int, error) {
 
 func (s *localPTYSession) Close() error {
 	if s.cmd != nil && s.cmd.Process != nil {
+		_ = s.cmd.Process.Signal(syscall.SIGTERM)
+		time.Sleep(200 * time.Millisecond)
 		_ = s.cmd.Process.Kill()
 	}
 	if s.file == nil {

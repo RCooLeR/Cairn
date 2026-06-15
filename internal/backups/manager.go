@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -55,6 +56,10 @@ type Manager struct {
 
 	mu    sync.Mutex
 	plans map[string]planRecord
+
+	jobsMu  sync.Mutex
+	rootCtx context.Context
+	jobs    map[string]context.CancelFunc
 }
 
 type planRecord struct {
@@ -110,6 +115,8 @@ type objectsChangedPayload struct {
 
 var safeFilenamePattern = regexp.MustCompile(`[^A-Za-z0-9_.-]+`)
 
+const maxBackupPathAttempts = 10000
+
 func NewManager(providers ProviderResolver, docker DockerClient, settings *store.SettingsRepository, backups *store.BackupRepository, audit *store.AuditRepository, events bus.Bus, version string) *Manager {
 	return &Manager{
 		Providers:      providers,
@@ -123,6 +130,32 @@ func NewManager(providers ProviderResolver, docker DockerClient, settings *store
 		Version:        version,
 		AvailableBytes: defaultAvailableBytes,
 		plans:          map[string]planRecord{},
+		jobs:           map[string]context.CancelFunc{},
+	}
+}
+
+func (m *Manager) Start(ctx context.Context) {
+	if m == nil {
+		return
+	}
+	m.jobsMu.Lock()
+	m.rootCtx = ctx
+	m.jobsMu.Unlock()
+}
+
+func (m *Manager) StopAll() {
+	if m == nil {
+		return
+	}
+	m.jobsMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(m.jobs))
+	for jobID, cancel := range m.jobs {
+		cancels = append(cancels, cancel)
+		delete(m.jobs, jobID)
+	}
+	m.jobsMu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
 	}
 }
 
@@ -154,7 +187,10 @@ func (m *Manager) PlanBackupVolume(ctx context.Context, req models.BackupVolumeR
 	}
 
 	now := m.now()
-	archiveName, archivePath, metadataPath := backupPaths(backupDirHost, volumeName, now)
+	archiveName, archivePath, metadataPath, err := backupPaths(backupDirHost, volumeName, now)
+	if err != nil {
+		return nil, err
+	}
 	containers := runningContainerNames(detail.Containers)
 	plan := models.CommandPlan{
 		PlanID:    security.NewPlanID(),
@@ -191,9 +227,9 @@ func (m *Manager) ApplyBackup(ctx context.Context, planID string) (string, error
 		return "", apperror.New(apperror.Conflict, "Plan is not a backup plan")
 	}
 	jobID := "backup-" + m.newID()
-	go func() {
-		_ = m.runBackup(context.Background(), jobID, record)
-	}()
+	m.startJob(jobID, func(jobCtx context.Context) {
+		_ = m.runBackup(jobCtx, jobID, record)
+	})
 	return jobID, nil
 }
 
@@ -310,7 +346,9 @@ func (m *Manager) ApplyRestore(ctx context.Context, planID string, typedName str
 		return "", apperror.New(apperror.Conflict, "Plan is not a restore plan")
 	}
 	jobID := "restore-" + m.newID()
-	go m.runRestore(context.Background(), jobID, record)
+	m.startJob(jobID, func(jobCtx context.Context) {
+		m.runRestore(jobCtx, jobID, record)
+	})
 	return jobID, nil
 }
 
@@ -432,6 +470,32 @@ func (m *Manager) runRestore(ctx context.Context, jobID string, record planRecor
 	m.publishVolumeChanged(record.TargetVolumeName)
 	_ = m.recordAudit(ctx, "backup.restore", "volume", record.TargetVolumeName, record.ProviderID, record.ProjectID, command, record.Plan.Risk, "success", duration, nil)
 	m.publishDone(jobID, record.TargetVolumeName, nil)
+}
+
+func (m *Manager) startJob(jobID string, run func(context.Context)) {
+	base := context.Background()
+	m.jobsMu.Lock()
+	if m.rootCtx != nil {
+		base = m.rootCtx
+	}
+	ctx, cancel := context.WithCancel(base)
+	if m.jobs == nil {
+		m.jobs = map[string]context.CancelFunc{}
+	}
+	m.jobs[jobID] = cancel
+	m.jobsMu.Unlock()
+
+	go func() {
+		defer cancel()
+		defer m.forgetJob(jobID)
+		run(ctx)
+	}()
+}
+
+func (m *Manager) forgetJob(jobID string) {
+	m.jobsMu.Lock()
+	defer m.jobsMu.Unlock()
+	delete(m.jobs, jobID)
 }
 
 func (m *Manager) savePlan(record planRecord) {
@@ -710,7 +774,7 @@ func dockerRunRestoreArgs(targetName string, backupDir string, archiveName strin
 		"-v", backupDir + ":/backup:ro",
 		helperImage,
 		"sh", "-c",
-		"rm -rf /restore/* /restore/..?* /restore/.[!.]* ; tar xzf /backup/" + archiveName + " -C /restore",
+		"rm -rf /restore/* /restore/..?* /restore/.[!.]* && tar xzf /backup/" + archiveName + " -C /restore",
 	}
 }
 
@@ -748,13 +812,17 @@ func restoreTitle(targetName string, overwrite bool) string {
 	return "Restore into " + targetName
 }
 
-func backupPaths(dir string, volumeName string, ts time.Time) (string, string, string) {
+func backupPaths(dir string, volumeName string, ts time.Time) (string, string, string, error) {
+	return backupPathsWithStat(dir, volumeName, ts, os.Stat, maxBackupPathAttempts)
+}
+
+func backupPathsWithStat(dir string, volumeName string, ts time.Time, stat func(string) (os.FileInfo, error), maxAttempts int) (string, string, string, error) {
 	base := sanitizeFilename(volumeName)
 	if base == "" {
 		base = "volume"
 	}
 	stamp := ts.UTC().Format("20060102T150405Z")
-	for i := 0; ; i++ {
+	for i := 0; i < maxAttempts; i++ {
 		suffix := ""
 		if i > 0 {
 			suffix = fmt.Sprintf("-%d", i+1)
@@ -762,12 +830,31 @@ func backupPaths(dir string, volumeName string, ts time.Time) (string, string, s
 		archive := fmt.Sprintf("%s-%s%s.tar.gz", base, stamp, suffix)
 		archivePath := filepath.Join(dir, archive)
 		metadataPath := metadataPathForArchive(archivePath)
-		if _, err := os.Stat(archivePath); os.IsNotExist(err) {
-			if _, err := os.Stat(metadataPath); os.IsNotExist(err) {
-				return archive, archivePath, metadataPath
+		if err := requirePathAvailable(archivePath, stat); err != nil {
+			if errors.Is(err, os.ErrExist) {
+				continue
 			}
+			return "", "", "", err
 		}
+		if err := requirePathAvailable(metadataPath, stat); err != nil {
+			if errors.Is(err, os.ErrExist) {
+				continue
+			}
+			return "", "", "", err
+		}
+		return archive, archivePath, metadataPath, nil
 	}
+	return "", "", "", apperror.New(apperror.Conflict, "Could not allocate a unique backup filename")
+}
+
+func requirePathAvailable(path string, stat func(string) (os.FileInfo, error)) error {
+	if _, err := stat(path); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return apperror.Wrap(apperror.Internal, "Check backup path failed", err)
+	}
+	return os.ErrExist
 }
 
 func sanitizeFilename(value string) string {
