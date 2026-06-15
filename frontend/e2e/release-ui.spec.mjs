@@ -91,6 +91,30 @@ test.describe('release UI validation', () => {
       await assertMatchesGolden(page, route, testInfo);
     }
   });
+
+  test('overflowing routes keep page content scrollable', async ({ page }) => {
+    await page.setViewportSize({ width: 1260, height: 720 });
+
+    for (const route of routes) {
+      await openRoute(page, route);
+      await assertScrollRegionCanReachOverflow(page, route.label);
+    }
+
+    await openRoute(page, {
+      label: 'Settings',
+      heading: 'Settings',
+      slug: 'settings',
+    });
+    const settingsScroll = await scrollRegionMetrics(page);
+    expect(
+      settingsScroll.scrollHeight,
+      'Settings should overflow in the compact release viewport',
+    ).toBeGreaterThan(settingsScroll.clientHeight);
+    expect(
+      settingsScroll.afterScrollTop,
+      'Settings content could not scroll to lower provider controls',
+    ).toBeGreaterThan(0);
+  });
 });
 
 test('daemon-stopped fixture renders degraded stale mode safely on every route', async ({
@@ -313,6 +337,32 @@ async function assertNoSeriousAxeViolations(page, label) {
     }));
 
   expect(violations).toEqual([]);
+}
+
+async function assertScrollRegionCanReachOverflow(page, label) {
+  const metrics = await scrollRegionMetrics(page);
+  expect(metrics.clientHeight, `${label} scroll region has no height`).toBeGreaterThan(0);
+  if (metrics.scrollHeight > metrics.clientHeight + 1) {
+    expect(
+      metrics.afterScrollTop,
+      `${label} content overflows but cannot be scrolled`,
+    ).toBeGreaterThan(0);
+  }
+}
+
+async function scrollRegionMetrics(page) {
+  return page.getByTestId('app-scroll-region').evaluate((node) => {
+    node.scrollTop = 0;
+    const beforeScrollTop = node.scrollTop;
+    node.scrollTop = node.scrollHeight;
+    const afterScrollTop = node.scrollTop;
+    return {
+      afterScrollTop,
+      beforeScrollTop,
+      clientHeight: node.clientHeight,
+      scrollHeight: node.scrollHeight,
+    };
+  });
 }
 
 async function assertScreenshotStable(page, label) {

@@ -36,8 +36,13 @@
   src: url("/Inter-Medium.ttf") format("truetype");
 }
 
+html,
+body,
+#root {
+  height: 100%;
+}
+
 body {
-  min-height: 700px;
   margin: 0;
   overflow: hidden;
 }

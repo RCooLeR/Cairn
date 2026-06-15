@@ -3949,9 +3949,9 @@ function App() {
   })();
 
   return (
-    <main className="min-h-screen bg-bg-app text-text-primary">
-      <div className="grid min-h-screen grid-cols-1 lg:grid-cols-[236px_1fr]">
-        <aside className="flex flex-col border-b border-border bg-bg-panel lg:min-h-screen lg:border-b-0 lg:border-r">
+    <main className="h-screen overflow-hidden bg-bg-app text-text-primary">
+      <div className="grid h-full min-h-0 grid-cols-1 lg:grid-cols-[236px_1fr]">
+        <aside className="flex min-h-0 flex-col border-b border-border bg-bg-panel lg:h-full lg:border-b-0 lg:border-r">
           <div className="flex h-16 items-center gap-3 border-b border-border px-4">
             <img
               src={logoUrl}
@@ -3967,7 +3967,7 @@ function App() {
           </div>
 
           <nav
-            className="flex gap-2 overflow-x-auto px-2 py-3 lg:flex-1 lg:flex-col lg:space-y-1 lg:overflow-visible"
+            className="flex min-h-0 gap-2 overflow-x-auto px-2 py-3 lg:flex-1 lg:flex-col lg:space-y-1 lg:overflow-y-auto lg:overflow-x-hidden"
             aria-label="Main navigation"
           >
             {navItems.map((item) => {
@@ -4043,7 +4043,7 @@ function App() {
           </div>
         </aside>
 
-        <section className="flex min-w-0 flex-col">
+        <section className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden">
           <header className="flex h-auto shrink-0 flex-col items-stretch gap-3 border-b border-border bg-bg-app px-4 py-3 sm:flex-row sm:items-center sm:justify-between lg:h-16 lg:px-6 lg:py-0">
             <div className="min-w-0">
               <h1 className="truncate text-xl font-semibold tracking-normal">
@@ -4155,7 +4155,10 @@ function App() {
             </div>
           ) : null}
 
-          <div className="min-h-0 flex-1 overflow-auto p-6">
+          <div
+            className="min-h-0 flex-1 overflow-auto p-6"
+            data-testid="app-scroll-region"
+          >
             <DegradedFrame stale={staleMode}>{content}</DegradedFrame>
           </div>
         </section>
@@ -4555,12 +4558,12 @@ function GlobalStateBanner({
         : "border-info/30 bg-info/10 text-info";
 
   return (
-    <div className={`border-b px-6 py-3 ${toneClass}`}>
+    <div className={`shrink-0 border-b px-6 py-3 ${toneClass}`}>
       <div className="flex flex-wrap items-center gap-3 text-sm">
         <span className="shrink-0">{state.icon}</span>
         <div className="min-w-0 flex-1">
           <div className="font-medium">{state.title}</div>
-          <div className="text-xs opacity-90">{state.body}</div>
+          <div className="break-words text-xs opacity-90">{state.body}</div>
         </div>
         {providerRepairNeeded ? (
           <Button
