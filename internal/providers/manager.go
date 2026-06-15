@@ -241,6 +241,12 @@ func (m *Manager) ActiveProvider(ctx context.Context) (PlatformProvider, error) 
 	return provider, nil
 }
 
+func (m *Manager) ApplySavedSettings(ctx context.Context) {
+	for _, id := range m.order {
+		m.applyProviderSettings(ctx, m.providers[id])
+	}
+}
+
 func (m *Manager) PlanInstall(ctx context.Context, providerID string, opts models.InstallOptions) (*models.CommandPlan, error) {
 	provider, ok := m.providers[providerID]
 	if !ok {

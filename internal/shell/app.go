@@ -50,6 +50,7 @@ func Run(assets fs.FS) error {
 
 	providerSet := defaultProviderSet()
 	providerManager := providers.NewManager(db.Providers(), db.Settings(), providerSet)
+	providerManager.ApplySavedSettings(ctx)
 	auditRepo := db.Audit()
 	projectRepo := db.Projects()
 	containerPlans := security.NewPlanStore(nil)
@@ -64,15 +65,22 @@ func Run(assets fs.FS) error {
 	var registryManager *registrycore.Manager
 	var lineageManager *lineagecore.Manager
 	var updateManager *updatescore.Manager
+	var runtimeProvider providers.PlatformProvider
+	runtimeProviderID := ""
 	if len(providerSet) > 0 {
-		dockerClient = dockercore.New(providerSet[0], eventBus)
+		runtimeProvider = providerSet[0]
+		if activeProvider, err := providerManager.ActiveProvider(ctx); err == nil && activeProvider != nil {
+			runtimeProvider = activeProvider
+		}
+		runtimeProviderID = runtimeProvider.ID()
+		dockerClient = dockercore.New(runtimeProvider, eventBus)
 		dockerClient.SetObjectCache(db.Objects())
 		dockerClient.StartHealthLoop(ctx)
 		dockerClient.StartObjectEventLoop(ctx)
 		dockerClient.StartReconcileLoop(ctx)
-		composeClient = composecore.NewClient(providerSet[0])
+		composeClient = composecore.NewClient(runtimeProvider)
 		projectDetector = &composecore.ProjectDetector{
-			ProviderID:  providerSet[0].ID(),
+			ProviderID:  runtimeProvider.ID(),
 			ContextName: "",
 			Docker:      dockerClient,
 			Compose:     composeClient,
@@ -82,7 +90,7 @@ func Run(assets fs.FS) error {
 		logsManager = logsvc.NewManager(dockerClient, eventBus, logsvc.Options{})
 		metricsManager = metrics.NewManager(dockerClient, db.Metrics(), projectRepo, auditRepo, eventBus, metrics.Options{})
 		metricsManager.Start(ctx)
-		terminalManager = terminal.NewManager(providerSet[0], dockerClient, projectRepo, eventBus, terminal.Options{})
+		terminalManager = terminal.NewManager(runtimeProvider, dockerClient, projectRepo, eventBus, terminal.Options{})
 		backupManager = backupcore.NewManager(providerManager, dockerClient, db.Settings(), db.Backups(), auditRepo, eventBus, services.Version)
 		registryManager = registrycore.NewManager(providerManager, auditRepo)
 		lineageManager = lineagecore.NewManager(projectRepo, db.Lineage(), db.Objects(), dockerClient)
@@ -111,7 +119,7 @@ func Run(assets fs.FS) error {
 				Audit:       auditRepo,
 				Plans:       projectPlans,
 				Events:      eventBus,
-				ProviderID:  firstProviderID(providerSet),
+				ProviderID:  runtimeProviderID,
 				ContextName: "",
 			}),
 			application.NewService(&services.ComposeService{Client: composeClient, Projects: projectRepo}),
@@ -207,13 +215,6 @@ func defaultProviderSet() []providers.PlatformProvider {
 		return []providers.PlatformProvider{providers.NewMacOSColima(providers.MacOSColimaOptions{})}
 	}
 	return nil
-}
-
-func firstProviderID(providerSet []providers.PlatformProvider) string {
-	if len(providerSet) == 0 || providerSet[0] == nil {
-		return ""
-	}
-	return providerSet[0].ID()
 }
 
 func forwardBusEvents(ctx context.Context, eventBus bus.Bus, window application.Window, topics []bus.Topic) {

@@ -86,6 +86,23 @@ func TestManagerAppliesWindowsWSLDistroSetting(t *testing.T) {
 	}
 }
 
+func TestManagerApplySavedSettingsBeforeDetect(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openProviderTestStore(t, ctx)
+	provider := &fakeProvider{id: "windows_wsl_ubuntu", kind: TypeWindowsWSL, platform: PlatformWindows, healthy: true}
+	manager := NewManager(db.Providers(), db.Settings(), []PlatformProvider{provider})
+	if err := db.Settings().SetString(ctx, "windows.wsl_distro", "cairn-dev"); err != nil {
+		t.Fatalf("SetString() error = %v", err)
+	}
+
+	manager.ApplySavedSettings(ctx)
+
+	if provider.distro != "cairn-dev" {
+		t.Fatalf("provider distro = %q, want cairn-dev", provider.distro)
+	}
+}
+
 func TestManagerAppliesMacOSColimaSettings(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
