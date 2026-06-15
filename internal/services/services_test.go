@@ -373,6 +373,53 @@ func TestProjectServiceImportProject(t *testing.T) {
 	}
 }
 
+func TestProjectServiceListProjectsScopesToActiveBackendContext(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	now := time.Date(2026, 6, 15, 10, 0, 0, 0, time.UTC)
+	projects := db.Projects()
+
+	if err := projects.SaveSnapshot(ctx, "windows_wsl_ubuntu", []store.ProjectRecord{{
+		ID:          "windows_wsl_ubuntu/ubuntu-app",
+		ProviderID:  "windows_wsl_ubuntu",
+		ContextName: "wsl:Ubuntu",
+		Name:        "ubuntu-app",
+		LastSeenAt:  now,
+	}, {
+		ID:          "windows_wsl_ubuntu/cairn-app",
+		ProviderID:  "windows_wsl_ubuntu",
+		ContextName: "wsl:cairn-dev",
+		Name:        "cairn-app",
+		LastSeenAt:  now,
+	}}, nil, now, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot windows error = %v", err)
+	}
+	if err := projects.SaveSnapshot(ctx, "linux_native", []store.ProjectRecord{{
+		ID:         "linux_native/linux-app",
+		ProviderID: "linux_native",
+		Name:       "linux-app",
+		LastSeenAt: now,
+	}}, nil, now, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot linux error = %v", err)
+	}
+
+	service := &ProjectService{
+		Projects:    projects,
+		ProviderID:  "windows_wsl_ubuntu",
+		ContextName: "wsl:cairn-dev",
+	}
+	summaries, err := service.ListProjects(ctx)
+	if err != nil {
+		t.Fatalf("ListProjects() error = %v", err)
+	}
+	if len(summaries) != 1 || summaries[0].ID != "windows_wsl_ubuntu/cairn-app" {
+		t.Fatalf("summaries = %#v", summaries)
+	}
+	if _, err := service.GetProject(ctx, "windows_wsl_ubuntu/ubuntu-app"); !apperror.IsCode(err, apperror.NotFound) {
+		t.Fatalf("GetProject stale context error = %v, want %s", err, apperror.NotFound)
+	}
+}
+
 func TestProjectServiceGetProjectIncludesDetailPayload(t *testing.T) {
 	ctx := context.Background()
 	db := openServiceTestStore(t)
@@ -868,7 +915,16 @@ func openServiceTestStore(t *testing.T) *store.Store {
 		DisplayName: "Linux Native",
 		Enabled:     true,
 	}); err != nil {
-		t.Fatalf("seed provider: %v", err)
+		t.Fatalf("seed linux provider: %v", err)
+	}
+	if err := db.Providers().Upsert(ctx, store.ProviderRecord{
+		ID:          "windows_wsl_ubuntu",
+		Type:        "windows_wsl_ubuntu",
+		Platform:    "windows",
+		DisplayName: "Windows WSL Ubuntu",
+		Enabled:     true,
+	}); err != nil {
+		t.Fatalf("seed windows provider: %v", err)
 	}
 	return db
 }

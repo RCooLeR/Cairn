@@ -62,7 +62,7 @@ func TestProjectDetectorLabelsWinOverImported(t *testing.T) {
 	detector := &ProjectDetector{
 		ProviderID:  "linux_native",
 		ContextName: "default",
-		Docker:      fakeDockerInventory{},
+		Docker:      nil,
 		Compose:     NewClient(runner),
 		Projects:    db.Projects(),
 		Objects:     db.Objects(),
@@ -96,6 +96,50 @@ func TestProjectDetectorLabelsWinOverImported(t *testing.T) {
 	}
 	if len(services) != 1 || services[0].ID != "linux_native/demo/web" || services[0].ReplicasRunning != 1 {
 		t.Fatalf("services = %#v", services)
+	}
+}
+
+func TestProjectDetectorIgnoresObjectCacheWhenLiveDockerIsEmpty(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openProjectTestStore(t)
+	now := time.Date(2026, 6, 13, 1, 30, 0, 0, time.UTC)
+	if err := db.Objects().SaveContainers(ctx, "linux_native", []store.ContainerCacheRecord{{
+		Summary: models.ContainerSummary{
+			ID:        "stale",
+			Name:      "stale-web-1",
+			Image:     "nginx:alpine",
+			State:     "running",
+			Status:    "running",
+			Health:    models.HealthStatusHealthy,
+			CreatedAt: now.Add(-time.Hour),
+		},
+		Labels: map[string]string{
+			LabelProject: "stale",
+			LabelService: "web",
+		},
+	}}, now.Add(-time.Hour)); err != nil {
+		t.Fatalf("SaveContainers() error = %v", err)
+	}
+
+	runner := newFakeRunner()
+	runner.outputs["|ls --format json --all"] = commandResult(`[]`)
+	detector := &ProjectDetector{
+		ProviderID:  "linux_native",
+		ContextName: "default",
+		Docker:      fakeDockerInventory{},
+		Compose:     NewClient(runner),
+		Projects:    db.Projects(),
+		Objects:     db.Objects(),
+		Now:         func() time.Time { return now },
+	}
+
+	summaries, err := detector.Reconcile(ctx)
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if len(summaries) != 0 {
+		t.Fatalf("summaries = %#v", summaries)
 	}
 }
 
@@ -144,11 +188,12 @@ func TestProjectDetectorFlagsImportedMissingWorkdir(t *testing.T) {
 	now := time.Date(2026, 6, 13, 3, 0, 0, 0, time.UTC)
 	missing := filepath.Join(t.TempDir(), "missing")
 	if err := db.Projects().UpsertImported(ctx, store.ProjectRecord{
-		ID:         ProjectID("linux_native", "gone"),
-		ProviderID: "linux_native",
-		Name:       "gone",
-		WorkingDir: missing,
-		LastSeenAt: now.Add(-time.Hour),
+		ID:          ProjectID("linux_native", "gone"),
+		ProviderID:  "linux_native",
+		ContextName: "default",
+		Name:        "gone",
+		WorkingDir:  missing,
+		LastSeenAt:  now.Add(-time.Hour),
 	}); err != nil {
 		t.Fatalf("UpsertImported() error = %v", err)
 	}

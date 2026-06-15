@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"strings"
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/models"
@@ -171,6 +172,44 @@ func (r *ProjectRepository) List(ctx context.Context) ([]ProjectRecord, error) {
 	return scanProjectRows(rows)
 }
 
+func (r *ProjectRepository) ListByProvider(ctx context.Context, providerID string) ([]ProjectRecord, error) {
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT id, provider_id, context_name, name, working_dir, compose_files_json,
+			status, health, source, pinned, last_seen_at, metadata_json
+		FROM projects
+		WHERE provider_id = ?
+		ORDER BY pinned DESC, name ASC
+	`, providerID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = rows.Close()
+	}()
+	return scanProjectRows(rows)
+}
+
+func (r *ProjectRepository) ListByProviderContext(ctx context.Context, providerID string, contextName string) ([]ProjectRecord, error) {
+	contextName = strings.TrimSpace(contextName)
+	if contextName == "" {
+		return r.ListByProvider(ctx, providerID)
+	}
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT id, provider_id, context_name, name, working_dir, compose_files_json,
+			status, health, source, pinned, last_seen_at, metadata_json
+		FROM projects
+		WHERE provider_id = ? AND context_name = ?
+		ORDER BY pinned DESC, name ASC
+	`, providerID, contextName)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = rows.Close()
+	}()
+	return scanProjectRows(rows)
+}
+
 func (r *ProjectRepository) Get(ctx context.Context, projectID string) (ProjectRecord, error) {
 	row := r.db.QueryRowContext(ctx, `
 		SELECT id, provider_id, context_name, name, working_dir, compose_files_json,
@@ -189,6 +228,27 @@ func (r *ProjectRepository) ListImported(ctx context.Context, providerID string)
 		WHERE provider_id = ? AND source = ?
 		ORDER BY name ASC
 	`, providerID, ProjectSourceImported)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = rows.Close()
+	}()
+	return scanProjectRows(rows)
+}
+
+func (r *ProjectRepository) ListImportedByProviderContext(ctx context.Context, providerID string, contextName string) ([]ProjectRecord, error) {
+	contextName = strings.TrimSpace(contextName)
+	if contextName == "" {
+		return r.ListImported(ctx, providerID)
+	}
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT id, provider_id, context_name, name, working_dir, compose_files_json,
+			status, health, source, pinned, last_seen_at, metadata_json
+		FROM projects
+		WHERE provider_id = ? AND context_name = ? AND source = ?
+		ORDER BY name ASC
+	`, providerID, contextName, ProjectSourceImported)
 	if err != nil {
 		return nil, err
 	}

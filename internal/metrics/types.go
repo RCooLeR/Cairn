@@ -47,11 +47,12 @@ type Options struct {
 }
 
 type Manager struct {
-	Docker     DockerClient
-	Repository *store.MetricsRepository
-	Projects   *store.ProjectRepository
-	Audit      *store.AuditRepository
-	Events     bus.Bus
+	Docker      DockerClient
+	Repository  *store.MetricsRepository
+	Projects    *store.ProjectRepository
+	Audit       *store.AuditRepository
+	Events      bus.Bus
+	ContextName string
 
 	visibleInterval    time.Duration
 	backgroundInterval time.Duration

@@ -83,3 +83,7 @@ type PlatformProvider interface {
 	MapPathToBackend(string) (string, error)
 	MapPathToHost(string) (string, error)
 }
+
+type BackendIdentityProvider interface {
+	BackendIdentity(context.Context) (string, error)
+}

@@ -61,6 +61,12 @@ func TestObjectCacheRepositoryUpsertAndDeleteStale(t *testing.T) {
 	if got := countRows(t, ctx, db, "containers_cache"); got != 1 {
 		t.Fatalf("containers after prune = %d, want 1", got)
 	}
+	if err := repo.SaveContainersSnapshot(ctx, "linux_native", nil, freshSeen.Add(time.Hour)); err != nil {
+		t.Fatalf("SaveContainersSnapshot(empty) error = %v", err)
+	}
+	if got := countRows(t, ctx, db, "containers_cache"); got != 0 {
+		t.Fatalf("containers after empty snapshot = %d, want 0", got)
+	}
 }
 
 func countRows(t *testing.T, ctx context.Context, db *Store, table string) int {

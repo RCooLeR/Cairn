@@ -66,7 +66,7 @@ func (c *Client) ListContainers(ctx context.Context, opts models.ContainerListOp
 		})
 	}
 	sortContainerSummaries(summaries)
-	if err := c.saveContainers(ctx, records); err != nil {
+	if err := c.saveContainers(ctx, records, isContainerInventorySnapshot(opts)); err != nil {
 		return nil, err
 	}
 	return summaries, nil
@@ -79,7 +79,7 @@ func (c *Client) GetContainer(ctx context.Context, id string) (*models.Container
 	}
 	detail := mapContainerDetail(raw)
 	c.qualifyContainerSummary(&detail.Summary)
-	if err := c.saveContainers(ctx, []store.ContainerCacheRecord{containerRecordFromInspect(raw, detail)}); err != nil {
+	if err := c.saveContainers(ctx, []store.ContainerCacheRecord{containerRecordFromInspect(raw, detail)}, false); err != nil {
 		return nil, err
 	}
 	return detail, nil
@@ -682,12 +682,22 @@ func imageDangling(tags []string) bool {
 	return true
 }
 
-func (c *Client) saveContainers(ctx context.Context, records []store.ContainerCacheRecord) error {
+func (c *Client) saveContainers(ctx context.Context, records []store.ContainerCacheRecord, replace bool) error {
 	cache := c.objectCache()
-	if cache == nil || len(records) == 0 {
+	if cache == nil {
+		return nil
+	}
+	if replace {
+		return cache.SaveContainersSnapshot(ctx, c.providerID(), records, c.now())
+	}
+	if len(records) == 0 {
 		return nil
 	}
 	return cache.SaveContainers(ctx, c.providerID(), records, c.now())
+}
+
+func isContainerInventorySnapshot(opts models.ContainerListOptions) bool {
+	return opts.All && opts.ProjectID == "" && opts.Service == "" && len(opts.Filters) == 0
 }
 
 func (c *Client) saveImages(ctx context.Context, records []store.ImageCacheRecord) error {

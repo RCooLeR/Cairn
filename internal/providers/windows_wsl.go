@@ -345,6 +345,10 @@ func (p *WindowsWSLProvider) DockerContext(ctx context.Context) (string, error) 
 	return contextName, nil
 }
 
+func (p *WindowsWSLProvider) BackendIdentity(context.Context) (string, error) {
+	return "wsl:" + p.configuredDistro(), nil
+}
+
 func (p *WindowsWSLProvider) RunDocker(ctx context.Context, args ...string) (*CommandResult, error) {
 	return p.runWSLWithTimeout(ctx, dockerOperationTimeout, p.configuredDistro(), append([]string{"docker"}, args...)...)
 }

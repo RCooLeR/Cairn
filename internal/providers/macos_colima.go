@@ -357,6 +357,10 @@ func (p *MacOSColimaProvider) DockerContext(context.Context) (string, error) {
 	return p.contextName(), nil
 }
 
+func (p *MacOSColimaProvider) BackendIdentity(context.Context) (string, error) {
+	return "colima:" + p.configuredProfile(), nil
+}
+
 func (p *MacOSColimaProvider) RunDocker(ctx context.Context, args ...string) (*CommandResult, error) {
 	dockerArgs := append([]string{"--context", p.contextName()}, args...)
 	return p.runner.Run(ctx, dockerOperationTimeout, "docker", dockerArgs...)

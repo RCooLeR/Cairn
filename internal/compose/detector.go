@@ -56,7 +56,7 @@ func (d *ProjectDetector) Reconcile(ctx context.Context) ([]models.ProjectSummar
 	}
 
 	if d.Projects != nil {
-		imported, err := d.Projects.ListImported(ctx, providerID)
+		imported, err := d.Projects.ListImportedByProviderContext(ctx, providerID, d.ContextName)
 		if err != nil {
 			return nil, err
 		}
@@ -88,7 +88,7 @@ func (d *ProjectDetector) refreshContainers(ctx context.Context) ([]store.Contai
 			return nil, err
 		}
 	}
-	if d.Objects != nil {
+	if d.Objects != nil && d.Docker == nil {
 		records, err := d.Objects.ListContainers(ctx, d.ProviderID)
 		if err != nil {
 			return nil, err

@@ -4,6 +4,7 @@ import (
 	"context"
 	"io/fs"
 	"runtime"
+	"strings"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	backupcore "github.com/RCooLeR/Cairn/internal/backups"
@@ -67,12 +68,14 @@ func Run(assets fs.FS) error {
 	var updateManager *updatescore.Manager
 	var runtimeProvider providers.PlatformProvider
 	runtimeProviderID := ""
+	runtimeContextName := ""
 	if len(providerSet) > 0 {
 		runtimeProvider = providerSet[0]
 		if activeProvider, err := providerManager.ActiveProvider(ctx); err == nil && activeProvider != nil {
 			runtimeProvider = activeProvider
 		}
 		runtimeProviderID = runtimeProvider.ID()
+		runtimeContextName = backendContextName(ctx, runtimeProvider)
 		dockerClient = dockercore.New(runtimeProvider, eventBus)
 		dockerClient.SetObjectCache(db.Objects())
 		dockerClient.StartHealthLoop(ctx)
@@ -81,7 +84,7 @@ func Run(assets fs.FS) error {
 		composeClient = composecore.NewClient(runtimeProvider)
 		projectDetector = &composecore.ProjectDetector{
 			ProviderID:  runtimeProvider.ID(),
-			ContextName: "",
+			ContextName: runtimeContextName,
 			Docker:      dockerClient,
 			Compose:     composeClient,
 			Projects:    projectRepo,
@@ -89,6 +92,7 @@ func Run(assets fs.FS) error {
 		}
 		logsManager = logsvc.NewManager(dockerClient, eventBus, logsvc.Options{})
 		metricsManager = metrics.NewManager(dockerClient, db.Metrics(), projectRepo, auditRepo, eventBus, metrics.Options{})
+		metricsManager.ContextName = runtimeContextName
 		metricsManager.Start(ctx)
 		terminalManager = terminal.NewManager(runtimeProvider, dockerClient, projectRepo, eventBus, terminal.Options{})
 		backupManager = backupcore.NewManager(providerManager, dockerClient, db.Settings(), db.Backups(), auditRepo, eventBus, services.Version)
@@ -99,6 +103,7 @@ func Run(assets fs.FS) error {
 		updateManager.Backups = backupManager
 		updateManager.Audit = auditRepo
 		updateManager.Notify = db.Notifications()
+		updateManager.ContextName = runtimeContextName
 		updateManager.Start(ctx)
 	}
 
@@ -120,7 +125,7 @@ func Run(assets fs.FS) error {
 				Plans:       projectPlans,
 				Events:      eventBus,
 				ProviderID:  runtimeProviderID,
-				ContextName: "",
+				ContextName: runtimeContextName,
 			}),
 			application.NewService(&services.ComposeService{Client: composeClient, Projects: projectRepo}),
 			application.NewService(&services.MetricsService{Manager: metricsManager}),
@@ -215,6 +220,21 @@ func defaultProviderSet() []providers.PlatformProvider {
 		return []providers.PlatformProvider{providers.NewMacOSColima(providers.MacOSColimaOptions{})}
 	}
 	return nil
+}
+
+func backendContextName(ctx context.Context, provider providers.PlatformProvider) string {
+	if provider == nil {
+		return ""
+	}
+	identityProvider, ok := provider.(providers.BackendIdentityProvider)
+	if !ok {
+		return ""
+	}
+	identity, err := identityProvider.BackendIdentity(ctx)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(identity)
 }
 
 func forwardBusEvents(ctx context.Context, eventBus bus.Bus, window application.Window, topics []bus.Topic) {

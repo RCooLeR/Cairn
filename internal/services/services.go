@@ -817,7 +817,7 @@ func (s *ProjectService) ListProjects(ctx context.Context) ([]models.ProjectSumm
 	if s.Projects == nil {
 		return nil, notReady()
 	}
-	projects, err := s.Projects.List(ctx)
+	projects, err := s.listCurrentProviderProjects(ctx)
 	if err != nil {
 		return nil, apperror.Wrap(apperror.Internal, "List projects failed", err)
 	}
@@ -835,6 +835,13 @@ func (s *ProjectService) ListProjects(ctx context.Context) ([]models.ProjectSumm
 	return summaries, nil
 }
 
+func (s *ProjectService) listCurrentProviderProjects(ctx context.Context) ([]store.ProjectRecord, error) {
+	if strings.TrimSpace(s.ProviderID) == "" {
+		return s.Projects.List(ctx)
+	}
+	return s.Projects.ListByProviderContext(ctx, s.ProviderID, s.ContextName)
+}
+
 func (s *ProjectService) GetProject(ctx context.Context, projectID string) (*models.ProjectDetail, error) {
 	if s.Projects == nil {
 		return nil, notReady()
@@ -842,6 +849,9 @@ func (s *ProjectService) GetProject(ctx context.Context, projectID string) (*mod
 	project, err := s.Projects.Get(ctx, projectID)
 	if err != nil {
 		return nil, mapStoreNotFound(err, "Project was not found")
+	}
+	if !s.projectInCurrentContext(project) {
+		return nil, apperror.New(apperror.NotFound, "Project was not found")
 	}
 	services, err := s.Projects.ListServices(ctx, projectID)
 	if err != nil {
@@ -1701,6 +1711,9 @@ func (s *ProjectService) projectForAction(ctx context.Context, projectID string)
 	if err != nil {
 		return store.ProjectRecord{}, mapStoreNotFound(err, "Project was not found")
 	}
+	if !s.projectInCurrentContext(project) {
+		return store.ProjectRecord{}, apperror.New(apperror.NotFound, "Project was not found")
+	}
 	workdir := strings.TrimSpace(project.WorkingDir)
 	if workdir == "" {
 		return store.ProjectRecord{}, apperror.New(apperror.WorkdirMissing, "Project working directory is missing")
@@ -2030,6 +2043,16 @@ func (s *ProjectService) now() time.Time {
 		return s.Now().UTC()
 	}
 	return time.Now().UTC()
+}
+
+func (s *ProjectService) projectInCurrentContext(project store.ProjectRecord) bool {
+	if providerID := strings.TrimSpace(s.ProviderID); providerID != "" && project.ProviderID != providerID {
+		return false
+	}
+	if contextName := strings.TrimSpace(s.ContextName); contextName != "" && project.ContextName != contextName {
+		return false
+	}
+	return true
 }
 
 func mapStoreNotFound(err error, message string) error {

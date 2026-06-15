@@ -148,7 +148,7 @@ func (m *Manager) GetDashboardMetrics(ctx context.Context) (*models.DashboardMet
 		Top:        m.topContainers(),
 	}
 	if m.Projects != nil {
-		projects, err := m.Projects.List(ctx)
+		projects, err := m.currentProviderProjects(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -643,6 +643,14 @@ func (m *Manager) providerID() string {
 		return ""
 	}
 	return m.Docker.ProviderID()
+}
+
+func (m *Manager) currentProviderProjects(ctx context.Context) ([]store.ProjectRecord, error) {
+	providerID := m.providerID()
+	if strings.TrimSpace(providerID) == "" {
+		return m.Projects.List(ctx)
+	}
+	return m.Projects.ListByProviderContext(ctx, providerID, m.ContextName)
 }
 
 func notReady() error {

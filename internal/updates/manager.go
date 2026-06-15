@@ -51,6 +51,7 @@ type Manager struct {
 	JitterFor          func(time.Duration) time.Duration
 	HealthWindow       time.Duration
 	HealthPollInterval time.Duration
+	ContextName        string
 
 	startOnce sync.Once
 	planMu    sync.Mutex
@@ -98,7 +99,7 @@ func (m *Manager) CheckAllUpdates(ctx context.Context) (string, error) {
 	if err := m.ready(); err != nil {
 		return "", err
 	}
-	projects, err := m.Projects.List(ctx)
+	projects, err := m.currentProviderProjects(ctx)
 	if err != nil {
 		return "", apperror.Wrap(apperror.Internal, "List projects for update check failed", err)
 	}
@@ -418,7 +419,7 @@ func (m *Manager) runScheduler(ctx context.Context) {
 			if m.offline(ctx) {
 				continue
 			}
-			projects, err := m.Projects.List(ctx)
+			projects, err := m.currentProviderProjects(ctx)
 			if err != nil {
 				continue
 			}
@@ -437,6 +438,21 @@ func (m *Manager) projectWithServices(ctx context.Context, projectID string) (st
 		return store.ProjectRecord{}, nil, apperror.Wrap(apperror.Internal, "List project services for update check failed", err)
 	}
 	return project, services, nil
+}
+
+func (m *Manager) currentProviderProjects(ctx context.Context) ([]store.ProjectRecord, error) {
+	providerID := m.providerID()
+	if strings.TrimSpace(providerID) == "" {
+		return m.Projects.List(ctx)
+	}
+	return m.Projects.ListByProviderContext(ctx, providerID, m.ContextName)
+}
+
+func (m *Manager) providerID() string {
+	if m == nil || m.Docker == nil {
+		return ""
+	}
+	return m.Docker.ProviderID()
 }
 
 func (m *Manager) lineageByService(ctx context.Context, projectID string) (map[string]store.LineageRecord, error) {

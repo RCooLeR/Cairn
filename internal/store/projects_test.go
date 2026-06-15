@@ -116,6 +116,68 @@ func TestProjectRepositoryDeletesOnlyStaleDetectedProjects(t *testing.T) {
 	}
 }
 
+func TestProjectRepositoryListByProvider(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openStoreForProjectTest(t)
+	repo := db.Projects()
+	now := time.Date(2026, 6, 15, 9, 0, 0, 0, time.UTC)
+
+	if err := repo.SaveSnapshot(ctx, "windows_wsl_ubuntu", []ProjectRecord{{
+		ID:          "windows_wsl_ubuntu/ubuntu-app",
+		ProviderID:  "windows_wsl_ubuntu",
+		ContextName: "wsl:Ubuntu",
+		Name:        "ubuntu-app",
+		LastSeenAt:  now,
+	}, {
+		ID:          "windows_wsl_ubuntu/cairn-app",
+		ProviderID:  "windows_wsl_ubuntu",
+		ContextName: "wsl:cairn-dev",
+		Name:        "cairn-app",
+		Source:      ProjectSourceImported,
+		LastSeenAt:  now,
+	}}, nil, now, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot windows error = %v", err)
+	}
+	if err := repo.SaveSnapshot(ctx, "linux_native", []ProjectRecord{{
+		ID:         "linux_native/app",
+		ProviderID: "linux_native",
+		Name:       "app",
+		LastSeenAt: now,
+	}}, nil, now, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot linux error = %v", err)
+	}
+
+	projects, err := repo.ListByProvider(ctx, "windows_wsl_ubuntu")
+	if err != nil {
+		t.Fatalf("ListByProvider() error = %v", err)
+	}
+	if len(projects) != 2 {
+		t.Fatalf("provider projects = %#v", projects)
+	}
+	projects, err = repo.ListByProviderContext(ctx, "windows_wsl_ubuntu", "wsl:cairn-dev")
+	if err != nil {
+		t.Fatalf("ListByProviderContext() error = %v", err)
+	}
+	if len(projects) != 1 || projects[0].ID != "windows_wsl_ubuntu/cairn-app" {
+		t.Fatalf("context projects = %#v", projects)
+	}
+	imported, err := repo.ListImportedByProviderContext(ctx, "windows_wsl_ubuntu", "wsl:Ubuntu")
+	if err != nil {
+		t.Fatalf("ListImportedByProviderContext(ubuntu) error = %v", err)
+	}
+	if len(imported) != 0 {
+		t.Fatalf("ubuntu imported projects = %#v", imported)
+	}
+	imported, err = repo.ListImportedByProviderContext(ctx, "windows_wsl_ubuntu", "wsl:cairn-dev")
+	if err != nil {
+		t.Fatalf("ListImportedByProviderContext(cairn) error = %v", err)
+	}
+	if len(imported) != 1 || imported[0].ID != "windows_wsl_ubuntu/cairn-app" {
+		t.Fatalf("cairn imported projects = %#v", imported)
+	}
+}
+
 func openStoreForProjectTest(t *testing.T) *Store {
 	t.Helper()
 	ctx := context.Background()
@@ -136,7 +198,16 @@ func openStoreForProjectTest(t *testing.T) *Store {
 		DisplayName: "Linux Native",
 		Enabled:     true,
 	}); err != nil {
-		t.Fatalf("seed provider: %v", err)
+		t.Fatalf("seed linux provider: %v", err)
+	}
+	if err := db.Providers().Upsert(ctx, ProviderRecord{
+		ID:          "windows_wsl_ubuntu",
+		Type:        "windows_wsl_ubuntu",
+		Platform:    "windows",
+		DisplayName: "Windows WSL Ubuntu",
+		Enabled:     true,
+	}); err != nil {
+		t.Fatalf("seed windows provider: %v", err)
 	}
 	return db
 }

@@ -43,6 +43,14 @@ func (s *Store) Objects() *ObjectCacheRepository {
 }
 
 func (r *ObjectCacheRepository) SaveContainers(ctx context.Context, providerID string, records []ContainerCacheRecord, seenAt time.Time) error {
+	return r.saveContainers(ctx, providerID, records, seenAt, false)
+}
+
+func (r *ObjectCacheRepository) SaveContainersSnapshot(ctx context.Context, providerID string, records []ContainerCacheRecord, seenAt time.Time) error {
+	return r.saveContainers(ctx, providerID, records, seenAt, true)
+}
+
+func (r *ObjectCacheRepository) saveContainers(ctx context.Context, providerID string, records []ContainerCacheRecord, seenAt time.Time, replace bool) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -50,6 +58,12 @@ func (r *ObjectCacheRepository) SaveContainers(ctx context.Context, providerID s
 	defer func() {
 		_ = tx.Rollback()
 	}()
+
+	if replace {
+		if _, err := tx.ExecContext(ctx, "DELETE FROM containers_cache WHERE provider_id = ?", providerID); err != nil {
+			return err
+		}
+	}
 
 	for _, record := range records {
 		summary := record.Summary
