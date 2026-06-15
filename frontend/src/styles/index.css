@@ -29,6 +29,51 @@
   -moz-osx-font-smoothing: grayscale;
 }
 
+:root[data-theme="light"],
+:root[data-theme="system"] {
+  --bg-app: 245 247 250;
+  --bg-panel: 255 255 255;
+  --bg-card: 255 255 255;
+  --bg-inset: 238 242 246;
+  --border: 15 23 42;
+  --border-strong: 15 23 42;
+  --text-primary: 15 23 42;
+  --text-secondary: 30 41 59;
+  --text-muted: 71 85 105;
+  --accent: 13 148 136;
+  --ok: 13 148 136;
+  --warn: 180 83 9;
+  --error: 220 38 38;
+  --info: 37 99 235;
+  --neutral: 100 116 139;
+  color-scheme: light;
+  background: #f5f7fa;
+  color: #0f172a;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root[data-theme="system"] {
+    --bg-app: 13 17 23;
+    --bg-panel: 17 24 32;
+    --bg-card: 22 31 41;
+    --bg-inset: 11 16 22;
+    --border: 255 255 255;
+    --border-strong: 255 255 255;
+    --text-primary: 240 246 252;
+    --text-secondary: 240 246 252;
+    --text-muted: 240 246 252;
+    --accent: 45 212 167;
+    --ok: 45 212 167;
+    --warn: 245 184 61;
+    --error: 240 96 93;
+    --info: 77 159 255;
+    --neutral: 139 148 158;
+    color-scheme: dark;
+    background: #0d1117;
+    color: #f0f6fc;
+  }
+}
+
 @font-face {
   font-family: "Inter";
   font-style: normal;

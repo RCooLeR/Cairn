@@ -195,6 +195,139 @@ func TestManagerIgnoreRoundTripExcludesBadges(t *testing.T) {
 	}
 }
 
+func TestManagerListCurrentUpdatesScopesToActiveBackendContext(t *testing.T) {
+	ctx := context.Background()
+	db := openUpdatesStore(t)
+	providerID := "windows_wsl_ubuntu"
+	if err := db.Providers().Upsert(ctx, store.ProviderRecord{
+		ID:          providerID,
+		Type:        providerID,
+		Platform:    "windows",
+		DisplayName: "Windows WSL Ubuntu",
+		Enabled:     true,
+	}); err != nil {
+		t.Fatalf("seed windows provider: %v", err)
+	}
+	now := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)
+	ubuntuProjectID := providerID + "/ubuntu-app"
+	cairnProjectID := providerID + "/cairn-app"
+	if err := db.Projects().SaveSnapshot(ctx, providerID, []store.ProjectRecord{
+		{
+			ID:           ubuntuProjectID,
+			ProviderID:   providerID,
+			ContextName:  "wsl:Ubuntu",
+			Name:         "ubuntu-app",
+			WorkingDir:   t.TempDir(),
+			ComposeFiles: []string{"compose.yaml"},
+			Source:       store.ProjectSourceImported,
+			LastSeenAt:   now,
+		},
+		{
+			ID:           cairnProjectID,
+			ProviderID:   providerID,
+			ContextName:  "wsl:cairn-dev",
+			Name:         "cairn-app",
+			WorkingDir:   t.TempDir(),
+			ComposeFiles: []string{"compose.yaml"},
+			Source:       store.ProjectSourceImported,
+			LastSeenAt:   now,
+		},
+	}, []store.ServiceRecord{
+		serviceRecord(ubuntuProjectID, "web", "nginx:1.25", ""),
+		serviceRecord(cairnProjectID, "api", "redis:7", ""),
+	}, now, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot() error = %v", err)
+	}
+	insertCheck(t, ctx, db, store.UpdateCheckRecord{
+		ProviderID:        providerID,
+		ProjectID:         ubuntuProjectID,
+		ServiceID:         ubuntuProjectID + "/web",
+		Kind:              models.UpdateKindServiceImage,
+		ImageRef:          "nginx:1.25",
+		LocalDigest:       digestA,
+		RemoteDigest:      digestB,
+		Confidence:        models.ConfidenceMedium,
+		RecommendedAction: models.RecommendedActionPullRecreate,
+		Status:            models.UpdateStatusServiceImageUpdateAvailable,
+		CheckedAt:         now,
+	})
+	insertCheck(t, ctx, db, store.UpdateCheckRecord{
+		ProviderID:        providerID,
+		ProjectID:         cairnProjectID,
+		ServiceID:         cairnProjectID + "/api",
+		Kind:              models.UpdateKindServiceImage,
+		ImageRef:          "redis:7",
+		LocalDigest:       digestA,
+		RemoteDigest:      digestB,
+		Confidence:        models.ConfidenceMedium,
+		RecommendedAction: models.RecommendedActionPullRecreate,
+		Status:            models.UpdateStatusServiceImageUpdateAvailable,
+		CheckedAt:         now,
+	})
+	if _, err := db.Updates().InsertHistory(ctx, store.UpdateHistoryRecord{
+		ProviderID:   providerID,
+		ProjectID:    ubuntuProjectID,
+		ServiceID:    ubuntuProjectID + "/web",
+		UpdateKind:   models.UpdateKindServiceImage,
+		ImageRef:     "nginx:1.25",
+		Result:       "success",
+		StartedAt:    now,
+		FinishedAt:   now.Add(time.Minute),
+		OldDigest:    digestA,
+		NewDigest:    digestB,
+		OldImageID:   "sha256:ubuntu-old",
+		NewImageID:   "sha256:ubuntu-new",
+		HealthResult: "healthy",
+	}); err != nil {
+		t.Fatalf("InsertHistory(ubuntu) error = %v", err)
+	}
+	if _, err := db.Updates().InsertHistory(ctx, store.UpdateHistoryRecord{
+		ProviderID:   providerID,
+		ProjectID:    cairnProjectID,
+		ServiceID:    cairnProjectID + "/api",
+		UpdateKind:   models.UpdateKindServiceImage,
+		ImageRef:     "redis:7",
+		Result:       "success",
+		StartedAt:    now,
+		FinishedAt:   now.Add(time.Minute),
+		OldDigest:    digestA,
+		NewDigest:    digestB,
+		OldImageID:   "sha256:cairn-old",
+		NewImageID:   "sha256:cairn-new",
+		HealthResult: "healthy",
+	}); err != nil {
+		t.Fatalf("InsertHistory(cairn-dev) error = %v", err)
+	}
+	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), &fakeUpdateDocker{
+		providerID: providerID,
+		images:     map[string]*models.ImageDetail{},
+		details:    map[string]*models.ContainerDetail{},
+	}, &fakeRegistry{}, db.Settings(), nil, nil)
+	manager.ContextName = "wsl:cairn-dev"
+
+	current, err := manager.ListCurrentUpdates(ctx, models.UpdateFilter{})
+	if err != nil {
+		t.Fatalf("ListCurrentUpdates() error = %v", err)
+	}
+	if len(current) != 1 || current[0].ProjectID != cairnProjectID {
+		t.Fatalf("current = %#v, want only %s", current, cairnProjectID)
+	}
+	stale, err := manager.ListCurrentUpdates(ctx, models.UpdateFilter{ProjectID: ubuntuProjectID})
+	if err != nil {
+		t.Fatalf("ListCurrentUpdates(stale project) error = %v", err)
+	}
+	if len(stale) != 0 {
+		t.Fatalf("stale context updates = %#v, want none", stale)
+	}
+	history, err := manager.ListUpdateHistory(ctx, models.UpdateHistoryFilter{Limit: 20})
+	if err != nil {
+		t.Fatalf("ListUpdateHistory() error = %v", err)
+	}
+	if len(history) != 1 || history[0].ProjectID != cairnProjectID {
+		t.Fatalf("history = %#v, want only %s", history, cairnProjectID)
+	}
+}
+
 func TestManagerMixedProjectPlanOrdering(t *testing.T) {
 	ctx := context.Background()
 	db := openUpdatesStore(t)
@@ -1168,6 +1301,7 @@ func (f *fakeUpdateCompose) Config(context.Context, composecore.ProjectOptions) 
 }
 
 type fakeUpdateDocker struct {
+	providerID string
 	images     map[string]*models.ImageDetail
 	containers []models.ContainerSummary
 	details    map[string]*models.ContainerDetail
@@ -1176,6 +1310,9 @@ type fakeUpdateDocker struct {
 }
 
 func (f *fakeUpdateDocker) ProviderID() string {
+	if f.providerID != "" {
+		return f.providerID
+	}
 	return "linux_native"
 }
 

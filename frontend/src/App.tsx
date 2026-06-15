@@ -215,6 +215,7 @@ type ProjectTabID =
 type LogScope = "all" | "project" | "service" | "container";
 type LogLevelFilter = "error" | "warn" | "info" | "debug" | "unknown";
 type PermissionMode = "ask" | "group" | "rootless";
+type ThemePreference = "dark" | "light" | "system";
 type SetupStepID =
   | "welcome"
   | "backend"
@@ -1110,11 +1111,47 @@ function App() {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [queuedTerminalCommand, setQueuedTerminalCommand] =
     useState<TerminalCommandRequest | null>(null);
+  const themePreference = normalizeThemePreference(
+    appSettings["general.theme"],
+  );
 
   const navigate = useCallback((page: PageID) => {
     setActivePage(page);
     setSearch("");
   }, []);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    const mediaQuery = window.matchMedia?.("(prefers-color-scheme: dark)");
+    const applyTheme = () => {
+      const resolvedTheme =
+        themePreference === "system"
+          ? mediaQuery?.matches
+            ? "dark"
+            : "light"
+          : themePreference;
+      root.dataset.theme = themePreference;
+      root.style.colorScheme = resolvedTheme;
+    };
+
+    applyTheme();
+    if (themePreference !== "system" || !mediaQuery) {
+      return undefined;
+    }
+
+    if (mediaQuery.addEventListener) {
+      mediaQuery.addEventListener("change", applyTheme);
+    } else {
+      mediaQuery.addListener(applyTheme);
+    }
+    return () => {
+      if (mediaQuery.removeEventListener) {
+        mediaQuery.removeEventListener("change", applyTheme);
+      } else {
+        mediaQuery.removeListener(applyTheme);
+      }
+    };
+  }, [themePreference]);
 
   useEffect(() => {
     if (!settingsToast) {
@@ -1973,16 +2010,19 @@ function App() {
           }
           await refreshInventory();
           await refreshProjects();
+          await refreshUpdateSurfaces();
         }
         if (key === "linux.sudo_mode" || key === "linux.socket_path") {
           await ProviderService.Detect(linuxNativeProviderID).catch(() => null);
           await refreshInventory();
           await refreshProjects();
+          await refreshUpdateSurfaces();
         }
         if (String(key).startsWith("macos.colima_")) {
           await ProviderService.Detect(macOSColimaProviderID).catch(() => null);
           await refreshInventory();
           await refreshProjects();
+          await refreshUpdateSurfaces();
         }
       } catch (error: unknown) {
         const message =
@@ -1997,7 +2037,12 @@ function App() {
         setSettingsSaving(false);
       }
     },
-    [activeProvider?.id, refreshInventory, refreshProjects],
+    [
+      activeProvider?.id,
+      refreshInventory,
+      refreshProjects,
+      refreshUpdateSurfaces,
+    ],
   );
 
   const saveWSLDistro = useCallback(async () => {
@@ -15394,6 +15439,10 @@ function volumeFilterCounts(volumes: VolumeSummary[]) {
 
 function normalizePermissionMode(value: unknown): PermissionMode {
   return value === "group" || value === "rootless" ? value : "ask";
+}
+
+function normalizeThemePreference(value: unknown): ThemePreference {
+  return value === "light" || value === "system" ? value : "dark";
 }
 
 function normalizeStringSetting(value: unknown, fallback: string) {

@@ -494,6 +494,8 @@ describe("App inventory shell", () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
+    delete document.documentElement.dataset.theme;
+    document.documentElement.style.colorScheme = "";
   });
 
   it("renders seeded Docker inventory and subscribes to object refresh events", async () => {
@@ -2044,6 +2046,10 @@ describe("App inventory shell", () => {
         "light",
       ),
     );
+    await waitFor(() =>
+      expect(document.documentElement.dataset.theme).toBe("light"),
+    );
+    expect(document.documentElement.style.colorScheme).toBe("light");
     fireEvent.click(
       screen.getByRole("checkbox", { name: "Launch Cairn at login" }),
     );
@@ -2105,6 +2111,9 @@ describe("App inventory shell", () => {
         "general.theme",
         "system",
       ),
+    );
+    await waitFor(() =>
+      expect(document.documentElement.dataset.theme).toBe("system"),
     );
 
     clickSettingsSection("Backups");

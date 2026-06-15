@@ -178,12 +178,21 @@ func (m *Manager) ListCurrentUpdates(ctx context.Context, filter models.UpdateFi
 	if m == nil || m.Updates == nil {
 		return nil, notReady()
 	}
+	currentProjectIDs, scoped, err := m.currentProviderProjectIDs(ctx)
+	if err != nil {
+		return nil, apperror.Wrap(apperror.Internal, "List current update projects failed", err)
+	}
 	records, err := m.Updates.ListCurrent(ctx, filter)
 	if err != nil {
 		return nil, apperror.Wrap(apperror.Internal, "List current updates failed", err)
 	}
 	result := make([]models.ImageUpdate, 0, len(records))
 	for _, record := range records {
+		if scoped {
+			if _, ok := currentProjectIDs[record.ProjectID]; !ok {
+				continue
+			}
+		}
 		result = append(result, record.ToModel())
 	}
 	return result, nil
@@ -222,12 +231,21 @@ func (m *Manager) ListUpdateHistory(ctx context.Context, filter models.UpdateHis
 	if m == nil || m.Updates == nil {
 		return nil, notReady()
 	}
+	currentProjectIDs, scoped, err := m.currentProviderProjectIDs(ctx)
+	if err != nil {
+		return nil, apperror.Wrap(apperror.Internal, "List update history projects failed", err)
+	}
 	records, err := m.Updates.ListHistory(ctx, filter)
 	if err != nil {
 		return nil, apperror.Wrap(apperror.Internal, "List update history failed", err)
 	}
 	result := make([]models.UpdateHistoryItem, 0, len(records))
 	for _, record := range records {
+		if scoped {
+			if _, ok := currentProjectIDs[record.ProjectID]; !ok {
+				continue
+			}
+		}
 		result = append(result, record.ToModel())
 	}
 	return result, nil
@@ -446,6 +464,24 @@ func (m *Manager) currentProviderProjects(ctx context.Context) ([]store.ProjectR
 		return m.Projects.List(ctx)
 	}
 	return m.Projects.ListByProviderContext(ctx, providerID, m.ContextName)
+}
+
+func (m *Manager) currentProviderProjectIDs(ctx context.Context) (map[string]struct{}, bool, error) {
+	if strings.TrimSpace(m.providerID()) == "" {
+		return nil, false, nil
+	}
+	if m == nil || m.Projects == nil {
+		return nil, true, notReady()
+	}
+	projects, err := m.currentProviderProjects(ctx)
+	if err != nil {
+		return nil, true, err
+	}
+	ids := make(map[string]struct{}, len(projects))
+	for _, project := range projects {
+		ids[project.ID] = struct{}{}
+	}
+	return ids, true, nil
 }
 
 func (m *Manager) providerID() string {
