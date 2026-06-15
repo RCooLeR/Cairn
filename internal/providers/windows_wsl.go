@@ -424,6 +424,9 @@ func (p *WindowsWSLProvider) MapPathToBackend(hostPath string) (string, error) {
 	if backend, ok := p.mapWSLUNCToBackend(value); ok {
 		return backend, nil
 	}
+	if backend, ok := normalizeBackslashBackendPath(value); ok {
+		return backend, nil
+	}
 	if windowsDrivePathPattern.MatchString(value) {
 		drive := strings.ToLower(value[:1])
 		rest := strings.TrimLeft(value[2:], `\/`)
@@ -444,6 +447,9 @@ func (p *WindowsWSLProvider) MapPathToHost(backendPath string) (string, error) {
 	if windowsDrivePathPattern.MatchString(value) || strings.HasPrefix(value, `\\`) {
 		return value, nil
 	}
+	if backend, ok := normalizeBackslashBackendPath(value); ok {
+		value = backend
+	}
 	if strings.HasPrefix(value, "/mnt/") && len(value) >= len("/mnt/x") {
 		drive := value[len("/mnt/")]
 		if isASCIILetter(drive) && (len(value) == len("/mnt/x") || value[len("/mnt/x")] == '/') {
@@ -463,6 +469,17 @@ func (p *WindowsWSLProvider) MapPathToHost(backendPath string) (string, error) {
 		return `\\wsl$\` + p.configuredDistro() + `\` + strings.ReplaceAll(trimmed, "/", `\`), nil
 	}
 	return "", fmt.Errorf("cannot map backend path %q to Windows host path", backendPath)
+}
+
+func normalizeBackslashBackendPath(value string) (string, bool) {
+	if !strings.HasPrefix(value, `\`) || strings.HasPrefix(value, `\\`) {
+		return "", false
+	}
+	normalized := "/" + strings.ReplaceAll(strings.TrimLeft(value, `\`), `\`, "/")
+	if normalized == "/" {
+		return normalized, true
+	}
+	return normalized, true
 }
 
 func (p *WindowsWSLProvider) configuredDistro() string {

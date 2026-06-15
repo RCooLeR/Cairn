@@ -395,6 +395,8 @@ func TestWindowsWSLPathMapping(t *testing.T) {
 		{name: "wsl-unc-root", in: `\\wsl$\cairn-dev`, want: "/"},
 		{name: "already-backend", in: "/home/ada/project", want: "/home/ada/project"},
 		{name: "already-mnt", in: "/mnt/c/Users/Ada/project", want: "/mnt/c/Users/Ada/project"},
+		{name: "windows-cleaned-mnt", in: `\mnt\e\Development\projects\apps\rcooler\Cairn\.scratch\cairn-test-projects\web-stack`, want: "/mnt/e/Development/projects/apps/rcooler/Cairn/.scratch/cairn-test-projects/web-stack"},
+		{name: "windows-cleaned-home", in: `\home\ada\project`, want: "/home/ada/project"},
 	}
 	for _, tt := range toBackend {
 		got, err := provider.MapPathToBackend(tt.in)
@@ -417,10 +419,12 @@ func TestWindowsWSLPathMapping(t *testing.T) {
 		{name: "mnt-spaces", in: "/mnt/c/Users/Ada Lovelace/Project One", want: `C:\Users\Ada Lovelace\Project One`},
 		{name: "mnt-unicode", in: unicodeBackendPath, want: unicodeHostPath},
 		{name: "backend-home", in: "/home/ada/project", want: `\\wsl$\cairn-dev\home\ada\project`},
+		{name: "windows-cleaned-backend-home", in: `\home\ada\project`, want: `\\wsl$\cairn-dev\home\ada\project`},
 		{name: "backend-root", in: "/", want: `\\wsl$\cairn-dev`},
 		{name: "already-drive", in: `C:\Users\Ada`, want: `C:\Users\Ada`},
 		{name: "already-unc", in: `\\wsl$\cairn-dev\home\ada`, want: `\\wsl$\cairn-dev\home\ada`},
 		{name: "file-path", in: "/mnt/c/Users/Ada/compose.yaml", want: `C:\Users\Ada\compose.yaml`},
+		{name: "windows-cleaned-mnt", in: `\mnt\e\Development\projects\apps\rcooler\Cairn\.scratch\cairn-test-projects\web-stack`, want: `E:\Development\projects\apps\rcooler\Cairn\.scratch\cairn-test-projects\web-stack`},
 	}
 	for _, tt := range toHost {
 		got, err := provider.MapPathToHost(tt.in)
