@@ -41,7 +41,18 @@ type appRuntime struct {
 	lineageService  *services.ImageLineageService
 	backupService   *services.BackupService
 
+	opMu     sync.Mutex
 	mu       sync.Mutex
+	cancel   context.CancelFunc
+	docker   *dockercore.Client
+	logs     *logsvc.Manager
+	metrics  *metrics.Manager
+	terminal *terminal.Manager
+	backups  *backupcore.Manager
+	updates  *updatescore.Manager
+}
+
+type runtimeHandles struct {
 	cancel   context.CancelFunc
 	docker   *dockercore.Client
 	logs     *logsvc.Manager
@@ -74,15 +85,20 @@ func newAppRuntime(rootCtx context.Context, db *store.Store, providerManager *pr
 }
 
 func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.PlatformProvider) (*models.ProviderSummary, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
+
 	if r.serviceMu != nil {
 		r.serviceMu.Lock()
-		defer r.serviceMu.Unlock()
 	}
-
-	r.stopLocked()
+	r.mu.Lock()
+	previous := r.detachLocked()
 	r.clearServicesLocked()
+	r.mu.Unlock()
+	if r.serviceMu != nil {
+		r.serviceMu.Unlock()
+	}
+	previous.stop()
 	if provider == nil {
 		return nil, nil
 	}
@@ -121,6 +137,10 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 	updateManager.ContextName = contextName
 	updateManager.Start(runtimeCtx)
 
+	if r.serviceMu != nil {
+		r.serviceMu.Lock()
+	}
+	r.mu.Lock()
 	r.cancel = cancel
 	r.docker = dockerClient
 	r.logs = logsManager
@@ -143,6 +163,10 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 	r.updateService.Manager = updateManager
 	r.lineageService.Manager = lineageManager
 	r.backupService.Manager = backupManager
+	r.mu.Unlock()
+	if r.serviceMu != nil {
+		r.serviceMu.Unlock()
+	}
 
 	summary := models.ProviderSummary{
 		ID:     provider.ID(),
@@ -161,44 +185,62 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 }
 
 func (r *appRuntime) StopAll() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
 	if r.serviceMu != nil {
 		r.serviceMu.Lock()
-		defer r.serviceMu.Unlock()
 	}
-	r.stopLocked()
+	r.mu.Lock()
+	previous := r.detachLocked()
 	r.clearServicesLocked()
+	r.mu.Unlock()
+	if r.serviceMu != nil {
+		r.serviceMu.Unlock()
+	}
+	previous.stop()
 }
 
-func (r *appRuntime) stopLocked() {
-	if r.cancel != nil {
-		r.cancel()
-		r.cancel = nil
+func (r *appRuntime) detachLocked() runtimeHandles {
+	handles := runtimeHandles{
+		cancel:   r.cancel,
+		docker:   r.docker,
+		logs:     r.logs,
+		metrics:  r.metrics,
+		terminal: r.terminal,
+		backups:  r.backups,
+		updates:  r.updates,
 	}
-	if r.updates != nil {
-		r.updates.StopAll()
-		r.updates = nil
+	r.cancel = nil
+	r.docker = nil
+	r.logs = nil
+	r.metrics = nil
+	r.terminal = nil
+	r.backups = nil
+	r.updates = nil
+	return handles
+}
+
+func (h runtimeHandles) stop() {
+	if h.cancel != nil {
+		h.cancel()
 	}
-	if r.backups != nil {
-		r.backups.StopAll()
-		r.backups = nil
+	if h.updates != nil {
+		h.updates.StopAll()
 	}
-	if r.logs != nil {
-		r.logs.StopAll()
-		r.logs = nil
+	if h.backups != nil {
+		h.backups.StopAll()
 	}
-	if r.metrics != nil {
-		r.metrics.StopAll()
-		r.metrics = nil
+	if h.logs != nil {
+		h.logs.StopAll()
 	}
-	if r.terminal != nil {
-		r.terminal.StopAll()
-		r.terminal = nil
+	if h.metrics != nil {
+		h.metrics.StopAll()
 	}
-	if r.docker != nil {
-		_ = r.docker.Close()
-		r.docker = nil
+	if h.terminal != nil {
+		h.terminal.StopAll()
+	}
+	if h.docker != nil {
+		_ = h.docker.Close()
 	}
 }
 

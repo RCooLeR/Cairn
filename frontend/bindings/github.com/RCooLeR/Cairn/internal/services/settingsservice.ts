@@ -9,6 +9,12 @@ import { Call as $Call, CancellablePromise as $CancellablePromise, Create as $Cr
 // @ts-ignore: Unused imports
 import * as models$0 from "../models/models.js";
 
+export function CheckAppUpdate(currentVersion: string): $CancellablePromise<models$0.AppUpdateNotice | null> {
+    return $Call.ByID(814318823, currentVersion).then(($result: any) => {
+        return $$createType10($result);
+    });
+}
+
 export function AppVersion(): $CancellablePromise<models$0.VersionInfo | null> {
     return $Call.ByID(2188903172).then(($result: any) => {
         return $$createType1($result);
@@ -61,3 +67,5 @@ const $$createType5 = $Create.Array($$createType4);
 const $$createType6 = models$0.Notification.createFrom;
 const $$createType7 = $Create.Array($$createType6);
 const $$createType8 = $Create.Map($Create.Any, $Create.Any);
+const $$createType9 = models$0.AppUpdateNotice.createFrom;
+const $$createType10 = $Create.Nullable($$createType9);

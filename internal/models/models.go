@@ -662,3 +662,10 @@ type VersionInfo struct {
 	BuildDate string `json:"buildDate,omitempty"`
 	GoVersion string `json:"goVersion"`
 }
+
+type AppUpdateNotice struct {
+	Version     string `json:"version"`
+	URL         string `json:"url"`
+	Name        string `json:"name,omitempty"`
+	PublishedAt string `json:"publishedAt,omitempty"`
+}

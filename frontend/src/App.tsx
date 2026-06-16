@@ -1559,11 +1559,7 @@ function App() {
       return undefined;
     }
     let active = true;
-    const controller =
-      typeof AbortController === "undefined"
-        ? null
-        : new AbortController();
-    fetchLatestAppUpdate(version.version, controller?.signal)
+    SettingsService.CheckAppUpdate(version.version)
       .then((notice) => {
         if (!active) {
           return;
@@ -1580,7 +1576,6 @@ function App() {
       });
     return () => {
       active = false;
-      controller?.abort();
     };
   }, [appSettings, settingsLoaded, version?.version]);
 
@@ -6541,7 +6536,7 @@ function SettingsPage({
                 label="Go"
                 value={version?.goVersion ?? "Unknown"}
               />
-              <ReadOnlySetting label="Wails" value="v3.0.0-alpha.99" />
+              <ReadOnlySetting label="Wails" value="v3.0.0-alpha.79" />
               <ReadOnlySetting label="Updates" value="Not checked" />
             </CardBody>
           </Card>
@@ -15951,72 +15946,6 @@ function notificationTargetPage(topic: string): PageID | null {
     default:
       return null;
   }
-}
-
-async function fetchLatestAppUpdate(
-  currentVersion: string,
-  signal?: AbortSignal,
-): Promise<AppUpdateNotice | null> {
-  if (typeof fetch !== "function") {
-    return null;
-  }
-  const response = await fetch(
-    "https://api.github.com/repos/RCooLeR/Cairn/releases/latest",
-    {
-      headers: { Accept: "application/vnd.github+json" },
-      signal,
-    },
-  );
-  if (!response.ok) {
-    return null;
-  }
-  const release = (await response.json()) as {
-    draft?: boolean;
-    prerelease?: boolean;
-    tag_name?: string;
-    name?: string;
-    html_url?: string;
-    published_at?: string;
-  };
-  if (
-    release.draft ||
-    release.prerelease ||
-    !release.tag_name ||
-    !release.html_url ||
-    !isNewerVersion(release.tag_name, currentVersion)
-  ) {
-    return null;
-  }
-  return {
-    version: normalizeVersionLabel(release.tag_name),
-    url: release.html_url,
-    name: release.name,
-    publishedAt: release.published_at,
-  };
-}
-
-function isNewerVersion(candidate: string, current: string) {
-  const candidateParts = versionParts(candidate);
-  const currentParts = versionParts(current);
-  for (let index = 0; index < 3; index += 1) {
-    if (candidateParts[index] > currentParts[index]) {
-      return true;
-    }
-    if (candidateParts[index] < currentParts[index]) {
-      return false;
-    }
-  }
-  return false;
-}
-
-function versionParts(value: string) {
-  const normalized = normalizeVersionLabel(value).split(/[+-]/)[0];
-  const parts = normalized.split(".").map((part) => Number.parseInt(part, 10));
-  return [parts[0] || 0, parts[1] || 0, parts[2] || 0];
-}
-
-function normalizeVersionLabel(value: string) {
-  return value.trim().replace(/^v/i, "");
 }
 
 function imageUsageCounts(containers: ContainerSummary[]) {

@@ -2,6 +2,8 @@ package services
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,6 +31,47 @@ func TestAppVersionReturnsVersionInfo(t *testing.T) {
 	}
 	if got.GoVersion == "" {
 		t.Fatalf("go version is empty")
+	}
+}
+
+func TestCheckAppUpdateReturnsNewStableRelease(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Accept"); got != "application/vnd.github+json" {
+			t.Fatalf("Accept header = %q", got)
+		}
+		_, _ = w.Write([]byte(`{
+			"draft": false,
+			"prerelease": false,
+			"tag_name": "v1.2.3",
+			"name": "Cairn v1.2.3",
+			"html_url": "https://github.com/RCooLeR/Cairn/releases/tag/v1.2.3",
+			"published_at": "2026-06-16T10:00:00Z"
+		}`))
+	}))
+	defer server.Close()
+	oldURL := appUpdateURL
+	oldClient := appUpdateHTTPClient
+	appUpdateURL = server.URL
+	appUpdateHTTPClient = server.Client()
+	t.Cleanup(func() {
+		appUpdateURL = oldURL
+		appUpdateHTTPClient = oldClient
+	})
+
+	got, err := (&SettingsService{}).CheckAppUpdate(context.Background(), "1.2.2")
+	if err != nil {
+		t.Fatalf("CheckAppUpdate() error = %v", err)
+	}
+	if got == nil || got.Version != "1.2.3" || got.URL == "" || got.Name != "Cairn v1.2.3" {
+		t.Fatalf("CheckAppUpdate() = %#v", got)
+	}
+
+	got, err = (&SettingsService{}).CheckAppUpdate(context.Background(), "1.2.3")
+	if err != nil {
+		t.Fatalf("CheckAppUpdate(current) error = %v", err)
+	}
+	if got != nil {
+		t.Fatalf("CheckAppUpdate(current) = %#v, want nil", got)
 	}
 }
 

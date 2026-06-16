@@ -5,6 +5,10 @@ on:
     branches: [main, "codex/**"]
   pull_request:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   lint-test:
     name: Lint and unit (${{ matrix.os }})
@@ -60,7 +64,7 @@ jobs:
         run: npm run audit
 
       - name: Generate Wails bindings
-        run: go run github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha.99 generate bindings -clean=true -ts
+        run: go run github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha.79 generate bindings -clean=true -ts
 
       - name: Verify generated bindings are committed
         shell: bash
@@ -69,6 +73,10 @@ jobs:
       - name: Frontend lint
         working-directory: frontend
         run: npm run lint
+
+      - name: Frontend typecheck
+        working-directory: frontend
+        run: npm run typecheck
 
       - name: Frontend unit tests
         working-directory: frontend
@@ -84,6 +92,9 @@ jobs:
 
       - name: Go unit tests
         run: go test . ./internal/...
+
+      - name: Go vulnerability scan
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
       - name: Docker reconnect integration
         if: runner.os == 'Linux'
@@ -133,12 +144,11 @@ jobs:
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v8
         with:
-          version: latest
+          version: v2.6.2
           args: --timeout=5m
 
   package-smoke:
     name: Package smoke (${{ matrix.os }})
-    if: github.event_name == 'push'
     needs: lint-test
     runs-on: ${{ matrix.os }}
     strategy:
@@ -182,7 +192,7 @@ jobs:
       - name: Install Wails CLI
         shell: pwsh
         run: |
-          go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha.99
+          go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha.79
           $goBin = Join-Path (go env GOPATH) "bin"
           Add-Content -Path $env:GITHUB_PATH -Value $goBin
 

@@ -3,13 +3,16 @@ package services
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +38,11 @@ var (
 	Version   = "0.1.0"
 	Commit    = ""
 	BuildDate = ""
+)
+
+var (
+	appUpdateHTTPClient = &http.Client{Timeout: 10 * time.Second}
+	appUpdateURL        = "https://api.github.com/repos/RCooLeR/Cairn/releases/latest"
 )
 
 type jobProgressPayload struct {
@@ -1931,6 +1939,45 @@ func (s *SettingsService) AppVersion(_ context.Context) (*models.VersionInfo, er
 	return versionInfo(), nil
 }
 
+func (s *SettingsService) CheckAppUpdate(ctx context.Context, currentVersion string) (*models.AppUpdateNotice, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, appUpdateURL, nil)
+	if err != nil {
+		return nil, apperror.Wrap(apperror.Internal, "Create app update request failed", err)
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("User-Agent", "Cairn")
+	response, err := appUpdateHTTPClient.Do(req)
+	if err != nil {
+		return nil, apperror.Wrap(apperror.Internal, "Check app update failed", err)
+	}
+	defer func() {
+		_ = response.Body.Close()
+	}()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, nil
+	}
+	var release struct {
+		Draft       bool   `json:"draft"`
+		Prerelease  bool   `json:"prerelease"`
+		TagName     string `json:"tag_name"`
+		Name        string `json:"name"`
+		HTMLURL     string `json:"html_url"`
+		PublishedAt string `json:"published_at"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&release); err != nil {
+		return nil, apperror.Wrap(apperror.Internal, "Decode app update response failed", err)
+	}
+	if release.Draft || release.Prerelease || release.TagName == "" || release.HTMLURL == "" || !isNewerAppVersion(release.TagName, currentVersion) {
+		return nil, nil
+	}
+	return &models.AppUpdateNotice{
+		Version:     normalizeAppVersionLabel(release.TagName),
+		URL:         release.HTMLURL,
+		Name:        release.Name,
+		PublishedAt: release.PublishedAt,
+	}, nil
+}
+
 func dockerRunCommand(req models.RunImageRequest) string {
 	args := []string{"docker", "run", "-d"}
 	if req.Name != "" {
@@ -2698,4 +2745,36 @@ func versionInfo() *models.VersionInfo {
 		}
 	}
 	return info
+}
+
+func isNewerAppVersion(candidate string, current string) bool {
+	candidateParts := appVersionParts(candidate)
+	currentParts := appVersionParts(current)
+	for index := 0; index < 3; index++ {
+		if candidateParts[index] > currentParts[index] {
+			return true
+		}
+		if candidateParts[index] < currentParts[index] {
+			return false
+		}
+	}
+	return false
+}
+
+func appVersionParts(value string) [3]int {
+	normalized := normalizeAppVersionLabel(value)
+	if index := strings.IndexAny(normalized, "+-"); index >= 0 {
+		normalized = normalized[:index]
+	}
+	raw := strings.Split(normalized, ".")
+	var parts [3]int
+	for index := 0; index < len(raw) && index < len(parts); index++ {
+		part, _ := strconv.Atoi(raw[index])
+		parts[index] = part
+	}
+	return parts
+}
+
+func normalizeAppVersionLabel(value string) string {
+	return strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(value), "v"), "V")
 }

@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "typecheck": "tsc --noEmit",
     "build:dev": "tsc --noEmit && vite build --configLoader runner --minify false --mode development",
     "build": "tsc --noEmit && vite build --configLoader runner --mode production",
     "lint": "eslint .",
@@ -26,6 +27,10 @@
     "react-dom": "^18.2.0",
     "recharts": "^3.5.1",
     "zustand": "^5.0.9"
+  },
+  "engines": {
+    "node": ">=24.0.0",
+    "npm": ">=11.0.0"
   },
   "devDependencies": {
     "@axe-core/playwright": "^4.11.3",

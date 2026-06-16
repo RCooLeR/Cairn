@@ -2,7 +2,7 @@
 # Multi-stage build for minimal image size
 
 # Build stage
-FROM golang:alpine AS builder
+FROM golang:1.26.4-alpine AS builder
 
 WORKDIR /app
 
@@ -15,8 +15,8 @@ COPY . .
 # Remove local replace directive if present (for production builds)
 RUN sed -i '/^replace/d' go.mod || true
 
-# Download dependencies
-RUN go mod tidy
+# Download dependencies without rewriting go.mod/go.sum during reproducible builds.
+RUN go mod download && go mod verify
 
 # Build the server binary
 RUN go build -tags server -ldflags="-s -w" -o server .

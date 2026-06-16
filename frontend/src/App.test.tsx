@@ -67,8 +67,6 @@ const runtimeMock = vi.hoisted(() => ({
   setClipboardText: vi.fn(),
 }));
 
-const fetchMock = vi.hoisted(() => vi.fn());
-
 const dockerServiceMock = vi.hoisted(() => ({
   InspectContainerRaw: vi.fn(),
   GetImage: vi.fn(),
@@ -165,6 +163,7 @@ const settingsServiceMock = vi.hoisted(() => ({
   GetNotifications: vi.fn(),
   MarkNotificationsRead: vi.fn(),
   GetCheatsheet: vi.fn(),
+  CheckAppUpdate: vi.fn(),
 }));
 
 const registryServiceMock = vi.hoisted(() => ({
@@ -446,6 +445,7 @@ describe("App inventory shell", () => {
     settingsServiceMock.GetNotifications.mockResolvedValue([]);
     settingsServiceMock.MarkNotificationsRead.mockResolvedValue(undefined);
     settingsServiceMock.GetCheatsheet.mockResolvedValue(seededCheatsheet());
+    settingsServiceMock.CheckAppUpdate.mockResolvedValue(null);
     registryServiceMock.KnownRegistries.mockResolvedValue([
       { name: "Docker Hub", registry: "docker.io" },
     ]);
@@ -476,19 +476,6 @@ describe("App inventory shell", () => {
     runtimeMock.openFile.mockResolvedValue("");
     runtimeMock.saveFile.mockResolvedValue("/tmp/cairn-logs.jsonl");
     runtimeMock.setClipboardText.mockResolvedValue(undefined);
-    fetchMock.mockResolvedValue({
-      ok: true,
-      json: vi.fn().mockResolvedValue({
-        draft: false,
-        prerelease: false,
-        tag_name: "v0.1.0",
-        name: "Cairn v0.1.0",
-        html_url: "https://github.com/RCooLeR/Cairn/releases/tag/v0.1.0",
-        published_at: "2026-06-13T08:00:00Z",
-      }),
-    });
-    vi.stubGlobal("fetch", fetchMock);
-
     useAppStore.setState({
       version: null,
       versionLoading: false,
@@ -601,22 +588,20 @@ describe("App inventory shell", () => {
     );
   });
 
-  it("shows an in-app app-update notice from GitHub releases", async () => {
+  it("shows an in-app app-update notice from the backend app update check", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
-    fetchMock.mockResolvedValueOnce({
-      ok: true,
-      json: vi.fn().mockResolvedValue({
-        draft: false,
-        prerelease: false,
-        tag_name: "v9.9.9",
-        name: "Cairn v9.9.9",
-        html_url: "https://github.com/RCooLeR/Cairn/releases/tag/v9.9.9",
-        published_at: "2026-06-13T10:00:00Z",
-      }),
+    settingsServiceMock.CheckAppUpdate.mockResolvedValueOnce({
+      version: "9.9.9",
+      name: "Cairn v9.9.9",
+      url: "https://github.com/RCooLeR/Cairn/releases/tag/v9.9.9",
+      publishedAt: "2026-06-13T10:00:00Z",
     });
 
     render(<App />);
 
+    await waitFor(() =>
+      expect(settingsServiceMock.CheckAppUpdate).toHaveBeenCalledWith("0.1.0"),
+    );
     expect(
       await screen.findByText("Cairn 9.9.9 is available"),
     ).toBeInTheDocument();

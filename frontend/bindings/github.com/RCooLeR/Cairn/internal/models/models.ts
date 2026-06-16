@@ -2774,6 +2774,33 @@ export class VersionInfo {
     }
 }
 
+export class AppUpdateNotice {
+    "version": string;
+    "url": string;
+    "name"?: string;
+    "publishedAt"?: string;
+
+    /** Creates a new AppUpdateNotice instance. */
+    constructor($$source: Partial<AppUpdateNotice> = {}) {
+        if (!("version" in $$source)) {
+            this["version"] = "";
+        }
+        if (!("url" in $$source)) {
+            this["url"] = "";
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new AppUpdateNotice instance from a string or object.
+     */
+    static createFrom($$source: any = {}): AppUpdateNotice {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new AppUpdateNotice($$parsedSource as Partial<AppUpdateNotice>);
+    }
+}
+
 export class VolumeDetail {
     "summary": VolumeSummary;
     "options"?: { [_ in string]?: string };
