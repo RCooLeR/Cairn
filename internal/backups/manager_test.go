@@ -120,6 +120,56 @@ func TestBackupPathsReturnStatErrorsAndCapCollisions(t *testing.T) {
 	}
 }
 
+func TestRemoveBackupArtifactsRemovesArchiveAndMetadata(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	archivePath := filepath.Join(dir, "archive.tar.gz")
+	metadataPath := filepath.Join(dir, "archive.tar.gz.json")
+	if err := os.WriteFile(archivePath, []byte("archive"), 0o600); err != nil {
+		t.Fatalf("write archive: %v", err)
+	}
+	if err := os.WriteFile(metadataPath, []byte("{}"), 0o600); err != nil {
+		t.Fatalf("write metadata: %v", err)
+	}
+
+	if err := removeBackupArtifacts(archivePath, metadataPath); err != nil {
+		t.Fatalf("removeBackupArtifacts() error = %v", err)
+	}
+	if _, err := os.Stat(archivePath); !os.IsNotExist(err) {
+		t.Fatalf("archive exists after cleanup: %v", err)
+	}
+	if _, err := os.Stat(metadataPath); !os.IsNotExist(err) {
+		t.Fatalf("metadata exists after cleanup: %v", err)
+	}
+}
+
+func TestRemoveBackupFilesJoinsRemoveErrors(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	archivePath := filepath.Join(dir, "archive-dir")
+	metadataPath := filepath.Join(dir, "metadata-dir")
+	for _, path := range []string{archivePath, metadataPath} {
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", path, err)
+		}
+		if err := os.WriteFile(filepath.Join(path, "keep"), []byte("x"), 0o600); err != nil {
+			t.Fatalf("write child: %v", err)
+		}
+	}
+
+	err := removeBackupFiles(store.BackupRecord{
+		BackupPath:   archivePath,
+		MetadataPath: metadataPath,
+	})
+	if err == nil {
+		t.Fatalf("removeBackupFiles() error = nil, want joined remove errors")
+	}
+	message := err.Error()
+	if !strings.Contains(message, "archive-dir") || !strings.Contains(message, "metadata-dir") {
+		t.Fatalf("joined error = %q, want both failed paths", message)
+	}
+}
+
 func TestRestoreHelperUsesPositionalArchiveAndRollbackStash(t *testing.T) {
 	t.Parallel()
 	archiveName := "app-db.tar.gz; touch /restore/pwned #"

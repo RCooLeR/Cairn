@@ -431,6 +431,9 @@ func (m *Manager) runBackup(ctx context.Context, jobID string, record planRecord
 		ArchiveFormatVersion: formatVersion,
 	}
 	if err := writeSidecar(record.MetadataPath, sidecar); err != nil {
+		if cleanupErr := removeBackupArtifacts(record.ArchivePath, record.MetadataPath); cleanupErr != nil {
+			err = errors.Join(err, apperror.Wrap(apperror.Internal, "Clean up failed backup artifacts failed", cleanupErr))
+		}
 		_ = m.insertBackupRecord(ctx, record, backupResultFailed, size, err)
 		_ = m.recordAudit(ctx, "backup.volume", "volume", record.VolumeName, record.ProviderID, record.ProjectID, command, record.Plan.Risk, "failed", duration, err)
 		m.publishDone(jobID, "", err)
@@ -956,18 +959,21 @@ func fileSHA256(path string) (string, int64, error) {
 }
 
 func removeBackupFiles(record store.BackupRecord) error {
-	var joined error
-	if record.BackupPath != "" {
-		if err := os.Remove(record.BackupPath); err != nil && !os.IsNotExist(err) {
-			joined = err
-		}
+	return removeBackupArtifacts(record.BackupPath, record.MetadataPath)
+}
+
+func removeBackupArtifacts(archivePath string, metadataPath string) error {
+	return errors.Join(removeFileIfExists(archivePath), removeFileIfExists(metadataPath))
+}
+
+func removeFileIfExists(path string) error {
+	if path == "" {
+		return nil
 	}
-	if record.MetadataPath != "" {
-		if err := os.Remove(record.MetadataPath); err != nil && !os.IsNotExist(err) {
-			joined = err
-		}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
 	}
-	return joined
+	return nil
 }
 
 func backupSummary(record store.BackupRecord) models.BackupSummary {
