@@ -3,7 +3,9 @@ package docker
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"net"
 	"sort"
 	"strings"
 
@@ -122,7 +124,7 @@ func (c *Client) RunContainerExec(ctx context.Context, containerID string, opts 
 	} else {
 		_, err = stdcopy.StdCopy(&out, &out, hijack.Reader)
 	}
-	if err != nil && !strings.Contains(err.Error(), "use of closed network connection") {
+	if err != nil && !isExpectedExecClose(err) {
 		return out.String(), -1, mapDockerError("read container exec", err)
 	}
 	inspect, err := api.ContainerExecInspect(callCtx, resp.ID)
@@ -130,6 +132,12 @@ func (c *Client) RunContainerExec(ctx context.Context, containerID string, opts 
 		return out.String(), -1, mapDockerError("inspect container exec", err)
 	}
 	return out.String(), inspect.ExitCode, nil
+}
+
+func isExpectedExecClose(err error) bool {
+	return errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrClosedPipe) ||
+		errors.Is(err, net.ErrClosed)
 }
 
 func (c *Client) ResizeContainerExec(ctx context.Context, execID string, cols int, rows int) error {

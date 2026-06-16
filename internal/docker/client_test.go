@@ -377,6 +377,28 @@ func TestClientContainerExecAndShellDetection(t *testing.T) {
 	}
 }
 
+func TestExpectedExecCloseUsesTypedErrors(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "eof", err: io.EOF, want: true},
+		{name: "closed pipe", err: io.ErrClosedPipe, want: true},
+		{name: "wrapped net closed", err: fmt.Errorf("read failed: %w", net.ErrClosed), want: true},
+		{name: "string only", err: errors.New("use of closed network connection"), want: false},
+		{name: "real error", err: errors.New("permission denied"), want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isExpectedExecClose(tt.err); got != tt.want {
+				t.Fatalf("isExpectedExecClose(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestClientHealthLoopDisconnectsAndReconnects(t *testing.T) {
 	t.Parallel()
 	rootCtx, cancel := context.WithCancel(context.Background())

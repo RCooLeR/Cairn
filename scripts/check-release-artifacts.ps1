@@ -13,16 +13,16 @@ if ([string]::IsNullOrWhiteSpace($Root)) {
 }
 
 function Require-Any([string]$Pattern, [string]$Description) {
-  $matches = Get-ChildItem -Path (Join-Path $Root "bin") -Filter $Pattern -File -ErrorAction SilentlyContinue
-  if (!$matches) {
+  $artifacts = Get-ChildItem -Path (Join-Path $Root "bin") -Filter $Pattern -File -ErrorAction SilentlyContinue
+  if (!$artifacts) {
     throw "Missing $Description matching bin/$Pattern"
   }
-  foreach ($match in $matches) {
-    if ($match.Length -le 0) {
-      throw "Artifact is empty: $($match.FullName)"
+  foreach ($artifact in $artifacts) {
+    if ($artifact.Length -le 0) {
+      throw "Artifact is empty: $($artifact.FullName)"
     }
   }
-  $matches | ForEach-Object { Write-Host "Found ${Description}: $($_.Name)" }
+  $artifacts | ForEach-Object { Write-Host "Found ${Description}: $($_.Name)" }
 }
 
 switch ($Platform) {

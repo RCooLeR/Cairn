@@ -568,8 +568,16 @@ type CleanupState = {
   includeBuildCache: boolean;
   includeVolumes: boolean;
   typedName: string;
+  results: CleanupStepResult[];
   busy: boolean;
   error?: string;
+};
+
+type CleanupStepResult = {
+  kind: string;
+  label: string;
+  status: "pending" | "running" | "success" | "error";
+  message?: string;
 };
 
 const navItems: NavItem[] = [
@@ -868,47 +876,123 @@ function normalizedSetupBackend(value: unknown): SetupBackendID {
     : "windows_wsl_ubuntu";
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function stringSetting(value: unknown, fallback: string) {
+  return typeof value === "string" && value.trim() ? value : fallback;
+}
+
+function numericSetting(value: unknown, fallback: number) {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function stringArraySetting(value: unknown) {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
+}
+
+function restoredCommandPlan(value: unknown): CommandPlan | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  if (
+    typeof value.planID !== "string" ||
+    typeof value.title !== "string" ||
+    !Array.isArray(value.commands) ||
+    !Array.isArray(value.effects)
+  ) {
+    return null;
+  }
+  return value as unknown as CommandPlan;
+}
+
+function restoredProviderStatus(value: unknown): ProviderStatus | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+  return value as unknown as ProviderStatus;
+}
+
+function restoredInstallProgress(
+  value: unknown,
+): ProviderInstallProgressPayload[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((item): item is ProviderInstallProgressPayload => {
+    if (!isRecord(item)) {
+      return false;
+    }
+    return (
+      typeof item.planID === "string" &&
+      typeof item.streamID === "string" &&
+      typeof item.step === "number" &&
+      Number.isFinite(item.step) &&
+      typeof item.totalSteps === "number" &&
+      Number.isFinite(item.totalSteps) &&
+      typeof item.message === "string" &&
+      typeof item.done === "boolean"
+    );
+  });
+}
+
+function restoredProjectSummaries(value: unknown): ProjectSummary[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.filter((item): item is ProjectSummary => {
+    if (!isRecord(item)) {
+      return false;
+    }
+    return (
+      typeof item.id === "string" &&
+      typeof item.name === "string" &&
+      typeof item.providerID === "string"
+    );
+  });
+}
+
 function restoreProviderSetupState(): ProviderSetupState {
   try {
     const raw = window.localStorage.getItem(providerSetupStorageKey);
     if (!raw) {
       return emptyProviderSetup;
     }
-    const parsed = JSON.parse(raw) as Partial<ProviderSetupState>;
+    const parsed = JSON.parse(raw) as unknown;
+    if (!isRecord(parsed)) {
+      return emptyProviderSetup;
+    }
     const platform = normalizedSetupPlatform(parsed.platform);
     return {
       ...emptyProviderSetup,
-      ...parsed,
       open: Boolean(parsed.open),
       step: normalizedSetupStep(parsed.step),
       platform,
       backend: normalizedSetupBackend(parsed.backend),
-      distro:
-        typeof parsed.distro === "string" && parsed.distro.trim()
-          ? parsed.distro
-          : "Ubuntu",
-      colimaProfile:
-        typeof parsed.colimaProfile === "string" &&
-        parsed.colimaProfile.trim()
-          ? parsed.colimaProfile
-          : "default",
-      colimaCPU: Number.isFinite(parsed.colimaCPU) ? parsed.colimaCPU! : 2,
-      colimaMemoryGB: Number.isFinite(parsed.colimaMemoryGB)
-        ? parsed.colimaMemoryGB!
-        : 4,
-      colimaDiskGB: Number.isFinite(parsed.colimaDiskGB)
-        ? parsed.colimaDiskGB!
-        : 60,
+      distro: stringSetting(parsed.distro, "Ubuntu"),
+      colimaProfile: stringSetting(parsed.colimaProfile, "default"),
+      colimaCPU: numericSetting(parsed.colimaCPU, 2),
+      colimaMemoryGB: numericSetting(parsed.colimaMemoryGB, 4),
+      colimaDiskGB: numericSetting(parsed.colimaDiskGB, 60),
+      detection: restoredProviderStatus(parsed.detection),
+      detectError:
+        typeof parsed.detectError === "string" ? parsed.detectError : undefined,
+      plan: restoredCommandPlan(parsed.plan),
+      progress: restoredInstallProgress(parsed.progress),
       detecting: false,
       planning: false,
       installing: false,
       detectingProjects: false,
-      detectedProjects: Array.isArray(parsed.detectedProjects)
-        ? parsed.detectedProjects
-        : [],
-      selectedProjectIDs: Array.isArray(parsed.selectedProjectIDs)
-        ? parsed.selectedProjectIDs
-        : [],
+      detectedProjects: restoredProjectSummaries(parsed.detectedProjects),
+      selectedProjectIDs: stringArraySetting(parsed.selectedProjectIDs),
+      projectDetectError:
+        typeof parsed.projectDetectError === "string"
+          ? parsed.projectDetectError
+          : undefined,
+      error: typeof parsed.error === "string" ? parsed.error : undefined,
     };
   } catch {
     window.localStorage.removeItem(providerSetupStorageKey);
@@ -935,6 +1019,90 @@ function persistProviderSetupState(setup: ProviderSetupState) {
   );
 }
 
+const focusableSelector = [
+  "a[href]",
+  "button:not([disabled])",
+  "textarea:not([disabled])",
+  "input:not([disabled])",
+  "select:not([disabled])",
+  "[tabindex]:not([tabindex='-1'])",
+].join(",");
+
+function focusableChildren(root: HTMLElement) {
+  return Array.from(root.querySelectorAll<HTMLElement>(focusableSelector)).filter(
+    (element) =>
+      !element.hasAttribute("disabled") &&
+      element.getAttribute("aria-hidden") !== "true",
+  );
+}
+
+function useFocusTrap(
+  open: boolean,
+  panelRef: RefObject<HTMLElement | null>,
+  onClose: () => void,
+) {
+  const onCloseRef = useRef(onClose);
+
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
+
+  useEffect(() => {
+    if (!open) {
+      return undefined;
+    }
+    const panel = panelRef.current;
+    if (!panel) {
+      return undefined;
+    }
+    const previouslyFocused =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    const focusTimer = window.setTimeout(() => {
+      const firstFocusable = focusableChildren(panel)[0];
+      if (firstFocusable) {
+        firstFocusable.focus();
+      } else {
+        panel.focus();
+      }
+    }, 0);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onCloseRef.current();
+        return;
+      }
+      if (event.key !== "Tab") {
+        return;
+      }
+      const focusable = focusableChildren(panel);
+      if (focusable.length === 0) {
+        event.preventDefault();
+        panel.focus();
+        return;
+      }
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+        return;
+      }
+      if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.clearTimeout(focusTimer);
+      document.removeEventListener("keydown", onKeyDown);
+      previouslyFocused?.focus();
+    };
+  }, [open, panelRef]);
+}
+
 const emptyExportLogs: ExportLogsState = {
   open: false,
   path: "",
@@ -951,6 +1119,7 @@ const emptyCleanup: CleanupState = {
   includeBuildCache: true,
   includeVolumes: false,
   typedName: "",
+  results: [],
   busy: false,
 };
 
@@ -4941,6 +5110,10 @@ function NotificationCenter({
   onNavigate: (page: PageID) => void;
   open: boolean;
 }) {
+  const panelRef = useRef<HTMLDivElement | null>(null);
+
+  useFocusTrap(open, panelRef, onClose);
+
   if (!open) {
     return null;
   }
@@ -4952,8 +5125,11 @@ function NotificationCenter({
   return (
     <div
       aria-label="Notification center"
+      aria-modal="true"
       className="absolute right-0 top-11 z-40 w-[min(360px,calc(100vw-2rem))] rounded-card border border-border bg-bg-panel shadow-2xl"
+      ref={panelRef}
       role="dialog"
+      tabIndex={-1}
     >
       <div className="flex items-center justify-between gap-3 border-b border-border px-4 py-3">
         <div>
@@ -7665,9 +7841,28 @@ function OverviewPage({
 
   const applyCleanup = useCallback(
     async (state: CleanupState) => {
-      setCleanup((current) => ({ ...current, busy: true, error: undefined }));
+      const kinds = cleanupKinds(state);
+      const initialResults = kinds.map((kind) => ({
+        kind,
+        label: cleanupKindLabel(kind),
+        status: "pending" as const,
+      }));
+      setCleanup((current) => ({
+        ...current,
+        busy: true,
+        error: undefined,
+        results: initialResults,
+      }));
       try {
-        for (const kind of cleanupKinds(state)) {
+        for (const kind of kinds) {
+          setCleanup((current) => ({
+            ...current,
+            results: current.results.map((result) =>
+              result.kind === kind
+                ? { ...result, status: "running", message: undefined }
+                : result,
+            ),
+          }));
           const plan = await DockerService.PlanPrune(kind);
           if (!plan) {
             throw new Error("Cleanup plan was empty");
@@ -7676,17 +7871,45 @@ function OverviewPage({
             plan.planID,
             plan.requiresTypedName ? state.typedName : "",
           );
+          setCleanup((current) => ({
+            ...current,
+            results: current.results.map((result) =>
+              result.kind === kind
+                ? { ...result, status: "success", message: "Completed" }
+                : result,
+            ),
+          }));
         }
         await onCleanupApplied();
         await loadDashboard();
         setCleanup(emptyCleanup);
       } catch (error: unknown) {
-        setCleanup((current) => ({
-          ...current,
-          busy: false,
-          error:
-            error instanceof Error ? error.message : "Unable to clean up Docker",
-        }));
+        const message =
+          error instanceof Error ? error.message : "Unable to clean up Docker";
+        setCleanup((current) => {
+          const running = current.results.find(
+            (result) => result.status === "running",
+          );
+          const failed: CleanupStepResult = running
+            ? { ...running, status: "error", message }
+            : {
+                kind: "cleanup",
+                label: "Cleanup",
+                status: "error",
+                message,
+              };
+          return {
+            ...current,
+            busy: false,
+            error: message,
+            results:
+              current.results.length > 0
+                ? current.results.map((result) =>
+                    result.kind === failed.kind ? failed : result,
+                  )
+                : [failed],
+          };
+        });
       }
     },
     [loadDashboard, onCleanupApplied],
@@ -8770,6 +8993,7 @@ function CleanupModal({
                   onChange({
                     [key]: event.target.checked,
                     typedName: "",
+                    results: [],
                   } as Partial<CleanupState>)
                 }
                 type="checkbox"
@@ -8795,6 +9019,28 @@ function CleanupModal({
             <div key={line}>$ {line}</div>
           ))}
         </div>
+        {state.results.length > 0 ? (
+          <div className="space-y-2">
+            {state.results.map((result) => (
+              <div
+                className="flex items-center justify-between gap-3 rounded-control border border-border bg-bg-inset px-3 py-2 text-sm"
+                key={result.kind}
+              >
+                <span className="min-w-0 truncate">{result.label}</span>
+                <div className="flex min-w-0 items-center gap-2">
+                  {result.message ? (
+                    <span className="min-w-0 truncate text-xs text-text-muted">
+                      {result.message}
+                    </span>
+                  ) : null}
+                  <Badge tone={cleanupStatusTone(result.status)}>
+                    {result.status}
+                  </Badge>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : null}
         {state.error ? (
           <div className="rounded-control border border-error/30 bg-error/10 p-3 text-sm text-error">
             {state.error}
@@ -8911,6 +9157,7 @@ function LogsPage({
     useState<ExportLogsState>(emptyExportLogs);
   const [exportToast, setExportToast] = useState<ExportResult | null>(null);
   const viewerRef = useRef<HTMLDivElement>(null);
+  const followScrollRAFRef = useRef<number | null>(null);
 
   const projectOptions = useMemo<LogOption[]>(
     () =>
@@ -9185,13 +9432,27 @@ function LogsPage({
     if (!follow || paused) {
       return;
     }
-    window.requestAnimationFrame(() => {
+    if (followScrollRAFRef.current !== null) {
+      return;
+    }
+    followScrollRAFRef.current = window.requestAnimationFrame(() => {
+      followScrollRAFRef.current = null;
       const node = viewerRef.current;
       if (node) {
         node.scrollTop = node.scrollHeight;
       }
     });
   }, [filteredLines.length, follow, paused]);
+
+  useEffect(
+    () => () => {
+      if (followScrollRAFRef.current !== null) {
+        window.cancelAnimationFrame(followScrollRAFRef.current);
+        followScrollRAFRef.current = null;
+      }
+    },
+    [],
+  );
 
   const toggleLevel = useCallback((level: LogLevelFilter) => {
     setLevelFilters((current) => {
@@ -16249,6 +16510,34 @@ function cleanupKinds(state: CleanupState) {
     kinds.push("volumes");
   }
   return kinds;
+}
+
+function cleanupKindLabel(kind: string) {
+  switch (kind) {
+    case "images":
+      return "Unused images";
+    case "containers":
+      return "Stopped containers";
+    case "build-cache":
+      return "Build cache";
+    case "volumes":
+      return "Unused volumes";
+    default:
+      return kind;
+  }
+}
+
+function cleanupStatusTone(status: CleanupStepResult["status"]): BadgeTone {
+  switch (status) {
+    case "success":
+      return "ok";
+    case "error":
+      return "error";
+    case "running":
+      return "info";
+    default:
+      return "neutral";
+  }
 }
 
 function cleanupPreviewCommands(state: CleanupState) {

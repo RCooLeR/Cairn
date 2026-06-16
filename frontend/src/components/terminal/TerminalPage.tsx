@@ -531,9 +531,14 @@ export function TerminalPage({
           </div>
         </div>
 
-        <div className="flex min-h-11 items-center gap-2 overflow-x-auto border-b border-border bg-bg-inset px-2 py-2">
+        <div
+          aria-label="Terminal sessions"
+          className="flex min-h-11 items-center gap-2 overflow-x-auto border-b border-border bg-bg-inset px-2 py-2"
+          role="tablist"
+        >
           {sessions.map((session) => (
-            <button
+            <div
+              aria-selected={activeSessionID === session.id}
               key={session.id}
               className={[
                 'flex h-8 max-w-56 shrink-0 items-center gap-2 rounded-control border px-2 text-sm',
@@ -542,7 +547,14 @@ export function TerminalPage({
                   : 'border-border bg-bg-card text-text-secondary hover:text-text-primary',
               ].join(' ')}
               onClick={() => setActiveSessionID(session.id)}
-              type="button"
+              onKeyDown={(event) => {
+                if (event.key === 'Enter' || event.key === ' ') {
+                  event.preventDefault();
+                  setActiveSessionID(session.id);
+                }
+              }}
+              role="tab"
+              tabIndex={0}
             >
               <SessionIcon kind={session.kind} />
               <span className="truncate">{session.title}</span>
@@ -551,19 +563,18 @@ export function TerminalPage({
                   <ShieldAlert size={11} /> root
                 </Badge>
               ) : null}
-              <span
+              <button
                 aria-label={`Close ${session.title}`}
                 className="rounded p-0.5 hover:bg-bg-panel"
                 onClick={(event) => {
                   event.stopPropagation();
                   void closeSession(session);
                 }}
-                role="button"
-                tabIndex={0}
+                type="button"
               >
                 <X size={13} />
-              </span>
-            </button>
+              </button>
+            </div>
           ))}
           {sessions.length === 0 ? (
             <span className="text-sm text-text-muted">No terminal sessions</span>
@@ -875,11 +886,22 @@ function TerminalSurface({
   const hostRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<XTerm | null>(null);
   const resizeTimer = useRef<number | null>(null);
+  const onInputRef = useRef(onInput);
+  const sessionRef = useRef(session);
+
+  useEffect(() => {
+    onInputRef.current = onInput;
+  }, [onInput]);
+
+  useEffect(() => {
+    sessionRef.current = session;
+  }, [session]);
 
   useEffect(() => {
     if (!hostRef.current) {
       return undefined;
     }
+    const sessionID = session.id;
     const terminal = new XTerm({
       allowProposedApi: false,
       convertEol: true,
@@ -898,7 +920,7 @@ function TerminalSurface({
     terminal.open(hostRef.current);
     terminalRef.current = terminal;
     const disposable = terminal.onData((data) => {
-      void onInput(session, data);
+      void onInputRef.current(sessionRef.current, data);
     });
     const resize = () => {
       if (!hostRef.current) {
@@ -912,7 +934,7 @@ function TerminalSurface({
         window.clearTimeout(resizeTimer.current);
       }
       resizeTimer.current = window.setTimeout(() => {
-        void TerminalService.ResizeTerminal(session.id, cols, rows);
+        void TerminalService.ResizeTerminal(sessionID, cols, rows);
       }, 100);
     };
     resize();
@@ -930,7 +952,7 @@ function TerminalSurface({
       terminal.dispose();
       terminalRef.current = null;
     };
-  }, [onInput, session]);
+  }, [session.id]);
 
   useEffect(() => {
     const off = Events.On('terminal:data', (event) => {
@@ -1085,12 +1107,15 @@ function shouldGuardPaste(session: TerminalSessionInfo, data: string) {
   return lines.length > 1;
 }
 
-function encodeTerminalInput(value: string) {
+const terminalBase64ChunkSize = 0x8000;
+
+export function encodeTerminalInput(value: string) {
   const bytes = new TextEncoder().encode(value);
   let binary = '';
-  bytes.forEach((byte) => {
-    binary += String.fromCharCode(byte);
-  });
+  for (let index = 0; index < bytes.length; index += terminalBase64ChunkSize) {
+    const chunk = bytes.subarray(index, index + terminalBase64ChunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
   return btoa(binary);
 }
 

@@ -50,7 +50,10 @@ import App, {
   imageRefPreview,
   parseMounts,
 } from "./App";
-import { decodeBase64Bytes } from "./components/terminal/TerminalPage";
+import {
+  decodeBase64Bytes,
+  encodeTerminalInput,
+} from "./components/terminal/TerminalPage";
 import { useAppStore } from "./state/appStore";
 import { useInventoryStore } from "./state/inventoryStore";
 
@@ -505,6 +508,37 @@ describe("App inventory shell", () => {
     document.documentElement.style.colorScheme = "";
   });
 
+  it("deduplicates inventory refreshes and re-enters loading on retry", async () => {
+    let resolveSnapshot!: (snapshot: InventorySnapshot) => void;
+    inventoryMock.getInventorySnapshot.mockReturnValueOnce(
+      new Promise<InventorySnapshot>((resolve) => {
+        resolveSnapshot = resolve;
+      }),
+    );
+
+    const first = useInventoryStore.getState().refresh();
+    const second = useInventoryStore.getState().refresh();
+
+    expect(inventoryMock.getInventorySnapshot).toHaveBeenCalledTimes(1);
+    expect(useInventoryStore.getState().status).toBe("loading");
+
+    resolveSnapshot(seededSnapshot());
+    await Promise.all([first, second]);
+
+    expect(useInventoryStore.getState().status).toBe("ready");
+    expect(useInventoryStore.getState().containers).toHaveLength(1);
+
+    inventoryMock.getInventorySnapshot.mockRejectedValueOnce(new Error("boom"));
+    await useInventoryStore.getState().refresh();
+    expect(useInventoryStore.getState().status).toBe("error");
+
+    inventoryMock.getInventorySnapshot.mockResolvedValueOnce(seededSnapshot());
+    const retry = useInventoryStore.getState().refresh();
+    expect(useInventoryStore.getState().status).toBe("loading");
+    await retry;
+    expect(useInventoryStore.getState().status).toBe("ready");
+  });
+
   it("renders seeded Docker inventory and subscribes to object refresh events", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
 
@@ -738,9 +772,9 @@ describe("App inventory shell", () => {
       },
     ]);
 
-    const bytes = decodeBase64Bytes(btoa("caf\xc3\xa9"));
+    const bytes = decodeBase64Bytes(encodeTerminalInput("caf\u00e9 \u26a1"));
     expect(bytes).toBeInstanceOf(Uint8Array);
-    expect(new TextDecoder().decode(bytes)).toBe("café");
+    expect(new TextDecoder().decode(bytes)).toBe("caf\u00e9 \u26a1");
   });
 
   it("opens terminal sessions from the Terminal page", async () => {

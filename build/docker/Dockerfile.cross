@@ -36,8 +36,11 @@ RUN ZIG_ARCH=$(case "${TARGETARCH}" in arm64) echo "aarch64" ;; *) echo "x86_64"
 
 # Download macOS SDK (required for darwin targets)
 ARG MACOS_SDK_VERSION=14.5
-RUN curl -L "https://github.com/joseluisq/macosx-sdks/releases/download/${MACOS_SDK_VERSION}/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz" \
-    | tar -xJ -C /opt \
+ARG MACOS_SDK_SHA256=6e146275d19f027faa2e8354da5e0267513abf013b8f16ad65a231653a2b1c5d
+RUN curl -fsSL -o /tmp/macos-sdk.tar.xz "https://github.com/joseluisq/macosx-sdks/releases/download/${MACOS_SDK_VERSION}/MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz" \
+    && echo "${MACOS_SDK_SHA256}  /tmp/macos-sdk.tar.xz" | sha256sum -c - \
+    && tar -xJ -C /opt -f /tmp/macos-sdk.tar.xz \
+    && rm /tmp/macos-sdk.tar.xz \
     && mv /opt/MacOSX${MACOS_SDK_VERSION}.sdk /opt/macos-sdk
 
 ENV MACOS_SDK_PATH=/opt/macos-sdk

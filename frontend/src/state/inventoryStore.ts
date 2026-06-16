@@ -38,6 +38,8 @@ type InventoryState = {
   setNetworks: (networks: NetworkSummary[]) => void;
 };
 
+let refreshPromise: Promise<void> | null = null;
+
 export const useInventoryStore = create<InventoryState>((set) => ({
   status: 'idle',
   error: null,
@@ -53,31 +55,39 @@ export const useInventoryStore = create<InventoryState>((set) => ({
   volumeDetails: {},
   networkDetails: {},
   refresh: async () => {
-    set((state) => ({ status: state.status === 'idle' ? 'loading' : state.status }));
-    try {
-      const snapshot = await getInventorySnapshot();
-      set({
-        status: snapshot.degradedReason ? 'error' : 'ready',
-        error: snapshot.degradedReason,
-        lastLoadedAt: Date.now(),
-        providers: snapshot.providers,
-        dockerInfo: snapshot.dockerInfo,
-        dockerVersion: snapshot.dockerVersion,
-        diskUsage: snapshot.diskUsage,
-        containers: snapshot.containers,
-        images: snapshot.images,
-        volumes: snapshot.volumes,
-        networks: snapshot.networks,
-        volumeDetails: snapshot.volumeDetails,
-        networkDetails: snapshot.networkDetails,
-      });
-    } catch (error) {
-      set({
-        status: 'error',
-        error: error instanceof Error ? error.message : 'Docker is not reachable',
-        lastLoadedAt: Date.now(),
-      });
+    if (refreshPromise) {
+      return refreshPromise;
     }
+    refreshPromise = (async () => {
+      set({ status: 'loading', error: null });
+      try {
+        const snapshot = await getInventorySnapshot();
+        set({
+          status: snapshot.degradedReason ? 'error' : 'ready',
+          error: snapshot.degradedReason,
+          lastLoadedAt: Date.now(),
+          providers: snapshot.providers,
+          dockerInfo: snapshot.dockerInfo,
+          dockerVersion: snapshot.dockerVersion,
+          diskUsage: snapshot.diskUsage,
+          containers: snapshot.containers,
+          images: snapshot.images,
+          volumes: snapshot.volumes,
+          networks: snapshot.networks,
+          volumeDetails: snapshot.volumeDetails,
+          networkDetails: snapshot.networkDetails,
+        });
+      } catch (error) {
+        set({
+          status: 'error',
+          error: error instanceof Error ? error.message : 'Docker is not reachable',
+          lastLoadedAt: Date.now(),
+        });
+      } finally {
+        refreshPromise = null;
+      }
+    })();
+    return refreshPromise;
   },
   setContainers: (containers) => set({ containers }),
   setImages: (images) => set({ images }),

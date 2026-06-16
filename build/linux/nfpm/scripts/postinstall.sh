@@ -1,4 +1,5 @@
 #!/bin/sh
+set -eu
 
 # Update desktop database for .desktop file changes
 # This makes the application appear in application menus and registers its capabilities.
