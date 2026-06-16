@@ -7,7 +7,10 @@ type SkeletonProps = {
 export function Skeleton({ className }: SkeletonProps) {
   return (
     <div
-      className={cx("animate-pulse rounded-control bg-white/[0.08]", className)}
+      className={cx(
+        "animate-pulse rounded-control bg-text-primary/10",
+        className,
+      )}
     />
   );
 }
