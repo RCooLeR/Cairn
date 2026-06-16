@@ -36,6 +36,11 @@ type SortState = {
   direction: "asc" | "desc";
 };
 
+type ScrollState = {
+  key: string;
+  top: number;
+};
+
 export function DataTable<T>({
   ariaLabel = "Data table",
   bulkActions,
@@ -50,7 +55,12 @@ export function DataTable<T>({
 }: DataTableProps<T>) {
   const hasSelection = selectedIDs.size > 0;
   const [sort, setSort] = useState<SortState | null>(null);
-  const [scrollTop, setScrollTop] = useState(0);
+  const virtualWindowKey = `${rows.length}:${sort?.columnID ?? ""}:${sort?.direction ?? ""}`;
+  const [scrollState, setScrollState] = useState<ScrollState>({
+    key: virtualWindowKey,
+    top: 0,
+  });
+  const scrollTop = scrollState.key === virtualWindowKey ? scrollState.top : 0;
   const selectAllRef = useRef<HTMLInputElement>(null);
   const scrollViewportRef = useRef<HTMLDivElement>(null);
   const visibleRows = useMemo(() => {
@@ -133,7 +143,6 @@ export function DataTable<T>({
     canToggleAll && selectedVisibleCount === visibleIDs.length;
 
   useLayoutEffect(() => {
-    setScrollTop(0);
     if (scrollViewportRef.current) {
       scrollViewportRef.current.scrollTop = 0;
     }
@@ -162,7 +171,10 @@ export function DataTable<T>({
         className="overflow-auto"
         onScroll={(event) => {
           if (virtualized) {
-            setScrollTop(event.currentTarget.scrollTop);
+            setScrollState({
+              key: virtualWindowKey,
+              top: event.currentTarget.scrollTop,
+            });
           }
         }}
         ref={scrollViewportRef}

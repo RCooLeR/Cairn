@@ -1160,6 +1160,44 @@ describe("App inventory shell", () => {
     expect(screen.getByText(/request/)).toBeInTheDocument();
   });
 
+  it("uses checkboxes for container log scope selection", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", {
+        name: /Logs/,
+      }),
+    );
+    await waitFor(() =>
+      expect(logsServiceMock.StartLogStream).toHaveBeenCalledWith(
+        expect.objectContaining({ follow: true, scope: "all" }),
+      ),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "container" }));
+    const scope = await screen.findByRole("group", {
+      name: "Container scope",
+    });
+    const checkbox = within(scope).getByRole("checkbox", { name: /web/ });
+    expect(checkbox).not.toBeChecked();
+
+    fireEvent.click(checkbox);
+
+    await waitFor(() =>
+      expect(logsServiceMock.StartLogStream).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          ids: ["container-1"],
+          scope: "container",
+        }),
+      ),
+    );
+  });
+
   it("pauses visible logs while buffering new stream events", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
 

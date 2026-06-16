@@ -9237,18 +9237,9 @@ function LogsPage({
     if (scope === "service" && !selectedServiceID && serviceOptions[0]) {
       setSelectedServiceID(serviceOptions[0].id);
     }
-    if (
-      scope === "container" &&
-      selectedContainerIDs.length === 0 &&
-      containerOptions[0]
-    ) {
-      setSelectedContainerIDs([containerOptions[0].id]);
-    }
   }, [
-    containerOptions,
     projectOptions,
     scope,
-    selectedContainerIDs.length,
     selectedProjectID,
     selectedServiceID,
     serviceOptions,
@@ -9624,25 +9615,12 @@ function LogsPage({
               />
             ) : null}
             {scope === "container" ? (
-              <select
-                aria-label="Container scope"
-                className="h-20 min-w-60 rounded-control border border-border bg-bg-inset px-3 py-2 text-sm text-text-primary"
-                multiple
-                onChange={(event) =>
-                  setSelectedContainerIDs(
-                    Array.from(event.currentTarget.selectedOptions).map(
-                      (option) => option.value,
-                    ),
-                  )
-                }
-                value={selectedContainerIDs}
-              >
-                {containerOptions.map((option) => (
-                  <option key={option.id} value={option.id}>
-                    {option.label}
-                  </option>
-                ))}
-              </select>
+              <LogContainerScopeChecklist
+                disabled={inventoryLoading}
+                onChange={setSelectedContainerIDs}
+                options={containerOptions}
+                selectedIDs={selectedContainerIDs}
+              />
             ) : null}
 
             <Badge tone={streamStatus === "error" ? "error" : "info"}>
@@ -9962,6 +9940,72 @@ function LogSelect({
         </option>
       ))}
     </select>
+  );
+}
+
+function LogContainerScopeChecklist({
+  disabled,
+  onChange,
+  options,
+  selectedIDs,
+}: {
+  disabled?: boolean;
+  onChange: (ids: string[]) => void;
+  options: LogOption[];
+  selectedIDs: string[];
+}) {
+  const selected = new Set(selectedIDs);
+  const toggle = (id: string, checked: boolean) => {
+    const next = new Set(selected);
+    if (checked) {
+      next.add(id);
+    } else {
+      next.delete(id);
+    }
+    onChange(
+      options
+        .filter((option) => next.has(option.id))
+        .map((option) => option.id),
+    );
+  };
+
+  return (
+    <fieldset
+      aria-label="Container scope"
+      className="max-h-36 min-w-64 overflow-auto rounded-control border border-border bg-bg-inset px-3 py-2 text-sm text-text-primary"
+      disabled={disabled || options.length === 0}
+    >
+      <legend className="sr-only">Container scope</legend>
+      {options.length === 0 ? (
+        <div className="text-text-muted">No containers</div>
+      ) : (
+        <div className="space-y-2">
+          {options.map((option) => (
+            <label
+              className="flex min-w-0 items-start gap-2 text-sm"
+              key={option.id}
+            >
+              <input
+                checked={selected.has(option.id)}
+                className="mt-0.5"
+                onChange={(event) =>
+                  toggle(option.id, event.currentTarget.checked)
+                }
+                type="checkbox"
+              />
+              <span className="min-w-0">
+                <span className="block truncate">{option.label}</span>
+                {option.hint ? (
+                  <span className="block truncate text-xs text-text-muted">
+                    {option.hint}
+                  </span>
+                ) : null}
+              </span>
+            </label>
+          ))}
+        </div>
+      )}
+    </fieldset>
   );
 }
 
