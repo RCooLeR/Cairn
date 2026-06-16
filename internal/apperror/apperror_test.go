@@ -66,3 +66,20 @@ func TestMarshalPlainErrorBecomesInternal(t *testing.T) {
 		t.Fatalf("plain error detail leaked: %#v", payload["detail"])
 	}
 }
+
+func TestMarshalAppErrorFallsBackWhenJSONMarshalFails(t *testing.T) {
+	out := marshalAppError(New(Conflict, "will not encode"), func(any) ([]byte, error) {
+		return nil, errors.New("json encoder failed")
+	})
+
+	var payload map[string]any
+	if marshalErr := json.Unmarshal(out, &payload); marshalErr != nil {
+		t.Fatalf("fallback returned invalid JSON: %v", marshalErr)
+	}
+	if payload["code"] != string(Internal) {
+		t.Fatalf("code = %#v, want %s", payload["code"], Internal)
+	}
+	if payload["message"] != "Internal error" {
+		t.Fatalf("message = %#v, want Internal error", payload["message"])
+	}
+}

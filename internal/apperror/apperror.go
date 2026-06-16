@@ -112,7 +112,11 @@ func Marshal(err error) []byte {
 		appErr = New(Internal, "Internal error")
 	}
 
-	out, marshalErr := json.Marshal(appErr)
+	return marshalAppError(appErr, json.Marshal)
+}
+
+func marshalAppError(appErr *AppError, marshal func(any) ([]byte, error)) []byte {
+	out, marshalErr := marshal(appErr)
 	if marshalErr != nil {
 		return []byte(`{"code":"E_INTERNAL","message":"Internal error"}`)
 	}
