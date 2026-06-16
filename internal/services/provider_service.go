@@ -225,6 +225,9 @@ func (s *ProviderService) runProviderLifecycle(ctx context.Context, action strin
 	if action == "start" || action == "restart" {
 		return s.rebindActiveProvider(ctx)
 	}
+	if action == "stop" {
+		return s.clearRuntimeIfActiveProvider(ctx, providerID)
+	}
 	return nil
 }
 
@@ -272,6 +275,17 @@ func (s *ProviderService) rebindActiveProvider(ctx context.Context) error {
 		return err
 	}
 	_, err = s.Runtime.RebindProvider(ctx, activeProvider)
+	return err
+}
+
+func (s *ProviderService) clearRuntimeIfActiveProvider(ctx context.Context, providerID string) error {
+	if s.Runtime == nil || s.Manager == nil {
+		return nil
+	}
+	if s.Manager.ActiveProviderID(ctx) != providerID {
+		return nil
+	}
+	_, err := s.Runtime.RebindProvider(ctx, nil)
 	return err
 }
 

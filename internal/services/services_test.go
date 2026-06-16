@@ -299,6 +299,61 @@ func TestProviderServiceApplyInstallCancelsRunningProvider(t *testing.T) {
 	}
 }
 
+func TestProviderServiceStopClearsRuntimeForActiveProvider(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	runner := &fakeLifecycleRunner{}
+	provider := providers.NewWindowsWSL(providers.WindowsWSLOptions{Distro: "Ubuntu", Runner: runner})
+	manager := providers.NewManager(db.Providers(), db.Settings(), []providers.PlatformProvider{provider})
+	if err := manager.SetActiveProvider(ctx, provider.ID()); err != nil {
+		t.Fatalf("SetActiveProvider() error = %v", err)
+	}
+	runtime := &fakeProviderRuntime{}
+	service := &ProviderService{Manager: manager, Runtime: runtime, Audit: db.Audit()}
+
+	if err := service.Stop(ctx, provider.ID()); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+
+	if len(runner.commands) != 1 {
+		t.Fatalf("lifecycle commands = %#v, want one command", runner.commands)
+	}
+	if got, want := strings.Join(runner.commands[0], " "), "wsl.exe -d Ubuntu -- systemctl stop docker"; got != want {
+		t.Fatalf("lifecycle command = %q, want %q", got, want)
+	}
+	if runtime.rebindCalls != 1 || runtime.lastProvider != nil {
+		t.Fatalf("runtime rebind calls = %d provider = %#v, want one nil rebind", runtime.rebindCalls, runtime.lastProvider)
+	}
+}
+
+func TestProviderServiceStopNonActiveProviderKeepsRuntime(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	runner := &fakeLifecycleRunner{}
+	active := providers.NewLinuxNative(providers.LinuxNativeOptions{Runner: runner})
+	inactive := providers.NewWindowsWSL(providers.WindowsWSLOptions{Distro: "Ubuntu", Runner: runner})
+	manager := providers.NewManager(db.Providers(), db.Settings(), []providers.PlatformProvider{active, inactive})
+	if err := manager.SetActiveProvider(ctx, active.ID()); err != nil {
+		t.Fatalf("SetActiveProvider() error = %v", err)
+	}
+	runtime := &fakeProviderRuntime{}
+	service := &ProviderService{Manager: manager, Runtime: runtime, Audit: db.Audit()}
+
+	if err := service.Stop(ctx, inactive.ID()); err != nil {
+		t.Fatalf("Stop(inactive) error = %v", err)
+	}
+
+	if len(runner.commands) != 1 {
+		t.Fatalf("lifecycle commands = %#v, want one command", runner.commands)
+	}
+	if got, want := strings.Join(runner.commands[0], " "), "wsl.exe -d Ubuntu -- systemctl stop docker"; got != want {
+		t.Fatalf("lifecycle command = %q, want %q", got, want)
+	}
+	if runtime.rebindCalls != 0 {
+		t.Fatalf("runtime rebind calls = %d, want 0", runtime.rebindCalls)
+	}
+}
+
 func TestDockerServiceLifecycleAuditsAndPlans(t *testing.T) {
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "cairn.db"))
@@ -1400,6 +1455,31 @@ func (p *fakeInstallProvider) BackendShellCommand(models.TerminalOptions) ([]str
 }
 func (p *fakeInstallProvider) MapPathToBackend(path string) (string, error) { return path, nil }
 func (p *fakeInstallProvider) MapPathToHost(path string) (string, error)    { return path, nil }
+
+type fakeLifecycleRunner struct {
+	commands [][]string
+}
+
+func (r *fakeLifecycleRunner) LookPath(file string) (string, error) {
+	return file, nil
+}
+
+func (r *fakeLifecycleRunner) Run(_ context.Context, _ time.Duration, name string, args ...string) (*providers.CommandResult, error) {
+	command := append([]string{name}, args...)
+	r.commands = append(r.commands, command)
+	return &providers.CommandResult{Command: command, ExitCode: 0}, nil
+}
+
+type fakeProviderRuntime struct {
+	rebindCalls  int
+	lastProvider providers.PlatformProvider
+}
+
+func (r *fakeProviderRuntime) RebindProvider(_ context.Context, provider providers.PlatformProvider) (*models.ProviderSummary, error) {
+	r.rebindCalls++
+	r.lastProvider = provider
+	return nil, nil
+}
 
 func openServiceTestStore(t *testing.T) *store.Store {
 	t.Helper()
