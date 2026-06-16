@@ -1,6 +1,6 @@
-import { create } from 'zustand';
+import { create } from "zustand";
 
-import type { VersionInfo } from '../../bindings/github.com/RCooLeR/Cairn/internal/models/models.js';
+import type { VersionInfo } from "../../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
 
 type AppState = {
   version: VersionInfo | null;

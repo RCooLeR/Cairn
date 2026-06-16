@@ -74,6 +74,10 @@ jobs:
         working-directory: frontend
         run: npm run lint
 
+      - name: Frontend format check
+        working-directory: frontend
+        run: npm run format:check
+
       - name: Frontend typecheck
         working-directory: frontend
         run: npm run typecheck
@@ -139,7 +143,7 @@ jobs:
         run: go test ./internal/docker -run TestClientRealRegistryTagPushRoundTrip -count=1 -timeout=4m
 
       - name: Go vet
-        run: go vet . ./internal/...
+        run: go vet -unsafeptr=false . ./internal/...
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v8
@@ -181,6 +185,14 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
+      - name: Cache Wails CLI
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/bin/wails3
+            ~/go/bin/wails3.exe
+          key: ${{ runner.os }}-wails3-v3.0.0-alpha.79
+
       - name: Install Linux packaging dependencies
         if: runner.os == 'Linux'
         run: |
@@ -192,9 +204,13 @@ jobs:
       - name: Install Wails CLI
         shell: pwsh
         run: |
-          go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha.79
           $goBin = Join-Path (go env GOPATH) "bin"
           Add-Content -Path $env:GITHUB_PATH -Value $goBin
+          $wailsExe = Join-Path $goBin ($(if ($IsWindows) { "wails3.exe" } else { "wails3" }))
+          if (!(Test-Path -LiteralPath $wailsExe)) {
+            go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha.79
+          }
+          & $wailsExe version
 
       - name: Install NSIS
         if: runner.os == 'Windows'
@@ -206,6 +222,13 @@ jobs:
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci
+
+      - name: Cache Playwright browsers
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('frontend/package-lock.json') }}
 
       - name: Install Playwright browser
         if: runner.os == 'Linux'

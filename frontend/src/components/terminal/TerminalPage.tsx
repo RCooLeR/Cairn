@@ -1,14 +1,14 @@
-import type { LucideIcon } from 'lucide-react';
+import type { LucideIcon } from "lucide-react";
 import type {
   CheatsheetEntry,
   ContainerSummary,
   ProjectSummary,
   TerminalSessionInfo,
-} from '../../../bindings/github.com/RCooLeR/Cairn/internal/models/models.js';
-import type { ReactNode } from 'react';
+} from "../../../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
+import type { ReactNode } from "react";
 
-import { Terminal as XTerm } from '@xterm/xterm';
-import '@xterm/xterm/css/xterm.css';
+import { Terminal as XTerm } from "@xterm/xterm";
+import "@xterm/xterm/css/xterm.css";
 import {
   Check,
   ChevronDown,
@@ -23,15 +23,23 @@ import {
   ShieldAlert,
   Terminal as TerminalIcon,
   X,
-} from 'lucide-react';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+} from "lucide-react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
-import { Clipboard, Events } from '@wailsio/runtime';
+import { Clipboard, Events } from "@wailsio/runtime";
 
-import { SettingsService, TerminalService } from '../../api/services';
-import { Badge, Button, Card, CardBody, CardHeader, EmptyState, Modal } from '../ui';
+import { SettingsService, TerminalService } from "../../api/services";
+import {
+  Badge,
+  Button,
+  Card,
+  CardBody,
+  CardHeader,
+  EmptyState,
+  Modal,
+} from "../ui";
 
-type BadgeTone = 'ok' | 'warn' | 'error' | 'info' | 'neutral' | 'accent';
+type BadgeTone = "ok" | "warn" | "error" | "info" | "neutral" | "accent";
 
 export type TerminalCommandRequest = {
   id: number;
@@ -91,16 +99,17 @@ export function TerminalPage({
   const [sessions, setSessions] = useState<TerminalSessionInfo[]>([]);
   const [activeSessionID, setActiveSessionID] = useState<string | null>(null);
   const [cheatsheet, setCheatsheet] = useState<CheatsheetEntry[]>([]);
-  const [cheatsheetSearch, setCheatsheetSearch] = useState('');
-  const [cheatsheetCategory, setCheatsheetCategory] = useState('all');
-  const [selectedProjectID, setSelectedProjectID] = useState('');
-  const [selectedContainerID, setSelectedContainerID] = useState('');
+  const [cheatsheetSearch, setCheatsheetSearch] = useState("");
+  const [cheatsheetCategory, setCheatsheetCategory] = useState("all");
+  const [selectedProjectID, setSelectedProjectID] = useState("");
+  const [selectedContainerID, setSelectedContainerID] = useState("");
   const [shellOptions, setShellOptions] = useState<string[]>([]);
-  const [containerShell, setContainerShell] = useState('');
-  const [containerUser, setContainerUser] = useState('');
-  const [containerWorkdir, setContainerWorkdir] = useState('');
-  const [placeholderValues, setPlaceholderValues] =
-    useState<PlaceholderValues>({});
+  const [containerShell, setContainerShell] = useState("");
+  const [containerUser, setContainerUser] = useState("");
+  const [containerWorkdir, setContainerWorkdir] = useState("");
+  const [placeholderValues, setPlaceholderValues] = useState<PlaceholderValues>(
+    {},
+  );
   const [pendingRun, setPendingRun] = useState<PendingRun | null>(null);
   const [pasteGuard, setPasteGuard] = useState<PasteGuardState | null>(null);
   const [status, setStatus] = useState<string | null>(null);
@@ -115,7 +124,7 @@ export function TerminalPage({
   const runningContainers = useMemo(
     () =>
       containers.filter((container) =>
-        ['running', 'paused'].includes(container.state),
+        ["running", "paused"].includes(container.state),
       ),
     [containers],
   );
@@ -123,12 +132,15 @@ export function TerminalPage({
     const unique = Array.from(
       new Set(cheatsheet.map((entry) => entry.category)),
     ).sort();
-    return ['all', ...unique];
+    return ["all", ...unique];
   }, [cheatsheet]);
   const filteredCheatsheet = useMemo(() => {
     const query = cheatsheetSearch.trim().toLowerCase();
     return cheatsheet.filter((entry) => {
-      if (cheatsheetCategory !== 'all' && entry.category !== cheatsheetCategory) {
+      if (
+        cheatsheetCategory !== "all" &&
+        entry.category !== cheatsheetCategory
+      ) {
         return false;
       }
       if (!query) {
@@ -148,17 +160,17 @@ export function TerminalPage({
         setActiveSessionID((current) => current ?? normalized[0]?.id ?? null);
       })
       .catch((loadError: unknown) => {
-        setError(errorMessage(loadError, 'Unable to load terminal sessions'));
+        setError(errorMessage(loadError, "Unable to load terminal sessions"));
       });
     SettingsService.GetCheatsheet()
       .then((entries) => setCheatsheet(entries ?? []))
       .catch((loadError: unknown) => {
-        setError(errorMessage(loadError, 'Unable to load terminal cheatsheet'));
+        setError(errorMessage(loadError, "Unable to load terminal cheatsheet"));
       });
   }, []);
 
   useEffect(() => {
-    const off = Events.On('terminal:closed', (event) => {
+    const off = Events.On("terminal:closed", (event) => {
       const payload = eventPayload<TerminalClosedPayload>(event);
       if (!payload) {
         return;
@@ -170,7 +182,9 @@ export function TerminalPage({
         if (current !== payload.sessionID) {
           return current;
         }
-        const next = sessions.find((session) => session.id !== payload.sessionID);
+        const next = sessions.find(
+          (session) => session.id !== payload.sessionID,
+        );
         return next?.id ?? null;
       });
       setStatus(`Session exited with code ${payload.exitCode}`);
@@ -190,12 +204,12 @@ export function TerminalPage({
         }
         const nextShells = shells ?? [];
         setShellOptions(nextShells);
-        setContainerShell((current) => current || nextShells[0] || '/bin/sh');
+        setContainerShell((current) => current || nextShells[0] || "/bin/sh");
       })
       .catch(() => {
         if (active) {
           setShellOptions([]);
-          setContainerShell('/bin/sh');
+          setContainerShell("/bin/sh");
         }
       });
     return () => {
@@ -205,15 +219,15 @@ export function TerminalPage({
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && pendingTimer.current !== null) {
+      if (event.key === "Escape" && pendingTimer.current !== null) {
         window.clearTimeout(pendingTimer.current);
         pendingTimer.current = null;
         setPendingRun(null);
-        setStatus('Command cancelled');
+        setStatus("Command cancelled");
       }
     };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   }, []);
 
   useEffect(
@@ -243,9 +257,11 @@ export function TerminalPage({
     setBusy(true);
     setError(null);
     try {
-      addSession(await TerminalService.OpenHostTerminal({ cols: 120, rows: 30 }));
+      addSession(
+        await TerminalService.OpenHostTerminal({ cols: 120, rows: 30 }),
+      );
     } catch (openError: unknown) {
-      setError(errorMessage(openError, 'Unable to open host terminal'));
+      setError(errorMessage(openError, "Unable to open host terminal"));
     } finally {
       setBusy(false);
     }
@@ -259,7 +275,7 @@ export function TerminalPage({
         await TerminalService.OpenBackendTerminal({ cols: 120, rows: 30 }),
       );
     } catch (openError: unknown) {
-      setError(errorMessage(openError, 'Unable to open backend terminal'));
+      setError(errorMessage(openError, "Unable to open backend terminal"));
       return null;
     } finally {
       setBusy(false);
@@ -280,7 +296,7 @@ export function TerminalPage({
         }),
       );
     } catch (openError: unknown) {
-      setError(errorMessage(openError, 'Unable to open project terminal'));
+      setError(errorMessage(openError, "Unable to open project terminal"));
     } finally {
       setBusy(false);
     }
@@ -303,7 +319,7 @@ export function TerminalPage({
         }),
       );
     } catch (openError: unknown) {
-      setError(errorMessage(openError, 'Unable to open container terminal'));
+      setError(errorMessage(openError, "Unable to open container terminal"));
     } finally {
       setBusy(false);
     }
@@ -317,7 +333,7 @@ export function TerminalPage({
 
   const closeSession = useCallback(
     async (session: TerminalSessionInfo) => {
-      if (session.kind === 'container') {
+      if (session.kind === "container") {
         const confirmed = window.confirm(
           `Close terminal for ${session.title}? The exec session will exit.`,
         );
@@ -331,7 +347,7 @@ export function TerminalPage({
       );
       setActiveSessionID((current) =>
         current === session.id
-          ? sessions.find((item) => item.id !== session.id)?.id ?? null
+          ? (sessions.find((item) => item.id !== session.id)?.id ?? null)
           : current,
       );
     },
@@ -344,17 +360,23 @@ export function TerminalPage({
         setPasteGuard({ sessionID: session.id, data });
         return;
       }
-      await TerminalService.WriteTerminal(session.id, encodeTerminalInput(data));
+      await TerminalService.WriteTerminal(
+        session.id,
+        encodeTerminalInput(data),
+      );
     },
     [],
   );
 
-  const writeCommand = useCallback(async (sessionID: string, command: string) => {
-    await TerminalService.WriteTerminal(
-      sessionID,
-      encodeTerminalInput(`${command}\r`),
-    );
-  }, []);
+  const writeCommand = useCallback(
+    async (sessionID: string, command: string) => {
+      await TerminalService.WriteTerminal(
+        sessionID,
+        encodeTerminalInput(`${command}\r`),
+      );
+    },
+    [],
+  );
 
   const scheduleCommand = useCallback(
     async (command: string) => {
@@ -396,17 +418,17 @@ export function TerminalPage({
 
   const copyCommand = useCallback(async (command: string) => {
     await Clipboard.SetText(command);
-    setStatus('Command copied');
+    setStatus("Command copied");
   }, []);
 
   const runCheatsheetEntry = useCallback(
     (entry: CheatsheetEntry) => {
       const resolved = resolveCommand(entry, activeSession, placeholderValues);
       if (resolved.unresolved.length > 0) {
-        setError(`Fill ${resolved.unresolved.join(', ')} before running`);
+        setError(`Fill ${resolved.unresolved.join(", ")} before running`);
         return;
       }
-      if (!entry.runnable || entry.risk !== 'safe') {
+      if (!entry.runnable || entry.risk !== "safe") {
         void copyCommand(resolved.command);
         return;
       }
@@ -476,7 +498,7 @@ export function TerminalPage({
                 setSelectedContainerID(nextID);
                 if (!nextID) {
                   setShellOptions([]);
-                  setContainerShell('');
+                  setContainerShell("");
                 }
               }}
               value={selectedContainerID}
@@ -494,7 +516,10 @@ export function TerminalPage({
               onChange={(event) => setContainerShell(event.target.value)}
               value={containerShell}
             >
-              {(shellOptions.length ? shellOptions : [containerShell || '/bin/sh'])
+              {(shellOptions.length
+                ? shellOptions
+                : [containerShell || "/bin/sh"]
+              )
                 .filter(Boolean)
                 .map((shell) => (
                   <option key={shell} value={shell}>
@@ -541,14 +566,14 @@ export function TerminalPage({
               aria-selected={activeSessionID === session.id}
               key={session.id}
               className={[
-                'flex h-8 max-w-56 shrink-0 items-center gap-2 rounded-control border px-2 text-sm',
+                "flex h-8 max-w-56 shrink-0 items-center gap-2 rounded-control border px-2 text-sm",
                 activeSessionID === session.id
-                  ? 'border-accent bg-accent/10 text-accent'
-                  : 'border-border bg-bg-card text-text-secondary hover:text-text-primary',
-              ].join(' ')}
+                  ? "border-accent bg-accent/10 text-accent"
+                  : "border-border bg-bg-card text-text-secondary hover:text-text-primary",
+              ].join(" ")}
               onClick={() => setActiveSessionID(session.id)}
               onKeyDown={(event) => {
-                if (event.key === 'Enter' || event.key === ' ') {
+                if (event.key === "Enter" || event.key === " ") {
                   event.preventDefault();
                   setActiveSessionID(session.id);
                 }
@@ -577,7 +602,9 @@ export function TerminalPage({
             </div>
           ))}
           {sessions.length === 0 ? (
-            <span className="text-sm text-text-muted">No terminal sessions</span>
+            <span className="text-sm text-text-muted">
+              No terminal sessions
+            </span>
           ) : null}
         </div>
 
@@ -587,7 +614,7 @@ export function TerminalPage({
               {activeSession.title}
             </span>
             <span className="mx-2">·</span>
-            <span>{activeSession.shell || 'shell'}</span>
+            <span>{activeSession.shell || "shell"}</span>
             {activeSession.isRoot ? (
               <>
                 <span className="mx-2">·</span>
@@ -624,7 +651,9 @@ export function TerminalPage({
         </div>
 
         <div className="flex min-h-9 items-center gap-3 border-t border-border px-3 text-xs text-text-muted">
-          <span>{activeSession ? `${activeSession.kind} session` : 'idle'}</span>
+          <span>
+            {activeSession ? `${activeSession.kind} session` : "idle"}
+          </span>
           <span className="ml-auto">{status}</span>
           {error ? <span className="text-error">{error}</span> : null}
         </div>
@@ -657,11 +686,11 @@ export function TerminalPage({
               {categories.map((category) => (
                 <button
                   className={[
-                    'h-8 shrink-0 rounded-control border px-2 text-xs',
+                    "h-8 shrink-0 rounded-control border px-2 text-xs",
                     cheatsheetCategory === category
-                      ? 'border-accent bg-accent/10 text-accent'
-                      : 'border-border bg-bg-inset text-text-secondary',
-                  ].join(' ')}
+                      ? "border-accent bg-accent/10 text-accent"
+                      : "border-border bg-bg-inset text-text-secondary",
+                  ].join(" ")}
                   key={category}
                   onClick={() => setCheatsheetCategory(category)}
                   type="button"
@@ -760,7 +789,7 @@ export function CommandPalette<T extends string>({
   open,
   pages,
 }: CommandPaletteProps<T>) {
-  const [query, setQuery] = useState('');
+  const [query, setQuery] = useState("");
   const [commands, setCommands] = useState<CheatsheetEntry[]>([]);
 
   useEffect(() => {
@@ -801,7 +830,7 @@ export function CommandPalette<T extends string>({
             className="h-full flex-1 bg-transparent text-sm outline-none"
             onChange={(event) => setQuery(event.target.value)}
             onKeyDown={(event) => {
-              if (event.key === 'Escape') {
+              if (event.key === "Escape") {
                 onClose();
               }
             }}
@@ -845,7 +874,7 @@ export function CommandPalette<T extends string>({
                 className="flex min-h-11 w-full items-center gap-3 rounded-control px-2 text-left text-sm hover:bg-bg-card"
                 key={`${entry.category}:${entry.command}`}
                 onClick={() => {
-                  if (entry.runnable && entry.risk === 'safe') {
+                  if (entry.runnable && entry.risk === "safe") {
                     onRunSafeCommand(entry.command);
                   } else {
                     void Clipboard.SetText(entry.command);
@@ -907,14 +936,14 @@ function TerminalSurface({
       convertEol: true,
       cursorBlink: true,
       fontFamily:
-        'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace',
+        "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
       fontSize: 13,
       scrollback: 10000,
       theme: {
-        background: '#070a0f',
-        foreground: '#d6deeb',
-        cursor: '#2dd4a7',
-        selectionBackground: '#2dd4a744',
+        background: "#070a0f",
+        foreground: "#d6deeb",
+        cursor: "#2dd4a7",
+        selectionBackground: "#2dd4a744",
       },
     });
     terminal.open(hostRef.current);
@@ -939,7 +968,7 @@ function TerminalSurface({
     };
     resize();
     let observer: ResizeObserver | null = null;
-    if (typeof ResizeObserver !== 'undefined') {
+    if (typeof ResizeObserver !== "undefined") {
       observer = new ResizeObserver(resize);
       observer.observe(hostRef.current);
     }
@@ -955,7 +984,7 @@ function TerminalSurface({
   }, [session.id]);
 
   useEffect(() => {
-    const off = Events.On('terminal:data', (event) => {
+    const off = Events.On("terminal:data", (event) => {
       const payload = eventPayload<TerminalDataPayload>(event);
       if (!payload || payload.sessionID !== session.id) {
         return;
@@ -967,7 +996,7 @@ function TerminalSurface({
 
   return (
     <div
-      className={active ? 'absolute inset-0 p-2' : 'hidden'}
+      className={active ? "absolute inset-0 p-2" : "hidden"}
       data-terminal-session={session.id}
       ref={hostRef}
     />
@@ -1010,9 +1039,11 @@ function CheatsheetRow({
               aria-label={`${name} value`}
               className="h-8 rounded-control border border-border bg-bg-panel px-2 text-xs"
               key={name}
-              onChange={(event) => onPlaceholderChange(name, event.target.value)}
+              onChange={(event) =>
+                onPlaceholderChange(name, event.target.value)
+              }
               placeholder={name}
-              value={placeholderValues[name] ?? ''}
+              value={placeholderValues[name] ?? ""}
             />
           ))}
         </div>
@@ -1029,7 +1060,7 @@ function CheatsheetRow({
         <Button
           disabled={
             !entry.runnable ||
-            entry.risk !== 'safe' ||
+            entry.risk !== "safe" ||
             resolved.unresolved.length > 0
           }
           icon={<Play size={13} />}
@@ -1062,13 +1093,13 @@ function PaletteSection({
 }
 
 function SessionIcon({ kind }: { kind: string }) {
-  if (kind === 'container') {
+  if (kind === "container") {
     return <Container size={14} />;
   }
-  if (kind === 'project') {
+  if (kind === "project") {
     return <FolderGit2 size={14} />;
   }
-  if (kind === 'backend') {
+  if (kind === "backend") {
     return <Server size={14} />;
   }
   return <TerminalIcon size={14} />;
@@ -1086,10 +1117,10 @@ function resolveCommand(
     if (explicit) {
       return explicit;
     }
-    if (name === 'container' && activeSession?.containerID) {
+    if (name === "container" && activeSession?.containerID) {
       return activeSession.containerID;
     }
-    if (name === 'service' && activeSession?.title) {
+    if (name === "service" && activeSession?.title) {
       return activeSession.title;
     }
     unresolved.add(name);
@@ -1099,11 +1130,11 @@ function resolveCommand(
 }
 
 function shouldGuardPaste(session: TerminalSessionInfo, data: string) {
-  if (session.kind !== 'container' && !session.isRoot) {
+  if (session.kind !== "container" && !session.isRoot) {
     return false;
   }
-  const normalized = data.replace(/\r/g, '\n');
-  const lines = normalized.split('\n').filter((line) => line.trim() !== '');
+  const normalized = data.replace(/\r/g, "\n");
+  const lines = normalized.split("\n").filter((line) => line.trim() !== "");
   return lines.length > 1;
 }
 
@@ -1111,7 +1142,7 @@ const terminalBase64ChunkSize = 0x8000;
 
 export function encodeTerminalInput(value: string) {
   const bytes = new TextEncoder().encode(value);
-  let binary = '';
+  let binary = "";
   for (let index = 0; index < bytes.length; index += terminalBase64ChunkSize) {
     const chunk = bytes.subarray(index, index + terminalBase64ChunkSize);
     binary += String.fromCharCode(...chunk);
@@ -1136,7 +1167,7 @@ function eventPayload<T>(event: unknown): T | null {
   if (!event) {
     return null;
   }
-  if (typeof event === 'object' && 'data' in event) {
+  if (typeof event === "object" && "data" in event) {
     return ((event as { data?: T }).data ?? null) as T | null;
   }
   return event as T;
@@ -1147,14 +1178,14 @@ function errorMessage(error: unknown, fallback: string) {
 }
 
 function riskTone(risk: string): BadgeTone {
-  if (risk === 'safe') {
-    return 'ok';
+  if (risk === "safe") {
+    return "ok";
   }
-  if (risk === 'needs_confirmation') {
-    return 'warn';
+  if (risk === "needs_confirmation") {
+    return "warn";
   }
-  if (risk === 'destructive' || risk === 'dangerous') {
-    return 'error';
+  if (risk === "destructive" || risk === "dangerous") {
+    return "error";
   }
-  return 'neutral';
+  return "neutral";
 }

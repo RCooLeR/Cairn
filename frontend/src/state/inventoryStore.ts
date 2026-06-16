@@ -1,4 +1,4 @@
-import { create } from 'zustand';
+import { create } from "zustand";
 
 import type {
   ContainerSummary,
@@ -11,11 +11,11 @@ import type {
   ProviderSummary,
   VolumeDetail,
   VolumeSummary,
-} from '../../bindings/github.com/RCooLeR/Cairn/internal/models/models.js';
+} from "../../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
 
-import { getInventorySnapshot } from '../api/inventory';
+import { getInventorySnapshot } from "../api/inventory";
 
-type LoadStatus = 'idle' | 'loading' | 'ready' | 'error';
+type LoadStatus = "idle" | "loading" | "ready" | "error";
 
 type InventoryState = {
   status: LoadStatus;
@@ -41,7 +41,7 @@ type InventoryState = {
 let refreshPromise: Promise<void> | null = null;
 
 export const useInventoryStore = create<InventoryState>((set) => ({
-  status: 'idle',
+  status: "idle",
   error: null,
   lastLoadedAt: null,
   providers: [],
@@ -59,11 +59,11 @@ export const useInventoryStore = create<InventoryState>((set) => ({
       return refreshPromise;
     }
     refreshPromise = (async () => {
-      set({ status: 'loading', error: null });
+      set({ status: "loading", error: null });
       try {
         const snapshot = await getInventorySnapshot();
         set({
-          status: snapshot.degradedReason ? 'error' : 'ready',
+          status: snapshot.degradedReason ? "error" : "ready",
           error: snapshot.degradedReason,
           lastLoadedAt: Date.now(),
           providers: snapshot.providers,
@@ -79,8 +79,9 @@ export const useInventoryStore = create<InventoryState>((set) => ({
         });
       } catch (error) {
         set({
-          status: 'error',
-          error: error instanceof Error ? error.message : 'Docker is not reachable',
+          status: "error",
+          error:
+            error instanceof Error ? error.message : "Docker is not reachable",
           lastLoadedAt: Date.now(),
         });
       } finally {

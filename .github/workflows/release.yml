@@ -12,6 +12,7 @@ on:
         default: "v1.0.0"
 
 permissions:
+  actions: read
   contents: write
 
 concurrency:
@@ -63,6 +64,14 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
+      - name: Cache Wails CLI
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/bin/wails3
+            ~/go/bin/wails3.exe
+          key: ${{ runner.os }}-wails3-v3.0.0-alpha.79
+
       - name: Install Linux packaging dependencies
         if: runner.os == 'Linux'
         run: |
@@ -74,9 +83,13 @@ jobs:
       - name: Install Wails CLI
         shell: pwsh
         run: |
-          go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha.79
           $goBin = Join-Path (go env GOPATH) "bin"
           Add-Content -Path $env:GITHUB_PATH -Value $goBin
+          $wailsExe = Join-Path $goBin ($(if ($IsWindows) { "wails3.exe" } else { "wails3" }))
+          if (!(Test-Path -LiteralPath $wailsExe)) {
+            go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha.79
+          }
+          & $wailsExe version
 
       - name: Install NSIS
         if: runner.os == 'Windows'
@@ -169,6 +182,13 @@ jobs:
         shell: pwsh
         run: ./scripts/check-release-artifacts.ps1 -Platform ${{ matrix.platform }}
 
+      - name: Generate package SBOM
+        uses: anchore/sbom-action@v0.24.0
+        with:
+          path: bin
+          format: spdx-json
+          artifact-name: cairn-${{ matrix.platform }}-${{ env.CAIRN_ARTIFACT_REF }}.spdx.json
+
       - name: Upgrade fixture smoke
         shell: pwsh
         run: ./scripts/run-release-validation.ps1 -Suite upgrade-fixtures
@@ -204,7 +224,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: release-artifacts
-          pattern: cairn-*-${{ github.ref_name }}
+          pattern: cairn-*-${{ github.ref_name }}*
           merge-multiple: true
 
       - name: Create GitHub Release

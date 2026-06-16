@@ -734,9 +734,7 @@ describe("App inventory shell", () => {
   });
 
   it("hardens audit CSV and run-image parsing helpers", () => {
-    expect(csvCell("=cmd|' /c calc'!A1")).toBe(
-      `"'=cmd|' /c calc'!A1"`,
-    );
+    expect(csvCell("=cmd|' /c calc'!A1")).toBe(`"'=cmd|' /c calc'!A1"`);
     expect(csvCell("plain")).toBe('"plain"');
     expect(csvCell('say "hello"')).toBe('"say ""hello"""');
 
@@ -861,12 +859,9 @@ describe("App inventory shell", () => {
     expect(
       within(dialog).getByRole("button", { name: "Clean up" }),
     ).toBeDisabled();
-    fireEvent.change(
-      within(dialog).getByLabelText("Type prune to confirm"),
-      {
-        target: { value: "prune" },
-      },
-    );
+    fireEvent.change(within(dialog).getByLabelText("Type prune to confirm"), {
+      target: { value: "prune" },
+    });
 
     const cleanUpButton = within(dialog).getByRole("button", {
       name: "Clean up",
@@ -1032,7 +1027,9 @@ describe("App inventory shell", () => {
       }),
     );
 
-    expect(await screen.findByText("Image update available")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Image update available"),
+    ).toBeInTheDocument();
     expect(screen.getAllByText("Rebuild required").length).toBeGreaterThan(0);
     expect(
       screen.getByText(
@@ -1041,7 +1038,9 @@ describe("App inventory shell", () => {
     ).toBeInTheDocument();
 
     fireEvent.click(screen.getAllByRole("button", { name: "Update" })[0]);
-    expect(await screen.findByText("$ docker compose pull app")).toBeInTheDocument();
+    expect(
+      await screen.findByText("$ docker compose pull app"),
+    ).toBeInTheDocument();
     fireEvent.click(screen.getByLabelText(/Back up named volumes first/));
     fireEvent.click(screen.getByRole("button", { name: "Update service" }));
 
@@ -1061,7 +1060,9 @@ describe("App inventory shell", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     fireEvent.click(screen.getByRole("button", { name: "Ignored" }));
-    expect(await screen.findByText("Waiting for maintenance window")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Waiting for maintenance window"),
+    ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Unignore" }));
     expect(updateServiceMock.UnignoreUpdate).toHaveBeenCalledWith(201);
   });
@@ -1071,7 +1072,9 @@ describe("App inventory shell", () => {
     projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
     projectServiceMock.GetProject.mockResolvedValue(seededProjectDetail());
     updateServiceMock.ListCurrentUpdates.mockResolvedValue(seededUpdates());
-    imageLineageServiceMock.GetProjectLineage.mockResolvedValue(seededLineage());
+    imageLineageServiceMock.GetProjectLineage.mockResolvedValue(
+      seededLineage(),
+    );
 
     render(<App />);
 
@@ -1095,7 +1098,9 @@ describe("App inventory shell", () => {
     expect(await screen.findByText("Pull & recreate")).toBeInTheDocument();
     expect(screen.getByText("Rebuild & redeploy")).toBeInTheDocument();
     expect(screen.getByText("Manual attention")).toBeInTheDocument();
-    expect(screen.getByText(/node:20-alpine - Confidence: High/)).toBeInTheDocument();
+    expect(
+      screen.getByText(/node:20-alpine - Confidence: High/),
+    ).toBeInTheDocument();
     expect(
       screen.getByText(
         "Base image: Unknown — this is a third-party registry image and no base metadata was found.",
@@ -1874,7 +1879,9 @@ describe("App inventory shell", () => {
     expect(
       await within(dialog).findByText("Use an existing Docker context"),
     ).toBeInTheDocument();
-    fireEvent.click(within(dialog).getByRole("button", { name: "Open Settings" }));
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Open Settings" }),
+    );
 
     expect(await screen.findByText("Docker Contexts")).toBeInTheDocument();
     expect(providerServiceMock.ListDockerContexts).toHaveBeenCalled();
@@ -1914,7 +1921,9 @@ describe("App inventory shell", () => {
     ).toBeInTheDocument();
     expect(within(dialog).getByLabelText(/app-db/)).toBeChecked();
     fireEvent.click(within(dialog).getByRole("button", { name: "Finish" }));
-    expect(await within(dialog).findByText("Cairn is ready")).toBeInTheDocument();
+    expect(
+      await within(dialog).findByText("Cairn is ready"),
+    ).toBeInTheDocument();
     fireEvent.click(within(dialog).getByRole("button", { name: "Continue" }));
 
     await waitFor(() =>
@@ -1975,7 +1984,9 @@ describe("App inventory shell", () => {
       expect(providerServiceMock.Detect).toHaveBeenCalledWith("linux_native"),
     );
     expect(
-      await within(dialog).findByText(/add your Linux user to the docker group/),
+      await within(dialog).findByText(
+        /add your Linux user to the docker group/,
+      ),
     ).toBeInTheDocument();
     fireEvent.click(within(dialog).getByLabelText(/Add user to docker group/));
     fireEvent.click(
@@ -2321,7 +2332,9 @@ describe("App inventory shell", () => {
       screen.getByRole("button", { name: "View audit update.apply" }),
     );
     const dialog = await screen.findByRole("dialog", { name: "Audit row" });
-    expect(within(dialog).getByText("docker compose up -d")).toBeInTheDocument();
+    expect(
+      within(dialog).getByText("docker compose up -d"),
+    ).toBeInTheDocument();
     expect(within(dialog).getByText("linux_native")).toBeInTheDocument();
   });
 

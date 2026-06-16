@@ -1,9 +1,9 @@
-import { create } from 'zustand';
+import { create } from "zustand";
 
 import type {
   ProviderStatus,
   ProviderSummary,
-} from '../../bindings/github.com/RCooLeR/Cairn/internal/models/models.js';
+} from "../../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
 
 type ProviderState = {
   providers: ProviderSummary[];

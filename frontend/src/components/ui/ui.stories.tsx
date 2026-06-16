@@ -1,10 +1,7 @@
-import { Database, RefreshCw } from 'lucide-react';
-import { useState } from 'react';
+import { Database, RefreshCw } from "lucide-react";
+import { useState } from "react";
 
-import {
-  APP_ERROR_CODES,
-  appErrorPresentation,
-} from '../../api/errors';
+import { APP_ERROR_CODES, appErrorPresentation } from "../../api/errors";
 import {
   Badge,
   Button,
@@ -17,7 +14,7 @@ import {
   StatusDot,
   Tabs,
   Toast,
-} from '.';
+} from ".";
 
 type Row = {
   id: string;
@@ -66,12 +63,12 @@ export const AppErrorMatrix = () => (
 );
 
 const rows: Row[] = [
-  { id: 'api', name: 'api', state: 'running' },
-  { id: 'worker', name: 'worker', state: 'stopped' },
+  { id: "api", name: "api", state: "running" },
+  { id: "worker", name: "worker", state: "stopped" },
 ];
 
 export const Components = () => {
-  const [tab, setTab] = useState('overview');
+  const [tab, setTab] = useState("overview");
   const [open, setOpen] = useState(false);
   const [selected, setSelected] = useState(new Set<string>());
 
@@ -91,17 +88,22 @@ export const Components = () => {
       </div>
 
       <Card>
-        <CardHeader status={<StatusDot label="Running" tone="ok" />} title="Provider Health" />
+        <CardHeader
+          status={<StatusDot label="Running" tone="ok" />}
+          title="Provider Health"
+        />
         <CardBody>
           <Tabs
             activeID={tab}
             items={[
-              { id: 'overview', label: 'Overview' },
-              { id: 'services', label: 'Services' },
+              { id: "overview", label: "Overview" },
+              { id: "services", label: "Services" },
             ]}
             onChange={setTab}
           >
-            <div className="pt-4 text-sm text-text-secondary">Active tab: {tab}</div>
+            <div className="pt-4 text-sm text-text-secondary">
+              Active tab: {tab}
+            </div>
           </Tabs>
         </CardBody>
       </Card>
@@ -109,8 +111,13 @@ export const Components = () => {
       <DataTable
         bulkActions={<Button size="sm">Stop</Button>}
         columns={[
-          { id: 'name', header: 'Name', render: (row) => row.name, sortable: true },
-          { id: 'state', header: 'State', render: (row) => row.state },
+          {
+            id: "name",
+            header: "Name",
+            render: (row) => row.name,
+            sortable: true,
+          },
+          { id: "state", header: "State", render: (row) => row.state },
         ]}
         getRowID={(row) => row.id}
         onToggleRow={(id) =>
@@ -135,7 +142,11 @@ export const Components = () => {
         title="No provider configured"
       />
 
-      <Toast body="The Docker provider is currently unavailable." level="warn" title="Provider degraded" />
+      <Toast
+        body="The Docker provider is currently unavailable."
+        level="warn"
+        title="Provider degraded"
+      />
 
       <Modal
         footer={<Button variant="danger">Confirm</Button>}

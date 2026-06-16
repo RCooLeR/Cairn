@@ -1029,7 +1029,9 @@ const focusableSelector = [
 ].join(",");
 
 function focusableChildren(root: HTMLElement) {
-  return Array.from(root.querySelectorAll<HTMLElement>(focusableSelector)).filter(
+  return Array.from(
+    root.querySelectorAll<HTMLElement>(focusableSelector),
+  ).filter(
     (element) =>
       !element.hasAttribute("disabled") &&
       element.getAttribute("aria-hidden") !== "true",
@@ -1236,8 +1238,9 @@ function App() {
   const [projectLineage, setProjectLineage] = useState<
     Record<string, ImageLineage[]>
   >({});
-  const [projectLineageStatus, setProjectLineageStatus] =
-    useState<Record<string, LoadStatus>>({});
+  const [projectLineageStatus, setProjectLineageStatus] = useState<
+    Record<string, LoadStatus>
+  >({});
   const [createNetwork, setCreateNetwork] =
     useState<CreateNetworkState>(emptyCreateNetwork);
   const [importProject, setImportProject] =
@@ -1267,8 +1270,9 @@ function App() {
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [settingsMessage, setSettingsMessage] = useState<string | null>(null);
   const [settingsError, setSettingsError] = useState<string | null>(null);
-  const [settingsToast, setSettingsToast] =
-    useState<SettingsToastState | null>(null);
+  const [settingsToast, setSettingsToast] = useState<SettingsToastState | null>(
+    null,
+  );
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([]);
   const [auditLoading, setAuditLoading] = useState(false);
@@ -1784,24 +1788,18 @@ function App() {
     refreshUpdateSurfaces,
   ]);
 
-  useDebouncedRuntimeEvent(
-    "objects:changed",
-    500,
-    refreshRuntimeSurfaces,
-  );
-  useDebouncedRuntimeEvent(
-    "provider:changed",
-    250,
-    refreshRuntimeSurfaces,
-  );
+  useDebouncedRuntimeEvent("objects:changed", 500, refreshRuntimeSurfaces);
+  useDebouncedRuntimeEvent("provider:changed", 250, refreshRuntimeSurfaces);
 
   useEffect(() => {
     const offCheck = Events.On("updates:check:progress", (event) => {
-      const payload = eventPayload<UpdateProgressEntry & {
-        done?: number;
-        total?: number;
-        current?: string;
-      }>(event);
+      const payload = eventPayload<
+        UpdateProgressEntry & {
+          done?: number;
+          total?: number;
+          current?: string;
+        }
+      >(event);
       if (!payload) {
         return;
       }
@@ -4042,7 +4040,8 @@ function App() {
         if (activeProjectID) {
           const detailProject = projectDetail?.summary;
           const projectID = detailProject?.id ?? activeProjectID;
-          const projectName = detailProject?.name ?? projectNameForID(projects, projectID);
+          const projectName =
+            detailProject?.name ?? projectNameForID(projects, projectID);
           return (
             <ProjectDetailPage
               actionBusyIDs={busyActionIDs}
@@ -4545,7 +4544,7 @@ function App() {
                         ? updatesStatus === "loading" ||
                           updateHistoryStatus === "loading" ||
                           ignoredUpdatesStatus === "loading"
-                      : inventoryStatus === "loading"
+                        : inventoryStatus === "loading"
                   }
                   onClick={() => {
                     if (activePage === "projects") {
@@ -5429,8 +5428,8 @@ function ProviderSetupModal({
     setup.backend === "linux_native"
       ? linuxSetupCheckRows(setup.detection)
       : setup.backend === "macos_colima"
-      ? macOSSetupCheckRows(setup.detection)
-      : windowsSetupCheckRows(setup.detection);
+        ? macOSSetupCheckRows(setup.detection)
+        : windowsSetupCheckRows(setup.detection);
   const hasProblems = Boolean(setup.detection?.problems?.length);
   const canPlan = !setup.detecting && Boolean(setup.detection) && hasProblems;
   const completed =
@@ -5440,8 +5439,9 @@ function ProviderSetupModal({
   const isLinux = setup.backend === "linux_native";
   const isWindows = setup.backend === "windows_wsl_ubuntu";
   const permissionProblem =
-    setup.detection?.problems?.find((problem) => problem.code === "PERM_SOCKET") ??
-    null;
+    setup.detection?.problems?.find(
+      (problem) => problem.code === "PERM_SOCKET",
+    ) ?? null;
   const selectedProjects = setup.detectedProjects.filter((project) =>
     setup.selectedProjectIDs.includes(project.id),
   );
@@ -5864,7 +5864,9 @@ function ProviderSetupModal({
             <div className="rounded-card border border-ok/30 bg-ok/10 p-4">
               <div className="flex items-center gap-2 font-medium text-ok">
                 <CheckCircle2 size={17} />
-                {completed ? setupReadyMessage(setup.backend) : "Provider checks complete"}
+                {completed
+                  ? setupReadyMessage(setup.backend)
+                  : "Provider checks complete"}
               </div>
               <div className="mt-2 grid gap-2 text-sm text-text-secondary sm:grid-cols-2">
                 <span>Provider: {setupBackendLabel(setup.backend)}</span>
@@ -5885,9 +5887,7 @@ function ProviderSetupModal({
                   {setup.detection?.dockerHost ||
                     setupBackendHostFallback(setup.backend)}
                 </span>
-                <span>
-                  Hello-world: {completed ? "Passed" : "Pending"}
-                </span>
+                <span>Hello-world: {completed ? "Passed" : "Pending"}</span>
               </div>
             </div>
             {isMac ? (
@@ -6011,9 +6011,7 @@ function ProviderSetupModal({
               <div className="mt-3 grid gap-2 text-sm text-text-secondary sm:grid-cols-2">
                 <span>Provider: {setupBackendLabel(setup.backend)}</span>
                 <span>{setupBackendDetail(setup)}</span>
-                <span>
-                  Projects selected: {selectedProjects.length}
-                </span>
+                <span>Projects selected: {selectedProjects.length}</span>
                 <span>
                   Docker:{" "}
                   {setup.detection?.dockerVersion || "verified after install"}
@@ -6406,11 +6404,7 @@ function SettingsPage({
                 value={settingString(settings, "general.theme", "dark")}
               />
               <SettingsCheckboxField
-                checked={settingBool(
-                  settings,
-                  "general.autostart_app",
-                  false,
-                )}
+                checked={settingBool(settings, "general.autostart_app", false)}
                 disabled={saving}
                 label="Launch Cairn at login"
                 onChange={(checked) =>
@@ -6496,7 +6490,10 @@ function SettingsPage({
                   60,
                 )} min raw -> 24 h / 1 m -> 7 d / 15 m`}
               />
-              <Button disabled disabledReason="Metrics compaction runs automatically">
+              <Button
+                disabled
+                disabledReason="Metrics compaction runs automatically"
+              >
                 Compact now
               </Button>
             </CardBody>
@@ -6693,7 +6690,10 @@ function SettingsPage({
             <CardHeader title="Advanced" />
             <CardBody className="space-y-3">
               <ReadOnlySetting label="Runtime cache" value="Managed by Cairn" />
-              <Button disabled disabledReason="No cached data is ready to reset">
+              <Button
+                disabled
+                disabledReason="No cached data is ready to reset"
+              >
                 Reset all caches
               </Button>
             </CardBody>
@@ -8626,8 +8626,7 @@ function ContainerHealthPanel({
     stopped,
     unhealthy,
   });
-  const pieData =
-    data.length > 0 ? data : [emptyContainerStatusChartSegment];
+  const pieData = data.length > 0 ? data : [emptyContainerStatusChartSegment];
   return (
     <Card>
       <CardHeader
@@ -8818,11 +8817,7 @@ function UpdatesCard({
     <Card>
       <CardHeader
         actions={
-          <Button
-            icon={<RefreshCw size={15} />}
-            onClick={onCheckNow}
-            size="sm"
-          >
+          <Button icon={<RefreshCw size={15} />} onClick={onCheckNow} size="sm">
             Check now
           </Button>
         }
@@ -10832,13 +10827,7 @@ function IgnoredUpdatesTable({
   );
 }
 
-function DigestDelta({
-  local,
-  remote,
-}: {
-  local?: string;
-  remote?: string;
-}) {
+function DigestDelta({ local, remote }: { local?: string; remote?: string }) {
   const differs = Boolean(local && remote && local !== remote);
   return (
     <div
@@ -13334,7 +13323,10 @@ function ImageLineageCard({ lineage }: { lineage: ImageLineage | null }) {
       {lineage ? (
         <div className="grid gap-3 text-sm md:grid-cols-2">
           <LineageField label="Running image" value={lineage.imageRef} />
-          <LineageField label="Image ID" value={shortID(lineage.imageID ?? "")} />
+          <LineageField
+            label="Image ID"
+            value={shortID(lineage.imageID ?? "")}
+          />
           <LineageField
             label="Built from"
             value={lineage.baseImage || "Unknown"}
@@ -13377,7 +13369,10 @@ function LineageField({
     <div className="min-w-0">
       <div className="text-xs text-text-muted">{label}</div>
       <div className="mt-1 flex items-center gap-2">
-        <span className="truncate font-mono text-xs text-text-primary" title={value}>
+        <span
+          className="truncate font-mono text-xs text-text-primary"
+          title={value}
+        >
           {value || "-"}
         </span>
         {copyable && value && value !== "-" ? (
@@ -13592,7 +13587,9 @@ function UpdatePlanModal({
     : state.target
       ? `Plan update for ${targetLabel}`
       : "Update";
-  const commandText = plan?.commands.map((command) => command.command).join("\n");
+  const commandText = plan?.commands
+    .map((command) => command.command)
+    .join("\n");
   const applying = state.applying || Boolean(state.jobID);
   return (
     <Modal
@@ -13700,7 +13697,9 @@ function UpdatePlanModal({
                       $ {command.command}
                     </div>
                     <div className="mt-2 flex flex-wrap gap-2 text-xs text-text-muted">
-                      <Badge tone={riskTone(command.risk)}>{command.risk}</Badge>
+                      <Badge tone={riskTone(command.risk)}>
+                        {command.risk}
+                      </Badge>
                       <span>{command.explanation}</span>
                       {command.workingDir ? (
                         <span>workdir: {command.workingDir}</span>
@@ -13844,8 +13843,8 @@ function IgnoreUpdateModal({
             {update?.currentImage ?? "-"}
           </div>
           <div className="mt-1 text-text-muted">
-            Scope: this service update. It will move to the Ignored tab and
-            stop contributing to project badges.
+            Scope: this service update. It will move to the Ignored tab and stop
+            contributing to project badges.
           </div>
         </div>
         <TextField
@@ -16142,10 +16141,7 @@ function notificationTone(level: string): BadgeTone {
   }
 }
 
-function filterAuditEntries(
-  entries: AuditEntry[],
-  filter: AuditFilterState,
-) {
+function filterAuditEntries(entries: AuditEntry[], filter: AuditFilterState) {
   const action = filter.action.trim().toLowerCase();
   const projectID = filter.projectID.trim().toLowerCase();
   const cutoff = auditRangeCutoff(filter.range);
@@ -16745,7 +16741,9 @@ function filterUpdateRows(
       case "image":
         return update.kind === UpdateKind.UpdateKindServiceImage;
       case "base":
-        return update.status === UpdateStatus.UpdateStatusBaseImageUpdateAvailable;
+        return (
+          update.status === UpdateStatus.UpdateStatusBaseImageUpdateAvailable
+        );
       case "rebuild":
         return update.status === UpdateStatus.UpdateStatusRebuildRequired;
       case "pinned":
@@ -16777,13 +16775,11 @@ function groupUpdatesByProject(
   for (const update of updates) {
     const projectID = update.projectID ?? "";
     const key = projectID || "unscoped";
-    const current =
-      map.get(key) ??
-      {
-        projectID,
-        projectName: projectNameForID(projects, projectID),
-        rows: [],
-      };
+    const current = map.get(key) ?? {
+      projectID,
+      projectName: projectNameForID(projects, projectID),
+      rows: [],
+    };
     current.rows.push(update);
     map.set(key, current);
   }
@@ -16824,7 +16820,9 @@ function projectNameForID(projects: ProjectSummary[], projectID?: string) {
   if (!projectID) {
     return "Unscoped";
   }
-  return projects.find((project) => project.id === projectID)?.name ?? projectID;
+  return (
+    projects.find((project) => project.id === projectID)?.name ?? projectID
+  );
 }
 
 function updateStatusLabel(status?: string) {
@@ -16891,7 +16889,9 @@ function updateActionLabel(action?: string) {
 }
 
 function updateKindLabel(kind?: string) {
-  return kind === UpdateKind.UpdateKindBaseImage ? "Base image" : "Service image";
+  return kind === UpdateKind.UpdateKindBaseImage
+    ? "Base image"
+    : "Service image";
 }
 
 function updateResultTone(result?: string): BadgeTone {

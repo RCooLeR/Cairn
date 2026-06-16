@@ -2,7 +2,7 @@
 
 module.exports = {
   build: {
-    assetsDir: '',
+    assetsDir: "",
   },
   publicDir: false,
 };

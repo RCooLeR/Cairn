@@ -1,10 +1,10 @@
-import type { ReactNode } from 'react';
+import type { ReactNode } from "react";
 
-import { X } from 'lucide-react';
-import { useEffect, useId, useRef } from 'react';
+import { X } from "lucide-react";
+import { useEffect, useId, useRef } from "react";
 
-import { Button } from './Button';
-import { cx } from './utils';
+import { Button } from "./Button";
+import { cx } from "./utils";
 
 type ModalProps = {
   open: boolean;
@@ -14,22 +14,22 @@ type ModalProps = {
   busy?: boolean;
   danger?: boolean;
   onClose: () => void;
-  size?: 'sm' | 'md' | 'lg';
+  size?: "sm" | "md" | "lg";
 };
 
 const focusableSelector = [
-  'a[href]',
-  'button:not([disabled])',
-  'input:not([disabled])',
-  'select:not([disabled])',
-  'textarea:not([disabled])',
+  "a[href]",
+  "button:not([disabled])",
+  "input:not([disabled])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
   '[tabindex]:not([tabindex="-1"])',
-].join(',');
+].join(",");
 
-const sizeClasses: Record<NonNullable<ModalProps['size']>, string> = {
-  sm: 'max-w-sm',
-  md: 'max-w-lg',
-  lg: 'max-w-3xl',
+const sizeClasses: Record<NonNullable<ModalProps["size"]>, string> = {
+  sm: "max-w-sm",
+  md: "max-w-lg",
+  lg: "max-w-3xl",
 };
 
 export function Modal({
@@ -39,7 +39,7 @@ export function Modal({
   footer,
   onClose,
   open,
-  size = 'md',
+  size = "md",
   title,
 }: ModalProps) {
   const panelRef = useRef<HTMLElement>(null);
@@ -49,19 +49,25 @@ export function Modal({
     if (!open) {
       return undefined;
     }
-    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    const firstFocusable = panelRef.current?.querySelector<HTMLElement>(focusableSelector);
+    const previousFocus =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : null;
+    const firstFocusable =
+      panelRef.current?.querySelector<HTMLElement>(focusableSelector);
     (firstFocusable ?? panelRef.current)?.focus();
 
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && !busy) {
+      if (event.key === "Escape" && !busy) {
         onClose();
       }
-      if (event.key !== 'Tab' || !panelRef.current) {
+      if (event.key !== "Tab" || !panelRef.current) {
         return;
       }
 
-      const focusable = Array.from(panelRef.current.querySelectorAll<HTMLElement>(focusableSelector));
+      const focusable = Array.from(
+        panelRef.current.querySelectorAll<HTMLElement>(focusableSelector),
+      );
       if (focusable.length === 0) {
         event.preventDefault();
         panelRef.current.focus();
@@ -78,9 +84,9 @@ export function Modal({
         first.focus();
       }
     };
-    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener("keydown", onKeyDown);
     return () => {
-      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener("keydown", onKeyDown);
       previousFocus?.focus();
     };
   }, [busy, onClose, open]);
@@ -94,15 +100,18 @@ export function Modal({
       <section
         aria-labelledby={titleID}
         aria-modal="true"
-        className={cx('w-full rounded-card border border-border bg-bg-panel', sizeClasses[size])}
+        className={cx(
+          "w-full rounded-card border border-border bg-bg-panel",
+          sizeClasses[size],
+        )}
         ref={panelRef}
         role="dialog"
         tabIndex={-1}
       >
         <header
           className={cx(
-            'flex items-center justify-between border-b px-4 py-3',
-            danger ? 'border-error/40 text-error' : 'border-border',
+            "flex items-center justify-between border-b px-4 py-3",
+            danger ? "border-error/40 text-error" : "border-border",
           )}
         >
           <h2 className="text-base font-semibold" id={titleID}>
@@ -119,7 +128,9 @@ export function Modal({
           />
         </header>
         <div className="p-4 text-sm text-text-secondary">{children}</div>
-        {footer ? <footer className="border-t border-border px-4 py-3">{footer}</footer> : null}
+        {footer ? (
+          <footer className="border-t border-border px-4 py-3">{footer}</footer>
+        ) : null}
       </section>
     </div>
   );

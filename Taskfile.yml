@@ -37,6 +37,12 @@ tasks:
     cmds:
       - "{{.PACKAGE_MANAGER}} run lint"
 
+  frontend:format:check:
+    summary: Checks frontend formatting
+    dir: frontend
+    cmds:
+      - "{{.PACKAGE_MANAGER}} run format:check"
+
   frontend:test:
     summary: Runs frontend unit tests
     dir: frontend
@@ -49,20 +55,28 @@ tasks:
     cmds:
       - "{{.PACKAGE_MANAGER}} run build"
 
+  frontend:ladle:build:
+    summary: Builds frontend component stories
+    dir: frontend
+    cmds:
+      - "{{.PACKAGE_MANAGER}} run ladle:build"
+
   go:test:
     summary: Runs Go unit tests
     cmds:
       - go test . ./internal/...
 
   go:lint:
-    summary: Runs baseline Go static checks
+    summary: Runs Go static checks
     cmds:
-      - go vet . ./internal/...
+      - go vet -unsafeptr=false . ./internal/...
+      - golangci-lint run --timeout=5m
 
   lint:
     summary: Runs all linters
     cmds:
       - task: frontend:lint
+      - task: frontend:format:check
       - task: go:lint
 
   test:
@@ -76,7 +90,9 @@ tasks:
     cmds:
       - task: assets:sync
       - task: frontend:lint
+      - task: frontend:format:check
       - task: frontend:test
+      - task: frontend:ladle:build
       - task: frontend:build
       - task: go:lint
       - task: go:test

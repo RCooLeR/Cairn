@@ -1,6 +1,6 @@
-import type { KeyboardEvent, ReactNode } from 'react';
+import type { KeyboardEvent, ReactNode } from "react";
 
-import { cx } from './utils';
+import { cx } from "./utils";
 
 type TabItem = {
   id: string;
@@ -23,16 +23,20 @@ export function Tabs({ activeID, children, items, onChange }: TabsProps) {
       return;
     }
 
-    if (event.key === 'ArrowRight') {
+    if (event.key === "ArrowRight") {
       event.preventDefault();
       onChange(enabledItems[(activeIndex + 1) % enabledItems.length].id);
-    } else if (event.key === 'ArrowLeft') {
+    } else if (event.key === "ArrowLeft") {
       event.preventDefault();
-      onChange(enabledItems[(activeIndex - 1 + enabledItems.length) % enabledItems.length].id);
-    } else if (event.key === 'Home') {
+      onChange(
+        enabledItems[
+          (activeIndex - 1 + enabledItems.length) % enabledItems.length
+        ].id,
+      );
+    } else if (event.key === "Home") {
       event.preventDefault();
       onChange(enabledItems[0].id);
-    } else if (event.key === 'End') {
+    } else if (event.key === "End") {
       event.preventDefault();
       onChange(enabledItems[enabledItems.length - 1].id);
     }
@@ -40,16 +44,20 @@ export function Tabs({ activeID, children, items, onChange }: TabsProps) {
 
   return (
     <div>
-      <div className="flex border-b border-border" onKeyDown={onKeyDown} role="tablist">
+      <div
+        className="flex border-b border-border"
+        onKeyDown={onKeyDown}
+        role="tablist"
+      >
         {items.map((item) => (
           <button
             aria-selected={item.id === activeID}
             className={cx(
-              'h-10 border-b-2 px-3 text-sm transition',
+              "h-10 border-b-2 px-3 text-sm transition",
               item.id === activeID
-                ? 'border-accent text-accent'
-                : 'border-transparent text-text-secondary hover:text-text-primary',
-              item.disabled && 'cursor-not-allowed opacity-50',
+                ? "border-accent text-accent"
+                : "border-transparent text-text-secondary hover:text-text-primary",
+              item.disabled && "cursor-not-allowed opacity-50",
             )}
             disabled={item.disabled}
             key={item.id}

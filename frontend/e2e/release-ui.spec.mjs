@@ -1,43 +1,43 @@
-import { AxeBuilder } from '@axe-core/playwright';
-import { expect, test } from '@playwright/test';
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import pixelmatch from 'pixelmatch';
-import { PNG } from 'pngjs';
+import { AxeBuilder } from "@axe-core/playwright";
+import { expect, test } from "@playwright/test";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import pixelmatch from "pixelmatch";
+import { PNG } from "pngjs";
 
 const routes = [
-  { label: 'Overview', heading: 'Overview', slug: 'overview' },
-  { label: 'Projects', heading: 'Projects', slug: 'projects' },
-  { label: 'Updates', heading: 'Updates', slug: 'updates' },
-  { label: 'Containers', heading: 'Containers', slug: 'containers' },
-  { label: 'Images', heading: 'Images', slug: 'images' },
-  { label: 'Volumes', heading: 'Volumes', slug: 'volumes' },
-  { label: 'Networks', heading: 'Networks', slug: 'networks' },
-  { label: 'Logs', heading: 'Logs', slug: 'logs' },
-  { label: 'Terminal', heading: 'Terminal', slug: 'terminal' },
-  { label: 'Settings', heading: 'Settings', slug: 'settings' },
+  { label: "Overview", heading: "Overview", slug: "overview" },
+  { label: "Projects", heading: "Projects", slug: "projects" },
+  { label: "Updates", heading: "Updates", slug: "updates" },
+  { label: "Containers", heading: "Containers", slug: "containers" },
+  { label: "Images", heading: "Images", slug: "images" },
+  { label: "Volumes", heading: "Volumes", slug: "volumes" },
+  { label: "Networks", heading: "Networks", slug: "networks" },
+  { label: "Logs", heading: "Logs", slug: "logs" },
+  { label: "Terminal", heading: "Terminal", slug: "terminal" },
+  { label: "Settings", heading: "Settings", slug: "settings" },
 ];
 const visualThreshold = 0.002;
-const updateVisuals = process.env.CAIRN_UPDATE_VISUALS === '1';
+const updateVisuals = process.env.CAIRN_UPDATE_VISUALS === "1";
 const visualPlatform = process.env.CAIRN_VISUAL_PLATFORM || process.platform;
 const firstRenderBudgetMs = 1500;
 const routeSwitchBudgetMs = 200;
 const filterBudgetMs = 100;
 const goldenDir = path.join(
   path.dirname(fileURLToPath(import.meta.url)),
-  'goldens',
-  'release-ui',
+  "goldens",
+  "release-ui",
   `chromium-${visualPlatform}-light`,
 );
 
-test.describe('release UI validation', () => {
+test.describe("release UI validation", () => {
   test.beforeEach(async ({ page }) => {
-    await page.goto('/');
+    await page.goto("/");
     await disableMotion(page);
-    await expect(page.getByRole('img', { name: 'Cairn' })).toBeVisible();
+    await expect(page.getByRole("img", { name: "Cairn" })).toBeVisible();
     await expect(
-      page.getByRole('heading', { name: 'Overview', level: 1 }),
+      page.getByRole("heading", { name: "Overview", level: 1 }),
     ).toBeVisible();
   });
 
@@ -50,40 +50,40 @@ test.describe('release UI validation', () => {
     });
   }
 
-  test('modal and popover states have no serious axe violations', async ({
+  test("modal and popover states have no serious axe violations", async ({
     page,
   }) => {
-    await page.keyboard.press('Control+K');
-    await expect(page.getByRole('dialog')).toBeVisible();
-    await assertNoSeriousAxeViolations(page, 'Command palette');
-    await page.keyboard.press('Escape');
+    await page.keyboard.press("Control+K");
+    await expect(page.getByRole("dialog")).toBeVisible();
+    await assertNoSeriousAxeViolations(page, "Command palette");
+    await page.keyboard.press("Escape");
 
-    await page.getByRole('button', { name: /^Notifications/ }).click();
+    await page.getByRole("button", { name: /^Notifications/ }).click();
     await expect(
-      page.getByLabel('Notification center', { exact: true }),
+      page.getByLabel("Notification center", { exact: true }),
     ).toBeVisible();
-    await assertNoSeriousAxeViolations(page, 'Notification center');
-    await page.getByRole('button', { name: /^Notifications/ }).click();
+    await assertNoSeriousAxeViolations(page, "Notification center");
+    await page.getByRole("button", { name: /^Notifications/ }).click();
     await expect(
-      page.getByLabel('Notification center', { exact: true }),
+      page.getByLabel("Notification center", { exact: true }),
     ).toBeHidden();
 
     await page
-      .getByRole('button', { name: /Import Project/i })
+      .getByRole("button", { name: /Import Project/i })
       .first()
       .click();
-    await expect(page.getByRole('dialog')).toBeVisible();
-    await assertNoSeriousAxeViolations(page, 'Import Project modal');
+    await expect(page.getByRole("dialog")).toBeVisible();
+    await assertNoSeriousAxeViolations(page, "Import Project modal");
   });
 
-  test('route screenshots are visually stable', async ({ page }) => {
+  test("route screenshots are visually stable", async ({ page }) => {
     for (const route of routes) {
       await openRoute(page, route);
       await assertScreenshotStable(page, route.label);
     }
   });
 
-  test('route screenshots match committed goldens', async ({
+  test("route screenshots match committed goldens", async ({
     page,
   }, testInfo) => {
     for (const route of routes) {
@@ -92,7 +92,7 @@ test.describe('release UI validation', () => {
     }
   });
 
-  test('overflowing routes keep page content scrollable', async ({ page }) => {
+  test("overflowing routes keep page content scrollable", async ({ page }) => {
     await page.setViewportSize({ width: 1260, height: 720 });
 
     for (const route of routes) {
@@ -101,76 +101,76 @@ test.describe('release UI validation', () => {
     }
 
     await openRoute(page, {
-      label: 'Settings',
-      heading: 'Settings',
-      slug: 'settings',
+      label: "Settings",
+      heading: "Settings",
+      slug: "settings",
     });
     const settingsScroll = await scrollRegionMetrics(page);
     expect(
       settingsScroll.scrollHeight,
-      'Settings should overflow in the compact release viewport',
+      "Settings should overflow in the compact release viewport",
     ).toBeGreaterThan(settingsScroll.clientHeight);
     expect(
       settingsScroll.afterScrollTop,
-      'Settings content could not scroll to lower provider controls',
+      "Settings content could not scroll to lower provider controls",
     ).toBeGreaterThan(0);
   });
 });
 
-test('daemon-stopped fixture renders degraded stale mode safely on every route', async ({
+test("daemon-stopped fixture renders degraded stale mode safely on every route", async ({
   page,
 }) => {
   await page.addInitScript(() => {
-    window.localStorage.setItem('cairn.release.fixture', 'degraded');
+    window.localStorage.setItem("cairn.release.fixture", "degraded");
   });
 
-  await page.goto('/');
+  await page.goto("/");
   await disableMotion(page);
-  await expect(page.getByRole('img', { name: 'Cairn' })).toBeVisible();
-  await expect(page.getByText('Docker is not reachable')).toBeVisible();
-  await expect(page.getByText('Stale cached data')).toBeVisible();
+  await expect(page.getByRole("img", { name: "Cairn" })).toBeVisible();
+  await expect(page.getByText("Docker is not reachable")).toBeVisible();
+  await expect(page.getByText("Stale cached data")).toBeVisible();
 
   for (const route of routes) {
     await openRoute(page, route);
-    await expect(page.getByText('Docker is not reachable')).toBeVisible();
-    await expect(page.getByText('Stale cached data')).toBeVisible();
+    await expect(page.getByText("Docker is not reachable")).toBeVisible();
+    await expect(page.getByText("Stale cached data")).toBeVisible();
     await assertNoSeriousAxeViolations(page, `Degraded ${route.label}`);
   }
 
   await openRoute(page, {
-    label: 'Containers',
-    heading: 'Containers',
-    slug: 'containers',
+    label: "Containers",
+    heading: "Containers",
+    slug: "containers",
   });
-  await expect(page.getByRole('button', { name: 'Stop web' })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Stop web" })).toBeDisabled();
 
-  await openRoute(page, { label: 'Logs', heading: 'Logs', slug: 'logs' });
+  await openRoute(page, { label: "Logs", heading: "Logs", slug: "logs" });
 
   const calls = await page.evaluate(() => window.__cairnReleaseMockCalls ?? {});
-  expect(calls['DockerService.StopContainer'] ?? 0).toBe(0);
-  expect(calls['LogsService.StartLogStream'] ?? 0).toBe(0);
-  expect(calls['MetricsService.StartStatsStream'] ?? 0).toBe(0);
+  expect(calls["DockerService.StopContainer"] ?? 0).toBe(0);
+  expect(calls["LogsService.StartLogStream"] ?? 0).toBe(0);
+  expect(calls["MetricsService.StartStatsStream"] ?? 0).toBe(0);
 });
 
-test('seed-scale fixture meets release responsiveness budgets', async ({
+test("seed-scale fixture meets release responsiveness budgets", async ({
   page,
 }, testInfo) => {
   await page.addInitScript(() => {
-    window.localStorage.setItem('cairn.release.fixture', 'seeded');
+    window.localStorage.setItem("cairn.release.fixture", "seeded");
   });
 
-  await page.goto('/');
+  await page.goto("/");
   await disableMotion(page);
-  await expect(page.getByRole('img', { name: 'Cairn' })).toBeVisible();
+  await expect(page.getByRole("img", { name: "Cairn" })).toBeVisible();
   await expect(
-    page.getByRole('heading', { name: 'Overview', level: 1 }),
+    page.getByRole("heading", { name: "Overview", level: 1 }),
   ).toBeVisible();
-  await expect(page.getByLabel('Docker object counts')).toContainText('100');
+  await expect(page.getByLabel("Docker object counts")).toContainText("100");
 
   const firstRenderMs = await page.evaluate(() => performance.now());
   annotatePerf(
     testInfo,
-    'seed dashboard first meaningful render',
+    "seed dashboard first meaningful render",
     firstRenderMs,
   );
   expect(
@@ -179,11 +179,11 @@ test('seed-scale fixture meets release responsiveness budgets', async ({
   ).toBeLessThanOrEqual(firstRenderBudgetMs);
 
   for (const label of [
-    'Projects',
-    'Containers',
-    'Images',
-    'Volumes',
-    'Networks',
+    "Projects",
+    "Containers",
+    "Images",
+    "Volumes",
+    "Networks",
   ]) {
     const route = routes.find((candidate) => candidate.label === label);
     const elapsed = await openRouteForBudget(page, route);
@@ -195,28 +195,28 @@ test('seed-scale fixture meets release responsiveness budgets', async ({
   }
 
   await openRoute(page, {
-    label: 'Containers',
-    heading: 'Containers',
-    slug: 'containers',
+    label: "Containers",
+    heading: "Containers",
+    slug: "containers",
   });
   const filterMs = await fillInputAndMeasureFrame(
     page,
-    'Search inventory',
-    'service-042',
+    "Search inventory",
+    "service-042",
   );
-  annotatePerf(testInfo, 'container inventory filter', filterMs);
+  annotatePerf(testInfo, "container inventory filter", filterMs);
   expect(
     filterMs,
     `container inventory filter took ${filterMs.toFixed(1)}ms`,
   ).toBeLessThanOrEqual(filterBudgetMs);
-  await expect(page.getByText('service-042').first()).toBeVisible();
+  await expect(page.getByText("service-042").first()).toBeVisible();
 
   const logsElapsed = await openRouteForBudget(page, {
-    label: 'Logs',
-    heading: 'Logs',
-    slug: 'logs',
+    label: "Logs",
+    heading: "Logs",
+    slug: "logs",
   });
-  annotatePerf(testInfo, 'Logs route switch', logsElapsed);
+  annotatePerf(testInfo, "Logs route switch", logsElapsed);
   expect(
     logsElapsed,
     `Logs route switch took ${logsElapsed.toFixed(1)}ms`,
@@ -227,32 +227,32 @@ test('seed-scale fixture meets release responsiveness budgets', async ({
   });
   await expect(page.getByText(/5[,. ]000 visible lines/)).toBeVisible();
 
-  const viewer = page.getByRole('log', { name: 'Log lines' });
+  const viewer = page.getByRole("log", { name: "Log lines" });
   await expect(
-    viewer.getByText('INFO release validation log line 4999'),
+    viewer.getByText("INFO release validation log line 4999"),
   ).toBeVisible();
 
-  const renderedRows = await viewer.locator('div.absolute').count();
-  annotatePerf(testInfo, 'rendered log rows', renderedRows, 'rows');
+  const renderedRows = await viewer.locator("div.absolute").count();
+  annotatePerf(testInfo, "rendered log rows", renderedRows, "rows");
   expect(renderedRows).toBeLessThanOrEqual(80);
 });
 
 async function openRoute(page, route) {
-  const nav = page.getByRole('navigation', { name: 'Main navigation' });
+  const nav = page.getByRole("navigation", { name: "Main navigation" });
   await nav
-    .getByRole('button', {
+    .getByRole("button", {
       name: new RegExp(`^${escapeRegExp(route.label)}\\b`),
     })
     .click();
   await expect(
-    page.getByRole('heading', { name: route.heading, level: 1 }),
+    page.getByRole("heading", { name: route.heading, level: 1 }),
   ).toBeVisible();
-  await page.waitForLoadState('networkidle');
+  await page.waitForLoadState("networkidle");
 }
 
 async function openRouteForBudget(page, route) {
   return page.evaluate(async ({ heading, label }) => {
-    const buttons = Array.from(document.querySelectorAll('nav button'));
+    const buttons = Array.from(document.querySelectorAll("nav button"));
     const button = buttons.find((item) =>
       item.textContent?.trim().startsWith(label),
     );
@@ -264,7 +264,7 @@ async function openRouteForBudget(page, route) {
     button.click();
     for (let frame = 0; frame < 30; frame += 1) {
       await new Promise(requestAnimationFrame);
-      const headingNode = Array.from(document.querySelectorAll('h1')).find(
+      const headingNode = Array.from(document.querySelectorAll("h1")).find(
         (node) => node.textContent?.trim() === heading,
       );
       if (headingNode) {
@@ -278,8 +278,8 @@ async function openRouteForBudget(page, route) {
 async function fillInputAndMeasureFrame(page, label, value) {
   return page.evaluate(
     async ({ label: inputLabel, value: nextValue }) => {
-      const input = Array.from(document.querySelectorAll('input')).find(
-        (candidate) => candidate.getAttribute('aria-label') === inputLabel,
+      const input = Array.from(document.querySelectorAll("input")).find(
+        (candidate) => candidate.getAttribute("aria-label") === inputLabel,
       );
       if (!(input instanceof HTMLInputElement)) {
         throw new Error(`Missing input with label ${inputLabel}`);
@@ -287,16 +287,16 @@ async function fillInputAndMeasureFrame(page, label, value) {
 
       const valueSetter = Object.getOwnPropertyDescriptor(
         HTMLInputElement.prototype,
-        'value',
+        "value",
       )?.set;
       const start = performance.now();
       input.focus();
       valueSetter?.call(input, nextValue);
       input.dispatchEvent(
-        new InputEvent('input', {
+        new InputEvent("input", {
           bubbles: true,
           data: nextValue,
-          inputType: 'insertText',
+          inputType: "insertText",
         }),
       );
       await new Promise(requestAnimationFrame);
@@ -342,10 +342,10 @@ async function disableMotion(page) {
 
 async function assertNoSeriousAxeViolations(page, label) {
   const results = await new AxeBuilder({ page })
-    .disableRules(['color-contrast'])
+    .disableRules(["color-contrast"])
     .analyze();
   const violations = results.violations
-    .filter((violation) => ['critical', 'serious'].includes(violation.impact))
+    .filter((violation) => ["critical", "serious"].includes(violation.impact))
     .map((violation) => ({
       id: violation.id,
       impact: violation.impact,
@@ -358,7 +358,10 @@ async function assertNoSeriousAxeViolations(page, label) {
 
 async function assertScrollRegionCanReachOverflow(page, label) {
   const metrics = await scrollRegionMetrics(page);
-  expect(metrics.clientHeight, `${label} scroll region has no height`).toBeGreaterThan(0);
+  expect(
+    metrics.clientHeight,
+    `${label} scroll region has no height`,
+  ).toBeGreaterThan(0);
   if (metrics.scrollHeight > metrics.clientHeight + 1) {
     expect(
       metrics.afterScrollTop,
@@ -368,7 +371,7 @@ async function assertScrollRegionCanReachOverflow(page, label) {
 }
 
 async function scrollRegionMetrics(page) {
-  return page.getByTestId('app-scroll-region').evaluate((node) => {
+  return page.getByTestId("app-scroll-region").evaluate((node) => {
     node.scrollTop = 0;
     const beforeScrollTop = node.scrollTop;
     node.scrollTop = node.scrollHeight;
@@ -418,7 +421,7 @@ async function assertMatchesGolden(page, route, testInfo) {
     fs.mkdirSync(goldenDir, { recursive: true });
     fs.writeFileSync(goldenPath, actual);
     testInfo.annotations.push({
-      type: 'visual-baseline',
+      type: "visual-baseline",
       description: `Updated ${path.relative(process.cwd(), goldenPath)}`,
     });
     return;
@@ -469,14 +472,14 @@ async function assertMatchesGolden(page, route, testInfo) {
 }
 
 async function captureFullRouteScreenshot(page) {
-  await page.getByTestId('app-scroll-region').evaluate((node) => {
+  await page.getByTestId("app-scroll-region").evaluate((node) => {
     node.scrollTop = 0;
-    document.documentElement.dataset.cairnVisualFullpage = 'true';
+    document.documentElement.dataset.cairnVisualFullpage = "true";
   });
   await page.waitForTimeout(0);
   try {
     return await page.screenshot({
-      animations: 'disabled',
+      animations: "disabled",
       fullPage: true,
     });
   } finally {
@@ -486,13 +489,13 @@ async function captureFullRouteScreenshot(page) {
   }
 }
 
-function annotatePerf(testInfo, label, value, unit = 'ms') {
+function annotatePerf(testInfo, label, value, unit = "ms") {
   testInfo.annotations.push({
-    type: 'perf',
+    type: "perf",
     description: `${label}: ${Number(value).toFixed(1)}${unit}`,
   });
 }
 
 function escapeRegExp(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }

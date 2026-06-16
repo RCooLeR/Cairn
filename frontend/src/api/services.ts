@@ -11,6 +11,6 @@ export {
   SettingsService,
   TerminalService,
   UpdateService,
-} from '../../bindings/github.com/RCooLeR/Cairn/internal/services/index.js';
+} from "../../bindings/github.com/RCooLeR/Cairn/internal/services/index.js";
 
-export * as Models from '../../bindings/github.com/RCooLeR/Cairn/internal/models/models.js';
+export * as Models from "../../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";

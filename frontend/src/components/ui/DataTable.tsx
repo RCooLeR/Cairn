@@ -1,9 +1,9 @@
-import type { ReactNode } from 'react';
+import type { ReactNode } from "react";
 
-import { ArrowDownUp } from 'lucide-react';
-import { useMemo, useState } from 'react';
+import { ArrowDownUp } from "lucide-react";
+import { useMemo, useState } from "react";
 
-import { cx } from './utils';
+import { cx } from "./utils";
 
 const virtualRowHeight = 44;
 const virtualViewportHeight = 420;
@@ -32,11 +32,11 @@ type DataTableProps<T> = {
 
 type SortState = {
   columnID: string;
-  direction: 'asc' | 'desc';
+  direction: "asc" | "desc";
 };
 
 export function DataTable<T>({
-  ariaLabel = 'Data table',
+  ariaLabel = "Data table",
   bulkActions,
   columns,
   empty,
@@ -62,16 +62,18 @@ export function DataTable<T>({
     return [...rows].sort((left, right) => {
       const leftValue = sortColumn.sortValue?.(left);
       const rightValue = sortColumn.sortValue?.(right);
-      const direction = sort.direction === 'asc' ? 1 : -1;
+      const direction = sort.direction === "asc" ? 1 : -1;
 
-      if (typeof leftValue === 'number' && typeof rightValue === 'number') {
+      if (typeof leftValue === "number" && typeof rightValue === "number") {
         return (leftValue - rightValue) * direction;
       }
 
-      return String(leftValue).localeCompare(String(rightValue), undefined, {
-        numeric: true,
-        sensitivity: 'base',
-      }) * direction;
+      return (
+        String(leftValue).localeCompare(String(rightValue), undefined, {
+          numeric: true,
+          sensitivity: "base",
+        }) * direction
+      );
     });
   }, [columns, rows, sort]);
 
@@ -82,8 +84,11 @@ export function DataTable<T>({
 
     setSort((current) =>
       current?.columnID === column.id
-        ? { columnID: column.id, direction: current.direction === 'asc' ? 'desc' : 'asc' }
-        : { columnID: column.id, direction: 'asc' },
+        ? {
+            columnID: column.id,
+            direction: current.direction === "asc" ? "desc" : "asc",
+          }
+        : { columnID: column.id, direction: "asc" },
     );
   };
   const virtualized = visibleRows.length > virtualizeRowThreshold;
@@ -92,7 +97,10 @@ export function DataTable<T>({
   const maxVirtualStart = Math.max(0, visibleRows.length - virtualWindowSize);
   const virtualStart = virtualized
     ? Math.min(
-        Math.max(0, Math.floor(scrollTop / virtualRowHeight) - virtualOverscanRows),
+        Math.max(
+          0,
+          Math.floor(scrollTop / virtualRowHeight) - virtualOverscanRows,
+        ),
         maxVirtualStart,
       )
     : 0;
@@ -137,17 +145,21 @@ export function DataTable<T>({
           <thead className="sticky top-0 z-10 bg-bg-inset text-xs text-text-muted">
             <tr>
               {onToggleRow ? (
-                <th aria-label="Selection" className="w-10 px-3 py-2" scope="col" />
+                <th
+                  aria-label="Selection"
+                  className="w-10 px-3 py-2"
+                  scope="col"
+                />
               ) : null}
               {columns.map((column) => (
                 <th
                   aria-sort={
                     column.sortable
                       ? sort?.columnID === column.id
-                        ? sort.direction === 'asc'
-                          ? 'ascending'
-                          : 'descending'
-                        : 'none'
+                        ? sort.direction === "asc"
+                          ? "ascending"
+                          : "descending"
+                        : "none"
                       : undefined
                   }
                   className="px-3 py-2 font-medium"
@@ -156,7 +168,11 @@ export function DataTable<T>({
                 >
                   {column.sortable ? (
                     <button
-                      aria-label={sortButtonLabel(column.header, sort, column.id)}
+                      aria-label={sortButtonLabel(
+                        column.header,
+                        sort,
+                        column.id,
+                      )}
                       className="inline-flex items-center gap-1 text-left hover:text-text-primary"
                       onClick={() => toggleSort(column)}
                       type="button"
@@ -174,7 +190,10 @@ export function DataTable<T>({
           <tbody className="divide-y divide-border">
             {topPadding > 0 ? (
               <tr aria-hidden="true">
-                <td colSpan={columnCount} style={{ height: topPadding, padding: 0 }} />
+                <td
+                  colSpan={columnCount}
+                  style={{ height: topPadding, padding: 0 }}
+                />
               </tr>
             ) : null}
             {virtualRows.map((row) => {
@@ -182,7 +201,13 @@ export function DataTable<T>({
               const selected = selectedIDs.has(id);
               const label = rowLabel?.(row) || id;
               return (
-                <tr className={cx('hover:bg-bg-inset', selected && 'bg-accent/10')} key={id}>
+                <tr
+                  className={cx(
+                    "hover:bg-bg-inset",
+                    selected && "bg-accent/10",
+                  )}
+                  key={id}
+                >
                   {onToggleRow ? (
                     <td className="px-3 py-2">
                       <input
@@ -194,7 +219,10 @@ export function DataTable<T>({
                     </td>
                   ) : null}
                   {columns.map((column) => (
-                    <td className="truncate px-3 py-2 text-text-secondary" key={column.id}>
+                    <td
+                      className="truncate px-3 py-2 text-text-secondary"
+                      key={column.id}
+                    >
                       {column.render(row)}
                     </td>
                   ))}
@@ -203,7 +231,10 @@ export function DataTable<T>({
             })}
             {bottomPadding > 0 ? (
               <tr aria-hidden="true">
-                <td colSpan={columnCount} style={{ height: bottomPadding, padding: 0 }} />
+                <td
+                  colSpan={columnCount}
+                  style={{ height: bottomPadding, padding: 0 }}
+                />
               </tr>
             ) : null}
           </tbody>
@@ -221,5 +252,5 @@ function sortButtonLabel(
   if (sort?.columnID !== columnID) {
     return `Sort by ${header}, not sorted`;
   }
-  return `Sort by ${header}, sorted ${sort.direction === 'asc' ? 'ascending' : 'descending'}`;
+  return `Sort by ${header}, sorted ${sort.direction === "asc" ? "ascending" : "descending"}`;
 }

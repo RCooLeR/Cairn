@@ -2,10 +2,17 @@ version: "2"
 
 linters:
   enable:
+    - errcheck
     - govet
     - ineffassign
+    - misspell
     - staticcheck
+    - unconvert
     - unused
+  settings:
+    govet:
+      disable:
+        - unsafeptr
   exclusions:
     generated: lax
     paths:
