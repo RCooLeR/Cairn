@@ -31,6 +31,48 @@ function Invoke-GoTest([string[]]$Packages, [string[]]$GoArgs) {
   }
 }
 
+function Invoke-GoTestNames([string]$Package, [string[]]$TestNames, [string]$Timeout = "3m") {
+  if ($TestNames.Count -eq 0) {
+    throw "No tests configured for $Package"
+  }
+  $escapedNames = $TestNames | ForEach-Object { [regex]::Escape($_) }
+  $runPattern = "^({0})$" -f ($escapedNames -join "|")
+  $started = New-Object "System.Collections.Generic.HashSet[string]"
+  $output = @()
+
+  Push-Location $root
+  try {
+    $output = & go test $Package -json -run $runPattern -count=1 "-timeout=$Timeout" 2>&1
+    $exitCode = $LASTEXITCODE
+  } finally {
+    Pop-Location
+  }
+
+  foreach ($line in $output) {
+    if ([string]::IsNullOrWhiteSpace($line)) {
+      continue
+    }
+    try {
+      $event = $line | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+      continue
+    }
+    if ($event.Action -eq "run" -and $event.Test) {
+      [void]$started.Add([string]$event.Test)
+    }
+  }
+
+  if ($exitCode -ne 0) {
+    $output | ForEach-Object { Write-Host $_ }
+    throw "go test failed for $Package with exit code $exitCode"
+  }
+
+  $missing = @($TestNames | Where-Object { !$started.Contains($_) })
+  if ($missing.Count -gt 0) {
+    throw "Security suite for $Package did not start expected test(s): $($missing -join ', ')"
+  }
+}
+
 function Invoke-FrontendNpm([string[]]$NpmArgs) {
   Push-Location (Join-Path $root "frontend")
   try {
@@ -76,19 +118,71 @@ foreach ($item in $Suite) {
     }
     "security" {
       Invoke-ReleaseStep "security policy review tests" {
-        $packages = @(
-          "./internal/security",
-          "./internal/providers",
-          "./internal/registry",
-          "./internal/docker",
-          "./internal/services",
-          "./internal/store",
-          "./internal/updates",
-          "./internal/backups",
-          "./internal/terminal"
+        $securityTests = @(
+          @{
+            Package = "./internal/security"
+            Tests = @(
+              "TestContainerRiskMapping",
+              "TestPlanStoreExpiresAndRequiresTypedName",
+              "TestRequireConfirmationTrimsTypedNameAndAllowsSafePlans",
+              "TestPlanStoreContextAndExpiry",
+              "TestNewContainerActionPlanCommandsEffectsAndRisks",
+              "TestNewContainerActionPlanValidationAndFallbackLabels",
+              "TestProjectPlanStoreTake",
+              "TestPlanStoresPruneExpiredEntriesOnSave",
+              "TestPlanStoreRejectsHighRiskWithoutTypedName",
+              "TestDockerObjectPlansDeclareTypedConfirmationForHighRisk",
+              "TestNewProjectActionPlanRequiresTypedConfirmationForHighRisk"
+            )
+          }
+          @{
+            Package = "./internal/providers"
+            Tests = @("TestExistingContextDetectHealthyWithUnencryptedTCPWarning")
+          }
+          @{
+            Package = "./internal/registry"
+            Tests = @(
+              "TestLoginPipesSecretThroughStdin",
+              "TestRegistryCLIArgRejectsFlagLikeHosts",
+              "TestPlainHTTPRegistryRequiresExactLoopbackHost"
+            )
+          }
+          @{
+            Package = "./internal/docker"
+            Tests = @("TestClientObjectsDTOsRawInspectAndCacheReconcile")
+          }
+          @{
+            Package = "./internal/services"
+            Tests = @(
+              "TestSettingsServiceGetCheatsheetSafetyContract",
+              "TestDockerServiceLifecycleAuditsAndPlans",
+              "TestProjectServicePlanDownWithVolumesRequiresTypedName"
+            )
+          }
+          @{
+            Package = "./internal/store"
+            Tests = @(
+              "TestOpenCreatesPrivateStoreDirectory",
+              "TestSettingsDefaultsAndRoundTrip",
+              "TestAuditListEscapesTopicAndPreservesZeroDuration"
+            )
+          }
+          @{
+            Package = "./internal/updates"
+            Tests = @("TestManagerApplyUpdateHealthFailureRollsBack")
+          }
+          @{
+            Package = "./internal/backups"
+            Tests = @("TestRestoreOverwriteRequiresTypedNameAndRunsHelper")
+          }
+          @{
+            Package = "./internal/terminal"
+            Tests = @("TestCheatsheetRisksMatchSecurityPolicy")
+          }
         )
-        $run = "Test(ContainerRiskMapping|PlanStore.*|RequireConfirmation.*|NewContainerActionPlan.*|ProjectPlanStoreTake|ExistingContextDetectHealthyWithUnencryptedTCPWarning|LoginPipesSecretThroughStdin|ClientObjectsDTOsRawInspectAndCacheReconcile|DockerServiceLifecycleAuditsAndPlans|ProjectServicePlanDownWithVolumesRequiresTypedName|SettingsDefaultsAndRoundTrip|ManagerApplyUpdateHealthFailureRollsBack|RestoreOverwriteRequiresTypedNameAndRunsHelper|CheatsheetRisksMatchSecurityPolicy)$"
-        Invoke-GoTest -Packages $packages -GoArgs @("-run", $run, "-count=1", "-timeout=3m")
+        foreach ($entry in $securityTests) {
+          Invoke-GoTestNames -Package $entry.Package -TestNames $entry.Tests -Timeout "3m"
+        }
       }
     }
     "performance" {
