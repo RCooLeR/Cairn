@@ -1,4 +1,3 @@
-import type { LucideIcon } from "lucide-react";
 import type {
   AuditEntry,
   BackupSummary,
@@ -142,9 +141,11 @@ import {
   Modal,
   Skeleton,
   StatusDot,
+  TableSkeleton,
   ToastViewport,
   Tooltip,
 } from "./components/ui";
+import { NotificationCenter } from "./components/notifications/NotificationCenter";
 import {
   CommandPalette,
   TerminalPage,
@@ -153,7 +154,6 @@ import {
 import { useAppStore } from "./state/appStore";
 import { useInventoryStore } from "./state/inventoryStore";
 import { useDebouncedRuntimeEvent } from "./hooks/useDebouncedRuntimeEvent";
-import { useFocusTrap } from "./hooks/useFocusTrap";
 import { useToastQueue, type ToastInput } from "./hooks/useToastQueue";
 import {
   chartColors,
@@ -162,21 +162,11 @@ import {
   emptyContainerStatusChartSegment,
 } from "./overview/dashboardData";
 import { frontendVersion } from "./version";
+import type { NavItem, PageID } from "./types/navigation";
 
 const logoUrl = "/cairn-logo.png";
 const MonacoEditor = lazy(() => import("@monaco-editor/react"));
 
-type PageID =
-  | "overview"
-  | "projects"
-  | "updates"
-  | "containers"
-  | "images"
-  | "volumes"
-  | "networks"
-  | "logs"
-  | "terminal"
-  | "settings";
 type SettingsSectionID =
   | "general"
   | "providers"
@@ -238,12 +228,6 @@ type SetupBackendID =
   | "linux_native"
   | "macos_colima"
   | "existing_context";
-
-type NavItem = {
-  id: PageID;
-  label: string;
-  icon: LucideIcon;
-};
 
 type InspectState = {
   open: boolean;
@@ -5071,129 +5055,6 @@ function GlobalStateBanner({
             Retry
           </Button>
         )}
-      </div>
-    </div>
-  );
-}
-
-function NotificationCenter({
-  error,
-  loading,
-  notifications,
-  onClose,
-  onMarkAllRead,
-  onNavigate,
-  open,
-}: {
-  error: string | null;
-  loading: boolean;
-  notifications: Notification[];
-  onClose: () => void;
-  onMarkAllRead: () => void;
-  onNavigate: (page: PageID) => void;
-  open: boolean;
-}) {
-  const panelRef = useRef<HTMLDivElement | null>(null);
-
-  useFocusTrap(open, panelRef, onClose);
-
-  if (!open) {
-    return null;
-  }
-
-  const unread = notifications.filter(
-    (notification) => !notification.read,
-  ).length;
-
-  return (
-    <div
-      aria-label="Notification center"
-      aria-modal="true"
-      className="absolute right-0 top-11 z-40 w-[min(360px,calc(100vw-2rem))] rounded-card border border-border bg-bg-panel shadow-2xl"
-      ref={panelRef}
-      role="dialog"
-      tabIndex={-1}
-    >
-      <div className="flex items-center justify-between gap-3 border-b border-border px-4 py-3">
-        <div>
-          <div className="font-medium text-text-primary">Notifications</div>
-          <div className="text-xs text-text-muted">{unread} unread</div>
-        </div>
-        <div className="flex gap-2">
-          <Button
-            disabled={unread === 0 || loading}
-            disabledReason="No unread notifications"
-            onClick={onMarkAllRead}
-            size="sm"
-            variant="secondary"
-          >
-            Mark all read
-          </Button>
-          <Button onClick={onClose} size="sm" variant="ghost">
-            Close
-          </Button>
-        </div>
-      </div>
-      <div className="max-h-[420px] overflow-y-auto p-2">
-        {error ? (
-          <div className="rounded-control border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
-            {error}
-          </div>
-        ) : null}
-        {loading && notifications.length === 0 ? <TableSkeleton /> : null}
-        {!loading && notifications.length === 0 ? (
-          <EmptyState
-            body="Provider, update, backup, and system messages appear here."
-            icon={<Bell size={26} />}
-            title="No notifications"
-          />
-        ) : null}
-        {notifications.map((notification) => {
-          const target = notificationTargetPage(notification.topic);
-          return (
-            <button
-              className={[
-                "mb-2 block w-full rounded-control border p-3 text-left text-sm transition",
-                notification.read
-                  ? "border-border bg-bg-inset text-text-secondary"
-                  : "border-accent/30 bg-accent/10 text-text-primary",
-                target ? "hover:border-border-strong" : "",
-              ].join(" ")}
-              key={notification.id}
-              onClick={() => {
-                if (target) {
-                  onNavigate(target);
-                }
-              }}
-              type="button"
-            >
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2">
-                    <Badge tone={notificationTone(notification.level)}>
-                      {notification.level || "info"}
-                    </Badge>
-                    <span className="truncate font-medium">
-                      {notification.title}
-                    </span>
-                  </div>
-                  {notification.body ? (
-                    <div className="mt-2 text-text-muted">
-                      {notification.body}
-                    </div>
-                  ) : null}
-                </div>
-                {!notification.read ? (
-                  <span className="mt-1 h-2 w-2 rounded-full bg-warn" />
-                ) : null}
-              </div>
-              <div className="mt-2 flex items-center justify-between gap-2 text-xs text-text-muted">
-                <span>{notification.topic || "system"}</span>
-                <span>{relativeTime(dateMillis(notification.createdAt))}</span>
-              </div>
-            </button>
-          );
-        })}
       </div>
     </div>
   );
@@ -15300,15 +15161,6 @@ function StatusBlock({
   );
 }
 
-function TableSkeleton() {
-  return (
-    <div className="space-y-3">
-      <Skeleton className="h-8 w-80" />
-      <Skeleton className="h-[420px] w-full" />
-    </div>
-  );
-}
-
 function PortList({ ports }: { ports: PortBinding[] }) {
   if (ports.length === 0) {
     return <span>-</span>;
@@ -16173,23 +16025,6 @@ function setupCheckRow(
   return { label, state: "ok" as StatusToneID, detail: "Ready" };
 }
 
-function notificationTone(level: string): BadgeTone {
-  switch (level) {
-    case "ok":
-    case "success":
-      return "ok";
-    case "warn":
-    case "warning":
-      return "warn";
-    case "error":
-      return "error";
-    case "info":
-      return "info";
-    default:
-      return "neutral";
-  }
-}
-
 function filterAuditEntries(entries: AuditEntry[], filter: AuditFilterState) {
   const action = filter.action.trim().toLowerCase();
   const projectID = filter.projectID.trim().toLowerCase();
@@ -16232,24 +16067,6 @@ function auditRangeCutoff(range: AuditRangeID) {
     case "90d":
       return now - 90 * 24 * 60 * 60 * 1000;
     case "all":
-      return null;
-  }
-}
-
-function notificationTargetPage(topic: string): PageID | null {
-  switch (topic) {
-    case "app-update":
-      return "settings";
-    case "backup":
-      return "volumes";
-    case "project":
-      return "projects";
-    case "provider":
-    case "system":
-      return "overview";
-    case "update":
-      return "updates";
-    default:
       return null;
   }
 }
