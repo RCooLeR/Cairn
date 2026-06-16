@@ -5,7 +5,7 @@ import type {
   ProjectSummary,
   TerminalSessionInfo,
 } from "../../../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
-import type { ReactNode } from "react";
+import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react";
 
 import { Terminal as XTerm } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
@@ -127,6 +127,36 @@ export function TerminalPage({
   const activeSession = useMemo(
     () => sessions.find((session) => session.id === activeSessionID) ?? null,
     [activeSessionID, sessions],
+  );
+  const activateSessionAt = useCallback(
+    (index: number) => {
+      const session = sessions[index];
+      if (session) {
+        setActiveSessionID(session.id);
+      }
+    },
+    [sessions],
+  );
+  const onSessionTabKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLButtonElement>, index: number) => {
+      if (sessions.length === 0) {
+        return;
+      }
+      if (event.key === "ArrowRight") {
+        event.preventDefault();
+        activateSessionAt((index + 1) % sessions.length);
+      } else if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        activateSessionAt((index - 1 + sessions.length) % sessions.length);
+      } else if (event.key === "Home") {
+        event.preventDefault();
+        activateSessionAt(0);
+      } else if (event.key === "End") {
+        event.preventDefault();
+        activateSessionAt(sessions.length - 1);
+      }
+    },
+    [activateSessionAt, sessions.length],
   );
   const runningContainers = useMemo(
     () =>
@@ -573,46 +603,50 @@ export function TerminalPage({
           className="flex min-h-11 items-center gap-2 overflow-x-auto border-b border-border bg-bg-inset px-2 py-2"
           role="tablist"
         >
-          {sessions.map((session) => (
-            <div
-              aria-selected={activeSessionID === session.id}
-              key={session.id}
-              className={[
-                "flex h-8 max-w-56 shrink-0 items-center gap-2 rounded-control border px-2 text-sm",
-                activeSessionID === session.id
-                  ? "border-accent bg-accent/10 text-accent"
-                  : "border-border bg-bg-card text-text-secondary hover:text-text-primary",
-              ].join(" ")}
-              onClick={() => setActiveSessionID(session.id)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" || event.key === " ") {
-                  event.preventDefault();
-                  setActiveSessionID(session.id);
-                }
-              }}
-              role="tab"
-              tabIndex={0}
-            >
-              <SessionIcon kind={session.kind} />
-              <span className="truncate">{session.title}</span>
-              {session.isRoot ? (
-                <Badge tone="error">
-                  <ShieldAlert size={11} /> root
-                </Badge>
-              ) : null}
-              <button
-                aria-label={`Close ${session.title}`}
-                className="rounded p-0.5 hover:bg-bg-panel"
-                onClick={(event) => {
-                  event.stopPropagation();
-                  closeSession(session);
-                }}
-                type="button"
+          {sessions.map((session, index) => {
+            const active = activeSessionID === session.id;
+            const tabID = `terminal-tab-${session.id}`;
+            const panelID = `terminal-panel-${session.id}`;
+            return (
+              <div
+                key={session.id}
+                className={[
+                  "flex h-8 max-w-56 shrink-0 items-center gap-2 rounded-control border px-2 text-sm",
+                  active
+                    ? "border-accent bg-accent/10 text-accent"
+                    : "border-border bg-bg-card text-text-secondary hover:text-text-primary",
+                ].join(" ")}
               >
-                <X size={13} />
-              </button>
-            </div>
-          ))}
+                <button
+                  aria-controls={panelID}
+                  aria-selected={active}
+                  className="flex min-w-0 flex-1 items-center gap-2 text-left outline-none focus-visible:text-text-primary"
+                  id={tabID}
+                  onClick={() => setActiveSessionID(session.id)}
+                  onKeyDown={(event) => onSessionTabKeyDown(event, index)}
+                  role="tab"
+                  tabIndex={active ? 0 : -1}
+                  type="button"
+                >
+                  <SessionIcon kind={session.kind} />
+                  <span className="truncate">{session.title}</span>
+                  {session.isRoot ? (
+                    <Badge tone="error">
+                      <ShieldAlert size={11} /> root
+                    </Badge>
+                  ) : null}
+                </button>
+                <button
+                  aria-label={`Close ${session.title}`}
+                  className="rounded p-0.5 hover:bg-bg-panel"
+                  onClick={() => closeSession(session)}
+                  type="button"
+                >
+                  <X size={13} />
+                </button>
+              </div>
+            );
+          })}
           {sessions.length === 0 ? (
             <span className="text-sm text-text-muted">
               No terminal sessions
@@ -1074,9 +1108,12 @@ function TerminalSurface({
 
   return (
     <div
+      aria-labelledby={`terminal-tab-${session.id}`}
       className={active ? "absolute inset-0 p-2" : "hidden"}
       data-terminal-session={session.id}
+      id={`terminal-panel-${session.id}`}
       ref={hostRef}
+      role="tabpanel"
     />
   );
 }
