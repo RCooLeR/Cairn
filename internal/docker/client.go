@@ -408,6 +408,9 @@ func mapDockerError(action string, err error) error {
 	if cerrdefs.IsConflict(err) {
 		return apperror.Wrap(apperror.Conflict, action+" conflicted", err, apperror.WithDetail(err.Error()))
 	}
+	if isDockerConflictMessage(err) {
+		return apperror.Wrap(apperror.Conflict, action+" conflicted", err, apperror.WithDetail(err.Error()))
+	}
 	if errors.Is(err, context.Canceled) {
 		return apperror.Wrap(apperror.Cancelled, action+" cancelled", err)
 	}
@@ -415,6 +418,13 @@ func mapDockerError(action string, err error) error {
 		return apperror.Wrap(apperror.Timeout, action+" timed out", err)
 	}
 	return apperror.Wrap(apperror.DockerUnreachable, action+" failed", err, apperror.WithDetail(err.Error()))
+}
+
+func isDockerConflictMessage(err error) bool {
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "port is already allocated") ||
+		strings.Contains(message, "address already in use") ||
+		strings.Contains(message, "is already in use")
 }
 
 func (c *Client) providerID() string {

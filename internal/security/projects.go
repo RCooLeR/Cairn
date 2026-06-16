@@ -2,6 +2,7 @@ package security
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,6 +42,7 @@ func NewProjectPlanStore(now func() time.Time) *ProjectPlanStore {
 func (s *ProjectPlanStore) Save(plan ProjectPlan) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	pruneExpiredPlans(s.now(), s.plans, func(plan ProjectPlan) models.CommandPlan { return plan.Plan })
 	s.plans[plan.Plan.PlanID] = plan
 }
 
@@ -58,9 +60,32 @@ func (s *ProjectPlanStore) Take(ctx context.Context, planID string, typedName st
 		delete(s.plans, planID)
 		return ProjectPlan{}, apperror.New(apperror.PlanExpired, "Plan expired")
 	}
+	pruneExpiredPlans(s.now(), s.plans, func(plan ProjectPlan) models.CommandPlan { return plan.Plan })
 	if err := RequireConfirmation(plan.Plan, typedName); err != nil {
 		return ProjectPlan{}, err
 	}
 	delete(s.plans, planID)
 	return plan, nil
+}
+
+func NewProjectActionPlan(plan models.CommandPlan, action string, projectID string, removeVolumes bool) (ProjectPlan, error) {
+	action = strings.ToLower(strings.TrimSpace(action))
+	switch action {
+	case ProjectActionStart, ProjectActionStop, ProjectActionRestart, ProjectActionPull, ProjectActionRedeploy, ProjectActionDown:
+	default:
+		return ProjectPlan{}, apperror.New(apperror.Conflict, "Unsupported project action", apperror.WithDetail(action))
+	}
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return ProjectPlan{}, apperror.New(apperror.Conflict, "Project ID is required")
+	}
+	if requiresTypedConfirmation(plan.Risk) && strings.TrimSpace(plan.RequiresTypedName) == "" {
+		return ProjectPlan{}, apperror.New(apperror.ConfirmationRequired, "Typed confirmation is required")
+	}
+	return ProjectPlan{
+		Plan:          plan,
+		Action:        action,
+		ProjectID:     projectID,
+		RemoveVolumes: removeVolumes,
+	}, nil
 }

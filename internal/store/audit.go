@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/models"
@@ -36,7 +37,7 @@ func (r *AuditRepository) Insert(ctx context.Context, record AuditRecord) (int64
 		record.CreatedAt = time.Now().UTC()
 	}
 	var durationMS any
-	if millis := record.Duration.Milliseconds(); millis > 0 {
+	if millis := record.Duration.Milliseconds(); millis > 0 || (record.Status != "" && record.Status != "started") {
 		durationMS = millis
 	}
 	result, err := r.db.ExecContext(ctx, `
@@ -60,16 +61,17 @@ func (r *AuditRepository) List(ctx context.Context, filter models.AuditFilter) (
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
+	topic := escapeAuditLike(filter.Topic)
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, action, COALESCE(target_type, ''), COALESCE(target_id, ''), status,
 		       COALESCE(error, ''), created_at, COALESCE(command, ''),
 		       COALESCE(risk, ''), COALESCE(provider_id, ''), COALESCE(project_id, ''),
 		       duration_ms
 		FROM audit_log
-		WHERE (? = '' OR action LIKE ? || '%')
+		WHERE (? = '' OR action LIKE ? || '%' ESCAPE '\')
 		ORDER BY created_at DESC, id DESC
 		LIMIT ?
-	`, filter.Topic, filter.Topic, limit)
+	`, topic, topic, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -110,6 +112,14 @@ func (r *AuditRepository) List(ctx context.Context, filter models.AuditFilter) (
 		entries = append(entries, entry)
 	}
 	return entries, rows.Err()
+}
+
+func escapeAuditLike(value string) string {
+	value = strings.TrimSpace(value)
+	value = strings.ReplaceAll(value, `\`, `\\`)
+	value = strings.ReplaceAll(value, `%`, `\%`)
+	value = strings.ReplaceAll(value, `_`, `\_`)
+	return value
 }
 
 func auditMetadata(command string, risk string, providerID string, projectID string, targetType string, durationMS sql.NullInt64) map[string]any {

@@ -1444,6 +1444,8 @@ func TestClientRealDockerCreateRunSaveLoadIntegration(t *testing.T) {
 	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
 	imageRef := "cairn-test-run:" + suffix
 	containerName := "cairn-test-run-" + suffix
+	portOwnerName := containerName + "-port-owner"
+	portConflictName := containerName + "-port-conflict"
 	renamedContainer := containerName + "-renamed"
 	volumeName := "cairn_test_run_" + suffix
 	networkName := "cairn_test_run_" + suffix
@@ -1455,7 +1457,7 @@ func TestClientRealDockerCreateRunSaveLoadIntegration(t *testing.T) {
 	t.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)
 		defer cleanupCancel()
-		_ = dockerCommand(cleanupCtx, "rm", "-f", containerName, renamedContainer)
+		_ = dockerCommand(cleanupCtx, "rm", "-f", containerName, renamedContainer, portOwnerName, portConflictName)
 		_ = dockerCommand(cleanupCtx, "network", "rm", networkName)
 		_ = dockerCommand(cleanupCtx, "volume", "rm", "-f", volumeName)
 		_ = dockerCommand(cleanupCtx, "rmi", "-f", imageRef)
@@ -1503,21 +1505,37 @@ func TestClientRealDockerCreateRunSaveLoadIntegration(t *testing.T) {
 		t.Fatalf("GetNetwork(created) error = %v", err)
 	}
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	portOwnerID, err := client.RunImage(ctx, models.RunImageRequest{
+		ImageRef: imageRef,
+		Name:     portOwnerName,
+		Ports:    []models.PortMapping{{HostIP: "127.0.0.1", HostPort: "0", ContainerPort: "8080", Protocol: "tcp"}},
+		Detach:   true,
+	})
 	if err != nil {
-		t.Fatalf("reserve test port: %v", err)
+		t.Fatalf("RunImage(port owner) error = %v", err)
 	}
-	conflictPort := strconv.Itoa(listener.Addr().(*net.TCPAddr).Port)
+	portOwnerDetail, err := client.GetContainer(ctx, portOwnerID)
+	if err != nil {
+		t.Fatalf("GetContainer(port owner) error = %v", err)
+	}
+	conflictPort := ""
+	for _, binding := range portOwnerDetail.Summary.Ports {
+		if binding.ContainerPort == "8080" && binding.Protocol == "tcp" && binding.HostPort != "" {
+			conflictPort = binding.HostPort
+			break
+		}
+	}
+	if conflictPort == "" {
+		t.Fatalf("port owner bindings = %#v, want published 8080/tcp", portOwnerDetail.Summary.Ports)
+	}
 	if _, err := client.RunImage(ctx, models.RunImageRequest{
 		ImageRef: imageRef,
-		Name:     containerName + "-conflict",
+		Name:     portConflictName,
 		Ports:    []models.PortMapping{{HostIP: "127.0.0.1", HostPort: conflictPort, ContainerPort: "8080", Protocol: "tcp"}},
 		Detach:   true,
 	}); !apperror.IsCode(err, apperror.Conflict) {
-		_ = listener.Close()
 		t.Fatalf("RunImage(port conflict) error = %v, want E_CONFLICT", err)
 	}
-	_ = listener.Close()
 
 	containerID, err := client.RunImage(ctx, models.RunImageRequest{
 		ImageRef:  imageRef,

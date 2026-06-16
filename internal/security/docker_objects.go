@@ -43,6 +43,7 @@ func NewDockerObjectPlanStore(now func() time.Time) *DockerObjectPlanStore {
 func (s *DockerObjectPlanStore) Save(plan DockerObjectPlan) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	pruneExpiredPlans(s.now(), s.plans, func(plan DockerObjectPlan) models.CommandPlan { return plan.Plan })
 	s.plans[plan.Plan.PlanID] = plan
 }
 
@@ -60,6 +61,7 @@ func (s *DockerObjectPlanStore) Take(ctx context.Context, planID string, typedNa
 		delete(s.plans, planID)
 		return DockerObjectPlan{}, apperror.New(apperror.PlanExpired, "Plan expired")
 	}
+	pruneExpiredPlans(s.now(), s.plans, func(plan DockerObjectPlan) models.CommandPlan { return plan.Plan })
 	if err := RequireConfirmation(plan.Plan, typedName); err != nil {
 		return DockerObjectPlan{}, err
 	}
@@ -83,6 +85,9 @@ func NewRemoveImagePlan(image models.ImageSummary, force bool, now time.Time) (D
 	plan := commandPlan(now, "Remove image "+target, risk, command, "Removes the selected image from the Docker backend.")
 	plan.Effects = []string{
 		"Image " + target + " will be removed from the active Docker backend.",
+	}
+	if requiresTypedConfirmation(risk) {
+		plan.RequiresTypedName = target
 	}
 	if image.InUse {
 		plan.Effects = append(plan.Effects, "Containers currently reference this image; Docker may require force removal or fail the operation.")
@@ -155,6 +160,9 @@ func NewPrunePlan(kind string, now time.Time) (DockerObjectPlan, error) {
 	}
 	plan := commandPlan(now, "Prune "+pruneTitle(kind), risk, command, "Removes unused Docker data for the selected category.")
 	plan.RequiresTypedName = typedName
+	if plan.RequiresTypedName == "" && requiresTypedConfirmation(risk) {
+		plan.RequiresTypedName = "prune"
+	}
 	plan.Effects = pruneEffects(kind)
 	return DockerObjectPlan{
 		Plan:      plan,
@@ -169,7 +177,7 @@ func commandPlan(now time.Time, title string, risk models.Risk, command string, 
 		now = time.Now().UTC()
 	}
 	return models.CommandPlan{
-		PlanID:    NewPlanID(),
+		PlanID:    NewTypedPlanID("object"),
 		Title:     title,
 		Risk:      risk,
 		Commands:  []models.PlannedCommand{{Order: 1, Command: command, Risk: risk, Explanation: explanation}},
@@ -195,7 +203,7 @@ func pruneRisk(kind string) (models.Risk, string) {
 	case "system":
 		return models.RiskDangerous, "prune"
 	case "images", "containers", "build-cache":
-		return models.RiskDestructive, ""
+		return models.RiskDestructive, "prune"
 	case "networks":
 		return models.RiskNeedsConfirmation, ""
 	default:

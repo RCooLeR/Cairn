@@ -79,6 +79,9 @@ func TestRequireConfirmationTrimsTypedNameAndAllowsSafePlans(t *testing.T) {
 	if err := RequireConfirmation(models.CommandPlan{Risk: models.RiskNeedsConfirmation}, ""); err != nil {
 		t.Fatalf("confirmation-only plan error = %v, want nil", err)
 	}
+	if err := RequireConfirmation(models.CommandPlan{Risk: models.RiskDestructive}, ""); !apperror.IsCode(err, apperror.ConfirmationRequired) {
+		t.Fatalf("destructive plan without typed name error = %v, want confirmation required", err)
+	}
 	if err := RequireConfirmation(models.CommandPlan{Risk: models.RiskDangerous, RequiresTypedName: " web "}, "web"); err != nil {
 		t.Fatalf("trimmed typed name error = %v, want nil", err)
 	}
@@ -189,13 +192,16 @@ func TestNewContainerActionPlanCommandsEffectsAndRisks(t *testing.T) {
 				plan.Plan.ExpiresAt != now.Add(DefaultPlanTTL) {
 				t.Fatalf("plan = %#v", plan.Plan)
 			}
+			if !strings.HasPrefix(plan.Plan.PlanID, "plan-container-") {
+				t.Fatalf("PlanID = %q, want plan-container-*", plan.Plan.PlanID)
+			}
 			if len(plan.Plan.Effects) == 0 || plan.Plan.Effects[0] != tt.wantEffect {
 				t.Fatalf("effects = %#v, want first %q", plan.Plan.Effects, tt.wantEffect)
 			}
 			if tt.opts.RemoveVolumes && !slices.Contains(plan.Plan.Effects, "Anonymous volumes attached to the container will also be removed.") {
 				t.Fatalf("missing anonymous volume effect in %#v", plan.Plan.Effects)
 			}
-			if tt.wantRisk == models.RiskDangerous && len(tt.containers) == 1 && plan.Plan.RequiresTypedName != tt.containers[0].Name {
+			if (tt.wantRisk == models.RiskDangerous || tt.wantRisk == models.RiskDestructive) && len(tt.containers) == 1 && plan.Plan.RequiresTypedName != tt.containers[0].Name {
 				t.Fatalf("RequiresTypedName = %q, want %q", plan.Plan.RequiresTypedName, tt.containers[0].Name)
 			}
 		})
@@ -224,6 +230,12 @@ func TestNewContainerActionPlanValidationAndFallbackLabels(t *testing.T) {
 	}
 	if got := NewPlanID(); !strings.HasPrefix(got, "plan-") {
 		t.Fatalf("NewPlanID() = %q, want plan-*", got)
+	}
+	if got := NewTypedPlanID("object"); !strings.HasPrefix(got, "plan-object-") {
+		t.Fatalf("NewTypedPlanID() = %q, want plan-object-*", got)
+	}
+	if got := NewJobID("project"); !strings.HasPrefix(got, "project-") || strings.Contains(got, "plan-") {
+		t.Fatalf("NewJobID() = %q, want project-* without plan prefix", got)
 	}
 }
 
@@ -265,5 +277,57 @@ func TestProjectPlanStoreTake(t *testing.T) {
 	cancel()
 	if _, err := expiring.Take(ctx, "missing", ""); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled project Take error = %v, want context.Canceled", err)
+	}
+}
+
+func TestPlanStoresPruneExpiredEntriesOnSave(t *testing.T) {
+	now := time.Date(2026, 6, 13, 14, 0, 0, 0, time.UTC)
+	store := NewPlanStore(func() time.Time { return now })
+	store.Save(ContainerPlan{Plan: models.CommandPlan{PlanID: "expired", ExpiresAt: now.Add(-time.Second)}})
+	store.Save(ContainerPlan{Plan: models.CommandPlan{PlanID: "fresh", ExpiresAt: now.Add(time.Minute)}})
+
+	if _, err := store.Take(context.Background(), "expired", ""); !apperror.IsCode(err, apperror.PlanExpired) {
+		t.Fatalf("expired plan error = %v, want E_PLAN_EXPIRED", err)
+	}
+	if _, err := store.Take(context.Background(), "fresh", ""); err != nil {
+		t.Fatalf("fresh plan error = %v", err)
+	}
+}
+
+func TestDockerObjectPlansDeclareTypedConfirmationForHighRisk(t *testing.T) {
+	now := time.Date(2026, 6, 13, 15, 0, 0, 0, time.UTC)
+	imagePlan, err := NewRemoveImagePlan(models.ImageSummary{ID: "sha256:abc", RepoTags: []string{"app:latest"}}, true, now)
+	if err != nil {
+		t.Fatalf("NewRemoveImagePlan() error = %v", err)
+	}
+	if imagePlan.Plan.Risk != models.RiskDestructive || imagePlan.Plan.RequiresTypedName != "app:latest" {
+		t.Fatalf("image plan = %#v", imagePlan.Plan)
+	}
+
+	prunePlan, err := NewPrunePlan("images", now)
+	if err != nil {
+		t.Fatalf("NewPrunePlan() error = %v", err)
+	}
+	if prunePlan.Plan.Risk != models.RiskDestructive || prunePlan.Plan.RequiresTypedName != "prune" {
+		t.Fatalf("prune plan = %#v", prunePlan.Plan)
+	}
+}
+
+func TestNewProjectActionPlanRequiresTypedConfirmationForHighRisk(t *testing.T) {
+	plan := models.CommandPlan{
+		PlanID:    "plan-project",
+		Risk:      models.RiskDestructive,
+		ExpiresAt: time.Now().Add(time.Minute),
+	}
+	if _, err := NewProjectActionPlan(plan, ProjectActionDown, "provider/app", false); !apperror.IsCode(err, apperror.ConfirmationRequired) {
+		t.Fatalf("project constructor error = %v, want confirmation required", err)
+	}
+	plan.RequiresTypedName = "app"
+	projectPlan, err := NewProjectActionPlan(plan, ProjectActionDown, "provider/app", false)
+	if err != nil {
+		t.Fatalf("NewProjectActionPlan() error = %v", err)
+	}
+	if projectPlan.Action != ProjectActionDown || projectPlan.ProjectID != "provider/app" {
+		t.Fatalf("project plan = %#v", projectPlan)
 	}
 }

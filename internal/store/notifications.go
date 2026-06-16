@@ -83,16 +83,25 @@ func (r *NotificationRepository) List(ctx context.Context, unreadOnly bool, limi
 }
 
 func (r *NotificationRepository) MarkRead(ctx context.Context, ids []int64) error {
-	if len(ids) == 0 {
-		_, err := r.db.ExecContext(ctx, `UPDATE notifications SET read = 1 WHERE read = 0`)
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
 		return err
 	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+	if len(ids) == 0 {
+		if _, err := tx.ExecContext(ctx, `UPDATE notifications SET read = 1 WHERE read = 0`); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
 	for _, id := range ids {
-		if _, err := r.db.ExecContext(ctx, `UPDATE notifications SET read = 1 WHERE id = ?`, id); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE notifications SET read = 1 WHERE id = ?`, id); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 func boolInt(value bool) int {

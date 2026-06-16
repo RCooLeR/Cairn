@@ -308,6 +308,16 @@ func TestProjectDetectorFlagsImportedMissingWorkdir(t *testing.T) {
 	}
 }
 
+func TestSamePathHonorsPlatformCaseSensitivity(t *testing.T) {
+	t.Parallel()
+	if !samePathForOS(`/tmp/App`, `/tmp/app`, "windows") {
+		t.Fatalf("windows paths should compare case-insensitively")
+	}
+	if samePathForOS(`/tmp/App`, `/tmp/app`, "linux") {
+		t.Fatalf("linux paths should compare case-sensitively")
+	}
+}
+
 type fakeDockerInventory struct{}
 
 func (fakeDockerInventory) ListContainers(context.Context, models.ContainerListOptions) ([]models.ContainerSummary, error) {

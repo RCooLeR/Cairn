@@ -434,6 +434,30 @@ func TestAuditListIncludesViewerMetadata(t *testing.T) {
 	}
 }
 
+func TestAuditListEscapesTopicAndPreservesZeroDuration(t *testing.T) {
+	ctx := context.Background()
+	s := openMigratedStore(t, ctx)
+	defer closeStore(t, s)
+
+	if _, err := s.Audit().Insert(ctx, AuditRecord{Action: "update.apply", Status: "success"}); err != nil {
+		t.Fatalf("Insert update.apply audit: %v", err)
+	}
+	if _, err := s.Audit().Insert(ctx, AuditRecord{Action: "update.%literal", Status: "success"}); err != nil {
+		t.Fatalf("Insert literal audit: %v", err)
+	}
+
+	entries, err := s.Audit().List(ctx, models.AuditFilter{Topic: "update.%", Limit: 10})
+	if err != nil {
+		t.Fatalf("List audit: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Action != "update.%literal" {
+		t.Fatalf("entries = %#v, want only literal wildcard action", entries)
+	}
+	if entries[0].Metadata["durationMS"] != int64(0) {
+		t.Fatalf("duration metadata = %#v, want durationMS 0", entries[0].Metadata)
+	}
+}
+
 func openMigratedStore(t *testing.T, ctx context.Context) *Store {
 	t.Helper()
 

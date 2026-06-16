@@ -179,6 +179,54 @@ func TestLoginPipesSecretThroughStdin(t *testing.T) {
 	}
 }
 
+func TestReadDockerConfigNormalizesUTF16LE(t *testing.T) {
+	t.Parallel()
+	raw := `{"auths":{"ghcr.io":{"auth":"` + base64.StdEncoding.EncodeToString([]byte("ada:token")) + `"}}}`
+	provider := &fakeRegistryProvider{backendStdout: utf16LEWithBOM(raw)}
+	manager := NewManager(fakeResolver{provider: provider}, nil)
+
+	accounts, err := manager.ListRegistryAccounts(context.Background())
+	if err != nil {
+		t.Fatalf("ListRegistryAccounts() error = %v", err)
+	}
+	if !hasTestRegistryAccount(accounts, "ghcr.io", "ada") {
+		t.Fatalf("accounts = %#v", accounts)
+	}
+}
+
+func TestRegistryCLIArgRejectsFlagLikeHosts(t *testing.T) {
+	t.Parallel()
+	for _, registry := range []string{"--config=/tmp/evil", "-u", "registry.example.com --debug", "registry.example.com\n--debug"} {
+		registry := registry
+		t.Run(registry, func(t *testing.T) {
+			t.Parallel()
+			if _, err := registryCLIArg(registry); !apperror.IsCode(err, apperror.Conflict) {
+				t.Fatalf("registryCLIArg(%q) error = %v, want conflict", registry, err)
+			}
+		})
+	}
+}
+
+func utf16LEWithBOM(value string) string {
+	out := []byte{0xff, 0xfe}
+	for _, r := range value {
+		if r > 0xffff {
+			continue
+		}
+		out = append(out, byte(r), byte(r>>8))
+	}
+	return string(out)
+}
+
+func hasTestRegistryAccount(accounts []models.RegistryAccount, registry string, username string) bool {
+	for _, account := range accounts {
+		if account.Registry == registry && account.Username == username {
+			return true
+		}
+	}
+	return false
+}
+
 func TestPlainHTTPRegistryRequiresExactLoopbackHost(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

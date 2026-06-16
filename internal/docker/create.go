@@ -141,9 +141,6 @@ func (c *Client) RunImage(ctx context.Context, req models.RunImageRequest) (stri
 	if err := validateRunImagePorts(req.Ports); err != nil {
 		return "", err
 	}
-	if err := validateHostPortsAvailable(req.Ports); err != nil {
-		return "", err
-	}
 	if err := c.ensureImagePresent(ctx, api, req.ImageRef, req.PullIfMissing); err != nil {
 		return "", err
 	}
@@ -623,35 +620,6 @@ func validateRunImagePorts(ports []models.PortMapping) error {
 		}
 		if err := validatePort("host port", mapping.HostPort, true); err != nil {
 			return err
-		}
-	}
-	return nil
-}
-
-func validateHostPortsAvailable(ports []models.PortMapping) error {
-	for _, mapping := range ports {
-		hostPort := strings.TrimSpace(mapping.HostPort)
-		if hostPort == "" || hostPort == "0" {
-			continue
-		}
-		host := strings.TrimSpace(mapping.HostIP)
-		if host == "" {
-			host = "0.0.0.0"
-		}
-		addr := net.JoinHostPort(host, hostPort)
-		switch protocolOrDefault(mapping.Protocol) {
-		case "udp":
-			conn, err := net.ListenPacket("udp", addr)
-			if err != nil {
-				return apperror.Wrap(apperror.Conflict, "Host port is already in use", err, apperror.WithDetail(addr))
-			}
-			_ = conn.Close()
-		case "tcp":
-			listener, err := net.Listen("tcp", addr)
-			if err != nil {
-				return apperror.Wrap(apperror.Conflict, "Host port is already in use", err, apperror.WithDetail(addr))
-			}
-			_ = listener.Close()
 		}
 	}
 	return nil

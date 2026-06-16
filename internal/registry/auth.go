@@ -19,7 +19,10 @@ import (
 )
 
 func (m *Manager) Login(ctx context.Context, req models.RegistryLoginRequest) error {
-	registry := registryDisplayArg(req.Registry)
+	registry, err := registryCLIArg(req.Registry)
+	if err != nil {
+		return err
+	}
 	username := strings.TrimSpace(req.Username)
 	secret := strings.TrimSpace(req.Secret)
 	if username == "" || secret == "" {
@@ -54,7 +57,10 @@ func (m *Manager) Login(ctx context.Context, req models.RegistryLoginRequest) er
 }
 
 func (m *Manager) Logout(ctx context.Context, registry string) error {
-	registry = registryDisplayArg(registry)
+	registry, err := registryCLIArg(registry)
+	if err != nil {
+		return err
+	}
 	provider, err := m.provider(ctx)
 	if err != nil {
 		return err

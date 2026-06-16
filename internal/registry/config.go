@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf16"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/models"
@@ -51,7 +52,7 @@ func (m *Manager) readDockerConfig(ctx context.Context, provider providers.Platf
 	}
 	raw := ""
 	if result != nil {
-		raw = strings.TrimSpace(result.Stdout)
+		raw = normalizeDockerConfigJSON(result.Stdout)
 	}
 	if raw == "" {
 		return dockerConfig{}, nil
@@ -61,6 +62,46 @@ func (m *Manager) readDockerConfig(ctx context.Context, provider providers.Platf
 		return dockerConfig{}, apperror.Wrap(apperror.Internal, "Parse Docker config failed", err)
 	}
 	return config, nil
+}
+
+func normalizeDockerConfigJSON(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	if strings.HasPrefix(raw, "\ufeff") {
+		return strings.TrimSpace(strings.TrimPrefix(raw, "\ufeff"))
+	}
+	bytes := []byte(raw)
+	if len(bytes) >= 2 && bytes[0] == 0xff && bytes[1] == 0xfe {
+		return strings.TrimSpace(decodeUTF16LE(bytes[2:]))
+	}
+	if looksUTF16LE(bytes) {
+		return strings.TrimSpace(decodeUTF16LE(bytes))
+	}
+	return raw
+}
+
+func looksUTF16LE(bytes []byte) bool {
+	if len(bytes) < 4 || len(bytes)%2 != 0 {
+		return false
+	}
+	nulPairs := 0
+	limit := min(len(bytes), 80)
+	for i := 1; i < limit; i += 2 {
+		if bytes[i] == 0 {
+			nulPairs++
+		}
+	}
+	return nulPairs >= limit/4
+}
+
+func decodeUTF16LE(bytes []byte) string {
+	units := make([]uint16, 0, len(bytes)/2)
+	for i := 0; i+1 < len(bytes); i += 2 {
+		units = append(units, uint16(bytes[i])|uint16(bytes[i+1])<<8)
+	}
+	return string(utf16.Decode(units))
 }
 
 func backendConfigCommand(provider providers.PlatformProvider) []string {

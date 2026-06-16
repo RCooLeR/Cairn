@@ -29,7 +29,6 @@ import type {
   RegistryAuthStatus,
   RegistryPreset,
   RunImageRequest,
-  StatsScope,
   UpdateHistoryItem,
   UpdatePlan,
   VersionInfo,
@@ -1127,6 +1126,20 @@ function App() {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [queuedTerminalCommand, setQueuedTerminalCommand] =
     useState<TerminalCommandRequest | null>(null);
+  const [chartPaused, setChartPaused] = useState(false);
+  const chartPausedRef = useRef(false);
+  const statsStreamIDRef = useRef<string | null>(null);
+  const [statsStreamError, setStatsStreamError] = useState<string | null>(null);
+  const [chartPoints, setChartPoints] = useState<DashboardChartPoint[]>([]);
+  const [latestSamples, setLatestSamples] = useState<
+    Record<string, StatsSample>
+  >({});
+  const [containerSparks, setContainerSparks] = useState<
+    Record<string, SparkPoint[]>
+  >({});
+  const [projectSparks, setProjectSparks] = useState<
+    Record<string, SparkPoint[]>
+  >({});
   const themePreference = normalizeThemePreference(
     appSettings["general.theme"],
   );
@@ -1877,6 +1890,87 @@ function App() {
     : providerRepairNeeded
       ? "error"
       : "neutral";
+
+  useEffect(() => {
+    chartPausedRef.current = chartPaused;
+  }, [chartPaused]);
+
+  useEffect(() => {
+    const off = Events.On("stats:sample", (event) => {
+      const payload = eventPayload<StatsSamplePayload>(event);
+      if (!payload || payload.streamID !== statsStreamIDRef.current) {
+        return;
+      }
+      const samples = (payload.samples ?? []).filter(isStatsSample);
+      if (samples.length === 0) {
+        return;
+      }
+      const label = sampleLabel(samples[0]);
+      setLatestSamples((current) => {
+        const next = { ...current };
+        for (const sample of samples) {
+          next[sample.containerID] = sample;
+        }
+        return next;
+      });
+      setContainerSparks((current) =>
+        appendSparkEntries(
+          current,
+          samples.map((sample) => ({
+            id: sample.containerID,
+            label,
+            value: sample.cpuPercent,
+          })),
+        ),
+      );
+      setProjectSparks((current) =>
+        appendSparkEntries(current, projectSparkEntries(samples, label)),
+      );
+      if (!chartPausedRef.current) {
+        setChartPoints((current) =>
+          trimChartPoints(current.concat(aggregateChartPoint(samples, label))),
+        );
+      }
+    });
+    return () => off();
+  }, []);
+
+  useEffect(() => {
+    if (!dockerRunning) {
+      statsStreamIDRef.current = null;
+      setStatsStreamError(null);
+      setLatestSamples({});
+      setContainerSparks({});
+      setProjectSparks({});
+      setChartPoints([]);
+      return undefined;
+    }
+    let cancelled = false;
+    let activeStreamID: string | null = null;
+    MetricsService.StartStatsStream({ kind: "all", ids: [] })
+      .then((streamID) => {
+        if (cancelled) {
+          void MetricsService.StopStream(streamID);
+          return;
+        }
+        activeStreamID = streamID;
+        statsStreamIDRef.current = streamID;
+        setStatsStreamError(null);
+      })
+      .catch((error: unknown) => {
+        setStatsStreamError(
+          error instanceof Error ? error.message : "Unable to start metrics",
+        );
+      });
+    return () => {
+      cancelled = true;
+      statsStreamIDRef.current = null;
+      if (activeStreamID) {
+        void MetricsService.StopStream(activeStreamID);
+      }
+    };
+  }, [dockerRunning]);
+
   const appUpdateNotification = useMemo<Notification | null>(() => {
     if (!appUpdateNotice || appUpdateNotificationRead) {
       return null;
@@ -3856,6 +3950,7 @@ function App() {
             onRefresh={refreshProjects}
             onSortChange={setProjectSort}
             onViewChange={changeProjectView}
+            projectSparks={projectSparks}
             projects={projects}
             search={search}
             sort={projectSort}
@@ -4121,13 +4216,19 @@ function App() {
       default:
         return (
           <OverviewPage
+            chartPaused={chartPaused}
+            chartPoints={chartPoints}
+            containerSparks={containerSparks}
             containers={containers}
             diskReclaimable={diskReclaimable}
             diskTotal={diskTotal}
             dockerRunning={dockerRunning}
             images={images}
+            latestSamples={latestSamples}
+            metricsStreamError={statsStreamError}
             mutationsDisabled={mutationsDisabled}
             mutationDisabledReason={mutationDisabledReason}
+            onChartPausedChange={setChartPaused}
             onImportProject={() =>
               setImportProject({ ...emptyImportProject, open: true })
             }
@@ -4143,6 +4244,7 @@ function App() {
             onRestartDocker={restartProvider}
             onShowContainers={showContainers}
             provider={activeProvider}
+            projectSparks={projectSparks}
             projects={projects}
             projectsLoading={projectsStatus === "loading"}
             refreshToken={dashboardRefreshToken}
@@ -7472,13 +7574,19 @@ function PermissionOption({
 }
 
 type OverviewProps = {
+  chartPaused: boolean;
+  chartPoints: DashboardChartPoint[];
+  containerSparks: Record<string, SparkPoint[]>;
   provider: ProviderSummary | null;
   dockerRunning: boolean;
   mutationsDisabled: boolean;
   mutationDisabledReason: string;
   containers: ContainerSummary[];
   images: ImageSummary[];
+  latestSamples: Record<string, StatsSample>;
+  metricsStreamError: string | null;
   volumes: VolumeSummary[];
+  projectSparks: Record<string, SparkPoint[]>;
   projects: ProjectSummary[];
   projectsLoading: boolean;
   refreshToken: number;
@@ -7488,6 +7596,7 @@ type OverviewProps = {
   diskReclaimable: number;
   onImportProject: () => void;
   onCheckUpdates: () => void;
+  onChartPausedChange: (paused: boolean) => void;
   onCleanupApplied: () => Promise<void>;
   onNavigate: (page: PageID) => void;
   onOpenTerminal: () => void;
@@ -7497,13 +7606,19 @@ type OverviewProps = {
 };
 
 function OverviewPage({
+  chartPaused,
+  chartPoints,
+  containerSparks,
   containers,
   diskReclaimable,
   diskTotal,
   dockerRunning,
   images,
+  latestSamples,
+  metricsStreamError,
   mutationsDisabled,
   mutationDisabledReason,
+  onChartPausedChange,
   onCheckUpdates,
   onCleanupApplied,
   onImportProject,
@@ -7513,6 +7628,7 @@ function OverviewPage({
   onRestartDocker,
   onShowContainers,
   provider,
+  projectSparks,
   projects,
   projectsLoading,
   refreshToken,
@@ -7526,21 +7642,8 @@ function OverviewPage({
   const [metric, setMetric] = useState<DashboardMetricID>("cpu");
   const [range, setRange] = useState<DashboardRangeID>("5m");
   const [stacked, setStacked] = useState(false);
-  const [chartPaused, setChartPaused] = useState(false);
-  const chartPausedRef = useRef(false);
-  const [chartPoints, setChartPoints] = useState<DashboardChartPoint[]>([]);
-  const [latestSamples, setLatestSamples] = useState<
-    Record<string, StatsSample>
-  >({});
-  const [containerSparks, setContainerSparks] = useState<
-    Record<string, SparkPoint[]>
-  >({});
-  const [projectSparks, setProjectSparks] = useState<
-    Record<string, SparkPoint[]>
-  >({});
   const [logPeek, setLogPeek] = useState<LogLine[]>([]);
   const [cleanup, setCleanup] = useState<CleanupState>(emptyCleanup);
-  const statsStreamIDRef = useRef<string | null>(null);
   const logStreamIDRef = useRef<string | null>(null);
 
   const loadDashboard = useCallback(async () => {
@@ -7576,7 +7679,7 @@ function OverviewPage({
           }
           await DockerService.ApplyContainerPlan(
             plan.planID,
-            kind === "volumes" ? "prune" : "",
+            plan.requiresTypedName ? state.typedName : "",
           );
         }
         await onCleanupApplied();
@@ -7600,80 +7703,6 @@ function OverviewPage({
     }, 0);
     return () => window.clearTimeout(timer);
   }, [loadDashboard, refreshToken]);
-
-  useEffect(() => {
-    chartPausedRef.current = chartPaused;
-  }, [chartPaused]);
-
-  useEffect(() => {
-    const off = Events.On("stats:sample", (event) => {
-      const payload = eventPayload<StatsSamplePayload>(event);
-      if (!payload || payload.streamID !== statsStreamIDRef.current) {
-        return;
-      }
-      const samples = (payload.samples ?? []).filter(isStatsSample);
-      if (samples.length === 0) {
-        return;
-      }
-      const label = sampleLabel(samples[0]);
-      setLatestSamples((current) => {
-        const next = { ...current };
-        for (const sample of samples) {
-          next[sample.containerID] = sample;
-        }
-        return next;
-      });
-      setContainerSparks((current) =>
-        appendSparkEntries(
-          current,
-          samples.map((sample) => ({
-            id: sample.containerID,
-            label,
-            value: sample.cpuPercent,
-          })),
-        ),
-      );
-      setProjectSparks((current) =>
-        appendSparkEntries(current, projectSparkEntries(samples, label)),
-      );
-      if (!chartPausedRef.current) {
-        setChartPoints((current) =>
-          trimChartPoints(current.concat(aggregateChartPoint(samples, label))),
-        );
-      }
-    });
-    return () => off();
-  }, []);
-
-  useEffect(() => {
-    if (!dockerRunning) {
-      return undefined;
-    }
-    let cancelled = false;
-    let activeStreamID: string | null = null;
-    const scope: StatsScope = { kind: "all", ids: [] };
-    MetricsService.StartStatsStream(scope)
-      .then((streamID) => {
-        if (cancelled) {
-          void MetricsService.StopStream(streamID);
-          return;
-        }
-        activeStreamID = streamID;
-        statsStreamIDRef.current = streamID;
-      })
-      .catch((error: unknown) => {
-        setDashboardError(
-          error instanceof Error ? error.message : "Unable to start metrics",
-        );
-      });
-    return () => {
-      cancelled = true;
-      statsStreamIDRef.current = null;
-      if (activeStreamID) {
-        void MetricsService.StopStream(activeStreamID);
-      }
-    };
-  }, [dockerRunning]);
 
   useEffect(() => {
     const offLines = Events.On("logs:lines", (event) => {
@@ -7831,6 +7860,11 @@ function OverviewPage({
           {dashboardError}
         </div>
       ) : null}
+      {metricsStreamError ? (
+        <div className="rounded-card border border-warn/30 bg-warn/10 px-4 py-3 text-sm text-warn">
+          {metricsStreamError}
+        </div>
+      ) : null}
 
       <section className="grid gap-4 xl:grid-cols-[1fr_1.35fr]">
         <EngineHeroCard dockerRunning={dockerRunning} provider={provider} />
@@ -7878,7 +7912,7 @@ function OverviewPage({
         <ResourceUsagePanel
           metric={metric}
           onMetricChange={setMetric}
-          onPauseChange={setChartPaused}
+          onPauseChange={onChartPausedChange}
           onRangeChange={setRange}
           onStackedChange={setStacked}
           paused={chartPaused || !dockerRunning}
@@ -8703,10 +8737,10 @@ function CleanupModal({
   onConfirm: (state: CleanupState) => void;
   onClose: () => void;
 }) {
-  const requiresTypedName = state.includeVolumes;
-  const typedReady = !requiresTypedName || state.typedName === "prune";
   const selectedKinds = cleanupKinds(state);
   const hasSelection = selectedKinds.length > 0;
+  const requiresTypedName = hasSelection;
+  const typedReady = !requiresTypedName || state.typedName === "prune";
   const disabledReason = !hasSelection
     ? "Choose at least one cleanup target"
     : requiresTypedName && !typedReady
@@ -8740,7 +8774,7 @@ function CleanupModal({
                 onChange={(event) =>
                   onChange({
                     [key]: event.target.checked,
-                    typedName: key === "includeVolumes" ? "" : state.typedName,
+                    typedName: "",
                   } as Partial<CleanupState>)
                 }
                 type="checkbox"
@@ -9825,6 +9859,7 @@ function LogsExportModal({
 
 type ProjectsPageProps = {
   projects: ProjectSummary[];
+  projectSparks: Record<string, SparkPoint[]>;
   actionBusyIDs: Set<string>;
   filter: FilterID;
   search: string;
@@ -9857,6 +9892,7 @@ function ProjectsPage({
   onRefresh,
   onSortChange,
   onViewChange,
+  projectSparks,
   projects,
   search,
   sort,
@@ -9866,53 +9902,6 @@ function ProjectsPage({
     () => sortProjects(filterProjects(projects, search, filter), sort),
     [filter, projects, search, sort],
   );
-  const [projectSparks, setProjectSparks] = useState<
-    Record<string, SparkPoint[]>
-  >({});
-
-  useEffect(() => {
-    if (projects.length === 0 || mutationsDisabled) {
-      return undefined;
-    }
-    let cancelled = false;
-    let activeStreamID: string | null = null;
-    const streamIDRef = { current: null as string | null };
-    const off = Events.On("stats:sample", (event) => {
-      const payload = eventPayload<StatsSamplePayload>(event);
-      if (!payload || payload.streamID !== streamIDRef.current) {
-        return;
-      }
-      const samples = (payload.samples ?? []).filter(isStatsSample);
-      if (samples.length === 0) {
-        return;
-      }
-      setProjectSparks((current) =>
-        appendSparkEntries(
-          current,
-          projectSparkEntries(samples, sampleLabel(samples[0])),
-        ),
-      );
-    });
-    MetricsService.StartStatsStream({ kind: "all", ids: [] })
-      .then((streamID) => {
-        if (cancelled) {
-          void MetricsService.StopStream(streamID);
-          return;
-        }
-        activeStreamID = streamID;
-        streamIDRef.current = streamID;
-      })
-      .catch(() => {
-        setProjectSparks({});
-      });
-    return () => {
-      cancelled = true;
-      off();
-      if (activeStreamID) {
-        void MetricsService.StopStream(activeStreamID);
-      }
-    };
-  }, [mutationsDisabled, projects.length]);
 
   if (loading && projects.length === 0) {
     return <TableSkeleton />;

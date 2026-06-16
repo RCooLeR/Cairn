@@ -48,6 +48,7 @@ func NewPlanStore(now func() time.Time) *PlanStore {
 func (s *PlanStore) Save(plan ContainerPlan) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	pruneExpiredPlans(s.now(), s.plans, func(plan ContainerPlan) models.CommandPlan { return plan.Plan })
 	s.plans[plan.Plan.PlanID] = plan
 }
 
@@ -65,6 +66,7 @@ func (s *PlanStore) Take(ctx context.Context, planID string, typedName string) (
 		delete(s.plans, planID)
 		return ContainerPlan{}, apperror.New(apperror.PlanExpired, "Plan expired")
 	}
+	pruneExpiredPlans(s.now(), s.plans, func(plan ContainerPlan) models.CommandPlan { return plan.Plan })
 	if err := RequireConfirmation(plan.Plan, typedName); err != nil {
 		return ContainerPlan{}, err
 	}
@@ -78,6 +80,13 @@ func RequireConfirmation(plan models.CommandPlan, typedName string) error {
 	}
 	required := strings.TrimSpace(plan.RequiresTypedName)
 	if required == "" {
+		if requiresTypedConfirmation(plan.Risk) {
+			return apperror.New(
+				apperror.ConfirmationRequired,
+				"Typed confirmation is required",
+				apperror.WithDetail("This high-risk action did not declare a confirmation phrase."),
+			)
+		}
 		return nil
 	}
 	if strings.TrimSpace(typedName) != required {
@@ -122,11 +131,11 @@ func NewContainerActionPlan(action string, containers []models.ContainerSummary,
 
 	command := containerCommand(action, names, timeoutSeconds, opts)
 	requiresTypedName := ""
-	if risk == models.RiskDangerous && len(containers) == 1 {
-		requiresTypedName = containers[0].Name
+	if requiresTypedConfirmation(risk) {
+		requiresTypedName = containerConfirmationName(containers)
 	}
 	plan := models.CommandPlan{
-		PlanID:            NewPlanID(),
+		PlanID:            NewTypedPlanID("container"),
 		Title:             containerPlanTitle(action, containers),
 		Risk:              risk,
 		Commands:          []models.PlannedCommand{{Order: 1, Command: command, Risk: risk, Explanation: containerActionExplanation(action, opts)}},
@@ -242,6 +251,10 @@ func riskRank(risk models.Risk) int {
 	}
 }
 
+func requiresTypedConfirmation(risk models.Risk) bool {
+	return risk == models.RiskDangerous || risk == models.RiskDestructive
+}
+
 func shortID(id string) string {
 	if len(id) <= 12 {
 		return id
@@ -259,7 +272,55 @@ func titleWord(value string) string {
 func NewPlanID() string {
 	var buf [16]byte
 	if _, err := rand.Read(buf[:]); err != nil {
-		return fmt.Sprintf("plan-%d", time.Now().UnixNano())
+		panic(fmt.Sprintf("generate plan id: %v", err))
 	}
 	return "plan-" + hex.EncodeToString(buf[:])
+}
+
+func NewTypedPlanID(kind string) string {
+	kind = strings.ToLower(strings.TrimSpace(kind))
+	kind = strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r
+		case r >= '0' && r <= '9':
+			return r
+		case r == '-' || r == '_':
+			return '-'
+		default:
+			return -1
+		}
+	}, kind)
+	kind = strings.Trim(kind, "-")
+	if kind == "" {
+		return NewPlanID()
+	}
+	return "plan-" + kind + "-" + strings.TrimPrefix(NewPlanID(), "plan-")
+}
+
+func NewJobID(prefix string) string {
+	prefix = strings.TrimSpace(strings.TrimSuffix(prefix, "-"))
+	if prefix == "" {
+		prefix = "job"
+	}
+	return prefix + "-" + strings.TrimPrefix(NewPlanID(), "plan-")
+}
+
+func containerConfirmationName(containers []models.ContainerSummary) string {
+	if len(containers) == 1 {
+		if name := strings.TrimSpace(containers[0].Name); name != "" {
+			return name
+		}
+		return shortID(containers[0].ID)
+	}
+	return "containers"
+}
+
+func pruneExpiredPlans[T any](now time.Time, plans map[string]T, toCommandPlan func(T) models.CommandPlan) {
+	for id, plan := range plans {
+		expiresAt := toCommandPlan(plan).ExpiresAt
+		if !expiresAt.IsZero() && now.After(expiresAt) {
+			delete(plans, id)
+		}
+	}
 }

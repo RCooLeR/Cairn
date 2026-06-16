@@ -4,8 +4,10 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
@@ -13,7 +15,12 @@ import (
 	"github.com/RCooLeR/Cairn/internal/store"
 )
 
-const staleProjectTTL = 24 * time.Hour
+const (
+	staleProjectTTL             = 24 * time.Hour
+	defaultConfigEnrichTimeout  = 10 * time.Second
+	defaultConfigEnrichParallel = 4
+	maxConfigEnrichParallel     = 8
+)
 
 type DockerInventory interface {
 	ListContainers(context.Context, models.ContainerListOptions) ([]models.ContainerSummary, error)
@@ -28,6 +35,9 @@ type ProjectDetector struct {
 	Projects    *store.ProjectRepository
 	Objects     *store.ObjectCacheRepository
 	Now         func() time.Time
+
+	ConfigTimeout     time.Duration
+	ConfigConcurrency int
 }
 
 func (d *ProjectDetector) Reconcile(ctx context.Context) ([]models.ProjectSummary, error) {
@@ -66,8 +76,8 @@ func (d *ProjectDetector) Reconcile(ctx context.Context) ([]models.ProjectSummar
 		}
 	}
 
+	d.enrichProjectsFromConfig(ctx, detected)
 	for _, project := range detected {
-		d.enrichFromConfig(ctx, project)
 		finalizeProject(project)
 	}
 
@@ -209,7 +219,9 @@ func (d *ProjectDetector) enrichFromConfig(ctx context.Context, project *detecte
 		return
 	}
 
-	config, err := d.Compose.Config(ctx, ProjectOptions{
+	configCtx, cancel := context.WithTimeout(ctx, d.configTimeout())
+	defer cancel()
+	config, err := d.Compose.Config(configCtx, ProjectOptions{
 		Workdir:     project.record.WorkingDir,
 		Files:       project.record.ComposeFiles,
 		ProjectName: project.record.Name,
@@ -233,6 +245,51 @@ func (d *ProjectDetector) enrichFromConfig(ctx context.Context, project *detecte
 		service.record.BuildTarget = serviceConfig.BuildTarget
 		service.record.Metadata = serviceConfigMetadata(serviceConfig)
 	}
+}
+
+func (d *ProjectDetector) enrichProjectsFromConfig(ctx context.Context, detected map[string]*detectedProject) {
+	if len(detected) == 0 {
+		return
+	}
+	workers := d.configConcurrency()
+	jobs := make(chan *detectedProject)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for project := range jobs {
+				d.enrichFromConfig(ctx, project)
+			}
+		}()
+	}
+sendProjects:
+	for _, project := range detected {
+		select {
+		case <-ctx.Done():
+			break sendProjects
+		case jobs <- project:
+		}
+	}
+	close(jobs)
+	wg.Wait()
+}
+
+func (d *ProjectDetector) configTimeout() time.Duration {
+	if d.ConfigTimeout > 0 {
+		return d.ConfigTimeout
+	}
+	return defaultConfigEnrichTimeout
+}
+
+func (d *ProjectDetector) configConcurrency() int {
+	if d.ConfigConcurrency <= 0 {
+		return defaultConfigEnrichParallel
+	}
+	if d.ConfigConcurrency > maxConfigEnrichParallel {
+		return maxConfigEnrichParallel
+	}
+	return d.ConfigConcurrency
 }
 
 func (d *ProjectDetector) hostPath(path string) string {
@@ -518,12 +575,22 @@ func workdirFromFiles(files []string) string {
 }
 
 func samePath(left string, right string) bool {
+	return samePathForOS(left, right, runtime.GOOS)
+}
+
+func samePathForOS(left string, right string, goos string) bool {
 	leftAbs, leftErr := filepath.Abs(left)
 	rightAbs, rightErr := filepath.Abs(right)
-	if leftErr == nil && rightErr == nil {
-		return strings.EqualFold(filepath.Clean(leftAbs), filepath.Clean(rightAbs))
+	compare := func(a string, b string) bool {
+		if goos == "windows" {
+			return strings.EqualFold(a, b)
+		}
+		return a == b
 	}
-	return strings.EqualFold(filepath.Clean(left), filepath.Clean(right))
+	if leftErr == nil && rightErr == nil {
+		return compare(filepath.Clean(leftAbs), filepath.Clean(rightAbs))
+	}
+	return compare(filepath.Clean(left), filepath.Clean(right))
 }
 
 func cloneMeta(metadata map[string]any) map[string]any {

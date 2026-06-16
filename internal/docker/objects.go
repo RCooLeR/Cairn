@@ -106,7 +106,7 @@ func (c *Client) ListImages(ctx context.Context) ([]models.ImageSummary, error) 
 		return nil, mapDockerError("list images", err)
 	}
 
-	usedBy := imageUsedBy(ctx, api)
+	usedBy := c.imageUsedBy(ctx, api)
 	summaries := make([]models.ImageSummary, 0, len(raw))
 	records := make([]store.ImageCacheRecord, 0, len(raw))
 	for _, item := range raw {
@@ -141,7 +141,7 @@ func (c *Client) GetImage(ctx context.Context, id string) (*models.ImageDetail, 
 		return nil, mapDockerError("inspect image", err)
 	}
 	detail := mapImageDetail(raw)
-	users := imageUsedBy(ctx, api)[detail.Summary.ID]
+	users := c.imageUsedBy(ctx, api)[detail.Summary.ID]
 	detail.Summary.InUse = len(users) > 0
 	if err := c.saveImages(ctx, []store.ImageCacheRecord{{
 		Summary:  detail.Summary,
@@ -166,8 +166,8 @@ func (c *Client) ListVolumes(ctx context.Context) ([]models.VolumeSummary, error
 		return nil, mapDockerError("list volumes", err)
 	}
 
-	usage := volumeUsageByName(ctx, api)
-	usedBy := volumeUsedBy(ctx, api)
+	usage := c.volumeUsageByName(ctx, api)
+	usedBy := c.volumeUsedBy(ctx, api)
 	summaries := make([]models.VolumeSummary, 0, len(raw.Volumes))
 	records := make([]store.VolumeCacheRecord, 0, len(raw.Volumes))
 	for _, item := range raw.Volumes {
@@ -543,8 +543,8 @@ func containerRecordFromInspect(raw container.InspectResponse, detail *models.Co
 	return record
 }
 
-func imageUsedBy(ctx context.Context, api APIClient) map[string][]string {
-	callCtx, cancel := context.WithTimeout(ctx, defaultTimeout)
+func (c *Client) imageUsedBy(ctx context.Context, api APIClient) map[string][]string {
+	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
 	containers, err := api.ContainerList(callCtx, container.ListOptions{All: true})
 	if err != nil {
@@ -563,8 +563,8 @@ func imageUsedBy(ctx context.Context, api APIClient) map[string][]string {
 	return usedBy
 }
 
-func volumeUsageByName(ctx context.Context, api APIClient) map[string]volumeUsage {
-	callCtx, cancel := context.WithTimeout(ctx, defaultTimeout)
+func (c *Client) volumeUsageByName(ctx context.Context, api APIClient) map[string]volumeUsage {
+	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
 	usage, err := api.DiskUsage(callCtx, dockertypes.DiskUsageOptions{})
 	if err != nil {
@@ -583,8 +583,8 @@ func volumeUsageByName(ctx context.Context, api APIClient) map[string]volumeUsag
 	return byName
 }
 
-func volumeUsedBy(ctx context.Context, api APIClient) map[string][]string {
-	callCtx, cancel := context.WithTimeout(ctx, defaultTimeout)
+func (c *Client) volumeUsedBy(ctx context.Context, api APIClient) map[string][]string {
+	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
 	containers, err := api.ContainerList(callCtx, container.ListOptions{All: true})
 	if err != nil {
@@ -606,7 +606,7 @@ func volumeUsedBy(ctx context.Context, api APIClient) map[string][]string {
 }
 
 func (c *Client) containersForVolume(ctx context.Context, api APIClient, volumeName string) []models.ContainerSummary {
-	callCtx, cancel := context.WithTimeout(ctx, defaultTimeout)
+	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
 	containers, err := api.ContainerList(callCtx, container.ListOptions{All: true})
 	if err != nil {
@@ -628,7 +628,7 @@ func (c *Client) containersForVolume(ctx context.Context, api APIClient, volumeN
 }
 
 func (c *Client) containersForNetwork(ctx context.Context, api APIClient, nw network.Inspect) []models.ContainerSummary {
-	callCtx, cancel := context.WithTimeout(ctx, defaultTimeout)
+	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
 	containers, err := api.ContainerList(callCtx, container.ListOptions{All: true})
 	if err != nil {

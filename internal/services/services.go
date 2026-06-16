@@ -678,6 +678,25 @@ func (s *DockerService) ApplyContainerPlan(ctx context.Context, planID string, t
 	if s.Client == nil {
 		return notReady()
 	}
+	if strings.HasPrefix(planID, "plan-object-") {
+		objectPlan, err := s.objectPlanStore().Take(ctx, planID, typedName)
+		if err != nil {
+			return err
+		}
+		return s.runDockerObjectPlan(ctx, objectPlan)
+	}
+	if strings.HasPrefix(planID, "plan-container-") {
+		plan, err := s.planStore().Take(ctx, planID, typedName)
+		if err != nil {
+			return err
+		}
+		for _, id := range plan.IDs {
+			if err := s.runContainerAction(ctx, plan.Action, id, plan.TimeoutSeconds, plan.RemoveOptions); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	plans := s.planStore()
 	plan, err := plans.Take(ctx, planID, typedName)
 	if err != nil {
@@ -2116,9 +2135,13 @@ func quoteArg(arg string) string {
 }
 
 func secretLike(name string) bool {
-	lower := strings.ToLower(name)
-	for _, marker := range []string{"pass", "password", "token", "secret", "key", "auth"} {
-		if strings.Contains(lower, marker) {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	parts := strings.FieldsFunc(lower, func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9')
+	})
+	for _, part := range parts {
+		switch part {
+		case "password", "passwd", "token", "secret", "key", "auth", "credential", "credentials":
 			return true
 		}
 	}
@@ -2220,12 +2243,11 @@ func (s *ProjectService) planProjectAction(ctx context.Context, action string, p
 		return nil, err
 	}
 	plan := newProjectCommandPlan(project, action, removeVolumes, s.now())
-	s.projectPlanStore().Save(security.ProjectPlan{
-		Plan:          plan,
-		Action:        action,
-		ProjectID:     project.ID,
-		RemoveVolumes: removeVolumes,
-	})
+	projectPlan, err := security.NewProjectActionPlan(plan, action, project.ID, removeVolumes)
+	if err != nil {
+		return nil, err
+	}
+	s.projectPlanStore().Save(projectPlan)
 	return &plan, nil
 }
 
@@ -2243,7 +2265,7 @@ func (s *ProjectService) runProjectAction(ctx context.Context, action string, pr
 	if len(plan.Commands) > 0 {
 		command = plan.Commands[0].Command
 	}
-	jobID := strings.Replace(security.NewPlanID(), "plan-", "job-", 1)
+	jobID := security.NewJobID("job")
 	started := time.Now().UTC()
 	if err := s.recordProjectAudit(ctx, project, action, command, plan.Risk, "started", 0, nil); err != nil {
 		return err
@@ -2355,11 +2377,11 @@ func newProjectCommandPlan(project store.ProjectRecord, action string, removeVol
 	title := projectActionTitle(action, project.Name, removeVolumes)
 	explanation := projectActionExplanation(action, removeVolumes)
 	requiresTypedName := ""
-	if risk == models.RiskDangerous {
+	if risk == models.RiskDangerous || risk == models.RiskDestructive {
 		requiresTypedName = project.Name
 	}
 	return models.CommandPlan{
-		PlanID: security.NewPlanID(),
+		PlanID: security.NewTypedPlanID("project"),
 		Title:  title,
 		Risk:   risk,
 		Commands: []models.PlannedCommand{{

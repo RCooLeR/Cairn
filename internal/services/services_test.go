@@ -333,6 +333,13 @@ func TestDockerCommandBuildersAreStableAndIPv6Safe(t *testing.T) {
 	if networkCommand != wantNetwork {
 		t.Fatalf("dockerNetworkCreateCommand() = %q, want %q", networkCommand, wantNetwork)
 	}
+
+	if !secretLike("API_KEY") || !secretLike("auth-token") || !secretLike("db.password") {
+		t.Fatalf("secretLike missed common credential names")
+	}
+	if secretLike("MONKEY") || secretLike("COMPASS") || secretLike("keyboard_layout") {
+		t.Fatalf("secretLike produced substring false positive")
+	}
 }
 
 func TestDockerServiceObjectCreationAudits(t *testing.T) {
@@ -474,6 +481,9 @@ func TestDockerServiceObjectPlansAuditAndExecute(t *testing.T) {
 	if imagePlan.Risk != models.RiskNeedsConfirmation || !strings.Contains(imagePlan.Commands[0].Command, "docker image rm") {
 		t.Fatalf("image plan = %#v", imagePlan)
 	}
+	if !strings.HasPrefix(imagePlan.PlanID, "plan-object-") {
+		t.Fatalf("image plan id = %q, want plan-object-*", imagePlan.PlanID)
+	}
 	if err := service.ApplyContainerPlan(ctx, imagePlan.PlanID, ""); err != nil {
 		t.Fatalf("ApplyContainerPlan(image) error = %v", err)
 	}
@@ -485,10 +495,13 @@ func TestDockerServiceObjectPlansAuditAndExecute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PlanPrune() error = %v", err)
 	}
-	if prunePlan.Risk != models.RiskDestructive || prunePlan.Commands[0].Command != "docker image prune --all" {
+	if prunePlan.Risk != models.RiskDestructive || prunePlan.RequiresTypedName != "prune" || prunePlan.Commands[0].Command != "docker image prune --all" {
 		t.Fatalf("prune plan = %#v", prunePlan)
 	}
-	if err := service.ApplyContainerPlan(ctx, prunePlan.PlanID, ""); err != nil {
+	if !strings.HasPrefix(prunePlan.PlanID, "plan-object-") {
+		t.Fatalf("prune plan id = %q, want plan-object-*", prunePlan.PlanID)
+	}
+	if err := service.ApplyContainerPlan(ctx, prunePlan.PlanID, "prune"); err != nil {
 		t.Fatalf("ApplyContainerPlan(prune) error = %v", err)
 	}
 	if len(client.pruned) != 1 || client.pruned[0] != "images" {

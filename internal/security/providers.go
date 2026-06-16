@@ -32,6 +32,7 @@ func NewProviderPlanStore(now func() time.Time) *ProviderPlanStore {
 func (s *ProviderPlanStore) Save(plan ProviderPlan) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	pruneExpiredPlans(s.now(), s.plans, func(plan ProviderPlan) models.CommandPlan { return plan.Plan })
 	s.plans[plan.Plan.PlanID] = plan
 }
 
@@ -49,6 +50,7 @@ func (s *ProviderPlanStore) Take(ctx context.Context, planID string, typedName s
 		delete(s.plans, planID)
 		return ProviderPlan{}, apperror.New(apperror.PlanExpired, "Plan expired")
 	}
+	pruneExpiredPlans(s.now(), s.plans, func(plan ProviderPlan) models.CommandPlan { return plan.Plan })
 	if err := RequireConfirmation(plan.Plan, typedName); err != nil {
 		return ProviderPlan{}, err
 	}
@@ -78,7 +80,7 @@ func NewProviderLifecyclePlan(action string, providerID string, providerName str
 		command = "restart Docker backend for " + providerName
 	}
 	plan := models.CommandPlan{
-		PlanID:   NewPlanID(),
+		PlanID:   NewTypedPlanID("provider"),
 		Title:    "Restart Docker backend",
 		Risk:     risk,
 		Commands: []models.PlannedCommand{{Order: 1, Command: command, Risk: risk, Explanation: "Restarts the selected Docker backend."}},
@@ -87,6 +89,9 @@ func NewProviderLifecyclePlan(action string, providerID string, providerName str
 			"Containers managed by Docker are not intentionally removed.",
 		},
 		ExpiresAt: now.Add(DefaultPlanTTL),
+	}
+	if requiresTypedConfirmation(plan.Risk) {
+		plan.RequiresTypedName = providerName
 	}
 	return ProviderPlan{Plan: plan, Action: action, ProviderID: providerID}, nil
 }

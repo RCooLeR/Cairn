@@ -82,3 +82,18 @@ func registryAPIHost(registry string) string {
 func registryDisplayArg(registry string) string {
 	return normalizeRegistryHost(registry)
 }
+
+func registryCLIArg(registry string) (string, error) {
+	value := registryDisplayArg(registry)
+	if value == "" {
+		return "", apperror.New(apperror.Conflict, "Registry is required")
+	}
+	if strings.HasPrefix(value, "-") || strings.ContainsAny(value, " \t\r\n") {
+		return "", apperror.New(
+			apperror.Conflict,
+			"Invalid registry host",
+			apperror.WithDetail("Registry hosts cannot start with '-' or contain whitespace."),
+		)
+	}
+	return value, nil
+}
