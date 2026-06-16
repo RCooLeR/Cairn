@@ -160,6 +160,22 @@ func TestSettingsServiceNotifications(t *testing.T) {
 	}
 }
 
+func TestSettingsServiceNotificationsAreNoopWithoutRepository(t *testing.T) {
+	service := &SettingsService{}
+	ctx := context.Background()
+
+	notifications, err := service.GetNotifications(ctx, false)
+	if err != nil {
+		t.Fatalf("GetNotifications() error = %v", err)
+	}
+	if len(notifications) != 0 {
+		t.Fatalf("notifications = %#v, want empty", notifications)
+	}
+	if err := service.MarkNotificationsRead(ctx, []int64{1, 2, 3}); err != nil {
+		t.Fatalf("MarkNotificationsRead() error = %v, want nil", err)
+	}
+}
+
 func TestProviderServiceApplyInstallPublishesProgress(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

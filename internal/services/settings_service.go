@@ -52,7 +52,7 @@ func (s *SettingsService) MarkNotificationsRead(ctx context.Context, ids []int64
 	if s.Notifications != nil {
 		return s.Notifications.MarkRead(ctx, ids)
 	}
-	return notReady()
+	return nil
 }
 
 func (s *SettingsService) GetCheatsheet(_ context.Context) ([]models.CheatsheetEntry, error) {
