@@ -180,6 +180,38 @@ func TestTrimPendingMetricsKeepsNewestSamples(t *testing.T) {
 	}
 }
 
+func TestAppendPendingMetricsSortsBeforeTrim(t *testing.T) {
+	base := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)
+	var existing []store.MetricsSampleRecord
+	for i := 0; i < maxPendingPersistSamples; i++ {
+		existing = append(existing, store.MetricsSampleRecord{
+			ContainerID: "c1",
+			CPUPercent:  float64(i),
+			SampledAt:   base.Add(time.Duration(i) * time.Second),
+		})
+	}
+
+	records := appendPendingMetrics(existing,
+		store.MetricsSampleRecord{ContainerID: "c1", CPUPercent: 999, SampledAt: base.Add(-time.Minute)},
+		store.MetricsSampleRecord{ContainerID: "c1", CPUPercent: 1000, SampledAt: base.Add(24 * time.Hour)},
+	)
+
+	if len(records) != maxPendingPersistSamples {
+		t.Fatalf("records len = %d, want %d", len(records), maxPendingPersistSamples)
+	}
+	if records[0].CPUPercent != 1 {
+		t.Fatalf("first retained CPU = %.1f, want second-oldest original after trim", records[0].CPUPercent)
+	}
+	if records[len(records)-1].CPUPercent != 1000 {
+		t.Fatalf("last retained CPU = %.1f, want newest appended sample", records[len(records)-1].CPUPercent)
+	}
+	for i := 1; i < len(records); i++ {
+		if records[i].SampledAt.Before(records[i-1].SampledAt) {
+			t.Fatalf("records out of order at %d: %s before %s", i, records[i].SampledAt, records[i-1].SampledAt)
+		}
+	}
+}
+
 func TestManagerQueriesStopsFallbackAndScopes(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)

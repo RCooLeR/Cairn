@@ -448,10 +448,12 @@ func (m *Manager) flush(ctx context.Context) error {
 }
 
 func appendPendingMetrics(existing []store.MetricsSampleRecord, records ...store.MetricsSampleRecord) []store.MetricsSampleRecord {
-	if len(records) == 0 {
-		return trimPendingMetrics(existing)
+	if len(records) > 0 {
+		existing = append(existing, records...)
 	}
-	existing = append(existing, records...)
+	sort.SliceStable(existing, func(i, j int) bool {
+		return existing[i].SampledAt.Before(existing[j].SampledAt)
+	})
 	return trimPendingMetrics(existing)
 }
 
