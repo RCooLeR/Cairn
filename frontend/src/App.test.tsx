@@ -41,7 +41,6 @@ import {
 } from "../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
 
 import App, {
-  csvCell,
   filterContainers,
   filterImages,
   filterNetworks,
@@ -50,6 +49,7 @@ import App, {
   imageRefPreview,
   parseMounts,
 } from "./App";
+import { csvCell } from "./settings/SettingsPage";
 import {
   decodeBase64Bytes,
   encodeTerminalInput,
@@ -1089,7 +1089,7 @@ describe("App inventory shell", () => {
     expect(screen.getAllByText("Rebuild required").length).toBeGreaterThan(0);
     expect(
       screen.getByText(
-        "Base image: Unknown — this is a third-party registry image and no base metadata was found.",
+        "Base image: Unknown - this is a third-party registry image and no base metadata was found.",
       ),
     ).toBeInTheDocument();
 
@@ -1159,7 +1159,7 @@ describe("App inventory shell", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByText(
-        "Base image: Unknown — this is a third-party registry image and no base metadata was found.",
+        "Base image: Unknown - this is a third-party registry image and no base metadata was found.",
       ),
     ).toBeInTheDocument();
 
@@ -1212,6 +1212,64 @@ describe("App inventory shell", () => {
 
     expect(screen.queryByText(/server started/)).not.toBeInTheDocument();
     expect(screen.getByText(/request/)).toBeInTheDocument();
+  });
+
+  it("stops a metrics stream that resolves after app cleanup", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    let resolveStatsStream: (streamID: string) => void = () => undefined;
+    metricsServiceMock.StartStatsStream.mockImplementationOnce(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveStatsStream = resolve;
+        }),
+    );
+
+    const { unmount } = render(<App />);
+
+    await waitFor(() =>
+      expect(metricsServiceMock.StartStatsStream).toHaveBeenCalled(),
+    );
+    unmount();
+
+    await act(async () => {
+      resolveStatsStream("late-stats-stream");
+    });
+
+    expect(metricsServiceMock.StopStream).toHaveBeenCalledWith(
+      "late-stats-stream",
+    );
+  });
+
+  it("stops a log stream that resolves after logs page cleanup", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    let resolveLogStream: (streamID: string) => void = () => undefined;
+    logsServiceMock.StartLogStream.mockImplementationOnce(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveLogStream = resolve;
+        }),
+    );
+
+    const { unmount } = render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", {
+        name: /Logs/,
+      }),
+    );
+    await waitFor(() =>
+      expect(logsServiceMock.StartLogStream).toHaveBeenCalled(),
+    );
+    unmount();
+
+    await act(async () => {
+      resolveLogStream("late-log-stream");
+    });
+
+    expect(logsServiceMock.StopStream).toHaveBeenCalledWith("late-log-stream");
   });
 
   it("uses checkboxes for container log scope selection", async () => {

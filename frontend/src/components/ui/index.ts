@@ -6,6 +6,7 @@ export * from "./EmptyState";
 export * from "./Modal";
 export * from "./Skeleton";
 export * from "./StatusDot";
+export * from "./StatusPill";
 export * from "./Tabs";
 export * from "./TableSkeleton";
 export * from "./Toast";

@@ -57,9 +57,7 @@ describe("NotificationCenter", () => {
     act(() => {
       vi.advanceTimersByTime(0);
     });
-    expect(
-      screen.getByRole("button", { name: "Mark all read" }),
-    ).toHaveFocus();
+    expect(screen.getByRole("button", { name: "Mark all read" })).toHaveFocus();
 
     fireEvent.keyDown(document, { key: "Tab", shiftKey: true });
     expect(
