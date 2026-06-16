@@ -707,27 +707,11 @@ func (s *DockerService) ApplyContainerPlan(ctx context.Context, planID string, t
 		}
 		return nil
 	}
-	plans := s.planStore()
-	plan, err := plans.Take(ctx, planID, typedName)
-	if err != nil {
-		if !apperror.IsCode(err, apperror.PlanExpired) {
-			return err
-		}
-		objectPlan, objectErr := s.objectPlanStore().Take(ctx, planID, typedName)
-		if objectErr != nil {
-			if !apperror.IsCode(objectErr, apperror.PlanExpired) {
-				return objectErr
-			}
-			return err
-		}
-		return s.runDockerObjectPlan(ctx, objectPlan)
-	}
-	for _, id := range plan.IDs {
-		if err := s.runContainerAction(ctx, plan.Action, id, plan.TimeoutSeconds, plan.RemoveOptions); err != nil {
-			return err
-		}
-	}
-	return nil
+	return apperror.New(
+		apperror.PlanExpired,
+		"Plan expired or was not found",
+		apperror.WithDetail("Unsupported Docker plan kind."),
+	)
 }
 
 func (s *DockerService) BulkContainerAction(ctx context.Context, ids []string, action string) (*models.BulkResult, error) {

@@ -341,6 +341,9 @@ func TestDockerServiceLifecycleAuditsAndPlans(t *testing.T) {
 	if len(client.killed) != 1 || client.killed[0] != "container-1" {
 		t.Fatalf("killed = %#v", client.killed)
 	}
+	if err := service.ApplyContainerPlan(ctx, "plan-legacy-1", ""); !apperror.IsCode(err, apperror.PlanExpired) {
+		t.Fatalf("ApplyContainerPlan(legacy) error = %v, want E_PLAN_EXPIRED", err)
+	}
 }
 
 func TestDockerCommandBuildersAreStableAndIPv6Safe(t *testing.T) {
