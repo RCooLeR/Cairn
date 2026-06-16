@@ -75,6 +75,24 @@ func TestMemoryAndPidHelpers(t *testing.T) {
 	}); got != 800 {
 		t.Fatalf("memoryUsageBytes(cache adjusted) = %d, want 800", got)
 	}
+	if got := memoryUsageBytes(container.MemoryStats{
+		Usage: 1000,
+		Stats: map[string]uint64{"inactive_file": 150, "cache": 600},
+	}); got != 850 {
+		t.Fatalf("memoryUsageBytes(cgroup v2 inactive_file) = %d, want 850", got)
+	}
+	if got := memoryUsageBytes(container.MemoryStats{
+		Usage: 1000,
+		Stats: map[string]uint64{"total_inactive_file": 0, "cache": 600},
+	}); got != 1000 {
+		t.Fatalf("memoryUsageBytes(zero cgroup inactive) = %d, want 1000", got)
+	}
+	if got := memoryUsageBytes(container.MemoryStats{
+		Usage: 1000,
+		Stats: map[string]uint64{"cache": 200},
+	}); got != 800 {
+		t.Fatalf("memoryUsageBytes(cache fallback) = %d, want 800", got)
+	}
 	if got := memoryUsageBytes(container.MemoryStats{PrivateWorkingSet: 700}); got != 700 {
 		t.Fatalf("memoryUsageBytes(windows) = %d, want 700", got)
 	}

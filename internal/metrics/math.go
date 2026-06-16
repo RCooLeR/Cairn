@@ -50,15 +50,23 @@ func memoryUsageBytes(stats container.MemoryStats) int64 {
 	if usage == 0 {
 		usage = stats.PrivateWorkingSet
 	}
-	if stats.Stats != nil {
-		for _, key := range []string{"total_inactive_file", "inactive_file", "cache"} {
-			if inactive := stats.Stats[key]; inactive > 0 && inactive < usage {
-				usage -= inactive
-				break
-			}
-		}
+	if inactive, ok := inactiveFileBytes(stats.Stats); ok && inactive > 0 && inactive < usage {
+		usage -= inactive
 	}
 	return uintToInt64(usage)
+}
+
+func inactiveFileBytes(stats map[string]uint64) (uint64, bool) {
+	if stats == nil {
+		return 0, false
+	}
+	for _, key := range []string{"total_inactive_file", "inactive_file"} {
+		if value, ok := stats[key]; ok {
+			return value, true
+		}
+	}
+	value, ok := stats["cache"]
+	return value, ok
 }
 
 func memoryLimitBytes(stats container.MemoryStats) int64 {
