@@ -325,6 +325,33 @@ func TestPlanStoresPruneExpiredEntriesOnSave(t *testing.T) {
 	}
 }
 
+func TestPlanStoreJanitorPrunesExpiredEntriesWithoutTraffic(t *testing.T) {
+	now := time.Date(2026, 6, 13, 14, 15, 0, 0, time.UTC)
+	store := NewPlanStore(func() time.Time { return now })
+	store.startJanitor(time.Millisecond)
+	t.Cleanup(store.Close)
+
+	if err := store.Save(ContainerPlan{Plan: models.CommandPlan{PlanID: "fresh", ExpiresAt: now.Add(time.Minute)}}); err != nil {
+		t.Fatalf("Save(fresh) error = %v", err)
+	}
+	now = now.Add(2 * time.Minute)
+
+	deadline := time.After(time.Second)
+	for {
+		store.mu.Lock()
+		count := len(store.plans)
+		store.mu.Unlock()
+		if count == 0 {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("expired plans were not pruned by janitor; count=%d", count)
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
 func TestPlanStoreRejectsHighRiskWithoutTypedName(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 6, 13, 14, 30, 0, 0, time.UTC)

@@ -15,17 +15,25 @@ type commandPlanStore[T any] struct {
 	now           func() time.Time
 	plans         map[string]T
 	toCommandPlan func(T) models.CommandPlan
+	stopJanitor   chan struct{}
+	janitorDone   chan struct{}
+	closeJanitor  sync.Once
 }
 
 func newCommandPlanStore[T any](now func() time.Time, toCommandPlan func(T) models.CommandPlan) *commandPlanStore[T] {
+	useSystemClock := now == nil
 	if now == nil {
 		now = func() time.Time { return time.Now().UTC() }
 	}
-	return &commandPlanStore[T]{
+	store := &commandPlanStore[T]{
 		now:           now,
 		plans:         map[string]T{},
 		toCommandPlan: toCommandPlan,
 	}
+	if useSystemClock {
+		store.startJanitor(time.Minute)
+	}
+	return store
 }
 
 func (s *commandPlanStore[T]) Save(plan T) error {
@@ -72,6 +80,39 @@ func (s *commandPlanStore[T]) pruneExpiredLocked(now time.Time) {
 			delete(s.plans, id)
 		}
 	}
+}
+
+func (s *commandPlanStore[T]) startJanitor(interval time.Duration) {
+	if interval <= 0 || s.stopJanitor != nil {
+		return
+	}
+	s.stopJanitor = make(chan struct{})
+	s.janitorDone = make(chan struct{})
+	go func() {
+		defer close(s.janitorDone)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				s.mu.Lock()
+				s.pruneExpiredLocked(s.now())
+				s.mu.Unlock()
+			case <-s.stopJanitor:
+				return
+			}
+		}
+	}()
+}
+
+func (s *commandPlanStore[T]) Close() {
+	if s.stopJanitor == nil {
+		return
+	}
+	s.closeJanitor.Do(func() {
+		close(s.stopJanitor)
+		<-s.janitorDone
+	})
 }
 
 func validateStoredPlan(plan models.CommandPlan) error {
