@@ -1300,6 +1300,7 @@ function App() {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [queuedTerminalCommand, setQueuedTerminalCommand] =
     useState<TerminalCommandRequest | null>(null);
+  const queuedTerminalCommandID = useRef(0);
   const [chartPaused, setChartPaused] = useState(false);
   const chartPausedRef = useRef(false);
   const statsStreamIDRef = useRef<string | null>(null);
@@ -1388,7 +1389,11 @@ function App() {
 
   const runPaletteCommand = useCallback(
     (command: string) => {
-      setQueuedTerminalCommand({ id: Date.now(), command });
+      queuedTerminalCommandID.current += 1;
+      setQueuedTerminalCommand({
+        id: queuedTerminalCommandID.current,
+        command,
+      });
       navigate("terminal");
     },
     [navigate],
