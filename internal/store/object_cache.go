@@ -326,17 +326,24 @@ func (r *ObjectCacheRepository) SaveNetworks(ctx context.Context, providerID str
 
 func (r *ObjectCacheRepository) DeleteStale(ctx context.Context, providerID string, cutoff time.Time) error {
 	cutoffText := formatTime(cutoff)
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
 	for _, stmt := range []string{
 		"DELETE FROM containers_cache WHERE provider_id = ? AND last_seen_at < ?",
 		"DELETE FROM images_cache WHERE provider_id = ? AND last_seen_at < ?",
 		"DELETE FROM volumes_cache WHERE provider_id = ? AND last_seen_at < ?",
 		"DELETE FROM networks_cache WHERE provider_id = ? AND last_seen_at < ?",
 	} {
-		if _, err := r.db.ExecContext(ctx, stmt, providerID, cutoffText); err != nil {
+		if _, err := tx.ExecContext(ctx, stmt, providerID, cutoffText); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 func jsonText(value any, fallback string) string {

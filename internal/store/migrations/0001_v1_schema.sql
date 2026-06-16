@@ -230,6 +230,14 @@ CREATE TABLE ignored_updates (
     reason TEXT,
     created_at DATETIME NOT NULL
 );
+CREATE UNIQUE INDEX idx_ignored_updates_unique ON ignored_updates(
+    provider_id,
+    image_ref,
+    update_kind,
+    COALESCE(base_image_ref, ''),
+    COALESCE(project_id, ''),
+    COALESCE(service_id, '')
+);
 
 CREATE TABLE update_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

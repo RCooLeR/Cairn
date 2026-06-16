@@ -57,6 +57,21 @@ func TestUpdateRepositoryIgnoreOverlayAndBadges(t *testing.T) {
 	if err := repo.IgnoreCheck(ctx, id, "wait for maintenance", now.Add(time.Minute)); err != nil {
 		t.Fatalf("IgnoreCheck() error = %v", err)
 	}
+	if err := repo.IgnoreCheck(ctx, id, "same rule updated", now.Add(2*time.Minute)); err != nil {
+		t.Fatalf("IgnoreCheck(update existing) error = %v", err)
+	}
+	var ignoredCount int
+	var ignoredReason string
+	if err := db.writer.QueryRowContext(ctx, `
+		SELECT COUNT(*), COALESCE(MAX(reason), '')
+		FROM ignored_updates
+		WHERE provider_id = ? AND image_ref = ? AND update_kind = ?
+	`, "linux_native", "nginx:1.25", string(models.UpdateKindServiceImage)).Scan(&ignoredCount, &ignoredReason); err != nil {
+		t.Fatalf("ignored update count query: %v", err)
+	}
+	if ignoredCount != 1 || ignoredReason != "same rule updated" {
+		t.Fatalf("ignored rule count/reason = %d/%q, want one updated rule", ignoredCount, ignoredReason)
+	}
 	current, err := repo.ListCurrent(ctx, models.UpdateFilter{ProjectID: "linux_native/app"})
 	if err != nil {
 		t.Fatalf("ListCurrent() error = %v", err)

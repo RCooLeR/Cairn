@@ -14,6 +14,10 @@ type UpdateRepository struct {
 	db *sql.DB
 }
 
+type updateCheckExecutor interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
 type UpdateCheckRecord struct {
 	ID                int64
 	ProviderID        string
@@ -77,6 +81,10 @@ func (s *Store) Updates() *UpdateRepository {
 }
 
 func (r *UpdateRepository) InsertCheck(ctx context.Context, record UpdateCheckRecord) (int64, error) {
+	return insertCheck(ctx, r.db, record)
+}
+
+func insertCheck(ctx context.Context, exec updateCheckExecutor, record UpdateCheckRecord) (int64, error) {
 	if record.CheckedAt.IsZero() {
 		record.CheckedAt = time.Now().UTC()
 	}
@@ -92,7 +100,7 @@ func (r *UpdateRepository) InsertCheck(ctx context.Context, record UpdateCheckRe
 	if record.RecommendedAction == "" {
 		record.RecommendedAction = models.RecommendedActionNone
 	}
-	result, err := r.db.ExecContext(ctx, `
+	result, err := exec.ExecContext(ctx, `
 		INSERT INTO image_update_checks (
 			provider_id, project_id, service_id, container_id, kind, image_ref,
 			base_image_ref, local_image_id, local_digest, remote_digest,
@@ -115,12 +123,19 @@ func (r *UpdateRepository) InsertCheck(ctx context.Context, record UpdateCheckRe
 }
 
 func (r *UpdateRepository) InsertChecks(ctx context.Context, records []UpdateCheckRecord) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
 	for _, record := range records {
-		if _, err := r.InsertCheck(ctx, record); err != nil {
+		if _, err := insertCheck(ctx, tx, record); err != nil {
 			return err
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 
 func (r *UpdateRepository) GetCheck(ctx context.Context, id int64) (UpdateCheckRecord, error) {
@@ -196,37 +211,69 @@ func (r *UpdateRepository) Badges(ctx context.Context, projectID string) (models
 }
 
 func (r *UpdateRepository) IgnoreCheck(ctx context.Context, id int64, reason string, createdAt time.Time) error {
-	check, err := r.GetCheck(ctx, id)
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+	check, err := scanUpdateCheck(tx.QueryRowContext(ctx, updateCheckSelectSQL()+` WHERE id = ?`, id))
 	if err != nil {
 		return err
 	}
 	if createdAt.IsZero() {
 		createdAt = time.Now().UTC()
 	}
-	ignored, err := r.listIgnored(ctx)
-	if err != nil {
+	if err := upsertIgnoredUpdate(ctx, tx, check, reason, createdAt); err != nil {
 		return err
 	}
-	for _, rule := range ignored {
-		if ignoreRuleMatches(rule, check) {
-			_, err := r.db.ExecContext(ctx, `
-				UPDATE ignored_updates
-				SET reason = NULLIF(?, '')
-				WHERE id = ?
-			`, reason, rule.ID)
-			return err
-		}
+	return tx.Commit()
+}
+
+func upsertIgnoredUpdate(ctx context.Context, tx *sql.Tx, check UpdateCheckRecord, reason string, createdAt time.Time) error {
+	args := []any{
+		check.ProviderID,
+		check.ImageRef,
+		string(check.Kind),
+		check.BaseImageRef,
+		check.ProjectID,
+		check.ServiceID,
 	}
-	_, err = r.db.ExecContext(ctx, `
+	update := func() (int64, error) {
+		result, err := tx.ExecContext(ctx, `
+			UPDATE ignored_updates
+			SET reason = NULLIF(?, ''), created_at = ?
+			WHERE provider_id = ?
+				AND image_ref = ?
+				AND update_kind = ?
+				AND COALESCE(base_image_ref, '') = ?
+				AND COALESCE(project_id, '') = ?
+				AND COALESCE(service_id, '') = ?
+		`, append([]any{reason, formatTime(createdAt)}, args...)...)
+		if err != nil {
+			return 0, err
+		}
+		return result.RowsAffected()
+	}
+	if rows, err := update(); err != nil || rows > 0 {
+		return err
+	}
+	_, insertErr := tx.ExecContext(ctx, `
 		INSERT INTO ignored_updates (
 			provider_id, image_ref, update_kind, base_image_ref, project_id,
 			service_id, reason, created_at
 		)
 		VALUES (?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''),
 			NULLIF(?, ''), ?)
-	`, check.ProviderID, check.ImageRef, string(check.Kind), check.BaseImageRef,
-		check.ProjectID, check.ServiceID, reason, formatTime(createdAt))
-	return err
+	`, append(args, reason, formatTime(createdAt))...)
+	if insertErr == nil {
+		return nil
+	}
+	if rows, err := update(); err == nil && rows > 0 {
+		return nil
+	}
+	return insertErr
 }
 
 func (r *UpdateRepository) Unignore(ctx context.Context, id int64) error {
