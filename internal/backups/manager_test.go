@@ -120,6 +120,30 @@ func TestBackupPathsReturnStatErrorsAndCapCollisions(t *testing.T) {
 	}
 }
 
+func TestCheckFreeSpaceIgnoresUnknownOrNegativeEstimates(t *testing.T) {
+	t.Parallel()
+	calls := 0
+	mgr := &Manager{
+		AvailableBytes: func(string) (uint64, bool) {
+			calls++
+			return 0, true
+		},
+	}
+
+	if err := mgr.checkFreeSpace(t.TempDir(), -1); err != nil {
+		t.Fatalf("checkFreeSpace(negative) error = %v, want nil", err)
+	}
+	if err := mgr.checkFreeSpace(t.TempDir(), 0); err != nil {
+		t.Fatalf("checkFreeSpace(zero) error = %v, want nil", err)
+	}
+	if calls != 0 {
+		t.Fatalf("AvailableBytes calls = %d, want 0 for unknown estimates", calls)
+	}
+	if err := mgr.checkFreeSpace(t.TempDir(), 1); !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("checkFreeSpace(positive) error = %v, want conflict", err)
+	}
+}
+
 func TestRemoveBackupArtifactsRemovesArchiveAndMetadata(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
