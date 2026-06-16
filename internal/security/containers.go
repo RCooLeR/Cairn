@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/models"
@@ -230,7 +231,11 @@ func titleWord(value string) string {
 	if value == "" {
 		return value
 	}
-	return strings.ToUpper(value[:1]) + value[1:]
+	first, size := utf8.DecodeRuneInString(value)
+	if first == utf8.RuneError && size == 0 {
+		return value
+	}
+	return strings.ToUpper(string(first)) + value[size:]
 }
 
 func NewPlanID() string {

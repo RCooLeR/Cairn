@@ -245,6 +245,14 @@ func TestNewContainerActionPlanValidationAndFallbackLabels(t *testing.T) {
 	}
 }
 
+func TestTitleWordHandlesUTF8(t *testing.T) {
+	t.Parallel()
+
+	if got, want := titleWord("запуск"), "Запуск"; got != want {
+		t.Fatalf("titleWord() = %q, want %q", got, want)
+	}
+}
+
 func TestProjectPlanStoreTake(t *testing.T) {
 	now := time.Date(2026, 6, 13, 13, 0, 0, 0, time.UTC)
 	store := NewProjectPlanStore(func() time.Time { return now })
