@@ -227,7 +227,7 @@ describe("UI kit", () => {
     expect(screen.queryByText("Row 199")).not.toBeInTheDocument();
   });
 
-  it("keeps the virtual table window inside shorter filtered row sets", () => {
+  it("resets the virtual table window when row sets change", () => {
     const makeRows = (count: number) =>
       Array.from({ length: count }, (_, index) => ({
         id: `row-${index}`,
@@ -254,6 +254,7 @@ describe("UI kit", () => {
 
     rerender(table(makeRows(130)));
 
-    expect(screen.getByText("Row 129")).toBeInTheDocument();
+    expect(screen.getByText("Row 0")).toBeInTheDocument();
+    expect(screen.queryByText("Row 129")).not.toBeInTheDocument();
   });
 });

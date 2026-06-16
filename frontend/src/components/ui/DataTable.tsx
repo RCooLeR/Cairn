@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 
 import { ArrowDownUp } from "lucide-react";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { cx } from "./utils";
 
@@ -52,6 +52,7 @@ export function DataTable<T>({
   const [sort, setSort] = useState<SortState | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const selectAllRef = useRef<HTMLInputElement>(null);
+  const scrollViewportRef = useRef<HTMLDivElement>(null);
   const visibleRows = useMemo(() => {
     if (!sort) {
       return rows;
@@ -131,6 +132,13 @@ export function DataTable<T>({
   const allVisibleSelected =
     canToggleAll && selectedVisibleCount === visibleIDs.length;
 
+  useLayoutEffect(() => {
+    setScrollTop(0);
+    if (scrollViewportRef.current) {
+      scrollViewportRef.current.scrollTop = 0;
+    }
+  }, [rows.length, sort?.columnID, sort?.direction]);
+
   useEffect(() => {
     if (selectAllRef.current) {
       selectAllRef.current.indeterminate =
@@ -151,12 +159,14 @@ export function DataTable<T>({
         </div>
       ) : null}
       <div
-        className="max-h-[420px] overflow-auto"
+        className="overflow-auto"
         onScroll={(event) => {
           if (virtualized) {
             setScrollTop(event.currentTarget.scrollTop);
           }
         }}
+        ref={scrollViewportRef}
+        style={{ maxHeight: virtualViewportHeight }}
       >
         <table
           aria-label={ariaLabel}
