@@ -196,6 +196,24 @@ func TestManagerFetchPageAndExport(t *testing.T) {
 	}
 }
 
+func TestParseRawLogLineAllowsLeadingWhitespaceBeforeTimestamp(t *testing.T) {
+	t.Parallel()
+	fallback := time.Date(2026, 6, 13, 10, 0, 0, 0, time.UTC)
+	line := ParseRawLogLine(
+		"  \t2026-06-13T09:00:00Z  INFO indented",
+		"stdout",
+		sourceInfo{ContainerID: "c1", ContainerName: "web"},
+		func() time.Time { return fallback },
+	)
+
+	if got, want := line.TS, time.Date(2026, 6, 13, 9, 0, 0, 0, time.UTC); !got.Equal(want) {
+		t.Fatalf("timestamp = %s, want %s", got, want)
+	}
+	if line.Text != " INFO indented" {
+		t.Fatalf("text = %q, want preserved spacing after timestamp", line.Text)
+	}
+}
+
 func dockerLogFrame(stream byte, payload string) []byte {
 	frame := make([]byte, 8+len(payload))
 	frame[0] = stream

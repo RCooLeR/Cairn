@@ -174,7 +174,7 @@ func ParseRawLogLine(raw string, stream string, source sourceInfo, now func() ti
 }
 
 func parseDockerTimestamp(raw string) (time.Time, string) {
-	prefix, rest, ok := strings.Cut(raw, " ")
+	prefix, rest, ok := strings.Cut(strings.TrimLeft(raw, " \t"), " ")
 	if !ok {
 		return time.Time{}, raw
 	}
