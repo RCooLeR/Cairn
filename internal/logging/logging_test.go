@@ -3,6 +3,7 @@ package logging
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -41,6 +42,50 @@ func TestRotatingLoggerWritesJSONAndRotates(t *testing.T) {
 	}
 	if record["phase"] != "test" {
 		t.Fatalf("phase = %#v, want test", record["phase"])
+	}
+}
+
+func TestRotatingFileWriteAfterCloseReturnsClosedError(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cairn.log")
+	writer, err := OpenRotatingFile(path, 128, 1)
+	if err != nil {
+		t.Fatalf("OpenRotatingFile: %v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	n, err := writer.Write([]byte("after close"))
+	if n != 0 {
+		t.Fatalf("Write n = %d, want 0", n)
+	}
+	if !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("Write error = %v, want os.ErrClosed", err)
+	}
+}
+
+func TestRotatingFileKeepsOnlyOneBackupAtBoundary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cairn.log")
+	writer, err := OpenRotatingFile(path, 16, 1)
+	if err != nil {
+		t.Fatalf("OpenRotatingFile: %v", err)
+	}
+	defer closeWriter(t, writer)
+
+	for i := 0; i < 4; i++ {
+		if _, err := writer.Write([]byte("0123456789abcdef\n")); err != nil {
+			t.Fatalf("Write(%d): %v", i, err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	if _, err := os.Stat(path + ".1"); err != nil {
+		t.Fatalf("first backup missing: %v", err)
+	}
+	if _, err := os.Stat(path + ".2"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unexpected second backup: %v", err)
 	}
 }
 
