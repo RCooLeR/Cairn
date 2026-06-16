@@ -2096,7 +2096,7 @@ function App() {
       topic: "app-update",
       read: false,
       createdAt: appUpdateNotice.publishedAt || new Date().toISOString(),
-    } as Notification;
+    };
   }, [appUpdateNotice, appUpdateNotificationRead]);
   const notificationsForDisplay = useMemo(
     () =>
