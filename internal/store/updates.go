@@ -408,16 +408,23 @@ type updateHistoryScanner interface {
 }
 
 func (r *UpdateRepository) listLatestChecks(ctx context.Context, projectID string) ([]UpdateCheckRecord, error) {
-	rows, err := r.db.QueryContext(ctx, updateCheckSelectSQL()+`
+	args := []any{}
+	query := updateCheckSelectSQL() + `
 		JOIN (
 			SELECT MAX(id) AS latest_id
 			FROM image_update_checks
-			WHERE (? = '' OR project_id = ?)
-			GROUP BY provider_id, COALESCE(project_id, ''), COALESCE(service_id, ''),
+`
+	if projectID != "" {
+		query += `			WHERE COALESCE(project_id, '') = ?
+`
+		args = append(args, projectID)
+	}
+	query += `			GROUP BY COALESCE(project_id, ''), provider_id, COALESCE(service_id, ''),
 				COALESCE(container_id, ''), kind, image_ref, COALESCE(base_image_ref, '')
 		) latest ON latest.latest_id = image_update_checks.id
 		ORDER BY COALESCE(project_id, ''), COALESCE(service_id, ''), kind, image_ref, COALESCE(base_image_ref, '')
-	`, projectID, projectID)
+	`
+	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}

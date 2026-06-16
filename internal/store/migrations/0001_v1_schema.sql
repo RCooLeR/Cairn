@@ -208,6 +208,16 @@ CREATE TABLE image_update_checks (
 );
 CREATE INDEX idx_checks_project ON image_update_checks(project_id, checked_at);
 CREATE INDEX idx_checks_kind ON image_update_checks(kind, status);
+CREATE INDEX idx_checks_latest ON image_update_checks(
+    COALESCE(project_id, ''),
+    provider_id,
+    COALESCE(service_id, ''),
+    COALESCE(container_id, ''),
+    kind,
+    image_ref,
+    COALESCE(base_image_ref, ''),
+    id
+);
 
 CREATE TABLE ignored_updates (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
