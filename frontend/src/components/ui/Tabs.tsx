@@ -17,8 +17,13 @@ type TabsProps = {
 
 export function Tabs({ activeID, children, items, onChange }: TabsProps) {
   const enabledItems = items.filter((item) => !item.disabled);
+  const activeEnabled = enabledItems.some((item) => item.id === activeID);
+  const focusID = activeEnabled ? activeID : enabledItems[0]?.id;
   const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
-    const activeIndex = enabledItems.findIndex((item) => item.id === activeID);
+    if (!focusID || enabledItems.length === 0) {
+      return;
+    }
+    const activeIndex = enabledItems.findIndex((item) => item.id === focusID);
     if (activeIndex === -1) {
       return;
     }
@@ -63,7 +68,7 @@ export function Tabs({ activeID, children, items, onChange }: TabsProps) {
             key={item.id}
             onClick={() => onChange(item.id)}
             role="tab"
-            tabIndex={item.id === activeID ? 0 : -1}
+            tabIndex={item.id === focusID ? 0 : -1}
             type="button"
           >
             {item.label}

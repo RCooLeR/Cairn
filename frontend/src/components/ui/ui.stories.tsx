@@ -120,6 +120,19 @@ export const Components = () => {
           { id: "state", header: "State", render: (row) => row.state },
         ]}
         getRowID={(row) => row.id}
+        onToggleAllRows={(ids, isSelected) =>
+          setSelected((current) => {
+            const next = new Set(current);
+            for (const id of ids) {
+              if (isSelected) {
+                next.add(id);
+              } else {
+                next.delete(id);
+              }
+            }
+            return next;
+          })
+        }
         onToggleRow={(id) =>
           setSelected((current) => {
             const next = new Set(current);

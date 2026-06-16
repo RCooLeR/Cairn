@@ -17,12 +17,25 @@ describe("UI kit", () => {
       "title",
       "Waiting for provider",
     );
+    expect(screen.getByRole("button", { name: "Start" })).toHaveAttribute(
+      "aria-busy",
+      "true",
+    );
+    expect(screen.getByText("Waiting for provider")).toHaveClass("sr-only");
   });
 
   it("renders status text without relying on color alone", () => {
     render(<StatusDot label="Running" tone="ok" />);
 
     expect(screen.getByText("Running")).toBeInTheDocument();
+  });
+
+  it("announces icon-only status dots", () => {
+    render(<StatusDot tone="warn" />);
+
+    expect(
+      screen.getByRole("img", { name: "Status warning" }),
+    ).toBeInTheDocument();
   });
 
   it("switches tabs with buttons", async () => {
@@ -46,6 +59,31 @@ describe("UI kit", () => {
 
     fireEvent.keyDown(screen.getByRole("tablist"), { key: "ArrowRight" });
     expect(onChange).toHaveBeenCalledWith("services");
+  });
+
+  it("keeps tab keyboard navigation working when the active tab is disabled", () => {
+    const onChange = vi.fn();
+
+    render(
+      <Tabs
+        activeID="overview"
+        items={[
+          { id: "overview", label: "Overview", disabled: true },
+          { id: "services", label: "Services" },
+          { id: "logs", label: "Logs" },
+        ]}
+        onChange={onChange}
+      >
+        Content
+      </Tabs>,
+    );
+
+    expect(screen.getByRole("tab", { name: "Services" })).toHaveAttribute(
+      "tabindex",
+      "0",
+    );
+    fireEvent.keyDown(screen.getByRole("tablist"), { key: "ArrowRight" });
+    expect(onChange).toHaveBeenCalledWith("logs");
   });
 
   it("sorts table rows by sortable columns", async () => {
@@ -83,6 +121,7 @@ describe("UI kit", () => {
 
   it("shows selected rows and bulk actions", async () => {
     const onToggle = vi.fn();
+    const onToggleAll = vi.fn();
 
     render(
       <DataTable
@@ -95,9 +134,10 @@ describe("UI kit", () => {
           },
         ]}
         getRowID={(row) => row.name}
+        onToggleAllRows={onToggleAll}
         onToggleRow={onToggle}
         rowLabel={(row) => row.name}
-        rows={[{ name: "api" }]}
+        rows={[{ name: "api" }, { name: "worker" }]}
         selectedIDs={new Set(["api"])}
       />,
     );
@@ -105,6 +145,20 @@ describe("UI kit", () => {
     expect(screen.getByText("1 selected")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("checkbox", { name: "Select api" }));
     expect(onToggle).toHaveBeenCalledWith("api");
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select all rows" }));
+    expect(onToggleAll).toHaveBeenCalledWith(["api", "worker"], true);
+  });
+
+  it("focuses modal panel unless an autofocus target is present", () => {
+    const onClose = vi.fn();
+
+    render(
+      <Modal onClose={onClose} open title="Confirm">
+        Body
+      </Modal>,
+    );
+
+    expect(screen.getByRole("dialog", { name: "Confirm" })).toHaveFocus();
   });
 
   it("closes modal on Escape", async () => {

@@ -25,6 +25,12 @@ const focusableSelector = [
   "textarea:not([disabled])",
   '[tabindex]:not([tabindex="-1"])',
 ].join(",");
+const initialFocusSelector = [
+  "[data-autofocus]",
+  "input:not([disabled])",
+  "select:not([disabled])",
+  "textarea:not([disabled])",
+].join(",");
 
 const sizeClasses: Record<NonNullable<ModalProps["size"]>, string> = {
   sm: "max-w-sm",
@@ -53,9 +59,9 @@ export function Modal({
       document.activeElement instanceof HTMLElement
         ? document.activeElement
         : null;
-    const firstFocusable =
-      panelRef.current?.querySelector<HTMLElement>(focusableSelector);
-    (firstFocusable ?? panelRef.current)?.focus();
+    const initialFocus =
+      panelRef.current?.querySelector<HTMLElement>(initialFocusSelector);
+    (initialFocus ?? panelRef.current)?.focus();
 
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !busy) {
@@ -121,6 +127,7 @@ export function Modal({
             aria-label="Close"
             disabled={busy}
             disabledReason="Action is running"
+            data-modal-close
             icon={<X size={16} />}
             onClick={onClose}
             size="icon"

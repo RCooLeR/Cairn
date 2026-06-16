@@ -3866,6 +3866,23 @@ function App() {
     });
   }, []);
 
+  const toggleAllContainerSelection = useCallback(
+    (ids: string[], selected: boolean) => {
+      setSelectedContainerIDs((current) => {
+        const next = new Set(current);
+        for (const id of ids) {
+          if (selected) {
+            next.add(id);
+          } else {
+            next.delete(id);
+          }
+        }
+        return next;
+      });
+    },
+    [],
+  );
+
   const openContainerInspect = useCallback((container: ContainerSummary) => {
     const subtitle = shortID(container.id);
     setInspect({
@@ -4312,6 +4329,7 @@ function App() {
             onFilterChange={setContainerFilter}
             onInspect={openContainerInspect}
             onRename={openRenameModal}
+            onToggleAllSelection={toggleAllContainerSelection}
             onToggleSelection={toggleContainerSelection}
             search={search}
             selectedIDs={selectedContainerIDs}
@@ -12099,6 +12117,7 @@ type ContainersPageProps = {
   onFilterChange: (filter: FilterID) => void;
   onInspect: (container: ContainerSummary) => void;
   onRename: (container: ContainerSummary) => void;
+  onToggleAllSelection: (ids: string[], selected: boolean) => void;
   onToggleSelection: (id: string) => void;
 };
 
@@ -12114,6 +12133,7 @@ function ContainersPage({
   onFilterChange,
   onInspect,
   onRename,
+  onToggleAllSelection,
   onToggleSelection,
   search,
   selectedIDs,
@@ -12257,6 +12277,7 @@ function ContainersPage({
           />
         }
         getRowID={(container) => container.id}
+        onToggleAllRows={onToggleAllSelection}
         onToggleRow={onToggleSelection}
         rowLabel={(container) => container.name || shortID(container.id)}
         rows={filtered}

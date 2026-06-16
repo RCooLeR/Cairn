@@ -16,15 +16,26 @@ const toneClasses: Record<StatusTone, string> = {
   neutral: "bg-neutral",
 };
 
+const toneLabels: Record<StatusTone, string> = {
+  ok: "Status ok",
+  warn: "Status warning",
+  error: "Status error",
+  info: "Status information",
+  neutral: "Status neutral",
+};
+
 export function StatusDot({
   label,
   pulse = false,
   tone = "neutral",
 }: StatusDotProps) {
+  const accessibleProps = label
+    ? {}
+    : { "aria-label": toneLabels[tone], role: "img" };
   return (
-    <span className="inline-flex items-center gap-2">
+    <span className="inline-flex items-center gap-2" {...accessibleProps}>
       <span
-        aria-hidden={label ? undefined : "true"}
+        aria-hidden="true"
         className={cx(
           "h-2 w-2 rounded-full",
           toneClasses[tone],

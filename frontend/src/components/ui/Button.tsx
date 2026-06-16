@@ -1,6 +1,7 @@
 import type { ButtonHTMLAttributes, ReactNode } from "react";
 
 import { Loader2 } from "lucide-react";
+import { useId } from "react";
 
 import { cx } from "./utils";
 
@@ -43,32 +44,46 @@ export function Button({
   ...props
 }: ButtonProps) {
   const isDisabled = disabled || loading;
+  const disabledReasonID = useId();
+  const describedBy =
+    isDisabled && disabledReason
+      ? [props["aria-describedby"], disabledReasonID].filter(Boolean).join(" ")
+      : props["aria-describedby"];
 
   return (
-    <button
-      {...props}
-      aria-disabled={isDisabled}
-      className={cx(
-        "inline-flex shrink-0 items-center justify-center gap-2 rounded-control border font-medium transition",
-        "disabled:cursor-not-allowed disabled:opacity-50",
-        variantClasses[variant],
-        sizeClasses[size],
-        className,
-      )}
-      disabled={isDisabled}
-      title={isDisabled ? disabledReason : props.title}
-      type={type}
-    >
-      {loading ? (
-        <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />
-      ) : (
-        icon
-      )}
-      {size === "icon" ? (
-        <span className="sr-only">{props["aria-label"]}</span>
-      ) : (
-        children
-      )}
-    </button>
+    <>
+      <button
+        {...props}
+        aria-busy={loading || undefined}
+        aria-describedby={describedBy}
+        aria-disabled={isDisabled}
+        className={cx(
+          "inline-flex shrink-0 items-center justify-center gap-2 rounded-control border font-medium transition",
+          "disabled:cursor-not-allowed disabled:opacity-50",
+          variantClasses[variant],
+          sizeClasses[size],
+          className,
+        )}
+        disabled={isDisabled}
+        title={isDisabled ? disabledReason : props.title}
+        type={type}
+      >
+        {loading ? (
+          <Loader2 aria-hidden="true" className="h-4 w-4 animate-spin" />
+        ) : (
+          icon
+        )}
+        {size === "icon" ? (
+          <span className="sr-only">{props["aria-label"]}</span>
+        ) : (
+          children
+        )}
+      </button>
+      {isDisabled && disabledReason ? (
+        <span className="sr-only" id={disabledReasonID}>
+          {disabledReason}
+        </span>
+      ) : null}
+    </>
   );
 }

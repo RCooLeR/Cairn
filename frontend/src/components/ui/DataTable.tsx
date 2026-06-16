@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 
 import { ArrowDownUp } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { cx } from "./utils";
 
@@ -25,6 +25,7 @@ type DataTableProps<T> = {
   ariaLabel?: string;
   selectedIDs?: Set<string>;
   onToggleRow?: (id: string) => void;
+  onToggleAllRows?: (ids: string[], selected: boolean) => void;
   rowLabel?: (row: T) => string;
   bulkActions?: ReactNode;
   empty?: ReactNode;
@@ -42,6 +43,7 @@ export function DataTable<T>({
   empty,
   getRowID,
   onToggleRow,
+  onToggleAllRows,
   rowLabel,
   rows,
   selectedIDs = new Set<string>(),
@@ -49,6 +51,7 @@ export function DataTable<T>({
   const hasSelection = selectedIDs.size > 0;
   const [sort, setSort] = useState<SortState | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
+  const selectAllRef = useRef<HTMLInputElement>(null);
   const visibleRows = useMemo(() => {
     if (!sort) {
       return rows;
@@ -115,6 +118,25 @@ export function DataTable<T>({
     ? Math.max(0, (visibleRows.length - virtualEnd) * virtualRowHeight)
     : 0;
   const columnCount = columns.length + (onToggleRow ? 1 : 0);
+  const visibleIDs = useMemo(
+    () => visibleRows.map(getRowID),
+    [getRowID, visibleRows],
+  );
+  const selectedVisibleCount = visibleIDs.filter((id) =>
+    selectedIDs.has(id),
+  ).length;
+  const canToggleAll = Boolean(
+    onToggleAllRows && onToggleRow && visibleIDs.length > 0,
+  );
+  const allVisibleSelected =
+    canToggleAll && selectedVisibleCount === visibleIDs.length;
+
+  useEffect(() => {
+    if (selectAllRef.current) {
+      selectAllRef.current.indeterminate =
+        selectedVisibleCount > 0 && selectedVisibleCount < visibleIDs.length;
+    }
+  }, [selectedVisibleCount, visibleIDs.length]);
 
   if (rows.length === 0 && empty) {
     return <>{empty}</>;
@@ -149,7 +171,24 @@ export function DataTable<T>({
                   aria-label="Selection"
                   className="w-10 px-3 py-2"
                   scope="col"
-                />
+                >
+                  {onToggleAllRows ? (
+                    <input
+                      aria-label={
+                        allVisibleSelected
+                          ? "Clear row selection"
+                          : "Select all rows"
+                      }
+                      checked={allVisibleSelected}
+                      disabled={visibleIDs.length === 0}
+                      onChange={() =>
+                        onToggleAllRows(visibleIDs, !allVisibleSelected)
+                      }
+                      ref={selectAllRef}
+                      type="checkbox"
+                    />
+                  ) : null}
+                </th>
               ) : null}
               {columns.map((column) => (
                 <th
