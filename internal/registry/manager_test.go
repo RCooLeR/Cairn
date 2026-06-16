@@ -19,6 +19,7 @@ import (
 
 func TestNormalizeImageRefCorpus(t *testing.T) {
 	digest := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	digest512 := "sha512:" + strings.Repeat("b", 128)
 	tests := []struct {
 		raw        string
 		registry   string
@@ -41,6 +42,7 @@ func TestNormalizeImageRefCorpus(t *testing.T) {
 		{"example.com/ns/app", "example.com", "ns/app", "latest", false},
 		{"example.com:5443/ns/app:release-2026.06", "example.com:5443", "ns/app", "release-2026.06", false},
 		{"example.com/ns/app@" + digest, "example.com", "ns/app", "", true},
+		{"example.com/ns/app:tag@" + digest512, "example.com", "ns/app", "", true},
 		{"ubuntu", "docker.io", "library/ubuntu", "latest", false},
 		{"debian:bookworm-slim", "docker.io", "library/debian", "bookworm-slim", false},
 		{"mcr.microsoft.com/dotnet/runtime:8.0", "mcr.microsoft.com", "dotnet/runtime", "8.0", false},

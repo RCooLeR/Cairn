@@ -53,7 +53,7 @@ func NormalizeImageRef(raw string) (ImageRef, error) {
 }
 
 func rawContainsDigest(value string) bool {
-	return strings.Contains(value, "@sha256:")
+	return strings.Contains(value, "@")
 }
 
 func normalizeRegistryHost(raw string) string {

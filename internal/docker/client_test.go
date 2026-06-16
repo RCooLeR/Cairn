@@ -132,6 +132,16 @@ func TestClientConnectAndDTOs(t *testing.T) {
 	}
 }
 
+func TestNormalizeContainerStateKeepsUnknownStateUnknown(t *testing.T) {
+	t.Parallel()
+	if got := normalizeContainerState("hibernating"); got != "unknown" {
+		t.Fatalf("normalizeContainerState(unknown) = %q, want unknown", got)
+	}
+	if got := normalizeContainerState("removing"); got != "exited" {
+		t.Fatalf("normalizeContainerState(removing) = %q, want exited", got)
+	}
+}
+
 func TestClientConnectUsesProviderDialer(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

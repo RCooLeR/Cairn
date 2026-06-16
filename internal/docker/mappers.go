@@ -345,7 +345,7 @@ func normalizeContainerState(value string) string {
 	case "":
 		return ""
 	default:
-		return "exited"
+		return "unknown"
 	}
 }
 
