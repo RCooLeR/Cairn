@@ -108,7 +108,7 @@ func TestManagerSessionLimitAndClose(t *testing.T) {
 	}
 }
 
-func TestManagerContainerTerminalDetectsShellAndRoot(t *testing.T) {
+func TestManagerContainerTerminalDetectsShellWithoutDefaultUserProbe(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	docker := &fakeDockerClient{
@@ -128,20 +128,45 @@ func TestManagerContainerTerminalDetectsShellAndRoot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenContainerTerminal() error = %v", err)
 	}
-	if info.Kind != KindContainer || info.Title != "api-1" || info.Shell != "/bin/sh" || !info.IsRoot || info.User != "root" {
+	if info.Kind != KindContainer || info.Title != "api-1" || info.Shell != "/bin/sh" || info.IsRoot || info.User != "" {
 		t.Fatalf("info = %#v", info)
 	}
 	if docker.detectedID != "abc123" {
 		t.Fatalf("detectedID = %q", docker.detectedID)
 	}
-	if got := docker.runCmd; strings.Join(got.Cmd, " ") != "/bin/sh -c id -u" {
-		t.Fatalf("root probe = %#v", got.Cmd)
+	if docker.runCmd.Cmd != nil {
+		t.Fatalf("unexpected default user probe = %#v", docker.runCmd.Cmd)
 	}
 	if docker.openContainerID != "abc123" || strings.Join(docker.openOpts.Cmd, " ") != "/bin/sh" {
 		t.Fatalf("open = %q %#v", docker.openContainerID, docker.openOpts)
 	}
 	if docker.openOpts.WorkingDir != "/app" || docker.openOpts.Env["RAILS_ENV"] != "test" || docker.openOpts.Cols != 132 || docker.openOpts.Rows != 43 {
 		t.Fatalf("open opts = %#v", docker.openOpts)
+	}
+}
+
+func TestManagerContainerTerminalLabelsRequestedRootUser(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	docker := &fakeDockerClient{
+		detail:  &models.ContainerDetail{Summary: models.ContainerSummary{ID: "abc123", Name: "api-1"}},
+		runOut:  "0\n",
+		runCode: 0,
+	}
+	manager := NewManager(fakeProvider{}, docker, nil, nil, Options{})
+
+	info, err := manager.OpenContainerTerminal(ctx, "abc123", models.ContainerTerminalOptions{
+		Shell: "/bin/sh",
+		User:  "root",
+	})
+	if err != nil {
+		t.Fatalf("OpenContainerTerminal(root) error = %v", err)
+	}
+	if !info.IsRoot || info.User != "root" {
+		t.Fatalf("info = %#v", info)
+	}
+	if got := docker.runCmd; strings.Join(got.Cmd, " ") != "/bin/sh -c id -u" || got.User != "root" {
+		t.Fatalf("root probe = %#v", got)
 	}
 }
 

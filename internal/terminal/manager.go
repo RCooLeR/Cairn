@@ -490,23 +490,17 @@ func (m *Manager) publishClosed(sessionID string, exitCode int) {
 
 func (m *Manager) containerUser(ctx context.Context, containerID string, shell string, requested string) (bool, string) {
 	user := strings.TrimSpace(requested)
+	if user == "" {
+		return false, ""
+	}
 	out, code, err := m.docker.RunContainerExec(ctx, containerID, dockercore.ExecOptions{
 		Cmd:  shellCommand(shell, "id -u"),
 		User: requested,
 	})
 	if err != nil || code != 0 {
-		if user == "" {
-			return false, ""
-		}
 		return user == "0" || user == "root", user
 	}
 	uid := strings.TrimSpace(out)
-	if user == "" {
-		user = uid
-		if uid == "0" {
-			user = "root"
-		}
-	}
 	return uid == "0", user
 }
 
