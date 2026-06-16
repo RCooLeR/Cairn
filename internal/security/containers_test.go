@@ -53,7 +53,9 @@ func TestPlanStoreExpiresAndRequiresTypedName(t *testing.T) {
 		Action: ContainerActionRemove,
 		IDs:    []string{"container-1"},
 	}
-	store.Save(plan)
+	if err := store.Save(plan); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
 
 	if _, err := store.Take(context.Background(), "plan-1", "wrong"); !apperror.IsCode(err, apperror.ConfirmationRequired) {
 		t.Fatalf("Take() error = %v, want E_CONFIRMATION_REQUIRED", err)
@@ -90,14 +92,18 @@ func TestRequireConfirmationTrimsTypedNameAndAllowsSafePlans(t *testing.T) {
 func TestPlanStoreContextAndExpiry(t *testing.T) {
 	now := time.Date(2026, 6, 13, 11, 0, 0, 0, time.UTC)
 	store := NewPlanStore(func() time.Time { return now })
-	store.Save(ContainerPlan{Plan: models.CommandPlan{PlanID: "expired", ExpiresAt: now.Add(-time.Second)}})
+	if err := store.Save(ContainerPlan{Plan: models.CommandPlan{PlanID: "expired", ExpiresAt: now.Add(-time.Second)}}); err != nil {
+		t.Fatalf("Save(expired) error = %v", err)
+	}
 	if _, err := store.Take(context.Background(), "expired", ""); !apperror.IsCode(err, apperror.PlanExpired) {
 		t.Fatalf("expired Take error = %v, want E_PLAN_EXPIRED", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	store.Save(ContainerPlan{Plan: models.CommandPlan{PlanID: "ctx", ExpiresAt: now.Add(time.Minute)}})
+	if err := store.Save(ContainerPlan{Plan: models.CommandPlan{PlanID: "ctx", ExpiresAt: now.Add(time.Minute)}}); err != nil {
+		t.Fatalf("Save(ctx) error = %v", err)
+	}
 	if _, err := store.Take(ctx, "ctx", ""); !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled Take error = %v, want context.Canceled", err)
 	}
@@ -242,7 +248,7 @@ func TestNewContainerActionPlanValidationAndFallbackLabels(t *testing.T) {
 func TestProjectPlanStoreTake(t *testing.T) {
 	now := time.Date(2026, 6, 13, 13, 0, 0, 0, time.UTC)
 	store := NewProjectPlanStore(func() time.Time { return now })
-	store.Save(ProjectPlan{
+	if err := store.Save(ProjectPlan{
 		Plan: models.CommandPlan{
 			PlanID:            "project-plan",
 			Risk:              models.RiskDangerous,
@@ -252,7 +258,9 @@ func TestProjectPlanStoreTake(t *testing.T) {
 		Action:        ProjectActionDown,
 		ProjectID:     "linux_native/app-db",
 		RemoveVolumes: true,
-	})
+	}); err != nil {
+		t.Fatalf("Save(project) error = %v", err)
+	}
 
 	if _, err := store.Take(context.Background(), "project-plan", "wrong"); !apperror.IsCode(err, apperror.ConfirmationRequired) {
 		t.Fatalf("wrong typed project Take error = %v, want E_CONFIRMATION_REQUIRED", err)
@@ -269,7 +277,9 @@ func TestProjectPlanStoreTake(t *testing.T) {
 	}
 
 	expiring := NewProjectPlanStore(func() time.Time { return now })
-	expiring.Save(ProjectPlan{Plan: models.CommandPlan{PlanID: "expired", ExpiresAt: now.Add(-time.Second)}})
+	if err := expiring.Save(ProjectPlan{Plan: models.CommandPlan{PlanID: "expired", ExpiresAt: now.Add(-time.Second)}}); err != nil {
+		t.Fatalf("Save(expired project) error = %v", err)
+	}
 	if _, err := expiring.Take(context.Background(), "expired", ""); !apperror.IsCode(err, apperror.PlanExpired) {
 		t.Fatalf("expired project Take error = %v, want E_PLAN_EXPIRED", err)
 	}
@@ -283,14 +293,40 @@ func TestProjectPlanStoreTake(t *testing.T) {
 func TestPlanStoresPruneExpiredEntriesOnSave(t *testing.T) {
 	now := time.Date(2026, 6, 13, 14, 0, 0, 0, time.UTC)
 	store := NewPlanStore(func() time.Time { return now })
-	store.Save(ContainerPlan{Plan: models.CommandPlan{PlanID: "expired", ExpiresAt: now.Add(-time.Second)}})
-	store.Save(ContainerPlan{Plan: models.CommandPlan{PlanID: "fresh", ExpiresAt: now.Add(time.Minute)}})
+	if err := store.Save(ContainerPlan{Plan: models.CommandPlan{PlanID: "expired", ExpiresAt: now.Add(-time.Second)}}); err != nil {
+		t.Fatalf("Save(expired) error = %v", err)
+	}
+	if err := store.Save(ContainerPlan{Plan: models.CommandPlan{PlanID: "fresh", ExpiresAt: now.Add(time.Minute)}}); err != nil {
+		t.Fatalf("Save(fresh) error = %v", err)
+	}
 
 	if _, err := store.Take(context.Background(), "expired", ""); !apperror.IsCode(err, apperror.PlanExpired) {
 		t.Fatalf("expired plan error = %v, want E_PLAN_EXPIRED", err)
 	}
 	if _, err := store.Take(context.Background(), "fresh", ""); err != nil {
 		t.Fatalf("fresh plan error = %v", err)
+	}
+}
+
+func TestPlanStoreRejectsHighRiskWithoutTypedName(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 6, 13, 14, 30, 0, 0, time.UTC)
+	plan := models.CommandPlan{
+		PlanID:    "unsafe-plan",
+		Risk:      models.RiskDangerous,
+		ExpiresAt: now.Add(time.Minute),
+	}
+	if err := NewPlanStore(func() time.Time { return now }).Save(ContainerPlan{Plan: plan}); !apperror.IsCode(err, apperror.ConfirmationRequired) {
+		t.Fatalf("container Save() error = %v, want E_CONFIRMATION_REQUIRED", err)
+	}
+	if err := NewDockerObjectPlanStore(func() time.Time { return now }).Save(DockerObjectPlan{Plan: plan}); !apperror.IsCode(err, apperror.ConfirmationRequired) {
+		t.Fatalf("object Save() error = %v, want E_CONFIRMATION_REQUIRED", err)
+	}
+	if err := NewProjectPlanStore(func() time.Time { return now }).Save(ProjectPlan{Plan: plan}); !apperror.IsCode(err, apperror.ConfirmationRequired) {
+		t.Fatalf("project Save() error = %v, want E_CONFIRMATION_REQUIRED", err)
+	}
+	if err := NewProviderPlanStore(func() time.Time { return now }).Save(ProviderPlan{Plan: plan}); !apperror.IsCode(err, apperror.ConfirmationRequired) {
+		t.Fatalf("provider Save() error = %v, want E_CONFIRMATION_REQUIRED", err)
 	}
 }
 

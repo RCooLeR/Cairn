@@ -477,7 +477,9 @@ func (s *ProviderService) PlanRestart(ctx context.Context, providerID string) (*
 	if err != nil {
 		return nil, err
 	}
-	s.providerPlanStore().Save(plan)
+	if err := s.providerPlanStore().Save(plan); err != nil {
+		return nil, err
+	}
 	return &plan.Plan, nil
 }
 
@@ -770,7 +772,9 @@ func (s *DockerService) planContainerAction(ctx context.Context, action string, 
 	if err != nil {
 		return nil, err
 	}
-	s.planStore().Save(plan)
+	if err := s.planStore().Save(plan); err != nil {
+		return nil, err
+	}
 	return &plan.Plan, nil
 }
 
@@ -888,7 +892,9 @@ func (s *DockerService) planRemoveImage(ctx context.Context, imageID string, for
 		return nil, err
 	}
 	plan.TargetID = imageID
-	s.objectPlanStore().Save(plan)
+	if err := s.objectPlanStore().Save(plan); err != nil {
+		return nil, err
+	}
 	return &plan.Plan, nil
 }
 
@@ -904,7 +910,9 @@ func (s *DockerService) planRemoveVolume(ctx context.Context, name string, force
 	if err != nil {
 		return nil, err
 	}
-	s.objectPlanStore().Save(plan)
+	if err := s.objectPlanStore().Save(plan); err != nil {
+		return nil, err
+	}
 	return &plan.Plan, nil
 }
 
@@ -921,7 +929,9 @@ func (s *DockerService) planRemoveNetwork(ctx context.Context, id string) (*mode
 		return nil, err
 	}
 	plan.TargetID = id
-	s.objectPlanStore().Save(plan)
+	if err := s.objectPlanStore().Save(plan); err != nil {
+		return nil, err
+	}
 	return &plan.Plan, nil
 }
 
@@ -1127,7 +1137,9 @@ func (s *DockerService) PlanPrune(_ context.Context, kind string) (*models.Comma
 	if err != nil {
 		return nil, err
 	}
-	s.objectPlanStore().Save(plan)
+	if err := s.objectPlanStore().Save(plan); err != nil {
+		return nil, err
+	}
 	return &plan.Plan, nil
 }
 
@@ -2294,7 +2306,9 @@ func (s *ProjectService) planProjectAction(ctx context.Context, action string, p
 	if err != nil {
 		return nil, err
 	}
-	s.projectPlanStore().Save(projectPlan)
+	if err := s.projectPlanStore().Save(projectPlan); err != nil {
+		return nil, err
+	}
 	return &plan, nil
 }
 

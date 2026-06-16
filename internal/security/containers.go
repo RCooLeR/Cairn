@@ -1,13 +1,11 @@
 package security
 
 import (
-	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"slices"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
@@ -33,45 +31,11 @@ type ContainerPlan struct {
 }
 
 type PlanStore struct {
-	mu    sync.Mutex
-	now   func() time.Time
-	plans map[string]ContainerPlan
+	*commandPlanStore[ContainerPlan]
 }
 
 func NewPlanStore(now func() time.Time) *PlanStore {
-	if now == nil {
-		now = func() time.Time { return time.Now().UTC() }
-	}
-	return &PlanStore{now: now, plans: map[string]ContainerPlan{}}
-}
-
-func (s *PlanStore) Save(plan ContainerPlan) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	pruneExpiredPlans(s.now(), s.plans, func(plan ContainerPlan) models.CommandPlan { return plan.Plan })
-	s.plans[plan.Plan.PlanID] = plan
-}
-
-func (s *PlanStore) Take(ctx context.Context, planID string, typedName string) (ContainerPlan, error) {
-	if err := ctx.Err(); err != nil {
-		return ContainerPlan{}, err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	plan, ok := s.plans[planID]
-	if !ok {
-		return ContainerPlan{}, apperror.New(apperror.PlanExpired, "Plan expired or was not found")
-	}
-	if s.now().After(plan.Plan.ExpiresAt) {
-		delete(s.plans, planID)
-		return ContainerPlan{}, apperror.New(apperror.PlanExpired, "Plan expired")
-	}
-	pruneExpiredPlans(s.now(), s.plans, func(plan ContainerPlan) models.CommandPlan { return plan.Plan })
-	if err := RequireConfirmation(plan.Plan, typedName); err != nil {
-		return ContainerPlan{}, err
-	}
-	delete(s.plans, planID)
-	return plan, nil
+	return &PlanStore{commandPlanStore: newCommandPlanStore(now, func(plan ContainerPlan) models.CommandPlan { return plan.Plan })}
 }
 
 func RequireConfirmation(plan models.CommandPlan, typedName string) error {
@@ -314,13 +278,4 @@ func containerConfirmationName(containers []models.ContainerSummary) string {
 		return shortID(containers[0].ID)
 	}
 	return "containers"
-}
-
-func pruneExpiredPlans[T any](now time.Time, plans map[string]T, toCommandPlan func(T) models.CommandPlan) {
-	for id, plan := range plans {
-		expiresAt := toCommandPlan(plan).ExpiresAt
-		if !expiresAt.IsZero() && now.After(expiresAt) {
-			delete(plans, id)
-		}
-	}
 }

@@ -1,9 +1,7 @@
 package security
 
 import (
-	"context"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
@@ -17,45 +15,11 @@ type ProviderPlan struct {
 }
 
 type ProviderPlanStore struct {
-	mu    sync.Mutex
-	now   func() time.Time
-	plans map[string]ProviderPlan
+	*commandPlanStore[ProviderPlan]
 }
 
 func NewProviderPlanStore(now func() time.Time) *ProviderPlanStore {
-	if now == nil {
-		now = func() time.Time { return time.Now().UTC() }
-	}
-	return &ProviderPlanStore{now: now, plans: map[string]ProviderPlan{}}
-}
-
-func (s *ProviderPlanStore) Save(plan ProviderPlan) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	pruneExpiredPlans(s.now(), s.plans, func(plan ProviderPlan) models.CommandPlan { return plan.Plan })
-	s.plans[plan.Plan.PlanID] = plan
-}
-
-func (s *ProviderPlanStore) Take(ctx context.Context, planID string, typedName string) (ProviderPlan, error) {
-	if err := ctx.Err(); err != nil {
-		return ProviderPlan{}, err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	plan, ok := s.plans[planID]
-	if !ok {
-		return ProviderPlan{}, apperror.New(apperror.PlanExpired, "Plan expired or was not found")
-	}
-	if s.now().After(plan.Plan.ExpiresAt) {
-		delete(s.plans, planID)
-		return ProviderPlan{}, apperror.New(apperror.PlanExpired, "Plan expired")
-	}
-	pruneExpiredPlans(s.now(), s.plans, func(plan ProviderPlan) models.CommandPlan { return plan.Plan })
-	if err := RequireConfirmation(plan.Plan, typedName); err != nil {
-		return ProviderPlan{}, err
-	}
-	delete(s.plans, planID)
-	return plan, nil
+	return &ProviderPlanStore{commandPlanStore: newCommandPlanStore(now, func(plan ProviderPlan) models.CommandPlan { return plan.Plan })}
 }
 
 func NewProviderLifecyclePlan(action string, providerID string, providerName string, command string, risk models.Risk, now time.Time) (ProviderPlan, error) {

@@ -1,10 +1,8 @@
 package security
 
 import (
-	"context"
 	"fmt"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
@@ -28,45 +26,11 @@ type DockerObjectPlan struct {
 }
 
 type DockerObjectPlanStore struct {
-	mu    sync.Mutex
-	now   func() time.Time
-	plans map[string]DockerObjectPlan
+	*commandPlanStore[DockerObjectPlan]
 }
 
 func NewDockerObjectPlanStore(now func() time.Time) *DockerObjectPlanStore {
-	if now == nil {
-		now = func() time.Time { return time.Now().UTC() }
-	}
-	return &DockerObjectPlanStore{now: now, plans: map[string]DockerObjectPlan{}}
-}
-
-func (s *DockerObjectPlanStore) Save(plan DockerObjectPlan) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	pruneExpiredPlans(s.now(), s.plans, func(plan DockerObjectPlan) models.CommandPlan { return plan.Plan })
-	s.plans[plan.Plan.PlanID] = plan
-}
-
-func (s *DockerObjectPlanStore) Take(ctx context.Context, planID string, typedName string) (DockerObjectPlan, error) {
-	if err := ctx.Err(); err != nil {
-		return DockerObjectPlan{}, err
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	plan, ok := s.plans[planID]
-	if !ok {
-		return DockerObjectPlan{}, apperror.New(apperror.PlanExpired, "Plan expired or was not found")
-	}
-	if s.now().After(plan.Plan.ExpiresAt) {
-		delete(s.plans, planID)
-		return DockerObjectPlan{}, apperror.New(apperror.PlanExpired, "Plan expired")
-	}
-	pruneExpiredPlans(s.now(), s.plans, func(plan DockerObjectPlan) models.CommandPlan { return plan.Plan })
-	if err := RequireConfirmation(plan.Plan, typedName); err != nil {
-		return DockerObjectPlan{}, err
-	}
-	delete(s.plans, planID)
-	return plan, nil
+	return &DockerObjectPlanStore{commandPlanStore: newCommandPlanStore(now, func(plan DockerObjectPlan) models.CommandPlan { return plan.Plan })}
 }
 
 func NewRemoveImagePlan(image models.ImageSummary, force bool, now time.Time) (DockerObjectPlan, error) {
