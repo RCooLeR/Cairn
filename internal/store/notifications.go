@@ -75,7 +75,11 @@ func (r *NotificationRepository) List(ctx context.Context, unreadOnly bool, limi
 		}
 		notification.Read = read != 0
 		if createdAt != "" {
-			notification.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+			parsed, err := time.Parse(time.RFC3339Nano, createdAt)
+			if err != nil {
+				return nil, err
+			}
+			notification.CreatedAt = parsed
 		}
 		notifications = append(notifications, notification)
 	}

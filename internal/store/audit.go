@@ -106,7 +106,11 @@ func (r *AuditRepository) List(ctx context.Context, filter models.AuditFilter) (
 			return nil, err
 		}
 		if createdAt != "" {
-			entry.TS, _ = time.Parse(time.RFC3339Nano, createdAt)
+			parsed, err := time.Parse(time.RFC3339Nano, createdAt)
+			if err != nil {
+				return nil, err
+			}
+			entry.TS = parsed
 		}
 		entry.Metadata = auditMetadata(command, risk, providerID, projectID, targetType, durationMS)
 		entries = append(entries, entry)

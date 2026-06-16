@@ -399,6 +399,22 @@ func TestNotificationsRoundTripAndMarkRead(t *testing.T) {
 	}
 }
 
+func TestNotificationsListRejectsMalformedCreatedAt(t *testing.T) {
+	ctx := context.Background()
+	s := openMigratedStore(t, ctx)
+	defer closeStore(t, s)
+
+	if _, err := s.writer.ExecContext(ctx, `
+		INSERT INTO notifications (level, title, read, created_at)
+		VALUES ('info', 'Bad timestamp', 0, 'not-a-time')
+	`); err != nil {
+		t.Fatalf("insert malformed notification: %v", err)
+	}
+	if _, err := s.Notifications().List(ctx, false, 10); err == nil {
+		t.Fatal("List() succeeded with malformed notification timestamp, want error")
+	}
+}
+
 func TestAuditListIncludesViewerMetadata(t *testing.T) {
 	ctx := context.Background()
 	s := openMigratedStore(t, ctx)
@@ -433,6 +449,22 @@ func TestAuditListIncludesViewerMetadata(t *testing.T) {
 		metadata["targetType"] != "project" ||
 		metadata["durationMS"] != int64(2000) {
 		t.Fatalf("metadata = %#v", metadata)
+	}
+}
+
+func TestAuditListRejectsMalformedCreatedAt(t *testing.T) {
+	ctx := context.Background()
+	s := openMigratedStore(t, ctx)
+	defer closeStore(t, s)
+
+	if _, err := s.writer.ExecContext(ctx, `
+		INSERT INTO audit_log (action, status, created_at)
+		VALUES ('update.apply', 'success', 'not-a-time')
+	`); err != nil {
+		t.Fatalf("insert malformed audit: %v", err)
+	}
+	if _, err := s.Audit().List(ctx, models.AuditFilter{Limit: 10}); err == nil {
+		t.Fatal("List() succeeded with malformed audit timestamp, want error")
 	}
 }
 
