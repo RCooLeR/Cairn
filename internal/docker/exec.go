@@ -186,7 +186,7 @@ func (c *Client) DetectContainerShells(ctx context.Context, containerID string) 
 		return cached, nil
 	}
 
-	candidates := []string{"/bin/bash", "/bin/sh", "/busybox/sh"}
+	candidates := []string{"/bin/bash", "/bin/sh", "/bin/ash", "/bin/zsh", "/usr/bin/bash", "/busybox/sh"}
 	shells := make([]string, 0, len(candidates))
 	for _, shell := range candidates {
 		_, code, err := c.RunContainerExec(ctx, containerID, ExecOptions{Cmd: []string{shell, "-c", "exit 0"}})
@@ -198,7 +198,7 @@ func (c *Client) DetectContainerShells(ctx context.Context, containerID string) 
 		return nil, apperror.New(
 			apperror.NotFound,
 			"No interactive shell was found in this container",
-			apperror.WithDetail("Tried /bin/bash, /bin/sh, and /busybox/sh."),
+			apperror.WithDetail("Tried /bin/bash, /bin/sh, /bin/ash, /bin/zsh, /usr/bin/bash, and /busybox/sh."),
 			apperror.WithRepairHints("Use logs or exec a known binary for shell-less images."),
 		)
 	}

@@ -339,7 +339,7 @@ func TestClientContainerExecAndShellDetection(t *testing.T) {
 	if _, err := client.DetectContainerShells(ctx, "abc123"); err != nil {
 		t.Fatalf("DetectContainerShells(cached) error = %v", err)
 	}
-	if len(api.execCreates) != 3 {
+	if len(api.execCreates) != 6 {
 		t.Fatalf("exec create count = %d, want cached second call", len(api.execCreates))
 	}
 
