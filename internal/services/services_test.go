@@ -346,6 +346,25 @@ func TestDockerServiceLifecycleAuditsAndPlans(t *testing.T) {
 	}
 }
 
+func TestNotReadyReturnsIndependentProviderError(t *testing.T) {
+	first := notReady()
+	second := notReady()
+	if first == second {
+		t.Fatal("notReady() returned the same error instance")
+	}
+	if !apperror.IsCode(first, apperror.ProviderNotReady) {
+		t.Fatalf("notReady() code = %v, want provider not ready", first)
+	}
+	appErr, ok := first.(*apperror.AppError)
+	if !ok {
+		t.Fatalf("notReady() type = %T, want *AppError", first)
+	}
+	appErr.RepairHints[0] = "mutated"
+	if second.(*apperror.AppError).RepairHints[0] == "mutated" {
+		t.Fatal("notReady() repair hints share backing storage")
+	}
+}
+
 func TestDockerCommandBuildersAreStableAndIPv6Safe(t *testing.T) {
 	runCommand := dockerRunCommand(models.RunImageRequest{
 		ImageRef: "nginx:alpine",

@@ -182,12 +182,16 @@ type SettingsService struct {
 	Settings      *store.SettingsRepository
 }
 
+var notReadyTemplate = apperror.AppError{
+	Code:        apperror.ProviderNotReady,
+	Message:     "Provider is not ready",
+	RepairHints: []string{"Connect a Docker provider from onboarding."},
+}
+
 func notReady() error {
-	return apperror.New(
-		apperror.ProviderNotReady,
-		"Provider is not ready",
-		apperror.WithRepairHints("Connect a Docker provider from onboarding."),
-	)
+	err := notReadyTemplate
+	err.RepairHints = append([]string(nil), notReadyTemplate.RepairHints...)
+	return &err
 }
 
 func lockRuntime(mu *sync.RWMutex) func() {
