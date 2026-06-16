@@ -1,8 +1,17 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { APP_ERROR_CODES, appErrorPresentation } from "../../api/errors";
-import { Button, DataTable, Modal, StatusDot, Tabs, Tooltip } from ".";
+import { useToastQueue } from "../../hooks/useToastQueue";
+import {
+  Button,
+  DataTable,
+  Modal,
+  StatusDot,
+  Tabs,
+  ToastViewport,
+  Tooltip,
+} from ".";
 
 describe("UI kit", () => {
   it("renders button loading and disabled states", () => {
@@ -28,6 +37,43 @@ describe("UI kit", () => {
     render(<StatusDot label="Running" tone="ok" />);
 
     expect(screen.getByText("Running")).toBeInTheDocument();
+  });
+
+  it("queues and dismisses toast messages", () => {
+    vi.useFakeTimers();
+
+    function ToastHarness() {
+      const { pushToast, toasts } = useToastQueue();
+      return (
+        <>
+          <button
+            onClick={() =>
+              pushToast({
+                body: "Saved to disk",
+                level: "ok",
+                title: "Setting saved",
+              })
+            }
+            type="button"
+          >
+            Push
+          </button>
+          <ToastViewport toasts={toasts} />
+        </>
+      );
+    }
+
+    render(<ToastHarness />);
+    fireEvent.click(screen.getByRole("button", { name: "Push" }));
+
+    expect(screen.getByRole("status")).toHaveTextContent("Setting saved");
+
+    act(() => {
+      vi.advanceTimersByTime(3200);
+    });
+    expect(screen.queryByText("Setting saved")).not.toBeInTheDocument();
+
+    vi.useRealTimers();
   });
 
   it("announces icon-only status dots", () => {

@@ -2,9 +2,9 @@ import type { ReactNode } from "react";
 
 import { Badge } from "./Badge";
 
-type ToastLevel = "ok" | "warn" | "error" | "info";
+export type ToastLevel = "ok" | "warn" | "error" | "info";
 
-type ToastProps = {
+export type ToastProps = {
   level: ToastLevel;
   title: string;
   body?: string;

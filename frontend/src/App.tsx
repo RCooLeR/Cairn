@@ -142,7 +142,7 @@ import {
   Modal,
   Skeleton,
   StatusDot,
-  Toast,
+  ToastViewport,
   Tooltip,
 } from "./components/ui";
 import {
@@ -154,6 +154,7 @@ import { useAppStore } from "./state/appStore";
 import { useInventoryStore } from "./state/inventoryStore";
 import { useDebouncedRuntimeEvent } from "./hooks/useDebouncedRuntimeEvent";
 import { useFocusTrap } from "./hooks/useFocusTrap";
+import { useToastQueue, type ToastInput } from "./hooks/useToastQueue";
 import {
   chartColors,
   containerStatusChartSegments,
@@ -189,11 +190,6 @@ type SettingsSectionID =
   | "security"
   | "advanced"
   | "about";
-type SettingsToastState = {
-  level: "ok" | "error";
-  title: string;
-  body?: string;
-};
 type AuditRangeID = "24h" | "7d" | "30d" | "90d" | "all";
 type AuditFilterState = {
   range: AuditRangeID;
@@ -1186,9 +1182,7 @@ function App() {
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [settingsMessage, setSettingsMessage] = useState<string | null>(null);
   const [settingsError, setSettingsError] = useState<string | null>(null);
-  const [settingsToast, setSettingsToast] = useState<SettingsToastState | null>(
-    null,
-  );
+  const { pushToast, toasts } = useToastQueue();
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([]);
   const [auditLoading, setAuditLoading] = useState(false);
@@ -1271,14 +1265,6 @@ function App() {
       }
     };
   }, [themePreference]);
-
-  useEffect(() => {
-    if (!settingsToast) {
-      return undefined;
-    }
-    const timer = window.setTimeout(() => setSettingsToast(null), 3200);
-    return () => window.clearTimeout(timer);
-  }, [settingsToast]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -2217,7 +2203,7 @@ function App() {
           setPermissionMode(normalizePermissionMode(value));
         }
         setSettingsMessage("Setting saved");
-        setSettingsToast({
+        pushToast({
           body: "Your preference was saved.",
           level: "ok",
           title: "Setting saved",
@@ -2256,7 +2242,7 @@ function App() {
         const message =
           error instanceof Error ? error.message : "Unable to save setting";
         setSettingsError(message);
-        setSettingsToast({
+        pushToast({
           body: message,
           level: "error",
           title: "Setting failed",
@@ -2267,6 +2253,7 @@ function App() {
     },
     [
       activeProvider?.id,
+      pushToast,
       refreshInventory,
       refreshProjects,
       refreshUpdateSurfaces,
@@ -2439,7 +2426,7 @@ function App() {
       try {
         await ProviderService.SetDockerContext(name);
         setSettingsMessage(`Using Docker context ${name}`);
-        setSettingsToast({
+        pushToast({
           body: `Using Docker context ${name}.`,
           level: "ok",
           title: "Docker context saved",
@@ -2453,7 +2440,7 @@ function App() {
             ? error.message
             : "Unable to use Docker context";
         setSettingsError(message);
-        setSettingsToast({
+        pushToast({
           body: message,
           level: "error",
           title: "Docker context failed",
@@ -2462,7 +2449,7 @@ function App() {
         setSettingsSaving(false);
       }
     },
-    [refreshDockerContexts, refreshInventory, refreshProjects],
+    [pushToast, refreshDockerContexts, refreshInventory, refreshProjects],
   );
 
   const changeProviderAutostart = useCallback(
@@ -4122,6 +4109,7 @@ function App() {
             containers={containers}
             dockerRunning={dockerRunning}
             inventoryLoading={inventoryStatus === "loading"}
+            onToast={pushToast}
             projects={projects}
             projectsLoading={projectsStatus === "loading"}
           />
@@ -4574,15 +4562,7 @@ function App() {
         </section>
       </div>
 
-      {settingsToast ? (
-        <div className="fixed bottom-5 right-5 z-50">
-          <Toast
-            body={settingsToast.body}
-            level={settingsToast.level}
-            title={settingsToast.title}
-          />
-        </div>
-      ) : null}
+      <ToastViewport toasts={toasts} />
 
       <InspectModal
         inspect={inspect}
@@ -9060,6 +9040,7 @@ type LogsPageProps = {
   projects: ProjectSummary[];
   inventoryLoading: boolean;
   projectsLoading: boolean;
+  onToast: (toast: ToastInput) => void;
 };
 
 type LogOption = {
@@ -9072,6 +9053,7 @@ function LogsPage({
   containers,
   dockerRunning,
   inventoryLoading,
+  onToast,
   projects,
   projectsLoading,
 }: LogsPageProps) {
@@ -9106,7 +9088,6 @@ function LogsPage({
   const [viewportHeight, setViewportHeight] = useState(520);
   const [exportLogs, setExportLogs] =
     useState<ExportLogsState>(emptyExportLogs);
-  const [exportToast, setExportToast] = useState<ExportResult | null>(null);
   const viewerRef = useRef<HTMLDivElement>(null);
   const followScrollRAFRef = useRef<number | null>(null);
 
@@ -9464,8 +9445,27 @@ function LogsPage({
         ids: streamIDs,
         path: exportLogs.path,
       });
+      if (!result) {
+        throw new Error("Log export did not return a result");
+      }
       setExportLogs({ ...emptyExportLogs, result });
-      setExportToast(result);
+      onToast({
+        action: (
+          <Button
+            icon={<FolderOpen size={15} />}
+            onClick={() => {
+              void Clipboard.SetText(result.path);
+            }}
+            size="sm"
+            variant="secondary"
+          >
+            Open folder
+          </Button>
+        ),
+        body: `${formatCount(result.lineCount)} lines saved`,
+        level: "ok",
+        title: "Logs exported",
+      });
     } catch (error: unknown) {
       setExportLogs((current) => ({
         ...current,
@@ -9473,7 +9473,7 @@ function LogsPage({
         error: error instanceof Error ? error.message : "Unable to export logs",
       }));
     }
-  }, [exportLogs.path, scope, streamIDs]);
+  }, [exportLogs.path, onToast, scope, streamIDs]);
 
   const streamLabel =
     scope === "all"
@@ -9784,28 +9784,6 @@ function LogsPage({
         >
           {formatCount(newLinesWhileUnpinned)} new lines
         </button>
-      ) : null}
-
-      {exportToast ? (
-        <div className="fixed bottom-5 right-5 z-40">
-          <Toast
-            action={
-              <Button
-                icon={<FolderOpen size={15} />}
-                onClick={() => {
-                  void Clipboard.SetText(exportToast.path);
-                }}
-                size="sm"
-                variant="secondary"
-              >
-                Open folder
-              </Button>
-            }
-            body={`${formatCount(exportToast.lineCount)} lines saved`}
-            level="ok"
-            title="Logs exported"
-          />
-        </div>
       ) : null}
 
       <LogsExportModal

@@ -8,4 +8,5 @@ export * from "./Skeleton";
 export * from "./StatusDot";
 export * from "./Tabs";
 export * from "./Toast";
+export * from "./ToastViewport";
 export * from "./Tooltip";
