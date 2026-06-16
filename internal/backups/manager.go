@@ -758,7 +758,7 @@ func restoreCommand(order int, targetName string, backupDir string, archiveName 
 		Order:       order,
 		Command:     shellJoin(append([]string{"docker"}, dockerRunRestoreArgs(targetName, backupDir, archiveName)...)),
 		Risk:        risk,
-		Explanation: "Runs a temporary Alpine helper container that wipes the target path and extracts the backup archive.",
+		Explanation: "Runs a temporary Alpine helper container that moves existing contents aside, extracts the backup archive, and restores the original contents if extraction fails.",
 	}
 }
 

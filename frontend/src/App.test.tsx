@@ -3350,10 +3350,10 @@ function restorePlan(): CommandPlan {
       {
         order: 1,
         command:
-          'docker run --rm -v cairn_data:/restore -v /tmp/cairn-backups:/backup:ro alpine:3 sh -c "rm -rf /restore/* /restore/..?* /restore/.[!.]* ; tar xzf /backup/cairn_data-20260613T080000Z.tar.gz -C /restore"',
+          "docker run --rm -v cairn_data:/restore -v /tmp/cairn-backups:/backup:ro alpine:3 sh -c 'set -eu; archive=$1; stash=/restore/.cairn-restore-old-$$; mkdir \"$stash\"; move existing contents to stash; tar xzf \"$archive\" -C /restore || rollback stash' cairn-restore /backup/cairn_data-20260613T080000Z.tar.gz",
         risk: Risk.RiskDangerous,
         explanation:
-          "Clears the target volume and restores files from the selected archive.",
+          "Moves existing contents aside, restores files from the selected archive, and rolls back the original contents if extraction fails.",
       },
     ],
     effects: ["cairn_data: Replaces volume contents with the selected backup."],

@@ -14326,7 +14326,9 @@ function RestoreVolumeModal({
             "alpine:3",
             "sh",
             "-c",
-            "rm -rf /restore/* ... ; tar xzf /backup/<file> -C /restore",
+            'set -eu; archive=$1; stash=/restore/.cairn-restore-old-$$; mkdir "$stash"; mv existing contents to stash; tar xzf "$archive" -C /restore || rollback',
+            "cairn-restore",
+            "/backup/<file>",
           ])}
         />
         <FormError error={state.error} />
