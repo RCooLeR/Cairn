@@ -53,7 +53,7 @@ import App, {
 import {
   decodeBase64Bytes,
   encodeTerminalInput,
-} from "./components/terminal/TerminalPage";
+} from "./components/terminal/terminalEncoding";
 import { useAppStore } from "./state/appStore";
 import { useInventoryStore } from "./state/inventoryStore";
 
