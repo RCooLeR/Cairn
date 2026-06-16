@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -18,8 +19,11 @@ import (
 type localPTYStarter struct{}
 
 type localPTYSession struct {
-	file *os.File
-	cmd  *exec.Cmd
+	file     *os.File
+	cmd      *exec.Cmd
+	waitOnce sync.Once
+	waitDone chan struct{}
+	waitCode int
 }
 
 func newDefaultPTYStarter() PTYStarter {
@@ -38,7 +42,7 @@ func (localPTYStarter) Start(_ context.Context, spec PTYSpec) (PTYSession, error
 	if err != nil {
 		return nil, err
 	}
-	return &localPTYSession{file: file, cmd: cmd}, nil
+	return &localPTYSession{file: file, cmd: cmd, waitDone: make(chan struct{})}, nil
 }
 
 func (s *localPTYSession) Read(p []byte) (int, error) {
@@ -52,8 +56,11 @@ func (s *localPTYSession) Write(p []byte) (int, error) {
 func (s *localPTYSession) Close() error {
 	if s.cmd != nil && s.cmd.Process != nil {
 		_ = s.cmd.Process.Signal(syscall.SIGTERM)
-		time.Sleep(200 * time.Millisecond)
-		_ = s.cmd.Process.Kill()
+		select {
+		case <-s.waitChannel():
+		case <-time.After(200 * time.Millisecond):
+			_ = s.cmd.Process.Kill()
+		}
 	}
 	if s.file == nil {
 		return nil
@@ -67,6 +74,24 @@ func (s *localPTYSession) Resize(cols int, rows int) error {
 }
 
 func (s *localPTYSession) Wait() int {
+	<-s.waitChannel()
+	return s.waitCode
+}
+
+func (s *localPTYSession) waitChannel() <-chan struct{} {
+	if s.waitDone == nil {
+		s.waitDone = make(chan struct{})
+	}
+	s.waitOnce.Do(func() {
+		go func() {
+			s.waitCode = s.waitCommand()
+			close(s.waitDone)
+		}()
+	})
+	return s.waitDone
+}
+
+func (s *localPTYSession) waitCommand() int {
 	if s.cmd == nil {
 		return -1
 	}
