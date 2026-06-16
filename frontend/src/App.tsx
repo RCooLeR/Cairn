@@ -94,6 +94,8 @@ import {
 import {
   type RefObject,
   type ReactNode,
+  lazy,
+  Suspense,
   useCallback,
   useEffect,
   useMemo,
@@ -114,8 +116,6 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-
-import Editor from "@monaco-editor/react";
 import { Clipboard, Dialogs, Events } from "@wailsio/runtime";
 
 import { getAppVersion } from "./api/app";
@@ -162,6 +162,7 @@ import {
 import { frontendVersion } from "./version";
 
 const logoUrl = "/cairn-logo.png";
+const MonacoEditor = lazy(() => import("@monaco-editor/react"));
 
 type PageID =
   | "overview"
@@ -11942,18 +11943,20 @@ function ProjectComposeTab({ detail }: { detail: ProjectDetail }) {
         ))}
       </div>
       <div className="overflow-hidden rounded-card border border-border">
-        <Editor
-          height="420px"
-          language="yaml"
-          options={{
-            minimap: { enabled: false },
-            readOnly: true,
-            scrollBeyondLastLine: false,
-            wordWrap: "on",
-          }}
-          theme="vs-dark"
-          value={value || "# No Compose content available"}
-        />
+        <Suspense fallback={<Skeleton className="h-[420px] w-full" />}>
+          <MonacoEditor
+            height="420px"
+            language="yaml"
+            options={{
+              minimap: { enabled: false },
+              readOnly: true,
+              scrollBeyondLastLine: false,
+              wordWrap: "on",
+            }}
+            theme="vs-dark"
+            value={value || "# No Compose content available"}
+          />
+        </Suspense>
       </div>
     </div>
   );

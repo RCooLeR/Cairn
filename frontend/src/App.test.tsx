@@ -996,7 +996,9 @@ describe("App inventory shell", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Compose" }));
     expect(screen.getByText("valid")).toBeInTheDocument();
-    expect(screen.getByTestId("monaco-viewer")).toHaveTextContent("services:");
+    expect(await screen.findByTestId("monaco-viewer")).toHaveTextContent(
+      "services:",
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "Backups" }));
     expect(screen.getByText("Project Volumes")).toBeInTheDocument();
