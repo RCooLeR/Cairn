@@ -710,6 +710,58 @@ func TestProjectServiceListProjectsScopesToActiveBackendContext(t *testing.T) {
 	}
 }
 
+func TestProjectServiceRemoveProjectFromListUsesStoreOnly(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	now := time.Date(2026, 6, 15, 11, 30, 0, 0, time.UTC)
+	projects := db.Projects()
+	if err := projects.SaveSnapshot(ctx, "windows_wsl_ubuntu", []store.ProjectRecord{{
+		ID:          "windows_wsl_ubuntu/cairn-app",
+		ProviderID:  "windows_wsl_ubuntu",
+		ContextName: "wsl:cairn-dev",
+		Name:        "cairn-app",
+		LastSeenAt:  now,
+	}}, []store.ServiceRecord{{
+		ID:         "windows_wsl_ubuntu/cairn-app/web",
+		ProjectID:  "windows_wsl_ubuntu/cairn-app",
+		Name:       "web",
+		ImageRef:   "nginx",
+		LastSeenAt: now,
+	}}, now, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot() error = %v", err)
+	}
+	eventBus := bus.New()
+	defer eventBus.Close()
+	eventCtx, cancelEvents := context.WithCancel(ctx)
+	defer cancelEvents()
+	events := eventBus.Subscribe(eventCtx, bus.TopicProjectChanged, 1)
+	service := &ProjectService{
+		Projects:    projects,
+		Audit:       db.Audit(),
+		Events:      eventBus,
+		ProviderID:  "windows_wsl_ubuntu",
+		ContextName: "wsl:cairn-dev",
+	}
+
+	if err := service.RemoveProjectFromList(ctx, "windows_wsl_ubuntu/cairn-app"); err != nil {
+		t.Fatalf("RemoveProjectFromList() error = %v", err)
+	}
+	if _, err := projects.Get(ctx, "windows_wsl_ubuntu/cairn-app"); err == nil {
+		t.Fatal("project still exists after RemoveProjectFromList")
+	}
+	select {
+	case event := <-events:
+		if event.Topic != bus.TopicProjectChanged {
+			t.Fatalf("event topic = %q", event.Topic)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for project changed event")
+	}
+	if err := service.RemoveProjectFromList(ctx, "windows_wsl_ubuntu/cairn-app"); !apperror.IsCode(err, apperror.NotFound) {
+		t.Fatalf("RemoveProjectFromList(missing) error = %v, want %s", err, apperror.NotFound)
+	}
+}
+
 func TestProjectServiceGetProjectIncludesDetailPayload(t *testing.T) {
 	ctx := context.Background()
 	db := openServiceTestStore(t)

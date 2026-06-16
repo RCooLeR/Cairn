@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -175,6 +176,85 @@ func TestProjectRepositoryListByProvider(t *testing.T) {
 	}
 	if len(imported) != 1 || imported[0].ID != "windows_wsl_ubuntu/cairn-app" {
 		t.Fatalf("cairn imported projects = %#v", imported)
+	}
+}
+
+func TestProjectRepositoryListServicesByProjectIDs(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openStoreForProjectTest(t)
+	repo := db.Projects()
+	now := time.Date(2026, 6, 15, 10, 0, 0, 0, time.UTC)
+
+	if err := repo.SaveSnapshot(ctx, "linux_native", []ProjectRecord{
+		{ID: "linux_native/web", ProviderID: "linux_native", Name: "web", LastSeenAt: now},
+		{ID: "linux_native/worker", ProviderID: "linux_native", Name: "worker", LastSeenAt: now},
+	}, []ServiceRecord{
+		{ID: "linux_native/web/api", ProjectID: "linux_native/web", Name: "api", ImageRef: "nginx", LastSeenAt: now},
+		{ID: "linux_native/web/cache", ProjectID: "linux_native/web", Name: "cache", ImageRef: "redis", LastSeenAt: now},
+		{ID: "linux_native/worker/job", ProjectID: "linux_native/worker", Name: "job", ImageRef: "busybox", LastSeenAt: now},
+	}, now, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot() error = %v", err)
+	}
+
+	servicesByProject, err := repo.ListServicesByProjectIDs(ctx, []string{
+		"linux_native/web",
+		"linux_native/worker",
+		"linux_native/missing",
+		"linux_native/web",
+		"",
+	})
+	if err != nil {
+		t.Fatalf("ListServicesByProjectIDs() error = %v", err)
+	}
+	if got := len(servicesByProject["linux_native/web"]); got != 2 {
+		t.Fatalf("web service count = %d, want 2: %#v", got, servicesByProject["linux_native/web"])
+	}
+	if got := len(servicesByProject["linux_native/worker"]); got != 1 {
+		t.Fatalf("worker service count = %d, want 1: %#v", got, servicesByProject["linux_native/worker"])
+	}
+	if _, ok := servicesByProject["linux_native/missing"]; !ok {
+		t.Fatal("missing project should be present with an empty service list")
+	}
+}
+
+func TestProjectRepositoryDeleteRemovesProjectAndServices(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openStoreForProjectTest(t)
+	repo := db.Projects()
+	now := time.Date(2026, 6, 15, 11, 0, 0, 0, time.UTC)
+
+	if err := repo.SaveSnapshot(ctx, "linux_native", []ProjectRecord{{
+		ID:         "linux_native/delete-me",
+		ProviderID: "linux_native",
+		Name:       "delete-me",
+		LastSeenAt: now,
+	}}, []ServiceRecord{{
+		ID:         "linux_native/delete-me/web",
+		ProjectID:  "linux_native/delete-me",
+		Name:       "web",
+		ImageRef:   "nginx",
+		LastSeenAt: now,
+	}}, now, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot() error = %v", err)
+	}
+
+	if err := repo.Delete(ctx, "linux_native/delete-me"); err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+	if _, err := repo.Get(ctx, "linux_native/delete-me"); err == nil {
+		t.Fatal("Get() after Delete succeeded, want missing project")
+	}
+	services, err := repo.ListServices(ctx, "linux_native/delete-me")
+	if err != nil {
+		t.Fatalf("ListServices() after Delete error = %v", err)
+	}
+	if len(services) != 0 {
+		t.Fatalf("services after Delete = %#v", services)
+	}
+	if err := repo.Delete(ctx, "linux_native/delete-me"); err != sql.ErrNoRows {
+		t.Fatalf("Delete(missing) error = %v, want sql.ErrNoRows", err)
 	}
 }
 

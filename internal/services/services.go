@@ -1091,13 +1091,17 @@ func (s *ProjectService) ListProjects(ctx context.Context) ([]models.ProjectSumm
 	if err != nil {
 		return nil, apperror.Wrap(apperror.Internal, "List projects failed", err)
 	}
+	projectIDs := make([]string, 0, len(projects))
+	for _, project := range projects {
+		projectIDs = append(projectIDs, project.ID)
+	}
+	servicesByProject, err := s.Projects.ListServicesByProjectIDs(ctx, projectIDs)
+	if err != nil {
+		return nil, apperror.Wrap(apperror.Internal, "List project services failed", err)
+	}
 	summaries := make([]models.ProjectSummary, 0, len(projects))
 	for _, project := range projects {
-		services, err := s.Projects.ListServices(ctx, project.ID)
-		if err != nil {
-			return nil, apperror.Wrap(apperror.Internal, "List project services failed", err)
-		}
-		summaries = append(summaries, projectSummaryFromRecord(project, services))
+		summaries = append(summaries, projectSummaryFromRecord(project, servicesByProject[project.ID]))
 	}
 	if err := s.hydrateUpdateBadges(ctx, summaries); err != nil {
 		return nil, err
@@ -1225,10 +1229,32 @@ func (s *ProjectService) ImportProject(ctx context.Context, req models.ImportPro
 	return s.getProject(ctx, projectID)
 }
 
-func (s *ProjectService) RemoveProjectFromList(_ context.Context, projectID string) error {
+func (s *ProjectService) RemoveProjectFromList(ctx context.Context, projectID string) error {
 	unlock := s.lockRuntime()
 	defer unlock()
-	return notReady()
+	if s.Projects == nil {
+		return notReady()
+	}
+	project, err := s.Projects.Get(ctx, projectID)
+	if err != nil {
+		return mapStoreNotFound(err, "Project was not found")
+	}
+	if !s.projectInCurrentContext(project) {
+		return apperror.New(apperror.NotFound, "Project was not found")
+	}
+	started := time.Now().UTC()
+	if err := s.Projects.Delete(ctx, projectID); err != nil {
+		_ = s.recordProjectAudit(ctx, project, "remove_from_list", "", models.RiskSafe, "failed", time.Since(started), err)
+		return mapStoreNotFound(err, "Project was not found")
+	}
+	if err := s.recordProjectAudit(ctx, project, "remove_from_list", "", models.RiskSafe, "success", time.Since(started), nil); err != nil {
+		return err
+	}
+	if s.Events != nil {
+		s.Events.Publish(bus.Event{Topic: bus.TopicProjectChanged, Payload: map[string]any{"projectID": project.ID, "action": "remove_from_list"}})
+		s.Events.Publish(bus.Event{Topic: bus.TopicObjectsChanged, Payload: map[string]any{"kind": "project", "ids": []string{project.ID}}})
+	}
+	return nil
 }
 
 func (s *ProjectService) RefreshProjects(ctx context.Context) ([]models.ProjectSummary, error) {
@@ -2081,12 +2107,16 @@ func (s *ProjectService) hydrateUpdateBadges(ctx context.Context, summaries []mo
 	if s.Updates == nil {
 		return nil
 	}
+	projectIDs := make([]string, 0, len(summaries))
+	for _, summary := range summaries {
+		projectIDs = append(projectIDs, summary.ID)
+	}
+	badgesByProject, err := s.Updates.BadgesByProjectIDs(ctx, projectIDs)
+	if err != nil {
+		return apperror.Wrap(apperror.Internal, "Load project update badges failed", err)
+	}
 	for i := range summaries {
-		badges, err := s.Updates.Badges(ctx, summaries[i].ID)
-		if err != nil {
-			return apperror.Wrap(apperror.Internal, "Load project update badges failed", err)
-		}
-		summaries[i].UpdateBadges = badges
+		summaries[i].UpdateBadges = badgesByProject[summaries[i].ID]
 	}
 	return nil
 }

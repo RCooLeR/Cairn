@@ -156,6 +156,31 @@ func (r *ProjectRepository) UpsertImported(ctx context.Context, record ProjectRe
 	return r.SaveSnapshot(ctx, record.ProviderID, []ProjectRecord{record}, nil, record.LastSeenAt, time.Time{})
 }
 
+func (r *ProjectRepository) Delete(ctx context.Context, projectID string) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+	if _, err := tx.ExecContext(ctx, "DELETE FROM services WHERE project_id = ?", projectID); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, "DELETE FROM projects WHERE id = ?", projectID)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return tx.Commit()
+}
+
 func (r *ProjectRepository) List(ctx context.Context) ([]ProjectRecord, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, provider_id, context_name, name, working_dir, compose_files_json,
@@ -283,6 +308,53 @@ func (r *ProjectRepository) ListServices(ctx context.Context, projectID string) 
 		services = append(services, service)
 	}
 	return services, rows.Err()
+}
+
+func (r *ProjectRepository) ListServicesByProjectIDs(ctx context.Context, projectIDs []string) (map[string][]ServiceRecord, error) {
+	servicesByProject := make(map[string][]ServiceRecord, len(projectIDs))
+	if len(projectIDs) == 0 {
+		return servicesByProject, nil
+	}
+	args := make([]any, 0, len(projectIDs))
+	placeholders := make([]string, 0, len(projectIDs))
+	for _, projectID := range projectIDs {
+		projectID = strings.TrimSpace(projectID)
+		if projectID == "" {
+			continue
+		}
+		if _, ok := servicesByProject[projectID]; ok {
+			continue
+		}
+		servicesByProject[projectID] = nil
+		placeholders = append(placeholders, "?")
+		args = append(args, projectID)
+	}
+	if len(args) == 0 {
+		return servicesByProject, nil
+	}
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT id, project_id, name, image_ref, build_context, dockerfile_path,
+			build_target, status, health, replicas_running, replicas_total,
+			metadata_json, last_seen_at
+		FROM services
+		WHERE project_id IN (`+strings.Join(placeholders, ",")+`)
+		ORDER BY project_id ASC, name ASC
+	`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = rows.Close()
+	}()
+
+	for rows.Next() {
+		service, err := scanService(rows)
+		if err != nil {
+			return nil, err
+		}
+		servicesByProject[service.ProjectID] = append(servicesByProject[service.ProjectID], service)
+	}
+	return servicesByProject, rows.Err()
 }
 
 type projectScanner interface {

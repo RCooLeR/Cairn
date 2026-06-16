@@ -108,3 +108,77 @@ func TestUpdateRepositoryIgnoreOverlayAndBadges(t *testing.T) {
 		t.Fatalf("badges after unignore = %#v", badges)
 	}
 }
+
+func TestUpdateRepositoryBadgesByProjectIDs(t *testing.T) {
+	ctx := context.Background()
+	db := openMigratedStore(t, ctx)
+	defer closeStore(t, db)
+	repo := db.Updates()
+	now := time.Date(2026, 6, 13, 13, 0, 0, 0, time.UTC)
+
+	ignoredID, err := repo.InsertCheck(ctx, UpdateCheckRecord{
+		ProviderID:        "linux_native",
+		ProjectID:         "linux_native/web",
+		ServiceID:         "linux_native/web/api",
+		Kind:              models.UpdateKindServiceImage,
+		ImageRef:          "nginx:1.25",
+		LocalDigest:       "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+		RemoteDigest:      "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+		Confidence:        models.ConfidenceMedium,
+		RecommendedAction: models.RecommendedActionPullRecreate,
+		Status:            models.UpdateStatusServiceImageUpdateAvailable,
+		CheckedAt:         now,
+	})
+	if err != nil {
+		t.Fatalf("InsertCheck(ignored) error = %v", err)
+	}
+	if err := repo.InsertChecks(ctx, []UpdateCheckRecord{
+		{
+			ProviderID:        "linux_native",
+			ProjectID:         "linux_native/web",
+			ServiceID:         "linux_native/web/worker",
+			Kind:              models.UpdateKindBaseImage,
+			ImageRef:          "web-worker:local",
+			BaseImageRef:      "alpine:3.20",
+			Confidence:        models.ConfidenceHigh,
+			RecommendedAction: models.RecommendedActionRebuildRedeploy,
+			Status:            models.UpdateStatusRebuildRequired,
+			CheckedAt:         now,
+		},
+		{
+			ProviderID:        "linux_native",
+			ProjectID:         "linux_native/cache",
+			ServiceID:         "linux_native/cache/redis",
+			Kind:              models.UpdateKindServiceImage,
+			ImageRef:          "redis:7",
+			Confidence:        models.ConfidenceMedium,
+			RecommendedAction: models.RecommendedActionPullRecreate,
+			Status:            models.UpdateStatusPinnedDigest,
+			CheckedAt:         now,
+		},
+	}); err != nil {
+		t.Fatalf("InsertChecks() error = %v", err)
+	}
+	if err := repo.IgnoreCheck(ctx, ignoredID, "keep pinned for test", now.Add(time.Minute)); err != nil {
+		t.Fatalf("IgnoreCheck() error = %v", err)
+	}
+
+	badgesByProject, err := repo.BadgesByProjectIDs(ctx, []string{
+		"linux_native/web",
+		"linux_native/cache",
+		"linux_native/empty",
+		"linux_native/web",
+	})
+	if err != nil {
+		t.Fatalf("BadgesByProjectIDs() error = %v", err)
+	}
+	if badgesByProject["linux_native/web"].ImageUpdates != 0 || badgesByProject["linux_native/web"].RebuildNeeded != 1 {
+		t.Fatalf("web badges = %#v", badgesByProject["linux_native/web"])
+	}
+	if badgesByProject["linux_native/cache"].Pinned != 1 {
+		t.Fatalf("cache badges = %#v", badgesByProject["linux_native/cache"])
+	}
+	if _, ok := badgesByProject["linux_native/empty"]; !ok {
+		t.Fatal("empty project should be present with zero badges")
+	}
+}

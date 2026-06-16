@@ -181,19 +181,46 @@ func (r *UpdateRepository) ListCurrent(ctx context.Context, filter models.Update
 }
 
 func (r *UpdateRepository) Badges(ctx context.Context, projectID string) (models.UpdateBadges, error) {
-	records, err := r.listLatestChecks(ctx, projectID)
+	badgesByProject, err := r.BadgesByProjectIDs(ctx, []string{projectID})
 	if err != nil {
 		return models.UpdateBadges{}, err
+	}
+	return badgesByProject[projectID], nil
+}
+
+func (r *UpdateRepository) BadgesByProjectIDs(ctx context.Context, projectIDs []string) (map[string]models.UpdateBadges, error) {
+	badgesByProject := make(map[string]models.UpdateBadges, len(projectIDs))
+	if len(projectIDs) == 0 {
+		return badgesByProject, nil
+	}
+	wanted := make(map[string]struct{}, len(projectIDs))
+	for _, projectID := range projectIDs {
+		projectID = strings.TrimSpace(projectID)
+		if projectID == "" {
+			continue
+		}
+		wanted[projectID] = struct{}{}
+		badgesByProject[projectID] = models.UpdateBadges{}
+	}
+	if len(wanted) == 0 {
+		return badgesByProject, nil
+	}
+	records, err := r.listLatestChecks(ctx, "")
+	if err != nil {
+		return nil, err
 	}
 	ignored, err := r.listIgnored(ctx)
 	if err != nil {
-		return models.UpdateBadges{}, err
+		return nil, err
 	}
-	var badges models.UpdateBadges
 	for _, record := range records {
+		if _, ok := wanted[record.ProjectID]; !ok {
+			continue
+		}
 		if _, ok := matchingIgnore(ignored, record); ok {
 			continue
 		}
+		badges := badgesByProject[record.ProjectID]
 		switch record.Status {
 		case models.UpdateStatusServiceImageUpdateAvailable:
 			badges.ImageUpdates++
@@ -206,8 +233,9 @@ func (r *UpdateRepository) Badges(ctx context.Context, projectID string) (models
 		case models.UpdateStatusUnknownBaseImage:
 			badges.UnknownBase++
 		}
+		badgesByProject[record.ProjectID] = badges
 	}
-	return badges, nil
+	return badgesByProject, nil
 }
 
 func (r *UpdateRepository) IgnoreCheck(ctx context.Context, id int64, reason string, createdAt time.Time) error {
