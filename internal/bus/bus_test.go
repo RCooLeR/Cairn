@@ -73,6 +73,44 @@ func TestSubscribeUnsubscribesOnCancel(t *testing.T) {
 	}
 }
 
+func TestSubscribeAfterCloseReturnsClosedChannel(t *testing.T) {
+	b := New()
+	b.Close()
+
+	ch := b.Subscribe(context.Background(), TopicObjectsChanged, 1)
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Fatal("Subscribe after Close returned an open channel")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Subscribe after Close did not return a closed channel")
+	}
+}
+
+func TestPublishRaceWithCloseDoesNotPanic(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	b := New()
+	_ = b.Subscribe(ctx, TopicObjectsChanged, 1)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 100 {
+			b.Publish(Event{Topic: TopicObjectsChanged, Payload: "event"})
+		}
+	}()
+
+	b.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Publish loop did not finish after Close")
+	}
+}
+
 func TestCoalesceLatestEmitsLastEventInWindow(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
