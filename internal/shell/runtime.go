@@ -43,6 +43,7 @@ type appRuntime struct {
 
 	opMu     sync.Mutex
 	mu       sync.Mutex
+	state    appRuntimeState
 	cancel   context.CancelFunc
 	docker   *dockercore.Client
 	logs     *logsvc.Manager
@@ -50,6 +51,36 @@ type appRuntime struct {
 	terminal *terminal.Manager
 	backups  *backupcore.Manager
 	updates  *updatescore.Manager
+}
+
+type appRuntimeState string
+
+const (
+	runtimeStateStopped  appRuntimeState = "stopped"
+	runtimeStateBinding  appRuntimeState = "binding"
+	runtimeStateRunning  appRuntimeState = "running"
+	runtimeStateStopping appRuntimeState = "stopping"
+)
+
+type appRuntimeConfig struct {
+	RootCtx         context.Context
+	DB              *store.Store
+	ProviderManager *providers.Manager
+	RegistryManager *registrycore.Manager
+	Audit           *store.AuditRepository
+	Projects        *store.ProjectRepository
+	Events          bus.Bus
+	ServiceMu       *sync.RWMutex
+
+	DockerService   *services.DockerService
+	ProjectService  *services.ProjectService
+	ComposeService  *services.ComposeService
+	MetricsService  *services.MetricsService
+	LogsService     *services.LogsService
+	TerminalService *services.TerminalService
+	UpdateService   *services.UpdateService
+	LineageService  *services.ImageLineageService
+	BackupService   *services.BackupService
 }
 
 type runtimeHandles struct {
@@ -62,25 +93,26 @@ type runtimeHandles struct {
 	updates  *updatescore.Manager
 }
 
-func newAppRuntime(rootCtx context.Context, db *store.Store, providerManager *providers.Manager, registryManager *registrycore.Manager, audit *store.AuditRepository, projects *store.ProjectRepository, events bus.Bus, serviceMu *sync.RWMutex, dockerService *services.DockerService, projectService *services.ProjectService, composeService *services.ComposeService, metricsService *services.MetricsService, logsService *services.LogsService, terminalService *services.TerminalService, updateService *services.UpdateService, lineageService *services.ImageLineageService, backupService *services.BackupService) *appRuntime {
+func newAppRuntime(cfg appRuntimeConfig) *appRuntime {
 	return &appRuntime{
-		rootCtx:         rootCtx,
-		db:              db,
-		events:          events,
-		providerManager: providerManager,
-		registryManager: registryManager,
-		audit:           audit,
-		projects:        projects,
-		serviceMu:       serviceMu,
-		dockerService:   dockerService,
-		projectService:  projectService,
-		composeService:  composeService,
-		metricsService:  metricsService,
-		logsService:     logsService,
-		terminalService: terminalService,
-		updateService:   updateService,
-		lineageService:  lineageService,
-		backupService:   backupService,
+		rootCtx:         cfg.RootCtx,
+		db:              cfg.DB,
+		events:          cfg.Events,
+		providerManager: cfg.ProviderManager,
+		registryManager: cfg.RegistryManager,
+		audit:           cfg.Audit,
+		projects:        cfg.Projects,
+		serviceMu:       cfg.ServiceMu,
+		dockerService:   cfg.DockerService,
+		projectService:  cfg.ProjectService,
+		composeService:  cfg.ComposeService,
+		metricsService:  cfg.MetricsService,
+		logsService:     cfg.LogsService,
+		terminalService: cfg.TerminalService,
+		updateService:   cfg.UpdateService,
+		lineageService:  cfg.LineageService,
+		backupService:   cfg.BackupService,
+		state:           runtimeStateStopped,
 	}
 }
 
@@ -92,6 +124,7 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 		r.serviceMu.Lock()
 	}
 	r.mu.Lock()
+	r.state = runtimeStateBinding
 	previous := r.detachLocked()
 	r.clearServicesLocked()
 	r.mu.Unlock()
@@ -100,6 +133,9 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 	}
 	previous.stop()
 	if provider == nil {
+		r.mu.Lock()
+		r.state = runtimeStateStopped
+		r.mu.Unlock()
 		return nil, nil
 	}
 
@@ -148,6 +184,7 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 	r.terminal = terminalManager
 	r.backups = backupManager
 	r.updates = updateManager
+	r.state = runtimeStateRunning
 
 	r.dockerService.Client = dockerClient
 	r.projectService.Detector = projectDetector
@@ -191,6 +228,7 @@ func (r *appRuntime) StopAll() {
 		r.serviceMu.Lock()
 	}
 	r.mu.Lock()
+	r.state = runtimeStateStopping
 	previous := r.detachLocked()
 	r.clearServicesLocked()
 	r.mu.Unlock()
@@ -198,6 +236,9 @@ func (r *appRuntime) StopAll() {
 		r.serviceMu.Unlock()
 	}
 	previous.stop()
+	r.mu.Lock()
+	r.state = runtimeStateStopped
+	r.mu.Unlock()
 }
 
 func (r *appRuntime) detachLocked() runtimeHandles {

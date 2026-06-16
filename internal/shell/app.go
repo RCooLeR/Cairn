@@ -73,7 +73,25 @@ func Run(assets fs.FS) error {
 	lineageService := &services.ImageLineageService{RuntimeMu: runtimeMu}
 	backupService := &services.BackupService{RuntimeMu: runtimeMu}
 	registryService := &services.RegistryService{Manager: registryManager}
-	runtimeController := newAppRuntime(ctx, db, providerManager, registryManager, auditRepo, projectRepo, eventBus, runtimeMu, dockerService, projectService, composeService, metricsService, logsService, terminalService, updateService, lineageService, backupService)
+	runtimeController := newAppRuntime(appRuntimeConfig{
+		RootCtx:         ctx,
+		DB:              db,
+		ProviderManager: providerManager,
+		RegistryManager: registryManager,
+		Audit:           auditRepo,
+		Projects:        projectRepo,
+		Events:          eventBus,
+		ServiceMu:       runtimeMu,
+		DockerService:   dockerService,
+		ProjectService:  projectService,
+		ComposeService:  composeService,
+		MetricsService:  metricsService,
+		LogsService:     logsService,
+		TerminalService: terminalService,
+		UpdateService:   updateService,
+		LineageService:  lineageService,
+		BackupService:   backupService,
+	})
 	providerService.Runtime = runtimeController
 	if len(providerSet) > 0 {
 		runtimeProvider := providerSet[0]
