@@ -163,6 +163,21 @@ func TestManagerContainerTerminalDetectsShellWithoutDefaultUserProbe(t *testing.
 	}
 }
 
+func TestManagerContainerTerminalHandlesNoDetectedShells(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	docker := &fakeDockerClient{
+		detail: &models.ContainerDetail{Summary: models.ContainerSummary{ID: "abc123", Name: "api-1"}},
+		shells: []string{},
+	}
+	manager := NewManager(fakeProvider{}, docker, nil, nil, Options{})
+
+	_, err := manager.OpenContainerTerminal(ctx, "abc123", models.ContainerTerminalOptions{})
+	if !apperror.IsCode(err, apperror.NotFound) {
+		t.Fatalf("OpenContainerTerminal(no shells) error = %v, want not found", err)
+	}
+}
+
 func TestManagerContainerTerminalLabelsRequestedRootUser(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

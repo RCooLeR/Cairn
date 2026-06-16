@@ -254,6 +254,13 @@ func (m *Manager) OpenContainerTerminal(ctx context.Context, containerID string,
 		if err != nil {
 			return nil, err
 		}
+		if len(shells) == 0 {
+			return nil, apperror.New(
+				apperror.NotFound,
+				"No interactive shell was found in this container",
+				apperror.WithRepairHints("Install sh/bash in the image or specify a shell path manually."),
+			)
+		}
 		shell = shells[0]
 	}
 
