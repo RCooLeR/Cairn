@@ -160,20 +160,10 @@ func (m *Manager) OpenBackendTerminal(ctx context.Context, opts models.TerminalO
 			cwd = mapped
 		}
 	}
-	ptySession, err := m.starter.Start(ctx, PTYSpec{Argv: argv, Env: opts.Env, WorkingDir: cwd, Cols: opts.Cols, Rows: opts.Rows})
-	if err != nil {
-		return nil, mapTerminalStartError("open backend terminal", err)
-	}
-	info := models.TerminalSessionInfo{
-		ID:         uuid.NewString(),
-		Kind:       KindBackend,
-		Title:      m.provider.DisplayName(),
-		Shell:      shellTitle(argv),
-		User:       currentUsername(),
-		WorkingDir: cwd,
-		CreatedAt:  m.now(),
-	}
-	return m.addPTYSession(ctx, info, ptySession)
+	return m.openProviderPTYTerminal(ctx, opts, argv, cwd, models.TerminalSessionInfo{
+		Kind:  KindBackend,
+		Title: m.provider.DisplayName(),
+	})
 }
 
 func (m *Manager) OpenProjectTerminal(ctx context.Context, projectID string, opts models.TerminalOptions) (*models.TerminalSessionInfo, error) {
@@ -221,21 +211,31 @@ func (m *Manager) OpenProjectTerminal(ctx context.Context, projectID string, opt
 	}
 	opts.WorkingDir = cwd
 	opts.Env = env
+	opts.Cols, opts.Rows = normalizeDimensions(opts.Cols, opts.Rows)
 
-	info, err := m.OpenBackendTerminal(ctx, opts)
+	argv, err := m.provider.BackendShellCommand(opts)
 	if err != nil {
 		return nil, err
 	}
-	m.mu.Lock()
-	if active := m.sessions[info.ID]; active != nil {
-		active.info.Kind = KindProject
-		active.info.Title = project.Name
-		active.info.ProjectID = projectID
-		active.info.WorkingDir = cwd
-		*info = active.info
+	return m.openProviderPTYTerminal(ctx, opts, argv, cwd, models.TerminalSessionInfo{
+		Kind:       KindProject,
+		Title:      project.Name,
+		ProjectID:  projectID,
+		WorkingDir: cwd,
+	})
+}
+
+func (m *Manager) openProviderPTYTerminal(ctx context.Context, opts models.TerminalOptions, argv []string, cwd string, info models.TerminalSessionInfo) (*models.TerminalSessionInfo, error) {
+	ptySession, err := m.starter.Start(ctx, PTYSpec{Argv: argv, Env: opts.Env, WorkingDir: cwd, Cols: opts.Cols, Rows: opts.Rows})
+	if err != nil {
+		return nil, mapTerminalStartError("open backend terminal", err)
 	}
-	m.mu.Unlock()
-	return info, nil
+	info.ID = uuid.NewString()
+	info.Shell = shellTitle(argv)
+	info.User = currentUsername()
+	info.WorkingDir = cwd
+	info.CreatedAt = m.now()
+	return m.addPTYSession(ctx, info, ptySession)
 }
 
 func (m *Manager) OpenContainerTerminal(ctx context.Context, containerID string, opts models.ContainerTerminalOptions) (*models.TerminalSessionInfo, error) {

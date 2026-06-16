@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/base64"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -14,6 +16,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/bus"
 	dockercore "github.com/RCooLeR/Cairn/internal/docker"
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/store"
 )
 
 type terminalContextKey string
@@ -170,6 +173,54 @@ func TestManagerContainerTerminalLabelsRequestedRootUser(t *testing.T) {
 	}
 }
 
+func TestManagerProjectTerminalRegistersProjectInfo(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	starter := &fakePTYStarter{}
+	projects := fakeProjectStore{
+		record: store.ProjectRecord{
+			ID:           "linux_native/demo",
+			Name:         "demo",
+			WorkingDir:   "/home/ada/demo",
+			ComposeFiles: []string{"compose.yml", "/opt/extra.yml"},
+		},
+	}
+	manager := NewManager(fakeProvider{}, nil, projects, nil, Options{PTYStarter: starter})
+
+	info, err := manager.OpenProjectTerminal(ctx, "linux_native/demo", models.TerminalOptions{
+		Env: map[string]string{"EXTRA": "1"},
+	})
+	if err != nil {
+		t.Fatalf("OpenProjectTerminal() error = %v", err)
+	}
+	if info.Kind != KindProject || info.ProjectID != "linux_native/demo" || info.Title != "demo" {
+		t.Fatalf("info = %#v", info)
+	}
+	active, err := manager.lookup(info.ID)
+	if err != nil {
+		t.Fatalf("lookup() error = %v", err)
+	}
+	if active.info.Kind != KindProject || active.info.ProjectID != "linux_native/demo" {
+		t.Fatalf("registered info = %#v", active.info)
+	}
+	started := starter.last()
+	if started == nil {
+		t.Fatal("missing started PTY")
+	}
+	if started.spec.WorkingDir != "/home/ada/demo" {
+		t.Fatalf("WorkingDir = %q", started.spec.WorkingDir)
+	}
+	expectedComposeFile := strings.Join([]string{
+		filepath.Join(projects.record.WorkingDir, "compose.yml"),
+		filepath.Join(projects.record.WorkingDir, "/opt/extra.yml"),
+	}, string(os.PathListSeparator))
+	if started.spec.Env["COMPOSE_PROJECT_NAME"] != "demo" ||
+		started.spec.Env["COMPOSE_FILE"] != expectedComposeFile ||
+		started.spec.Env["EXTRA"] != "1" {
+		t.Fatalf("env = %#v", started.spec.Env)
+	}
+}
+
 func TestCheatsheetEntriesAreSafeOnlyWhenRunnable(t *testing.T) {
 	t.Parallel()
 	entries := CheatsheetEntries()
@@ -305,6 +356,21 @@ func (fakeProvider) BackendShellCommand(models.TerminalOptions) ([]string, error
 }
 func (fakeProvider) MapPathToBackend(path string) (string, error) {
 	return path, nil
+}
+
+type fakeProjectStore struct {
+	record store.ProjectRecord
+	err    error
+}
+
+func (s fakeProjectStore) Get(_ context.Context, id string) (store.ProjectRecord, error) {
+	if s.err != nil {
+		return store.ProjectRecord{}, s.err
+	}
+	if s.record.ID != id {
+		return store.ProjectRecord{}, apperror.New(apperror.NotFound, "project not found")
+	}
+	return s.record, nil
 }
 
 type fakePTYStarter struct {
