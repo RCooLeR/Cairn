@@ -8692,6 +8692,8 @@ function LogsPage({
     useState<ExportLogsState>(emptyExportLogs);
   const viewerRef = useRef<HTMLDivElement>(null);
   const followScrollRAFRef = useRef<number | null>(null);
+  const followScrollTimerRef = useRef<number | null>(null);
+  const lastFollowScrollAtRef = useRef(0);
 
   const projectOptions = useMemo<LogOption[]>(
     () =>
@@ -8957,20 +8959,40 @@ function LogsPage({
     if (!follow || paused) {
       return;
     }
-    if (followScrollRAFRef.current !== null) {
+    if (
+      followScrollRAFRef.current !== null ||
+      followScrollTimerRef.current !== null
+    ) {
       return;
     }
-    followScrollRAFRef.current = window.requestAnimationFrame(() => {
-      followScrollRAFRef.current = null;
-      const node = viewerRef.current;
-      if (node) {
-        node.scrollTop = node.scrollHeight;
-      }
-    });
+    const requestScroll = () => {
+      followScrollRAFRef.current = window.requestAnimationFrame(() => {
+        followScrollRAFRef.current = null;
+        lastFollowScrollAtRef.current = Date.now();
+        const node = viewerRef.current;
+        if (node) {
+          node.scrollTop = node.scrollHeight;
+        }
+      });
+    };
+    const elapsed = Date.now() - lastFollowScrollAtRef.current;
+    const delay = Math.max(0, 50 - elapsed);
+    if (delay === 0) {
+      requestScroll();
+      return;
+    }
+    followScrollTimerRef.current = window.setTimeout(() => {
+      followScrollTimerRef.current = null;
+      requestScroll();
+    }, delay);
   }, [filteredLines.length, follow, paused]);
 
   useEffect(
     () => () => {
+      if (followScrollTimerRef.current !== null) {
+        window.clearTimeout(followScrollTimerRef.current);
+        followScrollTimerRef.current = null;
+      }
       if (followScrollRAFRef.current !== null) {
         window.cancelAnimationFrame(followScrollRAFRef.current);
         followScrollRAFRef.current = null;
