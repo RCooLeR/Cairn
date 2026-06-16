@@ -34,7 +34,7 @@ func TestNewProviderLifecyclePlanValidationAndDefaults(t *testing.T) {
 	if plan.Plan.Risk != models.RiskNeedsConfirmation || plan.Plan.RequiresTypedName != "" {
 		t.Fatalf("default risk/confirmation = %q/%q", plan.Plan.Risk, plan.Plan.RequiresTypedName)
 	}
-	if got, want := plan.Plan.Commands[0].Command, "restart Docker backend for linux_native"; got != want {
+	if got, want := plan.Plan.Commands[0].Command, "restart Docker backend for selected Docker backend"; got != want {
 		t.Fatalf("default command = %q, want %q", got, want)
 	}
 	if plan.Plan.ExpiresAt != now.Add(DefaultPlanTTL) {

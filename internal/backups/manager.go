@@ -25,10 +25,11 @@ import (
 )
 
 const (
-	helperImage        = "alpine:3"
-	formatVersion      = 1
-	backupResultOK     = "success"
-	backupResultFailed = "failed"
+	helperImage           = "alpine:3"
+	formatVersion         = 1
+	backupResultOK        = "success"
+	backupResultFailed    = "failed"
+	backupTimestampLayout = "20060102T150405Z"
 )
 
 type ProviderResolver interface {
@@ -844,7 +845,7 @@ func backupPathsWithStat(dir string, volumeName string, ts time.Time, stat func(
 	if base == "" {
 		base = "volume"
 	}
-	stamp := ts.UTC().Format("20060102T150405Z")
+	stamp := ts.UTC().Format(backupTimestampLayout)
 	for i := 0; i < maxAttempts; i++ {
 		suffix := ""
 		if i > 0 {

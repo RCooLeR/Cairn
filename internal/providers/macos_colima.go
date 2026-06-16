@@ -703,6 +703,8 @@ type boolish struct {
 	value bool
 }
 
+// Docker context JSON can report Current as a bool, "*", or "current"
+// depending on CLI/platform formatting.
 func (b *boolish) UnmarshalJSON(data []byte) error {
 	var boolValue bool
 	if err := json.Unmarshal(data, &boolValue); err == nil {

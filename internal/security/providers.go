@@ -37,11 +37,14 @@ func NewProviderLifecyclePlan(action string, providerID string, providerName str
 	if risk == "" {
 		risk = models.RiskNeedsConfirmation
 	}
-	if providerName == "" {
-		providerName = providerID
+	displayName := providerName
+	typedName := providerName
+	if displayName == "" {
+		displayName = "selected Docker backend"
+		typedName = providerID
 	}
 	if command == "" {
-		command = "restart Docker backend for " + providerName
+		command = "restart Docker backend for " + displayName
 	}
 	plan := models.CommandPlan{
 		PlanID:   NewTypedPlanID("provider"),
@@ -55,7 +58,7 @@ func NewProviderLifecyclePlan(action string, providerID string, providerName str
 		ExpiresAt: now.Add(DefaultPlanTTL),
 	}
 	if requiresTypedConfirmation(plan.Risk) {
-		plan.RequiresTypedName = providerName
+		plan.RequiresTypedName = typedName
 	}
 	return ProviderPlan{Plan: plan, Action: action, ProviderID: providerID}, nil
 }

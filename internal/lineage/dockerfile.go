@@ -89,6 +89,7 @@ func ParseDockerfile(content string, opts ParseOptions) DockerfileParseResult {
 				stage.BaseStageIndex = prior
 			}
 			result.Stages = append(result.Stages, stage)
+			// Numeric stage references keep legacy multi-stage fixtures resolvable.
 			stageByName[strconv.Itoa(stage.Index)] = stage.Index
 			if stage.Name != "" {
 				stageByName[strings.ToLower(stage.Name)] = stage.Index
@@ -379,20 +380,21 @@ func copyStringMap(values map[string]string) map[string]string {
 }
 
 func appendUnique(values []string, next ...string) []string {
+	seen := make(map[string]struct{}, len(values)+len(next))
+	for _, value := range values {
+		if value != "" {
+			seen[value] = struct{}{}
+		}
+	}
 	for _, value := range next {
 		if value == "" {
 			continue
 		}
-		found := false
-		for _, existing := range values {
-			if existing == value {
-				found = true
-				break
-			}
+		if _, ok := seen[value]; ok {
+			continue
 		}
-		if !found {
-			values = append(values, value)
-		}
+		values = append(values, value)
+		seen[value] = struct{}{}
 	}
 	return values
 }

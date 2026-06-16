@@ -21,9 +21,10 @@ import (
 )
 
 const (
-	dbFileName      = "cairn.db"
-	driverName      = "sqlite"
-	backupKeepCount = 2
+	dbFileName                  = "cairn.db"
+	driverName                  = "sqlite"
+	backupKeepCount             = 2
+	schemaBackupTimestampLayout = "20060102T150405.000000000Z"
 )
 
 var (
@@ -238,7 +239,7 @@ func (s *Store) backupBeforeMigration(ctx context.Context) error {
 		return err
 	}
 
-	stamp := time.Now().UTC().Format("20060102T150405.000000000Z")
+	stamp := time.Now().UTC().Format(schemaBackupTimestampLayout)
 	backupPath := fmt.Sprintf("%s.bak-%s", s.path, stamp)
 	if err := copyFile(s.path, backupPath); err != nil {
 		return err

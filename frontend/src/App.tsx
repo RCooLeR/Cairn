@@ -1022,6 +1022,7 @@ const emptyExportLogs: ExportLogsState = {
 
 function App() {
   const version = useAppStore((state) => state.version);
+  const versionLoading = useAppStore((state) => state.versionLoading);
   const setVersion = useAppStore((state) => state.setVersion);
   const setVersionError = useAppStore((state) => state.setVersionError);
   const setVersionLoading = useAppStore((state) => state.setVersionLoading);
@@ -1971,7 +1972,9 @@ function App() {
   const diskReclaimable = diskUsage?.reclaimable ?? 0;
   const versionLabel = version?.version
     ? `v${version.version}`
-    : "v1.0 workspace";
+    : versionLoading
+      ? "Version loading"
+      : "Version unavailable";
   const pageTitle =
     navItems.find((item) => item.id === activePage)?.label ?? "Overview";
   const providerStatus = activeProvider?.status;
