@@ -146,6 +146,15 @@ func TestNewContainerActionPlanCommandsEffectsAndRisks(t *testing.T) {
 			wantEffect: "web: Stops the selected container gracefully before Docker applies its timeout.",
 		},
 		{
+			name:       "stop quoted name",
+			action:     ContainerActionStop,
+			containers: []models.ContainerSummary{{ID: "space", Name: "web app", State: "running"}},
+			wantTitle:  "Stop web app",
+			wantRisk:   models.RiskSafe,
+			wantCmd:    "docker stop 'web app'",
+			wantEffect: "web app: Stops the selected container gracefully before Docker applies its timeout.",
+		},
+		{
 			name:       "restart timeout",
 			action:     ContainerActionRestart,
 			containers: []models.ContainerSummary{running},

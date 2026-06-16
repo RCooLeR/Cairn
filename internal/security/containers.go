@@ -142,15 +142,19 @@ func containerPlanTitle(action string, containers []models.ContainerSummary) str
 }
 
 func containerCommand(action string, names []string, timeoutSeconds int, opts models.RemoveContainerOptions) string {
-	targets := strings.Join(names, " ")
+	targets := make([]string, 0, len(names))
+	for _, name := range names {
+		targets = append(targets, quotePlanArg(name))
+	}
+	targetArgs := strings.Join(targets, " ")
 	switch action {
 	case ContainerActionStop:
 		if timeoutSeconds > 0 {
-			return fmt.Sprintf("docker stop --time %d %s", timeoutSeconds, targets)
+			return fmt.Sprintf("docker stop --time %d %s", timeoutSeconds, targetArgs)
 		}
 	case ContainerActionRestart:
 		if timeoutSeconds > 0 {
-			return fmt.Sprintf("docker restart --time %d %s", timeoutSeconds, targets)
+			return fmt.Sprintf("docker restart --time %d %s", timeoutSeconds, targetArgs)
 		}
 	case ContainerActionRemove:
 		flags := []string{}
@@ -161,11 +165,11 @@ func containerCommand(action string, names []string, timeoutSeconds int, opts mo
 			flags = append(flags, "--volumes")
 		}
 		if len(flags) > 0 {
-			return fmt.Sprintf("docker rm %s %s", strings.Join(flags, " "), targets)
+			return fmt.Sprintf("docker rm %s %s", strings.Join(flags, " "), targetArgs)
 		}
-		return "docker rm " + targets
+		return "docker rm " + targetArgs
 	}
-	return "docker " + action + " " + targets
+	return "docker " + action + " " + targetArgs
 }
 
 func containerActionExplanation(action string, opts models.RemoveContainerOptions) string {
