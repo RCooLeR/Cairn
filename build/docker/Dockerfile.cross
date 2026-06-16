@@ -16,7 +16,7 @@
 FROM golang:1.26.4-bookworm
 
 ARG TARGETARCH
-ARG GARBLE_VERSION=v0.16.0
+ARG GARBLE_VERSION
 
 # Install base tools, GCC, and GTK/WebKit dev packages
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -25,6 +25,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgtk-4-dev libwebkitgtk-6.0-dev \
     && rm -rf /var/lib/apt/lists/*
 
+RUN test -n "${GARBLE_VERSION}" \
+    || (echo "GARBLE_VERSION build arg is required. Use the top-level setup:docker task." >&2; exit 1)
 RUN go install mvdan.cc/garble@${GARBLE_VERSION}
 
 # Install Zig - automatically selects correct binary for host architecture

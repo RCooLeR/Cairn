@@ -289,7 +289,7 @@ tasks:
       Builds the Docker image needed for cross-compiling to any platform.
       Run this once to enable cross-platform builds from any OS.
     cmds:
-      - docker build -t wails-cross -f build/docker/Dockerfile.cross build/docker/
+      - docker build --build-arg GARBLE_VERSION={{.GARBLE_VERSION}} -t wails-cross -f build/docker/Dockerfile.cross build/docker/
     preconditions:
       - sh: docker info > /dev/null 2>&1
         msg: "Docker is required. Please install Docker first."
