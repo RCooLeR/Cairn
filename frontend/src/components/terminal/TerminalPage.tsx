@@ -83,6 +83,12 @@ type PasteGuardState = {
   data: string;
 };
 
+type CloseGuardState = {
+  busy: boolean;
+  error?: string;
+  session: TerminalSessionInfo;
+};
+
 type PendingRun = {
   command: string;
   sessionID: string;
@@ -112,6 +118,7 @@ export function TerminalPage({
   );
   const [pendingRun, setPendingRun] = useState<PendingRun | null>(null);
   const [pasteGuard, setPasteGuard] = useState<PasteGuardState | null>(null);
+  const [closeGuard, setCloseGuard] = useState<CloseGuardState | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -331,16 +338,8 @@ export function TerminalPage({
     selectedContainerID,
   ]);
 
-  const closeSession = useCallback(
+  const closeSessionNow = useCallback(
     async (session: TerminalSessionInfo) => {
-      if (session.kind === "container") {
-        const confirmed = window.confirm(
-          `Close terminal for ${session.title}? The exec session will exit.`,
-        );
-        if (!confirmed) {
-          return;
-        }
-      }
       await TerminalService.CloseTerminal(session.id);
       setSessions((current) =>
         current.filter((item) => item.id !== session.id),
@@ -352,6 +351,19 @@ export function TerminalPage({
       );
     },
     [sessions],
+  );
+
+  const closeSession = useCallback(
+    (session: TerminalSessionInfo) => {
+      if (session.kind === "container") {
+        setCloseGuard({ busy: false, session });
+        return;
+      }
+      void closeSessionNow(session).catch((closeError: unknown) => {
+        setError(errorMessage(closeError, "Unable to close terminal"));
+      });
+    },
+    [closeSessionNow],
   );
 
   const sendInput = useCallback(
@@ -593,7 +605,7 @@ export function TerminalPage({
                 className="rounded p-0.5 hover:bg-bg-panel"
                 onClick={(event) => {
                   event.stopPropagation();
-                  void closeSession(session);
+                  closeSession(session);
                 }}
                 type="button"
               >
@@ -752,6 +764,63 @@ export function TerminalPage({
         <pre className="max-h-64 overflow-auto rounded-control bg-bg-inset p-3 text-xs text-text-secondary">
           {pasteGuard?.data}
         </pre>
+      </Modal>
+
+      <Modal
+        footer={
+          <>
+            <Button
+              disabled={closeGuard?.busy}
+              onClick={() => setCloseGuard(null)}
+              variant="secondary"
+            >
+              Cancel
+            </Button>
+            <Button
+              loading={closeGuard?.busy}
+              onClick={() => {
+                if (!closeGuard) {
+                  return;
+                }
+                const session = closeGuard.session;
+                setCloseGuard({ busy: true, session });
+                void closeSessionNow(session)
+                  .then(() => setCloseGuard(null))
+                  .catch((closeError: unknown) => {
+                    setCloseGuard({
+                      busy: false,
+                      error: errorMessage(
+                        closeError,
+                        "Unable to close terminal",
+                      ),
+                      session,
+                    });
+                  });
+              }}
+              variant="danger"
+            >
+              Close
+            </Button>
+          </>
+        }
+        onClose={() => {
+          if (!closeGuard?.busy) {
+            setCloseGuard(null);
+          }
+        }}
+        open={Boolean(closeGuard)}
+        title="Close Terminal"
+      >
+        <p className="text-sm text-text-secondary">
+          Close terminal for{" "}
+          <span className="font-medium text-text-primary">
+            {closeGuard?.session.title}
+          </span>
+          ? The exec session will exit.
+        </p>
+        {closeGuard?.error ? (
+          <p className="mt-3 text-sm text-error">{closeGuard.error}</p>
+        ) : null}
       </Modal>
 
       {pendingRun ? (
