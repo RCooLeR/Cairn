@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/models"
@@ -122,7 +123,10 @@ func (r *MetricsRepository) QuerySeries(ctx context.Context, filter MetricsSerie
 		if err := rows.Scan(&tsText, &cpu, &mem, &rx, &txBytes, &br, &bw); err != nil {
 			return nil, err
 		}
-		ts := parseMetricTime(tsText)
+		ts, err := parseMetricTime(tsText)
+		if err != nil {
+			return nil, err
+		}
 		bundle.Series[0].Points = append(bundle.Series[0].Points, models.Point{TS: ts, Value: cpu})
 		bundle.Series[1].Points = append(bundle.Series[1].Points, models.Point{TS: ts, Value: mem})
 		bundle.Series[2].Points = append(bundle.Series[2].Points, models.Point{TS: ts, Value: rx})
@@ -262,7 +266,11 @@ func downsampleMetrics(ctx context.Context, tx *sql.Tx, fromResolution string, t
 		); err != nil {
 			return err
 		}
-		record.SampledAt = parseMetricTime(tsText)
+		sampledAt, err := parseMetricTime(tsText)
+		if err != nil {
+			return err
+		}
+		record.SampledAt = sampledAt
 		key := metricsBucketKey{
 			providerID:  record.ProviderID,
 			projectID:   record.ProjectID,
@@ -383,17 +391,17 @@ func emptySeriesBundle() *models.SeriesBundle {
 	}}
 }
 
-func parseMetricTime(value string) time.Time {
+func parseMetricTime(value string) (time.Time, error) {
 	if value == "" {
-		return time.Time{}
+		return time.Time{}, nil
 	}
 	for _, layout := range []string{time.RFC3339Nano, time.RFC3339, "2006-01-02 15:04:05"} {
 		parsed, err := time.Parse(layout, value)
 		if err == nil {
-			return parsed.UTC()
+			return parsed.UTC(), nil
 		}
 	}
-	return time.Time{}
+	return time.Time{}, fmt.Errorf("parse metric timestamp %q: invalid timestamp", value)
 }
 
 func maxFloat(a float64, b float64) float64 {

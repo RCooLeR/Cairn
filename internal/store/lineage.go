@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/models"
@@ -327,7 +328,7 @@ func scanLineageRecord(scanner lineageScanner) (LineageRecord, error) {
 		return LineageRecord{}, err
 	}
 	if err := json.Unmarshal([]byte(nullJSON(argsJSON, "{}")), &record.BuildArgs); err != nil {
-		record.BuildArgs = map[string]string{}
+		return LineageRecord{}, fmt.Errorf("parse lineage build args: %w", err)
 	}
 	record.Source = models.LineageSource(source)
 	record.Confidence = models.Confidence(confidence)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -367,6 +368,7 @@ func parseStoreTime(value string) time.Time {
 	}
 	parsed, err := time.Parse(time.RFC3339Nano, value)
 	if err != nil {
+		slog.Warn("store: invalid timestamp", "value", value, "error", err)
 		return time.Time{}
 	}
 	return parsed

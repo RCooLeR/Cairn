@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -71,6 +72,15 @@ func TestMigrateFreshDatabaseCreatesV1Schema(t *testing.T) {
 
 	if got := migrationCount(t, ctx, s); got != 4 {
 		t.Fatalf("migration count = %d, want 4", got)
+	}
+}
+
+func TestParseMetricTimeRejectsMalformedTimestamp(t *testing.T) {
+	t.Parallel()
+	if _, err := parseMetricTime("not-a-time"); err == nil {
+		t.Fatal("parseMetricTime() error = nil, want malformed timestamp error")
+	} else if !strings.Contains(err.Error(), "parse metric timestamp") {
+		t.Fatalf("parseMetricTime() error = %v, want parse context", err)
 	}
 }
 

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -95,7 +96,7 @@ func TestLineageRepositoryReasons(t *testing.T) {
 	}
 }
 
-func TestLineageRepositoryKeepsRecordWithMalformedBuildArgs(t *testing.T) {
+func TestLineageRepositoryRejectsMalformedBuildArgs(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	db, err := Open(ctx, t.TempDir()+"/cairn.db")
@@ -121,10 +122,10 @@ func TestLineageRepositoryKeepsRecordWithMalformedBuildArgs(t *testing.T) {
 	}
 
 	records, err := db.Lineage().ListProject(ctx, "linux_native/demo")
-	if err != nil {
-		t.Fatalf("ListProject() error = %v", err)
+	if err == nil {
+		t.Fatalf("ListProject() records = %#v, want malformed build args error", records)
 	}
-	if len(records) != 1 || len(records[0].BuildArgs) != 0 {
-		t.Fatalf("records = %#v, want row retained with empty build args", records)
+	if !strings.Contains(err.Error(), "parse lineage build args") {
+		t.Fatalf("ListProject() error = %v, want build args parse context", err)
 	}
 }
