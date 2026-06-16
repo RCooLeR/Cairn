@@ -203,6 +203,10 @@ type AppUpdateNotice = {
   name?: string;
   publishedAt?: string;
 };
+type ObjectsChangedEventPayload = {
+  kind?: string;
+  ids?: string[];
+};
 type FilterID = string;
 type BadgeTone = "ok" | "warn" | "error" | "info" | "neutral" | "accent";
 type StatusToneID = "ok" | "warn" | "error" | "info" | "neutral";
@@ -1695,7 +1699,68 @@ function App() {
     refreshUpdateSurfaces,
   ]);
 
-  useDebouncedRuntimeEvent("objects:changed", 500, refreshRuntimeSurfaces);
+  const refreshRuntimeSurfacesForObjects = useCallback(
+    (event: unknown) => {
+      const payload = eventPayload<ObjectsChangedEventPayload>(event);
+      const kind = payload?.kind?.trim().toLowerCase();
+      const ids = Array.isArray(payload?.ids) ? payload.ids : [];
+      if (!kind) {
+        refreshRuntimeSurfaces();
+        return;
+      }
+
+      void refreshInventory();
+      setDashboardRefreshToken((current) => current + 1);
+      switch (kind) {
+        case "container":
+          void refreshProjects();
+          if (activeProjectID) {
+            void refreshProjectDetail(activeProjectID);
+          }
+          break;
+        case "image":
+          void refreshUpdateSurfaces();
+          if (activeProjectID) {
+            void refreshProjectLineage(activeProjectID);
+          }
+          break;
+        case "volume":
+          void refreshBackups();
+          break;
+        case "network":
+          break;
+        case "project":
+          void refreshProjects();
+          void refreshUpdateSurfaces();
+          if (
+            activeProjectID &&
+            (ids.length === 0 || ids.includes(activeProjectID))
+          ) {
+            void refreshProjectDetail(activeProjectID);
+            void refreshProjectLineage(activeProjectID);
+          }
+          break;
+        default:
+          refreshRuntimeSurfaces();
+      }
+    },
+    [
+      activeProjectID,
+      refreshBackups,
+      refreshInventory,
+      refreshProjectDetail,
+      refreshProjectLineage,
+      refreshProjects,
+      refreshRuntimeSurfaces,
+      refreshUpdateSurfaces,
+    ],
+  );
+
+  useDebouncedRuntimeEvent(
+    "objects:changed",
+    500,
+    refreshRuntimeSurfacesForObjects,
+  );
   useDebouncedRuntimeEvent("provider:changed", 250, refreshRuntimeSurfaces);
 
   useEffect(() => {
