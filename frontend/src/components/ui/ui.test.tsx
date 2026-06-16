@@ -2,7 +2,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { APP_ERROR_CODES, appErrorPresentation } from "../../api/errors";
-import { Button, DataTable, Modal, StatusDot, Tabs } from ".";
+import { Button, DataTable, Modal, StatusDot, Tabs, Tooltip } from ".";
 
 describe("UI kit", () => {
   it("renders button loading and disabled states", () => {
@@ -36,6 +36,17 @@ describe("UI kit", () => {
     expect(
       screen.getByRole("img", { name: "Status warning" }),
     ).toBeInTheDocument();
+  });
+
+  it("wraps long tooltip text within its max width", () => {
+    render(
+      <Tooltip label="A long tooltip label that should wrap instead of clipping">
+        <button type="button">Hover me</button>
+      </Tooltip>,
+    );
+
+    expect(screen.getByRole("tooltip")).toHaveClass("whitespace-normal");
+    expect(screen.getByRole("tooltip")).toHaveClass("break-words");
   });
 
   it("switches tabs with buttons", async () => {
