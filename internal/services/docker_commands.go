@@ -217,10 +217,12 @@ func secretLike(name string) bool {
 	parts := strings.FieldsFunc(lower, func(r rune) bool {
 		return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9')
 	})
-	for _, part := range parts {
+	for i, part := range parts {
 		switch part {
-		case "password", "passwd", "token", "secret", "key", "auth", "credential", "credentials":
+		case "password", "passwd", "token", "secret", "auth", "credential", "credentials", "private", "bearer", "signature":
 			return true
+		case "key":
+			return i == len(parts)-1
 		}
 	}
 	return false

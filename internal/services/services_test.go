@@ -434,10 +434,15 @@ func TestDockerCommandBuildersAreStableAndIPv6Safe(t *testing.T) {
 		t.Fatalf("dockerNetworkCreateCommand() = %q, want %q", networkCommand, wantNetwork)
 	}
 
-	if !secretLike("API_KEY") || !secretLike("auth-token") || !secretLike("db.password") {
+	if !secretLike("API_KEY") ||
+		!secretLike("auth-token") ||
+		!secretLike("db.password") ||
+		!secretLike("SIGNATURE") ||
+		!secretLike("PRIVATE_KEY") ||
+		!secretLike("BEARER") {
 		t.Fatalf("secretLike missed common credential names")
 	}
-	if secretLike("MONKEY") || secretLike("COMPASS") || secretLike("keyboard_layout") {
+	if secretLike("MONKEY") || secretLike("COMPASS") || secretLike("keyboard_layout") || secretLike("JAVA_KEY_STORE") {
 		t.Fatalf("secretLike produced substring false positive")
 	}
 }
