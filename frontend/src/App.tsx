@@ -7755,6 +7755,12 @@ function OverviewPage({
                 : [failed],
           };
         });
+        try {
+          await onCleanupApplied();
+          await loadDashboard();
+        } catch {
+          // Keep the prune failure visible; refresh will retry through normal polling.
+        }
       }
     },
     [loadDashboard, onCleanupApplied],

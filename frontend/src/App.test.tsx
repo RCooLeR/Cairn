@@ -878,6 +878,50 @@ describe("App inventory shell", () => {
     );
   });
 
+  it("refreshes overview data when cleanup fails after a partial prune", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
+    dockerServiceMock.ApplyContainerPlan.mockImplementation((planID: string) =>
+      planID === "plan-prune-containers"
+        ? Promise.reject(new Error("containers failed"))
+        : Promise.resolve(undefined),
+    );
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    const inventoryCallsBefore =
+      inventoryMock.getInventorySnapshot.mock.calls.length;
+    const projectRefreshesBefore =
+      projectServiceMock.RefreshProjects.mock.calls.length;
+    const dashboardCallsBefore =
+      metricsServiceMock.GetDashboardMetrics.mock.calls.length;
+
+    fireEvent.click(screen.getByRole("button", { name: "Prune" }));
+    const dialog = await screen.findByRole("dialog", {
+      name: "Clean Up Docker Space",
+    });
+    fireEvent.change(within(dialog).getByLabelText("Type prune to confirm"), {
+      target: { value: "prune" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Clean up" }));
+
+    expect(
+      await within(dialog).findAllByText("containers failed"),
+    ).toHaveLength(2);
+    await waitFor(() =>
+      expect(
+        inventoryMock.getInventorySnapshot.mock.calls.length,
+      ).toBeGreaterThan(inventoryCallsBefore),
+    );
+    expect(
+      projectServiceMock.RefreshProjects.mock.calls.length,
+    ).toBeGreaterThan(projectRefreshesBefore);
+    expect(
+      metricsServiceMock.GetDashboardMetrics.mock.calls.length,
+    ).toBeGreaterThan(dashboardCallsBefore);
+  });
+
   it("lists containers and applies search without leaving the table view", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
 
