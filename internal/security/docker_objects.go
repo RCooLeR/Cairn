@@ -1,7 +1,6 @@
 package security
 
 import (
-	"fmt"
 	"strings"
 	"time"
 
@@ -247,10 +246,10 @@ func normalizePruneKind(kind string) string {
 func quotePlanArg(value string) string {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return `""`
+		return "''"
 	}
 	if strings.ContainsAny(value, " \t\n\"'`$&|;<>()") {
-		return fmt.Sprintf("%q", value)
+		return "'" + strings.ReplaceAll(value, "'", `'"'"'`) + "'"
 	}
 	return value
 }
