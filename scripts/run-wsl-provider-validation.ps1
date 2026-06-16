@@ -64,46 +64,65 @@ function Set-LocalGoEnvironment {
   }
 }
 
+function Invoke-WithLocalGoEnvironment([scriptblock]$Body) {
+  $keys = @("GOTOOLCHAIN", "GOPATH", "GOMODCACHE", "GOCACHE")
+  $previous = @{}
+  foreach ($key in $keys) {
+    $previous[$key] = [Environment]::GetEnvironmentVariable($key, "Process")
+  }
+
+  Set-LocalGoEnvironment
+  try {
+    & $Body
+  } finally {
+    foreach ($key in $keys) {
+      [Environment]::SetEnvironmentVariable($key, $previous[$key], "Process")
+    }
+  }
+}
+
 function Assert-GoToolchain {
   Invoke-Step "Go toolchain check" {
-    Set-LocalGoEnvironment
-    $go = Get-Command go -ErrorAction SilentlyContinue
-    if ($null -eq $go) {
-      throw "go was not found on PATH."
-    }
-    $version = Invoke-Native "go env GOVERSION" $go.Source @("env", "GOVERSION")
-    if ($version.Trim() -ne "go1.26.4") {
-      throw "Go toolchain is $($version.Trim()), want go1.26.4"
+    Invoke-WithLocalGoEnvironment {
+      $go = Get-Command go -ErrorAction SilentlyContinue
+      if ($null -eq $go) {
+        throw "go was not found on PATH."
+      }
+      $version = Invoke-Native "go env GOVERSION" $go.Source @("env", "GOVERSION")
+      if ($version.Trim() -ne "go1.26.4") {
+        throw "Go toolchain is $($version.Trim()), want go1.26.4"
+      }
     }
   }
 }
 
 function Invoke-GoTest([string]$Name, [string[]]$Packages, [string[]]$GoArgs, [hashtable]$EnvVars) {
   Invoke-Step $Name {
-    Set-LocalGoEnvironment
-    $previous = @{}
-    foreach ($key in $EnvVars.Keys) {
-      $previous[$key] = [Environment]::GetEnvironmentVariable($key, "Process")
-      [Environment]::SetEnvironmentVariable($key, [string]$EnvVars[$key], "Process")
-    }
-    $tmp = Join-Path $env:TEMP ("cairn-go-tmp-" + [guid]::NewGuid().ToString("N"))
-    New-Item -ItemType Directory -Force -Path $tmp | Out-Null
-    $previousGoTmp = $env:GOTMPDIR
-    $env:GOTMPDIR = $tmp
-    Push-Location $root
-    try {
-      & go test @Packages @GoArgs
-      if ($LASTEXITCODE -ne 0) {
-        throw "go test failed with exit code $LASTEXITCODE"
-      }
-    } finally {
-      Pop-Location
-      $env:GOTMPDIR = $previousGoTmp
+    Invoke-WithLocalGoEnvironment {
+      $previous = @{}
       foreach ($key in $EnvVars.Keys) {
-        [Environment]::SetEnvironmentVariable($key, $previous[$key], "Process")
+        $previous[$key] = [Environment]::GetEnvironmentVariable($key, "Process")
+        [Environment]::SetEnvironmentVariable($key, [string]$EnvVars[$key], "Process")
       }
-      Start-Sleep -Milliseconds 500
-      Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+      $tmp = Join-Path $env:TEMP ("cairn-go-tmp-" + [guid]::NewGuid().ToString("N"))
+      New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+      $previousGoTmp = $env:GOTMPDIR
+      $env:GOTMPDIR = $tmp
+      Push-Location $root
+      try {
+        & go test @Packages @GoArgs
+        if ($LASTEXITCODE -ne 0) {
+          throw "go test failed with exit code $LASTEXITCODE"
+        }
+      } finally {
+        Pop-Location
+        $env:GOTMPDIR = $previousGoTmp
+        foreach ($key in $EnvVars.Keys) {
+          [Environment]::SetEnvironmentVariable($key, $previous[$key], "Process")
+        }
+        Start-Sleep -Milliseconds 500
+        Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+      }
     }
   }
 }
