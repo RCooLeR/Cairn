@@ -21,8 +21,12 @@ func defaultAvailableBytes(path string) (uint64, bool) {
 	if !strings.HasSuffix(root, `\`) {
 		root += `\`
 	}
+	rootPtr, err := windows.UTF16PtrFromString(root)
+	if err != nil {
+		return 0, false
+	}
 	var free uint64
-	if err := windows.GetDiskFreeSpaceEx(windows.StringToUTF16Ptr(root), &free, nil, nil); err != nil {
+	if err := windows.GetDiskFreeSpaceEx(rootPtr, &free, nil, nil); err != nil {
 		return 0, false
 	}
 	return free, true
