@@ -9791,7 +9791,7 @@ function ProjectsPage({
             aria-label="Sort projects"
             className="h-9 rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
             onChange={(event) =>
-              onSortChange(event.target.value as ProjectSortID)
+              onSortChange(projectSortID(event.target.value))
             }
             value={sort}
           >
@@ -15754,6 +15754,10 @@ function sortProjects(projects: ProjectSummary[], sort: ProjectSortID) {
       sensitivity: "base",
     });
   });
+}
+
+function projectSortID(value: string): ProjectSortID {
+  return value === "activity" || value === "cpu" ? value : "name";
 }
 
 function projectUpdateCount(project: ProjectSummary) {
