@@ -150,11 +150,15 @@ func commandPlan(now time.Time, title string, risk models.Risk, command string, 
 }
 
 func imageTarget(image models.ImageSummary) string {
+	tags := make([]string, 0, len(image.RepoTags))
 	for _, tag := range image.RepoTags {
 		tag = strings.TrimSpace(tag)
 		if tag != "" && tag != "<none>:<none>" {
-			return tag
+			tags = append(tags, tag)
 		}
+	}
+	if len(tags) == 1 {
+		return tags[0]
 	}
 	return strings.TrimSpace(image.ID)
 }

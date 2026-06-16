@@ -38,3 +38,39 @@ func TestRemoveVolumePlanPreviewShellQuotesTarget(t *testing.T) {
 		t.Fatalf("preview command = %q, want %q", got, want)
 	}
 }
+
+func TestImageTargetUsesTagOnlyWhenUnambiguous(t *testing.T) {
+	tests := []struct {
+		name  string
+		image models.ImageSummary
+		want  string
+	}{
+		{
+			name:  "single tag",
+			image: models.ImageSummary{ID: "sha256:abc", RepoTags: []string{"app:latest"}},
+			want:  "app:latest",
+		},
+		{
+			name:  "multiple tags",
+			image: models.ImageSummary{ID: "sha256:abc", RepoTags: []string{"app:latest", "app:stable"}},
+			want:  "sha256:abc",
+		},
+		{
+			name:  "dangling tag ignored",
+			image: models.ImageSummary{ID: "sha256:abc", RepoTags: []string{"<none>:<none>"}},
+			want:  "sha256:abc",
+		},
+		{
+			name:  "blank tag ignored",
+			image: models.ImageSummary{ID: "sha256:abc", RepoTags: []string{"  "}},
+			want:  "sha256:abc",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := imageTarget(tt.image); got != tt.want {
+				t.Fatalf("imageTarget() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
