@@ -157,6 +157,18 @@ import {
 import { useAppStore } from "./state/appStore";
 import { useInventoryStore } from "./state/inventoryStore";
 import {
+  type AppSettings,
+  type PermissionMode,
+  normalizeBoolSetting,
+  normalizeIntSetting,
+  normalizePermissionMode,
+  normalizeStringSetting,
+  normalizeThemePreference,
+  settingBool,
+  settingInt,
+  settingString,
+} from "./settings/appSettings";
+import {
   normalizeRegistryHostForUI,
   registryStorageLabel,
 } from "./settings/registryUi";
@@ -219,8 +231,6 @@ type ProjectTabID =
   | "backups";
 type LogScope = "all" | "project" | "service" | "container";
 type LogLevelFilter = "error" | "warn" | "info" | "debug" | "unknown";
-type PermissionMode = "ask" | "group" | "rootless";
-type ThemePreference = "dark" | "light" | "system";
 type SetupStepID =
   | "welcome"
   | "backend"
@@ -1162,7 +1172,7 @@ function App() {
   const [repairError, setRepairError] = useState<string | null>(null);
   const [repairSaving, setRepairSaving] = useState(false);
   const [permissionMode, setPermissionMode] = useState<PermissionMode>("ask");
-  const [appSettings, setAppSettings] = useState<Record<string, unknown>>({});
+  const [appSettings, setAppSettings] = useState<AppSettings>({});
   const [wslDistro, setWSLDistro] = useState("Ubuntu");
   const [colimaProfile, setColimaProfile] = useState("default");
   const [colimaCPU, setColimaCPU] = useState(2);
@@ -6185,7 +6195,7 @@ function SettingsPage({
   registryStatuses: Record<string, RegistryAuthStatus>;
   saving: boolean;
   section: SettingsSectionID;
-  settings: Record<string, unknown>;
+  settings: AppSettings;
   onSectionChange: (section: SettingsSectionID) => void;
   version: VersionInfo | null;
   wslDistro: string;
@@ -7361,31 +7371,6 @@ function formatDurationMS(value: number | null) {
 function formatAuditTime(value: unknown) {
   const millis = dateMillis(value);
   return millis ? new Date(millis).toLocaleString() : "-";
-}
-
-function settingString(
-  settings: Record<string, unknown>,
-  key: string,
-  fallback: string,
-) {
-  return typeof settings[key] === "string" ? settings[key] : fallback;
-}
-
-function settingBool(
-  settings: Record<string, unknown>,
-  key: string,
-  fallback: boolean,
-) {
-  return typeof settings[key] === "boolean" ? settings[key] : fallback;
-}
-
-function settingInt(
-  settings: Record<string, unknown>,
-  key: string,
-  fallback: number,
-) {
-  const value = settings[key];
-  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
 function PermissionOption({
@@ -15632,26 +15617,6 @@ function volumeFilterCounts(volumes: VolumeSummary[]) {
     }
   }
   return counts;
-}
-
-function normalizePermissionMode(value: unknown): PermissionMode {
-  return value === "group" || value === "rootless" ? value : "ask";
-}
-
-function normalizeThemePreference(value: unknown): ThemePreference {
-  return value === "light" || value === "system" ? value : "dark";
-}
-
-function normalizeStringSetting(value: unknown, fallback: string) {
-  return typeof value === "string" && value.trim() ? value : fallback;
-}
-
-function normalizeIntSetting(value: unknown, fallback: number) {
-  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
-}
-
-function normalizeBoolSetting(value: unknown, fallback: boolean) {
-  return typeof value === "boolean" ? value : fallback;
 }
 
 function macOSSetupCheckRows(status: ProviderStatus | null) {
