@@ -94,3 +94,37 @@ func TestLineageRepositoryReasons(t *testing.T) {
 		t.Fatalf("scratch reason = %q", got)
 	}
 }
+
+func TestLineageRepositoryKeepsRecordWithMalformedBuildArgs(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir()+"/cairn.db")
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+	if _, err := db.writer.ExecContext(ctx, `
+		INSERT INTO image_lineage (
+			provider_id, project_id, service_id, service_name, service_image_ref,
+			build_args_json, source, confidence, discovered_at, updated_at
+		)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "linux_native", "linux_native/demo", "svc", "web", "demo:web",
+		"{malformed", string(models.LineageSourceComposeDockerfile), string(models.ConfidenceLow),
+		formatTime(time.Now().UTC()), formatTime(time.Now().UTC())); err != nil {
+		t.Fatalf("insert malformed lineage: %v", err)
+	}
+
+	records, err := db.Lineage().ListProject(ctx, "linux_native/demo")
+	if err != nil {
+		t.Fatalf("ListProject() error = %v", err)
+	}
+	if len(records) != 1 || len(records[0].BuildArgs) != 0 {
+		t.Fatalf("records = %#v, want row retained with empty build args", records)
+	}
+}

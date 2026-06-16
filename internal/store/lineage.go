@@ -327,7 +327,7 @@ func scanLineageRecord(scanner lineageScanner) (LineageRecord, error) {
 		return LineageRecord{}, err
 	}
 	if err := json.Unmarshal([]byte(nullJSON(argsJSON, "{}")), &record.BuildArgs); err != nil {
-		return LineageRecord{}, err
+		record.BuildArgs = map[string]string{}
 	}
 	record.Source = models.LineageSource(source)
 	record.Confidence = models.Confidence(confidence)
