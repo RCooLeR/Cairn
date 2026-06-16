@@ -130,6 +130,16 @@ func TestManagerAppliesMacOSColimaSettings(t *testing.T) {
 	}
 }
 
+func TestDetectBudgetForWindowsWSLAllowsColdStart(t *testing.T) {
+	t.Parallel()
+	if got := detectBudgetFor(&fakeProvider{id: "windows_wsl_ubuntu", kind: TypeWindowsWSL}); got != wslDetectBudget {
+		t.Fatalf("Windows WSL detect budget = %s, want %s", got, wslDetectBudget)
+	}
+	if got := detectBudgetFor(&fakeProvider{id: "linux_native", kind: TypeLinuxNative}); got != detectBudget {
+		t.Fatalf("Linux detect budget = %s, want %s", got, detectBudget)
+	}
+}
+
 func openProviderTestStore(t *testing.T, ctx context.Context) *store.Store {
 	t.Helper()
 	db, err := store.Open(ctx, t.TempDir()+"/cairn.db")

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"net/url"
 	"runtime"
@@ -168,7 +169,11 @@ func (m *Manager) registryBaseURL(registry string) string {
 
 func isPlainHTTPRegistry(registry string) bool {
 	host := normalizeRegistryHost(registry)
-	return host == "localhost" || strings.HasPrefix(host, "localhost:") || strings.HasPrefix(host, "127.0.0.1") || strings.HasPrefix(host, "[::1]")
+	if splitHost, _, err := net.SplitHostPort(host); err == nil {
+		host = splitHost
+	}
+	host = strings.Trim(host, "[]")
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
 func statusError(resp *http.Response) error {

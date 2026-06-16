@@ -15,7 +15,10 @@ import (
 	"github.com/RCooLeR/Cairn/internal/store"
 )
 
-const detectBudget = 5 * time.Second
+const (
+	detectBudget    = 5 * time.Second
+	wslDetectBudget = 30 * time.Second
+)
 
 type Manager struct {
 	repo      *store.ProviderRepository
@@ -86,7 +89,7 @@ func (m *Manager) Detect(ctx context.Context, providerID string) (*models.Provid
 		return nil, err
 	}
 	m.applyProviderSettings(ctx, provider)
-	detectCtx, cancel := context.WithTimeout(ctx, detectBudget)
+	detectCtx, cancel := context.WithTimeout(ctx, detectBudgetFor(provider))
 	defer cancel()
 	status, err := provider.Detect(detectCtx)
 	if err != nil {
@@ -116,7 +119,7 @@ func (m *Manager) DetectAll(ctx context.Context) (map[string]*models.ProviderSta
 	for _, id := range m.order {
 		provider := m.providers[id]
 		go func() {
-			detectCtx, cancel := context.WithTimeout(ctx, detectBudget)
+			detectCtx, cancel := context.WithTimeout(ctx, detectBudgetFor(provider))
 			defer cancel()
 			status, err := provider.Detect(detectCtx)
 			results <- detectResult{id: provider.ID(), status: status, err: err}
@@ -138,6 +141,13 @@ func (m *Manager) DetectAll(ctx context.Context) (map[string]*models.ProviderSta
 	}
 	m.updateActiveAfterDetect(ctx, statuses)
 	return statuses, joined
+}
+
+func detectBudgetFor(provider PlatformProvider) time.Duration {
+	if provider != nil && provider.Type() == TypeWindowsWSL {
+		return wslDetectBudget
+	}
+	return detectBudget
 }
 
 func (m *Manager) ListProviders(ctx context.Context) ([]models.ProviderSummary, error) {

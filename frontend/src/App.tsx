@@ -7180,8 +7180,9 @@ function exportAuditCSV(entries: AuditEntry[]) {
   URL.revokeObjectURL(url);
 }
 
-function csvCell(value: string) {
-  return `"${value.replace(/"/g, '""')}"`;
+export function csvCell(value: string) {
+  const safeValue = /^[=+\-@\t\r]/.test(value) ? `'${value}` : value;
+  return `"${safeValue.replace(/"/g, '""')}"`;
 }
 
 function auditMetadataString(entry: AuditEntry, key: string) {
@@ -9679,7 +9680,7 @@ function LogRow({
   return (
     <div
       className={[
-        "absolute left-0 right-0 grid items-start gap-2 border-b border-border/60 px-3 py-1",
+        "absolute left-0 right-0 grid items-start gap-2 overflow-hidden border-b border-border/60 px-3 py-1",
         showTimestamp
           ? "grid-cols-[96px_128px_64px_1fr]"
           : "grid-cols-[128px_64px_1fr]",
@@ -9712,9 +9713,10 @@ function LogRow({
       </Tooltip>
       <span
         className={[
-          "min-w-0 text-text-primary",
+          "min-w-0 overflow-hidden text-text-primary",
           wrap ? "whitespace-pre-wrap break-words" : "truncate whitespace-pre",
         ].join(" ")}
+        title={wrap ? line.text : undefined}
       >
         {renderAnsiText(line.text, query)}
       </span>
@@ -15111,7 +15113,7 @@ function parseEnv(value: string) {
   });
 }
 
-function parseMounts(value: string): MountSpec[] {
+export function parseMounts(value: string): MountSpec[] {
   return splitLines(value).map((line) => {
     if (line.includes("type=") || line.includes("target=")) {
       const values = parseCommaKeyValue(line);
@@ -15133,10 +15135,21 @@ function parseMounts(value: string): MountSpec[] {
       };
     }
     const parts = line.split(":");
-    const mode = parts.length > 3 ? parts.pop() : "rw";
+    const maybeMode = parts[parts.length - 1]?.trim().toLowerCase();
+    const mode =
+      maybeMode === "ro" || maybeMode === "rw" || maybeMode === "readonly"
+        ? parts.pop()?.trim().toLowerCase()
+        : "rw";
     const target = parts.pop()?.trim() ?? "";
-    const source = parts.slice(1).join(":").trim();
-    const mountType = parts[0]?.trim() || "volume";
+    const first = parts[0]?.trim() ?? "";
+    const hasExplicitType = first === "volume" || first === "bind";
+    const sourceParts = hasExplicitType ? parts.slice(1) : parts;
+    const source = sourceParts.join(":").trim();
+    const mountType = hasExplicitType
+      ? first
+      : looksLikeBindMountSource(source)
+        ? "bind"
+        : "volume";
     if (!target || !source) {
       throw new Error("Mount source and target are required");
     }
@@ -15145,9 +15158,20 @@ function parseMounts(value: string): MountSpec[] {
       source,
       target,
       volumeName: mountType === "volume" ? source : "",
-      readOnly: mode === "ro",
+      readOnly: mode === "ro" || mode === "readonly",
     };
   });
+}
+
+function looksLikeBindMountSource(source: string) {
+  return (
+    source.startsWith("/") ||
+    source.startsWith("./") ||
+    source.startsWith("../") ||
+    source.startsWith("~") ||
+    /^[A-Za-z]:[\\/]/.test(source) ||
+    source.startsWith("\\\\")
+  );
 }
 
 function parseKeyValueLines(value: string) {
@@ -15206,7 +15230,7 @@ function mergeImageProgress(
   return merged;
 }
 
-function imageRefPreview(raw: string) {
+export function imageRefPreview(raw: string) {
   const value = raw.trim();
   if (!value) {
     return {
@@ -15234,7 +15258,8 @@ function imageRefPreview(raw: string) {
   }
   const first = value.split("/")[0] ?? "";
   const hasRegistry =
-    first === "localhost" || first.includes(".") || first.includes(":");
+    value.includes("/") &&
+    (first === "localhost" || first.includes(".") || first.includes(":"));
   const registry = hasRegistry
     ? normalizeRegistryHostForUI(first)
     : "docker.io";

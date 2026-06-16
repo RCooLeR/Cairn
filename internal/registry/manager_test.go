@@ -179,6 +179,62 @@ func TestLoginPipesSecretThroughStdin(t *testing.T) {
 	}
 }
 
+func TestPlainHTTPRegistryRequiresExactLoopbackHost(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		registry string
+		want     bool
+	}{
+		{"localhost", true},
+		{"localhost:5000", true},
+		{"127.0.0.1", true},
+		{"127.0.0.1:5000", true},
+		{"[::1]:5000", true},
+		{"127.0.0.1.attacker.test", false},
+		{"[::1].attacker.test", false},
+		{"example.com:5000", false},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.registry, func(t *testing.T) {
+			t.Parallel()
+			if got := isPlainHTTPRegistry(tt.registry); got != tt.want {
+				t.Fatalf("isPlainHTTPRegistry(%q) = %v, want %v", tt.registry, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAuthDoesNotTreatUnexpectedClientStatusAsLoggedIn(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+	registryHost := strings.TrimPrefix(server.URL, "http://")
+	manager := NewManager(fakeResolver{provider: &fakeRegistryProvider{}}, nil)
+
+	status, err := manager.TestAuth(context.Background(), registryHost)
+	if err != nil {
+		t.Fatalf("TestAuth() error = %v", err)
+	}
+	if status.LoggedIn || !strings.Contains(status.Error, "404") {
+		t.Fatalf("status = %#v, want logged out 404 error", status)
+	}
+}
+
+func TestBearerTokenRealmRejectsPlainHTTPRemote(t *testing.T) {
+	t.Parallel()
+	manager := NewManager(fakeResolver{provider: &fakeRegistryProvider{}}, nil)
+	_, err := manager.fetchBearerToken(context.Background(), authChallenge{
+		Scheme: "Bearer",
+		Params: map[string]string{"realm": "http://registry-token.example/token"},
+	}, "repository:library/nginx:pull", credential{Username: "ada", Password: "secret"})
+	if !apperror.IsCode(err, apperror.RegistryAuth) {
+		t.Fatalf("fetchBearerToken() error = %v, want registry auth", err)
+	}
+}
+
 func TestResolveDigestHandlesBearerAuthAndIndexSelection(t *testing.T) {
 	var serverURL string
 	tokenRequested := false

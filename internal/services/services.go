@@ -633,21 +633,31 @@ func (s *DockerService) RunImage(ctx context.Context, req models.RunImageRequest
 		return "", notReady()
 	}
 	command := dockerRunCommand(req)
+	risk := runImageRisk(req)
 	targetID := strings.TrimSpace(req.Name)
 	if targetID == "" {
 		targetID = strings.TrimSpace(req.ImageRef)
 	}
+	if risk != models.RiskSafe {
+		err := apperror.New(
+			apperror.ConfirmationRequired,
+			"Run image with bind mounts requires a confirmed plan",
+			apperror.WithDetail("Remove bind mounts or add a run-image plan/apply flow before executing this request."),
+		)
+		_ = s.recordAudit(ctx, "container.run", "container", targetID, "", command, risk, "failed", 0, err)
+		return "", err
+	}
 	started := time.Now().UTC()
-	if err := s.recordAudit(ctx, "container.run", "container", targetID, "", command, models.RiskSafe, "started", 0, nil); err != nil {
+	if err := s.recordAudit(ctx, "container.run", "container", targetID, "", command, risk, "started", 0, nil); err != nil {
 		return "", err
 	}
 	id, err := s.Client.RunImage(ctx, req)
 	duration := time.Since(started)
 	if err != nil {
-		_ = s.recordAudit(ctx, "container.run", "container", targetID, "", command, models.RiskSafe, "failed", duration, err)
+		_ = s.recordAudit(ctx, "container.run", "container", targetID, "", command, risk, "failed", duration, err)
 		return "", err
 	}
-	return id, s.recordAudit(ctx, "container.run", "container", id, "", command, models.RiskSafe, "success", duration, nil)
+	return id, s.recordAudit(ctx, "container.run", "container", id, "", command, risk, "success", duration, nil)
 }
 
 func (s *DockerService) PlanKillContainer(ctx context.Context, id string) (*models.CommandPlan, error) {
@@ -1958,6 +1968,44 @@ func dockerRunCommand(req models.RunImageRequest) string {
 	args = append(args, req.ImageRef)
 	args = append(args, req.Command...)
 	return joinCommand(args)
+}
+
+func runImageRisk(req models.RunImageRequest) models.Risk {
+	risk := models.RiskSafe
+	for _, mount := range req.Volumes {
+		mountType := strings.TrimSpace(mount.Type)
+		if mountType == "" {
+			mountType = "volume"
+		}
+		if mountType != "bind" {
+			continue
+		}
+		if !mount.ReadOnly || isSensitiveBindSource(mount.Source) {
+			return models.RiskDangerous
+		}
+		risk = models.RiskNeedsConfirmation
+	}
+	return risk
+}
+
+func isSensitiveBindSource(source string) bool {
+	value := strings.TrimSpace(strings.ReplaceAll(source, "\\", "/"))
+	if value == "" {
+		return false
+	}
+	lower := strings.ToLower(strings.TrimRight(value, "/"))
+	switch lower {
+	case "/", ".", "/var/run/docker.sock", "/run/docker.sock":
+		return true
+	}
+	if len(lower) == 2 && lower[1] == ':' {
+		return true
+	}
+	if len(lower) == 3 && lower[1] == ':' && lower[2] == '/' {
+		return true
+	}
+	clean := strings.ToLower(strings.ReplaceAll(filepath.Clean(source), "\\", "/"))
+	return clean == "/" || clean == "/var/run/docker.sock" || clean == "/run/docker.sock"
 }
 
 func dockerRenameCommand(oldName string, newName string) string {

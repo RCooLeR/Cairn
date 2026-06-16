@@ -41,12 +41,16 @@ import {
 } from "../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
 
 import App, {
+  csvCell,
   filterContainers,
   filterImages,
   filterNetworks,
   filterProjects,
   filterVolumes,
+  imageRefPreview,
+  parseMounts,
 } from "./App";
+import { decodeBase64Bytes } from "./components/terminal/TerminalPage";
 import { useAppStore } from "./state/appStore";
 import { useInventoryStore } from "./state/inventoryStore";
 
@@ -710,6 +714,50 @@ describe("App inventory shell", () => {
     expect(performance.now() - filterStart).toBeLessThan(100);
   });
 
+  it("hardens audit CSV and run-image parsing helpers", () => {
+    expect(csvCell("=cmd|' /c calc'!A1")).toBe(
+      `"'=cmd|' /c calc'!A1"`,
+    );
+    expect(csvCell("plain")).toBe('"plain"');
+    expect(csvCell('say "hello"')).toBe('"say ""hello"""');
+
+    expect(imageRefPreview("redis:7")).toEqual({
+      registry: "docker.io",
+      repository: "redis",
+      tag: "7",
+      error: undefined,
+    });
+    expect(imageRefPreview("localhost:5000/team/app:dev")).toEqual({
+      registry: "localhost:5000",
+      repository: "team/app",
+      tag: "dev",
+      error: undefined,
+    });
+
+    expect(parseMounts("myvol:/data")).toEqual([
+      {
+        type: "volume",
+        source: "myvol",
+        target: "/data",
+        volumeName: "myvol",
+        readOnly: false,
+      },
+    ]);
+    expect(parseMounts("C:\\Users\\Ada\\data:/data:ro")).toEqual([
+      {
+        type: "bind",
+        source: "C:\\Users\\Ada\\data",
+        target: "/data",
+        volumeName: "",
+        readOnly: true,
+      },
+    ]);
+
+    const bytes = decodeBase64Bytes(btoa("caf\xc3\xa9"));
+    expect(bytes).toBeInstanceOf(Uint8Array);
+    expect(new TextDecoder().decode(bytes)).toBe("café");
+  });
+
   it("opens terminal sessions from the Terminal page", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
     projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
@@ -1361,6 +1409,9 @@ describe("App inventory shell", () => {
     ).toBeInTheDocument();
     expect(screen.getByLabelText("Image ref")).toHaveValue("cairn/web:latest");
     fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    fireEvent.change(screen.getByLabelText("Volumes"), {
+      target: { value: "myvol:/data" },
+    });
     expect(screen.getByText(/docker run -d/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Run" }));
 
@@ -1371,6 +1422,14 @@ describe("App inventory shell", () => {
           name: "web",
           detach: true,
           pullIfMissing: true,
+          volumes: [
+            expect.objectContaining({
+              type: "volume",
+              source: "myvol",
+              target: "/data",
+              volumeName: "myvol",
+            }),
+          ],
         }),
       ),
     );
@@ -1433,13 +1492,13 @@ describe("App inventory shell", () => {
       screen.getByRole("button", { name: "Tag cairn/web:latest" }),
     );
     fireEvent.change(screen.getByLabelText("New ref"), {
-      target: { value: "localhost:5000/test/app:1.0" },
+      target: { value: "redis:7" },
     });
     fireEvent.click(screen.getByRole("button", { name: "Create tag" }));
     await waitFor(() =>
       expect(dockerServiceMock.TagImage).toHaveBeenCalledWith(
         "sha256:image-1",
-        "localhost:5000/test/app:1.0",
+        "redis:7",
       ),
     );
 
@@ -1447,14 +1506,12 @@ describe("App inventory shell", () => {
       screen.getByRole("button", { name: "Push cairn/web:latest" }),
     );
     fireEvent.change(screen.getByLabelText("Image ref"), {
-      target: { value: "localhost:5000/test/app:1.0" },
+      target: { value: "redis:7" },
     });
     fireEvent.click(screen.getByLabelText(/Confirm publishing/));
     fireEvent.click(screen.getByRole("button", { name: "Push" }));
     await waitFor(() =>
-      expect(dockerServiceMock.PushImage).toHaveBeenCalledWith(
-        "localhost:5000/test/app:1.0",
-      ),
+      expect(dockerServiceMock.PushImage).toHaveBeenCalledWith("redis:7"),
     );
 
     fireEvent.click(

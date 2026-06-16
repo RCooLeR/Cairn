@@ -120,15 +120,24 @@ func TestBackupPathsReturnStatErrorsAndCapCollisions(t *testing.T) {
 	}
 }
 
-func TestRestoreHelperRequiresSuccessfulWipeBeforeExtract(t *testing.T) {
+func TestRestoreHelperUsesPositionalArchiveAndRollbackStash(t *testing.T) {
 	t.Parallel()
-	args := dockerRunRestoreArgs("app-db", "/tmp/backups", "app-db.tar.gz")
-	joined := strings.Join(args, " ")
-	if !strings.Contains(joined, "rm -rf /restore/* /restore/..?* /restore/.[!.]* && tar xzf /backup/app-db.tar.gz -C /restore") {
-		t.Fatalf("restore args = %q", joined)
+	archiveName := "app-db.tar.gz; touch /restore/pwned #"
+	args := dockerRunRestoreArgs("app-db", "/tmp/backups", archiveName)
+	if got, want := args[len(args)-2], "cairn-restore"; got != want {
+		t.Fatalf("restore argv script name = %q, want %q", got, want)
 	}
-	if strings.Contains(joined, " ; tar ") {
-		t.Fatalf("restore args still allow extract after wipe failure: %q", joined)
+	if got, want := args[len(args)-1], "/backup/"+archiveName; got != want {
+		t.Fatalf("restore archive argv = %q, want %q", got, want)
+	}
+	script := args[len(args)-3]
+	if strings.Contains(script, archiveName) {
+		t.Fatalf("archive name was interpolated into shell script: %q", script)
+	}
+	for _, want := range []string{`tar xzf "$archive"`, "stash_name", "rmdir \"$stash\""} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("restore script missing %q: %q", want, script)
+		}
 	}
 }
 
@@ -253,6 +262,51 @@ func TestRestoreOverwriteRequiresTypedNameAndRunsHelper(t *testing.T) {
 	waitJobDone(t, done, jobID)
 	if !provider.hasRunArg("tar xzf") {
 		t.Fatalf("provider calls = %#v", provider.calls)
+	}
+}
+
+func TestRestoreReverifiesChecksumBeforeRunningHelper(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	mgr, events, provider := newTestManager(t)
+	dir := t.TempDir()
+	archivePath := filepath.Join(dir, "app-db.tar.gz")
+	payload := []byte("backup-data")
+	if err := os.WriteFile(archivePath, payload, 0o600); err != nil {
+		t.Fatalf("write archive: %v", err)
+	}
+	sum := sha256.Sum256(payload)
+	if err := writeSidecar(metadataPathForArchive(archivePath), BackupSidecar{
+		FormatVersion: formatVersion,
+		Volume:        "app-db",
+		SHA256:        hex.EncodeToString(sum[:]),
+	}); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+	mgr.Docker.(*fakeBackupDocker).volumes["app-db"] = &models.VolumeDetail{Summary: models.VolumeSummary{Name: "app-db"}}
+	done := events.Subscribe(ctx, bus.TopicJobDone, 4)
+
+	plan, err := mgr.PlanRestoreVolume(ctx, models.RestoreVolumeRequest{
+		SourcePath: archivePath,
+		VolumeName: "app-db",
+		Overwrite:  true,
+	})
+	if err != nil {
+		t.Fatalf("PlanRestoreVolume() error = %v", err)
+	}
+	if err := os.WriteFile(archivePath, []byte("tampered"), 0o600); err != nil {
+		t.Fatalf("tamper archive: %v", err)
+	}
+	jobID, err := mgr.ApplyRestore(ctx, plan.PlanID, "app-db")
+	if err != nil {
+		t.Fatalf("ApplyRestore() error = %v", err)
+	}
+	payloadDone := waitJobDonePayload(t, done, jobID)
+	if payloadDone.Error == "" {
+		t.Fatalf("restore succeeded after checksum mismatch")
+	}
+	if provider.hasRunArg("tar xzf") {
+		t.Fatalf("restore helper ran despite checksum mismatch: %#v", provider.calls)
 	}
 }
 

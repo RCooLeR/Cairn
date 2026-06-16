@@ -287,6 +287,27 @@ func TestClientContainerStatsUsesStreamAndOneShot(t *testing.T) {
 	}
 }
 
+func TestCancelReadCloserCancelsOnlyOnClose(t *testing.T) {
+	t.Parallel()
+	canceled := false
+	body := cancelReadCloser{
+		ReadCloser: io.NopCloser(strings.NewReader("ok")),
+		cancel:     func() { canceled = true },
+	}
+	if _, err := io.ReadAll(body); err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	if canceled {
+		t.Fatalf("cancel fired before Close")
+	}
+	if err := body.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if !canceled {
+		t.Fatalf("cancel did not fire on Close")
+	}
+}
+
 func TestClientContainerExecAndShellDetection(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

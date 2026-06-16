@@ -102,11 +102,7 @@ func (m *Manager) TestAuth(ctx context.Context, registry string) (*models.Regist
 	case http.StatusTooManyRequests:
 		status.Error = "registry rate limit reached"
 	default:
-		if resp.StatusCode >= 500 {
-			status.Error = resp.Status
-		} else {
-			status.LoggedIn = true
-		}
+		status.Error = resp.Status
 	}
 	return status, nil
 }
@@ -234,6 +230,9 @@ func (m *Manager) fetchBearerToken(ctx context.Context, challenge authChallenge,
 	tokenURL, err := url.Parse(challenge.Params["realm"])
 	if err != nil {
 		return "", apperror.Wrap(apperror.RegistryAuth, "Registry token realm invalid", err)
+	}
+	if tokenURL.Scheme != "https" && !isPlainHTTPRegistry(tokenURL.Host) {
+		return "", apperror.New(apperror.RegistryAuth, "Registry token realm must use HTTPS")
 	}
 	query := tokenURL.Query()
 	if service := challenge.Params["service"]; service != "" {

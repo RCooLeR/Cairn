@@ -458,6 +458,9 @@ func (m *Manager) runRestore(ctx context.Context, jobID string, record planRecor
 		err = runProviderDocker(ctx, provider, "volume", "create", record.TargetVolumeName)
 	}
 	if err == nil {
+		err = verifyArchiveChecksum(record.ArchivePath, record.Sidecar.SHA256)
+	}
+	if err == nil {
 		err = runProviderDocker(ctx, provider, dockerRunRestoreArgs(record.TargetVolumeName, record.BackupDirBackend, record.ArchiveName)...)
 	}
 	duration := time.Since(started)
@@ -774,9 +777,26 @@ func dockerRunRestoreArgs(targetName string, backupDir string, archiveName strin
 		"-v", backupDir + ":/backup:ro",
 		helperImage,
 		"sh", "-c",
-		"rm -rf /restore/* /restore/..?* /restore/.[!.]* && tar xzf /backup/" + archiveName + " -C /restore",
+		restoreHelperScript,
+		"cairn-restore",
+		"/backup/" + archiveName,
 	}
 }
+
+const restoreHelperScript = `set -eu
+archive=$1
+stash_name=".cairn-restore-old-$$"
+stash="/restore/$stash_name"
+mkdir "$stash"
+find /restore -mindepth 1 -maxdepth 1 ! -name "$stash_name" -exec sh -c 'stash=$1; shift; for path do mv "$path" "$stash"/; done' sh "$stash" {} +
+if tar xzf "$archive" -C /restore; then
+  rm -rf "$stash"
+else
+  find /restore -mindepth 1 -maxdepth 1 ! -name "$stash_name" -exec rm -rf {} +
+  find "$stash" -mindepth 1 -maxdepth 1 -exec sh -c 'dest=$1; shift; for path do mv "$path" "$dest"/; done' sh /restore {} +
+  rmdir "$stash"
+  exit 1
+fi`
 
 func backupEffects(volumeName string, archivePath string, metadataPath string, running []string) []string {
 	effects := []string{
@@ -795,7 +815,7 @@ func restoreEffects(targetName string, archivePath string, overwrite bool, runni
 		"Restores archive " + archivePath + " into volume " + targetName + ".",
 	}
 	if overwrite {
-		effects = append(effects, "Existing contents of "+targetName+" will be deleted before extraction.")
+		effects = append(effects, "Existing contents of "+targetName+" are moved aside during extraction and restored automatically if extraction fails.")
 	} else {
 		effects = append(effects, "Creates a new volume named "+targetName+".")
 	}

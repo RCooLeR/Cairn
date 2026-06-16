@@ -354,6 +354,7 @@ func TestDockerServiceObjectCreationAudits(t *testing.T) {
 		ImageRef: "alpine:latest",
 		Name:     "demo",
 		Env:      []models.EnvVar{{Name: "API_TOKEN", Value: "secret-value"}},
+		Volumes:  []models.MountSpec{{Type: "volume", Source: "demo_data", Target: "/data"}},
 		Detach:   true,
 	}); err != nil || id != "container-created" {
 		t.Fatalf("RunImage() id=%q err=%v", id, err)
@@ -419,6 +420,44 @@ func TestDockerServiceObjectCreationAudits(t *testing.T) {
 	}
 	if !sawPush {
 		t.Fatalf("missing successful image.push audit in %#v", entries)
+	}
+}
+
+func TestDockerServiceRunImageRejectsBindMountWithoutPlan(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "cairn.db"))
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	client := newFakeDockerClient()
+	service := &DockerService{Client: client, Audit: db.Audit()}
+
+	_, err = service.RunImage(ctx, models.RunImageRequest{
+		ImageRef: "alpine:latest",
+		Name:     "danger",
+		Volumes:  []models.MountSpec{{Type: "bind", Source: "/", Target: "/host"}},
+		Detach:   true,
+	})
+	if !apperror.IsCode(err, apperror.ConfirmationRequired) {
+		t.Fatalf("RunImage(bind) error = %v, want confirmation required", err)
+	}
+	if len(client.runImages) != 0 {
+		t.Fatalf("RunImage reached Docker client: %#v", client.runImages)
+	}
+
+	entries, err := (&SettingsService{Audit: db.Audit()}).GetAuditLog(ctx, models.AuditFilter{Topic: "container.run", Limit: 10})
+	if err != nil {
+		t.Fatalf("GetAuditLog() error = %v", err)
+	}
+	if len(entries) != 1 || entries[0].Result != "failed" || entries[0].Metadata["risk"] != string(models.RiskDangerous) {
+		t.Fatalf("audit entries = %#v", entries)
 	}
 }
 

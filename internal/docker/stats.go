@@ -30,12 +30,12 @@ func (c *Client) ContainerStats(ctx context.Context, id string, opts StatsOption
 	}
 
 	callCtx, cancel := c.withTimeout(ctx)
-	defer cancel()
 	reader, err := statsOnce(callCtx, api, id, opts.OneShot)
 	if err != nil {
+		cancel()
 		return nil, mapDockerError("read container stats", err)
 	}
-	return &StatsReader{Body: reader.Body, OSType: reader.OSType}, nil
+	return &StatsReader{Body: cancelReadCloser{ReadCloser: reader.Body, cancel: cancel}, OSType: reader.OSType}, nil
 }
 
 func statsOnce(ctx context.Context, api APIClient, id string, oneShot bool) (statsResponseReader, error) {
@@ -50,4 +50,15 @@ func statsOnce(ctx context.Context, api APIClient, id string, oneShot bool) (sta
 type statsResponseReader struct {
 	Body   io.ReadCloser
 	OSType string
+}
+
+type cancelReadCloser struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c cancelReadCloser) Close() error {
+	err := c.ReadCloser.Close()
+	c.cancel()
+	return err
 }
