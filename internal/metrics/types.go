@@ -18,13 +18,14 @@ const (
 	ScopeService   = "service"
 	ScopeContainer = "container"
 
-	defaultVisibleInterval    = 2 * time.Second
-	defaultBackgroundInterval = 10 * time.Second
-	defaultPublishInterval    = time.Second
-	defaultPersistInterval    = 10 * time.Second
-	defaultRetainInterval     = time.Hour
-	defaultTopN               = 8
-	maxPendingPersistSamples  = 10000
+	defaultVisibleInterval     = 2 * time.Second
+	defaultBackgroundInterval  = 10 * time.Second
+	defaultPublishInterval     = time.Second
+	defaultPersistInterval     = 10 * time.Second
+	defaultRetainInterval      = time.Hour
+	defaultTopN                = 8
+	maxPendingPersistSamples   = 10000
+	streamRetryFallbackSamples = 5
 )
 
 type DockerClient interface {

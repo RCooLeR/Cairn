@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"math"
 	"sync"
@@ -212,6 +213,47 @@ func TestAppendPendingMetricsSortsBeforeTrim(t *testing.T) {
 	}
 }
 
+func TestWatchContainerRetriesStreamAfterFallbackFailures(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	retriedStream := make(chan struct{})
+	var retriedOnce sync.Once
+	docker := &fakeMetricsDocker{
+		streamErrors:  3,
+		oneShotErrors: streamRetryFallbackSamples,
+		afterStatsCall: func(streamCalls int, _ int) {
+			if streamCalls >= 4 {
+				retriedOnce.Do(func() {
+					close(retriedStream)
+				})
+			}
+		},
+	}
+	manager := NewManager(docker, nil, nil, nil, nil, Options{BackgroundInterval: time.Millisecond})
+	manager.mu.Lock()
+	manager.containers["c1"] = models.ContainerSummary{ID: "c1", Name: "web"}
+	manager.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		manager.watchContainer(ctx, "c1")
+	}()
+
+	select {
+	case <-retriedStream:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watcher did not retry streaming after fallback failures")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("watcher did not stop after context cancellation")
+	}
+}
+
 func TestManagerQueriesStopsFallbackAndScopes(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)
@@ -289,13 +331,18 @@ func TestManagerQueriesStopsFallbackAndScopes(t *testing.T) {
 }
 
 type fakeMetricsDocker struct {
-	mu         sync.Mutex
-	containers []models.ContainerSummary
-	images     []models.ImageSummary
-	volumes    []models.VolumeSummary
-	diskUsage  *models.DiskUsage
-	stats      map[string][]container.StatsResponse
-	calls      []dockercore.StatsOptions
+	mu             sync.Mutex
+	containers     []models.ContainerSummary
+	images         []models.ImageSummary
+	volumes        []models.VolumeSummary
+	diskUsage      *models.DiskUsage
+	stats          map[string][]container.StatsResponse
+	calls          []dockercore.StatsOptions
+	streamErrors   int
+	oneShotErrors  int
+	streamCalls    int
+	oneShotCalls   int
+	afterStatsCall func(streamCalls int, oneShotCalls int)
 }
 
 func (f *fakeMetricsDocker) ProviderID() string {
@@ -335,8 +382,34 @@ func (f *fakeMetricsDocker) ListVolumes(context.Context) ([]models.VolumeSummary
 func (f *fakeMetricsDocker) ContainerStats(_ context.Context, id string, opts dockercore.StatsOptions) (*dockercore.StatsReader, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, opts)
+	if opts.Stream {
+		f.streamCalls++
+	} else if opts.OneShot {
+		f.oneShotCalls++
+	}
+	streamCalls := f.streamCalls
+	oneShotCalls := f.oneShotCalls
+	if opts.Stream && f.streamErrors > 0 {
+		f.streamErrors--
+		f.mu.Unlock()
+		if f.afterStatsCall != nil {
+			f.afterStatsCall(streamCalls, oneShotCalls)
+		}
+		return nil, errors.New("stream stats failed")
+	}
+	if opts.OneShot && f.oneShotErrors > 0 {
+		f.oneShotErrors--
+		f.mu.Unlock()
+		if f.afterStatsCall != nil {
+			f.afterStatsCall(streamCalls, oneShotCalls)
+		}
+		return nil, errors.New("one-shot stats failed")
+	}
 	entries := append([]container.StatsResponse(nil), f.stats[id]...)
 	f.mu.Unlock()
+	if f.afterStatsCall != nil {
+		f.afterStatsCall(streamCalls, oneShotCalls)
+	}
 
 	var buf bytes.Buffer
 	encoder := json.NewEncoder(&buf)

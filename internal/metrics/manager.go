@@ -247,22 +247,42 @@ func (m *Manager) reconcileOnce(ctx context.Context) error {
 
 func (m *Manager) watchContainer(ctx context.Context, containerID string) {
 	failures := 0
+	fallbackSamples := 0
 	for ctx.Err() == nil {
-		if failures < 3 {
+		if failures < 3 || fallbackSamples >= streamRetryFallbackSamples {
+			if fallbackSamples >= streamRetryFallbackSamples {
+				failures = 0
+				fallbackSamples = 0
+			}
 			err := m.streamContainer(ctx, containerID)
 			if err == nil || errors.Is(err, context.Canceled) {
 				return
 			}
 			failures++
-			sleepContext(ctx, time.Duration(failures)*time.Second)
+			fallbackSamples = 0
+			sleepContext(ctx, m.streamRetryDelay(containerID, failures))
 			continue
 		}
 		err := m.sampleOneShot(ctx, containerID)
+		fallbackSamples++
 		if err == nil {
 			failures = 0
+			fallbackSamples = 0
 		}
 		sleepContext(ctx, m.sampleInterval(containerID))
 	}
+}
+
+func (m *Manager) streamRetryDelay(containerID string, failures int) time.Duration {
+	if failures <= 0 {
+		return 0
+	}
+	delay := time.Duration(failures) * time.Second
+	interval := m.sampleInterval(containerID)
+	if interval > 0 && interval < delay {
+		return interval
+	}
+	return delay
 }
 
 func (m *Manager) streamContainer(ctx context.Context, containerID string) error {
