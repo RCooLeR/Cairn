@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/models"
@@ -100,10 +101,14 @@ func (r *NotificationRepository) MarkRead(ctx context.Context, ids []int64) erro
 		}
 		return tx.Commit()
 	}
+	placeholders := make([]string, 0, len(ids))
+	args := make([]any, 0, len(ids))
 	for _, id := range ids {
-		if _, err := tx.ExecContext(ctx, `UPDATE notifications SET read = 1 WHERE id = ?`, id); err != nil {
-			return err
-		}
+		placeholders = append(placeholders, "?")
+		args = append(args, id)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE notifications SET read = 1 WHERE id IN (`+strings.Join(placeholders, ",")+`)`, args...); err != nil {
+		return err
 	}
 	return tx.Commit()
 }

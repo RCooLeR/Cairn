@@ -90,6 +90,53 @@ func TestProjectRepositorySnapshotPreservesPinnedAndReplacesServices(t *testing.
 	}
 }
 
+func TestProjectRepositorySnapshotNilServicesPreservesExistingServices(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openStoreForProjectTest(t)
+	repo := db.Projects()
+	now := time.Date(2026, 6, 15, 12, 0, 0, 0, time.UTC)
+
+	project := ProjectRecord{
+		ID:         "linux_native/partial",
+		ProviderID: "linux_native",
+		Name:       "partial",
+		LastSeenAt: now,
+	}
+	if err := repo.SaveSnapshot(ctx, "linux_native", []ProjectRecord{project}, []ServiceRecord{{
+		ID:         "linux_native/partial/api",
+		ProjectID:  "linux_native/partial",
+		Name:       "api",
+		ImageRef:   "nginx:alpine",
+		LastSeenAt: now,
+	}}, now, time.Time{}); err != nil {
+		t.Fatalf("seed SaveSnapshot() error = %v", err)
+	}
+
+	project.LastSeenAt = now.Add(time.Minute)
+	if err := repo.SaveSnapshot(ctx, "linux_native", []ProjectRecord{project}, nil, project.LastSeenAt, time.Time{}); err != nil {
+		t.Fatalf("partial SaveSnapshot() error = %v", err)
+	}
+	services, err := repo.ListServices(ctx, "linux_native/partial")
+	if err != nil {
+		t.Fatalf("ListServices() after partial snapshot error = %v", err)
+	}
+	if len(services) != 1 || services[0].Name != "api" {
+		t.Fatalf("services after partial snapshot = %#v", services)
+	}
+
+	if err := repo.SaveSnapshot(ctx, "linux_native", []ProjectRecord{project}, []ServiceRecord{}, project.LastSeenAt, time.Time{}); err != nil {
+		t.Fatalf("empty service SaveSnapshot() error = %v", err)
+	}
+	services, err = repo.ListServices(ctx, "linux_native/partial")
+	if err != nil {
+		t.Fatalf("ListServices() after empty service snapshot error = %v", err)
+	}
+	if len(services) != 0 {
+		t.Fatalf("services after empty service snapshot = %#v, want empty", services)
+	}
+}
+
 func TestProjectRepositoryDeletesOnlyStaleDetectedProjects(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

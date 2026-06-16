@@ -357,24 +357,32 @@ func TestNotificationsRoundTripAndMarkRead(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Insert second notification: %v", err)
 	}
+	secondUnreadID, err := repo.Insert(ctx, NotificationRecord{
+		Level: "error",
+		Title: "Backup failed",
+		Topic: "backup",
+	})
+	if err != nil {
+		t.Fatalf("Insert third notification: %v", err)
+	}
 
 	all, err := repo.List(ctx, false, 10)
 	if err != nil {
 		t.Fatalf("List all: %v", err)
 	}
-	if len(all) != 2 || all[0].Title == "" {
+	if len(all) != 3 || all[0].Title == "" {
 		t.Fatalf("all notifications = %#v", all)
 	}
 	unread, err := repo.List(ctx, true, 10)
 	if err != nil {
 		t.Fatalf("List unread: %v", err)
 	}
-	if len(unread) != 1 || unread[0].ID != firstID || unread[0].Read {
+	if len(unread) != 2 || unread[0].Read || unread[1].Read {
 		t.Fatalf("unread notifications = %#v", unread)
 	}
 
-	if err := repo.MarkRead(ctx, []int64{firstID}); err != nil {
-		t.Fatalf("MarkRead one: %v", err)
+	if err := repo.MarkRead(ctx, []int64{firstID, secondUnreadID}); err != nil {
+		t.Fatalf("MarkRead batch: %v", err)
 	}
 	unread, err = repo.List(ctx, true, 10)
 	if err != nil {

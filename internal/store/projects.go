@@ -64,6 +64,7 @@ func (r *ProjectRepository) SaveSnapshot(ctx context.Context, providerID string,
 		_ = tx.Rollback()
 	}()
 
+	replaceServices := services != nil
 	for _, project := range projects {
 		if project.LastSeenAt.IsZero() {
 			project.LastSeenAt = seenAt
@@ -104,9 +105,25 @@ func (r *ProjectRepository) SaveSnapshot(ctx context.Context, providerID string,
 			project.Source, pinned, formatTime(project.LastSeenAt), jsonText(project.Metadata, "{}")); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, "DELETE FROM services WHERE project_id = ?", project.ID); err != nil {
-			return err
+		if replaceServices {
+			if _, err := tx.ExecContext(ctx, "DELETE FROM services WHERE project_id = ?", project.ID); err != nil {
+				return err
+			}
 		}
+	}
+
+	if !replaceServices {
+		if !staleCutoff.IsZero() {
+			if _, err := tx.ExecContext(ctx, `
+				DELETE FROM projects
+				WHERE provider_id = ?
+					AND source <> ?
+					AND last_seen_at < ?
+			`, providerID, ProjectSourceImported, formatTime(staleCutoff)); err != nil {
+				return err
+			}
+		}
+		return tx.Commit()
 	}
 
 	for _, service := range services {
