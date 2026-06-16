@@ -8439,6 +8439,8 @@ function ResourceUsagePanel({
         >
           <ResponsiveContainer height="100%" width="100%">
             <AreaChart
+              accessibilityLayer
+              aria-label={`${metric} resource usage chart`}
               data={points}
               margin={{ bottom: 0, left: 0, right: 8, top: 8 }}
             >
@@ -8607,6 +8609,7 @@ function ProjectsMiniList({
               </div>
               <Sparkline
                 color={chartColors.spark}
+                label={`${project.name} project activity trend`}
                 points={
                   projectSparks[project.id] ?? projectSparkPoints(project)
                 }
@@ -8659,7 +8662,10 @@ function ContainerHealthPanel({
         <div className="grid gap-4 lg:grid-cols-[220px_1fr]">
           <div className="h-56">
             <ResponsiveContainer height="100%" width="100%">
-              <RechartsPieChart>
+              <RechartsPieChart
+                accessibilityLayer
+                aria-label="Container status distribution chart"
+              >
                 <Pie
                   data={pieData}
                   dataKey="value"
@@ -8734,6 +8740,7 @@ function ContainerHealthPanel({
                     <td className="px-3 py-2">
                       <Sparkline
                         color={chartColors.spark}
+                        label={`${container.name || shortID(container.id)} container activity trend`}
                         points={
                           containerSparks[container.id] ??
                           containerSparkPoints(container)
@@ -9078,12 +9085,22 @@ function CleanupModal({
   );
 }
 
-function Sparkline({ color, points }: { points: SparkPoint[]; color: string }) {
+function Sparkline({
+  color,
+  label = "Metric trend",
+  points,
+}: {
+  points: SparkPoint[];
+  color: string;
+  label?: string;
+}) {
   const data = points.length > 0 ? points : [{ label: "0", value: 0 }];
   return (
     <div className="h-10 w-full min-w-0">
       <ResponsiveContainer height="100%" width="100%">
         <LineChart
+          accessibilityLayer
+          aria-label={label}
           data={data}
           margin={{ bottom: 2, left: 0, right: 0, top: 2 }}
         >
@@ -10956,6 +10973,7 @@ function ProjectCard({
         <div className="h-10 overflow-hidden rounded-control border border-border bg-bg-inset px-2 py-2">
           <Sparkline
             color={chartColors.spark}
+            label={`${project.name} project resource trend`}
             points={sparkPoints ?? projectSparkPoints(project)}
           />
         </div>
