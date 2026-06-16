@@ -1314,13 +1314,14 @@ export function decodeBase64Bytes(value: string) {
 }
 
 function eventPayload<T>(event: unknown): T | null {
-  if (!event) {
+  if (!isEventRecord(event) || !("data" in event)) {
     return null;
   }
-  if (typeof event === "object" && "data" in event) {
-    return ((event as { data?: T }).data ?? null) as T | null;
-  }
-  return event as T;
+  return event.data == null ? null : (event.data as T);
+}
+
+function isEventRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 function errorMessage(error: unknown, fallback: string) {

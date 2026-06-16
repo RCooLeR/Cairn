@@ -12664,23 +12664,17 @@ function ContainerBulkActions({
 }
 
 function eventPayload<T>(event: unknown): T | null {
-  if (!event) {
+  if (!isRecord(event) || !("data" in event)) {
     return null;
   }
-  if (typeof event === "object" && "data" in event) {
-    return ((event as { data?: T }).data ?? null) as T | null;
-  }
-  return event as T;
+  return event.data == null ? null : (event.data as T);
 }
 
 function isLogLine(value: unknown): value is LogLine {
-  if (!value || typeof value !== "object") {
+  if (!isRecord(value)) {
     return false;
   }
-  const candidate = value as Partial<LogLine>;
-  return (
-    typeof candidate.text === "string" && typeof candidate.stream === "string"
-  );
+  return typeof value.text === "string" && typeof value.stream === "string";
 }
 
 function normalizeLogLevel(level?: string): LogLevelFilter {
@@ -15836,14 +15830,13 @@ function projectUpdateBadges(project: ProjectSummary) {
 }
 
 function isStatsSample(value: unknown): value is StatsSample {
-  if (!value || typeof value !== "object") {
+  if (!isRecord(value)) {
     return false;
   }
-  const sample = value as Partial<StatsSample>;
   return (
-    typeof sample.containerID === "string" &&
-    typeof sample.cpuPercent === "number" &&
-    typeof sample.memoryBytes === "number"
+    typeof value.containerID === "string" &&
+    typeof value.cpuPercent === "number" &&
+    typeof value.memoryBytes === "number"
   );
 }
 
