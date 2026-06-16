@@ -630,7 +630,7 @@ export function TerminalPage({
           </div>
         ) : null}
 
-        <div className="relative min-h-0 flex-1 bg-[#070a0f]">
+        <div className="relative min-h-0 flex-1 bg-terminal-bg">
           {sessions.map((session) => (
             <TerminalSurface
               active={session.id === activeSessionID}
@@ -939,12 +939,7 @@ function TerminalSurface({
         "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
       fontSize: 13,
       scrollback: 10000,
-      theme: {
-        background: "#070a0f",
-        foreground: "#d6deeb",
-        cursor: "#2dd4a7",
-        selectionBackground: "#2dd4a744",
-      },
+      theme: terminalThemeFromCSS(),
     });
     terminal.open(hostRef.current);
     terminalRef.current = terminal;
@@ -972,11 +967,25 @@ function TerminalSurface({
       observer = new ResizeObserver(resize);
       observer.observe(hostRef.current);
     }
+    let themeObserver: MutationObserver | null = null;
+    const applyTheme = () => {
+      if (terminal.options) {
+        terminal.options.theme = terminalThemeFromCSS();
+      }
+    };
+    if (typeof MutationObserver !== "undefined") {
+      themeObserver = new MutationObserver(applyTheme);
+      themeObserver.observe(document.documentElement, {
+        attributeFilter: ["data-theme", "style"],
+        attributes: true,
+      });
+    }
     return () => {
       if (resizeTimer.current !== null) {
         window.clearTimeout(resizeTimer.current);
       }
       observer?.disconnect();
+      themeObserver?.disconnect();
       disposable.dispose();
       terminal.dispose();
       terminalRef.current = null;
@@ -1001,6 +1010,41 @@ function TerminalSurface({
       ref={hostRef}
     />
   );
+}
+
+function terminalThemeFromCSS() {
+  return {
+    background: rgbVariable("--terminal-bg", "rgb(7, 10, 15)"),
+    foreground: rgbVariable("--terminal-fg", "rgb(214, 222, 235)"),
+    cursor: rgbVariable("--terminal-cursor", "rgb(45, 212, 167)"),
+    selectionBackground: rgbVariable(
+      "--terminal-selection",
+      "rgba(45, 212, 167, 0.27)",
+      0.27,
+    ),
+  };
+}
+
+function rgbVariable(name: string, fallback: string, alpha?: number) {
+  if (typeof window === "undefined") {
+    return fallback;
+  }
+  const raw = window
+    .getComputedStyle(document.documentElement)
+    .getPropertyValue(name)
+    .trim();
+  const channels = raw.split(/\s+/).map(Number);
+  if (
+    channels.length !== 3 ||
+    channels.some((channel) => !Number.isFinite(channel))
+  ) {
+    return fallback;
+  }
+  const [red, green, blue] = channels;
+  if (alpha === undefined) {
+    return `rgb(${red}, ${green}, ${blue})`;
+  }
+  return `rgba(${red}, ${green}, ${blue}, ${alpha})`;
 }
 
 function CheatsheetRow({

@@ -29,6 +29,10 @@
   --chart-unhealthy: 240 96 93;
   --chart-paused: 245 184 61;
   --chart-spark: 45 212 167;
+  --terminal-bg: 7 10 15;
+  --terminal-fg: 214 222 235;
+  --terminal-cursor: 45 212 167;
+  --terminal-selection: 45 212 167;
   color-scheme: dark;
   font-family:
     Inter,
@@ -74,6 +78,10 @@
   --chart-unhealthy: 220 38 38;
   --chart-paused: 180 83 9;
   --chart-spark: 13 148 136;
+  --terminal-bg: 255 255 255;
+  --terminal-fg: 15 23 42;
+  --terminal-cursor: 13 148 136;
+  --terminal-selection: 13 148 136;
   color-scheme: light;
   background: #f5f7fa;
   color: #0f172a;
@@ -107,6 +115,10 @@
     --chart-unhealthy: 240 96 93;
     --chart-paused: 245 184 61;
     --chart-spark: 45 212 167;
+    --terminal-bg: 7 10 15;
+    --terminal-fg: 214 222 235;
+    --terminal-cursor: 45 212 167;
+    --terminal-selection: 45 212 167;
     color-scheme: dark;
     background: #0d1117;
     color: #f0f6fc;

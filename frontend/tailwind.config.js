@@ -8,6 +8,7 @@ export default {
         "bg-panel": "rgb(var(--bg-panel) / <alpha-value>)",
         "bg-card": "rgb(var(--bg-card) / <alpha-value>)",
         "bg-inset": "rgb(var(--bg-inset) / <alpha-value>)",
+        "terminal-bg": "rgb(var(--terminal-bg) / <alpha-value>)",
         border: "rgb(var(--border) / 0.08)",
         "border-strong": "rgb(var(--border-strong) / 0.18)",
         "text-primary": "rgb(var(--text-primary) / <alpha-value>)",
