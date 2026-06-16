@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"io"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -87,6 +88,20 @@ func TestTerminalCloseContextOutlivesRequestCancellation(t *testing.T) {
 	}
 	if got := closeCtx.Value(terminalContextKey("trace")); got != "kept" {
 		t.Fatalf("close context value = %#v, want kept", got)
+	}
+}
+
+func TestCurrentUsernameFallsBackToOSUser(t *testing.T) {
+	t.Setenv("USER", "")
+	t.Setenv("USERNAME", "")
+	previous := currentOSUser
+	currentOSUser = func() (*user.User, error) {
+		return &user.User{Username: "container-user"}, nil
+	}
+	t.Cleanup(func() { currentOSUser = previous })
+
+	if got := currentUsername(); got != "container-user" {
+		t.Fatalf("currentUsername() = %q, want OS user fallback", got)
 	}
 }
 

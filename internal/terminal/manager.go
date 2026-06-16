@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"io"
 	"os"
+	"os/user"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -142,7 +143,7 @@ func (m *Manager) OpenHostTerminal(ctx context.Context, opts models.TerminalOpti
 		WorkingDir: cwd,
 		CreatedAt:  m.now(),
 	}
-	return m.addPTYSession(ctx, info, ptySession)
+	return m.addPTYSession(info, ptySession)
 }
 
 func (m *Manager) OpenBackendTerminal(ctx context.Context, opts models.TerminalOptions) (*models.TerminalSessionInfo, error) {
@@ -235,7 +236,7 @@ func (m *Manager) openProviderPTYTerminal(ctx context.Context, opts models.Termi
 	info.User = currentUsername()
 	info.WorkingDir = cwd
 	info.CreatedAt = m.now()
-	return m.addPTYSession(ctx, info, ptySession)
+	return m.addPTYSession(info, ptySession)
 }
 
 func (m *Manager) OpenContainerTerminal(ctx context.Context, containerID string, opts models.ContainerTerminalOptions) (*models.TerminalSessionInfo, error) {
@@ -372,7 +373,7 @@ func (m *Manager) StopAll() {
 	}
 }
 
-func (m *Manager) addPTYSession(ctx context.Context, info models.TerminalSessionInfo, ptySession PTYSession) (*models.TerminalSessionInfo, error) {
+func (m *Manager) addPTYSession(info models.TerminalSessionInfo, ptySession PTYSession) (*models.TerminalSessionInfo, error) {
 	active := &session{
 		info:      info,
 		stream:    ptySession,
@@ -389,7 +390,6 @@ func (m *Manager) addPTYSession(ctx context.Context, info models.TerminalSession
 		exitCode := ptySession.Wait()
 		m.finish(info.ID, exitCode)
 	}()
-	_ = ctx
 	return &info, nil
 }
 
@@ -542,8 +542,15 @@ func currentUsername() string {
 	if value := strings.TrimSpace(os.Getenv("USERNAME")); value != "" {
 		return value
 	}
+	if current, err := currentOSUser(); err == nil && current != nil {
+		if value := strings.TrimSpace(current.Username); value != "" {
+			return value
+		}
+	}
 	return ""
 }
+
+var currentOSUser = user.Current
 
 func mapTerminalStartError(action string, err error) error {
 	if err == nil {
