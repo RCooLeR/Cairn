@@ -65,6 +65,7 @@ func (r *ProjectRepository) SaveSnapshot(ctx context.Context, providerID string,
 	}()
 
 	replaceServices := services != nil
+	serviceReplacementIDs := serviceReplacementProjectIDs(projects, services)
 	for _, project := range projects {
 		if project.LastSeenAt.IsZero() {
 			project.LastSeenAt = seenAt
@@ -105,10 +106,11 @@ func (r *ProjectRepository) SaveSnapshot(ctx context.Context, providerID string,
 			project.Source, pinned, formatTime(project.LastSeenAt), jsonText(project.Metadata, "{}")); err != nil {
 			return err
 		}
-		if replaceServices {
-			if _, err := tx.ExecContext(ctx, "DELETE FROM services WHERE project_id = ?", project.ID); err != nil {
-				return err
-			}
+	}
+
+	for _, projectID := range serviceReplacementIDs {
+		if _, err := tx.ExecContext(ctx, "DELETE FROM services WHERE project_id = ?", projectID); err != nil {
+			return err
 		}
 	}
 
@@ -164,6 +166,35 @@ func (r *ProjectRepository) SaveSnapshot(ctx context.Context, providerID string,
 	}
 
 	return tx.Commit()
+}
+
+func serviceReplacementProjectIDs(projects []ProjectRecord, services []ServiceRecord) []string {
+	if services == nil {
+		return nil
+	}
+	if len(services) == 0 {
+		ids := make([]string, 0, len(projects))
+		for _, project := range projects {
+			if id := strings.TrimSpace(project.ID); id != "" {
+				ids = append(ids, id)
+			}
+		}
+		return ids
+	}
+	seen := map[string]struct{}{}
+	ids := make([]string, 0, len(services))
+	for _, service := range services {
+		projectID := strings.TrimSpace(service.ProjectID)
+		if projectID == "" {
+			continue
+		}
+		if _, ok := seen[projectID]; ok {
+			continue
+		}
+		seen[projectID] = struct{}{}
+		ids = append(ids, projectID)
+	}
+	return ids
 }
 
 func (r *ProjectRepository) UpsertImported(ctx context.Context, record ProjectRecord) error {

@@ -137,6 +137,49 @@ func TestProjectRepositorySnapshotNilServicesPreservesExistingServices(t *testin
 	}
 }
 
+func TestProjectRepositoryPartialServiceSnapshotOnlyReplacesCoveredProjects(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openStoreForProjectTest(t)
+	repo := db.Projects()
+	now := time.Date(2026, 6, 15, 12, 30, 0, 0, time.UTC)
+
+	projects := []ProjectRecord{
+		{ID: "linux_native/web", ProviderID: "linux_native", Name: "web", LastSeenAt: now},
+		{ID: "linux_native/worker", ProviderID: "linux_native", Name: "worker", LastSeenAt: now},
+	}
+	if err := repo.SaveSnapshot(ctx, "linux_native", projects, []ServiceRecord{
+		{ID: "linux_native/web/api", ProjectID: "linux_native/web", Name: "api", ImageRef: "nginx", LastSeenAt: now},
+		{ID: "linux_native/worker/job", ProjectID: "linux_native/worker", Name: "job", ImageRef: "busybox", LastSeenAt: now},
+	}, now, time.Time{}); err != nil {
+		t.Fatalf("seed SaveSnapshot() error = %v", err)
+	}
+
+	next := now.Add(time.Minute)
+	projects[0].LastSeenAt = next
+	projects[1].LastSeenAt = next
+	if err := repo.SaveSnapshot(ctx, "linux_native", projects, []ServiceRecord{
+		{ID: "linux_native/web/api-v2", ProjectID: "linux_native/web", Name: "api-v2", ImageRef: "nginx:alpine", LastSeenAt: next},
+	}, next, time.Time{}); err != nil {
+		t.Fatalf("partial service SaveSnapshot() error = %v", err)
+	}
+
+	webServices, err := repo.ListServices(ctx, "linux_native/web")
+	if err != nil {
+		t.Fatalf("ListServices(web) error = %v", err)
+	}
+	if len(webServices) != 1 || webServices[0].Name != "api-v2" {
+		t.Fatalf("web services = %#v, want only replacement service", webServices)
+	}
+	workerServices, err := repo.ListServices(ctx, "linux_native/worker")
+	if err != nil {
+		t.Fatalf("ListServices(worker) error = %v", err)
+	}
+	if len(workerServices) != 1 || workerServices[0].Name != "job" {
+		t.Fatalf("worker services = %#v, want original service preserved", workerServices)
+	}
+}
+
 func TestProjectRepositoryDeletesOnlyStaleDetectedProjects(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
