@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -31,6 +32,7 @@ import (
 const (
 	defaultImageSearchLimit = 25
 	maxImageSearchLimit     = 100
+	restartPolicyNone       = "no"
 )
 
 var dockerNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
@@ -346,7 +348,7 @@ func (c *Client) CreateVolume(ctx context.Context, req models.CreateVolumeReques
 	if err := c.saveVolumes(ctx, []store.VolumeCacheRecord{{
 		Summary:   summary,
 		CreatedAt: volumeCreatedAt(raw),
-	}}); err != nil {
+	}}, false); err != nil {
 		return nil, err
 	}
 	c.publishVolumeChanged(summary.Name)
@@ -398,7 +400,7 @@ func (c *Client) CreateNetwork(ctx context.Context, req models.CreateNetworkRequ
 		Subnet:     subnet,
 		Gateway:    gateway,
 		Containers: networkContainerIDs(raw),
-	}}); err != nil {
+	}}, false); err != nil {
 		return nil, err
 	}
 	c.publishNetworkChanged(summary.ID)
@@ -662,7 +664,7 @@ func createIPAM(subnet string, gateway string) (*network.IPAM, error) {
 
 func restartPolicy(value string) container.RestartPolicyMode {
 	switch strings.TrimSpace(value) {
-	case "", "no":
+	case "", restartPolicyNone:
 		return ""
 	case "on-failure":
 		return container.RestartPolicyOnFailure
@@ -676,13 +678,22 @@ func restartPolicy(value string) container.RestartPolicyMode {
 }
 
 func envList(values []models.EnvVar) []string {
-	out := make([]string, 0, len(values))
+	byName := make(map[string]string, len(values))
 	for _, item := range values {
 		name := strings.TrimSpace(item.Name)
 		if name == "" {
 			continue
 		}
-		out = append(out, name+"="+item.Value)
+		byName[name] = item.Value
+	}
+	names := make([]string, 0, len(byName))
+	for name := range byName {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	out := make([]string, 0, len(names))
+	for _, name := range names {
+		out = append(out, name+"="+byName[name])
 	}
 	return out
 }

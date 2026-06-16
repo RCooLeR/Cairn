@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -701,7 +702,7 @@ func TestClientRunImageRenameAndCreateObjects(t *testing.T) {
 		ImageRef:      "example/web:latest",
 		Name:          "new-web",
 		Ports:         []models.PortMapping{{HostPort: "0", ContainerPort: "80", Protocol: "tcp"}},
-		Env:           []models.EnvVar{{Name: "MODE", Value: "test"}},
+		Env:           []models.EnvVar{{Name: "MODE", Value: "dev"}, {Name: " ZED ", Value: "last"}, {Name: "MODE", Value: "test"}, {Name: "", Value: "ignored"}},
 		Volumes:       []models.MountSpec{{Type: "volume", VolumeName: "demo_data", Target: "/data", ReadOnly: true}},
 		NetworkID:     "demo_default",
 		RestartPolicy: "unless-stopped",
@@ -722,7 +723,7 @@ func TestClientRunImageRenameAndCreateObjects(t *testing.T) {
 	if call.Name != "new-web" || call.Config.Image != "example/web:latest" || call.Config.User != "1000" {
 		t.Fatalf("create call config = %#v", call)
 	}
-	if got := call.Config.Env; len(got) != 1 || got[0] != "MODE=test" {
+	if got, want := call.Config.Env, []string{"MODE=test", "ZED=last"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("env = %#v", got)
 	}
 	if got := call.HostConfig.RestartPolicy.Name; got != container.RestartPolicyUnlessStopped {

@@ -71,6 +71,10 @@ const runtimeMock = vi.hoisted(() => ({
 }));
 
 const dockerServiceMock = vi.hoisted(() => ({
+  ListContainers: vi.fn(),
+  ListImages: vi.fn(),
+  ListNetworks: vi.fn(),
+  ListVolumes: vi.fn(),
   InspectContainerRaw: vi.fn(),
   GetImage: vi.fn(),
   GetNetwork: vi.fn(),
@@ -288,6 +292,12 @@ describe("App inventory shell", () => {
       version: "0.1.0",
       goVersion: "go1.26.4",
     });
+    dockerServiceMock.ListContainers.mockResolvedValue(
+      seededSnapshot().containers,
+    );
+    dockerServiceMock.ListImages.mockResolvedValue(seededSnapshot().images);
+    dockerServiceMock.ListNetworks.mockResolvedValue(seededSnapshot().networks);
+    dockerServiceMock.ListVolumes.mockResolvedValue(seededSnapshot().volumes);
     dockerServiceMock.InspectContainerRaw.mockResolvedValue(
       '{"Id":"container-1"}',
     );
@@ -1927,6 +1937,9 @@ describe("App inventory shell", () => {
         "plan-wsl-install",
       ),
     );
+    const welcomeStep = within(dialog).getByRole("button", { name: /Welcome/ });
+    expect(welcomeStep).toHaveAttribute("aria-disabled", "true");
+    expect(welcomeStep).not.toBeDisabled();
     emitRuntimeEvent("provider:install:progress", {
       planID: "plan-wsl-install",
       streamID: "setup-stream",
@@ -2605,6 +2618,33 @@ describe("App inventory shell", () => {
     });
 
     expect(inventoryMock.getInventorySnapshot).toHaveBeenCalledTimes(2);
+  });
+
+  it("uses object event kinds to refresh only the changed inventory slice", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    expect(inventoryMock.getInventorySnapshot).toHaveBeenCalledTimes(1);
+    vi.useFakeTimers();
+
+    const callback = runtimeMock.on.mock.calls.find(
+      ([name]) => name === "objects:changed",
+    )?.[1] as (event?: unknown) => void;
+
+    act(() => {
+      callback({
+        name: "objects:changed",
+        data: { kind: "image", ids: ["image-nginx"] },
+      });
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+
+    expect(dockerServiceMock.ListImages).toHaveBeenCalled();
+    expect(inventoryMock.getInventorySnapshot).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -3350,7 +3390,7 @@ function restorePlan(): CommandPlan {
       {
         order: 1,
         command:
-          "docker run --rm -v cairn_data:/restore -v /tmp/cairn-backups:/backup:ro alpine:3 sh -c 'set -eu; archive=$1; stash=/restore/.cairn-restore-old-$$; mkdir \"$stash\"; move existing contents to stash; tar xzf \"$archive\" -C /restore || rollback stash' cairn-restore /backup/cairn_data-20260613T080000Z.tar.gz",
+          'docker run --rm -v cairn_data:/restore -v /tmp/cairn-backups:/backup:ro alpine:3 sh -c \'set -eu; archive=$1; stash=/restore/.cairn-restore-old-$$; mkdir "$stash"; move existing contents to stash; tar xzf "$archive" -C /restore || rollback stash\' cairn-restore /backup/cairn_data-20260613T080000Z.tar.gz',
         risk: Risk.RiskDangerous,
         explanation:
           "Moves existing contents aside, restores files from the selected archive, and rolls back the original contents if extraction fails.",

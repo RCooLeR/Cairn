@@ -47,8 +47,11 @@ func New(code Code, message string, opts ...Option) *AppError {
 }
 
 func Wrap(code Code, message string, cause error, opts ...Option) *AppError {
-	all := append([]Option{WithCause(cause)}, opts...)
-	return New(code, message, all...)
+	err := &AppError{Code: code, Message: message, Cause: cause}
+	for _, opt := range opts {
+		opt(err)
+	}
+	return err
 }
 
 func WithDetail(detail string) Option {

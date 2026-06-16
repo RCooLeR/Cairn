@@ -635,7 +635,7 @@ func (r UpdateCheckRecord) ToModel() models.ImageUpdate {
 	return models.ImageUpdate{
 		ID:                r.ID,
 		ProjectID:         r.ProjectID,
-		Service:           serviceNameFromID(r.ServiceID),
+		Service:           serviceNameFromID(r.ServiceID, r.ProjectID),
 		ContainerID:       r.ContainerID,
 		Kind:              r.Kind,
 		Status:            r.Status,
@@ -654,7 +654,7 @@ func (r UpdateHistoryRecord) ToModel() models.UpdateHistoryItem {
 	return models.UpdateHistoryItem{
 		ID:             r.ID,
 		ProjectID:      r.ProjectID,
-		Service:        serviceNameFromID(r.ServiceID),
+		Service:        serviceNameFromID(r.ServiceID, r.ProjectID),
 		Kind:           r.UpdateKind,
 		Result:         r.Result,
 		StartedAt:      r.StartedAt,
@@ -709,10 +709,16 @@ func ignoreRuleMatches(rule IgnoredUpdateRecord, check UpdateCheckRecord) bool {
 	return true
 }
 
-func serviceNameFromID(serviceID string) string {
+func serviceNameFromID(serviceID string, projectID string) string {
 	serviceID = strings.TrimSpace(serviceID)
 	if serviceID == "" {
 		return ""
+	}
+	projectID = strings.TrimSpace(projectID)
+	if projectID != "" {
+		if service, ok := strings.CutPrefix(serviceID, projectID+"/"); ok {
+			return service
+		}
 	}
 	if idx := strings.LastIndex(serviceID, "/"); idx >= 0 && idx < len(serviceID)-1 {
 		return serviceID[idx+1:]

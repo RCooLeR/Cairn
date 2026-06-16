@@ -182,3 +182,21 @@ func TestUpdateRepositoryBadgesByProjectIDs(t *testing.T) {
 		t.Fatal("empty project should be present with zero badges")
 	}
 }
+
+func TestUpdateRecordsKeepServiceNameSuffixAfterProjectPrefix(t *testing.T) {
+	t.Parallel()
+	check := UpdateCheckRecord{
+		ProjectID: "linux_native/demo",
+		ServiceID: "linux_native/demo/api/v1",
+	}
+	if got := check.ToModel().Service; got != "api/v1" {
+		t.Fatalf("check service = %q, want api/v1", got)
+	}
+	history := UpdateHistoryRecord{
+		ProjectID: "linux_native/demo",
+		ServiceID: "linux_native/demo/api/v1",
+	}
+	if got := history.ToModel().Service; got != "api/v1" {
+		t.Fatalf("history service = %q, want api/v1", got)
+	}
+}

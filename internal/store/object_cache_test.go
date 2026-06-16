@@ -84,6 +84,68 @@ func TestObjectCacheRepositoryUpsertAndDeleteStale(t *testing.T) {
 	}
 }
 
+func TestObjectCacheRepositorySnapshotsPruneMissingObjects(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db, err := Open(ctx, t.TempDir()+"/cairn.db")
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+
+	repo := db.Objects()
+	seen := time.Date(2026, 6, 16, 12, 0, 0, 0, time.UTC)
+	if err := repo.SaveImages(ctx, "linux_native", []ImageCacheRecord{
+		{Summary: models.ImageSummary{ID: "image-a", RepoTags: []string{"app:a"}}},
+		{Summary: models.ImageSummary{ID: "image-b", RepoTags: []string{"app:b"}}},
+	}, seen); err != nil {
+		t.Fatalf("SaveImages() error = %v", err)
+	}
+	if err := repo.SaveVolumes(ctx, "linux_native", []VolumeCacheRecord{
+		{Summary: models.VolumeSummary{Name: "volume-a"}},
+		{Summary: models.VolumeSummary{Name: "volume-b"}},
+	}, seen); err != nil {
+		t.Fatalf("SaveVolumes() error = %v", err)
+	}
+	if err := repo.SaveNetworks(ctx, "linux_native", []NetworkCacheRecord{
+		{Summary: models.NetworkSummary{ID: "network-a", Name: "net-a"}},
+		{Summary: models.NetworkSummary{ID: "network-b", Name: "net-b"}},
+	}, seen); err != nil {
+		t.Fatalf("SaveNetworks() error = %v", err)
+	}
+
+	if err := repo.SaveImagesSnapshot(ctx, "linux_native", []ImageCacheRecord{
+		{Summary: models.ImageSummary{ID: "image-b", RepoTags: []string{"app:b"}}},
+	}, seen.Add(time.Minute)); err != nil {
+		t.Fatalf("SaveImagesSnapshot() error = %v", err)
+	}
+	if err := repo.SaveVolumesSnapshot(ctx, "linux_native", []VolumeCacheRecord{
+		{Summary: models.VolumeSummary{Name: "volume-b"}},
+	}, seen.Add(time.Minute)); err != nil {
+		t.Fatalf("SaveVolumesSnapshot() error = %v", err)
+	}
+	if err := repo.SaveNetworksSnapshot(ctx, "linux_native", []NetworkCacheRecord{
+		{Summary: models.NetworkSummary{ID: "network-b", Name: "net-b"}},
+	}, seen.Add(time.Minute)); err != nil {
+		t.Fatalf("SaveNetworksSnapshot() error = %v", err)
+	}
+
+	if got := countRows(t, ctx, db, "images_cache"); got != 1 {
+		t.Fatalf("images after snapshot = %d, want 1", got)
+	}
+	if got := countRows(t, ctx, db, "volumes_cache"); got != 1 {
+		t.Fatalf("volumes after snapshot = %d, want 1", got)
+	}
+	if got := countRows(t, ctx, db, "networks_cache"); got != 1 {
+		t.Fatalf("networks after snapshot = %d, want 1", got)
+	}
+}
+
 func countRows(t *testing.T, ctx context.Context, db *Store, table string) int {
 	t.Helper()
 	var count int

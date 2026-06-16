@@ -3,6 +3,7 @@ package shell
 import (
 	"context"
 	"io/fs"
+	"log/slog"
 	"runtime"
 	"strings"
 	"sync"
@@ -25,7 +26,10 @@ const (
 // Run owns all Wails-specific bootstrapping so the domain core stays free of
 // Wails imports, as required by the architecture spec.
 func Run(assets fs.FS) error {
-	icon, _ := fs.ReadFile(assets, "assets/cairn-icon.png")
+	icon, err := fs.ReadFile(assets, "assets/cairn-icon.png")
+	if err != nil {
+		slog.Warn("failed to read application icon", "error", err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	eventBus := bus.New()
 
@@ -197,7 +201,7 @@ func defaultProviderSet() []providers.PlatformProvider {
 	case "darwin":
 		return []providers.PlatformProvider{providers.NewMacOSColima(providers.MacOSColimaOptions{})}
 	}
-	return nil
+	return []providers.PlatformProvider{providers.NewExistingContext(providers.ExistingContextOptions{ContextName: "default"})}
 }
 
 func backendContextName(ctx context.Context, provider providers.PlatformProvider) string {

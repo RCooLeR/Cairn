@@ -800,8 +800,11 @@ func TestExecutorHelperBranches(t *testing.T) {
 	if strings.Join(services, ",") != "b,a,z" {
 		t.Fatalf("sorted services = %#v", services)
 	}
-	if got := serviceNameFromID("plain"); got != "plain" {
+	if got := serviceNameFromID("plain", ""); got != "plain" {
 		t.Fatalf("serviceNameFromID plain = %q", got)
+	}
+	if got := serviceNameFromID("linux_native/demo/api/v1", "linux_native/demo"); got != "api/v1" {
+		t.Fatalf("serviceNameFromID project-prefixed = %q, want api/v1", got)
 	}
 	if got := metadataStringMap(map[string]any{"buildArgs": map[string]string{"A": "B"}}, "buildArgs"); got["A"] != "B" {
 		t.Fatalf("metadataStringMap string map = %#v", got)

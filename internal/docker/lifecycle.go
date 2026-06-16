@@ -98,6 +98,7 @@ func (c *Client) RemoveContainer(ctx context.Context, id string, opts models.Rem
 
 func stopOptions(timeoutSeconds int) container.StopOptions {
 	if timeoutSeconds <= 0 {
+		// Docker interprets nil Timeout as "use the daemon default" (usually 10s).
 		return container.StopOptions{}
 	}
 	return container.StopOptions{Timeout: &timeoutSeconds}

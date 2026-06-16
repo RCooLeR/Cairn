@@ -362,11 +362,11 @@ func TestDockerServiceLifecycleAuditsAndPlans(t *testing.T) {
 	}
 }
 
-func TestNotReadyReturnsIndependentProviderError(t *testing.T) {
+func TestNotReadyReturnsCachedProviderError(t *testing.T) {
 	first := notReady()
 	second := notReady()
-	if first == second {
-		t.Fatal("notReady() returned the same error instance")
+	if first != second {
+		t.Fatal("notReady() returned different error instances")
 	}
 	if !apperror.IsCode(first, apperror.ProviderNotReady) {
 		t.Fatalf("notReady() code = %v, want provider not ready", first)
@@ -375,9 +375,28 @@ func TestNotReadyReturnsIndependentProviderError(t *testing.T) {
 	if !ok {
 		t.Fatalf("notReady() type = %T, want *AppError", first)
 	}
-	appErr.RepairHints[0] = "mutated"
-	if second.(*apperror.AppError).RepairHints[0] == "mutated" {
-		t.Fatal("notReady() repair hints share backing storage")
+	if len(appErr.RepairHints) == 0 {
+		t.Fatal("notReady() missing repair hint")
+	}
+}
+
+func TestProjectActionTitleHandlesEmptyAndUnicodeActions(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		action string
+		want   string
+	}{
+		{"", "Run demo"},
+		{"запуск", "Запуск demo"},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.action, func(t *testing.T) {
+			t.Parallel()
+			if got := projectActionTitle(tt.action, "demo", false); got != tt.want {
+				t.Fatalf("projectActionTitle() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 

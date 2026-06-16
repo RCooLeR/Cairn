@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/backups"
@@ -147,16 +149,14 @@ type SettingsService struct {
 	Settings      *store.SettingsRepository
 }
 
-var notReadyTemplate = apperror.AppError{
-	Code:        apperror.ProviderNotReady,
-	Message:     "Provider is not ready",
-	RepairHints: []string{"Connect a Docker provider from onboarding."},
-}
+var notReadyErr = apperror.New(
+	apperror.ProviderNotReady,
+	"Provider is not ready",
+	apperror.WithRepairHints("Connect a Docker provider from onboarding."),
+)
 
 func notReady() error {
-	err := notReadyTemplate
-	err.RepairHints = append([]string(nil), notReadyTemplate.RepairHints...)
-	return &err
+	return notReadyErr
 }
 
 func lockRuntime(mu *sync.RWMutex) func() {
@@ -1315,8 +1315,19 @@ func projectActionTitle(action string, name string, removeVolumes bool) string {
 		}
 		return "Down " + name
 	default:
-		return strings.ToUpper(action[:1]) + action[1:] + " " + name
+		return titleAction(action) + " " + name
 	}
+}
+
+func titleAction(action string) string {
+	if action == "" {
+		return "Run"
+	}
+	first, size := utf8.DecodeRuneInString(action)
+	if first == utf8.RuneError && size == 0 {
+		return action
+	}
+	return string(unicode.ToTitle(first)) + action[size:]
 }
 
 func projectActionExplanation(action string, removeVolumes bool) string {

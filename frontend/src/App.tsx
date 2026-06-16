@@ -1039,6 +1039,12 @@ function App() {
   const volumeDetails = useInventoryStore((state) => state.volumeDetails);
   const networkDetails = useInventoryStore((state) => state.networkDetails);
   const refreshInventory = useInventoryStore((state) => state.refresh);
+  const refreshContainers = useInventoryStore(
+    (state) => state.refreshContainers,
+  );
+  const refreshImages = useInventoryStore((state) => state.refreshImages);
+  const refreshVolumes = useInventoryStore((state) => state.refreshVolumes);
+  const refreshNetworks = useInventoryStore((state) => state.refreshNetworks);
 
   const [activePage, setActivePage] = useState<PageID>("overview");
   const [dashboardRefreshToken, setDashboardRefreshToken] = useState(0);
@@ -1688,27 +1694,31 @@ function App() {
         return;
       }
 
-      void refreshInventory();
       setDashboardRefreshToken((current) => current + 1);
       switch (kind) {
         case "container":
+          void refreshContainers();
           void refreshProjects();
           if (activeProjectID) {
             void refreshProjectDetail(activeProjectID);
           }
           break;
         case "image":
+          void refreshImages();
           void refreshUpdateSurfaces();
           if (activeProjectID) {
             void refreshProjectLineage(activeProjectID);
           }
           break;
         case "volume":
+          void refreshVolumes();
           void refreshBackups();
           break;
         case "network":
+          void refreshNetworks();
           break;
         case "project":
+          void refreshInventory();
           void refreshProjects();
           void refreshUpdateSurfaces();
           if (
@@ -1726,12 +1736,16 @@ function App() {
     [
       activeProjectID,
       refreshBackups,
+      refreshContainers,
+      refreshImages,
       refreshInventory,
+      refreshNetworks,
       refreshProjectDetail,
       refreshProjectLineage,
       refreshProjects,
       refreshRuntimeSurfaces,
       refreshUpdateSurfaces,
+      refreshVolumes,
     ],
   );
 
@@ -5306,15 +5320,20 @@ function ProviderSetupModal({
         <div className="flex flex-wrap gap-2">
           {setupSteps.map((step, index) => (
             <button
+              aria-disabled={setup.installing}
               className={[
                 "flex h-8 items-center gap-2 rounded-control border px-3 text-xs font-medium",
                 setup.step === step
                   ? "border-accent/40 bg-accent/10 text-accent"
                   : "border-border bg-bg-inset text-text-muted",
+                setup.installing ? "cursor-not-allowed opacity-70" : "",
               ].join(" ")}
-              disabled={setup.installing}
               key={step}
-              onClick={() => onStep(step)}
+              onClick={() => {
+                if (!setup.installing) {
+                  onStep(step);
+                }
+              }}
               type="button"
             >
               <span>{index + 1}</span>

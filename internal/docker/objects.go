@@ -122,7 +122,7 @@ func (c *Client) ListImages(ctx context.Context) ([]models.ImageSummary, error) 
 		})
 	}
 	sortImageSummaries(summaries)
-	if err := c.saveImages(ctx, records); err != nil {
+	if err := c.saveImages(ctx, records, true); err != nil {
 		return nil, err
 	}
 	return summaries, nil
@@ -147,7 +147,7 @@ func (c *Client) GetImage(ctx context.Context, id string) (*models.ImageDetail, 
 		Summary:  detail.Summary,
 		UsedBy:   users,
 		Dangling: imageDangling(detail.Summary.RepoTags),
-	}}); err != nil {
+	}}, false); err != nil {
 		return nil, err
 	}
 	return detail, nil
@@ -192,7 +192,7 @@ func (c *Client) ListVolumes(ctx context.Context) ([]models.VolumeSummary, error
 		})
 	}
 	sortVolumeSummaries(summaries)
-	if err := c.saveVolumes(ctx, records); err != nil {
+	if err := c.saveVolumes(ctx, records, true); err != nil {
 		return nil, err
 	}
 	return summaries, nil
@@ -217,7 +217,7 @@ func (c *Client) GetVolume(ctx context.Context, name string) (*models.VolumeDeta
 		Summary:   detail.Summary,
 		UsedBy:    usedBy,
 		CreatedAt: volumeCreatedAt(raw),
-	}}); err != nil {
+	}}, false); err != nil {
 		return nil, err
 	}
 	return detail, nil
@@ -250,7 +250,7 @@ func (c *Client) ListNetworks(ctx context.Context) ([]models.NetworkSummary, err
 		})
 	}
 	sortNetworkSummaries(summaries)
-	if err := c.saveNetworks(ctx, records); err != nil {
+	if err := c.saveNetworks(ctx, records, true); err != nil {
 		return nil, err
 	}
 	return summaries, nil
@@ -275,7 +275,7 @@ func (c *Client) GetNetwork(ctx context.Context, id string) (*models.NetworkDeta
 		Subnet:     detail.Subnet,
 		Gateway:    detail.Gateway,
 		Containers: containerIDs(containers),
-	}}); err != nil {
+	}}, false); err != nil {
 		return nil, err
 	}
 	return detail, nil
@@ -700,25 +700,43 @@ func isContainerInventorySnapshot(opts models.ContainerListOptions) bool {
 	return opts.All && opts.ProjectID == "" && opts.Service == "" && len(opts.Filters) == 0
 }
 
-func (c *Client) saveImages(ctx context.Context, records []store.ImageCacheRecord) error {
+func (c *Client) saveImages(ctx context.Context, records []store.ImageCacheRecord, replace bool) error {
 	cache := c.objectCache()
-	if cache == nil || len(records) == 0 {
+	if cache == nil {
+		return nil
+	}
+	if replace {
+		return cache.SaveImagesSnapshot(ctx, c.providerID(), records, c.now())
+	}
+	if len(records) == 0 {
 		return nil
 	}
 	return cache.SaveImages(ctx, c.providerID(), records, c.now())
 }
 
-func (c *Client) saveVolumes(ctx context.Context, records []store.VolumeCacheRecord) error {
+func (c *Client) saveVolumes(ctx context.Context, records []store.VolumeCacheRecord, replace bool) error {
 	cache := c.objectCache()
-	if cache == nil || len(records) == 0 {
+	if cache == nil {
+		return nil
+	}
+	if replace {
+		return cache.SaveVolumesSnapshot(ctx, c.providerID(), records, c.now())
+	}
+	if len(records) == 0 {
 		return nil
 	}
 	return cache.SaveVolumes(ctx, c.providerID(), records, c.now())
 }
 
-func (c *Client) saveNetworks(ctx context.Context, records []store.NetworkCacheRecord) error {
+func (c *Client) saveNetworks(ctx context.Context, records []store.NetworkCacheRecord, replace bool) error {
 	cache := c.objectCache()
-	if cache == nil || len(records) == 0 {
+	if cache == nil {
+		return nil
+	}
+	if replace {
+		return cache.SaveNetworksSnapshot(ctx, c.providerID(), records, c.now())
+	}
+	if len(records) == 0 {
 		return nil
 	}
 	return cache.SaveNetworks(ctx, c.providerID(), records, c.now())

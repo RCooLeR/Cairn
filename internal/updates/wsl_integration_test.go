@@ -163,7 +163,7 @@ func TestManagerRealWSLUpdateAndRebuildSmoke(t *testing.T) {
 	}
 	currentByService := map[string]store.UpdateCheckRecord{}
 	for _, check := range currentChecks {
-		currentByService[serviceNameFromID(check.ServiceID)] = check
+		currentByService[serviceNameFromID(check.ServiceID, check.ProjectID)] = check
 	}
 	if currentByService["web"].LocalImageID != oldWebImageID {
 		t.Fatalf("web check local image = %q, want %q", currentByService["web"].LocalImageID, oldWebImageID)
@@ -227,7 +227,7 @@ func TestManagerRealWSLUpdateAndRebuildSmoke(t *testing.T) {
 		if err != nil {
 			t.Fatalf("GetHistory(%d) error = %v", item.ID, err)
 		}
-		byService[serviceNameFromID(full.ServiceID)] = full
+		byService[serviceNameFromID(full.ServiceID, full.ProjectID)] = full
 	}
 	assertWSLUpdateHistory(t, byService["web"], models.UpdateKindServiceImage, updateResultSuccessWarn, oldWebImageID, newWebImageID)
 	assertWSLUpdateHistory(t, byService["builder"], models.UpdateKindBaseImage, updateResultSuccessWarn, oldBuilderImageID, newBuilderImageID)

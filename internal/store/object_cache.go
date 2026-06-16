@@ -209,6 +209,14 @@ func normalizeCachedContainerState(status string) string {
 }
 
 func (r *ObjectCacheRepository) SaveImages(ctx context.Context, providerID string, records []ImageCacheRecord, seenAt time.Time) error {
+	return r.saveImages(ctx, providerID, records, seenAt, false)
+}
+
+func (r *ObjectCacheRepository) SaveImagesSnapshot(ctx context.Context, providerID string, records []ImageCacheRecord, seenAt time.Time) error {
+	return r.saveImages(ctx, providerID, records, seenAt, true)
+}
+
+func (r *ObjectCacheRepository) saveImages(ctx context.Context, providerID string, records []ImageCacheRecord, seenAt time.Time, replace bool) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -216,6 +224,12 @@ func (r *ObjectCacheRepository) SaveImages(ctx context.Context, providerID strin
 	defer func() {
 		_ = tx.Rollback()
 	}()
+
+	if replace {
+		if _, err := tx.ExecContext(ctx, "DELETE FROM images_cache WHERE provider_id = ?", providerID); err != nil {
+			return err
+		}
+	}
 
 	for _, record := range records {
 		summary := record.Summary
@@ -249,6 +263,14 @@ func (r *ObjectCacheRepository) SaveImages(ctx context.Context, providerID strin
 }
 
 func (r *ObjectCacheRepository) SaveVolumes(ctx context.Context, providerID string, records []VolumeCacheRecord, seenAt time.Time) error {
+	return r.saveVolumes(ctx, providerID, records, seenAt, false)
+}
+
+func (r *ObjectCacheRepository) SaveVolumesSnapshot(ctx context.Context, providerID string, records []VolumeCacheRecord, seenAt time.Time) error {
+	return r.saveVolumes(ctx, providerID, records, seenAt, true)
+}
+
+func (r *ObjectCacheRepository) saveVolumes(ctx context.Context, providerID string, records []VolumeCacheRecord, seenAt time.Time, replace bool) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -256,6 +278,12 @@ func (r *ObjectCacheRepository) SaveVolumes(ctx context.Context, providerID stri
 	defer func() {
 		_ = tx.Rollback()
 	}()
+
+	if replace {
+		if _, err := tx.ExecContext(ctx, "DELETE FROM volumes_cache WHERE provider_id = ?", providerID); err != nil {
+			return err
+		}
+	}
 
 	for _, record := range records {
 		summary := record.Summary
@@ -283,6 +311,14 @@ func (r *ObjectCacheRepository) SaveVolumes(ctx context.Context, providerID stri
 }
 
 func (r *ObjectCacheRepository) SaveNetworks(ctx context.Context, providerID string, records []NetworkCacheRecord, seenAt time.Time) error {
+	return r.saveNetworks(ctx, providerID, records, seenAt, false)
+}
+
+func (r *ObjectCacheRepository) SaveNetworksSnapshot(ctx context.Context, providerID string, records []NetworkCacheRecord, seenAt time.Time) error {
+	return r.saveNetworks(ctx, providerID, records, seenAt, true)
+}
+
+func (r *ObjectCacheRepository) saveNetworks(ctx context.Context, providerID string, records []NetworkCacheRecord, seenAt time.Time, replace bool) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -290,6 +326,12 @@ func (r *ObjectCacheRepository) SaveNetworks(ctx context.Context, providerID str
 	defer func() {
 		_ = tx.Rollback()
 	}()
+
+	if replace {
+		if _, err := tx.ExecContext(ctx, "DELETE FROM networks_cache WHERE provider_id = ?", providerID); err != nil {
+			return err
+		}
+	}
 
 	for _, record := range records {
 		summary := record.Summary

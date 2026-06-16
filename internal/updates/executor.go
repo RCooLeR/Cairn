@@ -564,7 +564,7 @@ func (m *Manager) rollbackSnapshots(ctx context.Context, jobID string, record up
 	rolled := map[string]bool{}
 	for i := range histories {
 		history := histories[i]
-		service := serviceNameFromID(history.ServiceID)
+		service := serviceNameFromID(history.ServiceID, history.ProjectID)
 		if rolled[service] {
 			continue
 		}
@@ -582,7 +582,7 @@ func (m *Manager) runManualRollback(ctx context.Context, jobID string, project s
 	started := m.now()
 	command := rollbackCommand(project, history)
 	_ = m.recordAudit(ctx, "update.rollback", "project", project.ID, project.ProviderID, project.ID, command, models.RiskNeedsConfirmation, "started", 0, nil)
-	m.publishJobProgress(jobID, "rollback", "Rolling back "+serviceNameFromID(history.ServiceID), nil)
+	m.publishJobProgress(jobID, "rollback", "Rolling back "+serviceNameFromID(history.ServiceID, history.ProjectID), nil)
 	err := m.rollbackHistory(ctx, project, history)
 	result := updateResultRolledBack
 	status := rollbackStatusRolledBack
@@ -619,7 +619,7 @@ func (m *Manager) rollbackHistory(ctx context.Context, project store.ProjectReco
 	noBuild := history.UpdateKind == models.UpdateKindBaseImage
 	result, err := m.Compose.UpServices(ctx, composeOptionsFromProject(project), composecore.UpOptions{
 		NoBuild:  noBuild,
-		Services: []string{serviceNameFromID(history.ServiceID)},
+		Services: []string{serviceNameFromID(history.ServiceID, history.ProjectID)},
 	})
 	m.publishComposeOutput("", result)
 	return err
@@ -635,7 +635,7 @@ func (m *Manager) finishUpdateJob(ctx context.Context, jobID string, record upda
 			FinishedAt:     m.now(),
 			Error:          errorString(actionErr),
 		}
-		newImageID, newDigest := m.currentServiceImage(ctx, record.Project.ID, serviceNameFromID(history.ServiceID), history.ImageRef)
+		newImageID, newDigest := m.currentServiceImage(ctx, record.Project.ID, serviceNameFromID(history.ServiceID, history.ProjectID), history.ImageRef)
 		finish.NewImageID = newImageID
 		finish.NewDigest = newDigest
 		if history.UpdateKind == models.UpdateKindBaseImage {
@@ -863,7 +863,7 @@ func rollbackCommand(project store.ProjectRecord, history store.UpdateHistoryRec
 	if history.UpdateKind == models.UpdateKindBaseImage {
 		args = append(args, "--no-build")
 	}
-	args = append(args, serviceNameFromID(history.ServiceID))
+	args = append(args, serviceNameFromID(history.ServiceID, history.ProjectID))
 	return "docker tag " + shellJoin([]string{history.OldImageID, history.ImageRef}) + " && " + composeCommandDisplay(project, args...)
 }
 
@@ -913,13 +913,19 @@ func warningForCheck(check store.UpdateCheckRecord) string {
 }
 
 func recordServiceName(check store.UpdateCheckRecord) string {
-	return serviceNameFromID(check.ServiceID)
+	return serviceNameFromID(check.ServiceID, check.ProjectID)
 }
 
-func serviceNameFromID(serviceID string) string {
+func serviceNameFromID(serviceID string, projectID string) string {
 	serviceID = strings.TrimSpace(serviceID)
 	if serviceID == "" {
 		return ""
+	}
+	projectID = strings.TrimSpace(projectID)
+	if projectID != "" {
+		if service, ok := strings.CutPrefix(serviceID, projectID+"/"); ok {
+			return service
+		}
 	}
 	if idx := strings.LastIndex(serviceID, "/"); idx >= 0 && idx < len(serviceID)-1 {
 		return serviceID[idx+1:]
