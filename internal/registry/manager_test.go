@@ -143,6 +143,66 @@ func TestEncodeDockerAuthConfigUsesCredentialHelper(t *testing.T) {
 	}
 }
 
+func TestEncodeDockerAuthConfigHandlesBadDockerConfigJSON(t *testing.T) {
+	t.Parallel()
+	provider := &fakeRegistryProvider{
+		backendResults: map[string]string{
+			`sh -lc cat "${DOCKER_CONFIG:-$HOME/.docker}/config.json" 2>/dev/null || true`: `{bad`,
+		},
+	}
+
+	_, err := EncodeDockerAuthConfig(context.Background(), provider, "ghcr.io")
+	if !apperror.IsCode(err, apperror.Internal) {
+		t.Fatalf("EncodeDockerAuthConfig() error = %v, want internal parse error", err)
+	}
+}
+
+func TestEncodeDockerAuthConfigIgnoresBadCredentialHelperJSON(t *testing.T) {
+	t.Parallel()
+	config := `{"auths":{"ghcr.io":{}},"credHelpers":{"ghcr.io":"gh"}}`
+	provider := &fakeRegistryProvider{
+		backendResults: map[string]string{
+			`sh -lc cat "${DOCKER_CONFIG:-$HOME/.docker}/config.json" 2>/dev/null || true`: config,
+			"docker-credential-gh get": `{bad`,
+		},
+	}
+
+	encoded, err := EncodeDockerAuthConfig(context.Background(), provider, "ghcr.io")
+	if err != nil {
+		t.Fatalf("EncodeDockerAuthConfig() error = %v", err)
+	}
+	if encoded != "" {
+		t.Fatalf("encoded auth = %q, want empty", encoded)
+	}
+}
+
+func TestParseWWWAuthenticateMalformedChallenges(t *testing.T) {
+	t.Parallel()
+
+	empty := parseWWWAuthenticate("")
+	if empty.Scheme != "" || len(empty.Params) != 0 {
+		t.Fatalf("empty challenge = %#v", empty)
+	}
+
+	basic := parseWWWAuthenticate("Basic")
+	if basic.Scheme != "Basic" || len(basic.Params) != 0 {
+		t.Fatalf("basic challenge = %#v", basic)
+	}
+
+	bearer := parseWWWAuthenticate(`Bearer realm="https://registry.example/token",broken,service=registry.example,scope="repository:library/nginx:pull"`)
+	if bearer.Scheme != "Bearer" {
+		t.Fatalf("bearer scheme = %q", bearer.Scheme)
+	}
+	if bearer.Params["realm"] != "https://registry.example/token" ||
+		bearer.Params["service"] != "registry.example" ||
+		bearer.Params["scope"] != "repository:library/nginx:pull" {
+		t.Fatalf("bearer params = %#v", bearer.Params)
+	}
+	if _, ok := bearer.Params["broken"]; ok {
+		t.Fatalf("malformed param was preserved: %#v", bearer.Params)
+	}
+}
+
 func TestLoginPipesSecretThroughStdin(t *testing.T) {
 	var registryHost string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

@@ -779,6 +779,83 @@ func TestClientRunImageRenameAndCreateObjects(t *testing.T) {
 	}
 }
 
+func TestProgressReaderWriterEmitFinalSmallTransfers(t *testing.T) {
+	t.Parallel()
+
+	var writeEvents []int64
+	writer := &progressWriter{
+		every: 3,
+		onProgress: func(bytes int64) {
+			writeEvents = append(writeEvents, bytes)
+		},
+	}
+	if n, err := writer.Write([]byte("ab")); err != nil || n != 2 {
+		t.Fatalf("first Write() n=%d err=%v", n, err)
+	}
+	if len(writeEvents) != 0 {
+		t.Fatalf("write events after short write = %#v", writeEvents)
+	}
+	if n, err := writer.Write([]byte("cd")); err != nil || n != 2 {
+		t.Fatalf("second Write() n=%d err=%v", n, err)
+	}
+	if got, want := writeEvents, []int64{4}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("write events = %#v, want %#v", got, want)
+	}
+
+	type progressEvent struct {
+		bytes int64
+		pct   *float64
+	}
+	readEvents := []progressEvent{}
+	reader := &progressReader{
+		reader: strings.NewReader("abcd"),
+		total:  4,
+		every:  10,
+		onProgress: func(bytes int64, pct *float64) {
+			var pctCopy *float64
+			if pct != nil {
+				value := *pct
+				pctCopy = &value
+			}
+			readEvents = append(readEvents, progressEvent{bytes: bytes, pct: pctCopy})
+		},
+	}
+	buf := make([]byte, 8)
+	if n, err := reader.Read(buf); err != nil || n != 4 {
+		t.Fatalf("first Read() n=%d err=%v", n, err)
+	}
+	if len(readEvents) != 0 {
+		t.Fatalf("read events before EOF = %#v", readEvents)
+	}
+	if n, err := reader.Read(buf); !errors.Is(err, io.EOF) || n != 0 {
+		t.Fatalf("second Read() n=%d err=%v, want EOF", n, err)
+	}
+	if len(readEvents) != 1 || readEvents[0].bytes != 4 || readEvents[0].pct == nil || *readEvents[0].pct != 100 {
+		t.Fatalf("read events = %#v", readEvents)
+	}
+
+	readEvents = nil
+	reader = &progressReader{
+		reader: strings.NewReader("xy"),
+		every:  10,
+		onProgress: func(bytes int64, pct *float64) {
+			if pct != nil {
+				t.Fatalf("zero-total pct = %v, want nil", *pct)
+			}
+			readEvents = append(readEvents, progressEvent{bytes: bytes})
+		},
+	}
+	if n, err := reader.Read(buf); err != nil || n != 2 {
+		t.Fatalf("zero-total first Read() n=%d err=%v", n, err)
+	}
+	if n, err := reader.Read(buf); !errors.Is(err, io.EOF) || n != 0 {
+		t.Fatalf("zero-total second Read() n=%d err=%v, want EOF", n, err)
+	}
+	if len(readEvents) != 1 || readEvents[0].bytes != 2 || readEvents[0].pct != nil {
+		t.Fatalf("zero-total read events = %#v", readEvents)
+	}
+}
+
 func TestClientImagePullSaveLoadAndSearch(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

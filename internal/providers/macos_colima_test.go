@@ -30,6 +30,13 @@ func TestParseColimaStatusJSON(t *testing.T) {
 	}
 }
 
+func TestParseColimaStatusJSONRejectsMalformedJSON(t *testing.T) {
+	t.Parallel()
+	if _, err := parseColimaStatusJSON("{"); err == nil {
+		t.Fatalf("parseColimaStatusJSON() error = nil, want malformed JSON error")
+	}
+}
+
 func TestParseDockerContextListJSONLinesAndArray(t *testing.T) {
 	t.Parallel()
 	lines := `{"Name":"default","Description":"Default","DockerEndpoint":"unix:///var/run/docker.sock","Current":false}

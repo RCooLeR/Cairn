@@ -846,15 +846,21 @@ func (r *progressReader) Read(p []byte) (int, error) {
 	n, err := r.reader.Read(p)
 	if n > 0 {
 		r.read += int64(n)
-		if r.every <= 0 || r.read-r.last >= r.every || err == io.EOF {
-			r.last = r.read
-			var pct *float64
-			if r.total > 0 {
-				value := float64(r.read) / float64(r.total) * 100
-				pct = &value
-			}
-			r.onProgress(r.read, pct)
-		}
+	}
+	if n > 0 && (r.every <= 0 || r.read-r.last >= r.every || err == io.EOF) {
+		r.emitProgress()
+	} else if err == io.EOF && r.read != r.last {
+		r.emitProgress()
 	}
 	return n, err
+}
+
+func (r *progressReader) emitProgress() {
+	r.last = r.read
+	var pct *float64
+	if r.total > 0 {
+		value := float64(r.read) / float64(r.total) * 100
+		pct = &value
+	}
+	r.onProgress(r.read, pct)
 }
