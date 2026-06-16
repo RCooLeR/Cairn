@@ -12,7 +12,7 @@ fi
 
 if command -v gtk-update-icon-cache >/dev/null 2>&1; then
   echo "Updating icon cache..."
-  gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor || true
+  gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor
 else
   echo "Warning: gtk-update-icon-cache command not found. App icons may not be immediately recognized." >&2
 fi
