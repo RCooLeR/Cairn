@@ -376,6 +376,17 @@ func TestResolveDigestRateLimitOpensCircuit(t *testing.T) {
 	}
 }
 
+func TestRetryAfterFromErrorUsesTypedDuration(t *testing.T) {
+	err := retryAfterError{
+		error:      apperror.New(apperror.RegistryRateLimit, "Registry rate limit reached", apperror.WithDetail("retry-after=999h")),
+		retryAfter: 2 * time.Second,
+	}
+
+	if got := retryAfterFromError(err); got != 2*time.Second {
+		t.Fatalf("retryAfterFromError() = %s, want 2s", got)
+	}
+}
+
 type fakeResolver struct {
 	provider providers.PlatformProvider
 }

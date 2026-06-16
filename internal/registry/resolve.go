@@ -186,6 +186,10 @@ func statusError(resp *http.Response) error {
 		detail := resp.Status
 		if retry := retryAfter(resp.Header.Get("Retry-After")); retry > 0 {
 			detail += "; retry-after=" + retry.String()
+			return retryAfterError{
+				error:      apperror.New(apperror.RegistryRateLimit, "Registry rate limit reached", apperror.WithDetail(detail)),
+				retryAfter: retry,
+			}
 		}
 		return apperror.New(apperror.RegistryRateLimit, "Registry rate limit reached", apperror.WithDetail(detail))
 	case resp.StatusCode == http.StatusNotFound:
@@ -342,20 +346,26 @@ func retryAfterFromError(err error) time.Duration {
 	if err == nil || !apperror.IsCode(err, apperror.RegistryRateLimit) {
 		return 0
 	}
-	var appErr *apperror.AppError
-	if !errors.As(err, &appErr) || !strings.Contains(appErr.Detail, "retry-after=") {
-		return 0
+	var withRetryAfter interface {
+		RetryAfter() time.Duration
 	}
-	_, raw, _ := strings.Cut(appErr.Detail, "retry-after=")
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return 0
+	if errors.As(err, &withRetryAfter) {
+		return withRetryAfter.RetryAfter()
 	}
-	duration, parseErr := time.ParseDuration(raw)
-	if parseErr != nil {
-		return 0
-	}
-	return duration
+	return 0
+}
+
+type retryAfterError struct {
+	error
+	retryAfter time.Duration
+}
+
+func (e retryAfterError) Unwrap() error {
+	return e.error
+}
+
+func (e retryAfterError) RetryAfter() time.Duration {
+	return e.retryAfter
 }
 
 func retryAfter(header string) time.Duration {
