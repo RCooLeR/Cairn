@@ -259,7 +259,6 @@ func (m *Manager) watchContainer(ctx context.Context, containerID string) {
 				return
 			}
 			failures++
-			fallbackSamples = 0
 			sleepContext(ctx, m.streamRetryDelay(containerID, failures))
 			continue
 		}

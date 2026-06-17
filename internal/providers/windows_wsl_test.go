@@ -453,7 +453,7 @@ func TestWindowsWSLPathMapping(t *testing.T) {
 	if _, err := provider.MapPathToBackend(`relative\path`); err == nil {
 		t.Fatalf("MapPathToBackend(relative) error = nil, want error")
 	}
-	if _, err := provider.MapPathToBackend(`\\wsl$\other\home\ada`); err == nil {
+	if _, err := provider.MapPathToBackend(`\\wsl$\debian\home\ada`); err == nil {
 		t.Fatalf("MapPathToBackend(other distro) error = nil, want error")
 	}
 }

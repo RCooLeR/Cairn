@@ -37,6 +37,7 @@ type BackendCommandRunner interface {
 type Manager struct {
 	Providers ProviderResolver
 	Audit     *store.AuditRepository
+	Settings  *store.SettingsRepository
 
 	HTTPClient          *http.Client
 	Now                 func() time.Time

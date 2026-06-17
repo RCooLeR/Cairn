@@ -348,6 +348,56 @@ func TestProjectRepositoryDeleteRemovesProjectAndServices(t *testing.T) {
 	}
 }
 
+func TestProjectRepositoryForgetSkipsDetectedSnapshotsUntilImported(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openStoreForProjectTest(t)
+	repo := db.Projects()
+	now := time.Date(2026, 6, 15, 11, 10, 0, 0, time.UTC)
+	project := ProjectRecord{
+		ID:          "windows_wsl_ubuntu/cairn-test-web",
+		ProviderID:  "windows_wsl_ubuntu",
+		ContextName: "wsl:cairn-dev",
+		Name:        "cairn-test-web",
+		Source:      ProjectSourceLabels,
+		LastSeenAt:  now,
+	}
+	service := ServiceRecord{
+		ID:         "windows_wsl_ubuntu/cairn-test-web/web",
+		ProjectID:  project.ID,
+		Name:       "web",
+		ImageRef:   "nginx",
+		LastSeenAt: now,
+	}
+
+	if err := repo.SaveSnapshot(ctx, project.ProviderID, []ProjectRecord{project}, []ServiceRecord{service}, now, time.Time{}); err != nil {
+		t.Fatalf("seed SaveSnapshot() error = %v", err)
+	}
+	if err := repo.Forget(ctx, project, now.Add(time.Minute)); err != nil {
+		t.Fatalf("Forget() error = %v", err)
+	}
+	if err := repo.Delete(ctx, project.ID); err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+	if err := repo.SaveSnapshot(ctx, project.ProviderID, []ProjectRecord{project}, []ServiceRecord{service}, now.Add(2*time.Minute), time.Time{}); err != nil {
+		t.Fatalf("forgotten SaveSnapshot() error = %v", err)
+	}
+	if _, err := repo.Get(ctx, project.ID); err == nil {
+		t.Fatal("forgotten detected project was saved again")
+	}
+
+	project.Source = ProjectSourceImported
+	if err := repo.Unforget(ctx, project.ProviderID, project.ContextName, project.Name, project.ID); err != nil {
+		t.Fatalf("Unforget() error = %v", err)
+	}
+	if err := repo.UpsertImported(ctx, project); err != nil {
+		t.Fatalf("UpsertImported() error = %v", err)
+	}
+	if _, err := repo.Get(ctx, project.ID); err != nil {
+		t.Fatalf("imported project was not restored: %v", err)
+	}
+}
+
 func openStoreForProjectTest(t *testing.T) *Store {
 	t.Helper()
 	ctx := context.Background()

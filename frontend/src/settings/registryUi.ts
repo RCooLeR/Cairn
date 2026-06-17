@@ -20,7 +20,7 @@ export function normalizeRegistryHostForUI(raw: string) {
 
 export function registryStorageLabel(account: RegistryAccount) {
   if (account.source === "authsFile") {
-    return "unencrypted config.json";
+    return "unencrypted Docker config.json";
   }
   if (account.source === "credHelper") {
     return "credential helper";

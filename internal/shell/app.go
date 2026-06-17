@@ -55,8 +55,8 @@ func Run(assets fs.FS) error {
 	objectPlans := security.NewDockerObjectPlanStore(nil)
 	providerPlans := security.NewProviderPlanStore(nil)
 	projectPlans := security.NewProjectPlanStore(nil)
-	var registryManager *registrycore.Manager
-	registryManager = registrycore.NewManager(providerManager, auditRepo)
+	registryManager := registrycore.NewManager(providerManager, auditRepo)
+	registryManager.Settings = db.Settings()
 	providerService := &services.ProviderService{Manager: providerManager, Events: eventBus, Audit: auditRepo, Plans: providerPlans}
 	runtimeMu := &sync.RWMutex{}
 	dockerService := &services.DockerService{Audit: auditRepo, Plans: containerPlans, ObjectPlans: objectPlans, RuntimeMu: runtimeMu}

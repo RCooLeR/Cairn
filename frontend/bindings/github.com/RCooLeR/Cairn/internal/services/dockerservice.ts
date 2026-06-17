@@ -75,27 +75,33 @@ export function KillContainer(id: string): $CancellablePromise<void> {
     return $Call.ByID(1539714983, id);
 }
 
+export function ListContainerFiles(id: string, path: string): $CancellablePromise<models$0.ContainerFileListing | null> {
+    return $Call.ByID(3831530022, id, path).then(($result: any) => {
+        return $$createType19($result);
+    });
+}
+
 export function ListContainers(opts: models$0.ContainerListOptions): $CancellablePromise<models$0.ContainerSummary[]> {
     return $Call.ByID(4209014116, opts).then(($result: any) => {
-        return $$createType19($result);
+        return $$createType21($result);
     });
 }
 
 export function ListImages(): $CancellablePromise<models$0.ImageSummary[]> {
     return $Call.ByID(54024818).then(($result: any) => {
-        return $$createType21($result);
+        return $$createType23($result);
     });
 }
 
 export function ListNetworks(): $CancellablePromise<models$0.NetworkSummary[]> {
     return $Call.ByID(3981221319).then(($result: any) => {
-        return $$createType22($result);
+        return $$createType24($result);
     });
 }
 
 export function ListVolumes(): $CancellablePromise<models$0.VolumeSummary[]> {
     return $Call.ByID(4113921307).then(($result: any) => {
-        return $$createType23($result);
+        return $$createType25($result);
     });
 }
 
@@ -109,37 +115,37 @@ export function Ping(): $CancellablePromise<void> {
 
 export function PlanKillContainer(id: string): $CancellablePromise<models$0.CommandPlan | null> {
     return $Call.ByID(795801790, id).then(($result: any) => {
-        return $$createType25($result);
+        return $$createType27($result);
     });
 }
 
 export function PlanPrune(kind: string): $CancellablePromise<models$0.CommandPlan | null> {
     return $Call.ByID(3091027417, kind).then(($result: any) => {
-        return $$createType25($result);
+        return $$createType27($result);
     });
 }
 
 export function PlanRemoveContainer(id: string, opts: models$0.RemoveContainerOptions): $CancellablePromise<models$0.CommandPlan | null> {
     return $Call.ByID(783154554, id, opts).then(($result: any) => {
-        return $$createType25($result);
+        return $$createType27($result);
     });
 }
 
 export function PlanRemoveImage(imageID: string, force: boolean): $CancellablePromise<models$0.CommandPlan | null> {
     return $Call.ByID(590018692, imageID, force).then(($result: any) => {
-        return $$createType25($result);
+        return $$createType27($result);
     });
 }
 
 export function PlanRemoveNetwork(id: string): $CancellablePromise<models$0.CommandPlan | null> {
     return $Call.ByID(3243822551, id).then(($result: any) => {
-        return $$createType25($result);
+        return $$createType27($result);
     });
 }
 
 export function PlanRemoveVolume(name: string, force: boolean): $CancellablePromise<models$0.CommandPlan | null> {
     return $Call.ByID(1592087289, name, force).then(($result: any) => {
-        return $$createType25($result);
+        return $$createType27($result);
     });
 }
 
@@ -169,7 +175,7 @@ export function SaveImage(imageRefs: string[], destPath: string): $CancellablePr
 
 export function SearchHub(query: string, limit: number): $CancellablePromise<models$0.HubSearchResult[]> {
     return $Call.ByID(3553985035, query, limit).then(($result: any) => {
-        return $$createType27($result);
+        return $$createType29($result);
     });
 }
 
@@ -187,7 +193,7 @@ export function TagImage(imageID: string, newRef: string): $CancellablePromise<v
 
 export function Version(): $CancellablePromise<models$0.DockerVersion | null> {
     return $Call.ByID(2954904332).then(($result: any) => {
-        return $$createType29($result);
+        return $$createType31($result);
     });
 }
 
@@ -210,15 +216,17 @@ const $$createType14 = models$0.VolumeDetail.createFrom;
 const $$createType15 = $Create.Nullable($$createType14);
 const $$createType16 = models$0.DockerInfo.createFrom;
 const $$createType17 = $Create.Nullable($$createType16);
-const $$createType18 = models$0.ContainerSummary.createFrom;
-const $$createType19 = $Create.Array($$createType18);
-const $$createType20 = models$0.ImageSummary.createFrom;
+const $$createType18 = models$0.ContainerFileListing.createFrom;
+const $$createType19 = $Create.Nullable($$createType18);
+const $$createType20 = models$0.ContainerSummary.createFrom;
 const $$createType21 = $Create.Array($$createType20);
-const $$createType22 = $Create.Array($$createType2);
-const $$createType23 = $Create.Array($$createType4);
-const $$createType24 = models$0.CommandPlan.createFrom;
-const $$createType25 = $Create.Nullable($$createType24);
-const $$createType26 = models$0.HubSearchResult.createFrom;
-const $$createType27 = $Create.Array($$createType26);
-const $$createType28 = models$0.DockerVersion.createFrom;
-const $$createType29 = $Create.Nullable($$createType28);
+const $$createType22 = models$0.ImageSummary.createFrom;
+const $$createType23 = $Create.Array($$createType22);
+const $$createType24 = $Create.Array($$createType2);
+const $$createType25 = $Create.Array($$createType4);
+const $$createType26 = models$0.CommandPlan.createFrom;
+const $$createType27 = $Create.Nullable($$createType26);
+const $$createType28 = models$0.HubSearchResult.createFrom;
+const $$createType29 = $Create.Array($$createType28);
+const $$createType30 = models$0.DockerVersion.createFrom;
+const $$createType31 = $Create.Nullable($$createType30);

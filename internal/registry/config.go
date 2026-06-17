@@ -29,9 +29,24 @@ func (m *Manager) ListRegistryAccounts(ctx context.Context) ([]models.RegistryAc
 }
 
 func (m *Manager) readDockerConfig(ctx context.Context, provider providers.PlatformProvider) (dockerConfig, error) {
+	raw, err := m.readDockerConfigRaw(ctx, provider)
+	if err != nil {
+		return dockerConfig{}, err
+	}
+	if raw == "" {
+		return dockerConfig{}, nil
+	}
+	var config dockerConfig
+	if err := json.Unmarshal([]byte(raw), &config); err != nil {
+		return dockerConfig{}, apperror.Wrap(apperror.Internal, "Parse Docker config failed", err)
+	}
+	return config, nil
+}
+
+func (m *Manager) readDockerConfigRaw(ctx context.Context, provider providers.PlatformProvider) (string, error) {
 	runner, ok := provider.(BackendCommandRunner)
 	if !ok {
-		return dockerConfig{}, apperror.New(
+		return "", apperror.New(
 			apperror.ProviderNotReady,
 			"Provider cannot read backend Docker configuration",
 			apperror.WithRepairHints("Reconnect the Docker provider and try again."),
@@ -41,10 +56,10 @@ func (m *Manager) readDockerConfig(ctx context.Context, provider providers.Platf
 	command := backendConfigCommand(provider)
 	result, err := runner.RunBackendCommand(ctx, "", command...)
 	if err != nil && result == nil {
-		return dockerConfig{}, apperror.Wrap(apperror.ProviderNotReady, "Read Docker config failed", err)
+		return "", apperror.Wrap(apperror.ProviderNotReady, "Read Docker config failed", err)
 	}
 	if result != nil && result.ExitCode != 0 {
-		return dockerConfig{}, apperror.New(
+		return "", apperror.New(
 			apperror.ProviderNotReady,
 			"Read Docker config failed",
 			apperror.WithDetail(strings.TrimSpace(result.Stderr)),
@@ -55,13 +70,39 @@ func (m *Manager) readDockerConfig(ctx context.Context, provider providers.Platf
 		raw = normalizeDockerConfigJSON(result.Stdout)
 	}
 	if raw == "" {
-		return dockerConfig{}, nil
+		return "", nil
 	}
-	var config dockerConfig
-	if err := json.Unmarshal([]byte(raw), &config); err != nil {
-		return dockerConfig{}, apperror.Wrap(apperror.Internal, "Parse Docker config failed", err)
+	return raw, nil
+}
+
+func (m *Manager) writeDockerConfigRaw(ctx context.Context, provider providers.PlatformProvider, raw []byte) error {
+	runner, ok := provider.(BackendCommandRunner)
+	if !ok {
+		return apperror.New(
+			apperror.ProviderNotReady,
+			"Provider cannot write backend Docker configuration",
+			apperror.WithRepairHints("Reconnect the Docker provider and try again."),
+		)
 	}
-	return config, nil
+	if len(raw) == 0 {
+		raw = []byte("{}")
+	}
+	if raw[len(raw)-1] != '\n' {
+		raw = append(raw, '\n')
+	}
+	command := backendWriteConfigCommand(provider)
+	result, err := runner.RunBackendCommand(ctx, string(raw), command...)
+	if err != nil && result == nil {
+		return apperror.Wrap(apperror.ProviderNotReady, "Write Docker config failed", err)
+	}
+	if result != nil && result.ExitCode != 0 {
+		detail := strings.TrimSpace(result.Stderr)
+		if detail == "" {
+			detail = strings.TrimSpace(result.Stdout)
+		}
+		return apperror.New(apperror.ProviderNotReady, "Write Docker config failed", apperror.WithDetail(detail))
+	}
+	return nil
 }
 
 func normalizeDockerConfigJSON(raw string) string {
@@ -114,6 +155,19 @@ func backendConfigCommand(provider providers.PlatformProvider) []string {
 		"-NonInteractive",
 		"-Command",
 		`$cfg=$env:DOCKER_CONFIG; if ([string]::IsNullOrWhiteSpace($cfg)) { $cfg=Join-Path $env:USERPROFILE '.docker' }; $p=Join-Path $cfg 'config.json'; if (Test-Path -LiteralPath $p) { Get-Content -LiteralPath $p -Raw }`,
+	}
+}
+
+func backendWriteConfigCommand(provider providers.PlatformProvider) []string {
+	if provider.Type() == providers.TypeWindowsWSL || provider.Platform() != providers.PlatformWindows {
+		return []string{"sh", "-lc", `cfg="${DOCKER_CONFIG:-$HOME/.docker}"; mkdir -p "$cfg"; umask 077; cat > "$cfg/config.json"`}
+	}
+	return []string{
+		"powershell.exe",
+		"-NoProfile",
+		"-NonInteractive",
+		"-Command",
+		`$cfg=$env:DOCKER_CONFIG; if ([string]::IsNullOrWhiteSpace($cfg)) { $cfg=Join-Path $env:USERPROFILE '.docker' }; New-Item -ItemType Directory -Force -Path $cfg | Out-Null; $p=Join-Path $cfg 'config.json'; $content=[Console]::In.ReadToEnd(); Set-Content -LiteralPath $p -Value $content -NoNewline -Encoding UTF8`,
 	}
 }
 

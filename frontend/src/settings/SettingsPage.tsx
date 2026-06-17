@@ -17,6 +17,7 @@ import type {
   RegistryAccount,
   RegistryAuthStatus,
   VersionInfo,
+  WSLDistroInfo,
 } from "../../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
 import {
   Badge,
@@ -112,6 +113,7 @@ export function SettingsPage({
   onDetect,
   onOpenSetup,
   onRefreshDockerContexts,
+  onRefreshWSLDistros,
   onRefreshAudit,
   onRefreshRegistries,
   onRegistryLogin,
@@ -125,6 +127,7 @@ export function SettingsPage({
   onSaveColimaProfile,
   onSaveWSLDistro,
   onUseDockerContext,
+  onUseWSLDistro,
   onWSLDistroChange,
   providers,
   registryAccounts,
@@ -138,6 +141,9 @@ export function SettingsPage({
   onSectionChange,
   version,
   wslDistro,
+  wslDistros,
+  wslDistrosError,
+  wslDistrosLoading,
 }: {
   activeProvider: ProviderSummary | null;
   auditEntries: AuditEntry[];
@@ -162,6 +168,7 @@ export function SettingsPage({
   onDetect: () => void;
   onOpenSetup: () => void;
   onRefreshDockerContexts: () => void;
+  onRefreshWSLDistros: () => void;
   onRefreshAudit: () => void;
   onRefreshRegistries: () => void;
   onRegistryLogin: (registry?: string) => void;
@@ -175,6 +182,7 @@ export function SettingsPage({
   onSaveColimaProfile: () => void;
   onSaveWSLDistro: () => void;
   onUseDockerContext: (name: string) => void;
+  onUseWSLDistro: (distro: string) => void;
   onWSLDistroChange: (distro: string) => void;
   providers: ProviderSummary[];
   registryAccounts: RegistryAccount[];
@@ -188,11 +196,25 @@ export function SettingsPage({
   onSectionChange: (section: SettingsSectionID) => void;
   version: VersionInfo | null;
   wslDistro: string;
+  wslDistros: WSLDistroInfo[];
+  wslDistrosError: string | null;
+  wslDistrosLoading: boolean;
 }) {
   const [selectedAuditEntry, setSelectedAuditEntry] =
     useState<AuditEntry | null>(null);
   const activeStatus = activeProvider?.status;
   const providerKind = activeProvider?.kind || "windows_wsl_ubuntu";
+  const registryCredentialMode = settingString(
+    settings,
+    "registry.credentials_mode",
+    "docker_helper",
+  );
+  const registryLoginDisabled = registryCredentialMode === "none";
+  const registryLoginDisabledReason =
+    "Switch Credential mode to Docker credential helper before logging in from Cairn.";
+  const hasUnencryptedRegistryCredentials = registryAccounts.some(
+    (account) => account.source === "authsFile",
+  );
   const settingsSections: Array<[SettingsSectionID, string]> = [
     ["general", "General"],
     ["providers", "Providers"],
@@ -209,8 +231,28 @@ export function SettingsPage({
   ];
   return (
     <div className="grid gap-4 xl:grid-cols-[220px_minmax(0,1fr)]">
-      <div className="space-y-2">
-        {settingsSections.map(([id, section]) => (
+      <div className="xl:hidden">
+        <label className="sr-only" htmlFor="settings-section-select">
+          Settings section
+        </label>
+        <select
+          className="h-10 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary"
+          id="settings-section-select"
+          onChange={(event) =>
+            onSectionChange(event.target.value as SettingsSectionID)
+          }
+          value={section}
+        >
+          {settingsSections.map(([id, label]) => (
+            <option key={id} value={id}>
+              {label}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      <div className="hidden space-y-2 xl:block">
+        {settingsSections.map(([id, label]) => (
           <button
             className={[
               "block h-9 w-full rounded-control px-3 text-left text-sm",
@@ -222,7 +264,7 @@ export function SettingsPage({
             onClick={() => onSectionChange(id)}
             type="button"
           >
-            {section}
+            {label}
           </button>
         ))}
       </div>
@@ -674,6 +716,12 @@ export function SettingsPage({
                     rerun detection.
                   </p>
                 </div>
+                <div className="rounded-card border border-info/30 bg-info/10 px-3 py-2 text-sm text-info">
+                  Providers are Cairn backends. The active provider decides
+                  where Docker and Compose commands run. For Windows WSL, pick
+                  the distro here; Docker contexts are separate Docker CLI
+                  endpoints.
+                </div>
                 <label className="block">
                   <span className="text-xs font-medium uppercase text-text-muted">
                     WSL distro
@@ -691,11 +739,110 @@ export function SettingsPage({
                     value={wslDistro}
                   />
                   <datalist id="wsl-distro-options">
-                    <option value={wslDistro} />
-                    <option value="Ubuntu" />
-                    <option value="cairn-dev" />
+                    {Array.from(
+                      new Set([
+                        wslDistro,
+                        ...wslDistros.map((distro) => distro.name),
+                        "Ubuntu",
+                        "cairn-dev",
+                      ]),
+                    )
+                      .filter(Boolean)
+                      .map((name) => (
+                        <option key={name} value={name} />
+                      ))}
                   </datalist>
                 </label>
+
+                <div className="rounded-card border border-border bg-bg-inset">
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-3 py-2">
+                    <div>
+                      <div className="text-sm font-medium text-text-primary">
+                        Installed WSL distros
+                      </div>
+                      <div className="text-xs text-text-muted">
+                        Docker Desktop internal distros are hidden.
+                      </div>
+                    </div>
+                    <Button
+                      icon={<RefreshCw size={15} />}
+                      loading={wslDistrosLoading}
+                      onClick={onRefreshWSLDistros}
+                      size="sm"
+                      variant="secondary"
+                    >
+                      Refresh
+                    </Button>
+                  </div>
+                  <div className="p-3">
+                    {wslDistrosError ? (
+                      <div className="rounded-control border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
+                        {wslDistrosError}
+                      </div>
+                    ) : null}
+                    {wslDistrosLoading && wslDistros.length === 0 ? (
+                      <TableSkeleton />
+                    ) : null}
+                    {!wslDistrosLoading && wslDistros.length === 0 ? (
+                      <EmptyState
+                        body="Installed WSL distributions appear here when wsl.exe is available."
+                        icon={<Server size={28} />}
+                        title="No WSL distros detected"
+                      />
+                    ) : null}
+                    {wslDistros.length > 0 ? (
+                      <div className="grid gap-2 md:grid-cols-2">
+                        {wslDistros.map((distro) => {
+                          const selected =
+                            distro.name.toLowerCase() ===
+                            wslDistro.trim().toLowerCase();
+                          return (
+                            <div
+                              className="rounded-control border border-border bg-bg-card p-3"
+                              key={distro.name}
+                            >
+                              <div className="flex items-start justify-between gap-3">
+                                <div className="min-w-0">
+                                  <div className="truncate font-medium text-text-primary">
+                                    {distro.name}
+                                  </div>
+                                  <div className="mt-1 flex flex-wrap gap-2">
+                                    {selected ? (
+                                      <Badge tone="accent">selected</Badge>
+                                    ) : null}
+                                    {distro.default ? (
+                                      <Badge tone="neutral">default</Badge>
+                                    ) : null}
+                                    <Badge
+                                      tone={
+                                        distro.version === 2 ? "ok" : "warn"
+                                      }
+                                    >
+                                      WSL {distro.version || "?"}
+                                    </Badge>
+                                    {distro.state ? (
+                                      <Badge tone="neutral">
+                                        {distro.state}
+                                      </Badge>
+                                    ) : null}
+                                  </div>
+                                </div>
+                                <Button
+                                  disabled={selected || saving}
+                                  onClick={() => onUseWSLDistro(distro.name)}
+                                  size="sm"
+                                  variant={selected ? "secondary" : "primary"}
+                                >
+                                  Use distro
+                                </Button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
 
                 <label className="flex items-center justify-between gap-3 rounded-card border border-border bg-bg-inset p-3 text-sm">
                   <span>
@@ -852,7 +999,13 @@ export function SettingsPage({
               }
               title="Docker Contexts"
             />
-            <CardBody>
+            <CardBody className="space-y-3">
+              <div className="rounded-card border border-info/30 bg-info/10 px-3 py-2 text-sm text-info">
+                Docker contexts are Docker CLI endpoints from `docker context
+                ls`. They are not WSL distros. Choosing one switches Cairn to an
+                existing Docker context provider; choosing a WSL distro happens
+                in Providers.
+              </div>
               {dockerContextsError ? (
                 <div className="rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
                   {dockerContextsError}
@@ -894,6 +1047,8 @@ export function SettingsPage({
                     Refresh
                   </Button>
                   <Button
+                    disabled={registryLoginDisabled}
+                    disabledReason={registryLoginDisabledReason}
                     icon={<LogIn size={15} />}
                     onClick={() => onRegistryLogin("docker.io")}
                     size="sm"
@@ -926,6 +1081,20 @@ export function SettingsPage({
                   "docker_helper",
                 )}
               />
+              {registryCredentialMode === "docker_helper" &&
+              hasUnencryptedRegistryCredentials ? (
+                <div className="rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
+                  Some registry credentials are still stored in Docker
+                  config.json. Log out and log in again after a credential
+                  helper is available.
+                </div>
+              ) : null}
+              {registryLoginDisabled ? (
+                <div className="rounded-card border border-info/30 bg-info/10 px-3 py-2 text-sm text-info">
+                  Cairn will not accept registry secrets while this mode is
+                  selected.
+                </div>
+              ) : null}
               {registryAccountsError ? (
                 <div className="rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
                   {registryAccountsError}
@@ -943,6 +1112,8 @@ export function SettingsPage({
                 <RegistryAccountsTable
                   accounts={registryAccounts}
                   busyKeys={registryBusyKeys}
+                  loginDisabled={registryLoginDisabled}
+                  loginDisabledReason={registryLoginDisabledReason}
                   onLogin={onRegistryLogin}
                   onLogout={onRegistryLogout}
                   onTest={onRegistryTest}

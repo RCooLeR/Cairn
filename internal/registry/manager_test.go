@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
+	"github.com/RCooLeR/Cairn/internal/store"
 	dockerregistry "github.com/docker/docker/api/types/registry"
 )
 
@@ -241,6 +243,108 @@ func TestLoginPipesSecretThroughStdin(t *testing.T) {
 	}
 }
 
+func TestLoginConfiguresCredentialHelperBeforeDockerLogin(t *testing.T) {
+	var registryHost string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	registryHost = strings.TrimPrefix(server.URL, "http://")
+
+	auth := base64.StdEncoding.EncodeToString([]byte("ada:old-token"))
+	provider := &fakeRegistryProvider{
+		backendResults: map[string]string{
+			`sh -lc cat "${DOCKER_CONFIG:-$HOME/.docker}/config.json" 2>/dev/null || true`: `{"auths":{"` + registryHost + `":{"auth":"` + auth + `"}},"experimental":"enabled"}`,
+			"docker-credential-pass list": `{}`,
+			"docker-credential-pass get":  `{"Username":"ada","Secret":"token"}`,
+		},
+		dockerResult: &providers.CommandResult{ExitCode: 0},
+	}
+	manager := NewManager(fakeResolver{provider: provider}, nil)
+	manager.Settings = testRegistrySettings(t, registryCredentialModeDockerHelper)
+
+	err := manager.Login(context.Background(), models.RegistryLoginRequest{
+		Registry: registryHost,
+		Username: "ada",
+		Secret:   "token",
+	})
+	if err != nil {
+		t.Fatalf("Login() error = %v", err)
+	}
+	if provider.dockerInput != "token\n" {
+		t.Fatalf("docker input = %q", provider.dockerInput)
+	}
+
+	var written map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(provider.backendConfig), &written); err != nil {
+		t.Fatalf("written Docker config is not JSON: %v\n%s", err, provider.backendConfig)
+	}
+	var helpers map[string]string
+	if err := json.Unmarshal(written["credHelpers"], &helpers); err != nil {
+		t.Fatalf("credHelpers = %s: %v", string(written["credHelpers"]), err)
+	}
+	if helpers[registryHost] != "pass" {
+		t.Fatalf("cred helper for %s = %q, want pass", registryHost, helpers[registryHost])
+	}
+	var auths map[string]json.RawMessage
+	if err := json.Unmarshal(written["auths"], &auths); err != nil {
+		t.Fatalf("auths = %s: %v", string(written["auths"]), err)
+	}
+	if _, ok := auths[registryHost]; ok {
+		t.Fatalf("inline auth for %s was not removed: %s", registryHost, string(written["auths"]))
+	}
+	if string(written["experimental"]) != `"enabled"` {
+		t.Fatalf("unrelated Docker config key was not preserved: %#v", written)
+	}
+}
+
+func TestLoginFailsWhenCredentialHelperUnavailable(t *testing.T) {
+	provider := &fakeRegistryProvider{
+		backendResults: map[string]string{
+			`sh -lc cat "${DOCKER_CONFIG:-$HOME/.docker}/config.json" 2>/dev/null || true`: `{}`,
+		},
+		backendDefaultExitCode: 127,
+		backendDefaultStderr:   "not found",
+		dockerResult:           &providers.CommandResult{ExitCode: 0},
+	}
+	manager := NewManager(fakeResolver{provider: provider}, nil)
+	manager.Settings = testRegistrySettings(t, registryCredentialModeDockerHelper)
+
+	err := manager.Login(context.Background(), models.RegistryLoginRequest{
+		Registry: "ghcr.io",
+		Username: "ada",
+		Secret:   "token",
+	})
+	if !apperror.IsCode(err, apperror.ProviderNotReady) {
+		t.Fatalf("Login() error = %v, want provider-not-ready", err)
+	}
+	if provider.dockerInput != "" {
+		t.Fatalf("docker login received secret despite missing helper: %q", provider.dockerInput)
+	}
+}
+
+func TestLoginRespectsDisabledCredentialMode(t *testing.T) {
+	provider := &fakeRegistryProvider{dockerResult: &providers.CommandResult{ExitCode: 0}}
+	manager := NewManager(fakeResolver{provider: provider}, nil)
+	manager.Settings = testRegistrySettings(t, registryCredentialModeNone)
+
+	err := manager.Login(context.Background(), models.RegistryLoginRequest{
+		Registry: "ghcr.io",
+		Username: "ada",
+		Secret:   "token",
+	})
+	if !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("Login() error = %v, want conflict", err)
+	}
+	if provider.dockerInput != "" {
+		t.Fatalf("docker login received secret while login is disabled: %q", provider.dockerInput)
+	}
+}
+
 func TestReadDockerConfigNormalizesUTF16LE(t *testing.T) {
 	t.Parallel()
 	raw := `{"auths":{"ghcr.io":{"auth":"` + base64.StdEncoding.EncodeToString([]byte("ada:token")) + `"}}}`
@@ -455,20 +559,69 @@ func (r fakeResolver) ActiveProvider(context.Context) (providers.PlatformProvide
 	return r.provider, nil
 }
 
+func testRegistrySettings(t *testing.T, mode string) *store.SettingsRepository {
+	t.Helper()
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "cairn.db"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+	settings := db.Settings()
+	if mode != "" {
+		if err := settings.SetString(ctx, "registry.credentials_mode", mode); err != nil {
+			t.Fatalf("SetString() error = %v", err)
+		}
+	}
+	return settings
+}
+
+func isBackendConfigReadForTest(command string) bool {
+	return strings.Contains(command, "config.json") &&
+		(strings.Contains(command, "cat \"${DOCKER_CONFIG") || strings.Contains(command, "Get-Content"))
+}
+
+func isBackendConfigWriteForTest(command string) bool {
+	return strings.Contains(command, "config.json") &&
+		(strings.Contains(command, "cat >") || strings.Contains(command, "Set-Content"))
+}
+
 type fakeRegistryProvider struct {
-	backendStdout  string
-	backendResults map[string]string
-	backendInput   string
-	backendArgs    []string
-	dockerInput    string
-	dockerArgs     []string
-	dockerResult   *providers.CommandResult
+	backendStdout          string
+	backendResults         map[string]string
+	backendDefaultExitCode int
+	backendDefaultStderr   string
+	backendConfig          string
+	backendInput           string
+	backendInputs          []string
+	backendArgs            []string
+	backendCalls           []string
+	dockerInput            string
+	dockerArgs             []string
+	dockerResult           *providers.CommandResult
+	providerType           string
+	providerPlatform       string
 }
 
 func (p *fakeRegistryProvider) ID() string          { return "fake" }
 func (p *fakeRegistryProvider) DisplayName() string { return "Fake" }
-func (p *fakeRegistryProvider) Type() string        { return providers.TypeLinuxNative }
-func (p *fakeRegistryProvider) Platform() string    { return providers.PlatformLinux }
+func (p *fakeRegistryProvider) Type() string {
+	if p.providerType != "" {
+		return p.providerType
+	}
+	return providers.TypeLinuxNative
+}
+func (p *fakeRegistryProvider) Platform() string {
+	if p.providerPlatform != "" {
+		return p.providerPlatform
+	}
+	return providers.PlatformLinux
+}
 func (p *fakeRegistryProvider) Detect(context.Context) (*models.ProviderStatus, error) {
 	return nil, nil
 }
@@ -504,13 +657,23 @@ func (p *fakeRegistryProvider) RunDockerWithInput(_ context.Context, input strin
 }
 func (p *fakeRegistryProvider) RunBackendCommand(_ context.Context, input string, args ...string) (*providers.CommandResult, error) {
 	p.backendInput = input
+	p.backendInputs = append(p.backendInputs, input)
 	p.backendArgs = append([]string(nil), args...)
+	joined := strings.Join(args, " ")
+	p.backendCalls = append(p.backendCalls, joined)
+	if isBackendConfigWriteForTest(joined) {
+		p.backendConfig = input
+		return &providers.CommandResult{Command: args, ExitCode: 0}, nil
+	}
+	if isBackendConfigReadForTest(joined) && p.backendConfig != "" {
+		return &providers.CommandResult{Command: args, Stdout: p.backendConfig, ExitCode: 0}, nil
+	}
 	if p.backendResults != nil {
-		if stdout, ok := p.backendResults[strings.Join(args, " ")]; ok {
+		if stdout, ok := p.backendResults[joined]; ok {
 			return &providers.CommandResult{Command: args, Stdout: stdout, ExitCode: 0}, nil
 		}
 	}
-	return &providers.CommandResult{Command: args, Stdout: p.backendStdout, ExitCode: 0}, nil
+	return &providers.CommandResult{Command: args, Stdout: p.backendStdout, Stderr: p.backendDefaultStderr, ExitCode: p.backendDefaultExitCode}, nil
 }
 func (p *fakeRegistryProvider) RunCompose(context.Context, string, ...string) (*providers.CommandResult, error) {
 	return nil, nil

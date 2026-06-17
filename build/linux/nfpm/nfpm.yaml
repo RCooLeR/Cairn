@@ -6,7 +6,7 @@
 name: "cairn"
 arch: ${GOARCH}
 platform: "linux"
-version: "0.1.0"
+version: "1.0.0"
 section: "utils"
 priority: "optional"
 maintainer: Cairn Maintainers <noreply@github.com>

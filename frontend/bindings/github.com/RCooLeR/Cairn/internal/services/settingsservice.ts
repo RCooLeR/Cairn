@@ -9,39 +9,39 @@ import { Call as $Call, CancellablePromise as $CancellablePromise, Create as $Cr
 // @ts-ignore: Unused imports
 import * as models$0 from "../models/models.js";
 
-export function CheckAppUpdate(currentVersion: string): $CancellablePromise<models$0.AppUpdateNotice | null> {
-    return $Call.ByID(814318823, currentVersion).then(($result: any) => {
-        return $$createType10($result);
-    });
-}
-
 export function AppVersion(): $CancellablePromise<models$0.VersionInfo | null> {
     return $Call.ByID(2188903172).then(($result: any) => {
         return $$createType1($result);
     });
 }
 
+export function CheckAppUpdate(currentVersion: string): $CancellablePromise<models$0.AppUpdateNotice | null> {
+    return $Call.ByID(814318823, currentVersion).then(($result: any) => {
+        return $$createType3($result);
+    });
+}
+
 export function GetAuditLog(filter: models$0.AuditFilter): $CancellablePromise<models$0.AuditEntry[]> {
     return $Call.ByID(689753624, filter).then(($result: any) => {
-        return $$createType3($result);
+        return $$createType5($result);
     });
 }
 
 export function GetCheatsheet(): $CancellablePromise<models$0.CheatsheetEntry[]> {
     return $Call.ByID(2903204757).then(($result: any) => {
-        return $$createType5($result);
+        return $$createType7($result);
     });
 }
 
 export function GetNotifications(unreadOnly: boolean): $CancellablePromise<models$0.Notification[]> {
     return $Call.ByID(340867397, unreadOnly).then(($result: any) => {
-        return $$createType7($result);
+        return $$createType9($result);
     });
 }
 
 export function GetSettings(): $CancellablePromise<{ [_ in string]?: any }> {
     return $Call.ByID(3314614998).then(($result: any) => {
-        return $$createType8($result);
+        return $$createType10($result);
     });
 }
 
@@ -60,12 +60,12 @@ export function SetSetting(key: string, value: any): $CancellablePromise<void> {
 // Private type creation functions
 const $$createType0 = models$0.VersionInfo.createFrom;
 const $$createType1 = $Create.Nullable($$createType0);
-const $$createType2 = models$0.AuditEntry.createFrom;
-const $$createType3 = $Create.Array($$createType2);
-const $$createType4 = models$0.CheatsheetEntry.createFrom;
+const $$createType2 = models$0.AppUpdateNotice.createFrom;
+const $$createType3 = $Create.Nullable($$createType2);
+const $$createType4 = models$0.AuditEntry.createFrom;
 const $$createType5 = $Create.Array($$createType4);
-const $$createType6 = models$0.Notification.createFrom;
+const $$createType6 = models$0.CheatsheetEntry.createFrom;
 const $$createType7 = $Create.Array($$createType6);
-const $$createType8 = $Create.Map($Create.Any, $Create.Any);
-const $$createType9 = models$0.AppUpdateNotice.createFrom;
-const $$createType10 = $Create.Nullable($$createType9);
+const $$createType8 = models$0.Notification.createFrom;
+const $$createType9 = $Create.Array($$createType8);
+const $$createType10 = $Create.Map($Create.Any, $Create.Any);

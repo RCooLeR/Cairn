@@ -98,7 +98,8 @@ jobs:
         run: go test . ./internal/...
 
       - name: Go vulnerability scan
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.3.0 ./...
+        shell: pwsh
+        run: ./scripts/run-govulncheck.ps1
 
       - name: Docker reconnect integration
         if: runner.os == 'Linux'

@@ -44,6 +44,10 @@ type distroConfigurable interface {
 	SetDistro(string)
 }
 
+type distroLister interface {
+	ListDistros(context.Context) ([]models.WSLDistroInfo, error)
+}
+
 type colimaConfigurable interface {
 	SetColimaConfig(profile string, cpu, memoryGB, diskGB int)
 }
@@ -372,6 +376,20 @@ func (m *Manager) ListDockerContexts(ctx context.Context) ([]models.DockerContex
 		return nil, apperror.New(apperror.ProviderNotReady, "Docker contexts are not available")
 	}
 	return contexts, nil
+}
+
+func (m *Manager) ListWSLDistros(ctx context.Context) ([]models.WSLDistroInfo, error) {
+	for _, provider := range m.providers {
+		if provider.Type() != TypeWindowsWSL {
+			continue
+		}
+		lister, ok := provider.(distroLister)
+		if !ok {
+			break
+		}
+		return lister.ListDistros(ctx)
+	}
+	return []models.WSLDistroInfo{}, nil
 }
 
 func (m *Manager) SetDockerContext(ctx context.Context, name string) error {

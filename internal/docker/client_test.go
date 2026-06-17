@@ -410,6 +410,61 @@ func TestExpectedExecCloseUsesTypedErrors(t *testing.T) {
 	}
 }
 
+func TestClientListContainerFiles(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	api.execOutputs[commandKey([]string{"sh", "-c", containerFileListScript})] = strings.Join([]string{
+		"file\tapp.log\t/app/app.log\t42\t-rw-r--r--\t1718600000\t",
+		"directory\tconfig\t/app/config\t4096\tdrwxr-xr-x\t1718600100\t",
+		"symlink\tcurrent\t/app/current\t7\tlrwxrwxrwx\t1718600200\t/releases/current",
+	}, "\n")
+
+	client := New(fakeDockerProvider{}, nil)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	listing, err := client.ListContainerFiles(ctx, "abc123", "app")
+	if err != nil {
+		t.Fatalf("ListContainerFiles() error = %v", err)
+	}
+	if listing.Path != "/app" || listing.ParentPath != "/" || listing.ContainerID != "abc123" {
+		t.Fatalf("listing metadata = %#v", listing)
+	}
+	if len(listing.Entries) != 3 {
+		t.Fatalf("entries = %#v, want 3", listing.Entries)
+	}
+	if listing.Entries[0].Name != "config" || listing.Entries[0].Type != "directory" {
+		t.Fatalf("first entry = %#v, want directory first", listing.Entries[0])
+	}
+	if listing.Entries[2].Name != "current" || listing.Entries[2].LinkTarget != "/releases/current" {
+		t.Fatalf("symlink entry = %#v", listing.Entries[2])
+	}
+	if got := fmt.Sprint(api.execCreates[0].Options.Env); got != "[CAIRN_PATH=/app]" {
+		t.Fatalf("exec env = %s", got)
+	}
+}
+
+func TestClientListContainerFilesNotFound(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	api.execExitCodes[commandKey([]string{"sh", "-c", containerFileListScript})] = 44
+
+	client := New(fakeDockerProvider{}, nil)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	_, err := client.ListContainerFiles(ctx, "abc123", "/missing")
+	if !apperror.IsCode(err, apperror.NotFound) {
+		t.Fatalf("ListContainerFiles() error = %v, want not found", err)
+	}
+}
+
 func TestClientHealthLoopDisconnectsAndReconnects(t *testing.T) {
 	t.Parallel()
 	rootCtx, cancel := context.WithCancel(context.Background())
@@ -564,6 +619,12 @@ func TestClientObjectsDTOsRawInspectAndCacheReconcile(t *testing.T) {
 	}
 	if networkDetail.Subnet != "172.22.0.0/16" || networkDetail.Gateway != "172.22.0.1" || len(networkDetail.Containers) != 1 {
 		t.Fatalf("network detail = %#v", networkDetail)
+	}
+	if got := networkDetail.Containers[0].IPv4Address; got != "172.22.0.2/16" {
+		t.Fatalf("network container IPv4 = %q, want 172.22.0.2/16", got)
+	}
+	if got := networkDetail.Containers[0].MacAddress; got != "02:42:ac:16:00:02" {
+		t.Fatalf("network container MAC = %q, want 02:42:ac:16:00:02", got)
 	}
 
 	sqlDB, err := sql.Open("sqlite", dbPath)
@@ -1058,7 +1119,15 @@ func seedFakeObjects(api *fakeAPI) {
 		State:  "running",
 		Status: "Up 2 minutes (healthy)",
 		NetworkSettings: &container.NetworkSettingsSummary{Networks: map[string]*network.EndpointSettings{
-			"demo_default": {NetworkID: "net1"},
+			"demo_default": {
+				Aliases:     []string{"web", "demo-web"},
+				EndpointID:  "endpoint1",
+				Gateway:     "172.22.0.1",
+				IPAddress:   "172.22.0.2",
+				IPPrefixLen: 16,
+				MacAddress:  "02:42:ac:16:00:02",
+				NetworkID:   "net1",
+			},
 		}},
 		Mounts: []container.MountPoint{{
 			Type:        mount.TypeVolume,

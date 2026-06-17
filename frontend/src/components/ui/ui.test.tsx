@@ -176,6 +176,74 @@ describe("UI kit", () => {
     ).toBeInTheDocument();
   });
 
+  it("shows and hides table columns from the header menu", () => {
+    render(
+      <DataTable
+        columns={[
+          {
+            id: "name",
+            header: "Name",
+            render: (row: { name: string; status: string }) => row.name,
+          },
+          {
+            id: "status",
+            header: "Status",
+            render: (row) => row.status,
+          },
+        ]}
+        getRowID={(row) => row.name}
+        ariaLabel="Workers"
+        rows={[{ name: "api", status: "running" }]}
+      />,
+    );
+
+    fireEvent.contextMenu(screen.getByRole("columnheader", { name: /Name/ }));
+    fireEvent.click(screen.getByLabelText("Status"));
+
+    expect(
+      screen.queryByRole("columnheader", { name: /Status/ }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("cell", { name: "running" }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show all columns" }));
+
+    expect(
+      screen.getByRole("columnheader", { name: /Status/ }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("cell", { name: "running" })).toBeInTheDocument();
+  });
+
+  it("resizes table columns from the header grip", () => {
+    const { container } = render(
+      <DataTable
+        columns={[
+          {
+            id: "name",
+            header: "Name",
+            render: (row: { name: string }) => row.name,
+          },
+        ]}
+        getRowID={(row) => row.name}
+        ariaLabel="Workers"
+        rows={[{ name: "api" }]}
+      />,
+    );
+
+    const grip = screen.getByRole("separator", {
+      name: "Resize Name column",
+    });
+
+    fireEvent.mouseDown(grip, { button: 0, clientX: 100 });
+    fireEvent.mouseMove(window, { clientX: 160 });
+    fireEvent.mouseUp(window);
+
+    expect(container.querySelector('[data-column-id="name"]')).toHaveStyle({
+      width: "240px",
+    });
+  });
+
   it("shows selected rows and bulk actions", async () => {
     const onToggle = vi.fn();
     const onToggleAll = vi.fn();
@@ -216,6 +284,32 @@ describe("UI kit", () => {
     );
 
     expect(screen.getByRole("dialog", { name: "Confirm" })).toHaveFocus();
+  });
+
+  it("does not steal input focus when an open modal rerenders", () => {
+    const modal = (onClose: () => void) => (
+      <Modal onClose={onClose} open title="Registry Login">
+        <label>
+          Registry
+          <select defaultValue="docker.io">
+            <option value="docker.io">Docker Hub</option>
+          </select>
+        </label>
+        <label>
+          Secret
+          <input aria-label="Secret" type="password" />
+        </label>
+      </Modal>
+    );
+    const { rerender } = render(modal(vi.fn()));
+
+    const secret = screen.getByLabelText("Secret");
+    secret.focus();
+    expect(secret).toHaveFocus();
+
+    rerender(modal(vi.fn()));
+
+    expect(secret).toHaveFocus();
   });
 
   it("closes modal on Escape", async () => {

@@ -642,6 +642,7 @@ func (c *Client) containersForNetwork(ctx context.Context, api APIClient, nw net
 		for name, endpoint := range item.NetworkSettings.Networks {
 			if name == nw.Name || (endpoint != nil && endpoint.NetworkID == nw.ID) {
 				summary := mapContainerSummary(item)
+				applyNetworkEndpoint(&summary, name, endpoint)
 				c.qualifyContainerSummary(&summary)
 				out = append(out, summary)
 				break
@@ -650,6 +651,37 @@ func (c *Client) containersForNetwork(ctx context.Context, api APIClient, nw net
 	}
 	sortContainerSummaries(out)
 	return out
+}
+
+func applyNetworkEndpoint(summary *models.ContainerSummary, name string, endpoint *network.EndpointSettings) {
+	summary.NetworkName = name
+	if endpoint == nil {
+		return
+	}
+	summary.EndpointID = endpoint.EndpointID
+	summary.IPv4Address = endpointAddress(endpoint.IPAddress, endpoint.IPPrefixLen)
+	summary.IPv6Address = endpointAddress(endpoint.GlobalIPv6Address, endpoint.GlobalIPv6PrefixLen)
+	summary.Gateway = firstNonEmpty(endpoint.Gateway, endpoint.IPv6Gateway)
+	summary.MacAddress = endpoint.MacAddress
+	summary.Aliases = sortedStrings(endpoint.Aliases)
+}
+
+func endpointAddress(address string, prefixLen int) string {
+	address = strings.TrimSpace(address)
+	if address == "" || strings.Contains(address, "/") || prefixLen <= 0 {
+		return address
+	}
+	return address + "/" + strconv.Itoa(prefixLen)
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func networkContainerIDs(raw network.Inspect) []string {

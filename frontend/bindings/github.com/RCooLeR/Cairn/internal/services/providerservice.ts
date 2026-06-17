@@ -49,15 +49,21 @@ export function ListProviders(): $CancellablePromise<models$0.ProviderSummary[]>
     });
 }
 
+export function ListWSLDistros(): $CancellablePromise<models$0.WSLDistroInfo[]> {
+    return $Call.ByID(650548699).then(($result: any) => {
+        return $$createType12($result);
+    });
+}
+
 export function PlanInstall(providerID: string, opts: models$0.InstallOptions): $CancellablePromise<models$0.CommandPlan | null> {
     return $Call.ByID(1372038617, providerID, opts).then(($result: any) => {
-        return $$createType12($result);
+        return $$createType14($result);
     });
 }
 
 export function PlanRestart(providerID: string): $CancellablePromise<models$0.CommandPlan | null> {
     return $Call.ByID(1935115277, providerID).then(($result: any) => {
-        return $$createType12($result);
+        return $$createType14($result);
     });
 }
 
@@ -93,5 +99,7 @@ const $$createType7 = models$0.DockerContextInfo.createFrom;
 const $$createType8 = $Create.Array($$createType7);
 const $$createType9 = models$0.ProviderSummary.createFrom;
 const $$createType10 = $Create.Array($$createType9);
-const $$createType11 = models$0.CommandPlan.createFrom;
-const $$createType12 = $Create.Nullable($$createType11);
+const $$createType11 = models$0.WSLDistroInfo.createFrom;
+const $$createType12 = $Create.Array($$createType11);
+const $$createType13 = models$0.CommandPlan.createFrom;
+const $$createType14 = $Create.Nullable($$createType13);

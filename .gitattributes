@@ -1,3 +1,4 @@
+.gitattributes text eol=lf
 *.css text eol=lf
 Dockerfile* text eol=lf
 *.go text eol=lf
@@ -11,3 +12,4 @@ Dockerfile* text eol=lf
 *.tsx text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
+frontend/dist/embed-placeholder.txt text eol=lf

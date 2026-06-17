@@ -86,6 +86,8 @@ export function DockerContextsTable({
 type RegistryAccountsTableProps = {
   accounts: RegistryAccount[];
   busyKeys: Set<string>;
+  loginDisabled?: boolean;
+  loginDisabledReason?: string;
   statuses: Record<string, RegistryAuthStatus>;
   onLogin: (registry?: string) => void;
   onLogout: (registry: string) => void;
@@ -95,6 +97,8 @@ type RegistryAccountsTableProps = {
 export function RegistryAccountsTable({
   accounts,
   busyKeys,
+  loginDisabled,
+  loginDisabledReason,
   onLogin,
   onLogout,
   onTest,
@@ -149,6 +153,8 @@ export function RegistryAccountsTable({
                     <Tooltip label="Log in">
                       <Button
                         aria-label={`Log in ${registry}`}
+                        disabled={loginDisabled}
+                        disabledReason={loginDisabledReason}
                         icon={<LogIn size={15} />}
                         onClick={() => onLogin(registry)}
                         size="icon"

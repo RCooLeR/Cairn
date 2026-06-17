@@ -20,7 +20,9 @@ func TestWindowsPTYStarterRunsCommand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Start() error = %v", err)
 	}
-	defer session.Close()
+	defer func() {
+		_ = session.Close()
+	}()
 
 	output := make(chan string, 1)
 	go func() {

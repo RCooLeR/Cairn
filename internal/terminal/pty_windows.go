@@ -238,8 +238,8 @@ func createPseudoConsoleProcess(spec PTYSpec, attr *windows.ProcThreadAttributeL
 	}
 
 	siEx := &windows.StartupInfoEx{}
-	siEx.StartupInfo.Cb = uint32(unsafe.Sizeof(*siEx))
-	siEx.StartupInfo.Flags = windows.STARTF_USESTDHANDLES
+	siEx.Cb = uint32(unsafe.Sizeof(*siEx))
+	siEx.Flags = windows.STARTF_USESTDHANDLES
 	siEx.ProcThreadAttributeList = attr.List()
 
 	pi := &windows.ProcessInformation{}
@@ -306,24 +306,6 @@ func windowsEnvironmentBlock(env map[string]string) ([]uint16, error) {
 		return []uint16{0, 0}, nil
 	}
 	return utf16.Encode([]rune(strings.Join(entries, "\x00") + "\x00\x00")), nil
-}
-
-func envEntries(env map[string]string) []string {
-	if len(env) == 0 {
-		return nil
-	}
-	keys := make([]string, 0, len(env))
-	for key := range env {
-		if strings.TrimSpace(key) != "" {
-			keys = append(keys, key)
-		}
-	}
-	sort.Strings(keys)
-	out := make([]string, 0, len(keys))
-	for _, key := range keys {
-		out = append(out, key+"="+env[key])
-	}
-	return out
 }
 
 func waitForProcess(process windows.Handle, timeout uint32) bool {

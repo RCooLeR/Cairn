@@ -27,6 +27,7 @@ func TestMigrateFreshDatabaseCreatesV1Schema(t *testing.T) {
 		"command_history",
 		"containers_cache",
 		"docker_contexts",
+		"forgotten_projects",
 		"ignored_updates",
 		"image_lineage",
 		"image_update_checks",
@@ -57,6 +58,7 @@ func TestMigrateFreshDatabaseCreatesV1Schema(t *testing.T) {
 		"idx_checks_kind",
 		"idx_checks_project",
 		"idx_containers_project",
+		"idx_forgotten_projects_id",
 		"idx_ignored_updates_unique",
 		"idx_lineage_container",
 		"idx_lineage_project",
@@ -70,8 +72,8 @@ func TestMigrateFreshDatabaseCreatesV1Schema(t *testing.T) {
 		}
 	}
 
-	if got := migrationCount(t, ctx, s); got != 4 {
-		t.Fatalf("migration count = %d, want 4", got)
+	if got := migrationCount(t, ctx, s); got != 5 {
+		t.Fatalf("migration count = %d, want 5", got)
 	}
 }
 
@@ -92,8 +94,8 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	if err := s.Migrate(ctx); err != nil {
 		t.Fatalf("second migrate: %v", err)
 	}
-	if got := migrationCount(t, ctx, s); got != 4 {
-		t.Fatalf("migration count after rerun = %d, want 4", got)
+	if got := migrationCount(t, ctx, s); got != 5 {
+		t.Fatalf("migration count after rerun = %d, want 5", got)
 	}
 }
 
@@ -179,8 +181,8 @@ func TestReleaseDBFixtureUpgrade(t *testing.T) {
 	if err := upgraded.Migrate(ctx); err != nil {
 		t.Fatalf("migrate release fixture: %v", err)
 	}
-	if got := migrationCount(t, ctx, upgraded); got != 4 {
-		t.Fatalf("migration count = %d, want 4", got)
+	if got := migrationCount(t, ctx, upgraded); got != 5 {
+		t.Fatalf("migration count = %d, want 5", got)
 	}
 
 	settings := upgraded.Settings()

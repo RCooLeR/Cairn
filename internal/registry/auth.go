@@ -32,6 +32,9 @@ func (m *Manager) Login(ctx context.Context, req models.RegistryLoginRequest) er
 	if err != nil {
 		return err
 	}
+	if err := m.prepareRegistryLoginStorage(ctx, provider, registry); err != nil {
+		return err
+	}
 	runner, ok := provider.(DockerInputRunner)
 	if !ok {
 		return apperror.New(apperror.ProviderNotReady, "Provider cannot pass registry secrets via stdin")

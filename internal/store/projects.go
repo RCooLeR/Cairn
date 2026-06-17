@@ -51,6 +51,12 @@ type ServiceRecord struct {
 	LastSeenAt      time.Time
 }
 
+type forgottenProjectKey struct {
+	contextName string
+	name        string
+	projectID   string
+}
+
 func (s *Store) Projects() *ProjectRepository {
 	return &ProjectRepository{db: s.writer}
 }
@@ -63,6 +69,16 @@ func (r *ProjectRepository) SaveSnapshot(ctx context.Context, providerID string,
 	defer func() {
 		_ = tx.Rollback()
 	}()
+
+	forgotten, err := r.forgottenProjectKeys(ctx, tx, providerID)
+	if err != nil {
+		return err
+	}
+	if len(forgotten) > 0 {
+		var skipped map[string]struct{}
+		projects, skipped = filterForgottenProjects(projects, forgotten)
+		services = filterForgottenServices(services, skipped)
+	}
 
 	replaceServices := services != nil
 	serviceReplacementIDs := serviceReplacementProjectIDs(projects, services)
@@ -168,6 +184,84 @@ func (r *ProjectRepository) SaveSnapshot(ctx context.Context, providerID string,
 	return tx.Commit()
 }
 
+func (r *ProjectRepository) forgottenProjectKeys(ctx context.Context, tx *sql.Tx, providerID string) (map[forgottenProjectKey]struct{}, error) {
+	rows, err := tx.QueryContext(ctx, `
+		SELECT context_name, name, project_id
+		FROM forgotten_projects
+		WHERE provider_id = ?
+	`, providerID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		_ = rows.Close()
+	}()
+	keys := map[forgottenProjectKey]struct{}{}
+	for rows.Next() {
+		var key forgottenProjectKey
+		if err := rows.Scan(&key.contextName, &key.name, &key.projectID); err != nil {
+			return nil, err
+		}
+		key.contextName = strings.TrimSpace(key.contextName)
+		key.name = strings.TrimSpace(key.name)
+		key.projectID = strings.TrimSpace(key.projectID)
+		keys[key] = struct{}{}
+	}
+	return keys, rows.Err()
+}
+
+func filterForgottenProjects(projects []ProjectRecord, forgotten map[forgottenProjectKey]struct{}) ([]ProjectRecord, map[string]struct{}) {
+	if len(projects) == 0 || len(forgotten) == 0 {
+		return projects, nil
+	}
+	filtered := make([]ProjectRecord, 0, len(projects))
+	skipped := map[string]struct{}{}
+	for _, project := range projects {
+		if project.Source != ProjectSourceImported && isForgottenProject(project, forgotten) {
+			if id := strings.TrimSpace(project.ID); id != "" {
+				skipped[id] = struct{}{}
+			}
+			continue
+		}
+		filtered = append(filtered, project)
+	}
+	return filtered, skipped
+}
+
+func isForgottenProject(project ProjectRecord, forgotten map[forgottenProjectKey]struct{}) bool {
+	key := forgottenProjectKey{
+		contextName: strings.TrimSpace(project.ContextName),
+		name:        strings.TrimSpace(project.Name),
+		projectID:   strings.TrimSpace(project.ID),
+	}
+	if _, ok := forgotten[key]; ok {
+		return true
+	}
+	if key.projectID == "" {
+		return false
+	}
+	for forgottenKey := range forgotten {
+		if forgottenKey.projectID == key.projectID {
+			return true
+		}
+	}
+	return false
+}
+
+func filterForgottenServices(services []ServiceRecord, skipped map[string]struct{}) []ServiceRecord {
+	if len(services) == 0 || len(skipped) == 0 {
+		return services
+	}
+	filtered := make([]ServiceRecord, 0, len(services))
+	for _, service := range services {
+		if _, ok := skipped[strings.TrimSpace(service.ProjectID)]; ok {
+			continue
+		}
+		filtered = append(filtered, service)
+	}
+	return filtered
+}
+
 func serviceReplacementProjectIDs(projects []ProjectRecord, services []ServiceRecord) []string {
 	if services == nil {
 		return nil
@@ -202,6 +296,48 @@ func (r *ProjectRepository) UpsertImported(ctx context.Context, record ProjectRe
 		record.Source = ProjectSourceImported
 	}
 	return r.SaveSnapshot(ctx, record.ProviderID, []ProjectRecord{record}, nil, record.LastSeenAt, time.Time{})
+}
+
+func (r *ProjectRepository) Forget(ctx context.Context, project ProjectRecord, forgottenAt time.Time) error {
+	providerID := strings.TrimSpace(project.ProviderID)
+	contextName := strings.TrimSpace(project.ContextName)
+	name := strings.TrimSpace(project.Name)
+	projectID := strings.TrimSpace(project.ID)
+	if providerID == "" || name == "" {
+		return nil
+	}
+	if forgottenAt.IsZero() {
+		forgottenAt = time.Now().UTC()
+	}
+	_, err := r.db.ExecContext(ctx, `
+		INSERT INTO forgotten_projects (
+			provider_id, context_name, name, project_id, forgotten_at
+		)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(provider_id, context_name, name) DO UPDATE SET
+			project_id = excluded.project_id,
+			forgotten_at = excluded.forgotten_at
+	`, providerID, contextName, name, projectID, formatTime(forgottenAt))
+	return err
+}
+
+func (r *ProjectRepository) Unforget(ctx context.Context, providerID string, contextName string, name string, projectID string) error {
+	providerID = strings.TrimSpace(providerID)
+	contextName = strings.TrimSpace(contextName)
+	name = strings.TrimSpace(name)
+	projectID = strings.TrimSpace(projectID)
+	if providerID == "" {
+		return nil
+	}
+	_, err := r.db.ExecContext(ctx, `
+		DELETE FROM forgotten_projects
+		WHERE provider_id = ?
+			AND (
+				(context_name = ? AND name = ?)
+				OR (? <> '' AND project_id = ?)
+			)
+	`, providerID, contextName, name, projectID, projectID)
+	return err
 }
 
 func (r *ProjectRepository) Delete(ctx context.Context, projectID string) error {

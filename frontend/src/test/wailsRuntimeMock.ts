@@ -70,6 +70,13 @@ export const Clipboard = {
   },
 };
 
+export const Browser = {
+  async OpenURL(url: string | URL) {
+    void url;
+    return undefined;
+  },
+};
+
 export const Dialogs = {
   async OpenFile() {
     return "/home/cairn/projects/app-db";
@@ -751,7 +758,17 @@ const callHandlers: Record<number, (...args: unknown[]) => unknown> = {
     summary: network,
     subnet: "172.19.0.0/16",
     gateway: "172.19.0.1",
-    containers: [container],
+    containers: [
+      {
+        ...container,
+        networkName: network.name,
+        endpointID: "endpoint-1",
+        ipv4Address: "172.19.0.2/16",
+        gateway: "172.19.0.1",
+        macAddress: "02:42:ac:13:00:02",
+        aliases: ["web", "app-web"],
+      },
+    ],
   }),
   3594940286: () => ({ summary: volume, containers: [container] }),
   364380892: () =>

@@ -127,7 +127,7 @@ func positive(value int64) int64 {
 
 func mapContainerSummary(raw container.Summary) models.ContainerSummary {
 	labels := raw.Labels
-	state := normalizeContainerState(string(raw.State))
+	state := normalizeContainerState(raw.State)
 	health := healthFromStatusText(raw.Status)
 	return models.ContainerSummary{
 		ID:        raw.ID,
@@ -182,7 +182,7 @@ func mapContainerInspectSummary(raw container.InspectResponse) models.ContainerS
 	var stateText string
 	var health models.HealthStatus
 	if base != nil && base.State != nil {
-		stateText = normalizeContainerState(string(base.State.Status))
+		stateText = normalizeContainerState(base.State.Status)
 		health = mapHealthStatus(base.State.Health)
 	}
 	if stateText == "" {

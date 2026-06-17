@@ -49,7 +49,14 @@ export function Modal({
   title,
 }: ModalProps) {
   const panelRef = useRef<HTMLElement>(null);
+  const busyRef = useRef(busy);
+  const onCloseRef = useRef(onClose);
   const titleID = useId();
+
+  useEffect(() => {
+    busyRef.current = busy;
+    onCloseRef.current = onClose;
+  }, [busy, onClose]);
 
   useEffect(() => {
     if (!open) {
@@ -64,8 +71,8 @@ export function Modal({
     (initialFocus ?? panelRef.current)?.focus();
 
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !busy) {
-        onClose();
+      if (event.key === "Escape" && !busyRef.current) {
+        onCloseRef.current();
       }
       if (event.key !== "Tab" || !panelRef.current) {
         return;
@@ -95,7 +102,7 @@ export function Modal({
       window.removeEventListener("keydown", onKeyDown);
       previousFocus?.focus();
     };
-  }, [busy, onClose, open]);
+  }, [open]);
 
   if (!open) {
     return null;

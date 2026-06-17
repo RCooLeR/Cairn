@@ -16,6 +16,7 @@ import (
 	composecore "github.com/RCooLeR/Cairn/internal/compose"
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
+	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/store"
 )
 
@@ -857,6 +858,65 @@ func TestProjectServiceRemoveProjectFromListUsesStoreOnly(t *testing.T) {
 	}
 }
 
+func TestProjectServiceMissingWorkdirStopAndDownUseProjectContainers(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	now := time.Date(2026, 6, 15, 11, 35, 0, 0, time.UTC)
+	missingWorkdir := filepath.Join(t.TempDir(), "gone")
+	project := store.ProjectRecord{
+		ID:          "linux_native/stale",
+		ProviderID:  "linux_native",
+		ContextName: "default",
+		Name:        "stale",
+		WorkingDir:  missingWorkdir,
+		Status:      models.ProjectStatusError,
+		Source:      store.ProjectSourceLabels,
+		LastSeenAt:  now,
+	}
+	if err := db.Projects().SaveSnapshot(ctx, "linux_native", []store.ProjectRecord{project}, []store.ServiceRecord{{
+		ID:         "linux_native/stale/web",
+		ProjectID:  project.ID,
+		Name:       "web",
+		ImageRef:   "nginx",
+		LastSeenAt: now,
+	}}, now, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot() error = %v", err)
+	}
+	docker := newFakeDockerClient()
+	docker.container.ID = "stale-web"
+	docker.container.Name = "stale-web-1"
+	docker.container.ProjectID = project.ID
+	docker.container.State = "running"
+	service := &ProjectService{
+		Client:     composecore.NewClient(newFakeComposeRunner()),
+		Docker:     docker,
+		Projects:   db.Projects(),
+		Audit:      db.Audit(),
+		Plans:      security.NewProjectPlanStore(nil),
+		ProviderID: "linux_native",
+	}
+
+	if err := service.StopProject(ctx, project.ID); err != nil {
+		t.Fatalf("StopProject() error = %v", err)
+	}
+	if len(docker.stopped) != 1 || docker.stopped[0] != "stale-web" {
+		t.Fatalf("stopped = %#v", docker.stopped)
+	}
+	plan, err := service.PlanDownProject(ctx, project.ID, true)
+	if err != nil {
+		t.Fatalf("PlanDownProject() error = %v", err)
+	}
+	if plan.RequiresTypedName != "stale" || !strings.Contains(plan.Commands[0].Command, "stale-web-1") {
+		t.Fatalf("stale down plan = %#v", plan)
+	}
+	if err := service.ApplyProjectPlan(ctx, plan.PlanID, "stale"); err != nil {
+		t.Fatalf("ApplyProjectPlan() error = %v", err)
+	}
+	if len(docker.removed) != 1 || docker.removed[0] != "stale-web" {
+		t.Fatalf("removed = %#v", docker.removed)
+	}
+}
+
 func TestProjectServiceGetProjectIncludesDetailPayload(t *testing.T) {
 	ctx := context.Background()
 	db := openServiceTestStore(t)
@@ -1008,6 +1068,78 @@ func TestProjectServiceStartProjectAuditsAndPublishesProgress(t *testing.T) {
 	}
 	if got := receiveEventPayload(t, done, time.Second); got == nil {
 		t.Fatal("expected job done event")
+	}
+}
+
+func TestProjectServicePullBuildsLocalBuildServices(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	root, composeFile := writeServiceComposeProject(t, "mixed-build")
+	now := time.Date(2026, 6, 17, 8, 39, 0, 0, time.UTC)
+	project := store.ProjectRecord{
+		ID:           "linux_native/mixed-build",
+		ProviderID:   "linux_native",
+		Name:         "mixed-build",
+		WorkingDir:   root,
+		ComposeFiles: []string{composeFile},
+		Status:       models.ProjectStatusStopped,
+		LastSeenAt:   now,
+	}
+	services := []store.ServiceRecord{
+		{
+			ID:         "linux_native/mixed-build/web",
+			ProjectID:  project.ID,
+			Name:       "web",
+			ImageRef:   "nginx:1.27-alpine",
+			LastSeenAt: now,
+		},
+		{
+			ID:           "linux_native/mixed-build/build-a",
+			ProjectID:    project.ID,
+			Name:         "build-a",
+			ImageRef:     "cairn-test/mixed-build-a:latest",
+			BuildContext: ".",
+			LastSeenAt:   now,
+		},
+		{
+			ID:           "linux_native/mixed-build/build-b",
+			ProjectID:    project.ID,
+			Name:         "build-b",
+			ImageRef:     "cairn-test/mixed-build-b:latest",
+			BuildContext: ".",
+			LastSeenAt:   now,
+		},
+		{
+			ID:         "linux_native/mixed-build/db",
+			ProjectID:  project.ID,
+			Name:       "db",
+			ImageRef:   "postgres:16-alpine",
+			LastSeenAt: now,
+		},
+	}
+	if err := db.Projects().SaveSnapshot(ctx, "linux_native", []store.ProjectRecord{project}, services, now, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot() error = %v", err)
+	}
+	runner := newFakeComposeRunner()
+	runner.outputs[root+"|-f "+composeFile+" pull db web"] = providers.CommandResult{Stdout: "registry images pulled\n"}
+	runner.outputs[root+"|-f "+composeFile+" build --pull build-a build-b"] = providers.CommandResult{Stdout: "local images built\n"}
+	service := &ProjectService{
+		Client:     composecore.NewClient(runner),
+		Projects:   db.Projects(),
+		ProviderID: "linux_native",
+	}
+
+	if err := service.PullProject(ctx, project.ID); err != nil {
+		t.Fatalf("PullProject() error = %v", err)
+	}
+	if !runner.hasCall(root + "|-f " + composeFile + " pull db web") {
+		t.Fatalf("compose calls = %#v, want pull only for registry services", runner.calls)
+	}
+	if !runner.hasCall(root + "|-f " + composeFile + " build --pull build-a build-b") {
+		t.Fatalf("compose calls = %#v, want build --pull for build services", runner.calls)
+	}
+	if runner.hasCall(root+"|-f "+composeFile+" pull build-a") || runner.hasCall(root+"|-f "+composeFile+" pull build-b") {
+		t.Fatalf("build service was sent to compose pull: %#v", runner.calls)
 	}
 }
 
@@ -1214,6 +1346,16 @@ func (f *fakeDockerClient) GetContainer(context.Context, string) (*models.Contai
 
 func (f *fakeDockerClient) InspectContainerRaw(context.Context, string) (string, error) {
 	return `{"Id":"container-1"}`, nil
+}
+
+func (f *fakeDockerClient) ListContainerFiles(_ context.Context, id string, path string) (*models.ContainerFileListing, error) {
+	return &models.ContainerFileListing{
+		ContainerID: id,
+		Path:        path,
+		Entries: []models.ContainerFileEntry{
+			{Name: "app", Path: "/app", Type: "directory"},
+		},
+	}, nil
 }
 
 func (f *fakeDockerClient) StartContainer(_ context.Context, id string) error {

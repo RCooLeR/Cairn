@@ -2,6 +2,8 @@ import type {
   AuditEntry,
   BackupSummary,
   CommandPlan,
+  ContainerDetail,
+  ContainerFileListing,
   ContainerSummary,
   DashboardMetrics,
   DockerContextInfo,
@@ -12,7 +14,6 @@ import type {
   ImageSummary,
   ImageUpdate,
   LogLine,
-  MetricRankItem,
   MountSpec,
   NetworkDetail,
   NetworkSummary,
@@ -28,10 +29,12 @@ import type {
   RegistryAuthStatus,
   RegistryPreset,
   RunImageRequest,
+  TerminalSessionInfo,
   UpdateHistoryItem,
   UpdatePlan,
   VolumeDetail,
   VolumeSummary,
+  WSLDistroInfo,
 } from "../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
 import {
   UpdateKind,
@@ -39,10 +42,8 @@ import {
 } from "../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
 
 import {
-  Activity,
   AlertTriangle,
   ArrowDown,
-  BarChart3,
   Bell,
   Box,
   CheckCircle2,
@@ -62,7 +63,6 @@ import {
   List,
   LogIn,
   MemoryStick,
-  MoreVertical,
   PackagePlus,
   Pencil,
   Plus,
@@ -86,6 +86,7 @@ import {
   Wifi,
   Wrench,
   WrapText,
+  X,
 } from "lucide-react";
 import {
   type RefObject,
@@ -112,7 +113,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { Clipboard, Dialogs, Events } from "@wailsio/runtime";
+import { Browser, Clipboard, Dialogs, Events } from "@wailsio/runtime";
 
 import { getAppVersion } from "./api/app";
 import {
@@ -125,6 +126,7 @@ import {
   ProjectService,
   RegistryService,
   SettingsService,
+  TerminalService,
   UpdateService,
 } from "./api/services";
 import {
@@ -188,7 +190,6 @@ import { useToastQueue, type ToastInput } from "./hooks/useToastQueue";
 import {
   chartColors,
   containerStatusChartSegments,
-  dashboardTopRows,
   emptyContainerStatusChartSegment,
 } from "./overview/dashboardData";
 import { dateMillis, formatDate, relativeTime, toDate } from "./utils/time";
@@ -218,11 +219,20 @@ type ProjectTabID =
   | "overview"
   | "services"
   | "containers"
+  | "logs"
   | "updates"
   | "compose"
   | "backups";
+type ContainerDrilldownTabID =
+  | "overview"
+  | "logs"
+  | "files"
+  | "terminal"
+  | "inspect";
+type NetworkTabID = "overview" | "containers" | "labels" | "raw";
+type ComposeServiceRow = NonNullable<ProjectDetail["services"]>[number];
 type LogScope = "all" | "project" | "service" | "container";
-type LogLevelFilter = "error" | "warn" | "info" | "debug" | "unknown";
+type LogLevelFilter = "error" | "warn" | "info" | "debug" | "log" | "unknown";
 type SetupStepID =
   | "welcome"
   | "backend"
@@ -297,7 +307,8 @@ type ProjectAction =
   | "pull"
   | "redeploy"
   | "down"
-  | "down-volumes";
+  | "down-volumes"
+  | "remove";
 type ConfirmPlanKind =
   | "container"
   | "project"
@@ -311,6 +322,13 @@ type ConfirmState = {
   planKind: ConfirmPlanKind;
   targetName: string;
   typedName: string;
+  busy: boolean;
+  error?: string;
+};
+
+type RemoveProjectState = {
+  open: boolean;
+  project: ProjectSummary | null;
   busy: boolean;
   error?: string;
 };
@@ -556,6 +574,9 @@ type SparkPoint = {
   value: number;
 };
 
+type SparkPointMap = Record<string, SparkPoint[]>;
+type ProjectMetricSparks = Record<DashboardMetricID, SparkPointMap>;
+
 const navItems: NavItem[] = [
   { id: "overview", label: "Overview", icon: Gauge },
   { id: "projects", label: "Projects", icon: LayoutGrid },
@@ -600,6 +621,12 @@ const emptyConfirm: ConfirmState = {
   planKind: "container",
   targetName: "",
   typedName: "",
+  busy: false,
+};
+
+const emptyRemoveProject: RemoveProjectState = {
+  open: false,
+  project: null,
   busy: false,
 };
 
@@ -1057,10 +1084,19 @@ function App() {
     return saved === "list" ? "list" : "grid";
   });
   const [containerFilter, setContainerFilter] = useState<FilterID>("all");
+  const [activeContainerID, setActiveContainerID] = useState<string | null>(
+    null,
+  );
+  const [containerDetailTab, setContainerDetailTab] =
+    useState<ContainerDrilldownTabID>("overview");
   const [imageFilter, setImageFilter] = useState<FilterID>("all");
   const [volumeFilter, setVolumeFilter] = useState<FilterID>("all");
+  const [activeNetworkID, setActiveNetworkID] = useState<string | null>(null);
+  const [networkTab, setNetworkTab] = useState<NetworkTabID>("overview");
   const [inspect, setInspect] = useState<InspectState>(emptyInspect);
   const [confirm, setConfirm] = useState<ConfirmState>(emptyConfirm);
+  const [removeProject, setRemoveProject] =
+    useState<RemoveProjectState>(emptyRemoveProject);
   const [rename, setRename] = useState<RenameState>(emptyRename);
   const [runImage, setRunImage] = useState<RunImageState>(emptyRunImage);
   const [pullImage, setPullImage] = useState<PullImageState>(emptyPullImage);
@@ -1135,6 +1171,8 @@ function App() {
     () => new Set<string>(),
   );
   const [busyActionIDs, setBusyActionIDs] = useState(() => new Set<string>());
+  const [terminalInitialSession, setTerminalInitialSession] =
+    useState<TerminalSessionInfo | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [providerActionBusy, setProviderActionBusy] = useState(false);
   const [repairOpen, setRepairOpen] = useState(false);
@@ -1152,6 +1190,9 @@ function App() {
   const [dockerContextsError, setDockerContextsError] = useState<string | null>(
     null,
   );
+  const [wslDistros, setWSLDistros] = useState<WSLDistroInfo[]>([]);
+  const [wslDistrosLoading, setWSLDistrosLoading] = useState(false);
+  const [wslDistrosError, setWSLDistrosError] = useState<string | null>(null);
   const [providerAutostart, setProviderAutostart] = useState(true);
   const [settingsSaving, setSettingsSaving] = useState(false);
   const [settingsMessage, setSettingsMessage] = useState<string | null>(null);
@@ -1198,12 +1239,19 @@ function App() {
   const [projectSparks, setProjectSparks] = useState<
     Record<string, SparkPoint[]>
   >({});
+  const [projectMetricSparks, setProjectMetricSparks] =
+    useState<ProjectMetricSparks>(() => emptyProjectMetricSparks());
   const themePreference = normalizeThemePreference(
     appSettings["general.theme"],
   );
 
   const navigate = useCallback((page: PageID) => {
+    setActionError(null);
     setActivePage(page);
+    setActiveContainerID(null);
+    setContainerDetailTab("overview");
+    setActiveNetworkID(null);
+    setNetworkTab("overview");
     setSearch("");
   }, []);
 
@@ -2040,6 +2088,9 @@ function App() {
       setProjectSparks((current) =>
         appendSparkEntries(current, projectSparkEntries(samples, label)),
       );
+      setProjectMetricSparks((current) =>
+        appendProjectMetricSparkEntries(current, samples, label),
+      );
       if (!chartPausedRef.current) {
         setChartPoints((current) =>
           trimChartPoints(current.concat(aggregateChartPoint(samples, label))),
@@ -2056,6 +2107,7 @@ function App() {
       setLatestSamples({});
       setContainerSparks({});
       setProjectSparks({});
+      setProjectMetricSparks(emptyProjectMetricSparks());
       setChartPoints([]);
       return undefined;
     }
@@ -2311,6 +2363,15 @@ function App() {
     await saveSetting("windows.wsl_distro", nextDistro);
   }, [saveSetting, wslDistro]);
 
+  const selectWSLDistro = useCallback(
+    async (distro: string) => {
+      const nextDistro = distro.trim() || "Ubuntu";
+      setWSLDistro(nextDistro);
+      await saveSetting("windows.wsl_distro", nextDistro);
+    },
+    [saveSetting],
+  );
+
   const saveColimaProfile = useCallback(async () => {
     const nextProfile = colimaProfile.trim() || "default";
     setColimaProfile(nextProfile);
@@ -2349,6 +2410,22 @@ function App() {
       );
     } finally {
       setDockerContextsLoading(false);
+    }
+  }, []);
+
+  const refreshWSLDistros = useCallback(async () => {
+    setWSLDistrosLoading(true);
+    setWSLDistrosError(null);
+    try {
+      const distros = await ProviderService.ListWSLDistros();
+      setWSLDistros(distros ?? []);
+    } catch (error: unknown) {
+      setWSLDistros([]);
+      setWSLDistrosError(
+        error instanceof Error ? error.message : "Unable to list WSL distros",
+      );
+    } finally {
+      setWSLDistrosLoading(false);
     }
   }, []);
 
@@ -2508,8 +2585,9 @@ function App() {
   useEffect(() => {
     if (activePage === "settings") {
       void refreshDockerContexts();
+      void refreshWSLDistros();
     }
-  }, [activePage, refreshDockerContexts]);
+  }, [activePage, refreshDockerContexts, refreshWSLDistros]);
 
   useEffect(() => {
     RegistryService.KnownRegistries()
@@ -3188,6 +3266,15 @@ function App() {
 
   const runProjectAction = useCallback(
     async (action: ProjectAction, project: ProjectSummary) => {
+      if (action === "remove") {
+        setActionError(null);
+        setRemoveProject({
+          open: true,
+          project,
+          busy: false,
+        });
+        return;
+      }
       if (!ensureDockerReady()) {
         return;
       }
@@ -3244,6 +3331,48 @@ function App() {
       setActionBusy,
     ],
   );
+
+  const confirmRemoveProject = useCallback(async () => {
+    const project = removeProject.project;
+    if (!project) {
+      return;
+    }
+    const key = projectActionBusyKey("remove", project.id);
+    setActionError(null);
+    setActionBusy(key, true);
+    setRemoveProject((current) => ({ ...current, busy: true, error: "" }));
+    try {
+      await ProjectService.RemoveProjectFromList(project.id);
+      pushToast({
+        body: project.name,
+        level: "ok",
+        title: "Project removed from list",
+      });
+      if (activeProjectID === project.id) {
+        closeProjectDetail();
+      }
+      setRemoveProject(emptyRemoveProject);
+      await refreshProjects();
+      await refreshUpdateSurfaces();
+    } catch (error: unknown) {
+      setRemoveProject((current) => ({
+        ...current,
+        busy: false,
+        error:
+          error instanceof Error ? error.message : "Unable to remove project",
+      }));
+    } finally {
+      setActionBusy(key, false);
+    }
+  }, [
+    activeProjectID,
+    closeProjectDetail,
+    pushToast,
+    refreshProjects,
+    refreshUpdateSurfaces,
+    removeProject.project,
+    setActionBusy,
+  ]);
 
   const openRunImageModal = useCallback((image?: ImageSummary) => {
     const ref = image ? primaryImageRef(image) : "";
@@ -3886,6 +4015,54 @@ function App() {
       });
   }, []);
 
+  const openContainerTerminal = useCallback(
+    async (container: ContainerSummary) => {
+      try {
+        const session = await TerminalService.OpenContainerTerminal(
+          container.id,
+          {
+            cols: 120,
+            rows: 30,
+          },
+        );
+        setTerminalInitialSession(session ?? null);
+        pushToast({
+          body: container.service || shortID(container.id),
+          level: "ok",
+          title: "Container terminal opened",
+        });
+        navigate("terminal");
+      } catch (error: unknown) {
+        setActionError(
+          error instanceof Error
+            ? error.message
+            : "Unable to open container terminal",
+        );
+      }
+    },
+    [navigate, pushToast],
+  );
+
+  const openProjectFolder = useCallback(
+    async (project: ProjectSummary) => {
+      const workdir = project.workingDir?.trim();
+      if (!workdir) {
+        return;
+      }
+      try {
+        await Browser.OpenURL(hostPathFileURL(workdir));
+      } catch {
+        await Clipboard.SetText(workdir);
+        pushToast({
+          body: workdir,
+          level: "warn",
+          title: "Folder path copied",
+        });
+      }
+    },
+    [pushToast],
+  );
+
   const openImageInspect = useCallback(
     (image: ImageSummary) => {
       setInspect({
@@ -3964,45 +4141,41 @@ function App() {
     [volumeDetails],
   );
 
-  const openNetworkInspect = useCallback(
+  const openNetworkDetail = useCallback(
     (network: NetworkSummary) => {
-      const detail = networkDetails[network.id];
-      setInspect({
-        open: true,
-        title: network.name,
-        subtitle: shortID(network.id),
-        rows: networkRows(network, detail),
-        raw: detail ? JSON.stringify(detail, null, 2) : undefined,
-        loading: !detail,
-      });
-      if (detail) {
-        return;
+      setActionError(null);
+      setActivePage("networks");
+      setActiveContainerID(null);
+      setContainerDetailTab("overview");
+      setActiveNetworkID(network.id);
+      setNetworkTab("overview");
+      setSearch("");
+      if (!networkDetails[network.id]) {
+        void refreshNetworks();
       }
-      DockerService.GetNetwork(network.id)
-        .then((nextDetail) => {
-          setInspect({
-            open: true,
-            title: network.name,
-            subtitle: shortID(network.id),
-            rows: networkRows(network, nextDetail ?? undefined),
-            raw: nextDetail ? JSON.stringify(nextDetail, null, 2) : undefined,
-          });
-        })
-        .catch((error: unknown) => {
-          setInspect({
-            open: true,
-            title: network.name,
-            subtitle: shortID(network.id),
-            rows: networkRows(network),
-            error:
-              error instanceof Error
-                ? error.message
-                : "Unable to inspect network",
-          });
-        });
     },
-    [networkDetails],
+    [networkDetails, refreshNetworks],
   );
+
+  const openContainerDetail = useCallback(
+    (
+      container: ContainerSummary,
+      tab: ContainerDrilldownTabID = "overview",
+    ) => {
+      setActionError(null);
+      setActivePage("containers");
+      setActiveContainerID(container.id);
+      setContainerDetailTab(tab);
+      setActiveNetworkID(null);
+      setNetworkTab("overview");
+    },
+    [],
+  );
+
+  const closeContainerDetail = useCallback(() => {
+    setActiveContainerID(null);
+    setContainerDetailTab("overview");
+  }, []);
 
   const content = (() => {
     switch (activePage) {
@@ -4030,6 +4203,7 @@ function App() {
               onBackupVolume={openBackupVolume}
               onCheckUpdates={checkAllUpdates}
               onIgnoreUpdate={openIgnoreUpdate}
+              onOpenContainerTerminal={openContainerTerminal}
               onRefresh={() => {
                 void refreshProjectDetail(activeProjectID);
                 void refreshBackups();
@@ -4059,6 +4233,10 @@ function App() {
                   projectIDForVolume(volume, projects) ===
                     projectDetail.summary.id,
               )}
+              dockerRunning={dockerRunning}
+              inventoryLoading={inventoryStatus === "loading"}
+              onToast={pushToast}
+              projectsLoading={projectsStatus === "loading"}
               tab={projectTab}
               updates={updates.filter(
                 (update) => update.projectID === projectID,
@@ -4080,6 +4258,7 @@ function App() {
               setImportProject({ ...emptyImportProject, open: true })
             }
             onOpen={openProjectDetail}
+            onOpenFolder={openProjectFolder}
             onRefresh={refreshProjects}
             onSortChange={setProjectSort}
             onViewChange={changeProjectView}
@@ -4163,8 +4342,14 @@ function App() {
         return (
           <TerminalPage
             containers={containers}
+            initialSession={terminalInitialSession}
             onCommandConsumed={(id) =>
               setQueuedTerminalCommand((current) =>
+                current?.id === id ? null : current,
+              )
+            }
+            onInitialSessionConsumed={(id) =>
+              setTerminalInitialSession((current) =>
                 current?.id === id ? null : current,
               )
             }
@@ -4201,6 +4386,9 @@ function App() {
             onOpenSetup={openProviderSetup}
             onRefreshDockerContexts={() => {
               void refreshDockerContexts();
+            }}
+            onRefreshWSLDistros={() => {
+              void refreshWSLDistros();
             }}
             onRefreshRegistries={() => {
               void refreshRegistryAccounts();
@@ -4254,6 +4442,9 @@ function App() {
             onUseDockerContext={(name) => {
               void activateDockerContext(name);
             }}
+            onUseWSLDistro={(distro) => {
+              void selectWSLDistro(distro);
+            }}
             onWSLDistroChange={setWSLDistro}
             providers={providers}
             registryAccounts={registryAccounts}
@@ -4267,9 +4458,49 @@ function App() {
             onSectionChange={setSettingsSection}
             version={version}
             wslDistro={wslDistro}
+            wslDistros={wslDistros}
+            wslDistrosError={wslDistrosError}
+            wslDistrosLoading={wslDistrosLoading}
           />
         );
       case "containers":
+        if (activeContainerID) {
+          const activeContainer =
+            containers.find((item) => item.id === activeContainerID) ?? null;
+          const activeContainerProject = activeContainer?.projectID
+            ? (projects.find(
+                (project) => project.id === activeContainer.projectID,
+              ) ?? null)
+            : null;
+          if (!activeContainer) {
+            return (
+              <EmptyState
+                action={
+                  <Button onClick={closeContainerDetail}>
+                    Back to containers
+                  </Button>
+                }
+                body="The selected container is no longer present in the current inventory."
+                icon={<Container size={28} />}
+                title="Container not found"
+              />
+            );
+          }
+          return (
+            <ContainerDetailPage
+              container={activeContainer}
+              dockerRunning={dockerRunning}
+              inventoryLoading={inventoryStatus === "loading"}
+              onBack={closeContainerDetail}
+              onOpenContainerTerminal={openContainerTerminal}
+              onTabChange={setContainerDetailTab}
+              onToast={pushToast}
+              project={activeContainerProject}
+              projectsLoading={projectsStatus === "loading"}
+              tab={containerDetailTab}
+            />
+          );
+        }
         return (
           <ContainersPage
             actionBusyIDs={busyActionIDs}
@@ -4282,6 +4513,7 @@ function App() {
             onBulkAction={runBulkContainerAction}
             onFilterChange={setContainerFilter}
             onInspect={openContainerInspect}
+            onOpen={openContainerDetail}
             onRename={openRenameModal}
             onToggleAllSelection={toggleAllContainerSelection}
             onToggleSelection={toggleContainerSelection}
@@ -4333,6 +4565,33 @@ function App() {
           />
         );
       case "networks":
+        if (activeNetworkID) {
+          const network =
+            networks.find((item) => item.id === activeNetworkID) ??
+            networkDetails[activeNetworkID]?.summary;
+          return (
+            <NetworkDetailPage
+              containers={containers}
+              detail={
+                activeNetworkID ? networkDetails[activeNetworkID] : undefined
+              }
+              loading={inventoryStatus === "loading"}
+              mutationsDisabled={mutationsDisabled}
+              mutationDisabledReason={mutationDisabledReason}
+              network={network}
+              onBack={() => {
+                setActiveNetworkID(null);
+                setNetworkTab("overview");
+              }}
+              onOpenContainerInspect={openContainerInspect}
+              onOpenContainerTerminal={openContainerTerminal}
+              onRefresh={refreshNetworks}
+              onRemove={openRemoveNetworkPlan}
+              onTabChange={setNetworkTab}
+              tab={networkTab}
+            />
+          );
+        }
         return (
           <NetworksPage
             loading={inventoryStatus === "loading"}
@@ -4343,7 +4602,7 @@ function App() {
             onCreate={() =>
               setCreateNetwork({ ...emptyCreateNetwork, open: true })
             }
-            onInspect={openNetworkInspect}
+            onInspect={openNetworkDetail}
             onRemove={openRemoveNetworkPlan}
             search={search}
           />
@@ -4379,6 +4638,7 @@ function App() {
             onRestartDocker={restartProvider}
             onShowContainers={showContainers}
             provider={activeProvider}
+            projectMetricSparks={projectMetricSparks}
             projectSparks={projectSparks}
             projects={projects}
             projectsLoading={projectsStatus === "loading"}
@@ -4402,7 +4662,6 @@ function App() {
               className="h-9 max-w-32 object-contain"
             />
             <div className="min-w-0">
-              <div className="text-sm font-semibold">Cairn</div>
               <div className="truncate text-xs text-text-muted">
                 {versionLabel}
               </div>
@@ -4593,8 +4852,23 @@ function App() {
             providerWarnings={providerWarnings}
           />
           {actionError ? (
-            <div className="border-b border-border bg-error/10 px-6 py-3 text-sm text-error">
-              {actionError}
+            <div
+              className="flex items-start gap-3 border-b border-error/20 bg-error/10 px-6 py-3 text-sm text-error"
+              role="alert"
+            >
+              <AlertTriangle className="mt-0.5 shrink-0" size={16} />
+              <div className="max-h-32 min-w-0 flex-1 overflow-auto break-words font-mono text-xs leading-5">
+                {actionError}
+              </div>
+              <Tooltip label="Dismiss error">
+                <Button
+                  aria-label="Dismiss error"
+                  icon={<X size={16} />}
+                  onClick={() => setActionError(null)}
+                  size="icon"
+                  variant="ghost"
+                />
+              </Tooltip>
             </div>
           ) : null}
 
@@ -4630,6 +4904,13 @@ function App() {
           setConfirm((current) => ({ ...current, typedName }))
         }
         onClose={() => setConfirm(emptyConfirm)}
+      />
+      <RemoveProjectModal
+        onClose={() => setRemoveProject(emptyRemoveProject)}
+        onConfirm={() => {
+          void confirmRemoveProject();
+        }}
+        state={removeProject}
       />
       <UpdatePlanModal
         onApply={() => {
@@ -6100,6 +6381,7 @@ type OverviewProps = {
   latestSamples: Record<string, StatsSample>;
   metricsStreamError: string | null;
   volumes: VolumeSummary[];
+  projectMetricSparks: ProjectMetricSparks;
   projectSparks: Record<string, SparkPoint[]>;
   projects: ProjectSummary[];
   projectsLoading: boolean;
@@ -6142,6 +6424,7 @@ function OverviewPage({
   onRestartDocker,
   onShowContainers,
   provider,
+  projectMetricSparks,
   projectSparks,
   projects,
   projectsLoading,
@@ -6323,10 +6606,7 @@ function OverviewPage({
   const paused = containers.filter(
     (container) => container.state === "paused",
   ).length;
-  const topRows = useMemo(
-    () => dashboardTopRows(dashboard?.top ?? [], latestSamples),
-    [dashboard?.top, latestSamples],
-  );
+  const activeProjectSparks = projectMetricSparks[metric] ?? projectSparks;
   const recentContainers = useMemo(
     () =>
       [...containers]
@@ -6342,11 +6622,11 @@ function OverviewPage({
       [...projects]
         .sort(
           (left, right) =>
-            projectActivityScore(right, projectSparks[right.id]) -
-            projectActivityScore(left, projectSparks[left.id]),
+            projectActivityScore(right, activeProjectSparks[right.id]) -
+            projectActivityScore(left, activeProjectSparks[left.id]),
         )
         .slice(0, 5),
-    [projectSparks, projects],
+    [activeProjectSparks, projects],
   );
   const updateSummary = useMemo(
     () => summarizeProjectUpdates(projects),
@@ -6433,7 +6713,7 @@ function OverviewPage({
         </div>
       ) : null}
 
-      <section className="grid gap-4 xl:grid-cols-[1fr_1.35fr]">
+      <section className="grid gap-3 xl:grid-cols-[360px_minmax(0,1fr)]">
         <EngineHeroCard dockerRunning={dockerRunning} provider={provider} />
         <DashboardCountsStrip
           containers={containers}
@@ -6446,6 +6726,7 @@ function OverviewPage({
           onCleanUp={() => setCleanup({ ...emptyCleanup, open: true })}
           onNavigate={onNavigate}
           onShowContainers={onShowContainers}
+          projectCount={projects.length}
           runningContainers={runningContainers}
           volumes={volumes}
         />
@@ -6489,9 +6770,10 @@ function OverviewPage({
         />
         <ProjectsMiniList
           loading={projectsLoading}
+          metric={metric}
           onOpenProject={onOpenProject}
           onViewAll={() => onNavigate("projects")}
-          projectSparks={projectSparks}
+          projectSparks={activeProjectSparks}
           projects={liveProjects}
         />
       </section>
@@ -6521,11 +6803,6 @@ function OverviewPage({
         </div>
       </section>
 
-      <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
-        <TopContainersTable rows={topRows} />
-        <RecentEventsPanel events={dashboard?.recentEvents ?? []} />
-      </section>
-
       <CleanupModal
         onChange={(patch) =>
           setCleanup((current) => ({ ...current, ...patch }))
@@ -6552,15 +6829,15 @@ function EngineHeroCard({
     <Card
       className={!dockerRunning ? "border-neutral/30 bg-bg-inset" : undefined}
     >
-      <CardBody className="flex items-center justify-between gap-5">
+      <CardBody className="space-y-3 p-3">
         <div className="min-w-0">
-          <div className="flex items-center gap-3">
+          <div className="flex items-start gap-3">
             <StatusDot
               pulse={!dockerRunning && provider?.healthy}
               tone={dockerRunning ? "ok" : "neutral"}
             />
             <div className="min-w-0">
-              <div className="text-lg font-semibold">
+              <div className="truncate text-base font-semibold">
                 Docker Engine - {dockerRunning ? "Running" : "Stopped"}
               </div>
               <div className="truncate text-sm text-text-muted">
@@ -6568,13 +6845,24 @@ function EngineHeroCard({
               </div>
             </div>
           </div>
-          <div className="mt-5 grid gap-3 text-sm sm:grid-cols-3">
+          <div className="mt-3 grid gap-2 text-xs sm:grid-cols-3">
             <StatusPill label="Provider" ok={provider?.healthy ?? false} />
             <StatusPill label="Context" ok={dockerRunning} value={context} />
             <StatusPill label="Engine" ok={dockerRunning} value={version} />
           </div>
         </div>
-        <Server className="h-16 w-16 text-accent/70" strokeWidth={1.4} />
+        <div className="sm:hidden">
+          <div
+            className={
+              dockerRunning
+                ? "inline-flex items-center gap-2 rounded-md border border-accent/40 bg-accent-soft px-2.5 py-1.5 text-sm font-semibold text-accent"
+                : "inline-flex items-center gap-2 rounded-md border border-border bg-bg-inset px-2.5 py-1.5 text-sm font-semibold text-text-muted"
+            }
+          >
+            <Gauge className="h-4 w-4" />
+            {dockerRunning ? "Running" : "Stopped"}
+          </div>
+        </div>
       </CardBody>
     </Card>
   );
@@ -6591,6 +6879,7 @@ function DashboardCountsStrip({
   onCleanUp,
   onNavigate,
   onShowContainers,
+  projectCount,
   runningContainers,
   volumes,
 }: {
@@ -6606,20 +6895,21 @@ function DashboardCountsStrip({
   onCleanUp: () => void;
   onNavigate: (page: PageID) => void;
   onShowContainers: (filter: FilterID) => void;
+  projectCount: number;
 }) {
   const stopped = Math.max(0, containers.length - runningContainers);
   const imageCounts = useMemo(() => imageFilterCounts(images, {}), [images]);
   const volumeCounts = useMemo(() => volumeFilterCounts(volumes), [volumes]);
   return (
     <section
-      className="grid gap-3 sm:grid-cols-2 2xl:grid-cols-5"
+      className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5"
       aria-label="Docker object counts"
     >
       <MetricButton
         hint="Compose stacks"
         label="Projects"
         onClick={() => onNavigate("projects")}
-        value={counts.projects}
+        value={projectCount}
       />
       <MetricButton
         hint={`${runningContainers} running / ${stopped} stopped`}
@@ -6641,7 +6931,7 @@ function DashboardCountsStrip({
       />
       <button
         className={[
-          "rounded-card border border-border bg-bg-card p-4 text-left transition",
+          "rounded-card border border-border bg-bg-card p-3 text-left transition",
           mutationsDisabled
             ? "cursor-not-allowed opacity-60"
             : "hover:border-border-strong hover:bg-bg-panel",
@@ -6652,10 +6942,10 @@ function DashboardCountsStrip({
         type="button"
       >
         <div className="text-sm text-text-secondary">Disk</div>
-        <div className="mt-3 text-2xl font-semibold">
+        <div className="mt-1 text-xl font-semibold">
           {formatBytes(diskTotal)}
         </div>
-        <div className="mt-2 text-xs text-text-muted">
+        <div className="mt-1 text-xs text-text-muted">
           {formatBytes(diskReclaimable)} reclaimable
         </div>
       </button>
@@ -6884,6 +7174,7 @@ function DashboardChartTooltip({
 
 function ProjectsMiniList({
   loading,
+  metric,
   onOpenProject,
   onViewAll,
   projectSparks,
@@ -6891,10 +7182,13 @@ function ProjectsMiniList({
 }: {
   projects: ProjectSummary[];
   loading: boolean;
+  metric: DashboardMetricID;
   projectSparks: Record<string, SparkPoint[]>;
   onOpenProject: (project: ProjectSummary) => void;
   onViewAll: () => void;
 }) {
+  const sparkColor = dashboardMetricColor(metric);
+  const metricLabel = dashboardMetricLabel(metric);
   return (
     <Card>
       <CardHeader
@@ -6939,10 +7233,11 @@ function ProjectsMiniList({
                 </div>
               </div>
               <Sparkline
-                color={chartColors.spark}
-                label={`${project.name} project activity trend`}
+                color={sparkColor}
+                label={`${project.name} project ${metricLabel} trend`}
                 points={
-                  projectSparks[project.id] ?? projectSparkPoints(project)
+                  projectSparks[project.id] ??
+                  projectSparkPoints(project, metric)
                 }
               />
             </button>
@@ -7069,14 +7364,24 @@ function ContainerHealthPanel({
                       </Badge>
                     </td>
                     <td className="px-3 py-2">
-                      <Sparkline
-                        color={chartColors.spark}
-                        label={`${container.name || shortID(container.id)} container activity trend`}
-                        points={
-                          containerSparks[container.id] ??
-                          containerSparkPoints(container)
-                        }
-                      />
+                      <div className="grid grid-cols-[3.75rem_minmax(0,1fr)] items-center gap-2">
+                        <span className="tabular-nums font-medium text-text-primary">
+                          {(
+                            sample?.cpuPercent ??
+                            container.cpuPercent ??
+                            0
+                          ).toFixed(1)}
+                          %
+                        </span>
+                        <Sparkline
+                          color={chartColors.spark}
+                          label={`${container.name || shortID(container.id)} container CPU trend`}
+                          points={
+                            containerSparks[container.id] ??
+                            containerSparkPoints(container)
+                          }
+                        />
+                      </div>
                     </td>
                     <td className="truncate px-3 py-2 text-text-muted">
                       {formatBytes(
@@ -7212,87 +7517,6 @@ function UpdatesCard({
   );
 }
 
-function TopContainersTable({ rows }: { rows: MetricRankItem[] }) {
-  return (
-    <Card>
-      <CardHeader
-        actions={<BarChart3 size={16} className="text-text-muted" />}
-        title="Top Containers"
-      />
-      <CardBody>
-        <div className="overflow-hidden rounded-control border border-border">
-          <table className="w-full table-fixed text-sm">
-            <thead className="bg-bg-inset text-xs uppercase text-text-muted">
-              <tr>
-                <th className="px-3 py-2 text-left font-medium">Name</th>
-                <th className="px-3 py-2 text-left font-medium">Kind</th>
-                <th className="px-3 py-2 text-left font-medium">CPU</th>
-                <th className="px-3 py-2 text-left font-medium">Memory</th>
-              </tr>
-            </thead>
-            <tbody>
-              {rows.map((row) => (
-                <tr className="border-t border-border" key={row.id}>
-                  <td className="truncate px-3 py-2">{row.name}</td>
-                  <td className="px-3 py-2 text-text-muted">{row.kind}</td>
-                  <td className="px-3 py-2">
-                    {(row.cpuPercent ?? 0).toFixed(1)}%
-                  </td>
-                  <td className="px-3 py-2 text-text-muted">
-                    {formatBytes(row.memoryBytes)}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          {rows.length === 0 ? (
-            <div className="p-4 text-sm text-text-muted">
-              No stats samples yet
-            </div>
-          ) : null}
-        </div>
-      </CardBody>
-    </Card>
-  );
-}
-
-function RecentEventsPanel({ events }: { events: AuditEntry[] }) {
-  return (
-    <Card>
-      <CardHeader
-        actions={<Activity size={16} className="text-text-muted" />}
-        title="Recent Events"
-      />
-      <CardBody>
-        <div className="space-y-2">
-          {events.slice(0, 10).map((event) => (
-            <div
-              className="rounded-control border border-border bg-bg-inset px-3 py-2 text-sm"
-              key={event.id}
-            >
-              <div className="flex items-center justify-between gap-2">
-                <span className="min-w-0 truncate">{event.action}</span>
-                <Badge tone={event.result === "success" ? "ok" : "neutral"}>
-                  {event.result || "event"}
-                </Badge>
-              </div>
-              <div className="mt-1 truncate text-xs text-text-muted">
-                {event.target || event.actor || "docker"} -{" "}
-                {relativeTime(dateMillis(event.ts))}
-              </div>
-            </div>
-          ))}
-          {events.length === 0 ? (
-            <div className="text-sm text-text-muted">
-              No recent Docker events
-            </div>
-          ) : null}
-        </div>
-      </CardBody>
-    </Card>
-  );
-}
-
 function Sparkline({
   color,
   label = "Metric trend",
@@ -7335,6 +7559,7 @@ const logLevelOptions: Array<{
   { id: "warn", label: "WARN", tone: "warn" },
   { id: "info", label: "INFO", tone: "info" },
   { id: "debug", label: "DEBUG", tone: "neutral" },
+  { id: "log", label: "LOG", tone: "neutral" },
   { id: "unknown", label: "unknown", tone: "neutral" },
 ];
 
@@ -7344,8 +7569,12 @@ const logRowOverscan = 8;
 type LogsPageProps = {
   containers: ContainerSummary[];
   dockerRunning: boolean;
+  initialContainerIDs?: string[];
+  initialProjectID?: string;
+  initialScope?: LogScope;
   projects: ProjectSummary[];
   inventoryLoading: boolean;
+  lockedScope?: boolean;
   projectsLoading: boolean;
   onToast: (toast: ToastInput) => void;
 };
@@ -7359,16 +7588,22 @@ type LogOption = {
 function LogsPage({
   containers,
   dockerRunning,
+  initialContainerIDs,
+  initialProjectID,
+  initialScope,
   inventoryLoading,
+  lockedScope = false,
   onToast,
   projects,
   projectsLoading,
 }: LogsPageProps) {
-  const [scope, setScope] = useState<LogScope>("all");
-  const [selectedProjectID, setSelectedProjectID] = useState("");
+  const [scope, setScope] = useState<LogScope>(initialScope ?? "all");
+  const [selectedProjectID, setSelectedProjectID] = useState(
+    initialProjectID ?? "",
+  );
   const [selectedServiceID, setSelectedServiceID] = useState("");
   const [selectedContainerIDs, setSelectedContainerIDs] = useState<string[]>(
-    [],
+    initialContainerIDs ?? [],
   );
   const [lines, setLines] = useState<LogLine[]>([]);
   const [streamID, setStreamID] = useState<string | null>(null);
@@ -7439,6 +7674,22 @@ function LogsPage({
         .sort((left, right) => left.label.localeCompare(right.label)),
     [containers],
   );
+
+  const initialContainerIDsKey = (initialContainerIDs ?? []).join("\u0000");
+
+  useEffect(() => {
+    if (initialScope) {
+      setScope(initialScope);
+    }
+    if (typeof initialProjectID === "string") {
+      setSelectedProjectID(initialProjectID);
+    }
+    if (typeof initialContainerIDsKey === "string") {
+      setSelectedContainerIDs(
+        initialContainerIDsKey ? initialContainerIDsKey.split("\u0000") : [],
+      );
+    }
+  }, [initialContainerIDsKey, initialProjectID, initialScope]);
 
   useEffect(() => {
     if (scope === "project" && !selectedProjectID && projectOptions[0]) {
@@ -7805,11 +8056,17 @@ function LogsPage({
   }, [exportLogs.path, onToast, scope, streamIDs]);
 
   const streamLabel =
-    scope === "all"
-      ? "All scopes"
-      : streamIDs.length > 0
-        ? `${streamIDs.length} selected`
-        : "No scope selected";
+    lockedScope && scope === "project" && selectedProjectID
+      ? projectName(projects, selectedProjectID)
+      : lockedScope &&
+          scope === "container" &&
+          selectedContainerIDs.length === 1
+        ? containerName(containers, selectedContainerIDs[0])
+        : scope === "all"
+          ? "All scopes"
+          : streamIDs.length > 0
+            ? `${streamIDs.length} selected`
+            : "No scope selected";
   const emptyTitle = !canStream
     ? "Pick a project, service, or container"
     : streamStatus === "loading"
@@ -7821,31 +8078,33 @@ function LogsPage({
       <Card>
         <CardBody className="space-y-3">
           <div className="flex flex-wrap items-center gap-2">
-            <div
-              aria-label="Log scope"
-              className="flex rounded-control border border-border bg-bg-inset p-1"
-              role="group"
-            >
-              {(["all", "project", "service", "container"] as LogScope[]).map(
-                (nextScope) => (
-                  <button
-                    className={[
-                      "h-8 rounded-control px-3 text-xs font-medium capitalize transition",
-                      scope === nextScope
-                        ? "bg-accent text-bg-app"
-                        : "text-text-secondary hover:bg-bg-card hover:text-text-primary",
-                    ].join(" ")}
-                    key={nextScope}
-                    onClick={() => setScope(nextScope)}
-                    type="button"
-                  >
-                    {nextScope}
-                  </button>
-                ),
-              )}
-            </div>
+            {!lockedScope ? (
+              <div
+                aria-label="Log scope"
+                className="flex rounded-control border border-border bg-bg-inset p-1"
+                role="group"
+              >
+                {(["all", "project", "service", "container"] as LogScope[]).map(
+                  (nextScope) => (
+                    <button
+                      className={[
+                        "h-8 rounded-control px-3 text-xs font-medium capitalize transition",
+                        scope === nextScope
+                          ? "bg-accent text-bg-app"
+                          : "text-text-secondary hover:bg-bg-card hover:text-text-primary",
+                      ].join(" ")}
+                      key={nextScope}
+                      onClick={() => setScope(nextScope)}
+                      type="button"
+                    >
+                      {nextScope}
+                    </button>
+                  ),
+                )}
+              </div>
+            ) : null}
 
-            {scope === "project" ? (
+            {scope === "project" && !lockedScope ? (
               <LogSelect
                 ariaLabel="Project scope"
                 disabled={projectsLoading}
@@ -7863,7 +8122,7 @@ function LogsPage({
                 value={selectedServiceID}
               />
             ) : null}
-            {scope === "container" ? (
+            {scope === "container" && !lockedScope ? (
               <LogContainerScopeChecklist
                 disabled={inventoryLoading}
                 onChange={setSelectedContainerIDs}
@@ -8181,7 +8440,53 @@ function LogContainerScopeChecklist({
   options: LogOption[];
   selectedIDs: string[];
 }) {
-  const selected = new Set(selectedIDs);
+  const [open, setOpen] = useState(false);
+  const [filter, setFilter] = useState("");
+  const rootRef = useRef<HTMLDivElement>(null);
+  const selected = useMemo(() => new Set(selectedIDs), [selectedIDs]);
+  const selectedOptions = useMemo(
+    () => options.filter((option) => selected.has(option.id)),
+    [options, selected],
+  );
+  const filteredOptions = useMemo(() => {
+    const needle = filter.trim().toLowerCase();
+    if (!needle) {
+      return options;
+    }
+    return options.filter((option) =>
+      [option.label, option.hint]
+        .filter(Boolean)
+        .some((value) => value?.toLowerCase().includes(needle)),
+    );
+  }, [filter, options]);
+  const selectionDisabled = disabled || options.length === 0;
+
+  useEffect(() => {
+    if (!open) {
+      return undefined;
+    }
+
+    const closeOnOutsideClick = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) {
+        setOpen(false);
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setOpen(false);
+      }
+    };
+
+    window.addEventListener("mousedown", closeOnOutsideClick);
+    window.addEventListener("keydown", closeOnEscape);
+    return () => {
+      window.removeEventListener("mousedown", closeOnOutsideClick);
+      window.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [open]);
+
+  const orderedIDs = (ids: Set<string>) =>
+    options.filter((option) => ids.has(option.id)).map((option) => option.id);
   const toggle = (id: string, checked: boolean) => {
     const next = new Set(selected);
     if (checked) {
@@ -8189,50 +8494,169 @@ function LogContainerScopeChecklist({
     } else {
       next.delete(id);
     }
-    onChange(
-      options
-        .filter((option) => next.has(option.id))
-        .map((option) => option.id),
-    );
+    onChange(orderedIDs(next));
+  };
+  const clearSelection = () => {
+    onChange([]);
+  };
+  const selectVisible = () => {
+    const next = new Set(selected);
+    for (const option of filteredOptions) {
+      next.add(option.id);
+    }
+    onChange(orderedIDs(next));
   };
 
   return (
-    <fieldset
+    <div
       aria-label="Container scope"
-      className="max-h-36 min-w-64 overflow-auto rounded-control border border-border bg-bg-inset px-3 py-2 text-sm text-text-primary"
-      disabled={disabled || options.length === 0}
+      className="relative min-w-72 max-w-xl flex-1"
+      ref={rootRef}
+      role="group"
     >
-      <legend className="sr-only">Container scope</legend>
-      {options.length === 0 ? (
-        <div className="text-text-muted">No containers</div>
-      ) : (
-        <div className="space-y-2">
-          {options.map((option) => (
-            <label
-              className="flex min-w-0 items-start gap-2 text-sm"
+      <div
+        className={[
+          "flex min-h-10 w-full items-center gap-2 rounded-control border border-border bg-bg-inset px-2 py-1.5 text-sm",
+          selectionDisabled
+            ? "opacity-60"
+            : "focus-within:border-accent hover:border-accent/70",
+        ].join(" ")}
+        onClick={() => {
+          if (!selectionDisabled) {
+            setOpen(true);
+          }
+        }}
+      >
+        <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
+          {selectedOptions.length === 0 ? (
+            <span className="px-1 text-text-muted">
+              {selectionDisabled ? "No containers" : "Select containers"}
+            </span>
+          ) : null}
+          {selectedOptions.slice(0, 3).map((option) => (
+            <span
+              className="inline-flex max-w-48 items-center gap-1 rounded-full border border-accent/30 bg-accent/10 px-2 py-1 text-xs text-accent"
               key={option.id}
             >
-              <input
-                checked={selected.has(option.id)}
-                className="mt-0.5"
-                onChange={(event) =>
-                  toggle(option.id, event.currentTarget.checked)
-                }
-                type="checkbox"
-              />
-              <span className="min-w-0">
-                <span className="block truncate">{option.label}</span>
-                {option.hint ? (
-                  <span className="block truncate text-xs text-text-muted">
-                    {option.hint}
-                  </span>
-                ) : null}
-              </span>
-            </label>
+              <span className="truncate">{option.label}</span>
+              <button
+                aria-label={`Remove ${option.label}`}
+                className="rounded-full text-accent hover:bg-accent/15"
+                disabled={selectionDisabled}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  toggle(option.id, false);
+                }}
+                type="button"
+              >
+                <X size={12} />
+              </button>
+            </span>
           ))}
+          {selectedOptions.length > 3 ? (
+            <Badge tone="neutral">+{selectedOptions.length - 3}</Badge>
+          ) : null}
+          <input
+            aria-label="Search containers"
+            className="h-7 min-w-24 flex-1 bg-transparent px-1 text-sm text-text-primary outline-none placeholder:text-text-muted"
+            disabled={selectionDisabled}
+            onChange={(event) => {
+              setFilter(event.currentTarget.value);
+              setOpen(true);
+            }}
+            onFocus={() => setOpen(true)}
+            placeholder={selectedOptions.length > 0 ? "Search" : ""}
+            value={filter}
+          />
         </div>
-      )}
-    </fieldset>
+        {selectedOptions.length > 0 ? (
+          <button
+            aria-label="Clear container selection"
+            className="rounded-control p-1 text-text-muted hover:bg-bg-card hover:text-text-primary"
+            disabled={selectionDisabled}
+            onClick={(event) => {
+              event.stopPropagation();
+              clearSelection();
+            }}
+            type="button"
+          >
+            <X size={15} />
+          </button>
+        ) : null}
+      </div>
+
+      {open && !selectionDisabled ? (
+        <div className="absolute left-0 top-[calc(100%+0.25rem)] z-40 w-full overflow-hidden rounded-card border border-border bg-bg-panel shadow-xl">
+          <div className="flex items-center justify-between gap-2 border-b border-border px-3 py-2">
+            <div className="text-xs text-text-muted">
+              {selectedOptions.length} of {options.length} selected
+            </div>
+            <div className="flex gap-1">
+              <Button
+                disabled={filteredOptions.length === 0}
+                onClick={selectVisible}
+                size="sm"
+                variant="ghost"
+              >
+                Select visible
+              </Button>
+              <Button
+                disabled={selectedOptions.length === 0}
+                onClick={clearSelection}
+                size="sm"
+                variant="ghost"
+              >
+                Clear
+              </Button>
+            </div>
+          </div>
+          <div
+            aria-label="Container scope options"
+            className="max-h-72 overflow-auto p-1"
+            role="listbox"
+          >
+            {filteredOptions.length === 0 ? (
+              <div className="px-3 py-6 text-center text-sm text-text-muted">
+                No matching containers
+              </div>
+            ) : null}
+            {filteredOptions.map((option) => {
+              const checked = selected.has(option.id);
+              return (
+                <label
+                  aria-selected={checked}
+                  className={[
+                    "flex min-w-0 cursor-pointer items-start gap-2 rounded-control px-2 py-2 text-sm hover:bg-bg-inset",
+                    checked ? "bg-accent/10" : "",
+                  ].join(" ")}
+                  key={option.id}
+                  role="option"
+                >
+                  <input
+                    checked={checked}
+                    className="mt-0.5"
+                    onChange={(event) =>
+                      toggle(option.id, event.currentTarget.checked)
+                    }
+                    type="checkbox"
+                  />
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-text-primary">
+                      {option.label}
+                    </span>
+                    {option.hint ? (
+                      <span className="block truncate text-xs text-text-muted">
+                        {option.hint}
+                      </span>
+                    ) : null}
+                  </span>
+                </label>
+              );
+            })}
+          </div>
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -8433,6 +8857,7 @@ type ProjectsPageProps = {
   onViewChange: (view: ProjectViewMode) => void;
   onImport: () => void;
   onOpen: (project: ProjectSummary) => void;
+  onOpenFolder: (project: ProjectSummary) => void;
   onRefresh: () => void;
 };
 
@@ -8447,6 +8872,7 @@ function ProjectsPage({
   onFilterChange,
   onImport,
   onOpen,
+  onOpenFolder,
   onRefresh,
   onSortChange,
   onViewChange,
@@ -8495,8 +8921,16 @@ function ProjectsPage({
             [
               "updates",
               "Updates available",
-              projects.filter((project) => projectUpdateCount(project) > 0)
-                .length,
+              projects.filter(
+                (project) => projectActionableUpdateCount(project) > 0,
+              ).length,
+            ],
+            [
+              "attention",
+              "Needs attention",
+              projects.filter(
+                (project) => projectManualUpdateCount(project) > 0,
+              ).length,
             ],
             [
               "high-cpu",
@@ -8570,7 +9004,7 @@ function ProjectsPage({
         />
       ) : view === "grid" ? (
         <section
-          className="grid grid-cols-[repeat(auto-fill,minmax(320px,1fr))] gap-4"
+          className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,340px),1fr))] gap-4"
           aria-label="Compose projects"
         >
           {filtered.map((project) => (
@@ -8581,6 +9015,7 @@ function ProjectsPage({
               mutationDisabledReason={mutationDisabledReason}
               onAction={onAction}
               onOpen={onOpen}
+              onOpenFolder={onOpenFolder}
               project={project}
               sparkPoints={projectSparks[project.id]}
             />
@@ -8593,6 +9028,7 @@ function ProjectsPage({
           mutationDisabledReason={mutationDisabledReason}
           onAction={onAction}
           onOpen={onOpen}
+          onOpenFolder={onOpenFolder}
           projects={filtered}
         />
       )}
@@ -8867,18 +9303,22 @@ function UpdatesPage({
                       {
                         id: "status",
                         header: "Status/notes",
+                        cellClassName:
+                          "whitespace-normal break-words leading-5 text-text-secondary",
+                        headerClassName: "w-[28%]",
                         render: (update) => (
-                          <div className="space-y-1">
+                          <div className="min-w-0 space-y-1">
                             <Badge tone={updateTone(update.status)}>
                               {updateStatusLabel(update.status)}
                             </Badge>
                             {updateStatusNote(update) ? (
-                              <div className="text-xs text-text-muted">
+                              <div className="whitespace-normal break-words text-xs text-text-muted">
                                 {updateStatusNote(update)}
                               </div>
                             ) : null}
                           </div>
                         ),
+                        wrap: true,
                       },
                       {
                         id: "checked",
@@ -9173,6 +9613,7 @@ function ProjectCard({
   mutationDisabledReason,
   onAction,
   onOpen,
+  onOpenFolder,
   project,
   sparkPoints,
 }: {
@@ -9183,18 +9624,18 @@ function ProjectCard({
   mutationDisabledReason: string;
   onAction: (action: ProjectAction, project: ProjectSummary) => void;
   onOpen: (project: ProjectSummary) => void;
+  onOpenFolder: (project: ProjectSummary) => void;
 }) {
-  const updates = projectUpdateCount(project);
   const workdirMissing = project.status === "error";
-  const primaryAction: ProjectAction =
-    project.status === "running" ? "stop" : "start";
-  const lifecycleDisabled =
-    mutationsDisabled || workdirMissing || !project.workingDir;
-  const disabledReason = mutationsDisabled
-    ? mutationDisabledReason
-    : workdirMissing
-      ? "Re-link folder before running project actions"
-      : "No workdir";
+  const primaryAction = primaryProjectAction(project);
+  const disabledReason = (action: ProjectAction) =>
+    projectActionDisabledReason(
+      action,
+      project,
+      mutationsDisabled,
+      mutationDisabledReason,
+    );
+  const disabled = (action: ProjectAction) => Boolean(disabledReason(action));
   const busy = (action: ProjectAction) =>
     actionBusyIDs.has(projectActionBusyKey(action, project.id));
   return (
@@ -9223,14 +9664,6 @@ function ProjectCard({
               {project.workingDir || "No workdir"}
             </div>
           </div>
-          <Tooltip label="More">
-            <Button
-              aria-label={`More actions for ${project.name}`}
-              icon={<MoreVertical size={16} />}
-              size="icon"
-              variant="ghost"
-            />
-          </Tooltip>
         </div>
 
         <div className="grid grid-cols-3 gap-2 text-sm">
@@ -9254,104 +9687,113 @@ function ProjectCard({
           <Badge tone={healthTone(project.health)}>
             {project.health || "unknown"}
           </Badge>
-          {updates > 0 ? (
-            <Badge tone="warn">{updates} updates</Badge>
-          ) : (
-            <Badge tone="neutral">0 updates</Badge>
-          )}
+          {projectCardUpdateBadges(project)}
           {workdirMissing ? <Badge tone="warn">Workdir missing</Badge> : null}
           <PortList ports={project.ports ?? []} />
         </div>
 
-        <div className="flex items-center gap-1 border-t border-border pt-3">
-          <Tooltip label={project.status === "running" ? "Stop" : "Start"}>
-            <Button
-              aria-label={`${project.status === "running" ? "Stop" : "Start"} ${project.name}`}
-              disabled={lifecycleDisabled}
-              disabledReason={disabledReason}
-              icon={
-                project.status === "running" ? (
-                  <Square size={15} />
-                ) : (
-                  <Play size={15} />
-                )
-              }
-              loading={busy(primaryAction)}
-              onClick={() => onAction(primaryAction, project)}
-              size="icon"
-              variant="ghost"
-            />
-          </Tooltip>
-          <Tooltip label="Restart">
-            <Button
-              aria-label={`Restart ${project.name}`}
-              disabled={lifecycleDisabled}
-              disabledReason={disabledReason}
-              icon={<RotateCw size={15} />}
-              loading={busy("restart")}
-              onClick={() => onAction("restart", project)}
-              size="icon"
-              variant="ghost"
-            />
-          </Tooltip>
-          <Tooltip label="Pull images">
-            <Button
-              aria-label={`Pull images ${project.name}`}
-              disabled={lifecycleDisabled}
-              disabledReason={disabledReason}
-              icon={<Download size={15} />}
-              loading={busy("pull")}
-              onClick={() => onAction("pull", project)}
-              size="icon"
-              variant="ghost"
-            />
-          </Tooltip>
-          <Tooltip label="Redeploy">
-            <Button
-              aria-label={`Redeploy ${project.name}`}
-              disabled={lifecycleDisabled}
-              disabledReason={disabledReason}
-              icon={<PackagePlus size={15} />}
-              loading={busy("redeploy")}
-              onClick={() => onAction("redeploy", project)}
-              size="icon"
-              variant="ghost"
-            />
-          </Tooltip>
-          <Tooltip label="Down">
-            <Button
-              aria-label={`Down ${project.name}`}
-              disabled={lifecycleDisabled}
-              disabledReason={disabledReason}
-              icon={<Square size={15} />}
-              loading={busy("down")}
-              onClick={() => onAction("down", project)}
-              size="icon"
-              variant="danger"
-            />
-          </Tooltip>
-          <Tooltip label="Down with volumes">
-            <Button
-              aria-label={`Down with volumes ${project.name}`}
-              disabled={lifecycleDisabled}
-              disabledReason={disabledReason}
-              icon={<Skull size={15} />}
-              loading={busy("down-volumes")}
-              onClick={() => onAction("down-volumes", project)}
-              size="icon"
-              variant="danger"
-            />
-          </Tooltip>
-          <Tooltip label="Open folder">
-            <Button
-              aria-label={`Open folder ${project.name}`}
-              disabled={!project.workingDir}
-              icon={<FolderOpen size={15} />}
-              size="icon"
-              variant="ghost"
-            />
-          </Tooltip>
-          <span className="ml-auto text-xs text-text-muted">
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-2 border-t border-border pt-3">
+          <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1">
+            <Tooltip label={primaryAction === "stop" ? "Stop" : "Start"}>
+              <Button
+                aria-label={`${primaryAction === "stop" ? "Stop" : "Start"} ${project.name}`}
+                disabled={disabled(primaryAction)}
+                disabledReason={disabledReason(primaryAction)}
+                icon={
+                  primaryAction === "stop" ? (
+                    <Square size={15} />
+                  ) : (
+                    <Play size={15} />
+                  )
+                }
+                loading={busy(primaryAction)}
+                onClick={() => onAction(primaryAction, project)}
+                size="icon"
+                variant="ghost"
+              />
+            </Tooltip>
+            <Tooltip label="Restart">
+              <Button
+                aria-label={`Restart ${project.name}`}
+                disabled={disabled("restart")}
+                disabledReason={disabledReason("restart")}
+                icon={<RotateCw size={15} />}
+                loading={busy("restart")}
+                onClick={() => onAction("restart", project)}
+                size="icon"
+                variant="ghost"
+              />
+            </Tooltip>
+            <Tooltip label="Pull images">
+              <Button
+                aria-label={`Pull images ${project.name}`}
+                disabled={disabled("pull")}
+                disabledReason={disabledReason("pull")}
+                icon={<Download size={15} />}
+                loading={busy("pull")}
+                onClick={() => onAction("pull", project)}
+                size="icon"
+                variant="ghost"
+              />
+            </Tooltip>
+            <Tooltip label="Redeploy">
+              <Button
+                aria-label={`Redeploy ${project.name}`}
+                disabled={disabled("redeploy")}
+                disabledReason={disabledReason("redeploy")}
+                icon={<PackagePlus size={15} />}
+                loading={busy("redeploy")}
+                onClick={() => onAction("redeploy", project)}
+                size="icon"
+                variant="ghost"
+              />
+            </Tooltip>
+            <Tooltip label="Down">
+              <Button
+                aria-label={`Down ${project.name}`}
+                disabled={disabled("down")}
+                disabledReason={disabledReason("down")}
+                icon={<Square size={15} />}
+                loading={busy("down")}
+                onClick={() => onAction("down", project)}
+                size="icon"
+                variant="danger"
+              />
+            </Tooltip>
+            <Tooltip label="Down with volumes">
+              <Button
+                aria-label={`Down with volumes ${project.name}`}
+                disabled={disabled("down-volumes")}
+                disabledReason={disabledReason("down-volumes")}
+                icon={<Skull size={15} />}
+                loading={busy("down-volumes")}
+                onClick={() => onAction("down-volumes", project)}
+                size="icon"
+                variant="danger"
+              />
+            </Tooltip>
+            <Tooltip label="Open folder">
+              <Button
+                aria-label={`Open folder ${project.name}`}
+                disabled={!project.workingDir}
+                icon={<FolderOpen size={15} />}
+                onClick={() => onOpenFolder(project)}
+                size="icon"
+                variant="ghost"
+              />
+            </Tooltip>
+            <Tooltip label="Remove from list">
+              <Button
+                aria-label={`Remove from list ${project.name}`}
+                icon={<Trash2 size={15} />}
+                loading={busy("remove")}
+                onClick={() => onAction("remove", project)}
+                size="icon"
+                variant="danger"
+              />
+            </Tooltip>
+          </div>
+          <span className="ml-auto shrink-0 whitespace-nowrap text-xs text-text-muted">
             {relativeTime(dateMillis(project.lastChangedAt))}
           </span>
         </div>
@@ -9366,6 +9808,7 @@ function ProjectList({
   mutationDisabledReason,
   onAction,
   onOpen,
+  onOpenFolder,
   projects,
 }: {
   projects: ProjectSummary[];
@@ -9374,6 +9817,7 @@ function ProjectList({
   mutationDisabledReason: string;
   onAction: (action: ProjectAction, project: ProjectSummary) => void;
   onOpen: (project: ProjectSummary) => void;
+  onOpenFolder: (project: ProjectSummary) => void;
 }) {
   return (
     <DataTable
@@ -9464,6 +9908,7 @@ function ProjectList({
               mutationsDisabled={mutationsDisabled}
               mutationDisabledReason={mutationDisabledReason}
               onAction={onAction}
+              onOpenFolder={onOpenFolder}
               project={project}
             />
           ),
@@ -9487,6 +9932,7 @@ function ProjectRowActions({
   mutationsDisabled,
   mutationDisabledReason,
   onAction,
+  onOpenFolder,
   project,
 }: {
   project: ProjectSummary;
@@ -9494,17 +9940,17 @@ function ProjectRowActions({
   mutationsDisabled: boolean;
   mutationDisabledReason: string;
   onAction: (action: ProjectAction, project: ProjectSummary) => void;
+  onOpenFolder: (project: ProjectSummary) => void;
 }) {
-  const workdirMissing = project.status === "error";
-  const lifecycleDisabled =
-    mutationsDisabled || workdirMissing || !project.workingDir;
-  const disabledReason = mutationsDisabled
-    ? mutationDisabledReason
-    : workdirMissing
-      ? "Re-link folder before running project actions"
-      : "No workdir";
-  const primaryAction: ProjectAction =
-    project.status === "running" ? "stop" : "start";
+  const primaryAction = primaryProjectAction(project);
+  const disabledReason = (action: ProjectAction) =>
+    projectActionDisabledReason(
+      action,
+      project,
+      mutationsDisabled,
+      mutationDisabledReason,
+    );
+  const disabled = (action: ProjectAction) => Boolean(disabledReason(action));
   const busy = (action: ProjectAction) =>
     actionBusyIDs.has(projectActionBusyKey(action, project.id));
   return (
@@ -9512,8 +9958,8 @@ function ProjectRowActions({
       <Tooltip label={primaryAction === "stop" ? "Stop" : "Start"}>
         <Button
           aria-label={`${primaryAction === "stop" ? "Stop" : "Start"} ${project.name}`}
-          disabled={lifecycleDisabled}
-          disabledReason={disabledReason}
+          disabled={disabled(primaryAction)}
+          disabledReason={disabledReason(primaryAction)}
           icon={
             primaryAction === "stop" ? <Square size={15} /> : <Play size={15} />
           }
@@ -9526,8 +9972,8 @@ function ProjectRowActions({
       <Tooltip label="Restart">
         <Button
           aria-label={`Restart ${project.name}`}
-          disabled={lifecycleDisabled}
-          disabledReason={disabledReason}
+          disabled={disabled("restart")}
+          disabledReason={disabledReason("restart")}
           icon={<RotateCw size={15} />}
           loading={busy("restart")}
           onClick={() => onAction("restart", project)}
@@ -9538,8 +9984,8 @@ function ProjectRowActions({
       <Tooltip label="Pull images">
         <Button
           aria-label={`Pull images ${project.name}`}
-          disabled={lifecycleDisabled}
-          disabledReason={disabledReason}
+          disabled={disabled("pull")}
+          disabledReason={disabledReason("pull")}
           icon={<Download size={15} />}
           loading={busy("pull")}
           onClick={() => onAction("pull", project)}
@@ -9550,8 +9996,8 @@ function ProjectRowActions({
       <Tooltip label="Redeploy">
         <Button
           aria-label={`Redeploy ${project.name}`}
-          disabled={lifecycleDisabled}
-          disabledReason={disabledReason}
+          disabled={disabled("redeploy")}
+          disabledReason={disabledReason("redeploy")}
           icon={<PackagePlus size={15} />}
           loading={busy("redeploy")}
           onClick={() => onAction("redeploy", project)}
@@ -9559,16 +10005,48 @@ function ProjectRowActions({
           variant="ghost"
         />
       </Tooltip>
+      <Tooltip label="Down">
+        <Button
+          aria-label={`Down ${project.name}`}
+          disabled={disabled("down")}
+          disabledReason={disabledReason("down")}
+          icon={<Square size={15} />}
+          loading={busy("down")}
+          onClick={() => onAction("down", project)}
+          size="icon"
+          variant="danger"
+        />
+      </Tooltip>
       <Tooltip label="Down with volumes">
         <Button
           aria-label={`Down with volumes ${project.name}`}
-          disabled={lifecycleDisabled}
-          disabledReason={disabledReason}
+          disabled={disabled("down-volumes")}
+          disabledReason={disabledReason("down-volumes")}
           icon={<Skull size={15} />}
           loading={busy("down-volumes")}
           onClick={() => onAction("down-volumes", project)}
           size="icon"
           variant="danger"
+        />
+      </Tooltip>
+      <Tooltip label="Remove from list">
+        <Button
+          aria-label={`Remove from list ${project.name}`}
+          icon={<Trash2 size={15} />}
+          loading={busy("remove")}
+          onClick={() => onAction("remove", project)}
+          size="icon"
+          variant="danger"
+        />
+      </Tooltip>
+      <Tooltip label="Open folder">
+        <Button
+          aria-label={`Open folder ${project.name}`}
+          disabled={!project.workingDir}
+          icon={<FolderOpen size={15} />}
+          onClick={() => onOpenFolder(project)}
+          size="icon"
+          variant="ghost"
         />
       </Tooltip>
     </div>
@@ -9579,6 +10057,7 @@ const projectTabs: Array<[ProjectTabID, string]> = [
   ["overview", "Overview"],
   ["services", "Services"],
   ["containers", "Containers"],
+  ["logs", "Logs"],
   ["updates", "Updates"],
   ["compose", "Compose"],
   ["backups", "Backups"],
@@ -9590,7 +10069,9 @@ function ProjectDetailPage({
   backupsError,
   backupsLoading,
   detail,
+  dockerRunning,
   error,
+  inventoryLoading,
   loading,
   lineage,
   lineageLoading,
@@ -9601,11 +10082,14 @@ function ProjectDetailPage({
   onBackupVolume,
   onCheckUpdates,
   onIgnoreUpdate,
+  onOpenContainerTerminal,
   onRefresh,
   onRestoreBackup,
+  onToast,
   onTabChange,
   onUpdateProject,
   onUpdateService,
+  projectsLoading,
   projectVolumes,
   tab,
   updates,
@@ -9615,6 +10099,8 @@ function ProjectDetailPage({
   backups: BackupSummary[];
   backupsError: string | null;
   backupsLoading: boolean;
+  dockerRunning: boolean;
+  inventoryLoading: boolean;
   loading: boolean;
   lineage: ImageLineage[];
   lineageLoading: boolean;
@@ -9629,12 +10115,30 @@ function ProjectDetailPage({
   onBackupVolume: (volume: VolumeSummary) => void;
   onCheckUpdates: () => void;
   onIgnoreUpdate: (update: ImageUpdate) => void;
+  onOpenContainerTerminal: (container: ContainerSummary) => void;
   onRefresh: () => void;
   onRestoreBackup: (backup: BackupSummary) => void;
+  onToast: (toast: ToastInput) => void;
   onTabChange: (tab: ProjectTabID) => void;
   onUpdateProject: () => void;
   onUpdateService: (service: string) => void;
+  projectsLoading: boolean;
 }) {
+  const [containerDrilldown, setContainerDrilldown] = useState<{
+    container: ContainerSummary;
+    tab: ContainerDrilldownTabID;
+  } | null>(null);
+  const openContainerDrilldown = useCallback(
+    (
+      container: ContainerSummary,
+      tab: ContainerDrilldownTabID = "overview",
+    ) => {
+      setContainerDrilldown({ container, tab });
+      onTabChange("containers");
+    },
+    [onTabChange],
+  );
+
   if (loading && !detail) {
     return <TableSkeleton />;
   }
@@ -9649,17 +10153,23 @@ function ProjectDetailPage({
   }
 
   const project = detail.summary;
-  const primaryAction: ProjectAction =
-    project.status === "running" ? "stop" : "start";
-  const lifecycleDisabled =
-    mutationsDisabled || project.status === "error" || !project.workingDir;
-  const disabledReason = mutationsDisabled
-    ? mutationDisabledReason
-    : project.status === "error"
-      ? "Re-link folder before running project actions"
-      : "No workdir";
+  const primaryAction = primaryProjectAction(project);
+  const disabledReason = (action: ProjectAction) =>
+    projectActionDisabledReason(
+      action,
+      project,
+      mutationsDisabled,
+      mutationDisabledReason,
+    );
+  const disabled = (action: ProjectAction) => Boolean(disabledReason(action));
   const busy = (action: ProjectAction) =>
     actionBusyIDs.has(projectActionBusyKey(action, project.id));
+  const projectContainers = detail.containers ?? [];
+  const selectedContainer = containerDrilldown
+    ? (projectContainers.find(
+        (container) => container.id === containerDrilldown.container.id,
+      ) ?? containerDrilldown.container)
+    : null;
 
   return (
     <div className="space-y-4">
@@ -9682,8 +10192,8 @@ function ProjectDetailPage({
         </div>
         <div className="flex flex-wrap justify-end gap-2">
           <Button
-            disabled={lifecycleDisabled}
-            disabledReason={disabledReason}
+            disabled={disabled(primaryAction)}
+            disabledReason={disabledReason(primaryAction)}
             icon={
               primaryAction === "stop" ? (
                 <Square size={15} />
@@ -9697,8 +10207,8 @@ function ProjectDetailPage({
             {primaryAction === "stop" ? "Stop" : "Start"}
           </Button>
           <Button
-            disabled={lifecycleDisabled}
-            disabledReason={disabledReason}
+            disabled={disabled("restart")}
+            disabledReason={disabledReason("restart")}
             icon={<RotateCw size={15} />}
             loading={busy("restart")}
             onClick={() => onAction("restart", project)}
@@ -9706,8 +10216,8 @@ function ProjectDetailPage({
             Restart
           </Button>
           <Button
-            disabled={lifecycleDisabled}
-            disabledReason={disabledReason}
+            disabled={disabled("redeploy")}
+            disabledReason={disabledReason("redeploy")}
             icon={<PackagePlus size={15} />}
             loading={busy("redeploy")}
             onClick={() => onAction("redeploy", project)}
@@ -9715,8 +10225,8 @@ function ProjectDetailPage({
             Redeploy
           </Button>
           <Button
-            disabled={lifecycleDisabled}
-            disabledReason={disabledReason}
+            disabled={disabled("pull")}
+            disabledReason={disabledReason("pull")}
             icon={<Download size={15} />}
             loading={busy("pull")}
             onClick={() => onAction("pull", project)}
@@ -9724,14 +10234,32 @@ function ProjectDetailPage({
             Pull
           </Button>
           <Button
-            disabled={lifecycleDisabled}
-            disabledReason={disabledReason}
+            disabled={disabled("down")}
+            disabledReason={disabledReason("down")}
+            icon={<Square size={15} />}
+            loading={busy("down")}
+            onClick={() => onAction("down", project)}
+            variant="danger"
+          >
+            Down
+          </Button>
+          <Button
+            disabled={disabled("down-volumes")}
+            disabledReason={disabledReason("down-volumes")}
             icon={<Skull size={15} />}
             loading={busy("down-volumes")}
             onClick={() => onAction("down-volumes", project)}
             variant="danger"
           >
             Down + volumes
+          </Button>
+          <Button
+            icon={<Trash2 size={15} />}
+            loading={busy("remove")}
+            onClick={() => onAction("remove", project)}
+            variant="danger"
+          >
+            Remove from list
           </Button>
           <Button
             icon={<RefreshCw size={15} />}
@@ -9767,9 +10295,39 @@ function ProjectDetailPage({
         ))}
       </div>
 
-      {tab === "overview" ? <ProjectOverviewTab detail={detail} /> : null}
-      {tab === "services" ? <ProjectServicesTab detail={detail} /> : null}
-      {tab === "containers" ? <ProjectContainersTab detail={detail} /> : null}
+      {tab === "overview" ? (
+        <ProjectOverviewTab
+          detail={detail}
+          onOpenContainerDrilldown={openContainerDrilldown}
+        />
+      ) : null}
+      {tab === "services" ? (
+        <ProjectServicesTab
+          detail={detail}
+          onOpenContainerDrilldown={openContainerDrilldown}
+        />
+      ) : null}
+      {tab === "containers" ? (
+        <ProjectContainersTab
+          detail={detail}
+          dockerRunning={dockerRunning}
+          onOpenContainerDrilldown={openContainerDrilldown}
+          onOpenContainerTerminal={onOpenContainerTerminal}
+        />
+      ) : null}
+      {tab === "logs" ? (
+        <LogsPage
+          containers={detail.containers ?? []}
+          dockerRunning={dockerRunning}
+          initialProjectID={project.id}
+          initialScope="project"
+          inventoryLoading={inventoryLoading}
+          lockedScope
+          onToast={onToast}
+          projects={[project]}
+          projectsLoading={projectsLoading}
+        />
+      ) : null}
       {tab === "updates" ? (
         <ProjectUpdatesTab
           detail={detail}
@@ -9795,11 +10353,127 @@ function ProjectDetailPage({
           volumes={projectVolumes}
         />
       ) : null}
+      {selectedContainer && tab === "containers" ? (
+        <ContainerDrilldownPanel
+          container={selectedContainer}
+          dockerRunning={dockerRunning}
+          inventoryLoading={inventoryLoading}
+          onClose={() => setContainerDrilldown(null)}
+          onOpenContainerTerminal={onOpenContainerTerminal}
+          onTabChange={(nextTab) =>
+            setContainerDrilldown((current) =>
+              current ? { ...current, tab: nextTab } : current,
+            )
+          }
+          onToast={onToast}
+          project={project}
+          projectsLoading={projectsLoading}
+          tab={containerDrilldown?.tab ?? "overview"}
+        />
+      ) : null}
     </div>
   );
 }
 
-function ProjectOverviewTab({ detail }: { detail: ProjectDetail }) {
+function serviceDrilldownContainer(
+  containers: ContainerSummary[],
+  service: ComposeServiceRow,
+): ContainerSummary | null {
+  const matches = containers.filter(
+    (container) => container.service === service.name,
+  );
+  if (matches.length === 0) {
+    return null;
+  }
+  return matches.find(containerIsRunning) ?? matches[0];
+}
+
+function containerIsRunning(container: ContainerSummary): boolean {
+  return (
+    container.state.toLowerCase() === "running" ||
+    container.status.toLowerCase().startsWith("up")
+  );
+}
+
+function ServiceTitle({
+  container,
+  image,
+  name,
+  onOpenContainerDrilldown,
+}: {
+  container: ContainerSummary | null;
+  image: string;
+  name: string;
+  onOpenContainerDrilldown: (
+    container: ContainerSummary,
+    tab?: ContainerDrilldownTabID,
+  ) => void;
+}) {
+  if (!container) {
+    return (
+      <div className="min-w-0">
+        <h3 className="truncate font-semibold text-text-primary">{name}</h3>
+        <div className="mt-1 truncate font-mono text-xs text-text-muted">
+          {image}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <button
+      aria-label={`Open ${name} container details`}
+      className="group min-w-0 rounded-control text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
+      onClick={() => onOpenContainerDrilldown(container)}
+      type="button"
+    >
+      <h3 className="truncate font-semibold text-accent group-hover:underline">
+        {name}
+      </h3>
+      <div className="mt-1 truncate font-mono text-xs text-text-muted">
+        {image}
+      </div>
+    </button>
+  );
+}
+
+function ServiceNameButton({
+  container,
+  name,
+  onOpenContainerDrilldown,
+}: {
+  container: ContainerSummary | null;
+  name: string;
+  onOpenContainerDrilldown: (
+    container: ContainerSummary,
+    tab?: ContainerDrilldownTabID,
+  ) => void;
+}) {
+  if (!container) {
+    return <span className="font-medium text-text-primary">{name}</span>;
+  }
+
+  return (
+    <button
+      className="min-w-0 truncate text-left font-medium text-accent hover:underline focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
+      onClick={() => onOpenContainerDrilldown(container)}
+      type="button"
+    >
+      {name}
+    </button>
+  );
+}
+
+function ProjectOverviewTab({
+  detail,
+  onOpenContainerDrilldown,
+}: {
+  detail: ProjectDetail;
+  onOpenContainerDrilldown: (
+    container: ContainerSummary,
+    tab?: ContainerDrilldownTabID,
+  ) => void;
+}) {
   const project = detail.summary;
   const services = detail.services ?? [];
   const containers = detail.containers ?? [];
@@ -9825,57 +10499,71 @@ function ProjectOverviewTab({ detail }: { detail: ProjectDetail }) {
         />
         <StatusBlock
           label="Updates"
-          tone={projectUpdateCount(project) > 0 ? "warn" : "ok"}
-          value={projectUpdateCount(project)}
+          tone={projectActionableUpdateCount(project) > 0 ? "warn" : "ok"}
+          value={projectActionableUpdateCount(project)}
         />
       </div>
 
       <section className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-        {services.map((service) => (
-          <Card key={service.name}>
-            <CardBody className="space-y-3">
-              <div className="flex items-start justify-between gap-2">
-                <div className="min-w-0">
-                  <h3 className="truncate font-semibold text-text-primary">
-                    {service.name}
-                  </h3>
-                  <div className="mt-1 truncate font-mono text-xs text-text-muted">
-                    {service.image || "build"}
-                  </div>
+        {services.map((service) => {
+          const drilldownContainer = serviceDrilldownContainer(
+            containers,
+            service,
+          );
+          return (
+            <Card key={service.name}>
+              <CardBody className="space-y-3">
+                <div className="flex items-start justify-between gap-2">
+                  <ServiceTitle
+                    container={drilldownContainer}
+                    image={service.image || "build"}
+                    name={service.name}
+                    onOpenContainerDrilldown={onOpenContainerDrilldown}
+                  />
+                  <Badge tone={projectStatusTone(service.status)}>
+                    {service.status || "unknown"}
+                  </Badge>
                 </div>
-                <Badge tone={projectStatusTone(service.status)}>
-                  {service.status || "unknown"}
-                </Badge>
-              </div>
-              <div className="grid grid-cols-3 gap-2">
-                <MiniMetric
-                  label="Replicas"
-                  value={`${service.running}/${service.replicas}`}
-                />
-                <MiniMetric
-                  label="CPU"
-                  value={`${(service.cpuPercent ?? 0).toFixed(1)}%`}
-                />
-                <MiniMetric
-                  label="RAM"
-                  value={formatBytes(service.memoryBytes ?? 0)}
-                />
-              </div>
-              <div className="flex flex-wrap items-center gap-2">
-                <Badge tone={healthTone(service.health)}>
-                  {service.health || "unknown"}
-                </Badge>
-                <PortList ports={service.ports ?? []} />
-              </div>
-            </CardBody>
-          </Card>
-        ))}
+                <div className="grid grid-cols-3 gap-2">
+                  <MiniMetric
+                    label="Replicas"
+                    value={`${service.running}/${service.replicas}`}
+                  />
+                  <MiniMetric
+                    label="CPU"
+                    value={`${(service.cpuPercent ?? 0).toFixed(1)}%`}
+                  />
+                  <MiniMetric
+                    label="RAM"
+                    value={formatBytes(service.memoryBytes ?? 0)}
+                  />
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  <Badge tone={healthTone(service.health)}>
+                    {service.health || "unknown"}
+                  </Badge>
+                  <PortList ports={service.ports ?? []} />
+                </div>
+              </CardBody>
+            </Card>
+          );
+        })}
       </section>
     </div>
   );
 }
 
-function ProjectServicesTab({ detail }: { detail: ProjectDetail }) {
+function ProjectServicesTab({
+  detail,
+  onOpenContainerDrilldown,
+}: {
+  detail: ProjectDetail;
+  onOpenContainerDrilldown: (
+    container: ContainerSummary,
+    tab?: ContainerDrilldownTabID,
+  ) => void;
+}) {
+  const containers = detail.containers ?? [];
   return (
     <DataTable
       ariaLabel={`${detail.summary.name} services`}
@@ -9884,9 +10572,11 @@ function ProjectServicesTab({ detail }: { detail: ProjectDetail }) {
           id: "name",
           header: "Name",
           render: (service) => (
-            <span className="font-medium text-text-primary">
-              {service.name}
-            </span>
+            <ServiceNameButton
+              container={serviceDrilldownContainer(containers, service)}
+              name={service.name}
+              onOpenContainerDrilldown={onOpenContainerDrilldown}
+            />
           ),
           sortValue: (service) => service.name,
           sortable: true,
@@ -9944,63 +10634,718 @@ function ProjectServicesTab({ detail }: { detail: ProjectDetail }) {
   );
 }
 
-function ProjectContainersTab({ detail }: { detail: ProjectDetail }) {
+function ProjectContainersTab({
+  detail,
+  dockerRunning,
+  onOpenContainerDrilldown,
+  onOpenContainerTerminal,
+}: {
+  detail: ProjectDetail;
+  dockerRunning: boolean;
+  onOpenContainerDrilldown: (
+    container: ContainerSummary,
+    tab?: ContainerDrilldownTabID,
+  ) => void;
+  onOpenContainerTerminal: (container: ContainerSummary) => void;
+}) {
+  const containers = detail.containers ?? [];
+
   return (
-    <DataTable
-      ariaLabel={`${detail.summary.name} containers`}
-      columns={[
-        {
-          id: "name",
-          header: "Name",
-          render: (container) => (
-            <span className="font-medium text-text-primary">
-              {container.name}
+    <div className="space-y-4">
+      <DataTable
+        ariaLabel={`${detail.summary.name} containers`}
+        columns={[
+          {
+            id: "name",
+            header: "Name",
+            render: (container) => (
+              <button
+                className="min-w-0 truncate text-left font-medium text-accent hover:underline"
+                onClick={() => onOpenContainerDrilldown(container)}
+                type="button"
+              >
+                {container.name}
+              </button>
+            ),
+            sortValue: (container) => container.name,
+            sortable: true,
+          },
+          {
+            id: "service",
+            header: "Service",
+            render: (container) => container.service || "-",
+            sortValue: (container) => container.service || "",
+            sortable: true,
+          },
+          {
+            id: "image",
+            header: "Image",
+            render: (container) => container.image,
+            sortValue: (container) => container.image,
+            sortable: true,
+          },
+          {
+            id: "state",
+            header: "State",
+            render: (container) => (
+              <Badge tone={containerTone(container)}>
+                {container.state || container.status}
+              </Badge>
+            ),
+            sortValue: (container) => container.state,
+            sortable: true,
+          },
+          {
+            id: "ports",
+            header: "Ports",
+            render: (container) => <PortList ports={container.ports ?? []} />,
+          },
+          {
+            id: "actions",
+            header: "Actions",
+            render: (container) => (
+              <div className="flex justify-end gap-1">
+                <Tooltip label="Open logs">
+                  <Button
+                    aria-label={`Open logs for ${container.name}`}
+                    icon={<ScrollText size={15} />}
+                    onClick={() => onOpenContainerDrilldown(container, "logs")}
+                    size="icon"
+                    variant="ghost"
+                  />
+                </Tooltip>
+                <Tooltip label="Browse files">
+                  <Button
+                    aria-label={`Browse files for ${container.name}`}
+                    icon={<FolderOpen size={15} />}
+                    onClick={() => onOpenContainerDrilldown(container, "files")}
+                    size="icon"
+                    variant="ghost"
+                  />
+                </Tooltip>
+                <Tooltip label="Open terminal">
+                  <Button
+                    aria-label={`Open terminal for ${container.name}`}
+                    disabled={!dockerRunning}
+                    disabledReason="Docker engine is not running"
+                    icon={<Terminal size={15} />}
+                    onClick={() => onOpenContainerTerminal(container)}
+                    size="icon"
+                    variant="ghost"
+                  />
+                </Tooltip>
+                <Tooltip label="Inspect JSON">
+                  <Button
+                    aria-label={`Inspect ${container.name}`}
+                    icon={<FileJson size={15} />}
+                    onClick={() =>
+                      onOpenContainerDrilldown(container, "inspect")
+                    }
+                    size="icon"
+                    variant="ghost"
+                  />
+                </Tooltip>
+              </div>
+            ),
+          },
+        ]}
+        empty={
+          <EmptyState
+            body="No containers are currently associated with this project."
+            icon={<Container size={28} />}
+            title="No project containers"
+          />
+        }
+        getRowID={(container) => container.id}
+        rows={containers}
+      />
+    </div>
+  );
+}
+
+function ContainerDrilldownPanel({
+  container,
+  dockerRunning,
+  inventoryLoading,
+  onClose,
+  onOpenContainerTerminal,
+  onTabChange,
+  onToast,
+  project,
+  projectsLoading,
+  tab,
+}: {
+  container: ContainerSummary;
+  dockerRunning: boolean;
+  inventoryLoading: boolean;
+  projectsLoading: boolean;
+  project?: ProjectSummary | null;
+  tab: ContainerDrilldownTabID;
+  onClose: () => void;
+  onOpenContainerTerminal: (container: ContainerSummary) => void;
+  onTabChange: (tab: ContainerDrilldownTabID) => void;
+  onToast: (toast: ToastInput) => void;
+}) {
+  const [detailState, setDetailState] = useState<{
+    containerID: string;
+    detail: ContainerDetail | null;
+    error: string | null;
+    status: LoadStatus;
+  }>(() => ({
+    containerID: container.id,
+    detail: null,
+    error: null,
+    status: "loading",
+  }));
+
+  useEffect(() => {
+    let cancelled = false;
+    DockerService.GetContainer(container.id)
+      .then((nextDetail) => {
+        if (cancelled) {
+          return;
+        }
+        setDetailState({
+          containerID: container.id,
+          detail: nextDetail,
+          error: null,
+          status: "ready",
+        });
+      })
+      .catch((error: unknown) => {
+        if (cancelled) {
+          return;
+        }
+        setDetailState({
+          containerID: container.id,
+          detail: null,
+          error:
+            error instanceof Error ? error.message : "Unable to load container",
+          status: "error",
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [container.id]);
+
+  const detailCurrent = detailState.containerID === container.id;
+  const detail = detailCurrent ? detailState.detail : null;
+  const detailError = detailCurrent ? detailState.error : null;
+  const detailStatus = detailCurrent ? detailState.status : "loading";
+  const tabs: Array<[ContainerDrilldownTabID, string]> = [
+    ["overview", "Overview"],
+    ["logs", "Logs"],
+    ["files", "Files"],
+    ["terminal", "Terminal"],
+    ["inspect", "Inspect"],
+  ];
+  const logProjectID = project?.id ?? container.projectID ?? "";
+  const logProjects = project ? [project] : [];
+
+  return (
+    <Card>
+      <CardHeader
+        actions={
+          <Button
+            aria-label="Close container drilldown"
+            icon={<X size={15} />}
+            onClick={onClose}
+            size="icon"
+            variant="ghost"
+          />
+        }
+        status={
+          <Badge tone={containerTone(container)}>{container.state}</Badge>
+        }
+        title={
+          <span className="flex min-w-0 items-center gap-2">
+            <Container size={16} />
+            <span className="truncate">{container.name}</span>
+            <span className="font-mono text-xs font-normal text-text-muted">
+              {shortID(container.id)}
             </span>
-          ),
-          sortValue: (container) => container.name,
-          sortable: true,
-        },
-        {
-          id: "service",
-          header: "Service",
-          render: (container) => container.service || "-",
-          sortValue: (container) => container.service || "",
-          sortable: true,
-        },
-        {
-          id: "image",
-          header: "Image",
-          render: (container) => container.image,
-          sortValue: (container) => container.image,
-          sortable: true,
-        },
-        {
-          id: "state",
-          header: "State",
-          render: (container) => (
-            <Badge tone={containerTone(container)}>
-              {container.state || container.status}
-            </Badge>
-          ),
-          sortValue: (container) => container.state,
-          sortable: true,
-        },
-        {
-          id: "ports",
-          header: "Ports",
-          render: (container) => <PortList ports={container.ports ?? []} />,
-        },
-      ]}
-      empty={
-        <EmptyState
-          body="No containers are currently associated with this project."
-          icon={<Container size={28} />}
-          title="No project containers"
-        />
-      }
-      getRowID={(container) => container.id}
-      rows={detail.containers ?? []}
-    />
+          </span>
+        }
+      />
+      <CardBody className="space-y-4">
+        <div className="flex flex-wrap gap-2 border-b border-border">
+          {tabs.map(([id, label]) => (
+            <button
+              className={[
+                "border-b-2 px-3 py-2 text-sm font-medium transition",
+                tab === id
+                  ? "border-accent text-accent"
+                  : "border-transparent text-text-secondary hover:text-text-primary",
+              ].join(" ")}
+              key={id}
+              onClick={() => onTabChange(id)}
+              type="button"
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {tab === "overview" ? (
+          <ContainerOverviewPanel
+            container={container}
+            detail={detail}
+            error={detailError}
+            loading={detailStatus === "loading"}
+            onOpenFiles={() => onTabChange("files")}
+            onOpenLogs={() => onTabChange("logs")}
+            onOpenTerminal={() => onOpenContainerTerminal(container)}
+          />
+        ) : null}
+        {tab === "logs" ? (
+          <LogsPage
+            containers={[container]}
+            dockerRunning={dockerRunning}
+            initialContainerIDs={[container.id]}
+            initialProjectID={logProjectID}
+            initialScope="container"
+            inventoryLoading={inventoryLoading}
+            lockedScope
+            onToast={onToast}
+            projects={logProjects}
+            projectsLoading={projectsLoading}
+          />
+        ) : null}
+        {tab === "files" ? (
+          <ContainerFilesPanel
+            container={container}
+            key={container.id}
+            onToast={onToast}
+          />
+        ) : null}
+        {tab === "terminal" ? (
+          <div className="flex flex-wrap items-center justify-between gap-3 rounded-control border border-border bg-bg-inset p-3">
+            <div className="min-w-0">
+              <div className="font-medium text-text-primary">
+                {container.name}
+              </div>
+              <div className="truncate font-mono text-xs text-text-muted">
+                {container.image}
+              </div>
+            </div>
+            <Button
+              disabled={!dockerRunning}
+              disabledReason="Docker engine is not running"
+              icon={<Terminal size={15} />}
+              onClick={() => onOpenContainerTerminal(container)}
+            >
+              Open terminal
+            </Button>
+          </div>
+        ) : null}
+        {tab === "inspect" ? (
+          <ContainerInspectPanel container={container} />
+        ) : null}
+      </CardBody>
+    </Card>
+  );
+}
+
+function ContainerOverviewPanel({
+  container,
+  detail,
+  error,
+  loading,
+  onOpenFiles,
+  onOpenLogs,
+  onOpenTerminal,
+}: {
+  container: ContainerSummary;
+  detail: ContainerDetail | null;
+  error: string | null;
+  loading: boolean;
+  onOpenFiles: () => void;
+  onOpenLogs: () => void;
+  onOpenTerminal: () => void;
+}) {
+  const rows = detail
+    ? [
+        ...containerRows(detail.summary),
+        ["Working dir", detail.workingDir || "-"],
+        ["User", detail.user || "-"],
+        ["Restart policy", detail.restartPolicy || "-"],
+      ]
+    : containerRows(container);
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap gap-2">
+        <Button icon={<ScrollText size={15} />} onClick={onOpenLogs}>
+          Logs
+        </Button>
+        <Button icon={<FolderOpen size={15} />} onClick={onOpenFiles}>
+          Files
+        </Button>
+        <Button icon={<Terminal size={15} />} onClick={onOpenTerminal}>
+          Terminal
+        </Button>
+      </div>
+      {loading ? (
+        <div className="grid gap-3 md:grid-cols-3">
+          <Skeleton className="h-16" />
+          <Skeleton className="h-16" />
+          <Skeleton className="h-16" />
+        </div>
+      ) : null}
+      {error ? (
+        <div className="rounded-control border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
+          {error}
+        </div>
+      ) : null}
+      <div className="grid gap-3 md:grid-cols-3">
+        {rows.map(([label, value]) => (
+          <div
+            className="min-w-0 rounded-control border border-border bg-bg-inset p-3"
+            key={label}
+          >
+            <div className="text-xs text-text-muted">{label}</div>
+            <div
+              className="mt-1 truncate font-mono text-xs text-text-primary"
+              title={value}
+            >
+              {value || "-"}
+            </div>
+          </div>
+        ))}
+      </div>
+      {detail?.mounts?.length ? (
+        <section className="space-y-2">
+          <h3 className="text-sm font-medium text-text-primary">Mounts</h3>
+          <div className="grid gap-2">
+            {detail.mounts.map((mount) => (
+              <div
+                className="grid gap-2 rounded-control border border-border bg-bg-inset p-3 text-sm md:grid-cols-[120px_1fr_1fr_auto]"
+                key={`${mount.type}:${mount.source}:${mount.target}`}
+              >
+                <Badge tone="neutral">{mount.type}</Badge>
+                <span className="min-w-0 truncate font-mono text-xs text-text-secondary">
+                  {mount.source || mount.volumeName || "-"}
+                </span>
+                <span className="min-w-0 truncate font-mono text-xs text-text-primary">
+                  {mount.target}
+                </span>
+                <Badge tone={mount.readOnly ? "warn" : "ok"}>
+                  {mount.readOnly ? "read-only" : "writable"}
+                </Badge>
+              </div>
+            ))}
+          </div>
+        </section>
+      ) : null}
+      {detail?.env?.length ? (
+        <details className="rounded-control border border-border bg-bg-inset">
+          <summary className="cursor-pointer px-3 py-2 text-sm text-text-primary">
+            Environment
+          </summary>
+          <div className="max-h-64 overflow-auto border-t border-border p-3 font-mono text-xs text-text-secondary">
+            {detail.env.map((env) => (
+              <div className="truncate" key={env.name} title={env.value}>
+                {env.name}=<span className="text-text-muted">{env.value}</span>
+              </div>
+            ))}
+          </div>
+        </details>
+      ) : null}
+    </div>
+  );
+}
+
+function ContainerFilesPanel({
+  container,
+  onToast,
+}: {
+  container: ContainerSummary;
+  onToast: (toast: ToastInput) => void;
+}) {
+  const [pathValue, setPathValue] = useState("/");
+  const [draftPath, setDraftPath] = useState("/");
+  const [listingState, setListingState] = useState<{
+    error: string | null;
+    listing: ContainerFileListing | null;
+    requestKey: string;
+    status: LoadStatus;
+  }>({
+    error: null,
+    listing: null,
+    requestKey: "",
+    status: "loading",
+  });
+  const [refreshNonce, setRefreshNonce] = useState(0);
+  const requestKey = `${container.id}\n${pathValue}\n${refreshNonce}`;
+
+  useEffect(() => {
+    let cancelled = false;
+    DockerService.ListContainerFiles(container.id, pathValue)
+      .then((nextListing) => {
+        if (cancelled) {
+          return;
+        }
+        setListingState({
+          error: null,
+          listing: nextListing,
+          requestKey,
+          status: "ready",
+        });
+        setDraftPath(nextListing?.path ?? pathValue);
+      })
+      .catch((listError: unknown) => {
+        if (cancelled) {
+          return;
+        }
+        setListingState({
+          error:
+            listError instanceof Error
+              ? listError.message
+              : "Unable to list container files",
+          listing: null,
+          requestKey,
+          status: "error",
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [container.id, pathValue, refreshNonce, requestKey]);
+
+  const listingCurrent = listingState.requestKey === requestKey;
+  const listing = listingCurrent ? listingState.listing : null;
+  const status = listingCurrent ? listingState.status : "loading";
+  const error = listingCurrent ? listingState.error : null;
+  const entries = listing?.entries ?? [];
+  const openPath = (nextPath: string) => {
+    setPathValue(nextPath || "/");
+    setDraftPath(nextPath || "/");
+  };
+
+  return (
+    <div className="space-y-3">
+      <form
+        className="flex flex-wrap items-center gap-2"
+        onSubmit={(event) => {
+          event.preventDefault();
+          openPath(draftPath);
+        }}
+      >
+        <div className="relative min-w-72 flex-1">
+          <FolderOpen
+            className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-text-muted"
+            size={16}
+          />
+          <input
+            aria-label="Container path"
+            className="h-9 w-full rounded-control border border-border bg-bg-inset pl-9 pr-3 font-mono text-sm text-text-primary"
+            onChange={(event) => setDraftPath(event.currentTarget.value)}
+            value={draftPath}
+          />
+        </div>
+        <Button disabled={status === "loading"} type="submit">
+          Open
+        </Button>
+        <Tooltip label="Parent folder">
+          <Button
+            aria-label="Open parent folder"
+            disabled={!listing?.parentPath || status === "loading"}
+            icon={<Undo2 size={15} />}
+            onClick={() => openPath(listing?.parentPath ?? "/")}
+            size="icon"
+            variant="secondary"
+          />
+        </Tooltip>
+        <Tooltip label="Refresh files">
+          <Button
+            aria-label="Refresh container files"
+            icon={<RefreshCw size={15} />}
+            loading={status === "loading"}
+            onClick={() => setRefreshNonce((current) => current + 1)}
+            size="icon"
+            variant="secondary"
+          />
+        </Tooltip>
+      </form>
+
+      {error ? (
+        <div className="rounded-control border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
+          {error}
+        </div>
+      ) : null}
+
+      <div className="overflow-hidden rounded-control border border-border">
+        <table className="w-full text-left text-sm">
+          <thead className="bg-bg-inset text-xs uppercase tracking-wide text-text-muted">
+            <tr>
+              <th className="px-3 py-2">Name</th>
+              <th className="px-3 py-2">Type</th>
+              <th className="px-3 py-2">Size</th>
+              <th className="px-3 py-2">Mode</th>
+              <th className="px-3 py-2">Modified</th>
+              <th className="px-3 py-2 text-right">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {status === "loading" ? (
+              <tr>
+                <td className="px-3 py-6" colSpan={6}>
+                  <Skeleton className="h-6 w-full" />
+                </td>
+              </tr>
+            ) : null}
+            {status !== "loading" && entries.length === 0 ? (
+              <tr>
+                <td className="px-3 py-8" colSpan={6}>
+                  <EmptyState
+                    body="This path has no visible entries."
+                    icon={<FolderOpen size={28} />}
+                    title="Empty folder"
+                  />
+                </td>
+              </tr>
+            ) : null}
+            {status !== "loading"
+              ? entries.map((entry) => {
+                  const isDirectory = entry.type === "directory";
+                  return (
+                    <tr
+                      className="border-t border-border hover:bg-bg-inset"
+                      key={entry.path}
+                    >
+                      <td className="min-w-0 px-3 py-2">
+                        {isDirectory ? (
+                          <button
+                            className="inline-flex min-w-0 items-center gap-2 text-accent hover:underline"
+                            onClick={() => openPath(entry.path)}
+                            type="button"
+                          >
+                            <FolderOpen size={15} />
+                            <span className="truncate">{entry.name}</span>
+                          </button>
+                        ) : (
+                          <span className="inline-flex min-w-0 items-center gap-2">
+                            <FileJson size={15} className="text-text-muted" />
+                            <span className="truncate">{entry.name}</span>
+                          </span>
+                        )}
+                        {entry.linkTarget ? (
+                          <div className="truncate pl-6 font-mono text-xs text-text-muted">
+                            {entry.linkTarget}
+                          </div>
+                        ) : null}
+                      </td>
+                      <td className="px-3 py-2">
+                        <Badge tone={isDirectory ? "info" : "neutral"}>
+                          {entry.type}
+                        </Badge>
+                      </td>
+                      <td className="px-3 py-2 font-mono text-xs">
+                        {isDirectory ? "-" : formatBytes(entry.sizeBytes ?? 0)}
+                      </td>
+                      <td className="px-3 py-2 font-mono text-xs">
+                        {entry.mode || "-"}
+                      </td>
+                      <td className="px-3 py-2 text-xs text-text-muted">
+                        {entry.modifiedAt ? formatDate(entry.modifiedAt) : "-"}
+                      </td>
+                      <td className="px-3 py-2">
+                        <div className="flex justify-end gap-1">
+                          <Tooltip label="Copy path">
+                            <Button
+                              aria-label={`Copy path for ${entry.name}`}
+                              icon={<Copy size={15} />}
+                              onClick={() => {
+                                void Clipboard.SetText(entry.path);
+                                onToast({
+                                  body: entry.path,
+                                  level: "ok",
+                                  title: "Path copied",
+                                });
+                              }}
+                              size="icon"
+                              variant="ghost"
+                            />
+                          </Tooltip>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })
+              : null}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function ContainerInspectPanel({ container }: { container: ContainerSummary }) {
+  const [inspectState, setInspectState] = useState<{
+    containerID: string;
+    error: string | null;
+    raw: string;
+    status: LoadStatus;
+  }>(() => ({
+    containerID: container.id,
+    error: null,
+    raw: "",
+    status: "loading",
+  }));
+
+  useEffect(() => {
+    let cancelled = false;
+    DockerService.InspectContainerRaw(container.id)
+      .then((nextRaw) => {
+        if (cancelled) {
+          return;
+        }
+        setInspectState({
+          containerID: container.id,
+          error: null,
+          raw: formatJSON(nextRaw),
+          status: "ready",
+        });
+      })
+      .catch((inspectError: unknown) => {
+        if (cancelled) {
+          return;
+        }
+        setInspectState({
+          containerID: container.id,
+          error:
+            inspectError instanceof Error
+              ? inspectError.message
+              : "Unable to inspect container",
+          raw: "",
+          status: "error",
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [container.id]);
+
+  const inspectCurrent = inspectState.containerID === container.id;
+  const raw = inspectCurrent ? inspectState.raw : "";
+  const status = inspectCurrent ? inspectState.status : "loading";
+  const error = inspectCurrent ? inspectState.error : null;
+
+  if (status === "loading") {
+    return <Skeleton className="h-96 w-full" />;
+  }
+  if (error) {
+    return (
+      <div className="rounded-control border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
+        {error}
+      </div>
+    );
+  }
+  return (
+    <pre className="max-h-[520px] overflow-auto rounded-control border border-border bg-bg-inset p-3 font-mono text-xs text-text-secondary">
+      {raw || "{}"}
+    </pre>
   );
 }
 
@@ -10024,6 +11369,7 @@ function ProjectUpdatesTab({
   onUpdateService: (service: string) => void;
 }) {
   const actionable = updates.filter(isActionableUpdate);
+  const manualRows = updates.filter((update) => !isActionableUpdate(update));
   const groups = [
     {
       title: "Pull & recreate",
@@ -10044,7 +11390,7 @@ function ProjectUpdatesTab({
     },
     {
       title: "Manual attention",
-      rows: updates.filter((update) => !isActionableUpdate(update)),
+      rows: manualRows,
     },
   ];
   return (
@@ -10076,6 +11422,31 @@ function ProjectUpdatesTab({
           icon={<CheckCircle2 size={28} />}
           title="All images up to date"
         />
+      ) : null}
+
+      {updates.length > 0 ? (
+        <div className="grid gap-3 md:grid-cols-2">
+          <div className="rounded-card border border-border bg-bg-inset px-3 py-2 text-sm">
+            <div className="font-medium text-text-primary">
+              {actionable.length} actionable update
+              {actionable.length === 1 ? "" : "s"}
+            </div>
+            <div className="mt-1 text-xs text-text-muted">
+              Update project applies rows in Pull & recreate or Rebuild &
+              redeploy. Use Update service to apply a single row.
+            </div>
+          </div>
+          <div className="rounded-card border border-border bg-bg-inset px-3 py-2 text-sm">
+            <div className="font-medium text-text-primary">
+              {manualRows.length} manual attention row
+              {manualRows.length === 1 ? "" : "s"}
+            </div>
+            <div className="mt-1 text-xs text-text-muted">
+              Manual rows cannot be auto-applied until the registry/base-image
+              issue is resolved, or you can ignore them.
+            </div>
+          </div>
+        </div>
       ) : null}
 
       {groups.map((group) => (
@@ -10130,12 +11501,12 @@ function ProjectUpdatesTab({
                           confidence={update.confidence}
                           reason={rowLineage?.reason}
                         />
-                        {updateStatusNote(update) ? (
-                          <Badge tone={updateTone(update.status)}>
-                            {updateStatusNote(update)}
-                          </Badge>
-                        ) : null}
                       </div>
+                      {updateStatusNote(update) ? (
+                        <div className="whitespace-normal break-words text-xs text-text-muted">
+                          {updateStatusNote(update)}
+                        </div>
+                      ) : null}
                     </div>
                     <div className="flex items-center justify-end gap-2">
                       {isActionableUpdate(update) ? (
@@ -10395,6 +11766,78 @@ function MiniMetric({ label, value }: { label: string; value: string }) {
   );
 }
 
+function ContainerDetailPage({
+  container,
+  dockerRunning,
+  inventoryLoading,
+  onBack,
+  onOpenContainerTerminal,
+  onTabChange,
+  onToast,
+  project,
+  projectsLoading,
+  tab,
+}: {
+  container: ContainerSummary;
+  dockerRunning: boolean;
+  inventoryLoading: boolean;
+  project: ProjectSummary | null;
+  projectsLoading: boolean;
+  tab: ContainerDrilldownTabID;
+  onBack: () => void;
+  onOpenContainerTerminal: (container: ContainerSummary) => void;
+  onTabChange: (tab: ContainerDrilldownTabID) => void;
+  onToast: (toast: ToastInput) => void;
+}) {
+  const projectLabel = project?.name ?? container.projectID ?? "Ungrouped";
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <Button onClick={onBack} size="sm" variant="ghost">
+            Back
+          </Button>
+          <div className="mt-2 flex flex-wrap items-center gap-2">
+            <h2 className="truncate text-2xl font-semibold">
+              {container.name}
+            </h2>
+            <Badge tone={containerTone(container)}>
+              {container.state || "unknown"}
+            </Badge>
+            <Badge tone="info">{projectLabel}</Badge>
+          </div>
+          <div className="mt-2 max-w-3xl truncate font-mono text-sm text-text-muted">
+            {container.image || "No image"} - {shortID(container.id)}
+          </div>
+        </div>
+        <div className="flex flex-wrap justify-end gap-2">
+          <Button
+            disabled={!dockerRunning}
+            disabledReason="Docker engine is not running"
+            icon={<Terminal size={15} />}
+            onClick={() => onOpenContainerTerminal(container)}
+          >
+            Open terminal
+          </Button>
+        </div>
+      </div>
+
+      <ContainerDrilldownPanel
+        container={container}
+        dockerRunning={dockerRunning}
+        inventoryLoading={inventoryLoading}
+        onClose={onBack}
+        onOpenContainerTerminal={onOpenContainerTerminal}
+        onTabChange={onTabChange}
+        onToast={onToast}
+        project={project}
+        projectsLoading={projectsLoading}
+        tab={tab}
+      />
+    </div>
+  );
+}
+
 type ContainersPageProps = {
   containers: ContainerSummary[];
   filter: FilterID;
@@ -10408,6 +11851,7 @@ type ContainersPageProps = {
   onBulkAction: (action: Exclude<ContainerAction, "kill">) => void;
   onFilterChange: (filter: FilterID) => void;
   onInspect: (container: ContainerSummary) => void;
+  onOpen: (container: ContainerSummary) => void;
   onRename: (container: ContainerSummary) => void;
   onToggleAllSelection: (ids: string[], selected: boolean) => void;
   onToggleSelection: (id: string) => void;
@@ -10424,6 +11868,7 @@ function ContainersPage({
   onBulkAction,
   onFilterChange,
   onInspect,
+  onOpen,
   onRename,
   onToggleAllSelection,
   onToggleSelection,
@@ -10458,15 +11903,22 @@ function ContainersPage({
           {
             id: "name",
             header: "Name",
+            defaultWidth: 230,
+            minWidth: 150,
             render: (container) => (
-              <div className="min-w-0">
-                <div className="truncate text-text-primary">
+              <button
+                aria-label={`Open ${container.name} container details`}
+                className="group block min-w-0 rounded-control text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
+                onClick={() => onOpen(container)}
+                type="button"
+              >
+                <div className="truncate font-medium text-accent group-hover:underline">
                   {container.name}
                 </div>
                 <div className="truncate text-xs text-text-muted">
                   {container.service || shortID(container.id)}
                 </div>
-              </div>
+              </button>
             ),
             sortable: true,
             sortValue: (container) => container.name,
@@ -10474,6 +11926,8 @@ function ContainersPage({
           {
             id: "status",
             header: "Status",
+            defaultWidth: 130,
+            minWidth: 110,
             render: (container) => (
               <Badge tone={containerTone(container)}>
                 {container.state || "unknown"}
@@ -10485,6 +11939,8 @@ function ContainersPage({
           {
             id: "project",
             header: "Project",
+            defaultWidth: 240,
+            minWidth: 150,
             render: (container) => container.projectID || "-",
             sortable: true,
             sortValue: (container) => container.projectID || "",
@@ -10492,6 +11948,8 @@ function ContainersPage({
           {
             id: "image",
             header: "Image",
+            defaultWidth: 260,
+            minWidth: 160,
             render: (container) => (
               <span title={container.image}>{container.image}</span>
             ),
@@ -10501,11 +11959,15 @@ function ContainersPage({
           {
             id: "ports",
             header: "Ports",
+            defaultWidth: 180,
+            minWidth: 120,
             render: (container) => <PortList ports={container.ports ?? []} />,
           },
           {
             id: "memory",
             header: "Memory",
+            defaultWidth: 140,
+            minWidth: 110,
             render: (container) =>
               formatMemory(container.memoryBytes, container.memoryLimit),
             sortable: true,
@@ -10514,6 +11976,8 @@ function ContainersPage({
           {
             id: "health",
             header: "Health",
+            defaultWidth: 140,
+            minWidth: 110,
             render: (container) => (
               <Badge tone={healthTone(container.health)}>
                 {container.health || "unknown"}
@@ -10525,6 +11989,8 @@ function ContainersPage({
           {
             id: "restarts",
             header: "Restarts",
+            defaultWidth: 110,
+            minWidth: 90,
             render: (container) => (
               <span
                 className={
@@ -10540,6 +12006,9 @@ function ContainersPage({
           {
             id: "actions",
             header: "",
+            defaultWidth: 190,
+            hideable: false,
+            minWidth: 160,
             render: (container) => (
               <ContainerRowActions
                 busyIDs={actionBusyIDs}
@@ -10980,7 +12449,13 @@ function NetworksPage({
             id: "name",
             header: "Name",
             render: (network) => (
-              <span className="text-text-primary">{network.name}</span>
+              <button
+                className="text-left font-medium text-text-primary hover:text-accent hover:underline"
+                onClick={() => onInspect(network)}
+                type="button"
+              >
+                {network.name}
+              </button>
             ),
             sortable: true,
             sortValue: (network) => network.name,
@@ -11038,6 +12513,7 @@ function NetworksPage({
                 label={network.name}
                 mutationsDisabled={mutationsDisabled}
                 mutationDisabledReason={mutationDisabledReason}
+                inspectLabel="Open network"
                 onInspect={() => onInspect(network)}
                 onRemove={() => onRemove(network)}
               />
@@ -11055,6 +12531,494 @@ function NetworksPage({
         rows={filtered}
       />
     </div>
+  );
+}
+
+type NetworkDetailPageProps = {
+  containers: ContainerSummary[];
+  detail?: NetworkDetail;
+  loading: boolean;
+  mutationsDisabled: boolean;
+  mutationDisabledReason: string;
+  network?: NetworkSummary;
+  tab: NetworkTabID;
+  onBack: () => void;
+  onOpenContainerInspect: (container: ContainerSummary) => void;
+  onOpenContainerTerminal: (container: ContainerSummary) => void;
+  onRefresh: () => Promise<void>;
+  onRemove: (network: NetworkSummary) => void;
+  onTabChange: (tab: NetworkTabID) => void;
+};
+
+function NetworkDetailPage({
+  containers,
+  detail,
+  loading,
+  mutationsDisabled,
+  mutationDisabledReason,
+  network,
+  onBack,
+  onOpenContainerInspect,
+  onOpenContainerTerminal,
+  onRefresh,
+  onRemove,
+  onTabChange,
+  tab,
+}: NetworkDetailPageProps) {
+  const summary = detail?.summary ?? network;
+  const attachedContainers = useMemo(
+    () => mergeNetworkContainers(detail?.containers ?? [], containers),
+    [containers, detail?.containers],
+  );
+  const labelRows = useMemo(
+    () =>
+      Object.entries(summary?.labels ?? {})
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, value]) => ({ key, value: value ?? "" })),
+    [summary?.labels],
+  );
+  const tabs: Array<[NetworkTabID, string, number | undefined]> = [
+    ["overview", "Overview", undefined],
+    ["containers", "Containers", attachedContainers.length],
+    ["labels", "Labels", labelRows.length],
+    ["raw", "Raw", undefined],
+  ];
+
+  if (!summary) {
+    return (
+      <div className="space-y-4">
+        <Button onClick={onBack} size="sm" variant="ghost">
+          Back
+        </Button>
+        <EmptyState
+          body="The network is no longer present in the active Docker backend."
+          icon={<Network size={28} />}
+          title="Network not found"
+        />
+      </div>
+    );
+  }
+
+  const rawValue = JSON.stringify(
+    detail
+      ? { ...detail, containers: attachedContainers }
+      : { summary, containers: attachedContainers },
+    null,
+    2,
+  );
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0 space-y-2">
+          <Button onClick={onBack} size="sm" variant="ghost">
+            Back
+          </Button>
+          <div className="flex min-w-0 flex-wrap items-center gap-2">
+            <h2 className="truncate text-2xl font-semibold">{summary.name}</h2>
+            <Badge tone="info">{summary.driver || "unknown"}</Badge>
+            <Badge tone={summary.internal ? "warn" : "neutral"}>
+              {summary.internal ? "internal" : "external"}
+            </Badge>
+            {summary.attachable ? <Badge tone="ok">attachable</Badge> : null}
+          </div>
+          <div className="truncate font-mono text-xs text-text-muted">
+            {summary.id}
+          </div>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Button
+            icon={<RefreshCw size={15} />}
+            loading={loading}
+            onClick={() => {
+              void onRefresh();
+            }}
+            variant="secondary"
+          >
+            Refresh
+          </Button>
+          <Button
+            disabled={mutationsDisabled}
+            disabledReason={mutationDisabledReason}
+            icon={<Trash2 size={15} />}
+            onClick={() => onRemove(summary)}
+            variant="danger"
+          >
+            Remove network
+          </Button>
+        </div>
+      </div>
+
+      <div className="flex flex-wrap gap-2 border-b border-border">
+        {tabs.map(([id, label, count]) => (
+          <button
+            className={[
+              "inline-flex items-center gap-2 border-b-2 px-3 py-2 text-sm font-medium transition",
+              tab === id
+                ? "border-accent text-accent"
+                : "border-transparent text-text-secondary hover:text-text-primary",
+            ].join(" ")}
+            key={id}
+            onClick={() => onTabChange(id)}
+            type="button"
+          >
+            <span>{label}</span>
+            {typeof count === "number" ? <Badge>{count}</Badge> : null}
+          </button>
+        ))}
+      </div>
+
+      {tab === "overview" ? (
+        <NetworkOverviewTab
+          attachedContainers={attachedContainers}
+          detail={detail}
+          labelCount={labelRows.length}
+          network={summary}
+          onOpenContainers={() => onTabChange("containers")}
+        />
+      ) : null}
+
+      {tab === "containers" ? (
+        <NetworkContainersTab
+          containers={attachedContainers}
+          onOpenContainerInspect={onOpenContainerInspect}
+          onOpenContainerTerminal={onOpenContainerTerminal}
+        />
+      ) : null}
+
+      {tab === "labels" ? <NetworkLabelsTab labels={labelRows} /> : null}
+
+      {tab === "raw" ? (
+        <Card>
+          <CardHeader
+            status={
+              <Badge tone="neutral">{detail ? "loaded" : "summary"}</Badge>
+            }
+            title="Network detail JSON"
+          />
+          <CardBody>
+            <CodePreview value={rawValue} />
+          </CardBody>
+        </Card>
+      ) : null}
+    </div>
+  );
+}
+
+function NetworkOverviewTab({
+  attachedContainers,
+  detail,
+  labelCount,
+  network,
+  onOpenContainers,
+}: {
+  attachedContainers: ContainerSummary[];
+  detail?: NetworkDetail;
+  labelCount: number;
+  network: NetworkSummary;
+  onOpenContainers: () => void;
+}) {
+  const rows = [
+    ["Driver", network.driver || "-"],
+    ["Scope", network.scope || "-"],
+    ["Subnet", detail?.subnet || "-"],
+    ["Gateway", detail?.gateway || "-"],
+    ["Containers", String(attachedContainers.length)],
+    ["Labels", String(labelCount)],
+    ["Internal", network.internal ? "yes" : "no"],
+    ["Attachable", network.attachable ? "yes" : "no"],
+  ];
+
+  return (
+    <div className="space-y-4">
+      <div className="grid gap-3 md:grid-cols-4">
+        {rows.map(([label, value]) => (
+          <div
+            className="min-w-0 rounded-control border border-border bg-bg-inset p-3"
+            key={label}
+          >
+            <div className="text-xs text-text-muted">{label}</div>
+            <div
+              className="mt-1 truncate font-mono text-xs text-text-primary"
+              title={value}
+            >
+              {value}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <Card>
+        <CardHeader
+          actions={
+            <Button onClick={onOpenContainers} size="sm" variant="secondary">
+              View containers
+            </Button>
+          }
+          status={<Badge tone="neutral">{attachedContainers.length}</Badge>}
+          title="Attached containers"
+        />
+        <CardBody>
+          {attachedContainers.length > 0 ? (
+            <div className="grid gap-2 lg:grid-cols-2">
+              {attachedContainers.slice(0, 6).map((container) => (
+                <div
+                  className="grid gap-2 rounded-control border border-border bg-bg-inset p-3 text-sm md:grid-cols-[1fr_auto]"
+                  key={container.id}
+                >
+                  <div className="min-w-0">
+                    <div className="truncate font-medium text-text-primary">
+                      {container.name || shortID(container.id)}
+                    </div>
+                    <div className="truncate font-mono text-xs text-text-muted">
+                      {networkContainerIP(container) || "No IP recorded"}
+                    </div>
+                  </div>
+                  <Badge tone={containerTone(container)}>
+                    {container.state}
+                  </Badge>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <EmptyState
+              body="No containers are currently attached to this network."
+              icon={<Container size={28} />}
+              title="No attached containers"
+            />
+          )}
+        </CardBody>
+      </Card>
+    </div>
+  );
+}
+
+function NetworkContainersTab({
+  containers,
+  onOpenContainerInspect,
+  onOpenContainerTerminal,
+}: {
+  containers: ContainerSummary[];
+  onOpenContainerInspect: (container: ContainerSummary) => void;
+  onOpenContainerTerminal: (container: ContainerSummary) => void;
+}) {
+  return (
+    <DataTable
+      ariaLabel="Network containers"
+      columns={[
+        {
+          id: "name",
+          header: "Name",
+          defaultWidth: 220,
+          render: (container) => (
+            <div className="min-w-0">
+              <button
+                className="truncate text-left font-medium text-text-primary hover:text-accent hover:underline"
+                onClick={() => onOpenContainerInspect(container)}
+                title={container.name}
+                type="button"
+              >
+                {container.name || shortID(container.id)}
+              </button>
+              <div className="truncate font-mono text-xs text-text-muted">
+                {shortID(container.id)}
+              </div>
+            </div>
+          ),
+          sortable: true,
+          sortValue: (container) => container.name,
+        },
+        {
+          id: "status",
+          header: "Status",
+          defaultWidth: 120,
+          render: (container) => (
+            <Badge tone={containerTone(container)}>{container.state}</Badge>
+          ),
+          sortable: true,
+          sortValue: (container) => container.state,
+        },
+        {
+          id: "service",
+          header: "Service",
+          defaultWidth: 140,
+          render: (container) => container.service || "-",
+          sortable: true,
+          sortValue: (container) => container.service || "",
+        },
+        {
+          id: "image",
+          header: "Image",
+          defaultWidth: 220,
+          render: (container) => container.image || "-",
+          wrap: true,
+        },
+        {
+          id: "ipv4",
+          header: "IPv4",
+          defaultWidth: 150,
+          render: (container) => container.ipv4Address || "-",
+          sortable: true,
+          sortValue: (container) => container.ipv4Address || "",
+        },
+        {
+          id: "ipv6",
+          header: "IPv6",
+          defaultWidth: 180,
+          render: (container) => container.ipv6Address || "-",
+          sortable: true,
+          sortValue: (container) => container.ipv6Address || "",
+        },
+        {
+          id: "gateway",
+          header: "Gateway",
+          defaultWidth: 140,
+          render: (container) => container.gateway || "-",
+        },
+        {
+          id: "mac",
+          header: "MAC",
+          defaultWidth: 150,
+          render: (container) => container.macAddress || "-",
+        },
+        {
+          id: "ports",
+          header: "Ports",
+          defaultWidth: 180,
+          render: (container) => formatContainerPorts(container.ports),
+          wrap: true,
+        },
+        {
+          id: "cpu",
+          header: "CPU",
+          defaultWidth: 90,
+          render: (container) => `${(container.cpuPercent ?? 0).toFixed(1)}%`,
+          sortable: true,
+          sortValue: (container) => container.cpuPercent ?? 0,
+        },
+        {
+          id: "memory",
+          header: "Memory",
+          defaultWidth: 130,
+          render: (container) =>
+            formatMemory(container.memoryBytes, container.memoryLimit),
+          sortable: true,
+          sortValue: (container) => container.memoryBytes ?? 0,
+        },
+        {
+          id: "io",
+          header: "Network IO",
+          defaultWidth: 180,
+          render: (container) =>
+            `${formatRate(container.netRxRate ?? 0)} RX / ${formatRate(
+              container.netTxRate ?? 0,
+            )} TX`,
+        },
+        {
+          id: "aliases",
+          header: "Aliases",
+          defaultWidth: 180,
+          render: (container) => container.aliases?.join(", ") || "-",
+          wrap: true,
+        },
+        {
+          id: "actions",
+          header: "",
+          defaultWidth: 96,
+          render: (container) => (
+            <div className="flex justify-end gap-1">
+              <Tooltip label="Inspect container">
+                <Button
+                  aria-label={`Inspect container ${container.name}`}
+                  icon={<Eye size={15} />}
+                  onClick={() => onOpenContainerInspect(container)}
+                  size="icon"
+                  variant="ghost"
+                />
+              </Tooltip>
+              <Tooltip label="Open terminal">
+                <Button
+                  aria-label={`Open terminal for ${container.name}`}
+                  disabled={container.state !== "running"}
+                  disabledReason="Container is not running"
+                  icon={<Terminal size={15} />}
+                  onClick={() => onOpenContainerTerminal(container)}
+                  size="icon"
+                  variant="ghost"
+                />
+              </Tooltip>
+            </div>
+          ),
+        },
+      ]}
+      empty={
+        <EmptyState
+          body="No containers are currently attached to this network."
+          icon={<Container size={28} />}
+          title="No attached containers"
+        />
+      }
+      getRowID={(container) => container.id}
+      rows={containers}
+    />
+  );
+}
+
+function NetworkLabelsTab({
+  labels,
+}: {
+  labels: Array<{ key: string; value: string }>;
+}) {
+  return (
+    <DataTable
+      ariaLabel="Network labels"
+      columns={[
+        {
+          id: "key",
+          header: "Key",
+          defaultWidth: 320,
+          render: (label) => label.key,
+          sortable: true,
+          sortValue: (label) => label.key,
+        },
+        {
+          id: "value",
+          header: "Value",
+          defaultWidth: 420,
+          render: (label) => label.value || "-",
+          wrap: true,
+        },
+        {
+          id: "actions",
+          header: "",
+          defaultWidth: 72,
+          render: (label) => (
+            <div className="flex justify-end">
+              <Tooltip label="Copy value">
+                <Button
+                  aria-label={`Copy ${label.key}`}
+                  icon={<Copy size={15} />}
+                  onClick={() => {
+                    void Clipboard.SetText(label.value);
+                  }}
+                  size="icon"
+                  variant="ghost"
+                />
+              </Tooltip>
+            </div>
+          ),
+        },
+      ]}
+      empty={
+        <EmptyState
+          body="This network does not expose Docker labels."
+          icon={<Tag size={28} />}
+          title="No labels"
+        />
+      }
+      getRowID={(label) => label.key}
+      rows={labels}
+    />
   );
 }
 
@@ -11115,6 +13079,7 @@ function FilterChips({
 
 function RowActions({
   id,
+  inspectLabel = "Inspect",
   label,
   mutationsDisabled = false,
   mutationDisabledReason = "",
@@ -11122,6 +13087,7 @@ function RowActions({
   onRemove,
 }: {
   id: string;
+  inspectLabel?: string;
   label: string;
   mutationsDisabled?: boolean;
   mutationDisabledReason?: string;
@@ -11130,9 +13096,9 @@ function RowActions({
 }) {
   return (
     <div className="flex justify-end gap-1">
-      <Tooltip label="Inspect">
+      <Tooltip label={inspectLabel}>
         <Button
-          aria-label={`Inspect ${label}`}
+          aria-label={`${inspectLabel} ${label}`}
           icon={<Eye size={15} />}
           onClick={onInspect}
           size="icon"
@@ -11405,14 +13371,21 @@ function isLogLine(value: unknown): value is LogLine {
 }
 
 function normalizeLogLevel(level?: string): LogLevelFilter {
-  const value = level?.toLowerCase();
+  const value = level?.trim().toLowerCase();
+  if (!value) {
+    return "log";
+  }
   if (
     value === "error" ||
     value === "warn" ||
     value === "info" ||
-    value === "debug"
+    value === "debug" ||
+    value === "log"
   ) {
     return value;
+  }
+  if (value === "fatal") {
+    return "error";
   }
   return "unknown";
 }
@@ -11445,6 +13418,76 @@ function logSourceKey(line: LogLine) {
 
 function projectName(projects: ProjectSummary[], id: string) {
   return projects.find((project) => project.id === id)?.name ?? id;
+}
+
+function containerName(containers: ContainerSummary[], id: string) {
+  return (
+    containers.find((container) => container.id === id)?.name ?? shortID(id)
+  );
+}
+
+function mergeNetworkContainers(
+  attachedContainers: ContainerSummary[],
+  inventoryContainers: ContainerSummary[],
+) {
+  const inventoryByID = new Map(
+    inventoryContainers.map((container) => [container.id, container]),
+  );
+
+  return attachedContainers.map((container) => {
+    const current = inventoryByID.get(container.id);
+    if (!current) {
+      return container;
+    }
+    return {
+      ...current,
+      ...container,
+      cpuPercent: current.cpuPercent ?? container.cpuPercent,
+      memoryBytes: current.memoryBytes ?? container.memoryBytes,
+      memoryLimit: current.memoryLimit ?? container.memoryLimit,
+      netRxRate: current.netRxRate ?? container.netRxRate,
+      netTxRate: current.netTxRate ?? container.netTxRate,
+      ports: current.ports?.length ? current.ports : container.ports,
+    };
+  });
+}
+
+function networkContainerIP(container: ContainerSummary) {
+  return container.ipv4Address || container.ipv6Address || "";
+}
+
+function formatContainerPorts(ports?: PortBinding[]) {
+  if (!ports?.length) {
+    return "-";
+  }
+  return ports.map(formatPortBinding).join(", ");
+}
+
+function formatPortBinding(port: PortBinding) {
+  const containerPort = [
+    port.containerPort || "-",
+    port.protocol ? `/${port.protocol}` : "",
+  ].join("");
+  if (!port.hostPort) {
+    return containerPort;
+  }
+  const host = [port.hostIP, port.hostPort].filter(Boolean).join(":");
+  return `${host}->${containerPort}`;
+}
+
+function hostPathFileURL(path: string) {
+  const value = path.trim();
+  if (value.startsWith("\\\\")) {
+    return `file://${encodeURI(value.slice(2).replace(/\\/g, "/"))}`;
+  }
+  const normalized = value.replace(/\\/g, "/");
+  if (/^[a-zA-Z]:\//.test(normalized)) {
+    return `file:///${encodeURI(normalized)}`;
+  }
+  if (normalized.startsWith("/")) {
+    return `file://${encodeURI(normalized)}`;
+  }
+  return encodeURI(normalized);
 }
 
 function projectIDForVolume(volume: VolumeSummary, projects: ProjectSummary[]) {
@@ -11867,6 +13910,61 @@ function ConfirmPlanModal({
           ) : null}
         </div>
       ) : null}
+    </Modal>
+  );
+}
+
+function RemoveProjectModal({
+  onClose,
+  onConfirm,
+  state,
+}: {
+  onClose: () => void;
+  onConfirm: () => void;
+  state: RemoveProjectState;
+}) {
+  const project = state.project;
+  return (
+    <Modal
+      busy={state.busy}
+      danger
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button disabled={state.busy} onClick={onClose} variant="secondary">
+            Cancel
+          </Button>
+          <Button loading={state.busy} onClick={onConfirm} variant="danger">
+            Remove
+          </Button>
+        </div>
+      }
+      onClose={onClose}
+      open={state.open}
+      title="Remove project from list?"
+    >
+      <div className="space-y-4">
+        <p className="text-sm text-text-secondary">
+          Remove{" "}
+          <span className="font-semibold text-text-primary">
+            {project?.name ?? "this project"}
+          </span>{" "}
+          from Cairn's project list.
+        </p>
+        <div className="rounded-control border border-warn/30 bg-warn/10 p-3 text-sm text-warn">
+          This does not stop containers, remove volumes, delete images, or
+          delete files. You can import the project again later.
+        </div>
+        {project?.workingDir ? (
+          <div className="truncate rounded-control border border-border bg-bg-inset p-3 font-mono text-xs text-text-muted">
+            {project.workingDir}
+          </div>
+        ) : null}
+        {state.error ? (
+          <div className="rounded-control border border-error/30 bg-error/10 p-3 text-sm text-error">
+            {state.error}
+          </div>
+        ) : null}
+      </div>
     </Modal>
   );
 }
@@ -13510,13 +15608,13 @@ function MetricButton({
 }) {
   return (
     <button
-      className="rounded-card border border-border bg-bg-card p-4 text-left transition hover:border-border-strong hover:bg-bg-panel"
+      className="rounded-card border border-border bg-bg-card p-3 text-left transition hover:border-border-strong hover:bg-bg-panel"
       onClick={onClick}
       type="button"
     >
       <div className="text-sm text-text-secondary">{label}</div>
-      <div className="mt-3 text-2xl font-semibold">{value}</div>
-      <div className="mt-2 text-xs text-text-muted">{hint}</div>
+      <div className="mt-1 text-xl font-semibold">{value}</div>
+      <div className="mt-1 text-xs text-text-muted">{hint}</div>
     </button>
   );
 }
@@ -14419,7 +16517,9 @@ export function filterProjects(
       case "unhealthy":
         return project.health === "unhealthy";
       case "updates":
-        return projectUpdateCount(project) > 0;
+        return projectActionableUpdateCount(project) > 0;
+      case "attention":
+        return projectManualUpdateCount(project) > 0;
       case "high-cpu":
         return project.cpuPercent >= 80;
       case "recent":
@@ -14472,6 +16572,36 @@ function projectUpdateCount(project: ProjectSummary) {
     badges.rebuildNeeded +
     badges.pinned +
     badges.unknownBase
+  );
+}
+
+function projectActionableUpdateCount(project: ProjectSummary) {
+  const badges = project.updateBadges;
+  if (!badges) {
+    return 0;
+  }
+  return badges.imageUpdates + badges.baseUpdates + badges.rebuildNeeded;
+}
+
+function projectManualUpdateCount(project: ProjectSummary) {
+  const badges = project.updateBadges;
+  if (!badges) {
+    return 0;
+  }
+  return badges.pinned + badges.unknownBase;
+}
+
+function projectCardUpdateBadges(project: ProjectSummary) {
+  const actionable = projectActionableUpdateCount(project);
+  const manual = projectManualUpdateCount(project);
+  if (actionable === 0 && manual === 0) {
+    return <Badge tone="neutral">0 updates</Badge>;
+  }
+  return (
+    <>
+      {actionable > 0 ? <Badge tone="warn">{actionable} updates</Badge> : null}
+      {manual > 0 ? <Badge tone="warn">{manual} needs attention</Badge> : null}
+    </>
   );
 }
 
@@ -14594,16 +16724,43 @@ function appendSparkEntries(
   return next;
 }
 
-function projectSparkEntries(samples: StatsSample[], label: string) {
+function emptyProjectMetricSparks(): ProjectMetricSparks {
+  return { cpu: {}, memory: {}, network: {} };
+}
+
+function appendProjectMetricSparkEntries(
+  current: ProjectMetricSparks,
+  samples: StatsSample[],
+  label: string,
+): ProjectMetricSparks {
+  return {
+    cpu: appendSparkEntries(
+      current.cpu,
+      projectSparkEntries(samples, label, "cpu"),
+    ),
+    memory: appendSparkEntries(
+      current.memory,
+      projectSparkEntries(samples, label, "memory"),
+    ),
+    network: appendSparkEntries(
+      current.network,
+      projectSparkEntries(samples, label, "network"),
+    ),
+  };
+}
+
+function projectSparkEntries(
+  samples: StatsSample[],
+  label: string,
+  metric: DashboardMetricID = "cpu",
+) {
   const grouped = new Map<string, number>();
   for (const sample of samples) {
     if (!sample.projectID) {
       continue;
     }
-    grouped.set(
-      sample.projectID,
-      (grouped.get(sample.projectID) ?? 0) + sample.cpuPercent,
-    );
+    const value = statsSampleMetricValue(sample, metric);
+    grouped.set(sample.projectID, (grouped.get(sample.projectID) ?? 0) + value);
   }
   return Array.from(grouped.entries()).map(([id, value]) => ({
     id,
@@ -14612,17 +16769,61 @@ function projectSparkEntries(samples: StatsSample[], label: string) {
   }));
 }
 
+function statsSampleMetricValue(
+  sample: StatsSample,
+  metric: DashboardMetricID,
+) {
+  switch (metric) {
+    case "memory":
+      return sample.memoryBytes;
+    case "network":
+      return sample.networkRxRate + sample.networkTxRate;
+    default:
+      return sample.cpuPercent;
+  }
+}
+
 function projectActivityScore(project: ProjectSummary, points?: SparkPoint[]) {
   const latest = points?.[points.length - 1]?.value ?? project.cpuPercent;
   return latest + project.memoryBytes / 1024 / 1024 / 1024;
 }
 
-function projectSparkPoints(project: ProjectSummary): SparkPoint[] {
-  const baseline = Math.max(0.2, project.cpuPercent);
+function projectSparkPoints(
+  project: ProjectSummary,
+  metric: DashboardMetricID = "cpu",
+): SparkPoint[] {
+  const baseline =
+    metric === "memory"
+      ? Math.max(1, project.memoryBytes)
+      : metric === "network"
+        ? Math.max(1, project.netRxRate + project.netTxRate)
+        : Math.max(0.2, project.cpuPercent);
   return sparkBars(project.id).map((height, index) => ({
     label: String(index),
     value: Math.max(0, (height / 100) * baseline),
   }));
+}
+
+function dashboardMetricColor(metric: DashboardMetricID) {
+  switch (metric) {
+    case "memory":
+      return chartColors.memory;
+    case "network":
+      return chartColors.networkRx;
+    default:
+      return chartColors.cpu;
+  }
+}
+
+function dashboardMetricLabel(metric: DashboardMetricID) {
+  switch (metric) {
+    case "memory":
+      return "memory";
+    case "network":
+      return "network";
+    default:
+      return "CPU";
+  }
 }
 
 function containerSparkPoints(container: ContainerSummary): SparkPoint[] {
@@ -14681,6 +16882,39 @@ function logLevelClass(level: LogLevelFilter) {
 
 function projectActionBusyKey(action: ProjectAction, projectID: string) {
   return `project:${action}:${projectID}`;
+}
+
+function primaryProjectAction(project: ProjectSummary): ProjectAction {
+  return project.status === "running" || project.servicesRunning > 0
+    ? "stop"
+    : "start";
+}
+
+function projectActionDisabledReason(
+  action: ProjectAction,
+  project: ProjectSummary,
+  mutationsDisabled: boolean,
+  mutationDisabledReason: string,
+) {
+  if (action === "remove") {
+    return "";
+  }
+  if (mutationsDisabled) {
+    return mutationDisabledReason;
+  }
+  const canUseStaleContainers =
+    (action === "stop" || action === "down" || action === "down-volumes") &&
+    project.servicesTotal > 0;
+  if (canUseStaleContainers) {
+    return "";
+  }
+  if (project.status === "error") {
+    return "Re-link folder before running this Compose action";
+  }
+  if (!project.workingDir) {
+    return "No workdir";
+  }
+  return "";
 }
 
 function isRecentlyChanged(value: unknown) {
@@ -15219,23 +17453,6 @@ function volumeRows(
     ["Containers", String(detail?.containers?.length ?? 0)],
     ["Mountpoint", volume.mountpoint ?? "-"],
     ["Project", volume.labels?.[composeProjectLabel] ?? "-"],
-  ];
-}
-
-function networkRows(
-  network: NetworkSummary,
-  detail?: NetworkDetail,
-): Array<[string, string]> {
-  return [
-    ["ID", network.id],
-    ["Name", network.name],
-    ["Driver", network.driver],
-    ["Scope", network.scope ?? "-"],
-    ["Subnet", detail?.subnet ?? "-"],
-    ["Gateway", detail?.gateway ?? "-"],
-    ["Containers", String(detail?.containers?.length ?? 0)],
-    ["Internal", network.internal ? "yes" : "no"],
-    ["Attachable", network.attachable ? "yes" : "no"],
   ];
 }
 

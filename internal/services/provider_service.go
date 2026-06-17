@@ -353,6 +353,13 @@ func (s *ProviderService) ListDockerContexts(ctx context.Context) ([]models.Dock
 	return nil, notReady()
 }
 
+func (s *ProviderService) ListWSLDistros(ctx context.Context) ([]models.WSLDistroInfo, error) {
+	if s.Manager != nil {
+		return s.Manager.ListWSLDistros(ctx)
+	}
+	return nil, notReady()
+}
+
 func (s *ProviderService) SetDockerContext(ctx context.Context, name string) error {
 	if s.Manager == nil {
 		return notReady()

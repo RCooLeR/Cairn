@@ -8,7 +8,7 @@ vars:
   GARBLE_VERSION: "v0.16.0"
   GARBLE_PACKAGE: "mvdan.cc/garble@{{.GARBLE_VERSION}}"
   GARBLE_INSTALL_HINT: "garble is required for obfuscated builds. Install it with: go install {{.GARBLE_PACKAGE}} (requires Go 1.24+). See https://github.com/burrowers/garble/releases for version/toolchain compatibility."
-  VERSION_LDFLAGS: '-X github.com/RCooLeR/Cairn/internal/services.Version={{.APP_VERSION | default "0.1.0"}} -X github.com/RCooLeR/Cairn/internal/services.Commit={{.GIT_COMMIT | default ""}} -X github.com/RCooLeR/Cairn/internal/services.BuildDate={{.BUILD_DATE | default ""}}'
+  VERSION_LDFLAGS: '-X github.com/RCooLeR/Cairn/internal/services.Version={{.APP_VERSION | default "1.0.0"}} -X github.com/RCooLeR/Cairn/internal/services.Commit={{.GIT_COMMIT | default ""}} -X github.com/RCooLeR/Cairn/internal/services.BuildDate={{.BUILD_DATE | default ""}}'
 
 includes:
   common: ./build/Taskfile.yml
@@ -79,7 +79,7 @@ tasks:
   go:vuln:
     summary: Runs Go vulnerability scanning
     cmds:
-      - go run golang.org/x/vuln/cmd/govulncheck@v1.3.0 ./...
+      - powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-govulncheck.ps1
 
   lint:
     summary: Runs all linters

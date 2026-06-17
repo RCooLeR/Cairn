@@ -16,6 +16,8 @@ import type {
   DashboardMetrics,
   DiskUsageCategory,
   CheatsheetEntry,
+  ContainerDetail,
+  ContainerFileListing,
   ImageLineage,
   ImageSummary,
   ImageUpdate,
@@ -66,6 +68,8 @@ const runtimeMock = vi.hoisted(() => ({
     (eventName: string, callback: (event?: unknown) => void) => () => void
   >(() => vi.fn()),
   openFile: vi.fn(),
+  openURL: vi.fn(),
+  question: vi.fn(),
   saveFile: vi.fn(),
   setClipboardText: vi.fn(),
 }));
@@ -75,7 +79,9 @@ const dockerServiceMock = vi.hoisted(() => ({
   ListImages: vi.fn(),
   ListNetworks: vi.fn(),
   ListVolumes: vi.fn(),
+  GetContainer: vi.fn(),
   InspectContainerRaw: vi.fn(),
+  ListContainerFiles: vi.fn(),
   GetImage: vi.fn(),
   GetNetwork: vi.fn(),
   GetVolume: vi.fn(),
@@ -113,6 +119,7 @@ const projectServiceMock = vi.hoisted(() => ({
   PlanRedeployProject: vi.fn(),
   PlanDownProject: vi.fn(),
   ApplyProjectPlan: vi.fn(),
+  RemoveProjectFromList: vi.fn(),
 }));
 
 const backupServiceMock = vi.hoisted(() => ({
@@ -127,6 +134,7 @@ const backupServiceMock = vi.hoisted(() => ({
 const providerServiceMock = vi.hoisted(() => ({
   Detect: vi.fn(),
   ListDockerContexts: vi.fn(),
+  ListWSLDistros: vi.fn(),
   PlanInstall: vi.fn(),
   ApplyInstall: vi.fn(),
   SetDockerContext: vi.fn(),
@@ -271,10 +279,14 @@ vi.mock("@wailsio/runtime", () => ({
   },
   Dialogs: {
     OpenFile: runtimeMock.openFile,
+    Question: runtimeMock.question,
     SaveFile: runtimeMock.saveFile,
   },
   Clipboard: {
     SetText: runtimeMock.setClipboardText,
+  },
+  Browser: {
+    OpenURL: runtimeMock.openURL,
   },
 }));
 
@@ -289,7 +301,7 @@ describe("App inventory shell", () => {
     });
     inventoryMock.getInventorySnapshot.mockReset();
     appApiMock.getAppVersion.mockResolvedValue({
-      version: "0.1.0",
+      version: "1.0.0",
       goVersion: "go1.26.4",
     });
     dockerServiceMock.ListContainers.mockResolvedValue(
@@ -298,8 +310,12 @@ describe("App inventory shell", () => {
     dockerServiceMock.ListImages.mockResolvedValue(seededSnapshot().images);
     dockerServiceMock.ListNetworks.mockResolvedValue(seededSnapshot().networks);
     dockerServiceMock.ListVolumes.mockResolvedValue(seededSnapshot().volumes);
+    dockerServiceMock.GetContainer.mockResolvedValue(seededContainerDetail());
     dockerServiceMock.InspectContainerRaw.mockResolvedValue(
       '{"Id":"container-1"}',
+    );
+    dockerServiceMock.ListContainerFiles.mockResolvedValue(
+      seededContainerFiles(),
     );
     dockerServiceMock.GetImage.mockResolvedValue(null);
     dockerServiceMock.GetNetwork.mockResolvedValue(null);
@@ -356,6 +372,8 @@ describe("App inventory shell", () => {
       projectDownVolumesPlan(),
     );
     projectServiceMock.ApplyProjectPlan.mockResolvedValue(undefined);
+    projectServiceMock.RemoveProjectFromList.mockResolvedValue(undefined);
+    runtimeMock.question.mockResolvedValue("Remove");
     backupServiceMock.ListBackups.mockResolvedValue([]);
     backupServiceMock.PlanBackupVolume.mockResolvedValue(backupPlan());
     backupServiceMock.ApplyBackup.mockResolvedValue("backup-job");
@@ -369,6 +387,20 @@ describe("App inventory shell", () => {
         description: "Docker Desktop",
         current: true,
         dockerHost: "unix:///var/run/docker.sock",
+      },
+    ]);
+    providerServiceMock.ListWSLDistros.mockResolvedValue([
+      {
+        name: "Ubuntu",
+        state: "Running",
+        version: 2,
+        default: true,
+      },
+      {
+        name: "cairn-dev",
+        state: "Stopped",
+        version: 2,
+        default: false,
       },
     ]);
     providerServiceMock.PlanInstall.mockResolvedValue(wslInstallPlan());
@@ -561,7 +593,7 @@ describe("App inventory shell", () => {
     expect(
       screen.getByRole("heading", { name: "Overview" }),
     ).toBeInTheDocument();
-    expect(await screen.findByText("v0.1.0")).toBeInTheDocument();
+    expect(await screen.findByText("v1.0.0")).toBeInTheDocument();
     expect(
       await screen.findByText("Docker Engine - Running"),
     ).toBeInTheDocument();
@@ -644,7 +676,7 @@ describe("App inventory shell", () => {
     render(<App />);
 
     await waitFor(() =>
-      expect(settingsServiceMock.CheckAppUpdate).toHaveBeenCalledWith("0.1.0"),
+      expect(settingsServiceMock.CheckAppUpdate).toHaveBeenCalledWith("1.0.0"),
     );
     expect(
       await screen.findByText("Cairn 9.9.9 is available"),
@@ -691,7 +723,9 @@ describe("App inventory shell", () => {
     });
 
     expect(await screen.findByText("31.2% CPU")).toBeInTheDocument();
-    expect(screen.getByText("Top Containers")).toBeInTheDocument();
+    expect(screen.getByText("Resource Usage")).toBeInTheDocument();
+    expect(screen.queryByText("Top Containers")).toBeNull();
+    expect(screen.queryByText("Recent Events")).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: /Running1/ }));
 
@@ -786,7 +820,37 @@ describe("App inventory shell", () => {
   });
 
   it("opens terminal sessions from the Terminal page", async () => {
-    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    const snapshot = seededSnapshot();
+    const projectContainer = {
+      ...snapshot.containers[0],
+      id: "app-running",
+      name: "app-db-app-1",
+      projectID: "linux_native/app-db",
+      service: "app",
+      state: "running",
+      status: "Up 2 minutes",
+    };
+    snapshot.containers = [
+      projectContainer,
+      {
+        ...projectContainer,
+        id: "app-stopped",
+        name: "app-db-stopped-1",
+        state: "exited",
+        status: "Exited 1 minute ago",
+      },
+      {
+        ...projectContainer,
+        id: "other-running",
+        name: "other-api-1",
+        projectID: "linux_native/other",
+      },
+    ];
+    inventoryMock.getInventorySnapshot.mockResolvedValue(snapshot);
+    projectServiceMock.ListProjects.mockResolvedValue([
+      seededProject(),
+      { ...seededProject(), id: "linux_native/other", name: "other" },
+    ]);
     projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
 
     render(<App />);
@@ -808,6 +872,55 @@ describe("App inventory shell", () => {
     );
     await waitFor(() =>
       expect(screen.getAllByText("Host").length).toBeGreaterThan(1),
+    );
+
+    const projectSelect = screen.getByLabelText(
+      "Project terminal",
+    ) as HTMLSelectElement;
+    fireEvent.change(projectSelect, {
+      target: { value: "linux_native/app-db" },
+    });
+    const containerSelect = screen.getByLabelText(
+      "Container terminal",
+    ) as HTMLSelectElement;
+    expect(
+      within(containerSelect).getByRole("option", { name: "app-db-app-1" }),
+    ).toBeInTheDocument();
+    expect(
+      within(containerSelect).queryByRole("option", {
+        name: "app-db-stopped-1",
+      }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(containerSelect).queryByRole("option", { name: "other-api-1" }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.change(containerSelect, { target: { value: "app-running" } });
+    await waitFor(() =>
+      expect(terminalServiceMock.DetectContainerShells).toHaveBeenCalledWith(
+        "app-running",
+      ),
+    );
+    await waitFor(() =>
+      expect(
+        (screen.getByLabelText("Container shell path") as HTMLSelectElement)
+          .value,
+      ).toBe("/bin/sh"),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Open container terminal" }),
+    );
+    await waitFor(() =>
+      expect(terminalServiceMock.OpenContainerTerminal).toHaveBeenCalledWith(
+        "app-running",
+        {
+          shell: "/bin/sh",
+          user: "",
+          workingDir: "",
+          cols: 120,
+          rows: 30,
+        },
+      ),
     );
   });
 
@@ -959,6 +1072,51 @@ describe("App inventory shell", () => {
     expect(screen.getByText("No containers match")).toBeInTheDocument();
   });
 
+  it("opens a full container detail screen from the containers table", async () => {
+    const snapshot = seededSnapshot();
+    const container = snapshot.containers[0];
+    inventoryMock.getInventorySnapshot.mockResolvedValue(snapshot);
+    dockerServiceMock.GetContainer.mockResolvedValue({
+      ...seededContainerDetail(),
+      summary: container,
+      workingDir: "/usr/share/nginx/html",
+    });
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", {
+        name: /Containers/,
+      }),
+    );
+
+    const table = screen.getByRole("table", { name: "Containers inventory" });
+    fireEvent.click(
+      within(table).getByRole("button", {
+        name: `Open ${container.name} container details`,
+      }),
+    );
+
+    await waitFor(() =>
+      expect(dockerServiceMock.GetContainer).toHaveBeenCalledWith(
+        "container-1",
+      ),
+    );
+    expect(
+      screen.getByRole("heading", { name: container.name }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Working dir")).toBeInTheDocument();
+    expect(screen.getByText("/usr/share/nginx/html")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect(
+      screen.getByRole("table", { name: "Containers inventory" }),
+    ).toBeInTheDocument();
+  });
+
   it("renders Compose projects and applies project filters", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
     projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
@@ -1014,6 +1172,78 @@ describe("App inventory shell", () => {
     );
   });
 
+  it("lets users dismiss project action errors", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
+    projectServiceMock.StopProject.mockRejectedValueOnce(
+      new Error("Compose project action failed"),
+    );
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", {
+        name: /Projects/,
+      }),
+    );
+    await screen.findByText("app-db");
+    fireEvent.click(screen.getByRole("button", { name: "Stop app-db" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Compose project action failed",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss error" }));
+
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("removes error projects from the list without requiring Docker actions", async () => {
+    const brokenProject = seededBrokenProject();
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValueOnce([
+      brokenProject,
+    ]).mockResolvedValueOnce([]);
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", {
+        name: /Projects/,
+      }),
+    );
+    await screen.findByText("Workdir missing");
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: `Remove from list ${brokenProject.name}`,
+      }),
+    );
+
+    expect(
+      await screen.findByRole("dialog", {
+        name: "Remove project from list?",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/This does not stop containers/),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+
+    await waitFor(() =>
+      expect(projectServiceMock.RemoveProjectFromList).toHaveBeenCalledWith(
+        brokenProject.id,
+      ),
+    );
+    expect(projectServiceMock.StartProject).not.toHaveBeenCalledWith(
+      brokenProject.id,
+    );
+  });
+
   it("opens project detail tabs with services, containers, and Compose config", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
     projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
@@ -1048,6 +1278,19 @@ describe("App inventory shell", () => {
     fireEvent.click(screen.getByRole("button", { name: "Containers" }));
     expect(screen.getByText("container-app")).toBeInTheDocument();
 
+    const logsButtons = screen.getAllByRole("button", { name: "Logs" });
+    fireEvent.click(logsButtons[logsButtons.length - 1]);
+    await waitFor(() =>
+      expect(logsServiceMock.StartLogStream).toHaveBeenCalledWith({
+        scope: "project",
+        ids: ["linux_native/app-db"],
+        follow: true,
+        tail: 500,
+        timestamps: true,
+      }),
+    );
+    expect(screen.queryByRole("group", { name: "Log scope" })).toBeNull();
+
     fireEvent.click(screen.getByRole("button", { name: "Compose" }));
     expect(screen.getByText("valid")).toBeInTheDocument();
     expect(await screen.findByTestId("monaco-viewer")).toHaveTextContent(
@@ -1058,6 +1301,106 @@ describe("App inventory shell", () => {
     expect(screen.getByText("Project Volumes")).toBeInTheDocument();
     expect(screen.getByText("cairn_data")).toBeInTheDocument();
     expect(screen.getByText("success")).toBeInTheDocument();
+  });
+
+  it("drills into project containers with logs, files, inspect, and terminal actions", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
+    projectServiceMock.GetProject.mockResolvedValue(seededProjectDetail());
+    dockerServiceMock.GetContainer.mockResolvedValue(seededContainerDetail());
+    dockerServiceMock.InspectContainerRaw.mockResolvedValue(
+      '{"Id":"container-app","Config":{"Image":"cairn/app:latest"}}',
+    );
+    dockerServiceMock.ListContainerFiles.mockResolvedValue(
+      seededContainerFiles(),
+    );
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", {
+        name: /Projects/,
+      }),
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "app-db" }));
+    await screen.findByText("linux_native");
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Open app container details" }),
+    );
+    await waitFor(() =>
+      expect(dockerServiceMock.GetContainer).toHaveBeenCalledWith(
+        "container-app",
+      ),
+    );
+    expect(
+      screen.getByRole("table", { name: "app-db containers" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Working dir")).toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", { name: "Close container drilldown" }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Containers" }));
+    fireEvent.click(
+      await screen.findByRole("button", { name: "container-app" }),
+    );
+    await waitFor(() =>
+      expect(dockerServiceMock.GetContainer).toHaveBeenCalledWith(
+        "container-app",
+      ),
+    );
+    expect(screen.getByText("Working dir")).toBeInTheDocument();
+
+    const drilldownLogsButtons = screen.getAllByRole("button", {
+      name: "Logs",
+    });
+    fireEvent.click(drilldownLogsButtons[drilldownLogsButtons.length - 1]);
+    await waitFor(() =>
+      expect(logsServiceMock.StartLogStream).toHaveBeenLastCalledWith({
+        scope: "container",
+        ids: ["container-app"],
+        follow: true,
+        tail: 500,
+        timestamps: true,
+      }),
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Files" }));
+    await waitFor(() =>
+      expect(dockerServiceMock.ListContainerFiles).toHaveBeenCalledWith(
+        "container-app",
+        "/",
+      ),
+    );
+    expect(await screen.findByText("app.log")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Inspect" }));
+    await waitFor(() =>
+      expect(dockerServiceMock.InspectContainerRaw).toHaveBeenCalledWith(
+        "container-app",
+      ),
+    );
+    await waitFor(() =>
+      expect(screen.getAllByText(/cairn\/app:latest/).length).toBeGreaterThan(
+        1,
+      ),
+    );
+
+    const terminalButtons = screen.getAllByRole("button", {
+      name: "Terminal",
+    });
+    fireEvent.click(terminalButtons[terminalButtons.length - 1]);
+    fireEvent.click(screen.getByRole("button", { name: "Open terminal" }));
+    await waitFor(() =>
+      expect(terminalServiceMock.OpenContainerTerminal).toHaveBeenCalledWith(
+        "container-app",
+        { cols: 120, rows: 30 },
+      ),
+    );
   });
 
   it("plans and applies updates from the global Updates page", async () => {
@@ -1193,6 +1536,7 @@ describe("App inventory shell", () => {
       streamID: "stream-1",
       lines: [
         logLine({ level: "info", text: "INFO server started" }),
+        logLine({ level: "", text: "plain startup message" }),
         logLine({
           level: "error",
           stream: "stderr",
@@ -1202,7 +1546,11 @@ describe("App inventory shell", () => {
     });
 
     expect(await screen.findByText(/server started/)).toBeInTheDocument();
+    expect(screen.getByText(/plain startup/)).toBeInTheDocument();
     expect(screen.getByText(/failed request/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "LOG" }));
+    expect(screen.queryByText(/plain startup/)).not.toBeInTheDocument();
+    expect(screen.getByText(/server started/)).toBeInTheDocument();
 
     fireEvent.change(screen.getByLabelText("Search logs"), {
       target: { value: "failed" },
@@ -1295,6 +1643,7 @@ describe("App inventory shell", () => {
     const scope = await screen.findByRole("group", {
       name: "Container scope",
     });
+    fireEvent.click(within(scope).getByLabelText("Search containers"));
     const checkbox = within(scope).getByRole("checkbox", { name: /web/ });
     expect(checkbox).not.toBeChecked();
 
@@ -1754,6 +2103,35 @@ describe("App inventory shell", () => {
         expect.objectContaining({ name: "demo_net", driver: "bridge" }),
       ),
     );
+  });
+
+  it("opens a network detail view with attached container endpoint data", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", {
+        name: /Networks/,
+      }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "cairn_default" }));
+
+    expect(
+      screen.getByRole("heading", { name: "cairn_default" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("172.19.0.0/16")).toBeInTheDocument();
+
+    fireEvent.click(screen.getAllByRole("button", { name: /Containers/ })[1]);
+
+    expect(
+      screen.getByRole("table", { name: "Network containers" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("172.19.0.2/16")).toBeInTheDocument();
+    expect(screen.getByText("02:42:ac:13:00:02")).toBeInTheDocument();
   });
 
   it("plans volume backup and restore actions behind confirmation", async () => {
@@ -2245,14 +2623,29 @@ describe("App inventory shell", () => {
 
     expect(await screen.findByText("Windows WSL")).toBeInTheDocument();
     expect(screen.getByText("Path mapping")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Installed WSL distros"),
+    ).toBeInTheDocument();
+    expect(screen.getAllByText("cairn-dev").length).toBeGreaterThan(0);
+    expect(
+      screen.getByText(/Docker contexts are separate Docker CLI endpoints/),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole("button", { name: "Use distro" })[1]);
+    await waitFor(() =>
+      expect(settingsServiceMock.SetSetting).toHaveBeenCalledWith(
+        "windows.wsl_distro",
+        "cairn-dev",
+      ),
+    );
+    settingsServiceMock.SetSetting.mockClear();
     const distroInput = screen.getByLabelText("WSL distro");
-    fireEvent.change(distroInput, { target: { value: "cairn-dev" } });
+    fireEvent.change(distroInput, { target: { value: "custom-dev" } });
     fireEvent.blur(distroInput);
 
     await waitFor(() =>
       expect(settingsServiceMock.SetSetting).toHaveBeenCalledWith(
         "windows.wsl_distro",
-        "cairn-dev",
+        "custom-dev",
       ),
     );
     fireEvent.click(
@@ -2414,7 +2807,7 @@ describe("App inventory shell", () => {
     ).toBeDisabled();
 
     clickSettingsSection("About");
-    expect(await screen.findByText("0.1.0")).toBeInTheDocument();
+    expect(await screen.findByText("1.0.0")).toBeInTheDocument();
     expect(screen.getByText("go1.26.4")).toBeInTheDocument();
   });
 
@@ -2434,7 +2827,7 @@ describe("App inventory shell", () => {
     );
     clickSettingsSection("About");
 
-    expect(await screen.findByText("0.1.0")).toBeInTheDocument();
+    expect(await screen.findByText("1.0.0")).toBeInTheDocument();
     expect(screen.getByText("Unavailable")).toBeInTheDocument();
   });
 
@@ -2894,7 +3287,17 @@ function seededSnapshot(): InventorySnapshot {
         summary: network,
         subnet: "172.19.0.0/16",
         gateway: "172.19.0.1",
-        containers: [container],
+        containers: [
+          {
+            ...container,
+            networkName: network.name,
+            endpointID: "endpoint-1",
+            ipv4Address: "172.19.0.2/16",
+            gateway: "172.19.0.1",
+            macAddress: "02:42:ac:13:00:02",
+            aliases: ["web", "cairn-web"],
+          },
+        ],
       },
     },
     degradedReason: null,
@@ -3082,6 +3485,23 @@ function seededProject(): ProjectSummary {
   };
 }
 
+function seededBrokenProject(): ProjectSummary {
+  return {
+    ...seededProject(),
+    id: "linux_native/missing-workdir",
+    name: "missing-workdir",
+    status: ProjectStatus.ProjectStatusError,
+    health: HealthStatus.HealthStatusUnknown,
+    servicesRunning: 0,
+    servicesTotal: 1,
+    cpuPercent: 0,
+    memoryBytes: 0,
+    ports: [],
+    workingDir:
+      "E:\\Development\\projects\\apps\\rcooler\\Cairn\\.scratch\\missing-workdir",
+  };
+}
+
 function seededProjectDetail(): ProjectDetail {
   return {
     summary: seededProject(),
@@ -3153,6 +3573,56 @@ function seededProjectDetail(): ProjectDetail {
       valid: true,
       errors: [],
     },
+  };
+}
+
+function seededContainerDetail(): ContainerDetail {
+  const container = seededProjectDetail().containers?.[0] as ContainerSummary;
+  return {
+    summary: container,
+    command: ["node", "server.js"],
+    entrypoint: ["docker-entrypoint.sh"],
+    env: [
+      { name: "NODE_ENV", value: "production" },
+      { name: "API_TOKEN", value: "[redacted]" },
+    ],
+    mounts: [
+      {
+        type: "bind",
+        source: "/srv/app",
+        target: "/app",
+        readOnly: false,
+      },
+    ],
+    networks: ["app-db_default"],
+    labels: { "com.docker.compose.service": "app" },
+    workingDir: "/app",
+    user: "node",
+    restartPolicy: "unless-stopped",
+  };
+}
+
+function seededContainerFiles(): ContainerFileListing {
+  return {
+    containerID: "container-app",
+    path: "/",
+    entries: [
+      {
+        name: "app",
+        path: "/app",
+        type: "directory",
+        mode: "drwxr-xr-x",
+        modifiedAt: "2026-06-13T08:00:00Z",
+      },
+      {
+        name: "app.log",
+        path: "/app.log",
+        type: "file",
+        sizeBytes: 42,
+        mode: "-rw-r--r--",
+        modifiedAt: "2026-06-13T08:05:00Z",
+      },
+    ],
   };
 }
 

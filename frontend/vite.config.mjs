@@ -25,6 +25,20 @@ function wailsRuntimePlugin(browserMocks) {
   };
 }
 
+function embedPlaceholderPlugin() {
+  return {
+    name: "cairn-embed-placeholder",
+    generateBundle() {
+      this.emitFile({
+        type: "asset",
+        fileName: "embed-placeholder.txt",
+        source:
+          "placeholder for Go embed before the Vite build writes production assets\n",
+      });
+    },
+  };
+}
+
 export default defineConfig(({ mode }) => {
   const browserMocks =
     mode === "release-validation" || process.env.CAIRN_BROWSER_MOCKS === "1";
@@ -35,6 +49,10 @@ export default defineConfig(({ mode }) => {
       port: Number(process.env.WAILS_VITE_PORT) || 9245,
       strictPort: true,
     },
-    plugins: [wailsRuntimePlugin(browserMocks), react()],
+    plugins: [
+      wailsRuntimePlugin(browserMocks),
+      react(),
+      embedPlaceholderPlugin(),
+    ],
   };
 });

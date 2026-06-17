@@ -188,6 +188,7 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 
 	r.dockerService.Client = dockerClient
 	r.projectService.Detector = projectDetector
+	r.projectService.Docker = dockerClient
 	r.projectService.Client = composeClient
 	r.projectService.PathMapper = provider
 	r.projectService.ProviderID = provider.ID()
@@ -288,6 +289,7 @@ func (h runtimeHandles) stop() {
 func (r *appRuntime) clearServicesLocked() {
 	r.dockerService.Client = nil
 	r.projectService.Detector = nil
+	r.projectService.Docker = nil
 	r.projectService.Client = nil
 	r.projectService.PathMapper = nil
 	r.projectService.ProviderID = ""

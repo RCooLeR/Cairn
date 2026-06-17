@@ -17,7 +17,6 @@ import {
   Copy,
   FolderGit2,
   Play,
-  Plus,
   Search,
   Server,
   ShieldAlert,
@@ -49,8 +48,10 @@ export type TerminalCommandRequest = {
 
 type TerminalPageProps = {
   containers: ContainerSummary[];
+  initialSession: TerminalSessionInfo | null;
   projects: ProjectSummary[];
   queuedCommand: TerminalCommandRequest | null;
+  onInitialSessionConsumed: (id: string) => void;
   onCommandConsumed: (id: number) => void;
 };
 
@@ -99,6 +100,8 @@ type PlaceholderValues = Record<string, string>;
 
 export function TerminalPage({
   containers,
+  initialSession,
+  onInitialSessionConsumed,
   onCommandConsumed,
   projects,
   queuedCommand,
@@ -159,12 +162,23 @@ export function TerminalPage({
     },
     [activateSessionAt, sessions.length],
   );
-  const runningContainers = useMemo(
+  const terminalContainers = useMemo(
     () =>
-      containers.filter((container) =>
-        ["running", "paused"].includes(container.state),
+      containers.filter(
+        (container) =>
+          terminalContainerIsRunning(container) &&
+          (!selectedProjectID || container.projectID === selectedProjectID),
       ),
-    [containers],
+    [containers, selectedProjectID],
+  );
+  const selectedTerminalContainerID = useMemo(
+    () =>
+      terminalContainers.some(
+        (container) => container.id === selectedContainerID,
+      )
+        ? selectedContainerID
+        : "",
+    [selectedContainerID, terminalContainers],
   );
   const categories = useMemo(() => {
     const unique = Array.from(
@@ -231,11 +245,11 @@ export function TerminalPage({
   }, [sessions]);
 
   useEffect(() => {
-    if (!selectedContainerID) {
+    if (!selectedTerminalContainerID) {
       return undefined;
     }
     let active = true;
-    TerminalService.DetectContainerShells(selectedContainerID)
+    TerminalService.DetectContainerShells(selectedTerminalContainerID)
       .then((shells) => {
         if (!active) {
           return;
@@ -253,7 +267,7 @@ export function TerminalPage({
     return () => {
       active = false;
     };
-  }, [selectedContainerID]);
+  }, [selectedTerminalContainerID]);
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -290,6 +304,23 @@ export function TerminalPage({
     setActiveSessionID(session.id);
     return session;
   }, []);
+
+  useEffect(() => {
+    if (!initialSession) {
+      return;
+    }
+    let cancelled = false;
+    queueMicrotask(() => {
+      if (cancelled) {
+        return;
+      }
+      addSession(initialSession);
+      onInitialSessionConsumed(initialSession.id);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [addSession, initialSession, onInitialSessionConsumed]);
 
   const openHost = useCallback(async () => {
     setBusy(true);
@@ -341,20 +372,23 @@ export function TerminalPage({
   }, [addSession, selectedProjectID]);
 
   const openContainer = useCallback(async () => {
-    if (!selectedContainerID) {
+    if (!selectedTerminalContainerID) {
       return;
     }
     setBusy(true);
     setError(null);
     try {
       addSession(
-        await TerminalService.OpenContainerTerminal(selectedContainerID, {
-          shell: containerShell,
-          user: containerUser,
-          workingDir: containerWorkdir,
-          cols: 120,
-          rows: 30,
-        }),
+        await TerminalService.OpenContainerTerminal(
+          selectedTerminalContainerID,
+          {
+            shell: containerShell,
+            user: containerUser,
+            workingDir: containerWorkdir,
+            cols: 120,
+            rows: 30,
+          },
+        ),
       );
     } catch (openError: unknown) {
       setError(errorMessage(openError, "Unable to open container terminal"));
@@ -366,7 +400,7 @@ export function TerminalPage({
     containerShell,
     containerUser,
     containerWorkdir,
-    selectedContainerID,
+    selectedTerminalContainerID,
   ]);
 
   const closeSessionNow = useCallback(
@@ -481,35 +515,38 @@ export function TerminalPage({
   );
 
   return (
-    <div className="grid min-h-[calc(100vh-9rem)] gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
-      <section className="flex min-h-[620px] min-w-0 flex-col overflow-hidden rounded-card border border-border bg-bg-panel">
-        <div className="flex min-h-12 flex-wrap items-center gap-2 border-b border-border px-3 py-2">
-          <Button
-            icon={<TerminalIcon size={15} />}
-            loading={busy}
-            onClick={() => {
-              void openHost();
-            }}
-            size="sm"
-            variant="secondary"
-          >
-            Host
-          </Button>
-          <Button
-            icon={<Server size={15} />}
-            loading={busy}
-            onClick={() => {
-              void openBackend();
-            }}
-            size="sm"
-            variant="secondary"
-          >
-            Backend
-          </Button>
-          <div className="flex min-w-[220px] items-center gap-2">
+    <div className="grid h-[calc(100vh-9rem)] min-h-[620px] gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
+      <section className="flex min-h-0 min-w-0 flex-col overflow-hidden rounded-card border border-border bg-bg-panel">
+        <div className="space-y-2 border-b border-border px-3 py-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              icon={<TerminalIcon size={15} />}
+              loading={busy}
+              onClick={() => {
+                void openHost();
+              }}
+              size="sm"
+              variant="secondary"
+            >
+              Host
+            </Button>
+            <Button
+              icon={<Server size={15} />}
+              loading={busy}
+              onClick={() => {
+                void openBackend();
+              }}
+              size="sm"
+              variant="secondary"
+            >
+              Backend
+            </Button>
+          </div>
+
+          <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_auto]">
             <select
               aria-label="Project terminal"
-              className="h-9 min-w-0 flex-1 rounded-control border border-border bg-bg-inset px-2 text-sm"
+              className="h-9 min-w-0 rounded-control border border-border bg-bg-inset px-2 text-sm"
               onChange={(event) => setSelectedProjectID(event.target.value)}
               value={selectedProjectID}
             >
@@ -528,14 +565,17 @@ export function TerminalPage({
               onClick={() => {
                 void openProject();
               }}
-              size="icon"
+              size="sm"
               variant="secondary"
-            />
+            >
+              Project
+            </Button>
           </div>
-          <div className="flex min-w-[360px] flex-1 flex-wrap items-center gap-2">
+
+          <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_156px_110px_minmax(120px,0.45fr)_auto]">
             <select
               aria-label="Container terminal"
-              className="h-9 min-w-[150px] flex-1 rounded-control border border-border bg-bg-inset px-2 text-sm"
+              className="h-9 min-w-0 rounded-control border border-border bg-bg-inset px-2 text-sm"
               onChange={(event) => {
                 const nextID = event.target.value;
                 setSelectedContainerID(nextID);
@@ -544,19 +584,31 @@ export function TerminalPage({
                   setContainerShell("");
                 }
               }}
-              value={selectedContainerID}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && selectedTerminalContainerID) {
+                  event.preventDefault();
+                  void openContainer();
+                }
+              }}
+              value={selectedTerminalContainerID}
             >
-              <option value="">Container</option>
-              {runningContainers.map((container) => (
+              <option value="">Select container</option>
+              {terminalContainers.map((container) => (
                 <option key={container.id} value={container.id}>
                   {container.name}
                 </option>
               ))}
             </select>
             <select
-              aria-label="Container shell"
-              className="h-9 w-32 rounded-control border border-border bg-bg-inset px-2 text-sm"
+              aria-label="Container shell path"
+              className="h-9 min-w-0 rounded-control border border-border bg-bg-inset px-2 text-sm"
               onChange={(event) => setContainerShell(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && selectedTerminalContainerID) {
+                  event.preventDefault();
+                  void openContainer();
+                }
+              }}
               value={containerShell}
             >
               {(shellOptions.length
@@ -566,27 +618,40 @@ export function TerminalPage({
                 .filter(Boolean)
                 .map((shell) => (
                   <option key={shell} value={shell}>
-                    {shell}
+                    {shellLabel(shell)}
                   </option>
                 ))}
             </select>
             <input
               aria-label="Container user"
-              className="h-9 w-24 rounded-control border border-border bg-bg-inset px-2 text-sm"
+              className="h-9 min-w-0 rounded-control border border-border bg-bg-inset px-2 text-sm"
               onChange={(event) => setContainerUser(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && selectedTerminalContainerID) {
+                  event.preventDefault();
+                  void openContainer();
+                }
+              }}
               placeholder="user"
               value={containerUser}
             />
             <input
               aria-label="Container working directory"
-              className="h-9 w-28 rounded-control border border-border bg-bg-inset px-2 text-sm"
+              className="h-9 min-w-0 rounded-control border border-border bg-bg-inset px-2 text-sm"
               onChange={(event) => setContainerWorkdir(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && selectedTerminalContainerID) {
+                  event.preventDefault();
+                  void openContainer();
+                }
+              }}
               placeholder="/workdir"
               value={containerWorkdir}
             />
             <Button
-              disabled={!selectedContainerID}
-              icon={<Plus size={15} />}
+              aria-label="Open container terminal"
+              disabled={!selectedTerminalContainerID}
+              icon={<TerminalIcon size={15} />}
               loading={busy}
               onClick={() => {
                 void openContainer();
@@ -594,7 +659,7 @@ export function TerminalPage({
               size="sm"
               variant="secondary"
             >
-              Open
+              Open terminal
             </Button>
           </div>
         </div>
@@ -660,17 +725,17 @@ export function TerminalPage({
             <span className="font-medium text-text-secondary">
               {activeSession.title}
             </span>
-            <span className="mx-2">·</span>
+            <span className="mx-2">/</span>
             <span>{activeSession.shell || "shell"}</span>
             {activeSession.isRoot ? (
               <>
-                <span className="mx-2">·</span>
+                <span className="mx-2">/</span>
                 <span className="text-error">root</span>
               </>
             ) : null}
             {activeSession.workingDir ? (
               <>
-                <span className="mx-2">·</span>
+                <span className="mx-2">/</span>
                 <span>{activeSession.workingDir}</span>
               </>
             ) : null}
@@ -706,8 +771,8 @@ export function TerminalPage({
         </div>
       </section>
 
-      <aside className="min-h-0 space-y-4">
-        <Card>
+      <aside className="flex min-h-0 flex-col">
+        <Card className="flex min-h-0 flex-1 flex-col">
           <CardHeader
             actions={
               <Badge tone="neutral">
@@ -716,7 +781,7 @@ export function TerminalPage({
             }
             title="Cheatsheet"
           />
-          <CardBody className="space-y-3">
+          <CardBody className="flex min-h-0 flex-1 flex-col gap-3">
             <div className="relative">
               <Search
                 className="pointer-events-none absolute left-2 top-2.5 text-text-muted"
@@ -729,24 +794,19 @@ export function TerminalPage({
                 value={cheatsheetSearch}
               />
             </div>
-            <div className="flex gap-2 overflow-x-auto pb-1">
+            <select
+              aria-label="Cheatsheet category"
+              className="h-9 w-full rounded-control border border-border bg-bg-inset px-2 text-sm text-text-primary"
+              onChange={(event) => setCheatsheetCategory(event.target.value)}
+              value={cheatsheetCategory}
+            >
               {categories.map((category) => (
-                <button
-                  className={[
-                    "h-8 shrink-0 rounded-control border px-2 text-xs",
-                    cheatsheetCategory === category
-                      ? "border-accent bg-accent/10 text-accent"
-                      : "border-border bg-bg-inset text-text-secondary",
-                  ].join(" ")}
-                  key={category}
-                  onClick={() => setCheatsheetCategory(category)}
-                  type="button"
-                >
-                  {category}
-                </button>
+                <option key={category} value={category}>
+                  {category === "all" ? "All categories" : category}
+                </option>
               ))}
-            </div>
-            <div className="max-h-[520px] space-y-2 overflow-auto pr-1">
+            </select>
+            <div className="min-h-0 flex-1 space-y-2 overflow-auto pr-1">
               {filteredCheatsheet.map((entry) => (
                 <CheatsheetRow
                   activeSession={activeSession}
@@ -1254,6 +1314,29 @@ function SessionIcon({ kind }: { kind: string }) {
     return <Server size={14} />;
   }
   return <TerminalIcon size={14} />;
+}
+
+function terminalContainerIsRunning(container: ContainerSummary) {
+  const state = container.state?.toLowerCase() ?? "";
+  const status = container.status?.toLowerCase() ?? "";
+  return state === "running" || status.startsWith("up");
+}
+
+function shellLabel(shell: string) {
+  switch (shell) {
+    case "/bin/bash":
+    case "/usr/bin/bash":
+      return `${shell} (bash)`;
+    case "/bin/sh":
+    case "/busybox/sh":
+      return `${shell} (sh)`;
+    case "/bin/ash":
+      return `${shell} (Alpine shell)`;
+    case "/bin/zsh":
+      return `${shell} (zsh)`;
+    default:
+      return shell;
+  }
 }
 
 function resolveCommand(

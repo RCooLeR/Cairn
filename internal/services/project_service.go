@@ -127,6 +127,9 @@ func (s *ProjectService) ImportProject(ctx context.Context, req models.ImportPro
 
 	now := s.now()
 	projectID := composecore.ProjectID(s.ProviderID, projectName)
+	if err := s.Projects.Unforget(ctx, s.ProviderID, s.ContextName, projectName, projectID); err != nil {
+		return nil, apperror.Wrap(apperror.Internal, "Import project failed", err)
+	}
 	project := store.ProjectRecord{
 		ID:           projectID,
 		ProviderID:   s.ProviderID,
@@ -182,6 +185,10 @@ func (s *ProjectService) RemoveProjectFromList(ctx context.Context, projectID st
 		return apperror.New(apperror.NotFound, "Project was not found")
 	}
 	started := time.Now().UTC()
+	if err := s.Projects.Forget(ctx, project, started); err != nil {
+		_ = s.recordProjectAudit(ctx, project, "remove_from_list", "", models.RiskSafe, "failed", time.Since(started), err)
+		return apperror.Wrap(apperror.Internal, "Remove project from list failed", err)
+	}
 	if err := s.Projects.Delete(ctx, projectID); err != nil {
 		_ = s.recordProjectAudit(ctx, project, "remove_from_list", "", models.RiskSafe, "failed", time.Since(started), err)
 		return mapStoreNotFound(err, "Project was not found")
@@ -387,6 +394,32 @@ func (s *ProjectService) projectContainers(ctx context.Context, project store.Pr
 	return containers, nil
 }
 
+func (s *ProjectService) liveProjectContainers(ctx context.Context, project store.ProjectRecord) ([]models.ContainerSummary, error) {
+	if s.Docker != nil {
+		summaries, err := s.Docker.ListContainers(ctx, models.ContainerListOptions{All: true})
+		if err != nil {
+			return nil, err
+		}
+		containers := make([]models.ContainerSummary, 0, len(summaries))
+		for _, summary := range summaries {
+			if summary.ProjectID == project.ID {
+				containers = append(containers, summary)
+			}
+		}
+		return containers, nil
+	}
+	return s.projectContainers(ctx, project)
+}
+
+func containerNeedsStop(state string) bool {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "", "created", "exited", "dead", "removing":
+		return false
+	default:
+		return true
+	}
+}
+
 func (s *ProjectService) projectComposeConfig(ctx context.Context, project store.ProjectRecord) *models.ComposeConfigResult {
 	if s.Client == nil {
 		return nil
@@ -417,7 +450,29 @@ func composeOptionsFromProject(project store.ProjectRecord) composecore.ProjectO
 func (s *ProjectService) planProjectAction(ctx context.Context, action string, projectID string, removeVolumes bool) (*models.CommandPlan, error) {
 	project, err := s.projectForAction(ctx, projectID)
 	if err != nil {
-		return nil, err
+		if action != security.ProjectActionDown || !apperror.IsCode(err, apperror.WorkdirMissing) {
+			return nil, err
+		}
+		project, err = s.projectRecordForCurrentContext(ctx, projectID)
+		if err != nil {
+			return nil, err
+		}
+		containers, err := s.liveProjectContainers(ctx, project)
+		if err != nil {
+			return nil, err
+		}
+		if len(containers) == 0 {
+			return nil, apperror.New(apperror.NotFound, "No project containers were found", apperror.WithDetail(project.ID))
+		}
+		plan := newStaleProjectDownPlan(project, containers, removeVolumes, s.now())
+		projectPlan, err := security.NewProjectActionPlan(plan, action, project.ID, removeVolumes)
+		if err != nil {
+			return nil, err
+		}
+		if err := s.projectPlanStore().Save(projectPlan); err != nil {
+			return nil, err
+		}
+		return &plan, nil
 	}
 	plan := newProjectCommandPlan(project, action, removeVolumes, s.now())
 	projectPlan, err := security.NewProjectActionPlan(plan, action, project.ID, removeVolumes)
@@ -433,7 +488,14 @@ func (s *ProjectService) planProjectAction(ctx context.Context, action string, p
 func (s *ProjectService) runProjectAction(ctx context.Context, action string, projectID string, removeVolumes bool, planned *models.CommandPlan) error {
 	project, err := s.projectForAction(ctx, projectID)
 	if err != nil {
-		return err
+		if !apperror.IsCode(err, apperror.WorkdirMissing) || (action != security.ProjectActionStop && action != security.ProjectActionDown) {
+			return err
+		}
+		project, err = s.projectRecordForCurrentContext(ctx, projectID)
+		if err != nil {
+			return err
+		}
+		return s.runStaleProjectContainerAction(ctx, action, project, removeVolumes, planned)
 	}
 	plan := planned
 	if plan == nil {
@@ -473,18 +535,92 @@ func (s *ProjectService) runProjectAction(ctx context.Context, action string, pr
 	return nil
 }
 
+func (s *ProjectService) runStaleProjectContainerAction(ctx context.Context, action string, project store.ProjectRecord, removeVolumes bool, planned *models.CommandPlan) error {
+	if s.Docker == nil {
+		return notReady()
+	}
+	containers, err := s.liveProjectContainers(ctx, project)
+	if err != nil {
+		return err
+	}
+	if len(containers) == 0 {
+		return apperror.New(apperror.NotFound, "No project containers were found", apperror.WithDetail(project.ID))
+	}
+	plan := planned
+	if plan == nil {
+		if action == security.ProjectActionDown {
+			nextPlan := newStaleProjectDownPlan(project, containers, removeVolumes, s.now())
+			plan = &nextPlan
+		} else {
+			nextPlan := newStaleProjectStopPlan(project, containers, s.now())
+			plan = &nextPlan
+		}
+	}
+	command := ""
+	if len(plan.Commands) > 0 {
+		command = plan.Commands[0].Command
+	}
+	jobID := security.NewJobID("job")
+	started := time.Now().UTC()
+	if err := s.recordProjectAudit(ctx, project, action, command, plan.Risk, "started", 0, nil); err != nil {
+		return err
+	}
+	s.publishJobProgress(jobID, "running", command, nil)
+
+	err = s.executeStaleProjectContainerAction(ctx, action, containers, removeVolumes)
+	duration := time.Since(started)
+	if err != nil {
+		_ = s.recordProjectAudit(ctx, project, action, command, plan.Risk, "failed", duration, err)
+		s.publishJobDone(jobID, "", err)
+		return err
+	}
+	if err := s.recordProjectAudit(ctx, project, action, command, plan.Risk, "success", duration, nil); err != nil {
+		return err
+	}
+	s.publishJobDone(jobID, "success", nil)
+	if s.Detector != nil {
+		_, _ = s.Detector.Reconcile(ctx)
+	}
+	if s.Events != nil {
+		s.Events.Publish(bus.Event{Topic: bus.TopicProjectChanged, Payload: map[string]any{"projectID": project.ID, "action": action}})
+		s.Events.Publish(bus.Event{Topic: bus.TopicObjectsChanged, Payload: map[string]any{"kind": "project", "ids": []string{project.ID}}})
+	}
+	return nil
+}
+
+func (s *ProjectService) executeStaleProjectContainerAction(ctx context.Context, action string, containers []models.ContainerSummary, removeVolumes bool) error {
+	switch action {
+	case security.ProjectActionStop:
+		for _, container := range containers {
+			if !containerNeedsStop(container.State) {
+				continue
+			}
+			if err := s.Docker.StopContainer(ctx, container.ID, 10); err != nil && !apperror.IsCode(err, apperror.NotFound) {
+				return err
+			}
+		}
+		return nil
+	case security.ProjectActionDown:
+		opts := models.RemoveContainerOptions{Force: true, RemoveVolumes: removeVolumes}
+		for _, container := range containers {
+			if err := s.Docker.RemoveContainer(ctx, container.ID, opts); err != nil && !apperror.IsCode(err, apperror.NotFound) {
+				return err
+			}
+		}
+		return nil
+	default:
+		return apperror.New(apperror.Conflict, "Unsupported stale project action", apperror.WithDetail(action))
+	}
+}
+
 func (s *ProjectService) projectForAction(ctx context.Context, projectID string) (store.ProjectRecord, error) {
 	if s.Client == nil || s.Projects == nil {
 		return store.ProjectRecord{}, notReady()
 	}
-	project, err := s.Projects.Get(ctx, projectID)
+	project, err := s.projectRecordForCurrentContext(ctx, projectID)
 	if err != nil {
-		return store.ProjectRecord{}, mapStoreNotFound(err, "Project was not found")
+		return store.ProjectRecord{}, err
 	}
-	if !s.projectInCurrentContext(project) {
-		return store.ProjectRecord{}, apperror.New(apperror.NotFound, "Project was not found")
-	}
-	project = normalizeProjectHostPaths(project, s.PathMapper)
 	workdir := strings.TrimSpace(project.WorkingDir)
 	if workdir == "" {
 		return store.ProjectRecord{}, apperror.New(apperror.WorkdirMissing, "Project working directory is missing")
@@ -499,6 +635,21 @@ func (s *ProjectService) projectForAction(ctx context.Context, projectID string)
 			return store.ProjectRecord{}, apperror.New(apperror.ComposeInvalid, "No Compose files were found for this project", apperror.WithDetail(workdir))
 		}
 	}
+	return project, nil
+}
+
+func (s *ProjectService) projectRecordForCurrentContext(ctx context.Context, projectID string) (store.ProjectRecord, error) {
+	if s.Projects == nil {
+		return store.ProjectRecord{}, notReady()
+	}
+	project, err := s.Projects.Get(ctx, projectID)
+	if err != nil {
+		return store.ProjectRecord{}, mapStoreNotFound(err, "Project was not found")
+	}
+	if !s.projectInCurrentContext(project) {
+		return store.ProjectRecord{}, apperror.New(apperror.NotFound, "Project was not found")
+	}
+	project = normalizeProjectHostPaths(project, s.PathMapper)
 	return project, nil
 }
 
@@ -538,13 +689,89 @@ func (s *ProjectService) executeProjectAction(ctx context.Context, action string
 	case security.ProjectActionRestart:
 		return s.Client.Restart(ctx, opts)
 	case security.ProjectActionPull:
-		return s.Client.Pull(ctx, opts)
+		return s.executeProjectPull(ctx, project, opts)
 	case security.ProjectActionRedeploy:
 		return s.Client.Up(ctx, opts, true)
 	case security.ProjectActionDown:
 		return s.Client.Down(ctx, opts, removeVolumes)
 	default:
 		return nil, apperror.New(apperror.Conflict, "Unsupported project action", apperror.WithDetail(action))
+	}
+}
+
+func (s *ProjectService) executeProjectPull(ctx context.Context, project store.ProjectRecord, opts composecore.ProjectOptions) (*providers.CommandResult, error) {
+	services, err := s.Projects.ListServices(ctx, project.ID)
+	if err != nil {
+		return nil, apperror.Wrap(apperror.Internal, "List project services failed", err)
+	}
+	if len(services) == 0 {
+		return s.Client.Pull(ctx, opts)
+	}
+	pullServices := make([]string, 0, len(services))
+	buildServices := make([]string, 0, len(services))
+	for _, service := range services {
+		if strings.TrimSpace(service.Name) == "" {
+			continue
+		}
+		if strings.TrimSpace(service.BuildContext) != "" {
+			buildServices = append(buildServices, service.Name)
+			continue
+		}
+		if strings.TrimSpace(service.ImageRef) != "" {
+			pullServices = append(pullServices, service.Name)
+		}
+	}
+	if len(pullServices) == 0 && len(buildServices) == 0 {
+		return s.Client.Pull(ctx, opts)
+	}
+	var combined *providers.CommandResult
+	if len(pullServices) > 0 {
+		result, err := s.Client.PullServices(ctx, opts, pullServices)
+		combined = combineCommandResults(combined, result)
+		if err != nil {
+			return combined, err
+		}
+	}
+	if len(buildServices) > 0 {
+		result, err := s.Client.Build(ctx, opts, composecore.BuildOptions{Pull: true, Services: buildServices})
+		combined = combineCommandResults(combined, result)
+		if err != nil {
+			return combined, err
+		}
+	}
+	return combined, nil
+}
+
+func combineCommandResults(first *providers.CommandResult, next *providers.CommandResult) *providers.CommandResult {
+	if next == nil {
+		return first
+	}
+	if first == nil {
+		copied := *next
+		copied.Command = append([]string(nil), next.Command...)
+		return &copied
+	}
+	first.Stdout = appendCommandOutput(first.Stdout, next.Stdout)
+	first.Stderr = appendCommandOutput(first.Stderr, next.Stderr)
+	first.Duration += next.Duration
+	first.ExitCode = next.ExitCode
+	first.Command = append([]string(nil), next.Command...)
+	if strings.TrimSpace(next.Workdir) != "" {
+		first.Workdir = next.Workdir
+	}
+	return first
+}
+
+func appendCommandOutput(current string, next string) string {
+	current = strings.TrimRight(current, "\r\n")
+	next = strings.TrimRight(next, "\r\n")
+	switch {
+	case current == "":
+		return next
+	case next == "":
+		return current
+	default:
+		return current + "\n" + next
 	}
 }
 
@@ -573,6 +800,89 @@ func newProjectCommandPlan(project store.ProjectRecord, action string, removeVol
 		Effects:           []string{project.Name + ": " + explanation},
 		RequiresTypedName: requiresTypedName,
 		ExpiresAt:         now.Add(security.DefaultPlanTTL),
+	}
+}
+
+func newStaleProjectStopPlan(project store.ProjectRecord, containers []models.ContainerSummary, now time.Time) models.CommandPlan {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	return models.CommandPlan{
+		PlanID: security.NewTypedPlanID("project"),
+		Title:  "Stop " + project.Name,
+		Risk:   models.RiskSafe,
+		Commands: []models.PlannedCommand{{
+			Order:       1,
+			Command:     staleProjectContainerCommand("stop", containers, false),
+			Risk:        models.RiskSafe,
+			Explanation: "Stops known containers that still carry this Compose project label.",
+		}},
+		Effects:   []string{project.Name + ": Stops known project containers without needing the missing Compose folder."},
+		ExpiresAt: now.Add(security.DefaultPlanTTL),
+	}
+}
+
+func newStaleProjectDownPlan(project store.ProjectRecord, containers []models.ContainerSummary, removeVolumes bool, now time.Time) models.CommandPlan {
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	risk := projectActionRisk(security.ProjectActionDown, removeVolumes)
+	effects := []string{
+		project.Name + ": Removes known containers that still carry this Compose project label.",
+		"Project networks and named Compose volumes cannot be inferred when the Compose folder is missing.",
+	}
+	if removeVolumes {
+		effects = append(effects, "Anonymous volumes attached to removed containers will also be removed.")
+	}
+	return models.CommandPlan{
+		PlanID: security.NewTypedPlanID("project"),
+		Title:  projectActionTitle(security.ProjectActionDown, project.Name, removeVolumes),
+		Risk:   risk,
+		Commands: []models.PlannedCommand{{
+			Order:       1,
+			Command:     staleProjectContainerCommand("rm", containers, removeVolumes),
+			Risk:        risk,
+			Explanation: "Removes known project containers because the Compose folder is missing.",
+		}},
+		Effects:           effects,
+		RequiresTypedName: project.Name,
+		ExpiresAt:         now.Add(security.DefaultPlanTTL),
+	}
+}
+
+func staleProjectContainerCommand(action string, containers []models.ContainerSummary, removeVolumes bool) string {
+	names := make([]string, 0, len(containers))
+	for _, container := range containers {
+		if name := strings.TrimSpace(container.Name); name != "" {
+			names = append(names, name)
+			continue
+		}
+		if id := strings.TrimSpace(container.ID); id != "" {
+			names = append(names, id)
+		}
+	}
+	switch action {
+	case "stop":
+		args := []string{"docker", "stop", "--time", "10"}
+		if len(names) == 0 {
+			args = append(args, "<project-containers>")
+		} else {
+			args = append(args, names...)
+		}
+		return joinCommand(args)
+	case "rm":
+		args := []string{"docker", "rm", "--force"}
+		if removeVolumes {
+			args = append(args, "--volumes")
+		}
+		if len(names) == 0 {
+			args = append(args, "<project-containers>")
+		} else {
+			args = append(args, names...)
+		}
+		return joinCommand(args)
+	default:
+		return "docker " + action + " <project-containers>"
 	}
 }
 

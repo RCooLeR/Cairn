@@ -215,7 +215,7 @@ func quoteArg(arg string) string {
 func secretLike(name string) bool {
 	lower := strings.ToLower(strings.TrimSpace(name))
 	parts := strings.FieldsFunc(lower, func(r rune) bool {
-		return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9')
+		return (r < 'a' || r > 'z') && (r < '0' || r > '9')
 	})
 	for i, part := range parts {
 		switch part {

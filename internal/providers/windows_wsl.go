@@ -240,6 +240,26 @@ func (p *WindowsWSLProvider) Detect(ctx context.Context) (*models.ProviderStatus
 	return status, nil
 }
 
+func (p *WindowsWSLProvider) ListDistros(ctx context.Context) ([]models.WSLDistroInfo, error) {
+	if _, err := p.runner.LookPath(wslCommandName); err != nil {
+		return nil, apperror.New(apperror.ProviderNotReady, "WSL is not installed or wsl.exe is not on PATH")
+	}
+	distros, ok := p.listDistros(ctx)
+	if !ok {
+		return nil, apperror.New(apperror.ProviderNotReady, "WSL distros are not available")
+	}
+	result := make([]models.WSLDistroInfo, 0, len(distros))
+	for _, distro := range distros {
+		result = append(result, models.WSLDistroInfo{
+			Name:    distro.Name,
+			State:   distro.State,
+			Version: distro.Version,
+			Default: distro.Default,
+		})
+	}
+	return result, nil
+}
+
 func (p *WindowsWSLProvider) PlanInstall(_ context.Context, opts models.InstallOptions) (*models.CommandPlan, error) {
 	distro := strings.TrimSpace(opts.Extra["distro"])
 	if distro == "" {

@@ -22,7 +22,7 @@ import (
 )
 
 var (
-	Version   = "0.1.0"
+	Version   = "1.0.0"
 	Commit    = ""
 	BuildDate = ""
 )
@@ -49,6 +49,7 @@ type DockerClient interface {
 	ListContainers(context.Context, models.ContainerListOptions) ([]models.ContainerSummary, error)
 	GetContainer(context.Context, string) (*models.ContainerDetail, error)
 	InspectContainerRaw(context.Context, string) (string, error)
+	ListContainerFiles(context.Context, string, string) (*models.ContainerFileListing, error)
 	StartContainer(context.Context, string) error
 	StopContainer(context.Context, string, int) error
 	RestartContainer(context.Context, string, int) error
@@ -92,6 +93,7 @@ type ProjectService struct {
 	Projects    *store.ProjectRepository
 	Objects     *store.ObjectCacheRepository
 	Updates     *store.UpdateRepository
+	Docker      DockerClient
 	Client      *composecore.Client
 	PathMapper  composecore.PathMapper
 	Audit       *store.AuditRepository
@@ -231,6 +233,15 @@ func (s *DockerService) InspectContainerRaw(ctx context.Context, id string) (str
 		return s.Client.InspectContainerRaw(ctx, id)
 	}
 	return "", notReady()
+}
+
+func (s *DockerService) ListContainerFiles(ctx context.Context, id string, path string) (*models.ContainerFileListing, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
+	if s.Client != nil {
+		return s.Client.ListContainerFiles(ctx, id, path)
+	}
+	return nil, notReady()
 }
 
 func (s *DockerService) StartContainer(ctx context.Context, id string) error {

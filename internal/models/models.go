@@ -65,6 +65,13 @@ type DockerContextInfo struct {
 	DockerHost  string `json:"dockerHost,omitempty"`
 }
 
+type WSLDistroInfo struct {
+	Name    string `json:"name"`
+	State   string `json:"state,omitempty"`
+	Version int    `json:"version,omitempty"`
+	Default bool   `json:"default"`
+}
+
 type DockerInfo struct {
 	ID              string `json:"id,omitempty"`
 	Name            string `json:"name,omitempty"`
@@ -126,6 +133,13 @@ type ContainerSummary struct {
 	NetRxRate   int64         `json:"netRxRate,omitempty"`
 	NetTxRate   int64         `json:"netTxRate,omitempty"`
 	Restarts    int           `json:"restarts,omitempty"`
+	NetworkName string        `json:"networkName,omitempty"`
+	EndpointID  string        `json:"endpointID,omitempty"`
+	IPv4Address string        `json:"ipv4Address,omitempty"`
+	IPv6Address string        `json:"ipv6Address,omitempty"`
+	Gateway     string        `json:"gateway,omitempty"`
+	MacAddress  string        `json:"macAddress,omitempty"`
+	Aliases     []string      `json:"aliases,omitempty"`
 	CreatedAt   time.Time     `json:"createdAt"`
 }
 
@@ -140,6 +154,23 @@ type ContainerDetail struct {
 	WorkingDir    string            `json:"workingDir,omitempty"`
 	User          string            `json:"user,omitempty"`
 	RestartPolicy string            `json:"restartPolicy,omitempty"`
+}
+
+type ContainerFileListing struct {
+	ContainerID string               `json:"containerID"`
+	Path        string               `json:"path"`
+	ParentPath  string               `json:"parentPath,omitempty"`
+	Entries     []ContainerFileEntry `json:"entries"`
+}
+
+type ContainerFileEntry struct {
+	Name       string    `json:"name"`
+	Path       string    `json:"path"`
+	Type       string    `json:"type"`
+	SizeBytes  int64     `json:"sizeBytes,omitempty"`
+	Mode       string    `json:"mode,omitempty"`
+	ModifiedAt time.Time `json:"modifiedAt,omitempty"`
+	LinkTarget string    `json:"linkTarget,omitempty"`
 }
 
 type PortBinding struct {
