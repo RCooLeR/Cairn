@@ -9,6 +9,10 @@ import { Call as $Call, CancellablePromise as $CancellablePromise, Create as $Cr
 // @ts-ignore: Unused imports
 import * as models$0 from "../models/models.js";
 
+export function ApplyRollback(planID: string): $CancellablePromise<string> {
+    return $Call.ByID(955601079, planID);
+}
+
 export function ApplyUpdate(req: models$0.ApplyUpdateRequest): $CancellablePromise<string> {
     return $Call.ByID(2969046818, req);
 }
@@ -47,6 +51,12 @@ export function ListUpdateHistory(filter: models$0.UpdateHistoryFilter): $Cancel
 
 export function PlanProjectUpdate(projectID: string): $CancellablePromise<models$0.UpdatePlan | null> {
     return $Call.ByID(3794215738, projectID).then(($result: any) => {
+        return $$createType6($result);
+    });
+}
+
+export function PlanRollback(historyID: number): $CancellablePromise<models$0.UpdatePlan | null> {
+    return $Call.ByID(2764539970, historyID).then(($result: any) => {
         return $$createType6($result);
     });
 }

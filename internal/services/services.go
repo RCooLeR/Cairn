@@ -109,6 +109,9 @@ type ComposeService struct {
 	Client     *composecore.Client
 	Projects   *store.ProjectRepository
 	PathMapper composecore.PathMapper
+	Audit      *store.AuditRepository
+	Detector   ProjectDetector
+	Events     bus.Bus
 	RuntimeMu  *sync.RWMutex
 }
 type MetricsService struct {
@@ -304,15 +307,12 @@ func (s *DockerService) RunImage(ctx context.Context, req models.RunImageRequest
 	}
 	command := dockerRunCommand(req)
 	risk := runImageRisk(req)
-	targetID := strings.TrimSpace(req.Name)
-	if targetID == "" {
-		targetID = strings.TrimSpace(req.ImageRef)
-	}
+	targetID := runImageTarget(req)
 	if risk != models.RiskSafe {
 		err := apperror.New(
 			apperror.ConfirmationRequired,
 			"Run image with bind mounts requires a confirmed plan",
-			apperror.WithDetail("Remove bind mounts or add a run-image plan/apply flow before executing this request."),
+			apperror.WithDetail("Call PlanRunImage and ApplyRunImagePlan before creating containers with bind mounts."),
 		)
 		_ = s.recordAudit(ctx, "container.run", "container", targetID, "", command, risk, "failed", 0, err)
 		return "", err
@@ -423,11 +423,15 @@ func (s *DockerService) recordAudit(ctx context.Context, action string, targetTy
 	if actionErr != nil {
 		message = actionErr.Error()
 	}
+	providerID := ""
+	if s.Client != nil {
+		providerID = s.Client.ProviderID()
+	}
 	_, err := s.Audit.Insert(ctx, store.AuditRecord{
 		Action:     action,
 		TargetType: targetType,
 		TargetID:   targetID,
-		ProviderID: s.Client.ProviderID(),
+		ProviderID: providerID,
 		ProjectID:  projectID,
 		Command:    command,
 		Risk:       risk,
@@ -482,10 +486,56 @@ func (s *DockerService) runDockerObjectPlan(ctx context.Context, plan security.D
 	return s.recordAudit(ctx, action, targetType, targetID, "", command, plan.Plan.Risk, "success", duration, nil)
 }
 
+func (s *DockerService) runPushImagePlan(ctx context.Context, plan security.DockerObjectPlan) (string, error) {
+	command := ""
+	if len(plan.Plan.Commands) > 0 {
+		command = plan.Plan.Commands[0].Command
+	}
+	imageRef := strings.TrimSpace(plan.TargetID)
+	started := time.Now().UTC()
+	if err := s.recordAudit(ctx, "image.push", "image", imageRef, "", command, plan.Plan.Risk, "started", 0, nil); err != nil {
+		return "", err
+	}
+	streamID, err := s.Client.PushImage(ctx, imageRef)
+	duration := time.Since(started)
+	if err != nil {
+		_ = s.recordAudit(ctx, "image.push", "image", imageRef, "", command, plan.Plan.Risk, "failed", duration, err)
+		return "", err
+	}
+	return streamID, s.recordAudit(ctx, "image.push", "image", imageRef, "", command, plan.Plan.Risk, "success", duration, nil)
+}
+
+func (s *DockerService) runRunImagePlan(ctx context.Context, plan security.DockerObjectPlan) (string, error) {
+	req := plan.RunImage
+	command := ""
+	if len(plan.Plan.Commands) > 0 {
+		command = plan.Plan.Commands[0].Command
+	}
+	targetID := strings.TrimSpace(plan.TargetID)
+	if targetID == "" {
+		targetID = runImageTarget(req)
+	}
+	started := time.Now().UTC()
+	if err := s.recordAudit(ctx, "container.run", "container", targetID, "", command, plan.Plan.Risk, "started", 0, nil); err != nil {
+		return "", err
+	}
+	id, err := s.Client.RunImage(ctx, req)
+	duration := time.Since(started)
+	if err != nil {
+		_ = s.recordAudit(ctx, "container.run", "container", targetID, "", command, plan.Plan.Risk, "failed", duration, err)
+		return "", err
+	}
+	return id, s.recordAudit(ctx, "container.run", "container", id, "", command, plan.Plan.Risk, "success", duration, nil)
+}
+
 func (s *DockerService) executeDockerObjectPlan(ctx context.Context, plan security.DockerObjectPlan) error {
 	switch plan.Action {
 	case security.DockerActionRemoveImage:
 		return s.Client.RemoveImage(ctx, plan.TargetID, plan.Force)
+	case security.DockerActionPushImage:
+		return apperror.New(apperror.Conflict, "Image push plans must be applied with ApplyPushImagePlan")
+	case security.DockerActionRunImage:
+		return apperror.New(apperror.Conflict, "Run image plans must be applied with ApplyRunImagePlan")
 	case security.DockerActionRemoveVolume:
 		return s.Client.RemoveVolume(ctx, plan.TargetID, plan.Force)
 	case security.DockerActionRemoveNetwork:
@@ -501,6 +551,8 @@ func dockerObjectAuditAction(plan security.DockerObjectPlan) string {
 	switch plan.Action {
 	case security.DockerActionRemoveImage:
 		return "image.remove"
+	case security.DockerActionPushImage:
+		return "image.push"
 	case security.DockerActionRemoveVolume:
 		return "volume.remove"
 	case security.DockerActionRemoveNetwork:
@@ -580,17 +632,13 @@ func (s *DockerService) PushImage(ctx context.Context, imageRef string) (string,
 		return "", notReady()
 	}
 	command := "docker push " + quoteArg(imageRef)
-	started := time.Now().UTC()
-	if err := s.recordAudit(ctx, "image.push", "image", imageRef, "", command, models.RiskNeedsConfirmation, "started", 0, nil); err != nil {
-		return "", err
-	}
-	streamID, err := s.Client.PushImage(ctx, imageRef)
-	duration := time.Since(started)
-	if err != nil {
-		_ = s.recordAudit(ctx, "image.push", "image", imageRef, "", command, models.RiskNeedsConfirmation, "failed", duration, err)
-		return "", err
-	}
-	return streamID, s.recordAudit(ctx, "image.push", "image", imageRef, "", command, models.RiskNeedsConfirmation, "success", duration, nil)
+	err := apperror.New(
+		apperror.ConfirmationRequired,
+		"Image push requires a confirmed plan",
+		apperror.WithDetail("Call PlanPushImage and ApplyPushImagePlan before publishing images."),
+	)
+	_ = s.recordAudit(ctx, "image.push", "image", imageRef, "", command, models.RiskNeedsConfirmation, "failed", 0, err)
+	return "", err
 }
 
 func (s *DockerService) SaveImage(ctx context.Context, imageRefs []string, destPath string) (string, error) {

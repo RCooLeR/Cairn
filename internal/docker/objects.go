@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"sort"
 	"strconv"
@@ -264,12 +265,18 @@ func (c *Client) GetNetwork(ctx context.Context, id string) (*models.NetworkDeta
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
 
-	raw, _, err := api.NetworkInspectWithRaw(callCtx, id, network.InspectOptions{})
+	raw, body, err := api.NetworkInspectWithRaw(callCtx, id, network.InspectOptions{})
 	if err != nil {
 		return nil, mapDockerError("inspect network", err)
 	}
 	containers := c.containersForNetwork(ctx, api, raw)
-	detail := mapNetworkDetail(raw, containers)
+	rawJSON := strings.TrimSpace(string(body))
+	if rawJSON == "" {
+		if encoded, marshalErr := json.MarshalIndent(raw, "", "  "); marshalErr == nil {
+			rawJSON = string(encoded)
+		}
+	}
+	detail := mapNetworkDetail(raw, containers, rawJSON)
 	if err := c.saveNetworks(ctx, []store.NetworkCacheRecord{{
 		Summary:    detail.Summary,
 		Subnet:     detail.Subnet,

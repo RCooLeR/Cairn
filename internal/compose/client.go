@@ -95,12 +95,27 @@ func (c *Client) Start(ctx context.Context, opts ProjectOptions) (*providers.Com
 	return c.runProjectCommand(ctx, opts, "start")
 }
 
+func (c *Client) StartServices(ctx context.Context, opts ProjectOptions, services []string) (*providers.CommandResult, error) {
+	args := append([]string{"start"}, nonEmptyServices(services)...)
+	return c.runProjectCommand(ctx, opts, args...)
+}
+
 func (c *Client) Stop(ctx context.Context, opts ProjectOptions) (*providers.CommandResult, error) {
 	return c.runProjectCommand(ctx, opts, "stop")
 }
 
+func (c *Client) StopServices(ctx context.Context, opts ProjectOptions, services []string) (*providers.CommandResult, error) {
+	args := append([]string{"stop"}, nonEmptyServices(services)...)
+	return c.runProjectCommand(ctx, opts, args...)
+}
+
 func (c *Client) Restart(ctx context.Context, opts ProjectOptions) (*providers.CommandResult, error) {
 	return c.runProjectCommand(ctx, opts, "restart")
+}
+
+func (c *Client) RestartServices(ctx context.Context, opts ProjectOptions, services []string) (*providers.CommandResult, error) {
+	args := append([]string{"restart"}, nonEmptyServices(services)...)
+	return c.runProjectCommand(ctx, opts, args...)
 }
 
 func (c *Client) Pull(ctx context.Context, opts ProjectOptions) (*providers.CommandResult, error) {
@@ -148,6 +163,18 @@ func (c *Client) UpServices(ctx context.Context, opts ProjectOptions, up UpOptio
 		args = append(args, "--no-build")
 	}
 	args = append(args, nonEmptyServices(up.Services)...)
+	return c.runProjectCommand(ctx, opts, args...)
+}
+
+func (c *Client) ScaleService(ctx context.Context, opts ProjectOptions, service string, replicas int) (*providers.CommandResult, error) {
+	service = strings.TrimSpace(service)
+	if service == "" {
+		return nil, apperror.New(apperror.Conflict, "Service name is required")
+	}
+	if replicas < 0 {
+		return nil, apperror.New(apperror.Conflict, "Replica count cannot be negative")
+	}
+	args := []string{"up", "-d", "--scale", fmt.Sprintf("%s=%d", service, replicas), service}
 	return c.runProjectCommand(ctx, opts, args...)
 }
 

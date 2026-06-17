@@ -701,9 +701,19 @@ func TestManagerRollbackHistory(t *testing.T) {
 	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), docker, &fakeRegistry{}, db.Settings(), eventBus, nil)
 	manager.Compose = compose
 
-	_, err = manager.Rollback(ctx, historyID)
+	if _, err := manager.Rollback(ctx, historyID); !apperror.IsCode(err, apperror.ConfirmationRequired) {
+		t.Fatalf("Rollback() error = %v, want confirmation required", err)
+	}
+	plan, err := manager.PlanRollback(ctx, historyID)
 	if err != nil {
-		t.Fatalf("Rollback() error = %v", err)
+		t.Fatalf("PlanRollback() error = %v", err)
+	}
+	if plan == nil || plan.PlanID == "" || len(plan.Commands) != 2 {
+		t.Fatalf("PlanRollback() plan = %#v", plan)
+	}
+	_, err = manager.ApplyRollback(ctx, plan.PlanID)
+	if err != nil {
+		t.Fatalf("ApplyRollback() error = %v", err)
 	}
 	waitUpdateDone(t, done, updateResultRolledBack)
 	if len(docker.tags) != 1 || docker.tags[0] != "sha256:web-old->rollback-web:local" {

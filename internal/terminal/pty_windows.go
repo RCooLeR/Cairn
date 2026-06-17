@@ -19,6 +19,8 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+var procUpdateProcThreadAttribute = windows.NewLazySystemDLL("kernel32.dll").NewProc("UpdateProcThreadAttribute")
+
 type windowsPTYStarter struct{}
 
 type windowsPTYSession struct {
@@ -197,7 +199,7 @@ func createPseudoConsole(cols int, rows int) (windows.Handle, *os.File, *os.File
 		_ = windows.CloseHandle(ptyOutputRead)
 		return 0, nil, nil, nil, err
 	}
-	if err := attr.Update(windows.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, unsafe.Pointer(console), unsafe.Sizeof(console)); err != nil {
+	if err := updatePseudoConsoleAttribute(attr, console); err != nil {
 		attr.Delete()
 		windows.ClosePseudoConsole(console)
 		_ = windows.CloseHandle(ptyInputWrite)
@@ -210,6 +212,29 @@ func createPseudoConsole(cols int, rows int) (windows.Handle, *os.File, *os.File
 		os.NewFile(uintptr(ptyOutputRead), "|cairn-conpty-output"),
 		attr,
 		nil
+}
+
+func updatePseudoConsoleAttribute(attr *windows.ProcThreadAttributeListContainer, console windows.Handle) error {
+	if err := procUpdateProcThreadAttribute.Find(); err != nil {
+		return err
+	}
+	r1, _, e1 := syscall.SyscallN(
+		procUpdateProcThreadAttribute.Addr(),
+		uintptr(unsafe.Pointer(attr.List())),
+		0,
+		windows.PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
+		uintptr(console),
+		unsafe.Sizeof(console),
+		0,
+		0,
+	)
+	if r1 != 0 {
+		return nil
+	}
+	if e1 != 0 {
+		return e1
+	}
+	return syscall.EINVAL
 }
 
 func createPseudoConsoleProcess(spec PTYSpec, attr *windows.ProcThreadAttributeListContainer) (windows.Handle, windows.Handle, error) {

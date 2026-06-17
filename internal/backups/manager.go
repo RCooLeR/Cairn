@@ -76,6 +76,7 @@ type planRecord struct {
 	ArchiveName       string
 	ArchivePath       string
 	MetadataPath      string
+	BackupID          string
 	UsingContainers   []string
 	Overwrite         bool
 	CreateTargetFirst bool
@@ -353,6 +354,58 @@ func (m *Manager) ApplyRestore(ctx context.Context, planID string, typedName str
 	return jobID, nil
 }
 
+func (m *Manager) PlanDeleteBackup(ctx context.Context, backupID string) (*models.CommandPlan, error) {
+	if m.Backups == nil {
+		return nil, notReady()
+	}
+	record, err := m.Backups.Get(ctx, backupID)
+	if err != nil {
+		return nil, apperror.Wrap(apperror.NotFound, "Backup was not found", err)
+	}
+	now := m.now()
+	plan := models.CommandPlan{
+		PlanID:    security.NewPlanID(),
+		Title:     "Delete backup " + record.ID,
+		Risk:      models.RiskNeedsConfirmation,
+		ExpiresAt: now.Add(security.DefaultPlanTTL),
+		Commands: []models.PlannedCommand{
+			{
+				Order:       1,
+				Command:     "delete backup " + record.BackupPath,
+				Risk:        models.RiskNeedsConfirmation,
+				Explanation: "Deletes the selected backup archive and metadata from disk.",
+			},
+		},
+		Effects: []string{
+			"Backup " + record.ID + " will be removed from Cairn and deleted from disk.",
+			"Archive: " + record.BackupPath,
+			"Metadata: " + record.MetadataPath,
+		},
+	}
+	m.savePlan(planRecord{
+		Plan:         plan,
+		Operation:    "delete",
+		ProviderID:   record.ProviderID,
+		ProjectID:    record.ProjectID,
+		VolumeName:   record.VolumeName,
+		ArchivePath:  record.BackupPath,
+		MetadataPath: record.MetadataPath,
+		BackupID:     record.ID,
+	})
+	return &plan, nil
+}
+
+func (m *Manager) ApplyDeleteBackup(ctx context.Context, planID string) error {
+	record, err := m.takePlan(ctx, planID, "")
+	if err != nil {
+		return err
+	}
+	if record.Operation != "delete" {
+		return apperror.New(apperror.Conflict, "Plan is not a backup delete plan")
+	}
+	return m.deleteBackupRecord(ctx, record)
+}
+
 func (m *Manager) ListBackups(ctx context.Context, filter models.BackupFilter) ([]models.BackupSummary, error) {
 	if m.Backups == nil {
 		return []models.BackupSummary{}, nil
@@ -369,29 +422,38 @@ func (m *Manager) ListBackups(ctx context.Context, filter models.BackupFilter) (
 }
 
 func (m *Manager) DeleteBackup(ctx context.Context, backupID string) error {
+	backupID = strings.TrimSpace(backupID)
+	err := apperror.New(
+		apperror.ConfirmationRequired,
+		"Backup delete requires a confirmed plan",
+		apperror.WithDetail("Call PlanDeleteBackup and ApplyDeleteBackup before deleting backups."),
+	)
+	_ = m.recordAudit(ctx, "backup.delete", "backup", backupID, "", "", "delete backup "+backupID, models.RiskNeedsConfirmation, "failed", 0, err)
+	return err
+}
+
+func (m *Manager) deleteBackupRecord(ctx context.Context, record planRecord) error {
 	if m.Backups == nil {
 		return notReady()
 	}
-	record, err := m.Backups.Get(ctx, backupID)
-	if err != nil {
-		return apperror.Wrap(apperror.NotFound, "Backup was not found", err)
-	}
 	started := m.now()
-	command := "delete backup " + record.BackupPath
-	if err := m.recordAudit(ctx, "backup.delete", "backup", record.ID, record.ProviderID, record.ProjectID, command, models.RiskNeedsConfirmation, "started", 0, nil); err != nil {
+	command := "delete backup " + record.ArchivePath
+	if err := m.recordAudit(ctx, "backup.delete", "backup", record.BackupID, record.ProviderID, record.ProjectID, command, models.RiskNeedsConfirmation, "started", 0, nil); err != nil {
 		return err
 	}
-	err = removeBackupFiles(record)
+	err := m.Backups.Delete(ctx, record.BackupID)
 	duration := time.Since(started)
 	if err != nil {
-		_ = m.recordAudit(ctx, "backup.delete", "backup", record.ID, record.ProviderID, record.ProjectID, command, models.RiskNeedsConfirmation, "failed", duration, err)
+		_ = m.recordAudit(ctx, "backup.delete", "backup", record.BackupID, record.ProviderID, record.ProjectID, command, models.RiskNeedsConfirmation, "failed", duration, err)
 		return err
 	}
-	if err := m.Backups.Delete(ctx, backupID); err != nil {
-		_ = m.recordAudit(ctx, "backup.delete", "backup", record.ID, record.ProviderID, record.ProjectID, command, models.RiskNeedsConfirmation, "failed", duration, err)
+	err = removeBackupArtifacts(record.ArchivePath, record.MetadataPath)
+	duration = time.Since(started)
+	if err != nil {
+		_ = m.recordAudit(ctx, "backup.delete", "backup", record.BackupID, record.ProviderID, record.ProjectID, command, models.RiskNeedsConfirmation, "failed", duration, err)
 		return err
 	}
-	return m.recordAudit(ctx, "backup.delete", "backup", record.ID, record.ProviderID, record.ProjectID, command, models.RiskNeedsConfirmation, "success", duration, nil)
+	return m.recordAudit(ctx, "backup.delete", "backup", record.BackupID, record.ProviderID, record.ProjectID, command, models.RiskNeedsConfirmation, "success", duration, nil)
 }
 
 func (m *Manager) runBackup(ctx context.Context, jobID string, record planRecord) error {

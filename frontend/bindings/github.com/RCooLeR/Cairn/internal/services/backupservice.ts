@@ -13,6 +13,10 @@ export function ApplyBackup(planID: string): $CancellablePromise<string> {
     return $Call.ByID(2274904588, planID);
 }
 
+export function ApplyDeleteBackup(planID: string): $CancellablePromise<void> {
+    return $Call.ByID(515387423, planID);
+}
+
 export function ApplyRestore(planID: string, typedName: string): $CancellablePromise<string> {
     return $Call.ByID(2356649536, planID, typedName);
 }
@@ -29,6 +33,12 @@ export function ListBackups(filter: models$0.BackupFilter): $CancellablePromise<
 
 export function PlanBackupVolume(req: models$0.BackupVolumeRequest): $CancellablePromise<models$0.CommandPlan | null> {
     return $Call.ByID(3500563541, req).then(($result: any) => {
+        return $$createType3($result);
+    });
+}
+
+export function PlanDeleteBackup(backupID: string): $CancellablePromise<models$0.CommandPlan | null> {
+    return $Call.ByID(3571190712, backupID).then(($result: any) => {
         return $$createType3($result);
     });
 }

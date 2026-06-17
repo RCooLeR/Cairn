@@ -256,7 +256,13 @@ export function TerminalPage({
         }
         const nextShells = shells ?? [];
         setShellOptions(nextShells);
-        setContainerShell((current) => current || nextShells[0] || "/bin/sh");
+        setContainerShell((current) => {
+          const trimmed = current.trim();
+          if (trimmed && nextShells.includes(trimmed)) {
+            return trimmed;
+          }
+          return nextShells[0] || "/bin/sh";
+        });
       })
       .catch(() => {
         if (active) {

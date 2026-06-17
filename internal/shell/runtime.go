@@ -195,6 +195,7 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 	r.projectService.ContextName = contextName
 	r.composeService.Client = composeClient
 	r.composeService.PathMapper = provider
+	r.composeService.Detector = projectDetector
 	r.metricsService.Manager = metricsManager
 	r.logsService.Manager = logsManager
 	r.terminalService.Manager = terminalManager
@@ -296,6 +297,7 @@ func (r *appRuntime) clearServicesLocked() {
 	r.projectService.ContextName = ""
 	r.composeService.Client = nil
 	r.composeService.PathMapper = nil
+	r.composeService.Detector = nil
 	r.metricsService.Manager = nil
 	r.logsService.Manager = nil
 	r.terminalService.Manager = nil

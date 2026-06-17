@@ -292,12 +292,13 @@ func (m *Manager) OpenContainerTerminal(ctx context.Context, containerID string,
 		IsRoot:      isRoot,
 		CreatedAt:   m.now(),
 	}
+	closeCtx := terminalCloseContext(ctx)
 	active := &session{
 		info:      info,
 		stream:    execSession,
 		closeDone: make(chan struct{}),
 		resize: func(cols int, rows int) error {
-			return m.docker.ResizeContainerExec(ctx, execSession.ID, cols, rows)
+			return m.docker.ResizeContainerExec(closeCtx, execSession.ID, cols, rows)
 		},
 		inspectExit: func(ctx context.Context) int {
 			inspect, err := m.docker.InspectContainerExec(ctx, execSession.ID)
@@ -306,7 +307,7 @@ func (m *Manager) OpenContainerTerminal(ctx context.Context, containerID string,
 			}
 			return inspect.ExitCode
 		},
-		closeContext: terminalCloseContext(ctx),
+		closeContext: closeCtx,
 	}
 	if err := m.register(active); err != nil {
 		_ = execSession.Close()

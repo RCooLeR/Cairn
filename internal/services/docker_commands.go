@@ -85,6 +85,14 @@ func runImageRisk(req models.RunImageRequest) models.Risk {
 	return risk
 }
 
+func runImageTarget(req models.RunImageRequest) string {
+	targetID := strings.TrimSpace(req.Name)
+	if targetID == "" {
+		targetID = strings.TrimSpace(req.ImageRef)
+	}
+	return targetID
+}
+
 func isSensitiveBindSource(source string) bool {
 	value := strings.TrimSpace(strings.ReplaceAll(source, "\\", "/"))
 	if value == "" {

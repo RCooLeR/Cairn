@@ -278,13 +278,17 @@ func mapNetworkSummary(raw network.Summary) models.NetworkSummary {
 	}
 }
 
-func mapNetworkDetail(raw network.Inspect, containers []models.ContainerSummary) *models.NetworkDetail {
+func mapNetworkDetail(raw network.Inspect, containers []models.ContainerSummary, rawJSON string) *models.NetworkDetail {
 	subnet, gateway := networkIPAM(raw)
 	return &models.NetworkDetail{
 		Summary:    mapNetworkSummary(raw),
 		Subnet:     subnet,
 		Gateway:    gateway,
+		Options:    copyStringMap(raw.Options),
+		IPAM:       networkIPAMConfigs(raw),
 		Containers: containers,
+		RawJSON:    rawJSON,
+		CreatedAt:  raw.Created,
 	}
 }
 
@@ -515,6 +519,19 @@ func networkIPAM(raw network.Inspect) (string, string) {
 		}
 	}
 	return "", ""
+}
+
+func networkIPAMConfigs(raw network.Inspect) []models.NetworkIPAMConfig {
+	configs := make([]models.NetworkIPAMConfig, 0, len(raw.IPAM.Config))
+	for _, cfg := range raw.IPAM.Config {
+		configs = append(configs, models.NetworkIPAMConfig{
+			Subnet:     cfg.Subnet,
+			Gateway:    cfg.Gateway,
+			IPRange:    cfg.IPRange,
+			AuxAddress: copyStringMap(cfg.AuxAddress),
+		})
+	}
+	return configs
 }
 
 func volumeCreatedAt(raw volume.Volume) time.Time {

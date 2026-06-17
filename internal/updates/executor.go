@@ -68,15 +68,17 @@ type BackupRunner interface {
 }
 
 type updatePlanRecord struct {
-	Plan       models.UpdatePlan
-	ExpiresAt  time.Time
-	Project    store.ProjectRecord
-	Services   map[string]store.ServiceRecord
-	Snapshots  []updateSnapshot
-	Pull       []string
-	Build      []string
-	Up         []string
-	CommandSet []models.PlannedCommand
+	Plan            models.UpdatePlan
+	ExpiresAt       time.Time
+	Operation       string
+	Project         store.ProjectRecord
+	Services        map[string]store.ServiceRecord
+	Snapshots       []updateSnapshot
+	RollbackHistory store.UpdateHistoryRecord
+	Pull            []string
+	Build           []string
+	Up              []string
+	CommandSet      []models.PlannedCommand
 }
 
 type updateSnapshot struct {
@@ -116,6 +118,9 @@ func (m *Manager) ApplyUpdate(ctx context.Context, req models.ApplyUpdateRequest
 	if err != nil {
 		return "", err
 	}
+	if record.Operation == "rollback" {
+		return "", apperror.New(apperror.Conflict, "Update plan is a rollback plan")
+	}
 	if len(record.CommandSet) == 0 {
 		return "", apperror.New(apperror.Conflict, "Update plan has no actionable commands")
 	}
@@ -129,30 +134,104 @@ func (m *Manager) ApplyUpdate(ctx context.Context, req models.ApplyUpdateRequest
 	return jobID, nil
 }
 
-func (m *Manager) Rollback(ctx context.Context, historyID int64) (string, error) {
+func (m *Manager) PlanRollback(ctx context.Context, historyID int64) (*models.UpdatePlan, error) {
 	if m == nil || m.Updates == nil || m.Compose == nil || m.Docker == nil {
-		return "", notReady()
+		return nil, notReady()
 	}
 	history, err := m.Updates.GetHistory(ctx, historyID)
 	if err != nil {
-		return "", mapStoreError(err, "Update history item was not found")
+		return nil, mapStoreError(err, "Update history item was not found")
 	}
 	if history.RollbackStatus != rollbackStatusAvailable {
-		return "", apperror.New(
+		return nil, apperror.New(
 			apperror.Conflict,
 			"Rollback is not available for this update history item",
 			apperror.WithDetail(history.RollbackStatus),
 		)
 	}
+	if strings.TrimSpace(history.OldImageID) == "" {
+		return nil, apperror.New(apperror.NotFound, "Previous image ID is not available for rollback")
+	}
+	if _, err := m.Docker.GetImage(ctx, history.OldImageID); err != nil {
+		return nil, apperror.New(apperror.NotFound, "Previous image is no longer present locally", apperror.WithCause(err), apperror.WithRepairHints("Pull the previous versioned tag manually, then redeploy this service."))
+	}
 	project, err := m.projectForCompose(ctx, history.ProjectID)
+	if err != nil {
+		return nil, err
+	}
+	service := serviceNameFromID(history.ServiceID, history.ProjectID)
+	composeArgs := []string{"up", "-d"}
+	if history.UpdateKind == models.UpdateKindBaseImage {
+		composeArgs = append(composeArgs, "--no-build")
+	}
+	composeArgs = append(composeArgs, service)
+	commands := []models.PlannedCommand{
+		{
+			Order:       1,
+			Command:     "docker tag " + shellJoin([]string{history.OldImageID, history.ImageRef}),
+			Risk:        models.RiskNeedsConfirmation,
+			Explanation: "Retags the previous local image back to the service image reference.",
+		},
+		{
+			Order:       2,
+			Command:     composeCommandDisplay(project, composeArgs...),
+			WorkingDir:  project.WorkingDir,
+			Risk:        models.RiskNeedsConfirmation,
+			Explanation: "Recreates the service with the restored image reference.",
+		},
+	}
+	record := updatePlanRecord{
+		Plan: models.UpdatePlan{
+			PlanID:    "rollback-" + m.newID(),
+			ProjectID: project.ID,
+			Items: []models.UpdatePlanItem{
+				{
+					Service:      service,
+					Kind:         history.UpdateKind,
+					CurrentImage: history.ImageRef,
+					LocalDigest:  history.NewDigest,
+					RemoteDigest: history.OldDigest,
+					Confidence:   models.ConfidenceMedium,
+					Action:       models.RecommendedActionManual,
+				},
+			},
+			Commands: commands,
+			Warnings: []string{"Rollback will retag the previous local image and recreate the service."},
+		},
+		ExpiresAt:       m.now().Add(security.DefaultPlanTTL),
+		Operation:       "rollback",
+		Project:         project,
+		RollbackHistory: history,
+		CommandSet:      commands,
+	}
+	m.saveUpdatePlan(record)
+	plan := record.Plan
+	return &plan, nil
+}
+
+func (m *Manager) ApplyRollback(ctx context.Context, planID string) (string, error) {
+	record, err := m.takeUpdatePlan(ctx, planID)
 	if err != nil {
 		return "", err
 	}
+	if record.Operation != "rollback" {
+		return "", apperror.New(apperror.Conflict, "Update plan is not a rollback plan")
+	}
 	jobID := "updates-" + m.newID()
 	m.startJob(jobID, func(jobCtx context.Context) {
-		m.runManualRollback(jobCtx, jobID, project, history)
+		m.runManualRollback(jobCtx, jobID, record.Project, record.RollbackHistory)
 	})
 	return jobID, nil
+}
+
+func (m *Manager) Rollback(ctx context.Context, historyID int64) (string, error) {
+	err := apperror.New(
+		apperror.ConfirmationRequired,
+		"Rollback requires a confirmed plan",
+		apperror.WithDetail("Call PlanRollback and ApplyRollback before rolling back an update."),
+	)
+	_ = m.recordAudit(ctx, "update.rollback", "project", "", "", "", "rollback history "+strconv.FormatInt(historyID, 10), models.RiskNeedsConfirmation, "failed", 0, err)
+	return "", err
 }
 
 func (m *Manager) planUpdate(ctx context.Context, projectID string, serviceName string) (*models.UpdatePlan, error) {

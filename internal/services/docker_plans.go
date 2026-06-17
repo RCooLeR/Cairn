@@ -54,6 +54,73 @@ func (s *DockerService) ApplyContainerPlan(ctx context.Context, planID string, t
 	)
 }
 
+func (s *DockerService) PlanPushImage(ctx context.Context, imageRef string) (*models.CommandPlan, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
+	if s.Client == nil {
+		return nil, notReady()
+	}
+	plan, err := security.NewPushImagePlan(imageRef, time.Now().UTC())
+	if err != nil {
+		return nil, err
+	}
+	if err := s.objectPlanStore().Save(plan); err != nil {
+		return nil, err
+	}
+	return &plan.Plan, nil
+}
+
+func (s *DockerService) ApplyPushImagePlan(ctx context.Context, planID string) (string, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
+	if s.Client == nil {
+		return "", notReady()
+	}
+	plan, err := s.objectPlanStore().Take(ctx, planID, "")
+	if err != nil {
+		return "", err
+	}
+	if plan.Action != security.DockerActionPushImage {
+		return "", apperror.New(apperror.Conflict, "Plan is not an image push plan")
+	}
+	return s.runPushImagePlan(ctx, plan)
+}
+
+func (s *DockerService) PlanRunImage(ctx context.Context, req models.RunImageRequest) (*models.CommandPlan, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
+	if s.Client == nil {
+		return nil, notReady()
+	}
+	command := dockerRunCommand(req)
+	risk := runImageRisk(req)
+	targetID := runImageTarget(req)
+	plan, err := security.NewRunImagePlan(req, risk, command, targetID, time.Now().UTC())
+	if err != nil {
+		return nil, err
+	}
+	if err := s.objectPlanStore().Save(plan); err != nil {
+		return nil, err
+	}
+	return &plan.Plan, nil
+}
+
+func (s *DockerService) ApplyRunImagePlan(ctx context.Context, planID string, typedName string) (string, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
+	if s.Client == nil {
+		return "", notReady()
+	}
+	plan, err := s.objectPlanStore().Take(ctx, planID, typedName)
+	if err != nil {
+		return "", err
+	}
+	if plan.Action != security.DockerActionRunImage {
+		return "", apperror.New(apperror.Conflict, "Plan is not a run image plan")
+	}
+	return s.runRunImagePlan(ctx, plan)
+}
+
 func (s *DockerService) planContainerAction(ctx context.Context, action string, ids []string, timeoutSeconds int, opts models.RemoveContainerOptions) (*models.CommandPlan, error) {
 	if s.Client == nil {
 		return nil, notReady()

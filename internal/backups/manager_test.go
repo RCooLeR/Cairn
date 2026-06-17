@@ -194,6 +194,70 @@ func TestRemoveBackupFilesJoinsRemoveErrors(t *testing.T) {
 	}
 }
 
+func TestPlanDeleteBackupRequiresConfirmationAndRemovesRecord(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	mgr, _, _ := newTestManager(t)
+	dir := t.TempDir()
+	archivePath := filepath.Join(dir, "archive.tar.gz")
+	metadataPath := filepath.Join(dir, "archive.json")
+	for _, item := range []struct {
+		path string
+		body string
+	}{
+		{archivePath, "archive"},
+		{metadataPath, "{}"},
+	} {
+		if err := os.WriteFile(item.path, []byte(item.body), 0o600); err != nil {
+			t.Fatalf("write %s: %v", item.path, err)
+		}
+	}
+	record := store.BackupRecord{
+		ID:                  "backup-delete",
+		ProviderID:          "linux_native",
+		ProjectID:           "linux_native/app",
+		VolumeName:          "app-data",
+		BackupPath:          archivePath,
+		MetadataPath:        metadataPath,
+		CompressedSizeBytes: 7,
+		Result:              backupResultOK,
+		CreatedAt:           time.Now().UTC(),
+	}
+	if err := mgr.Backups.Insert(ctx, record); err != nil {
+		t.Fatalf("Insert() error = %v", err)
+	}
+
+	if err := mgr.DeleteBackup(ctx, record.ID); !apperror.IsCode(err, apperror.ConfirmationRequired) {
+		t.Fatalf("DeleteBackup() error = %v, want confirmation required", err)
+	}
+	if _, err := os.Stat(archivePath); err != nil {
+		t.Fatalf("archive removed by rejected delete: %v", err)
+	}
+	if _, err := mgr.Backups.Get(ctx, record.ID); err != nil {
+		t.Fatalf("record removed by rejected delete: %v", err)
+	}
+
+	plan, err := mgr.PlanDeleteBackup(ctx, record.ID)
+	if err != nil {
+		t.Fatalf("PlanDeleteBackup() error = %v", err)
+	}
+	if plan == nil || plan.Risk != models.RiskNeedsConfirmation {
+		t.Fatalf("PlanDeleteBackup() plan = %#v", plan)
+	}
+	if err := mgr.ApplyDeleteBackup(ctx, plan.PlanID); err != nil {
+		t.Fatalf("ApplyDeleteBackup() error = %v", err)
+	}
+	if _, err := mgr.Backups.Get(ctx, record.ID); err == nil {
+		t.Fatal("backup record still exists after delete")
+	}
+	if _, err := os.Stat(archivePath); !os.IsNotExist(err) {
+		t.Fatalf("archive exists after delete: %v", err)
+	}
+	if _, err := os.Stat(metadataPath); !os.IsNotExist(err) {
+		t.Fatalf("metadata exists after delete: %v", err)
+	}
+}
+
 func TestRestoreHelperUsesPositionalArchiveAndRollbackStash(t *testing.T) {
 	t.Parallel()
 	archiveName := "app-db.tar.gz; touch /restore/pwned #"

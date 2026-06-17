@@ -449,7 +449,17 @@ func TestClientListContainerFiles(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	api := newFakeAPI()
-	api.execOutputs[commandKey([]string{"sh", "-c", containerFileListScript})] = strings.Join([]string{
+	api.containerInspects["abc123"] = container.InspectResponse{
+		ContainerJSONBase: &container.ContainerJSONBase{
+			ID:    "abc123",
+			Name:  "/app-1",
+			Image: "sha256:image1",
+			State: &container.State{Status: "running"},
+		},
+		Config: &container.Config{Image: "example/app:latest"},
+	}
+	api.executablePaths["/bin/sh"] = true
+	api.execOutputs[commandKey([]string{"/bin/sh", "-c", containerFileListScript})] = strings.Join([]string{
 		"file\tapp.log\t/app/app.log\t42\t-rw-r--r--\t1718600000\t",
 		"directory\tconfig\t/app/config\t4096\tdrwxr-xr-x\t1718600100\t",
 		"symlink\tcurrent\t/app/current\t7\tlrwxrwxrwx\t1718600200\t/releases/current",
@@ -477,7 +487,11 @@ func TestClientListContainerFiles(t *testing.T) {
 	if listing.Entries[2].Name != "current" || listing.Entries[2].LinkTarget != "/releases/current" {
 		t.Fatalf("symlink entry = %#v", listing.Entries[2])
 	}
-	if got := fmt.Sprint(api.execCreates[0].Options.Env); got != "[CAIRN_PATH=/app]" {
+	if len(api.execCreates) == 0 {
+		t.Fatalf("expected exec create calls")
+	}
+	listCall := api.execCreates[len(api.execCreates)-1]
+	if got := fmt.Sprint(listCall.Options.Env); got != "[CAIRN_PATH=/app]" {
 		t.Fatalf("exec env = %s", got)
 	}
 }
@@ -486,7 +500,17 @@ func TestClientListContainerFilesNotFound(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	api := newFakeAPI()
-	api.execExitCodes[commandKey([]string{"sh", "-c", containerFileListScript})] = 44
+	api.containerInspects["abc123"] = container.InspectResponse{
+		ContainerJSONBase: &container.ContainerJSONBase{
+			ID:    "abc123",
+			Name:  "/app-1",
+			Image: "sha256:image1",
+			State: &container.State{Status: "running"},
+		},
+		Config: &container.Config{Image: "example/app:latest"},
+	}
+	api.executablePaths["/bin/sh"] = true
+	api.execExitCodes[commandKey([]string{"/bin/sh", "-c", containerFileListScript})] = 44
 
 	client := New(fakeDockerProvider{}, nil)
 	client.factory = func(string) (APIClient, error) { return api, nil }

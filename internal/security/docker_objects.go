@@ -10,6 +10,8 @@ import (
 
 const (
 	DockerActionRemoveImage   = "remove-image"
+	DockerActionPushImage     = "push-image"
+	DockerActionRunImage      = "run-image"
 	DockerActionPrune         = "prune"
 	DockerActionRemoveVolume  = "remove-volume"
 	DockerActionRemoveNetwork = "remove-network"
@@ -22,6 +24,7 @@ type DockerObjectPlan struct {
 	TargetID  string
 	Force     bool
 	PruneKind string
+	RunImage  models.RunImageRequest
 }
 
 type DockerObjectPlanStore struct {
@@ -61,6 +64,72 @@ func NewRemoveImagePlan(image models.ImageSummary, force bool, now time.Time) (D
 		Kind:     "image",
 		TargetID: target,
 		Force:    force,
+	}, nil
+}
+
+func NewPushImagePlan(imageRef string, now time.Time) (DockerObjectPlan, error) {
+	imageRef = strings.TrimSpace(imageRef)
+	if imageRef == "" {
+		return DockerObjectPlan{}, apperror.New(apperror.Conflict, "Image reference is required")
+	}
+	plan := commandPlan(now, "Push image "+imageRef, models.RiskNeedsConfirmation, "docker push "+quotePlanArg(imageRef), "Publishes the selected image reference to its registry.")
+	plan.PlanID = NewTypedPlanID("push")
+	plan.Effects = []string{
+		"Image " + imageRef + " will be pushed to its registry.",
+		"Registry credentials configured for this Docker backend may be used by Docker.",
+	}
+	return DockerObjectPlan{
+		Plan:     plan,
+		Action:   DockerActionPushImage,
+		Kind:     "image",
+		TargetID: imageRef,
+	}, nil
+}
+
+func NewRunImagePlan(req models.RunImageRequest, risk models.Risk, command string, target string, now time.Time) (DockerObjectPlan, error) {
+	req.ImageRef = strings.TrimSpace(req.ImageRef)
+	req.Name = strings.TrimSpace(req.Name)
+	target = strings.TrimSpace(target)
+	if req.ImageRef == "" {
+		return DockerObjectPlan{}, apperror.New(apperror.Conflict, "Image reference is required")
+	}
+	if target == "" {
+		if req.Name != "" {
+			target = req.Name
+		} else {
+			target = req.ImageRef
+		}
+	}
+	if strings.TrimSpace(command) == "" {
+		command = "docker run " + quotePlanArg(req.ImageRef)
+	}
+	plan := commandPlan(now, "Run image "+req.ImageRef, risk, command, "Creates a container from the selected image.")
+	plan.PlanID = NewTypedPlanID("run-image")
+	plan.Effects = []string{
+		"A new container will be created from " + req.ImageRef + ".",
+	}
+	for _, mount := range req.Volumes {
+		mountType := strings.TrimSpace(mount.Type)
+		if mountType == "" {
+			mountType = "volume"
+		}
+		if mountType == "bind" {
+			access := "read/write"
+			if mount.ReadOnly {
+				access = "read-only"
+			}
+			plan.Effects = append(plan.Effects, "Bind mount "+strings.TrimSpace(mount.Source)+" -> "+strings.TrimSpace(mount.Target)+" will be attached as "+access+".")
+		}
+	}
+	if requiresTypedConfirmation(risk) {
+		plan.RequiresTypedName = target
+	}
+	return DockerObjectPlan{
+		Plan:     plan,
+		Action:   DockerActionRunImage,
+		Kind:     "container",
+		TargetID: target,
+		RunImage: req,
 	}, nil
 }
 

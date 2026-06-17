@@ -52,6 +52,7 @@ export {
     MetricRankItem,
     MountSpec,
     NetworkDetail,
+    NetworkIPAMConfig,
     NetworkSummary,
     Notification,
     PlannedCommand,

@@ -54,12 +54,23 @@ func (c *Client) ListContainerFiles(ctx context.Context, containerID string, req
 	if err != nil {
 		return nil, err
 	}
-	output, exitCode, err := c.RunContainerExec(ctx, containerID, ExecOptions{
-		Cmd: []string{"sh", "-c", containerFileListScript},
-		Env: map[string]string{"CAIRN_PATH": containerPath},
-	})
+	shells, err := c.DetectContainerShells(ctx, containerID)
 	if err != nil {
 		return nil, err
+	}
+	var output string
+	var exitCode int
+	for _, shell := range shells {
+		output, exitCode, err = c.RunContainerExec(ctx, containerID, ExecOptions{
+			Cmd: []string{shell, "-c", containerFileListScript},
+			Env: map[string]string{"CAIRN_PATH": containerPath},
+		})
+		if err != nil {
+			return nil, err
+		}
+		if exitCode != 126 && exitCode != 127 {
+			break
+		}
 	}
 	if exitCode == 44 {
 		return nil, apperror.New(

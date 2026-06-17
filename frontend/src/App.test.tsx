@@ -93,8 +93,12 @@ const dockerServiceMock = vi.hoisted(() => ({
   ApplyContainerPlan: vi.fn(),
   RenameContainer: vi.fn(),
   RunImage: vi.fn(),
+  PlanRunImage: vi.fn(),
+  ApplyRunImagePlan: vi.fn(),
   PullImage: vi.fn(),
   TagImage: vi.fn(),
+  PlanPushImage: vi.fn(),
+  ApplyPushImagePlan: vi.fn(),
   PushImage: vi.fn(),
   SaveImage: vi.fn(),
   LoadImage: vi.fn(),
@@ -128,6 +132,8 @@ const backupServiceMock = vi.hoisted(() => ({
   PlanRestoreVolume: vi.fn(),
   ApplyRestore: vi.fn(),
   ListBackups: vi.fn(),
+  PlanDeleteBackup: vi.fn(),
+  ApplyDeleteBackup: vi.fn(),
   DeleteBackup: vi.fn(),
 }));
 
@@ -197,6 +203,8 @@ const updateServiceMock = vi.hoisted(() => ({
   PlanServiceUpdate: vi.fn(),
   PlanProjectUpdate: vi.fn(),
   ApplyUpdate: vi.fn(),
+  PlanRollback: vi.fn(),
+  ApplyRollback: vi.fn(),
   IgnoreUpdate: vi.fn(),
   UnignoreUpdate: vi.fn(),
   ListUpdateHistory: vi.fn(),
@@ -333,8 +341,12 @@ describe("App inventory shell", () => {
     dockerServiceMock.ApplyContainerPlan.mockResolvedValue(undefined);
     dockerServiceMock.RenameContainer.mockResolvedValue(undefined);
     dockerServiceMock.RunImage.mockResolvedValue("container-new");
+    dockerServiceMock.PlanRunImage.mockResolvedValue(runImagePlan());
+    dockerServiceMock.ApplyRunImagePlan.mockResolvedValue("container-new");
     dockerServiceMock.PullImage.mockResolvedValue("pull-stream");
     dockerServiceMock.TagImage.mockResolvedValue(undefined);
+    dockerServiceMock.PlanPushImage.mockResolvedValue(pushImagePlan());
+    dockerServiceMock.ApplyPushImagePlan.mockResolvedValue("push-stream");
     dockerServiceMock.PushImage.mockResolvedValue("push-stream");
     dockerServiceMock.SaveImage.mockResolvedValue("save-job");
     dockerServiceMock.LoadImage.mockResolvedValue("load-job");
@@ -379,6 +391,8 @@ describe("App inventory shell", () => {
     backupServiceMock.ApplyBackup.mockResolvedValue("backup-job");
     backupServiceMock.PlanRestoreVolume.mockResolvedValue(restorePlan());
     backupServiceMock.ApplyRestore.mockResolvedValue("restore-job");
+    backupServiceMock.PlanDeleteBackup.mockResolvedValue(deleteBackupPlan());
+    backupServiceMock.ApplyDeleteBackup.mockResolvedValue(undefined);
     backupServiceMock.DeleteBackup.mockResolvedValue(undefined);
     providerServiceMock.Detect.mockResolvedValue(healthyProviderStatus());
     providerServiceMock.ListDockerContexts.mockResolvedValue([
@@ -509,6 +523,8 @@ describe("App inventory shell", () => {
     updateServiceMock.PlanServiceUpdate.mockResolvedValue(updatePlan());
     updateServiceMock.PlanProjectUpdate.mockResolvedValue(updateProjectPlan());
     updateServiceMock.ApplyUpdate.mockResolvedValue("updates-apply-job");
+    updateServiceMock.PlanRollback.mockResolvedValue(rollbackPlan());
+    updateServiceMock.ApplyRollback.mockResolvedValue("updates-rollback-job");
     updateServiceMock.IgnoreUpdate.mockResolvedValue(undefined);
     updateServiceMock.UnignoreUpdate.mockResolvedValue(undefined);
     updateServiceMock.ListUpdateHistory.mockResolvedValue([]);
@@ -1337,22 +1353,8 @@ describe("App inventory shell", () => {
       ),
     );
     expect(
-      screen.getByRole("table", { name: "app-db containers" }),
+      screen.getByRole("heading", { name: "container-app" }),
     ).toBeInTheDocument();
-    expect(screen.getByText("Working dir")).toBeInTheDocument();
-    fireEvent.click(
-      screen.getByRole("button", { name: "Close container drilldown" }),
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: "Containers" }));
-    fireEvent.click(
-      await screen.findByRole("button", { name: "container-app" }),
-    );
-    await waitFor(() =>
-      expect(dockerServiceMock.GetContainer).toHaveBeenCalledWith(
-        "container-app",
-      ),
-    );
     expect(screen.getByText("Working dir")).toBeInTheDocument();
 
     const drilldownLogsButtons = screen.getAllByRole("button", {
@@ -1394,7 +1396,10 @@ describe("App inventory shell", () => {
       name: "Terminal",
     });
     fireEvent.click(terminalButtons[terminalButtons.length - 1]);
-    fireEvent.click(screen.getByRole("button", { name: "Open terminal" }));
+    const openTerminalButtons = screen.getAllByRole("button", {
+      name: "Open terminal",
+    });
+    fireEvent.click(openTerminalButtons[openTerminalButtons.length - 1]);
     await waitFor(() =>
       expect(terminalServiceMock.OpenContainerTerminal).toHaveBeenCalledWith(
         "container-app",
@@ -1455,7 +1460,15 @@ describe("App inventory shell", () => {
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     fireEvent.click(screen.getByRole("button", { name: "History" }));
     fireEvent.click(await screen.findByRole("button", { name: "Rollback" }));
-    expect(updateServiceMock.Rollback).toHaveBeenCalledWith(301);
+    await waitFor(() =>
+      expect(updateServiceMock.PlanRollback).toHaveBeenCalledWith(301),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Roll back" }));
+    await waitFor(() =>
+      expect(updateServiceMock.ApplyRollback).toHaveBeenCalledWith(
+        "rollback-plan-app",
+      ),
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     fireEvent.click(screen.getByRole("button", { name: "Ignored" }));
@@ -1941,7 +1954,7 @@ describe("App inventory shell", () => {
     fireEvent.click(screen.getByRole("button", { name: "Run" }));
 
     await waitFor(() =>
-      expect(dockerServiceMock.RunImage).toHaveBeenCalledWith(
+      expect(dockerServiceMock.PlanRunImage).toHaveBeenCalledWith(
         expect.objectContaining({
           imageRef: "cairn/web:latest",
           name: "web",
@@ -1958,6 +1971,13 @@ describe("App inventory shell", () => {
         }),
       ),
     );
+    await waitFor(() =>
+      expect(dockerServiceMock.ApplyRunImagePlan).toHaveBeenCalledWith(
+        "run-image-plan",
+        "",
+      ),
+    );
+    expect(dockerServiceMock.RunImage).not.toHaveBeenCalled();
     await waitFor(() =>
       expect(inventoryMock.getInventorySnapshot).toHaveBeenCalledTimes(2),
     );
@@ -2036,7 +2056,10 @@ describe("App inventory shell", () => {
     fireEvent.click(screen.getByLabelText(/Confirm publishing/));
     fireEvent.click(screen.getByRole("button", { name: "Push" }));
     await waitFor(() =>
-      expect(dockerServiceMock.PushImage).toHaveBeenCalledWith("redis:7"),
+      expect(dockerServiceMock.PlanPushImage).toHaveBeenCalledWith("redis:7"),
+    );
+    expect(dockerServiceMock.ApplyPushImagePlan).toHaveBeenCalledWith(
+      "push-image-plan",
     );
 
     fireEvent.click(
@@ -3847,6 +3870,42 @@ function updatePlan(): UpdatePlan {
   };
 }
 
+function rollbackPlan(): UpdatePlan {
+  return {
+    planID: "rollback-plan-app",
+    projectID: "linux_native/app-db",
+    items: [
+      {
+        service: "app",
+        kind: UpdateKind.UpdateKindServiceImage,
+        currentImage: "cairn/app:latest",
+        localDigest: "sha256:new",
+        remoteDigest: "sha256:old",
+        confidence: Confidence.ConfidenceMedium,
+        action: RecommendedAction.RecommendedActionManual,
+      },
+    ],
+    commands: [
+      {
+        order: 1,
+        command: "docker tag sha256:old cairn/app:latest",
+        risk: Risk.RiskNeedsConfirmation,
+        explanation:
+          "Retags the previous local image back to the service image reference.",
+      },
+      {
+        order: 2,
+        command: "docker compose up -d app",
+        risk: Risk.RiskNeedsConfirmation,
+        explanation: "Recreates the service with the restored image reference.",
+      },
+    ],
+    warnings: [
+      "Rollback will retag the previous local image and recreate the service.",
+    ],
+  };
+}
+
 function updateProjectPlan(): UpdatePlan {
   return {
     planID: "plan-update-project",
@@ -3909,6 +3968,28 @@ function backupPlan(): CommandPlan {
   };
 }
 
+function deleteBackupPlan(): CommandPlan {
+  return {
+    planID: "plan-delete-backup",
+    title: "Delete backup backup-1",
+    risk: Risk.RiskNeedsConfirmation,
+    commands: [
+      {
+        order: 1,
+        command:
+          "delete backup /tmp/cairn-backups/cairn_data-20260613T080000Z.tar.gz",
+        risk: Risk.RiskNeedsConfirmation,
+        explanation:
+          "Deletes the selected backup archive and metadata from disk.",
+      },
+    ],
+    effects: [
+      "Backup backup-1 will be removed from Cairn and deleted from disk.",
+    ],
+    expiresAt: "2026-06-13T08:10:00Z",
+  };
+}
+
 function restorePlan(): CommandPlan {
   return {
     planID: "plan-restore-volume",
@@ -3926,6 +4007,46 @@ function restorePlan(): CommandPlan {
     ],
     effects: ["cairn_data: Replaces volume contents with the selected backup."],
     requiresTypedName: "cairn_data",
+    expiresAt: "2026-06-13T08:10:00Z",
+  };
+}
+
+function pushImagePlan(): CommandPlan {
+  return {
+    planID: "push-image-plan",
+    title: "Push image redis:7",
+    risk: Risk.RiskNeedsConfirmation,
+    commands: [
+      {
+        order: 1,
+        command: "docker push redis:7",
+        risk: Risk.RiskNeedsConfirmation,
+        explanation: "Publishes the selected image reference to its registry.",
+      },
+    ],
+    effects: [
+      "Image redis:7 will be uploaded to the configured registry if credentials allow it.",
+    ],
+    expiresAt: "2026-06-13T08:10:00Z",
+  };
+}
+
+function runImagePlan(risk: Risk = Risk.RiskSafe): CommandPlan {
+  return {
+    planID: "run-image-plan",
+    title: "Run image cairn/web:latest",
+    risk,
+    requiresTypedName: risk === Risk.RiskDangerous ? "web" : undefined,
+    commands: [
+      {
+        order: 1,
+        command:
+          "docker run -d --name web --mount type=volume,source=myvol,target=/data,rw cairn/web:latest",
+        risk,
+        explanation: "Creates a container from the selected image.",
+      },
+    ],
+    effects: ["Container web will be created from cairn/web:latest."],
     expiresAt: "2026-06-13T08:10:00Z",
   };
 }

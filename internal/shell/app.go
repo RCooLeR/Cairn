@@ -69,7 +69,7 @@ func Run(assets fs.FS) error {
 		Events:    eventBus,
 		RuntimeMu: runtimeMu,
 	}
-	composeService := &services.ComposeService{Projects: projectRepo, RuntimeMu: runtimeMu}
+	composeService := &services.ComposeService{Projects: projectRepo, Audit: auditRepo, Events: eventBus, RuntimeMu: runtimeMu}
 	metricsService := &services.MetricsService{RuntimeMu: runtimeMu}
 	logsService := &services.LogsService{RuntimeMu: runtimeMu}
 	terminalService := &services.TerminalService{RuntimeMu: runtimeMu}

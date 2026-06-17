@@ -231,6 +231,24 @@ func (s *UpdateService) ApplyUpdate(ctx context.Context, req models.ApplyUpdateR
 	return s.Manager.ApplyUpdate(ctx, req)
 }
 
+func (s *UpdateService) PlanRollback(ctx context.Context, historyID int64) (*models.UpdatePlan, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
+	if s.Manager == nil {
+		return nil, notReady()
+	}
+	return s.Manager.PlanRollback(ctx, historyID)
+}
+
+func (s *UpdateService) ApplyRollback(ctx context.Context, planID string) (string, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
+	if s.Manager == nil {
+		return "", notReady()
+	}
+	return s.Manager.ApplyRollback(ctx, planID)
+}
+
 func (s *UpdateService) IgnoreUpdate(ctx context.Context, req models.IgnoreUpdateRequest) error {
 	unlock := s.lockRuntime()
 	defer unlock()
@@ -346,6 +364,24 @@ func (s *BackupService) ApplyRestore(ctx context.Context, planID string, typedNa
 		return s.Manager.ApplyRestore(ctx, planID, typedName)
 	}
 	return "", notReady()
+}
+
+func (s *BackupService) PlanDeleteBackup(ctx context.Context, backupID string) (*models.CommandPlan, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
+	if s.Manager != nil {
+		return s.Manager.PlanDeleteBackup(ctx, backupID)
+	}
+	return nil, notReady()
+}
+
+func (s *BackupService) ApplyDeleteBackup(ctx context.Context, planID string) error {
+	unlock := s.lockRuntime()
+	defer unlock()
+	if s.Manager != nil {
+		return s.Manager.ApplyDeleteBackup(ctx, planID)
+	}
+	return notReady()
 }
 
 func (s *BackupService) ListBackups(ctx context.Context, filter models.BackupFilter) ([]models.BackupSummary, error) {

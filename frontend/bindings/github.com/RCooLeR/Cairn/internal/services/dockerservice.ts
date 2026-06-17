@@ -13,6 +13,14 @@ export function ApplyContainerPlan(planID: string, typedName: string): $Cancella
     return $Call.ByID(2719469876, planID, typedName);
 }
 
+export function ApplyPushImagePlan(planID: string): $CancellablePromise<string> {
+    return $Call.ByID(1538481882, planID);
+}
+
+export function ApplyRunImagePlan(planID: string, typedName: string): $CancellablePromise<string> {
+    return $Call.ByID(2183540141, planID, typedName);
+}
+
 export function BulkContainerAction(ids: string[], action: string): $CancellablePromise<models$0.BulkResult | null> {
     return $Call.ByID(169789409, ids, action).then(($result: any) => {
         return $$createType1($result);
@@ -125,6 +133,12 @@ export function PlanPrune(kind: string): $CancellablePromise<models$0.CommandPla
     });
 }
 
+export function PlanPushImage(imageRef: string): $CancellablePromise<models$0.CommandPlan | null> {
+    return $Call.ByID(712309436, imageRef).then(($result: any) => {
+        return $$createType27($result);
+    });
+}
+
 export function PlanRemoveContainer(id: string, opts: models$0.RemoveContainerOptions): $CancellablePromise<models$0.CommandPlan | null> {
     return $Call.ByID(783154554, id, opts).then(($result: any) => {
         return $$createType27($result);
@@ -145,6 +159,12 @@ export function PlanRemoveNetwork(id: string): $CancellablePromise<models$0.Comm
 
 export function PlanRemoveVolume(name: string, force: boolean): $CancellablePromise<models$0.CommandPlan | null> {
     return $Call.ByID(1592087289, name, force).then(($result: any) => {
+        return $$createType27($result);
+    });
+}
+
+export function PlanRunImage(req: models$0.RunImageRequest): $CancellablePromise<models$0.CommandPlan | null> {
+    return $Call.ByID(3051213665, req).then(($result: any) => {
         return $$createType27($result);
     });
 }

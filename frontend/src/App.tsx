@@ -37,6 +37,7 @@ import type {
   WSLDistroInfo,
 } from "../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
 import {
+  Risk,
   UpdateKind,
   UpdateStatus,
 } from "../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
@@ -278,6 +279,7 @@ type UpdateProgressEntry = {
 
 type UpdatePlanState = {
   open: boolean;
+  mode: "update" | "rollback";
   plan: UpdatePlan | null;
   target: UpdatePlanTarget | null;
   backupVolumesFirst: boolean;
@@ -312,7 +314,9 @@ type ProjectAction =
 type ConfirmPlanKind =
   | "container"
   | "project"
+  | "run-image"
   | "backup"
+  | "backup-delete"
   | "restore"
   | "provider";
 
@@ -598,6 +602,7 @@ const emptyInspect: InspectState = {
 
 const emptyUpdatePlan: UpdatePlanState = {
   open: false,
+  mode: "update",
   plan: null,
   target: null,
   backupVolumesFirst: false,
@@ -1087,6 +1092,8 @@ function App() {
   const [activeContainerID, setActiveContainerID] = useState<string | null>(
     null,
   );
+  const [activeContainerFallback, setActiveContainerFallback] =
+    useState<ContainerSummary | null>(null);
   const [containerDetailTab, setContainerDetailTab] =
     useState<ContainerDrilldownTabID>("overview");
   const [imageFilter, setImageFilter] = useState<FilterID>("all");
@@ -2985,24 +2992,33 @@ function App() {
       progress: [
         {
           phase: "apply",
-          message: "Starting update",
+          message:
+            updatePlan.mode === "rollback"
+              ? "Starting rollback"
+              : "Starting update",
         },
       ],
     }));
     try {
-      const jobID = await UpdateService.ApplyUpdate({
-        planID: updatePlan.plan.planID,
-        backupVolumesFirst: updatePlan.backupVolumesFirst,
-        watchHealth: updatePlan.watchHealth,
-        rollbackOnFailure: updatePlan.rollbackOnFailure,
-      });
+      const jobID =
+        updatePlan.mode === "rollback"
+          ? await UpdateService.ApplyRollback(updatePlan.plan.planID)
+          : await UpdateService.ApplyUpdate({
+              planID: updatePlan.plan.planID,
+              backupVolumesFirst: updatePlan.backupVolumesFirst,
+              watchHealth: updatePlan.watchHealth,
+              rollbackOnFailure: updatePlan.rollbackOnFailure,
+            });
       setUpdatePlan((current) => ({
         ...current,
         jobID,
         progress: current.progress.concat({
           jobID,
-          phase: "apply",
-          message: "Update job started",
+          phase: updatePlan.mode === "rollback" ? "rollback" : "apply",
+          message:
+            updatePlan.mode === "rollback"
+              ? "Rollback job started"
+              : "Update job started",
         }),
       }));
     } catch (error: unknown) {
@@ -3011,11 +3027,16 @@ function App() {
         busy: false,
         applying: false,
         error:
-          error instanceof Error ? error.message : "Unable to apply update",
+          error instanceof Error
+            ? error.message
+            : updatePlan.mode === "rollback"
+              ? "Unable to roll back update"
+              : "Unable to apply update",
       }));
     }
   }, [
     updatePlan.backupVolumesFirst,
+    updatePlan.mode,
     updatePlan.plan,
     updatePlan.rollbackOnFailure,
     updatePlan.watchHealth,
@@ -3082,20 +3103,20 @@ function App() {
         return;
       }
       try {
-        const jobID = await UpdateService.Rollback(historyID);
+        const plan = await UpdateService.PlanRollback(historyID);
+        if (!plan) {
+          throw new Error("Rollback plan was empty");
+        }
         setUpdatePlan({
           ...emptyUpdatePlan,
           open: true,
-          applying: true,
-          busy: true,
-          jobID,
-          progress: [
-            {
-              jobID,
-              phase: "rollback",
-              message: "Rollback job started",
-            },
-          ],
+          mode: "rollback",
+          target: {
+            kind: "project",
+            projectID: plan.projectID,
+            projectName: projectNameForID(projects, plan.projectID),
+          },
+          plan,
         });
       } catch (error: unknown) {
         setUpdateHistoryError(
@@ -3103,7 +3124,7 @@ function App() {
         );
       }
     },
-    [ensureDockerReady],
+    [ensureDockerReady, projects],
   );
 
   const runContainerAction = useCallback(
@@ -3205,6 +3226,8 @@ function App() {
         );
       } else if (confirm.planKind === "backup") {
         await BackupService.ApplyBackup(confirm.plan.planID);
+      } else if (confirm.planKind === "backup-delete") {
+        await BackupService.ApplyDeleteBackup(confirm.plan.planID);
       } else if (confirm.planKind === "restore") {
         await BackupService.ApplyRestore(
           confirm.plan.planID,
@@ -3215,6 +3238,12 @@ function App() {
           confirm.plan.planID,
           confirm.typedName,
         );
+      } else if (confirm.planKind === "run-image") {
+        await DockerService.ApplyRunImagePlan(
+          confirm.plan.planID,
+          confirm.typedName,
+        );
+        setRunImage(emptyRunImage);
       } else {
         await DockerService.ApplyContainerPlan(
           confirm.plan.planID,
@@ -3232,8 +3261,12 @@ function App() {
         await refreshInventory();
         await refreshProjects();
         await refreshUpdateSurfaces();
+      } else if (confirm.planKind === "run-image") {
+        await refreshAfterAction();
+        setActivePage("containers");
       } else if (
         confirm.planKind === "backup" ||
+        confirm.planKind === "backup-delete" ||
         confirm.planKind === "restore"
       ) {
         await refreshBackups();
@@ -3393,10 +3426,26 @@ function App() {
     setRunImage((current) => ({ ...current, busy: true, error: undefined }));
     try {
       const req = buildRunImageRequest(runImage);
-      await DockerService.RunImage(req);
-      setRunImage(emptyRunImage);
-      await refreshAfterAction();
-      setActivePage("containers");
+      const plan = await DockerService.PlanRunImage(req);
+      if (!plan) {
+        throw new Error("Run image plan was empty");
+      }
+      if (plan.risk === Risk.RiskSafe) {
+        await DockerService.ApplyRunImagePlan(plan.planID, "");
+        setRunImage(emptyRunImage);
+        await refreshAfterAction();
+        setActivePage("containers");
+        return;
+      }
+      setRunImage((current) => ({ ...current, busy: false }));
+      setConfirm({
+        open: true,
+        plan,
+        planKind: "run-image",
+        targetName: plan.requiresTypedName || req.name || req.imageRef,
+        typedName: "",
+        busy: false,
+      });
     } catch (error: unknown) {
       setRunImage((current) => ({
         ...current,
@@ -3508,7 +3557,11 @@ function App() {
       streamID: undefined,
     }));
     try {
-      const streamID = await DockerService.PushImage(pushImage.ref);
+      const plan = await DockerService.PlanPushImage(pushImage.ref);
+      if (!plan) {
+        throw new Error("Push plan was empty");
+      }
+      const streamID = await DockerService.ApplyPushImagePlan(plan.planID);
       setPushImage((current) => ({
         ...current,
         busy: false,
@@ -3804,6 +3857,35 @@ function App() {
       }));
     }
   }, [ensureDockerReady, restoreVolume]);
+
+  const openDeleteBackupPlan = useCallback(
+    async (backup: BackupSummary) => {
+      if (!ensureDockerReady()) {
+        return;
+      }
+      setActionError(null);
+      try {
+        const plan = await BackupService.PlanDeleteBackup(backup.id);
+        if (!plan) {
+          throw new Error("Backup delete plan was empty");
+        }
+        setConfirm({
+          ...emptyConfirm,
+          open: true,
+          plan,
+          planKind: "backup-delete",
+          targetName: backup.volumeName,
+        });
+      } catch (error: unknown) {
+        setActionError(
+          error instanceof Error
+            ? error.message
+            : "Unable to plan backup deletion",
+        );
+      }
+    },
+    [ensureDockerReady],
+  );
 
   const submitCreateNetwork = useCallback(async () => {
     if (!ensureDockerReady()) {
@@ -4165,6 +4247,7 @@ function App() {
       setActionError(null);
       setActivePage("containers");
       setActiveContainerID(container.id);
+      setActiveContainerFallback(container);
       setContainerDetailTab(tab);
       setActiveNetworkID(null);
       setNetworkTab("overview");
@@ -4174,6 +4257,7 @@ function App() {
 
   const closeContainerDetail = useCallback(() => {
     setActiveContainerID(null);
+    setActiveContainerFallback(null);
     setContainerDetailTab("overview");
   }, []);
 
@@ -4202,7 +4286,9 @@ function App() {
               onBack={closeProjectDetail}
               onBackupVolume={openBackupVolume}
               onCheckUpdates={checkAllUpdates}
+              onDeleteBackup={openDeleteBackupPlan}
               onIgnoreUpdate={openIgnoreUpdate}
+              onOpenContainerDetail={openContainerDetail}
               onOpenContainerTerminal={openContainerTerminal}
               onRefresh={() => {
                 void refreshProjectDetail(activeProjectID);
@@ -4466,7 +4552,10 @@ function App() {
       case "containers":
         if (activeContainerID) {
           const activeContainer =
-            containers.find((item) => item.id === activeContainerID) ?? null;
+            containers.find((item) => item.id === activeContainerID) ??
+            (activeContainerFallback?.id === activeContainerID
+              ? activeContainerFallback
+              : null);
           const activeContainerProject = activeContainer?.projectID
             ? (projects.find(
                 (project) => project.id === activeContainer.projectID,
@@ -7235,10 +7324,7 @@ function ProjectsMiniList({
               <Sparkline
                 color={sparkColor}
                 label={`${project.name} project ${metricLabel} trend`}
-                points={
-                  projectSparks[project.id] ??
-                  projectSparkPoints(project, metric)
-                }
+                points={projectSparks[project.id] ?? []}
               />
             </button>
           ))}
@@ -9679,7 +9765,7 @@ function ProjectCard({
           <Sparkline
             color={chartColors.spark}
             label={`${project.name} project resource trend`}
-            points={sparkPoints ?? projectSparkPoints(project)}
+            points={sparkPoints ?? []}
           />
         </div>
 
@@ -10082,8 +10168,10 @@ function ProjectDetailPage({
   onBackupVolume,
   onCheckUpdates,
   onIgnoreUpdate,
+  onOpenContainerDetail,
   onOpenContainerTerminal,
   onRefresh,
+  onDeleteBackup,
   onRestoreBackup,
   onToast,
   onTabChange,
@@ -10115,8 +10203,13 @@ function ProjectDetailPage({
   onBackupVolume: (volume: VolumeSummary) => void;
   onCheckUpdates: () => void;
   onIgnoreUpdate: (update: ImageUpdate) => void;
+  onOpenContainerDetail: (
+    container: ContainerSummary,
+    tab?: ContainerDrilldownTabID,
+  ) => void;
   onOpenContainerTerminal: (container: ContainerSummary) => void;
   onRefresh: () => void;
+  onDeleteBackup: (backup: BackupSummary) => void;
   onRestoreBackup: (backup: BackupSummary) => void;
   onToast: (toast: ToastInput) => void;
   onTabChange: (tab: ProjectTabID) => void;
@@ -10124,19 +10217,14 @@ function ProjectDetailPage({
   onUpdateService: (service: string) => void;
   projectsLoading: boolean;
 }) {
-  const [containerDrilldown, setContainerDrilldown] = useState<{
-    container: ContainerSummary;
-    tab: ContainerDrilldownTabID;
-  } | null>(null);
   const openContainerDrilldown = useCallback(
     (
       container: ContainerSummary,
       tab: ContainerDrilldownTabID = "overview",
     ) => {
-      setContainerDrilldown({ container, tab });
-      onTabChange("containers");
+      onOpenContainerDetail(container, tab);
     },
-    [onTabChange],
+    [onOpenContainerDetail],
   );
 
   if (loading && !detail) {
@@ -10164,12 +10252,6 @@ function ProjectDetailPage({
   const disabled = (action: ProjectAction) => Boolean(disabledReason(action));
   const busy = (action: ProjectAction) =>
     actionBusyIDs.has(projectActionBusyKey(action, project.id));
-  const projectContainers = detail.containers ?? [];
-  const selectedContainer = containerDrilldown
-    ? (projectContainers.find(
-        (container) => container.id === containerDrilldown.container.id,
-      ) ?? containerDrilldown.container)
-    : null;
 
   return (
     <div className="space-y-4">
@@ -10186,7 +10268,7 @@ function ProjectDetailPage({
             <Badge tone="info">{project.providerID}</Badge>
           </div>
           <div className="mt-2 max-w-3xl truncate text-sm text-text-muted">
-            {project.workingDir || "No workdir"} В· changed{" "}
+            {project.workingDir || "No workdir"} - changed{" "}
             {relativeTime(dateMillis(project.lastChangedAt))}
           </div>
         </div>
@@ -10349,26 +10431,9 @@ function ProjectDetailPage({
           mutationsDisabled={mutationsDisabled}
           mutationDisabledReason={mutationDisabledReason}
           onBackupVolume={onBackupVolume}
+          onDeleteBackup={onDeleteBackup}
           onRestoreBackup={onRestoreBackup}
           volumes={projectVolumes}
-        />
-      ) : null}
-      {selectedContainer && tab === "containers" ? (
-        <ContainerDrilldownPanel
-          container={selectedContainer}
-          dockerRunning={dockerRunning}
-          inventoryLoading={inventoryLoading}
-          onClose={() => setContainerDrilldown(null)}
-          onOpenContainerTerminal={onOpenContainerTerminal}
-          onTabChange={(nextTab) =>
-            setContainerDrilldown((current) =>
-              current ? { ...current, tab: nextTab } : current,
-            )
-          }
-          onToast={onToast}
-          project={project}
-          projectsLoading={projectsLoading}
-          tab={containerDrilldown?.tab ?? "overview"}
         />
       ) : null}
     </div>
@@ -11611,6 +11676,7 @@ function ProjectBackupsTab({
   mutationsDisabled,
   mutationDisabledReason,
   onBackupVolume,
+  onDeleteBackup,
   onRestoreBackup,
   volumes,
 }: {
@@ -11621,6 +11687,7 @@ function ProjectBackupsTab({
   mutationDisabledReason: string;
   volumes: VolumeSummary[];
   onBackupVolume: (volume: VolumeSummary) => void;
+  onDeleteBackup: (backup: BackupSummary) => void;
   onRestoreBackup: (backup: BackupSummary) => void;
 }) {
   return (
@@ -11720,20 +11787,32 @@ function ProjectBackupsTab({
             id: "actions",
             header: "",
             render: (backup) => (
-              <Button
-                disabled={mutationsDisabled || backup.result !== "success"}
-                disabledReason={
-                  backup.result !== "success"
-                    ? "Only successful backups can be restored"
-                    : mutationDisabledReason
-                }
-                icon={<Upload size={15} />}
-                onClick={() => onRestoreBackup(backup)}
-                size="sm"
-                variant="secondary"
-              >
-                Restore
-              </Button>
+              <div className="flex justify-end gap-2">
+                <Button
+                  disabled={mutationsDisabled || backup.result !== "success"}
+                  disabledReason={
+                    backup.result !== "success"
+                      ? "Only successful backups can be restored"
+                      : mutationDisabledReason
+                  }
+                  icon={<Upload size={15} />}
+                  onClick={() => onRestoreBackup(backup)}
+                  size="sm"
+                  variant="secondary"
+                >
+                  Restore
+                </Button>
+                <Button
+                  disabled={mutationsDisabled}
+                  disabledReason={mutationDisabledReason}
+                  icon={<Trash2 size={15} />}
+                  onClick={() => onDeleteBackup(backup)}
+                  size="sm"
+                  variant="danger"
+                >
+                  Delete
+                </Button>
+              </div>
             ),
           },
         ]}
@@ -11944,6 +12023,15 @@ function ContainersPage({
             render: (container) => container.projectID || "-",
             sortable: true,
             sortValue: (container) => container.projectID || "",
+          },
+          {
+            id: "cpu",
+            header: "CPU",
+            defaultWidth: 110,
+            minWidth: 90,
+            render: (container) => `${(container.cpuPercent ?? 0).toFixed(1)}%`,
+            sortable: true,
+            sortValue: (container) => container.cpuPercent ?? 0,
           },
           {
             id: "image",
@@ -12599,13 +12687,16 @@ function NetworkDetailPage({
     );
   }
 
-  const rawValue = JSON.stringify(
-    detail
-      ? { ...detail, containers: attachedContainers }
-      : { summary, containers: attachedContainers },
-    null,
-    2,
-  );
+  const rawValue =
+    detail?.rawJSON && detail.rawJSON.trim().length > 0
+      ? detail.rawJSON
+      : JSON.stringify(
+          detail
+            ? { ...detail, containers: attachedContainers }
+            : { summary, containers: attachedContainers },
+          null,
+          2,
+        );
 
   return (
     <div className="space-y-4">
@@ -12723,6 +12814,8 @@ function NetworkOverviewTab({
     ["Scope", network.scope || "-"],
     ["Subnet", detail?.subnet || "-"],
     ["Gateway", detail?.gateway || "-"],
+    ["IPAM ranges", String(detail?.ipam?.length ?? 0)],
+    ["Options", String(Object.keys(detail?.options ?? {}).length)],
     ["Containers", String(attachedContainers.length)],
     ["Labels", String(labelCount)],
     ["Internal", network.internal ? "yes" : "no"],
@@ -13987,11 +14080,18 @@ function UpdatePlanModal({
       : `service "${state.target?.service ?? ""}" in project "${
           state.target?.projectName ?? state.target?.projectID ?? ""
         }"`;
-  const title = plan
-    ? `Update ${targetLabel}`
-    : state.target
-      ? `Plan update for ${targetLabel}`
-      : "Update";
+  const title =
+    state.mode === "rollback"
+      ? plan
+        ? `Rollback ${targetLabel}`
+        : state.target
+          ? `Plan rollback for ${targetLabel}`
+          : "Rollback"
+      : plan
+        ? `Update ${targetLabel}`
+        : state.target
+          ? `Plan update for ${targetLabel}`
+          : "Update";
   const commandText = plan?.commands
     .map((command) => command.command)
     .join("\n");
@@ -14006,9 +14106,11 @@ function UpdatePlanModal({
           </Button>
           {plan && !applying && !state.result ? (
             <Button loading={state.busy} onClick={onApply} variant="primary">
-              {state.target?.kind === "project"
-                ? "Update project"
-                : "Update service"}
+              {state.mode === "rollback"
+                ? "Roll back"
+                : state.target?.kind === "project"
+                  ? "Update project"
+                  : "Update service"}
             </Button>
           ) : null}
         </div>
@@ -14123,45 +14225,48 @@ function UpdatePlanModal({
               </div>
             ) : null}
 
-            <div className="space-y-2 rounded-control border border-border bg-bg-inset p-3 text-sm">
-              <label className="flex items-center gap-2">
-                <input
-                  checked={state.backupVolumesFirst}
-                  disabled={applying}
-                  onChange={(event) =>
-                    onChange({ backupVolumesFirst: event.target.checked })
-                  }
-                  type="checkbox"
-                />
-                Back up named volumes first
-              </label>
-              <label className="flex items-center gap-2">
-                <input
-                  checked={state.watchHealth}
-                  disabled={applying}
-                  onChange={(event) =>
-                    onChange({ watchHealth: event.target.checked })
-                  }
-                  type="checkbox"
-                />
-                Watch health after update (60 s)
-              </label>
-              <label className="flex items-center gap-2">
-                <input
-                  checked={state.rollbackOnFailure}
-                  disabled={applying}
-                  onChange={(event) =>
-                    onChange({ rollbackOnFailure: event.target.checked })
-                  }
-                  type="checkbox"
-                />
-                Roll back automatically if health check fails
-              </label>
-              <div className="text-xs text-text-muted">
-                Rollback possible when the previous image is kept locally. If it
-                is unavailable, Cairn records manual-needed guidance in History.
+            {state.mode === "update" ? (
+              <div className="space-y-2 rounded-control border border-border bg-bg-inset p-3 text-sm">
+                <label className="flex items-center gap-2">
+                  <input
+                    checked={state.backupVolumesFirst}
+                    disabled={applying}
+                    onChange={(event) =>
+                      onChange({ backupVolumesFirst: event.target.checked })
+                    }
+                    type="checkbox"
+                  />
+                  Back up named volumes first
+                </label>
+                <label className="flex items-center gap-2">
+                  <input
+                    checked={state.watchHealth}
+                    disabled={applying}
+                    onChange={(event) =>
+                      onChange({ watchHealth: event.target.checked })
+                    }
+                    type="checkbox"
+                  />
+                  Watch health after update (60 s)
+                </label>
+                <label className="flex items-center gap-2">
+                  <input
+                    checked={state.rollbackOnFailure}
+                    disabled={applying}
+                    onChange={(event) =>
+                      onChange({ rollbackOnFailure: event.target.checked })
+                    }
+                    type="checkbox"
+                  />
+                  Roll back automatically if health check fails
+                </label>
+                <div className="text-xs text-text-muted">
+                  Rollback possible when the previous image is kept locally. If
+                  it is unavailable, Cairn records manual-needed guidance in
+                  History.
+                </div>
               </div>
-            </div>
+            ) : null}
           </>
         ) : null}
 
@@ -16786,22 +16891,6 @@ function statsSampleMetricValue(
 function projectActivityScore(project: ProjectSummary, points?: SparkPoint[]) {
   const latest = points?.[points.length - 1]?.value ?? project.cpuPercent;
   return latest + project.memoryBytes / 1024 / 1024 / 1024;
-}
-
-function projectSparkPoints(
-  project: ProjectSummary,
-  metric: DashboardMetricID = "cpu",
-): SparkPoint[] {
-  const baseline =
-    metric === "memory"
-      ? Math.max(1, project.memoryBytes)
-      : metric === "network"
-        ? Math.max(1, project.netRxRate + project.netTxRate)
-        : Math.max(0.2, project.cpuPercent);
-  return sparkBars(project.id).map((height, index) => ({
-    label: String(index),
-    value: Math.max(0, (height / 100) * baseline),
-  }));
 }
 
 function dashboardMetricColor(metric: DashboardMetricID) {

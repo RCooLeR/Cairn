@@ -292,10 +292,21 @@ type NetworkSummary struct {
 }
 
 type NetworkDetail struct {
-	Summary    NetworkSummary     `json:"summary"`
-	Subnet     string             `json:"subnet,omitempty"`
-	Gateway    string             `json:"gateway,omitempty"`
-	Containers []ContainerSummary `json:"containers,omitempty"`
+	Summary    NetworkSummary      `json:"summary"`
+	Subnet     string              `json:"subnet,omitempty"`
+	Gateway    string              `json:"gateway,omitempty"`
+	Options    map[string]string   `json:"options,omitempty"`
+	IPAM       []NetworkIPAMConfig `json:"ipam,omitempty"`
+	Containers []ContainerSummary  `json:"containers,omitempty"`
+	RawJSON    string              `json:"rawJSON,omitempty"`
+	CreatedAt  time.Time           `json:"createdAt,omitempty"`
+}
+
+type NetworkIPAMConfig struct {
+	Subnet     string            `json:"subnet,omitempty"`
+	Gateway    string            `json:"gateway,omitempty"`
+	IPRange    string            `json:"ipRange,omitempty"`
+	AuxAddress map[string]string `json:"auxAddress,omitempty"`
 }
 
 type CreateNetworkRequest struct {

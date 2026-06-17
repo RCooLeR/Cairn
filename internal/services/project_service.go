@@ -6,6 +6,8 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -304,28 +306,199 @@ func (s *ComposeService) Ps(ctx context.Context, projectID string) ([]models.Com
 	return s.Client.Ps(ctx, composeOptionsFromProject(project))
 }
 
-func (s *ComposeService) StartServices(_ context.Context, projectID string, services []string) error {
+func (s *ComposeService) StartServices(ctx context.Context, projectID string, services []string) error {
 	unlock := s.lockRuntime()
 	defer unlock()
-	return notReady()
+	project, serviceNames, err := s.projectForServiceAction(ctx, projectID, services)
+	if err != nil {
+		return err
+	}
+	return s.runComposeServiceAction(ctx, project, "service.start", composeServiceCommandDisplay(project, "start", serviceNames, 0), func() (*providers.CommandResult, error) {
+		return s.Client.StartServices(ctx, composeOptionsFromProject(project), serviceNames)
+	})
 }
 
-func (s *ComposeService) StopServices(_ context.Context, projectID string, services []string) error {
+func (s *ComposeService) StopServices(ctx context.Context, projectID string, services []string) error {
 	unlock := s.lockRuntime()
 	defer unlock()
-	return notReady()
+	project, serviceNames, err := s.projectForServiceAction(ctx, projectID, services)
+	if err != nil {
+		return err
+	}
+	return s.runComposeServiceAction(ctx, project, "service.stop", composeServiceCommandDisplay(project, "stop", serviceNames, 0), func() (*providers.CommandResult, error) {
+		return s.Client.StopServices(ctx, composeOptionsFromProject(project), serviceNames)
+	})
 }
 
-func (s *ComposeService) RestartServices(_ context.Context, projectID string, services []string) error {
+func (s *ComposeService) RestartServices(ctx context.Context, projectID string, services []string) error {
 	unlock := s.lockRuntime()
 	defer unlock()
-	return notReady()
+	project, serviceNames, err := s.projectForServiceAction(ctx, projectID, services)
+	if err != nil {
+		return err
+	}
+	return s.runComposeServiceAction(ctx, project, "service.restart", composeServiceCommandDisplay(project, "restart", serviceNames, 0), func() (*providers.CommandResult, error) {
+		return s.Client.RestartServices(ctx, composeOptionsFromProject(project), serviceNames)
+	})
 }
 
-func (s *ComposeService) ScaleService(_ context.Context, projectID string, service string, replicas int) error {
+func (s *ComposeService) ScaleService(ctx context.Context, projectID string, service string, replicas int) error {
 	unlock := s.lockRuntime()
 	defer unlock()
-	return notReady()
+	project, serviceNames, err := s.projectForServiceAction(ctx, projectID, []string{service})
+	if err != nil {
+		return err
+	}
+	return s.runComposeServiceAction(ctx, project, "service.scale", composeServiceCommandDisplay(project, "scale", serviceNames, replicas), func() (*providers.CommandResult, error) {
+		return s.Client.ScaleService(ctx, composeOptionsFromProject(project), serviceNames[0], replicas)
+	})
+}
+
+func (s *ComposeService) runComposeServiceAction(ctx context.Context, project store.ProjectRecord, action string, command string, run func() (*providers.CommandResult, error)) error {
+	jobID := security.NewJobID("job")
+	started := time.Now().UTC()
+	if err := s.recordComposeServiceAudit(ctx, project, action, command, "started", 0, nil); err != nil {
+		return err
+	}
+	s.publishJobProgress(jobID, "running", command, nil)
+	result, err := run()
+	duration := time.Since(started)
+	s.publishComposeOutput(jobID, result)
+	if err != nil {
+		_ = s.recordComposeServiceAudit(ctx, project, action, command, "failed", duration, err)
+		s.publishJobDone(jobID, "", err)
+		return err
+	}
+	if err := s.recordComposeServiceAudit(ctx, project, action, command, "success", duration, nil); err != nil {
+		return err
+	}
+	s.publishJobDone(jobID, "success", nil)
+	if s.Detector != nil {
+		_, _ = s.Detector.Reconcile(ctx)
+	}
+	if s.Events != nil {
+		s.Events.Publish(bus.Event{Topic: bus.TopicProjectChanged, Payload: map[string]any{"projectID": project.ID, "action": action}})
+		s.Events.Publish(bus.Event{Topic: bus.TopicObjectsChanged, Payload: map[string]any{"kind": "project", "ids": []string{project.ID}}})
+	}
+	return nil
+}
+
+func (s *ComposeService) recordComposeServiceAudit(ctx context.Context, project store.ProjectRecord, action string, command string, status string, duration time.Duration, actionErr error) error {
+	if s.Audit == nil {
+		return nil
+	}
+	var exitCode *int
+	if status == "success" {
+		code := 0
+		exitCode = &code
+	}
+	message := ""
+	if actionErr != nil {
+		message = actionErr.Error()
+	}
+	_, err := s.Audit.Insert(ctx, store.AuditRecord{
+		Action:     "project." + action,
+		TargetType: "project",
+		TargetID:   project.ID,
+		ProviderID: project.ProviderID,
+		ProjectID:  project.ID,
+		Command:    command,
+		Risk:       models.RiskSafe,
+		Status:     status,
+		ExitCode:   exitCode,
+		Duration:   duration,
+		Error:      message,
+		CreatedAt:  time.Now().UTC(),
+	})
+	if err != nil {
+		return apperror.Wrap(apperror.Internal, "Record Compose service audit entry failed", err)
+	}
+	return nil
+}
+
+func (s *ComposeService) publishComposeOutput(jobID string, result *providers.CommandResult) {
+	if result == nil {
+		return
+	}
+	for _, line := range splitOutputLines(result.Stdout) {
+		s.publishJobProgress(jobID, "stdout", line, nil)
+	}
+	for _, line := range splitOutputLines(result.Stderr) {
+		s.publishJobProgress(jobID, "stderr", line, nil)
+	}
+}
+
+func (s *ComposeService) publishJobProgress(jobID string, phase string, message string, pct *float64) {
+	if s.Events == nil {
+		return
+	}
+	s.Events.Publish(bus.Event{Topic: bus.TopicJobProgress, Payload: jobProgressPayload{JobID: jobID, Phase: phase, Message: message, Pct: pct}})
+}
+
+func (s *ComposeService) publishJobDone(jobID string, result string, actionErr error) {
+	if s.Events == nil {
+		return
+	}
+	payload := jobDonePayload{JobID: jobID, Result: result}
+	if actionErr != nil {
+		payload.Error = actionErr.Error()
+	}
+	s.Events.Publish(bus.Event{Topic: bus.TopicJobDone, Payload: payload})
+}
+
+func (s *ComposeService) projectForServiceAction(ctx context.Context, projectID string, requested []string) (store.ProjectRecord, []string, error) {
+	if s.Client == nil || s.Projects == nil {
+		return store.ProjectRecord{}, nil, notReady()
+	}
+	project, err := s.Projects.Get(ctx, projectID)
+	if err != nil {
+		return store.ProjectRecord{}, nil, mapStoreNotFound(err, "Project was not found")
+	}
+	workdir := strings.TrimSpace(project.WorkingDir)
+	if workdir == "" {
+		return store.ProjectRecord{}, nil, apperror.New(apperror.WorkdirMissing, "Project working directory is missing")
+	}
+	info, err := os.Stat(workdir)
+	if err != nil || !info.IsDir() {
+		return store.ProjectRecord{}, nil, apperror.New(apperror.WorkdirMissing, "Project working directory was not found", apperror.WithDetail(workdir), apperror.WithRepairHints("Re-link the project folder before running Compose actions."))
+	}
+	if len(project.ComposeFiles) == 0 {
+		project.ComposeFiles = discoverComposeFiles(workdir)
+		if len(project.ComposeFiles) == 0 {
+			return store.ProjectRecord{}, nil, apperror.New(apperror.ComposeInvalid, "No Compose files were found for this project", apperror.WithDetail(workdir))
+		}
+	}
+	serviceSet := map[string]struct{}{}
+	for _, service := range requested {
+		service = strings.TrimSpace(service)
+		if service != "" {
+			serviceSet[service] = struct{}{}
+		}
+	}
+	if len(serviceSet) == 0 {
+		return store.ProjectRecord{}, nil, apperror.New(apperror.Conflict, "At least one service is required")
+	}
+	known, err := s.Projects.ListServices(ctx, projectID)
+	if err != nil {
+		return store.ProjectRecord{}, nil, apperror.Wrap(apperror.Internal, "List project services failed", err)
+	}
+	knownSet := make(map[string]struct{}, len(known))
+	for _, service := range known {
+		if name := strings.TrimSpace(service.Name); name != "" {
+			knownSet[name] = struct{}{}
+		}
+	}
+	serviceNames := make([]string, 0, len(serviceSet))
+	for service := range serviceSet {
+		if len(knownSet) > 0 {
+			if _, ok := knownSet[service]; !ok {
+				return store.ProjectRecord{}, nil, apperror.New(apperror.NotFound, "Service was not found", apperror.WithDetail(service))
+			}
+		}
+		serviceNames = append(serviceNames, service)
+	}
+	sort.Strings(serviceNames)
+	return project, serviceNames, nil
 }
 
 func projectSummaryFromRecord(project store.ProjectRecord, services []store.ServiceRecord) models.ProjectSummary {
@@ -968,6 +1141,30 @@ func projectCommandDisplay(project store.ProjectRecord, action string, removeVol
 		args = append(args, "pull")
 	default:
 		args = append(args, action)
+	}
+	return joinCommand(args)
+}
+
+func composeServiceCommandDisplay(project store.ProjectRecord, action string, services []string, replicas int) string {
+	args := []string{"docker", "compose"}
+	for _, file := range project.ComposeFiles {
+		if strings.TrimSpace(file) != "" {
+			args = append(args, "-f", file)
+		}
+	}
+	switch action {
+	case "scale":
+		service := ""
+		if len(services) > 0 {
+			service = services[0]
+		}
+		args = append(args, "up", "-d", "--scale", service+"="+strconv.Itoa(replicas))
+		if service != "" {
+			args = append(args, service)
+		}
+	default:
+		args = append(args, action)
+		args = append(args, services...)
 	}
 	return joinCommand(args)
 }

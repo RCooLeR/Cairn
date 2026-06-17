@@ -536,8 +536,18 @@ func TestDockerServiceObjectCreationAudits(t *testing.T) {
 	if err := service.TagImage(ctx, "sha256:local", "localhost:5000/test/app:1.0"); err != nil {
 		t.Fatalf("TagImage() error = %v", err)
 	}
-	if _, err := service.PushImage(ctx, "localhost:5000/test/app:1.0"); err != nil {
-		t.Fatalf("PushImage() error = %v", err)
+	if _, err := service.PushImage(ctx, "localhost:5000/test/app:1.0"); !apperror.IsCode(err, apperror.ConfirmationRequired) {
+		t.Fatalf("PushImage() error = %v, want confirmation required", err)
+	}
+	pushPlan, err := service.PlanPushImage(ctx, "localhost:5000/test/app:1.0")
+	if err != nil {
+		t.Fatalf("PlanPushImage() error = %v", err)
+	}
+	if pushPlan == nil || pushPlan.Risk != models.RiskNeedsConfirmation {
+		t.Fatalf("PlanPushImage() plan = %#v", pushPlan)
+	}
+	if _, err := service.ApplyPushImagePlan(ctx, pushPlan.PlanID); err != nil {
+		t.Fatalf("ApplyPushImagePlan() error = %v", err)
 	}
 	if _, err := service.SaveImage(ctx, []string{"alpine:latest"}, "/tmp/alpine.tar"); err != nil {
 		t.Fatalf("SaveImage() error = %v", err)
@@ -563,8 +573,8 @@ func TestDockerServiceObjectCreationAudits(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAuditLog() error = %v", err)
 	}
-	if len(entries) != 18 {
-		t.Fatalf("audit entries count = %d, want 18: %#v", len(entries), entries)
+	if len(entries) != 19 {
+		t.Fatalf("audit entries count = %d, want 19: %#v", len(entries), entries)
 	}
 	var sawRun bool
 	var sawPush bool
@@ -626,6 +636,37 @@ func TestDockerServiceRunImageRejectsBindMountWithoutPlan(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].Result != "failed" || entries[0].Metadata["risk"] != string(models.RiskDangerous) {
 		t.Fatalf("audit entries = %#v", entries)
+	}
+
+	plan, err := service.PlanRunImage(ctx, models.RunImageRequest{
+		ImageRef: "alpine:latest",
+		Name:     "danger",
+		Volumes:  []models.MountSpec{{Type: "bind", Source: "/", Target: "/host"}},
+		Detach:   true,
+	})
+	if err != nil {
+		t.Fatalf("PlanRunImage() error = %v", err)
+	}
+	if plan.Risk != models.RiskDangerous || plan.RequiresTypedName != "danger" {
+		t.Fatalf("PlanRunImage() plan = %#v", plan)
+	}
+	if _, err := service.ApplyRunImagePlan(ctx, plan.PlanID, "wrong"); !apperror.IsCode(err, apperror.ConfirmationRequired) {
+		t.Fatalf("ApplyRunImagePlan(wrong) error = %v, want confirmation", err)
+	}
+	containerID, err := service.ApplyRunImagePlan(ctx, plan.PlanID, "danger")
+	if err != nil {
+		t.Fatalf("ApplyRunImagePlan() error = %v", err)
+	}
+	if containerID != "container-created" || len(client.runImages) != 1 {
+		t.Fatalf("ApplyRunImagePlan() id=%q runImages=%#v", containerID, client.runImages)
+	}
+}
+
+func TestDockerServicePushImageWithoutClientReturnsNotReady(t *testing.T) {
+	t.Parallel()
+	_, err := (&DockerService{}).PushImage(context.Background(), "localhost:5000/demo:latest")
+	if !apperror.IsCode(err, apperror.ProviderNotReady) {
+		t.Fatalf("PushImage() error = %v, want %s", err, apperror.ProviderNotReady)
 	}
 }
 
