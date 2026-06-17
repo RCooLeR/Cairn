@@ -379,12 +379,47 @@ func TestClientContainerExecAndShellDetection(t *testing.T) {
 	if last.Options.ConsoleSize == nil || *last.Options.ConsoleSize != [2]uint{43, 132} {
 		t.Fatalf("console size = %#v", last.Options.ConsoleSize)
 	}
+	if len(api.execAttachCtxs) == 0 {
+		t.Fatalf("no exec attach recorded")
+	}
+	if len(api.execAttachOpts) == 0 || api.execAttachOpts[len(api.execAttachOpts)-1].ConsoleSize == nil ||
+		*api.execAttachOpts[len(api.execAttachOpts)-1].ConsoleSize != [2]uint{43, 132} {
+		t.Fatalf("attach options = %#v", api.execAttachOpts)
+	}
 
 	if err := client.ResizeContainerExec(ctx, session.ID, 120, 30); err != nil {
 		t.Fatalf("ResizeContainerExec() error = %v", err)
 	}
 	if got := api.execResizes[len(api.execResizes)-1]; got.ExecID != session.ID || got.Options.Width != 120 || got.Options.Height != 30 {
 		t.Fatalf("resize = %#v", got)
+	}
+}
+
+func TestClientOpenContainerExecKeepsAttachAfterCallerCancel(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	api := newFakeAPI()
+
+	client := New(fakeDockerProvider{}, nil)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	session, err := client.OpenContainerExec(ctx, "abc123", ExecOptions{Cmd: []string{"/bin/sh"}, TTY: true})
+	if err != nil {
+		t.Fatalf("OpenContainerExec() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = session.Close()
+	})
+	if len(api.execAttachCtxs) != 1 {
+		t.Fatalf("exec attach context count = %d, want 1", len(api.execAttachCtxs))
+	}
+
+	cancel()
+	if err := api.execAttachCtxs[0].Err(); err != nil {
+		t.Fatalf("exec attach context was cancelled with caller context: %v", err)
 	}
 }
 
@@ -1918,6 +1953,8 @@ type fakeAPI struct {
 	stats             map[string][]container.StatsResponse
 	statsCalls        []statsCall
 	execCreates       []execCreateCall
+	execAttachCtxs    []context.Context
+	execAttachOpts    []container.ExecAttachOptions
 	execResizes       []execResizeCall
 	execInspects      map[string]container.ExecInspect
 	execOutputs       map[string]string
@@ -2120,8 +2157,10 @@ func (a *fakeAPI) ContainerExecCreate(_ context.Context, containerID string, opt
 	return container.ExecCreateResponse{ID: id}, nil
 }
 
-func (a *fakeAPI) ContainerExecAttach(_ context.Context, execID string, opts container.ExecAttachOptions) (dockertypes.HijackedResponse, error) {
+func (a *fakeAPI) ContainerExecAttach(ctx context.Context, execID string, opts container.ExecAttachOptions) (dockertypes.HijackedResponse, error) {
 	a.mu.Lock()
+	a.execAttachCtxs = append(a.execAttachCtxs, ctx)
+	a.execAttachOpts = append(a.execAttachOpts, opts)
 	var output string
 	for _, call := range a.execCreates {
 		if call.ID == execID {

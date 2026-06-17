@@ -83,7 +83,11 @@ func (c *Client) OpenContainerExec(ctx context.Context, containerID string, opts
 		return nil, mapDockerError("create container exec", err)
 	}
 
-	hijack, err := api.ContainerExecAttach(ctx, resp.ID, container.ExecAttachOptions{Tty: opts.TTY})
+	attachCtx := context.WithoutCancel(ctx)
+	hijack, err := api.ContainerExecAttach(attachCtx, resp.ID, container.ExecAttachOptions{
+		Tty:         opts.TTY,
+		ConsoleSize: consoleSize(opts.Cols, opts.Rows),
+	})
 	if err != nil {
 		return nil, mapDockerError("attach container exec", err)
 	}
