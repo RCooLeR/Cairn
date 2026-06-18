@@ -49,6 +49,14 @@ Secrets are redacted before file and JSON context is sent to the local model. Re
 
 For identity, capability, greeting, and general conceptual questions, Cairn skips Docker inventory context and asks the model to answer directly. This prevents unrelated current projects or stopped containers from hijacking simple questions such as "Can you write code?"
 
+## Conversation UI
+
+Agent responses render common Markdown, including headings, bullet and numbered lists, task lists, inline code, fenced code blocks, bold text, and HTTP links. The transcript scrolls inside the chat card instead of growing the whole page.
+
+Press `Enter` to send a prompt. Press `Shift+Enter` to insert a newline.
+
+On wide windows, the latest model-returned plan and agent log appear beside the conversation. On narrower windows they stack above the conversation. The plan panel is populated from a Markdown `Plan` section in the latest assistant answer; for larger requests the model is asked to return task-list items using `[ ]` for todo, `[-]` for in progress, and `[x]` for done.
+
 ## App Analysis
 
 When a project is selected, Cairn inspects common application files such as `package.json`, `composer.json`, `go.mod`, `requirements.txt`, `pyproject.toml`, Dockerfiles, Compose files, `.env.example`, and shallow config files. The analysis detects likely stacks, runtime/build needs, expected environment variables, and ports.

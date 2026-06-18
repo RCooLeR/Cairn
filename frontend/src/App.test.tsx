@@ -187,6 +187,16 @@ const settingsServiceMock = vi.hoisted(() => ({
   CheckAppUpdate: vi.fn(),
 }));
 
+const agentServiceMock = vi.hoisted(() => ({
+  AnalyzeProject: vi.fn(),
+  ApplyFileEdit: vi.fn(),
+  Chat: vi.fn(),
+  DraftProjectFile: vi.fn(),
+  PlanFileEdit: vi.fn(),
+  Status: vi.fn(),
+  ToolCatalog: vi.fn(),
+}));
+
 const registryServiceMock = vi.hoisted(() => ({
   KnownRegistries: vi.fn(),
   ListRegistryAccounts: vi.fn(),
@@ -232,6 +242,7 @@ vi.mock("./api/inventory", () => ({
 }));
 
 vi.mock("./api/services", () => ({
+  AgentService: agentServiceMock,
   BackupService: backupServiceMock,
   DockerService: dockerServiceMock,
   LogsService: logsServiceMock,
@@ -505,6 +516,46 @@ describe("App inventory shell", () => {
     settingsServiceMock.MarkNotificationsRead.mockResolvedValue(undefined);
     settingsServiceMock.GetCheatsheet.mockResolvedValue(seededCheatsheet());
     settingsServiceMock.CheckAppUpdate.mockResolvedValue(null);
+    agentServiceMock.Status.mockResolvedValue({
+      enabled: true,
+      provider: "ollama",
+      endpoint: "http://127.0.0.1:11434",
+      model: "gemma4:12b",
+      reachable: true,
+      availableModels: ["gemma4:12b", "qwen2.5-coder:7b"],
+      candidateModels: ["gemma4:12b", "qwen2.5-coder:7b", "llama3.1:8b"],
+    });
+    agentServiceMock.Chat.mockResolvedValue({
+      message: "Agent response.",
+      toolResults: [],
+      model: "gemma4:12b",
+    });
+    agentServiceMock.AnalyzeProject.mockResolvedValue({
+      projectID: "linux_native/app-db",
+      projectName: "app-db",
+      workingDir: "/home/cairn/projects/app-db",
+      stacks: ["Node.js"],
+      runtimeHints: ["npm install"],
+      configFiles: ["package.json"],
+      envVars: [],
+      ports: [],
+      recommendations: [],
+    });
+    agentServiceMock.DraftProjectFile.mockResolvedValue({
+      projectID: "linux_native/app-db",
+      path: ".env",
+      content: "APP_PORT=8080\n",
+      summary: "Drafted .env",
+      model: "gemma4:12b",
+    });
+    agentServiceMock.PlanFileEdit.mockResolvedValue(agentFileEditPlan());
+    agentServiceMock.ApplyFileEdit.mockResolvedValue({
+      projectID: "linux_native/app-db",
+      path: ".env",
+      bytesWritten: 14,
+      appliedAt: "2026-06-13T09:00:00Z",
+    });
+    agentServiceMock.ToolCatalog.mockResolvedValue([]);
     registryServiceMock.KnownRegistries.mockResolvedValue([
       { name: "Docker Hub", registry: "docker.io" },
     ]);
@@ -628,6 +679,72 @@ describe("App inventory shell", () => {
     const searchInput = screen.getByLabelText("Search inventory");
     fireEvent.keyDown(window, { key: "/" });
     expect(searchInput).toHaveFocus();
+  });
+
+  it("renders agent markdown, plan items, and Enter chat shortcuts", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    agentServiceMock.Chat.mockResolvedValueOnce({
+      message: [
+        "## Plan",
+        "- [x] Inspect app files",
+        "- [-] Draft Compose changes",
+        "- [ ] Verify with tests",
+        "",
+        "## Answer",
+        "Use `docker compose up` after checking [Docker docs](https://docs.docker.com).",
+        "",
+        "```yaml",
+        "services:",
+        "  app:",
+        "    image: nginx",
+        "```",
+      ].join("\n"),
+      toolResults: [
+        {
+          toolID: "project.files",
+          title: "Project files",
+          summary: "compose.yaml",
+        },
+      ],
+      model: "gemma4:12b",
+    });
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Agent/ }),
+    );
+
+    await screen.findByText("Local Agent");
+    const input = screen.getByPlaceholderText("Ask a Docker question...");
+    expect(screen.getByTestId("agent-transcript")).toHaveClass("overflow-auto");
+
+    fireEvent.change(input, {
+      target: { value: "Review this Compose project and make a plan" },
+    });
+    fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
+    expect(agentServiceMock.Chat).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(agentServiceMock.Chat).toHaveBeenCalledTimes(1));
+    expect(agentServiceMock.Chat.mock.calls[0][0].prompt).toContain(
+      'Markdown section named "Plan"',
+    );
+
+    const plan = await screen.findByTestId("agent-plan-content");
+    expect(within(plan).getByText("Inspect app files")).toBeInTheDocument();
+    expect(within(plan).getByText("Draft Compose changes")).toBeInTheDocument();
+    expect(within(plan).getByText("Verify with tests")).toBeInTheDocument();
+    expect(within(plan).getByText("In progress")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Docker docs" })).toHaveAttribute(
+      "href",
+      "https://docs.docker.com",
+    );
+    expect(screen.getByText(/services:\s+app:/)).toBeInTheDocument();
+    expect(screen.getByText("Project files: compose.yaml")).toBeInTheDocument();
   });
 
   it("opens the notification center and marks notifications read", async () => {
@@ -3964,6 +4081,24 @@ function backupPlan(): CommandPlan {
     effects: [
       "cairn_data: Creates a compressed tar.gz backup and JSON sidecar.",
     ],
+    expiresAt: "2026-06-13T08:10:00Z",
+  };
+}
+
+function agentFileEditPlan(): CommandPlan {
+  return {
+    planID: "plan-agent-file-env",
+    title: "Update .env",
+    risk: Risk.RiskNeedsConfirmation,
+    commands: [
+      {
+        order: 1,
+        command: "write .env",
+        risk: Risk.RiskNeedsConfirmation,
+        explanation: "Apply an agent-drafted project configuration edit.",
+      },
+    ],
+    effects: ["Update .env", "Write 14 bytes"],
     expiresAt: "2026-06-13T08:10:00Z",
   };
 }

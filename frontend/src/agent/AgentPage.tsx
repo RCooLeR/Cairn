@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import {
   Bot,
   CheckCircle2,
@@ -36,6 +43,17 @@ type ChatMessage = {
   toolResults?: AgentToolResult[];
 };
 
+type AgentPlanItem = {
+  text: string;
+  status: "done" | "in_progress" | "todo";
+};
+
+type AgentLogItem = {
+  id: string;
+  text: string;
+  tone: "accent" | "error" | "neutral" | "ok";
+};
+
 const defaultEndpoint = "http://127.0.0.1:11434";
 
 export function AgentPage({ projects }: AgentPageProps) {
@@ -67,6 +85,7 @@ export function AgentPage({ projects }: AgentPageProps) {
   const [editError, setEditError] = useState<string | null>(null);
   const requestRef = useRef<ReturnType<typeof AgentService.Chat> | null>(null);
   const stoppedRef = useRef(false);
+  const transcriptRef = useRef<HTMLDivElement | null>(null);
 
   const selectedProject = projects.find((project) => project.id === projectID);
   const availableModels = useMemo(
@@ -80,6 +99,23 @@ export function AgentPage({ projects }: AgentPageProps) {
     Boolean(status?.reachable) &&
     availableModels.length > 0 &&
     !sending;
+
+  const llmPlanItems = useMemo(
+    () => extractLatestPlanItems(messages),
+    [messages],
+  );
+  const logItems = useMemo(
+    () => buildAgentLogItems(messages, lastToolResults, sending),
+    [lastToolResults, messages, sending],
+  );
+
+  useEffect(() => {
+    const transcript = transcriptRef.current;
+    if (!transcript) {
+      return;
+    }
+    transcript.scrollTop = transcript.scrollHeight;
+  }, [messages, sending]);
 
   const refreshAgent = useCallback(async (showSpinner = true) => {
     if (showSpinner) {
@@ -334,18 +370,9 @@ export function AgentPage({ projects }: AgentPageProps) {
     ]);
   };
 
-  const planItems = buildPlanItems({
-    endpoint,
-    mode,
-    model,
-    project: selectedProject,
-    provider,
-    reachable: Boolean(status?.reachable),
-  });
-
   return (
-    <div className="flex min-h-[calc(100vh-120px)] flex-col gap-3">
-      <Card>
+    <div className="flex h-full min-h-0 flex-col gap-3 overflow-hidden">
+      <Card className="shrink-0">
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-4 py-3">
           <div className="inline-flex items-center gap-2 text-sm font-semibold">
             <Bot size={16} />
@@ -436,181 +463,139 @@ export function AgentPage({ projects }: AgentPageProps) {
         </CardBody>
       </Card>
 
-      <div className="grid gap-3 xl:grid-cols-[minmax(0,1fr)_360px]">
-        <Card>
-          <div className="flex items-center gap-2 border-b border-border px-4 py-3 text-sm font-semibold">
-            <ListChecks size={16} />
-            Plan
+      <div className="grid min-h-0 flex-1 gap-3 overflow-auto xl:grid-cols-[minmax(0,1fr)_360px] xl:overflow-hidden">
+        <Card className="order-2 flex min-h-[420px] min-w-0 flex-col overflow-hidden xl:order-1 xl:min-h-0">
+          <div className="flex items-center justify-between gap-3 border-b border-border px-4 py-3">
+            <div className="text-sm font-semibold">Conversation</div>
+            <Button
+              disabled={messages.length === 0 || sending}
+              icon={<Trash2 size={15} />}
+              onClick={() => {
+                setMessages([]);
+                setLastToolResults([]);
+              }}
+              size="sm"
+              variant="ghost"
+            >
+              Clear
+            </Button>
           </div>
-          <CardBody className="space-y-3">
-            <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
-              {planItems.map((item, index) => (
-                <div
-                  className="rounded-card border border-border bg-bg-inset p-3 text-sm"
-                  key={item}
-                >
-                  <div className="text-xs font-medium uppercase text-text-muted">
-                    Step {index + 1}
-                  </div>
-                  <div className="mt-1 text-text-primary">{item}</div>
-                </div>
+          <CardBody className="flex min-h-0 flex-1 flex-col gap-3">
+            <div
+              className="min-h-0 flex-1 space-y-3 overflow-auto rounded-card border border-border bg-bg-inset p-3"
+              data-testid="agent-transcript"
+              ref={transcriptRef}
+            >
+              {messages.length === 0 ? (
+                <EmptyState
+                  body="Choose a model, optionally scope to a project, then ask a Docker question."
+                  icon={<Bot size={28} />}
+                  title="Start a conversation"
+                />
+              ) : null}
+              {messages.map((message) => (
+                <ChatBubble key={message.id} message={message} />
               ))}
             </div>
-            {selectedProject ? (
-              <ProjectConfigPanel
-                analysis={analysis}
-                analysisLoading={analysisLoading}
-                editBusy={editBusy}
-                editContent={editContent}
-                editError={editError}
-                editInstruction={editInstruction}
-                editPath={editPath}
-                editPlan={editPlan}
-                editResult={editResult}
-                onAnalyze={() => {
-                  void loadProjectAnalysis();
-                }}
-                onApply={() => {
-                  void applyFileEdit();
-                }}
-                onDraft={() => {
-                  void draftProjectFile();
-                }}
-                onPreview={() => {
-                  void previewFileEdit();
-                }}
-                onSetContent={setEditContent}
-                onSetInstruction={setEditInstruction}
-                onSetPath={(path) => {
-                  setEditPath(path);
-                  setEditPlan(null);
-                  setEditResult(null);
-                }}
-                project={selectedProject}
-              />
-            ) : (
-              <div className="rounded-card border border-border bg-bg-inset px-3 py-2 text-sm text-text-muted">
-                Select a project to analyze app files and draft config edits.
+
+            <div className="rounded-card border border-border bg-bg-card p-3">
+              <div className="mb-3 flex flex-wrap gap-2">
+                <ModeButton
+                  active={mode === "ask"}
+                  label="Ask"
+                  onClick={() => setMode("ask")}
+                />
+                <ModeButton
+                  active={mode === "agent"}
+                  label="Agent"
+                  onClick={() => setMode("agent")}
+                />
               </div>
-            )}
-          </CardBody>
-        </Card>
-
-        <Card>
-          <div className="border-b border-border px-4 py-3 text-sm font-semibold">
-            Log
-          </div>
-          <CardBody className="space-y-2">
-            {sending ? (
-              <LogLine tone="accent" text="Request running..." />
-            ) : null}
-            {!sending && lastToolResults.length === 0 ? (
-              <LogLine tone="neutral" text="No agent run yet." />
-            ) : null}
-            {lastToolResults.slice(0, 6).map((tool) => (
-              <LogLine
-                key={`${tool.toolID}-${tool.title}`}
-                text={`${tool.title}${tool.summary ? `: ${tool.summary}` : ""}`}
-                tone={tool.error ? "error" : "ok"}
-              />
-            ))}
-          </CardBody>
-        </Card>
-      </div>
-
-      <Card className="flex min-h-[520px] flex-1 flex-col">
-        <div className="flex items-center justify-between gap-3 border-b border-border px-4 py-3">
-          <div className="text-sm font-semibold">Conversation</div>
-          <Button
-            disabled={messages.length === 0 || sending}
-            icon={<Trash2 size={15} />}
-            onClick={() => {
-              setMessages([]);
-              setLastToolResults([]);
-            }}
-            size="sm"
-            variant="ghost"
-          >
-            Clear
-          </Button>
-        </div>
-        <CardBody className="flex flex-1 flex-col gap-3">
-          <div className="min-h-0 flex-1 space-y-3 overflow-auto rounded-card border border-border bg-bg-inset p-3">
-            {messages.length === 0 ? (
-              <EmptyState
-                body="Choose a model, optionally scope to a project, then ask a Docker question."
-                icon={<Bot size={28} />}
-                title="Start a conversation"
-              />
-            ) : null}
-            {messages.map((message) => (
-              <ChatBubble key={message.id} message={message} />
-            ))}
-          </div>
-
-          <div className="rounded-card border border-border bg-bg-card p-3">
-            <div className="mb-3 flex flex-wrap gap-2">
-              <ModeButton
-                active={mode === "ask"}
-                label="Ask"
-                onClick={() => setMode("ask")}
-              />
-              <ModeButton
-                active={mode === "agent"}
-                label="Agent"
-                onClick={() => setMode("agent")}
-              />
-            </div>
-            <div className="flex gap-2">
-              <textarea
-                className="min-h-16 flex-1 resize-none rounded-control border border-border bg-bg-inset px-3 py-2 text-sm text-text-primary outline-none focus:border-accent"
-                onChange={(event) => setPrompt(event.target.value)}
-                onKeyDown={(event) => {
-                  if (
-                    (event.ctrlKey || event.metaKey) &&
-                    event.key === "Enter"
-                  ) {
-                    void sendPrompt();
-                  }
-                }}
-                placeholder={
-                  mode === "agent"
-                    ? "Ask the agent to diagnose, plan, and explain next Docker steps..."
-                    : "Ask a Docker question..."
-                }
-                value={prompt}
-              />
-              {sending ? (
-                <Button
-                  className="self-end"
-                  icon={<Square size={15} />}
-                  onClick={stopPrompt}
-                  variant="danger"
-                >
-                  Stop
-                </Button>
-              ) : (
-                <Button
-                  className="self-end"
-                  disabled={!canSend}
-                  disabledReason={sendDisabledReason(
-                    status,
-                    availableModels,
-                    prompt,
-                  )}
-                  icon={<Send size={15} />}
-                  onClick={() => {
-                    void sendPrompt();
+              <div className="flex gap-2">
+                <textarea
+                  className="min-h-16 flex-1 resize-none rounded-control border border-border bg-bg-inset px-3 py-2 text-sm text-text-primary outline-none focus:border-accent"
+                  onChange={(event) => setPrompt(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && !event.shiftKey) {
+                      event.preventDefault();
+                      void sendPrompt();
+                    }
                   }}
-                  variant="primary"
-                >
-                  Send
-                </Button>
-              )}
+                  placeholder={
+                    mode === "agent"
+                      ? "Ask the agent to diagnose, plan, and explain next Docker steps..."
+                      : "Ask a Docker question..."
+                  }
+                  value={prompt}
+                />
+                {sending ? (
+                  <Button
+                    className="self-end"
+                    icon={<Square size={15} />}
+                    onClick={stopPrompt}
+                    variant="danger"
+                  >
+                    Stop
+                  </Button>
+                ) : (
+                  <Button
+                    className="self-end"
+                    disabled={!canSend}
+                    disabledReason={sendDisabledReason(
+                      status,
+                      availableModels,
+                      prompt,
+                    )}
+                    icon={<Send size={15} />}
+                    onClick={() => {
+                      void sendPrompt();
+                    }}
+                    variant="primary"
+                  >
+                    Send
+                  </Button>
+                )}
+              </div>
             </div>
-          </div>
-        </CardBody>
-      </Card>
+          </CardBody>
+        </Card>
+
+        <div className="order-1 grid min-h-0 gap-3 xl:order-2 xl:grid-rows-[minmax(160px,0.8fr)_minmax(180px,1fr)_auto] xl:overflow-hidden">
+          <AgentPlanPanel items={llmPlanItems} />
+          <AgentLogPanel items={logItems} />
+          <ProjectConfigDrawer
+            analysis={analysis}
+            analysisLoading={analysisLoading}
+            editBusy={editBusy}
+            editContent={editContent}
+            editError={editError}
+            editInstruction={editInstruction}
+            editPath={editPath}
+            editPlan={editPlan}
+            editResult={editResult}
+            onAnalyze={() => {
+              void loadProjectAnalysis();
+            }}
+            onApply={() => {
+              void applyFileEdit();
+            }}
+            onDraft={() => {
+              void draftProjectFile();
+            }}
+            onPreview={() => {
+              void previewFileEdit();
+            }}
+            onSetContent={setEditContent}
+            onSetInstruction={setEditInstruction}
+            onSetPath={(path) => {
+              setEditPath(path);
+              setEditPlan(null);
+              setEditResult(null);
+            }}
+            project={selectedProject}
+          />
+        </div>
+      </div>
     </div>
   );
 }
@@ -820,6 +805,94 @@ function ConfigHint({ label, value }: { label: string; value: string }) {
   );
 }
 
+function AgentPlanPanel({ items }: { items: AgentPlanItem[] }) {
+  return (
+    <Card className="flex min-h-0 flex-col overflow-hidden">
+      <div
+        className="flex items-center gap-2 border-b border-border px-4 py-3 text-sm font-semibold"
+        data-testid="agent-plan-panel"
+      >
+        <ListChecks size={16} />
+        Plan
+      </div>
+      <CardBody className="min-h-0 flex-1 overflow-auto">
+        <div data-testid="agent-plan-content">
+          {items.length === 0 ? (
+            <div className="rounded-card border border-border bg-bg-inset px-3 py-2 text-sm text-text-muted">
+              No plan in the latest answer.
+            </div>
+          ) : (
+            <div className="space-y-2">
+              {items.map((item, index) => (
+                <div
+                  className="rounded-card border border-border bg-bg-inset p-3"
+                  key={`${item.status}-${item.text}-${index}`}
+                >
+                  <div className="mb-1">
+                    <Badge tone={planStatusTone(item.status)}>
+                      {planStatusLabel(item.status)}
+                    </Badge>
+                  </div>
+                  <div className="break-words text-sm text-text-primary">
+                    {item.text}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </CardBody>
+    </Card>
+  );
+}
+
+function AgentLogPanel({ items }: { items: AgentLogItem[] }) {
+  return (
+    <Card className="flex min-h-0 flex-col overflow-hidden">
+      <div
+        className="border-b border-border px-4 py-3 text-sm font-semibold"
+        data-testid="agent-log-panel"
+      >
+        Log
+      </div>
+      <CardBody className="min-h-0 flex-1 space-y-2 overflow-auto">
+        {items.map((item) => (
+          <LogLine key={item.id} text={item.text} tone={item.tone} />
+        ))}
+      </CardBody>
+    </Card>
+  );
+}
+
+function ProjectConfigDrawer({
+  project,
+  ...props
+}: Omit<Parameters<typeof ProjectConfigPanel>[0], "project"> & {
+  project?: ProjectSummary;
+}) {
+  if (!project) {
+    return (
+      <Card className="shrink-0">
+        <CardBody className="text-sm text-text-muted">
+          Select a project to analyze app files and draft config edits.
+        </CardBody>
+      </Card>
+    );
+  }
+  return (
+    <Card className="shrink-0 overflow-hidden">
+      <details>
+        <summary className="cursor-pointer border-b border-border px-4 py-3 text-sm font-semibold text-text-primary">
+          Project config tools
+        </summary>
+        <CardBody>
+          <ProjectConfigPanel project={project} {...props} />
+        </CardBody>
+      </details>
+    </Card>
+  );
+}
+
 function AgentStatusBadge({
   loading,
   status,
@@ -931,10 +1004,227 @@ function ChatBubble({ message }: { message: ChatMessage }) {
           {isUser ? "You" : isSystem ? "System" : "Agent"}
           {message.model ? ` - ${message.model}` : ""}
         </div>
-        <div className="whitespace-pre-wrap">{message.content}</div>
+        <MarkdownContent content={message.content} />
       </div>
     </div>
   );
+}
+
+type MarkdownListItem = {
+  checked?: boolean;
+  text: string;
+};
+
+type MarkdownBlock =
+  | { kind: "code"; code: string; language?: string }
+  | { kind: "heading"; level: number; text: string }
+  | { kind: "list"; items: MarkdownListItem[]; ordered: boolean }
+  | { kind: "paragraph"; text: string };
+
+function MarkdownContent({ content }: { content: string }) {
+  const blocks = parseMarkdownBlocks(content);
+  return (
+    <div className="space-y-3 break-words">
+      {blocks.map((block, index) => (
+        <MarkdownBlockView block={block} key={`${block.kind}-${index}`} />
+      ))}
+    </div>
+  );
+}
+
+function MarkdownBlockView({ block }: { block: MarkdownBlock }) {
+  if (block.kind === "heading") {
+    const className =
+      block.level <= 2
+        ? "text-base font-semibold text-text-primary"
+        : "text-sm font-semibold text-text-primary";
+    return <div className={className}>{renderInlineMarkdown(block.text)}</div>;
+  }
+  if (block.kind === "code") {
+    return (
+      <pre className="overflow-auto rounded-control border border-border bg-bg-inset p-3 font-mono text-xs leading-5 text-text-secondary">
+        <code>{block.code}</code>
+      </pre>
+    );
+  }
+  if (block.kind === "list") {
+    const ListTag = block.ordered ? "ol" : "ul";
+    return (
+      <ListTag
+        className={[
+          "space-y-1 pl-5",
+          block.ordered ? "list-decimal" : "list-disc",
+        ].join(" ")}
+      >
+        {block.items.map((item, index) => (
+          <li className="text-text-primary" key={`${item.text}-${index}`}>
+            {item.checked === undefined ? null : (
+              <input
+                checked={item.checked}
+                className="mr-2 align-middle"
+                disabled
+                readOnly
+                type="checkbox"
+              />
+            )}
+            {renderInlineMarkdown(item.text)}
+          </li>
+        ))}
+      </ListTag>
+    );
+  }
+  return (
+    <p className="whitespace-pre-wrap text-text-primary">
+      {renderInlineMarkdown(block.text)}
+    </p>
+  );
+}
+
+function parseMarkdownBlocks(content: string): MarkdownBlock[] {
+  const lines = content.replace(/\r\n/g, "\n").split("\n");
+  const blocks: MarkdownBlock[] = [];
+  let paragraph: string[] = [];
+  let list: { items: MarkdownListItem[]; ordered: boolean } | null = null;
+  let codeLines: string[] | null = null;
+  let codeLanguage = "";
+
+  const flushParagraph = () => {
+    if (paragraph.length === 0) {
+      return;
+    }
+    blocks.push({ kind: "paragraph", text: paragraph.join("\n") });
+    paragraph = [];
+  };
+  const flushList = () => {
+    if (!list) {
+      return;
+    }
+    blocks.push({ kind: "list", items: list.items, ordered: list.ordered });
+    list = null;
+  };
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const fence = trimmed.match(/^```([\w-]*)/);
+    if (codeLines) {
+      if (fence) {
+        blocks.push({
+          kind: "code",
+          code: codeLines.join("\n"),
+          language: codeLanguage || undefined,
+        });
+        codeLines = null;
+        codeLanguage = "";
+      } else {
+        codeLines.push(line);
+      }
+      continue;
+    }
+    if (fence) {
+      flushParagraph();
+      flushList();
+      codeLines = [];
+      codeLanguage = fence[1] ?? "";
+      continue;
+    }
+    if (!trimmed) {
+      flushParagraph();
+      flushList();
+      continue;
+    }
+    const heading = trimmed.match(/^(#{1,4})\s+(.+)$/);
+    if (heading) {
+      flushParagraph();
+      flushList();
+      blocks.push({
+        kind: "heading",
+        level: heading[1].length,
+        text: heading[2],
+      });
+      continue;
+    }
+    const unordered = line.match(/^\s*[-*]\s+(?:\[([ xX~-])\]\s+)?(.+)$/);
+    const ordered = line.match(/^\s*\d+[.)]\s+(.+)$/);
+    if (unordered || ordered) {
+      flushParagraph();
+      const isOrdered = Boolean(ordered);
+      const checkedToken = unordered?.[1];
+      const itemText = unordered?.[2] ?? ordered?.[1] ?? "";
+      if (!list || list.ordered !== isOrdered) {
+        flushList();
+        list = { items: [], ordered: isOrdered };
+      }
+      list.items.push({
+        checked:
+          checkedToken === undefined
+            ? undefined
+            : checkedToken.toLowerCase() === "x",
+        text: itemText,
+      });
+      continue;
+    }
+    flushList();
+    paragraph.push(line);
+  }
+
+  if (codeLines) {
+    blocks.push({
+      kind: "code",
+      code: codeLines.join("\n"),
+      language: codeLanguage || undefined,
+    });
+  }
+  flushParagraph();
+  flushList();
+  return blocks.length > 0 ? blocks : [{ kind: "paragraph", text: content }];
+}
+
+function renderInlineMarkdown(text: string): ReactNode[] {
+  const pattern = /(`[^`]+`|\*\*[^*]+\*\*|\[[^\]]+\]\(https?:\/\/[^)\s]+\))/g;
+  const nodes: ReactNode[] = [];
+  let lastIndex = 0;
+  for (const match of text.matchAll(pattern)) {
+    const token = match[0];
+    if (match.index > lastIndex) {
+      nodes.push(text.slice(lastIndex, match.index));
+    }
+    if (token.startsWith("`")) {
+      nodes.push(
+        <code
+          className="rounded border border-border bg-bg-inset px-1 py-0.5 font-mono text-[0.85em]"
+          key={`code-${match.index}`}
+        >
+          {token.slice(1, -1)}
+        </code>,
+      );
+    } else if (token.startsWith("**")) {
+      nodes.push(
+        <strong key={`strong-${match.index}`}>{token.slice(2, -2)}</strong>,
+      );
+    } else {
+      const link = token.match(/^\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)$/);
+      if (link) {
+        nodes.push(
+          <a
+            className="text-info underline decoration-info/40 underline-offset-2 hover:text-accent"
+            href={link[2]}
+            key={`link-${match.index}`}
+            rel="noreferrer"
+            target="_blank"
+          >
+            {link[1]}
+          </a>,
+        );
+      } else {
+        nodes.push(token);
+      }
+    }
+    lastIndex = match.index + token.length;
+  }
+  if (lastIndex < text.length) {
+    nodes.push(text.slice(lastIndex));
+  }
+  return nodes;
 }
 
 function LogLine({
@@ -963,33 +1253,6 @@ function LogLine({
   );
 }
 
-function buildPlanItems({
-  endpoint,
-  mode,
-  model,
-  project,
-  provider,
-  reachable,
-}: {
-  endpoint: string;
-  mode: AgentMode;
-  model: string;
-  project?: ProjectSummary;
-  provider: string;
-  reachable: boolean;
-}) {
-  return [
-    reachable
-      ? `${providerLabel(provider)} at ${endpoint}`
-      : "Connect to the local model endpoint",
-    model ? `Use ${model}` : "Pick an installed model",
-    project ? `Scope to ${project.name}` : "Use all Docker context",
-    mode === "agent"
-      ? "Use context when relevant"
-      : "Answer directly with safe next steps",
-  ];
-}
-
 function buildAgentPrompt(
   mode: AgentMode,
   messages: ChatMessage[],
@@ -1001,8 +1264,8 @@ function buildAgentPrompt(
     .join("\n");
   const modeInstruction =
     mode === "agent"
-      ? "Agent mode: use Cairn context when it helps, outline a concise plan for troubleshooting or implementation requests, then answer with concrete next steps. For capability, identity, greeting, or conceptual questions, answer directly without diagnosing current Docker state. Do not execute mutations."
-      : "Ask mode: answer directly and concisely with Docker-specific guidance.";
+      ? 'Agent mode: use Cairn context when it helps, then answer with concrete next steps. For larger troubleshooting, implementation, migration, or debugging requests, include a Markdown section named "Plan" with task-list items using [ ] todo, [-] in progress, and [x] done where those statuses are known. For simple capability, identity, greeting, or conceptual questions, answer directly without a plan and without diagnosing current Docker state. Do not execute mutations.'
+      : 'Ask mode: answer directly and concisely with Docker-specific guidance. For larger troubleshooting, implementation, migration, or debugging requests, include a Markdown section named "Plan" with task-list items using [ ] todo, [-] in progress, and [x] done where those statuses are known. For simple questions, skip the plan.';
   return [
     modeInstruction,
     history ? `Recent conversation:\n${history}` : "",
@@ -1013,7 +1276,10 @@ function buildAgentPrompt(
 }
 
 function shouldUseAgentToolContext(prompt: string) {
-  const normalized = prompt.trim().toLowerCase().replace(/[?!.]+$/g, "");
+  const normalized = prompt
+    .trim()
+    .toLowerCase()
+    .replace(/[?!.]+$/g, "");
   if (!normalized) {
     return false;
   }
@@ -1041,6 +1307,193 @@ function shouldUseAgentToolContext(prompt: string) {
   return !containedMetaPhrases.some(
     (phrase) => normalized === phrase || normalized.includes(phrase),
   );
+}
+
+function extractLatestPlanItems(messages: ChatMessage[]) {
+  const latestAssistant = [...messages]
+    .reverse()
+    .find((message) => message.role === "assistant");
+  return latestAssistant ? extractPlanItems(latestAssistant.content) : [];
+}
+
+function extractPlanItems(content: string): AgentPlanItem[] {
+  const lines = content.replace(/\r\n/g, "\n").split("\n");
+  const items: AgentPlanItem[] = [];
+  let inPlan = false;
+  let status: AgentPlanItem["status"] = "todo";
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) {
+      continue;
+    }
+    const heading = trimmed.match(/^#{1,4}\s+(.+)$/);
+    const plainPlan = trimmed.match(/^plan\s*:?\s*$/i);
+    if (heading && /^plan\b/i.test(heading[1])) {
+      inPlan = true;
+      status = "todo";
+      continue;
+    }
+    if (plainPlan) {
+      inPlan = true;
+      status = "todo";
+      continue;
+    }
+    if (!inPlan) {
+      continue;
+    }
+    if (heading) {
+      const headingStatus = planStatusFromText(heading[1]);
+      if (headingStatus) {
+        status = headingStatus;
+        continue;
+      }
+      break;
+    }
+    const sectionStatus = planStatusFromText(trimmed.replace(/[:*]+$/g, ""));
+    if (sectionStatus) {
+      status = sectionStatus;
+      continue;
+    }
+    const parsed = parsePlanLine(trimmed, status);
+    if (parsed) {
+      items.push(parsed);
+    }
+  }
+
+  if (items.length > 0) {
+    return items.slice(0, 12);
+  }
+  return parseGlobalTaskList(lines).slice(0, 12);
+}
+
+function parsePlanLine(
+  line: string,
+  fallbackStatus: AgentPlanItem["status"],
+): AgentPlanItem | null {
+  const task = line.match(/^[-*]\s+\[([ xX~-])\]\s+(.+)$/);
+  if (task) {
+    return {
+      status: taskStatus(task[1]),
+      text: stripInlineMarkdown(task[2]),
+    };
+  }
+  const labeled = line.match(
+    /^[-*]\s+(todo|to do|in progress|doing|done|complete|completed)\s*[:-]\s*(.+)$/i,
+  );
+  if (labeled) {
+    return {
+      status: planStatusFromText(labeled[1]) ?? fallbackStatus,
+      text: stripInlineMarkdown(labeled[2]),
+    };
+  }
+  const bullet = line.match(/^[-*]\s+(.+)$/);
+  if (bullet) {
+    return { status: fallbackStatus, text: stripInlineMarkdown(bullet[1]) };
+  }
+  const numbered = line.match(/^\d+[.)]\s+(.+)$/);
+  if (numbered) {
+    return { status: fallbackStatus, text: stripInlineMarkdown(numbered[1]) };
+  }
+  return null;
+}
+
+function parseGlobalTaskList(lines: string[]) {
+  return lines
+    .map((line) => parsePlanLine(line.trim(), "todo"))
+    .filter((item): item is AgentPlanItem => Boolean(item));
+}
+
+function taskStatus(token: string): AgentPlanItem["status"] {
+  if (token.toLowerCase() === "x") {
+    return "done";
+  }
+  if (token === "-" || token === "~") {
+    return "in_progress";
+  }
+  return "todo";
+}
+
+function planStatusFromText(value: string): AgentPlanItem["status"] | null {
+  const normalized = value.toLowerCase().trim();
+  if (["done", "complete", "completed"].includes(normalized)) {
+    return "done";
+  }
+  if (["doing", "in progress", "in-progress", "current"].includes(normalized)) {
+    return "in_progress";
+  }
+  if (["todo", "to do", "next", "pending"].includes(normalized)) {
+    return "todo";
+  }
+  return null;
+}
+
+function planStatusLabel(status: AgentPlanItem["status"]) {
+  if (status === "done") {
+    return "Done";
+  }
+  if (status === "in_progress") {
+    return "In progress";
+  }
+  return "Todo";
+}
+
+function planStatusTone(status: AgentPlanItem["status"]) {
+  if (status === "done") {
+    return "ok";
+  }
+  if (status === "in_progress") {
+    return "accent";
+  }
+  return "neutral";
+}
+
+function stripInlineMarkdown(value: string) {
+  return value
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, "$1")
+    .trim();
+}
+
+function buildAgentLogItems(
+  messages: ChatMessage[],
+  toolResults: AgentToolResult[],
+  sending: boolean,
+): AgentLogItem[] {
+  const items: AgentLogItem[] = [];
+  if (sending) {
+    items.push({
+      id: "running",
+      text: "Request running...",
+      tone: "accent",
+    });
+  }
+  const latestAssistant = [...messages]
+    .reverse()
+    .find((message) => message.role === "assistant");
+  if (latestAssistant?.model) {
+    items.push({
+      id: "model",
+      text: `Answered by ${latestAssistant.model}`,
+      tone: "ok",
+    });
+  }
+  for (const [index, tool] of toolResults.slice(0, 8).entries()) {
+    items.push({
+      id: `${tool.toolID}-${index}`,
+      text: `${tool.title}${tool.summary ? `: ${tool.summary}` : ""}`,
+      tone: tool.error ? "error" : "ok",
+    });
+  }
+  if (items.length === 0) {
+    items.push({
+      id: "empty",
+      text: "No agent run yet.",
+      tone: "neutral",
+    });
+  }
+  return items;
 }
 
 function sendDisabledReason(
@@ -1075,13 +1528,6 @@ function uniqueOptions(values: Array<string | undefined>) {
     out.push(trimmed);
   }
   return out;
-}
-
-function providerLabel(provider: string | undefined) {
-  if (provider === "openai_compatible") {
-    return "OpenAI-compatible";
-  }
-  return "Ollama";
 }
 
 function errorMessage(error: unknown, fallback: string) {
