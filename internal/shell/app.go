@@ -55,6 +55,7 @@ func Run(assets fs.FS) error {
 	objectPlans := security.NewDockerObjectPlanStore(nil)
 	providerPlans := security.NewProviderPlanStore(nil)
 	projectPlans := security.NewProjectPlanStore(nil)
+	agentFilePlans := security.NewAgentFileEditPlanStore(nil)
 	registryManager := registrycore.NewManager(providerManager, auditRepo)
 	registryManager.Settings = db.Settings()
 	providerService := &services.ProviderService{Manager: providerManager, Events: eventBus, Audit: auditRepo, Plans: providerPlans}
@@ -83,6 +84,7 @@ func Run(assets fs.FS) error {
 		Docker:   dockerService,
 		Project:  projectService,
 		Logs:     logsService,
+		Plans:    agentFilePlans,
 	}
 	runtimeController := newAppRuntime(appRuntimeConfig{
 		RootCtx:         ctx,
@@ -144,6 +146,7 @@ func Run(assets fs.FS) error {
 		OnShutdown: func() {
 			cancel()
 			runtimeController.StopAll()
+			agentFilePlans.Close()
 			eventBus.Close()
 			_ = db.Close()
 		},

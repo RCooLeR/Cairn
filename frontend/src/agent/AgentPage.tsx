@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Bot,
   CheckCircle2,
+  FilePenLine,
   ListChecks,
   RefreshCw,
   Send,
@@ -11,8 +12,11 @@ import {
 
 import type {
   AgentChatResponse,
+  AgentFileEditResult,
+  AgentProjectAnalysis,
   AgentStatus,
   AgentToolResult,
+  CommandPlan,
   ProjectSummary,
 } from "../../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
 import { AgentService, SettingsService } from "../api/services";
@@ -44,10 +48,23 @@ export function AgentPage({ projects }: AgentPageProps) {
   const [prompt, setPrompt] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [lastToolResults, setLastToolResults] = useState<AgentToolResult[]>([]);
+  const [analysis, setAnalysis] = useState<AgentProjectAnalysis | null>(null);
   const [loadingStatus, setLoadingStatus] = useState(true);
+  const [analysisLoading, setAnalysisLoading] = useState(false);
   const [sending, setSending] = useState(false);
   const [savingKey, setSavingKey] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [editPath, setEditPath] = useState(".env");
+  const [editInstruction, setEditInstruction] = useState(
+    "Create/update placeholders for detected app environment variables.",
+  );
+  const [editContent, setEditContent] = useState("");
+  const [editPlan, setEditPlan] = useState<CommandPlan | null>(null);
+  const [editResult, setEditResult] = useState<AgentFileEditResult | null>(
+    null,
+  );
+  const [editBusy, setEditBusy] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
   const requestRef = useRef<ReturnType<typeof AgentService.Chat> | null>(null);
   const stoppedRef = useRef(false);
 
@@ -127,6 +144,116 @@ export function AgentPage({ projects }: AgentPageProps) {
     setEndpoint(nextEndpoint);
     if (nextEndpoint !== status?.endpoint) {
       void saveAgentSetting("agent.endpoint", nextEndpoint);
+    }
+  };
+
+  const changeProject = (nextProjectID: string) => {
+    setProjectID(nextProjectID);
+    setAnalysis(null);
+    setEditPlan(null);
+    setEditResult(null);
+    setEditError(null);
+    if (nextProjectID) {
+      void loadProjectAnalysis(nextProjectID);
+    }
+  };
+
+  const loadProjectAnalysis = async (targetProjectID = projectID) => {
+    if (!targetProjectID) {
+      return;
+    }
+    setAnalysisLoading(true);
+    setEditError(null);
+    try {
+      const nextAnalysis = await AgentService.AnalyzeProject(targetProjectID);
+      setAnalysis(nextAnalysis);
+    } catch (nextError) {
+      setEditError(errorMessage(nextError, "Unable to analyze project"));
+    } finally {
+      setAnalysisLoading(false);
+    }
+  };
+
+  const draftProjectFile = async () => {
+    if (!projectID || !editPath.trim() || !editInstruction.trim()) {
+      return;
+    }
+    setEditBusy(true);
+    setEditError(null);
+    setEditPlan(null);
+    setEditResult(null);
+    try {
+      const draft = await AgentService.DraftProjectFile({
+        projectID,
+        path: editPath.trim(),
+        instruction: editInstruction.trim(),
+      });
+      setEditContent(draft?.content ?? "");
+      if (draft?.path) {
+        setEditPath(draft.path);
+      }
+      setLastToolResults([
+        {
+          toolID: "agent.draft_file",
+          title: "Draft file",
+          summary: draft?.path ?? editPath.trim(),
+        },
+      ]);
+    } catch (nextError) {
+      setEditError(errorMessage(nextError, "Unable to draft file"));
+    } finally {
+      setEditBusy(false);
+    }
+  };
+
+  const previewFileEdit = async () => {
+    if (!projectID || !editPath.trim() || !editContent.trim()) {
+      return;
+    }
+    setEditBusy(true);
+    setEditError(null);
+    setEditResult(null);
+    try {
+      const plan = await AgentService.PlanFileEdit({
+        projectID,
+        path: editPath.trim(),
+        content: editContent,
+        reason: editInstruction.trim(),
+      });
+      setEditPlan(plan);
+    } catch (nextError) {
+      setEditError(errorMessage(nextError, "Unable to preview file edit"));
+    } finally {
+      setEditBusy(false);
+    }
+  };
+
+  const applyFileEdit = async () => {
+    if (!editPlan) {
+      return;
+    }
+    setEditBusy(true);
+    setEditError(null);
+    try {
+      const result = await AgentService.ApplyFileEdit(editPlan.planID, "");
+      setEditResult(result);
+      setEditPlan(null);
+      setLastToolResults([
+        {
+          toolID: "agent.file_edit",
+          title: "Applied file edit",
+          summary: result
+            ? `${result.path} (${result.bytesWritten} bytes)`
+            : "",
+        },
+      ]);
+      if (projectID) {
+        void loadProjectAnalysis(projectID);
+      }
+    } catch (nextError) {
+      setEditError(errorMessage(nextError, "Unable to apply file edit"));
+    } finally {
+      setEditBusy(false);
     }
   };
 
@@ -285,7 +412,7 @@ export function AgentPage({ projects }: AgentPageProps) {
             />
             <AgentSelect
               label="Project"
-              onChange={setProjectID}
+              onChange={changeProject}
               options={[
                 ["", "Any project"],
                 ...projects.map(
@@ -314,18 +441,57 @@ export function AgentPage({ projects }: AgentPageProps) {
             <ListChecks size={16} />
             Plan
           </div>
-          <CardBody className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
-            {planItems.map((item, index) => (
-              <div
-                className="rounded-card border border-border bg-bg-inset p-3 text-sm"
-                key={item}
-              >
-                <div className="text-xs font-medium uppercase text-text-muted">
-                  Step {index + 1}
+          <CardBody className="space-y-3">
+            <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+              {planItems.map((item, index) => (
+                <div
+                  className="rounded-card border border-border bg-bg-inset p-3 text-sm"
+                  key={item}
+                >
+                  <div className="text-xs font-medium uppercase text-text-muted">
+                    Step {index + 1}
+                  </div>
+                  <div className="mt-1 text-text-primary">{item}</div>
                 </div>
-                <div className="mt-1 text-text-primary">{item}</div>
+              ))}
+            </div>
+            {selectedProject ? (
+              <ProjectConfigPanel
+                analysis={analysis}
+                analysisLoading={analysisLoading}
+                editBusy={editBusy}
+                editContent={editContent}
+                editError={editError}
+                editInstruction={editInstruction}
+                editPath={editPath}
+                editPlan={editPlan}
+                editResult={editResult}
+                onAnalyze={() => {
+                  void loadProjectAnalysis();
+                }}
+                onApply={() => {
+                  void applyFileEdit();
+                }}
+                onDraft={() => {
+                  void draftProjectFile();
+                }}
+                onPreview={() => {
+                  void previewFileEdit();
+                }}
+                onSetContent={setEditContent}
+                onSetInstruction={setEditInstruction}
+                onSetPath={(path) => {
+                  setEditPath(path);
+                  setEditPlan(null);
+                  setEditResult(null);
+                }}
+                project={selectedProject}
+              />
+            ) : (
+              <div className="rounded-card border border-border bg-bg-inset px-3 py-2 text-sm text-text-muted">
+                Select a project to analyze app files and draft config edits.
               </div>
-            ))}
+            )}
           </CardBody>
         </Card>
 
@@ -444,6 +610,211 @@ export function AgentPage({ projects }: AgentPageProps) {
           </div>
         </CardBody>
       </Card>
+    </div>
+  );
+}
+
+function ProjectConfigPanel({
+  analysis,
+  analysisLoading,
+  editBusy,
+  editContent,
+  editError,
+  editInstruction,
+  editPath,
+  editPlan,
+  editResult,
+  onAnalyze,
+  onApply,
+  onDraft,
+  onPreview,
+  onSetContent,
+  onSetInstruction,
+  onSetPath,
+  project,
+}: {
+  analysis: AgentProjectAnalysis | null;
+  analysisLoading: boolean;
+  editBusy: boolean;
+  editContent: string;
+  editError: string | null;
+  editInstruction: string;
+  editPath: string;
+  editPlan: CommandPlan | null;
+  editResult: AgentFileEditResult | null;
+  onAnalyze: () => void;
+  onApply: () => void;
+  onDraft: () => void;
+  onPreview: () => void;
+  onSetContent: (value: string) => void;
+  onSetInstruction: (value: string) => void;
+  onSetPath: (value: string) => void;
+  project: ProjectSummary;
+}) {
+  const recommendations = analysis?.recommendations ?? [];
+  const envVars = analysis?.envVars ?? [];
+  const ports = analysis?.ports ?? [];
+  const canDraft =
+    Boolean(editPath.trim() && editInstruction.trim()) && !editBusy;
+  const canPreview =
+    Boolean(editPath.trim() && editContent.trim()) && !editBusy;
+  return (
+    <div className="rounded-card border border-border bg-bg-inset p-3">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="min-w-0">
+          <div className="inline-flex items-center gap-2 text-sm font-semibold text-text-primary">
+            <FilePenLine size={16} />
+            Project config
+          </div>
+          <div className="truncate text-xs text-text-muted">{project.name}</div>
+        </div>
+        <Button
+          icon={<RefreshCw size={15} />}
+          loading={analysisLoading}
+          onClick={onAnalyze}
+          size="sm"
+          variant="secondary"
+        >
+          Analyze
+        </Button>
+      </div>
+
+      {analysis ? (
+        <div className="mt-3 grid gap-2 lg:grid-cols-3">
+          <ConfigHint
+            label="Stack"
+            value={
+              analysis.stacks && analysis.stacks.length > 0
+                ? analysis.stacks.join(", ")
+                : "Unknown"
+            }
+          />
+          <ConfigHint
+            label="Env vars"
+            value={
+              envVars.length > 0
+                ? envVars
+                    .slice(0, 6)
+                    .map((item) => item.name)
+                    .join(", ")
+                : "None detected"
+            }
+          />
+          <ConfigHint
+            label="Ports"
+            value={
+              ports.length > 0
+                ? ports
+                    .slice(0, 6)
+                    .map((item) => item.value)
+                    .join(", ")
+                : "None detected"
+            }
+          />
+        </div>
+      ) : null}
+
+      {recommendations.length > 0 ? (
+        <div className="mt-3 space-y-1">
+          {recommendations.slice(0, 3).map((item) => (
+            <div
+              className="rounded-control border border-info/20 bg-info/10 px-3 py-2 text-xs text-info"
+              key={item}
+            >
+              {item}
+            </div>
+          ))}
+        </div>
+      ) : null}
+
+      <div className="mt-3 grid gap-3 lg:grid-cols-[220px_minmax(0,1fr)]">
+        <label className="block">
+          <span className="text-xs font-medium uppercase text-text-muted">
+            File
+          </span>
+          <input
+            className="mt-1 h-9 w-full rounded-control border border-border bg-bg-card px-3 text-sm text-text-primary outline-none focus:border-accent"
+            onChange={(event) => onSetPath(event.target.value)}
+            placeholder=".env"
+            value={editPath}
+          />
+        </label>
+        <label className="block">
+          <span className="text-xs font-medium uppercase text-text-muted">
+            Instruction
+          </span>
+          <input
+            className="mt-1 h-9 w-full rounded-control border border-border bg-bg-card px-3 text-sm text-text-primary outline-none focus:border-accent"
+            onChange={(event) => onSetInstruction(event.target.value)}
+            placeholder="Draft Compose env settings with safe placeholders"
+            value={editInstruction}
+          />
+        </label>
+      </div>
+
+      <textarea
+        className="mt-3 min-h-36 w-full resize-y rounded-control border border-border bg-bg-card px-3 py-2 font-mono text-xs text-text-primary outline-none focus:border-accent"
+        onChange={(event) => onSetContent(event.target.value)}
+        placeholder="Drafted or manually edited file content appears here."
+        value={editContent}
+      />
+
+      {editError ? (
+        <div className="mt-2 rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
+          {editError}
+        </div>
+      ) : null}
+      {editResult ? (
+        <div className="mt-2 rounded-card border border-ok/30 bg-ok/10 px-3 py-2 text-sm text-ok">
+          Applied {editResult.path} ({editResult.bytesWritten} bytes).
+        </div>
+      ) : null}
+      {editPlan ? (
+        <div className="mt-2 rounded-card border border-warn/30 bg-warn/10 px-3 py-2 text-sm text-warn">
+          Preview ready: {editPlan.title}. {editPlan.effects?.join(" ")}
+        </div>
+      ) : null}
+
+      <div className="mt-3 flex flex-wrap justify-end gap-2">
+        <Button
+          disabled={!canDraft}
+          loading={editBusy}
+          onClick={onDraft}
+          size="sm"
+          variant="secondary"
+        >
+          Draft
+        </Button>
+        <Button
+          disabled={!canPreview}
+          loading={editBusy}
+          onClick={onPreview}
+          size="sm"
+          variant="secondary"
+        >
+          Preview edit
+        </Button>
+        <Button
+          disabled={!editPlan || editBusy}
+          loading={editBusy}
+          onClick={onApply}
+          size="sm"
+          variant="primary"
+        >
+          Apply edit
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function ConfigHint({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="rounded-control border border-border bg-bg-card px-3 py-2 text-sm">
+      <div className="text-xs font-medium uppercase text-text-muted">
+        {label}
+      </div>
+      <div className="mt-1 break-words text-text-primary">{value}</div>
     </div>
   );
 }

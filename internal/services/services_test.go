@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -254,6 +255,76 @@ func TestAgentServiceChatUsesSelectedLocalModel(t *testing.T) {
 	}
 	if !strings.Contains(response.Message, "multi-stage") {
 		t.Fatalf("response.Message = %q", response.Message)
+	}
+}
+
+func TestAgentServiceAnalyzeProjectDetectsAppRuntimeHints(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	projectService, projectID, _ := importAgentTestProject(t, ctx, db)
+
+	analysis, err := (&AgentService{Project: projectService}).AnalyzeProject(ctx, projectID)
+	if err != nil {
+		t.Fatalf("AnalyzeProject() error = %v", err)
+	}
+	if !slices.Contains(analysis.Stacks, "Node.js") {
+		t.Fatalf("Stacks = %#v, want Node.js", analysis.Stacks)
+	}
+	foundEnv := false
+	for _, hint := range analysis.EnvVars {
+		if hint.Name == "APP_PORT" {
+			foundEnv = true
+			break
+		}
+	}
+	if !foundEnv {
+		t.Fatalf("EnvVars = %#v, want APP_PORT", analysis.EnvVars)
+	}
+	foundPort := false
+	for _, hint := range analysis.Ports {
+		if hint.Value == "8080" {
+			foundPort = true
+			break
+		}
+	}
+	if !foundPort {
+		t.Fatalf("Ports = %#v, want 8080", analysis.Ports)
+	}
+}
+
+func TestAgentServiceFileEditPlanWritesProjectConfig(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	projectService, projectID, root := importAgentTestProject(t, ctx, db)
+	planStore := security.NewAgentFileEditPlanStore(nil)
+	t.Cleanup(planStore.Close)
+	service := &AgentService{Project: projectService, Plans: planStore, Audit: db.Audit()}
+
+	plan, err := service.PlanFileEdit(ctx, models.AgentFileEditRequest{
+		ProjectID: projectID,
+		Path:      ".env",
+		Content:   "APP_PORT=8080\nNODE_ENV=development\n",
+		Reason:    "Set development env placeholders",
+	})
+	if err != nil {
+		t.Fatalf("PlanFileEdit() error = %v", err)
+	}
+	if plan == nil || !strings.HasPrefix(plan.PlanID, "plan-agent-file-") {
+		t.Fatalf("plan = %#v", plan)
+	}
+	result, err := service.ApplyFileEdit(ctx, plan.PlanID, "")
+	if err != nil {
+		t.Fatalf("ApplyFileEdit() error = %v", err)
+	}
+	if result == nil || result.Path != ".env" || result.BytesWritten == 0 {
+		t.Fatalf("result = %#v", result)
+	}
+	raw, err := os.ReadFile(filepath.Join(root, ".env"))
+	if err != nil {
+		t.Fatalf("ReadFile(.env): %v", err)
+	}
+	if string(raw) != "APP_PORT=8080\nNODE_ENV=development\n" {
+		t.Fatalf(".env = %q", raw)
 	}
 }
 
@@ -1789,6 +1860,40 @@ func writeServiceComposeProject(t *testing.T, name string) (string, string) {
 		t.Fatalf("write compose file: %v", err)
 	}
 	return root, composeFile
+}
+
+func importAgentTestProject(t *testing.T, ctx context.Context, db *store.Store) (*ProjectService, string, string) {
+	t.Helper()
+	root, composeFile := writeServiceComposeProject(t, "agent-app")
+	if err := os.WriteFile(filepath.Join(root, "package.json"), []byte(`{
+  "scripts": {
+    "dev": "vite --host 0.0.0.0 --port 8080",
+    "build": "vite build"
+  },
+  "dependencies": {
+    "vite": "latest"
+  }
+}`), 0o600); err != nil {
+		t.Fatalf("write package.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".env.example"), []byte("APP_PORT=8080\nAPI_URL=http://localhost:8080\n"), 0o600); err != nil {
+		t.Fatalf("write .env.example: %v", err)
+	}
+	runner := newFakeComposeRunner()
+	runner.outputs[root+"|-f "+composeFile+" config"] = providers.CommandResult{
+		Stdout: "services:\n  app:\n    image: nginx:alpine\n    ports:\n      - \"8080:80\"\n",
+	}
+	service := &ProjectService{
+		Client:     composecore.NewClient(runner),
+		Projects:   db.Projects(),
+		ProviderID: "linux_native",
+		Now:        func() time.Time { return time.Date(2026, 6, 13, 6, 0, 0, 0, time.UTC) },
+	}
+	detail, err := service.ImportProject(ctx, models.ImportProjectRequest{FolderPath: root})
+	if err != nil {
+		t.Fatalf("ImportProject() error = %v", err)
+	}
+	return service, detail.Summary.ID, root
 }
 
 func serviceTestFixturePath(t *testing.T, parts ...string) string {

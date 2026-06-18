@@ -170,9 +170,13 @@ function dockerStopped<T>(value: T): T | Promise<never> {
 }
 
 const callNames: Record<number, string> = {
+  1451733442: "AgentService.AnalyzeProject",
+  1865183595: "AgentService.ApplyFileEdit",
   2194297540: "AgentService.ToolCatalog",
+  3291403973: "AgentService.DraftProjectFile",
   3181999705: "AgentService.Status",
   3444129041: "AgentService.Chat",
+  4074296898: "AgentService.PlanFileEdit",
   4257326101: "SettingsService.SetSetting",
   1752754799: "DockerService.StopContainer",
   3715102761: "LogsService.StartLogStream",
@@ -723,6 +727,25 @@ function callListCurrentUpdates(filter?: { status?: string[] }) {
 }
 
 const callHandlers: Record<number, (...args: unknown[]) => unknown> = {
+  1451733442: () => ({
+    projectID: "linux_native/app-db",
+    projectName: "app-db",
+    workingDir: "/home/cairn/projects/app-db",
+    stacks: ["Node.js", "Nginx"],
+    runtimeHints: ["npm install", "npm run build"],
+    configFiles: ["package.json", "compose.yaml", ".env.example"],
+    envVars: [{ name: "APP_PORT", source: ".env.example", required: true }],
+    ports: [{ value: "8080", source: "compose.yaml" }],
+    recommendations: [
+      "Your app expects APP_PORT. Would you like me to draft or update a .env file with placeholders?",
+    ],
+  }),
+  1865183595: () => ({
+    projectID: "linux_native/app-db",
+    path: ".env",
+    bytesWritten: 24,
+    appliedAt: "2026-06-13T09:00:00Z",
+  }),
   3444129041: () => ({
     message:
       "The local agent mock reviewed the selected Docker context. Check Compose ports, image tags, health checks, and recent logs before applying changes.",
@@ -765,6 +788,14 @@ const callHandlers: Record<number, (...args: unknown[]) => unknown> = {
       readOnly: true,
     },
   ],
+  3291403973: () => ({
+    projectID: "linux_native/app-db",
+    path: ".env",
+    content: "APP_PORT=8080\nNODE_ENV=development\n",
+    summary: "Drafted env placeholders",
+    model: "qwen2.5-coder:7b",
+  }),
+  4074296898: () => commandPlan("Update .env", "write .env", risk.confirm),
   149806977: backups,
   2274904588: () => "backup-job",
   2356649536: () => "restore-job",

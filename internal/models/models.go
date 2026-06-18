@@ -756,3 +756,60 @@ type AgentChatResponse struct {
 	ToolResults []AgentToolResult `json:"toolResults,omitempty"`
 	Model       string            `json:"model,omitempty"`
 }
+
+type AgentProjectFile struct {
+	Path    string `json:"path"`
+	Content string `json:"content"`
+}
+
+type AgentEnvVarHint struct {
+	Name     string `json:"name"`
+	Source   string `json:"source"`
+	Required bool   `json:"required"`
+}
+
+type AgentPortHint struct {
+	Value  string `json:"value"`
+	Source string `json:"source"`
+}
+
+type AgentProjectAnalysis struct {
+	ProjectID       string            `json:"projectID"`
+	ProjectName     string            `json:"projectName,omitempty"`
+	WorkingDir      string            `json:"workingDir,omitempty"`
+	Stacks          []string          `json:"stacks,omitempty"`
+	RuntimeHints    []string          `json:"runtimeHints,omitempty"`
+	ConfigFiles     []string          `json:"configFiles,omitempty"`
+	EnvVars         []AgentEnvVarHint `json:"envVars,omitempty"`
+	Ports           []AgentPortHint   `json:"ports,omitempty"`
+	Recommendations []string          `json:"recommendations,omitempty"`
+	Warnings        []string          `json:"warnings,omitempty"`
+}
+
+type AgentDraftFileRequest struct {
+	ProjectID   string `json:"projectID"`
+	Path        string `json:"path"`
+	Instruction string `json:"instruction"`
+}
+
+type AgentDraftFileResponse struct {
+	ProjectID string `json:"projectID"`
+	Path      string `json:"path"`
+	Content   string `json:"content"`
+	Summary   string `json:"summary,omitempty"`
+	Model     string `json:"model,omitempty"`
+}
+
+type AgentFileEditRequest struct {
+	ProjectID string `json:"projectID"`
+	Path      string `json:"path"`
+	Content   string `json:"content"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+type AgentFileEditResult struct {
+	ProjectID    string    `json:"projectID"`
+	Path         string    `json:"path"`
+	BytesWritten int       `json:"bytesWritten"`
+	AppliedAt    time.Time `json:"appliedAt"`
+}

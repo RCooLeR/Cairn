@@ -4,6 +4,13 @@
 export {
     AgentChatRequest,
     AgentChatResponse,
+    AgentDraftFileRequest,
+    AgentDraftFileResponse,
+    AgentEnvVarHint,
+    AgentFileEditRequest,
+    AgentFileEditResult,
+    AgentPortHint,
+    AgentProjectAnalysis,
     AgentScope,
     AgentStatus,
     AgentToolResult,
