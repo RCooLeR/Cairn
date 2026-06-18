@@ -4447,14 +4447,7 @@ function App() {
           />
         );
       case "agent":
-        return (
-          <AgentPage
-            containers={containers}
-            images={images}
-            networks={networks}
-            projects={projects}
-          />
-        );
+        return <AgentPage projects={projects} />;
       case "settings":
         return (
           <SettingsPage

@@ -173,6 +173,7 @@ const callNames: Record<number, string> = {
   2194297540: "AgentService.ToolCatalog",
   3181999705: "AgentService.Status",
   3444129041: "AgentService.Chat",
+  4257326101: "SettingsService.SetSetting",
   1752754799: "DockerService.StopContainer",
   3715102761: "LogsService.StartLogStream",
   48603856: "MetricsService.StartStatsStream",
@@ -1015,6 +1016,7 @@ const callHandlers: Record<number, (...args: unknown[]) => unknown> = {
       createdAt: "2026-06-13T09:00:00Z",
     },
   ],
+  4257326101: () => undefined,
   3314614998: () => ({
     "appearance.theme": "system",
     "security.confirm_destructive": true,
