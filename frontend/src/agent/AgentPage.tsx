@@ -1008,6 +1008,15 @@ function ModeButton({
 function ChatBubble({ message }: { message: ChatMessage }) {
   const isUser = message.role === "user";
   const isSystem = message.role === "system";
+  const displayContent =
+    isUser || isSystem
+      ? message.content
+      : stripExtractedPlanSection(message.content);
+
+  if (!displayContent.trim() && !isUser && !isSystem) {
+    return null;
+  }
+
   return (
     <div
       className={[
@@ -1030,7 +1039,7 @@ function ChatBubble({ message }: { message: ChatMessage }) {
           {isUser ? "You" : isSystem ? "System" : "Agent"}
           {message.model ? ` - ${message.model}` : ""}
         </div>
-        <MarkdownContent content={message.content} />
+        <MarkdownContent content={displayContent} />
       </div>
     </div>
   );
@@ -1467,13 +1476,47 @@ function extractLatestPlanItems(messages: ChatMessage[]) {
 }
 
 function extractPlanItems(content: string): AgentPlanItem[] {
+  return findExtractedPlanSection(content)?.items.slice(0, 12) ?? [];
+}
+
+function stripExtractedPlanSection(content: string) {
+  const section = findExtractedPlanSection(content);
+  if (!section) {
+    return content;
+  }
+  const lines = content.replace(/\r\n/g, "\n").split("\n");
+  const visibleLines = [
+    ...lines.slice(0, section.startIndex),
+    ...lines.slice(section.endIndex),
+  ];
+  return visibleLines
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function findExtractedPlanSection(content: string): {
+  endIndex: number;
+  items: AgentPlanItem[];
+  startIndex: number;
+} | null {
   const lines = content.replace(/\r\n/g, "\n").split("\n");
   const items: AgentPlanItem[] = [];
   let inPlan = false;
   let status: AgentPlanItem["status"] = "todo";
+  let startIndex = -1;
+  let inFence = false;
 
-  for (const line of lines) {
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
     const trimmed = line.trim();
+    if (trimmed.startsWith("```")) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) {
+      continue;
+    }
     if (!trimmed) {
       continue;
     }
@@ -1482,11 +1525,13 @@ function extractPlanItems(content: string): AgentPlanItem[] {
     if (heading && /^plan\b/i.test(heading[1])) {
       inPlan = true;
       status = "todo";
+      startIndex = index;
       continue;
     }
     if (plainPlan) {
       inPlan = true;
       status = "todo";
+      startIndex = index;
       continue;
     }
     if (!inPlan) {
@@ -1498,10 +1543,10 @@ function extractPlanItems(content: string): AgentPlanItem[] {
         status = headingStatus;
         continue;
       }
-      break;
+      return items.length > 0 ? { endIndex: index, items, startIndex } : null;
     }
     if (isPlanSectionBoundary(trimmed)) {
-      break;
+      return items.length > 0 ? { endIndex: index, items, startIndex } : null;
     }
     const sectionStatus = planStatusFromText(trimmed.replace(/[:*]+$/g, ""));
     if (sectionStatus) {
@@ -1514,10 +1559,9 @@ function extractPlanItems(content: string): AgentPlanItem[] {
     }
   }
 
-  if (items.length > 0) {
-    return items.slice(0, 12);
-  }
-  return [];
+  return items.length > 0
+    ? { endIndex: lines.length, items, startIndex }
+    : null;
 }
 
 function parsePlanLine(

@@ -739,6 +739,7 @@ describe("App inventory shell", () => {
       'Markdown section named "Plan"',
     );
 
+    const transcript = screen.getByTestId("agent-transcript");
     const plan = await screen.findByTestId("agent-plan-content");
     expect(within(plan).getByText("Inspect app files")).toBeInTheDocument();
     expect(within(plan).getByText("Draft Compose changes")).toBeInTheDocument();
@@ -746,6 +747,11 @@ describe("App inventory shell", () => {
     expect(within(plan).getByLabelText("Done")).toBeInTheDocument();
     expect(within(plan).getByLabelText("In progress")).toBeInTheDocument();
     expect(within(plan).getByLabelText("Todo")).toBeInTheDocument();
+    expect(within(transcript).queryByText("Plan")).not.toBeInTheDocument();
+    expect(
+      within(transcript).queryByText("Inspect app files"),
+    ).not.toBeInTheDocument();
+    expect(within(transcript).getByText("Answer")).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Docker docs" })).toHaveAttribute(
       "href",
       "https://docs.docker.com",

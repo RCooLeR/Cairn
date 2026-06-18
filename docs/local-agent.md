@@ -55,7 +55,7 @@ Agent responses render common Markdown, including headings, bullet and numbered 
 
 Press `Enter` to send a prompt. Press `Shift+Enter` to insert a newline.
 
-On wide windows, the latest model-returned plan and agent log appear beside the conversation. On narrower windows they stack above the conversation. The plan panel is populated only from an explicit Markdown `Plan` section in the latest assistant answer; for larger requests the model is asked to return one task per line using bare checkboxes: `[ ]` for todo, `[-]` for in progress, and `[x]` for done. Ordinary bullet or numbered lists stay in the chat answer and do not become plan items.
+On wide windows, the latest model-returned plan and agent log appear beside the conversation. On narrower windows they stack above the conversation. The plan panel is populated only from an explicit Markdown `Plan` section in the latest assistant answer; for larger requests the model is asked to return one task per line using bare checkboxes: `[ ]` for todo, `[-]` for in progress, and `[x]` for done. When a plan is promoted into the plan panel, that plan block is removed from the chat answer so it is not duplicated. Ordinary bullet or numbered lists stay in the chat answer and do not become plan items.
 
 The log panel is an activity trail for the latest run. It records steps such as understanding the request, creating a plan or direct answer shape, using context tools, and providing the final model answer. It does not display raw tool summaries as the primary log content.
 
