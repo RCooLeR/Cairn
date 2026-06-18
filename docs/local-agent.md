@@ -55,7 +55,7 @@ Agent responses render common Markdown, including headings, bullet and numbered 
 
 Press `Enter` to send a prompt. Press `Shift+Enter` to insert a newline.
 
-On wide windows, the latest model-returned plan and agent log appear beside the conversation. On narrower windows they stack above the conversation. The plan panel is populated from a Markdown `Plan` section in the latest assistant answer; for larger requests the model is asked to return task-list items using `[ ]` for todo, `[-]` for in progress, and `[x]` for done.
+On wide windows, the latest model-returned plan and agent log appear beside the conversation. On narrower windows they stack above the conversation. The plan panel is populated from a Markdown `Plan` section in the latest assistant answer; for larger requests the model is asked to return one task per line using bare checkboxes: `[ ]` for todo, `[-]` for in progress, and `[x]` for done.
 
 ## App Analysis
 

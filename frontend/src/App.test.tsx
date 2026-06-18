@@ -685,10 +685,10 @@ describe("App inventory shell", () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
     agentServiceMock.Chat.mockResolvedValueOnce({
       message: [
-        "## Plan",
-        "- [x] Inspect app files",
-        "- [-] Draft Compose changes",
-        "- [ ] Verify with tests",
+        "Plan",
+        "[x] Inspect app files",
+        "[-] Draft Compose changes",
+        "[ ] Verify with tests",
         "",
         "## Answer",
         "Use `docker compose up` after checking [Docker docs](https://docs.docker.com).",

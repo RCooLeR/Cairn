@@ -1264,8 +1264,8 @@ function buildAgentPrompt(
     .join("\n");
   const modeInstruction =
     mode === "agent"
-      ? 'Agent mode: use Cairn context when it helps, then answer with concrete next steps. For larger troubleshooting, implementation, migration, or debugging requests, include a Markdown section named "Plan" with task-list items using [ ] todo, [-] in progress, and [x] done where those statuses are known. For simple capability, identity, greeting, or conceptual questions, answer directly without a plan and without diagnosing current Docker state. Do not execute mutations.'
-      : 'Ask mode: answer directly and concisely with Docker-specific guidance. For larger troubleshooting, implementation, migration, or debugging requests, include a Markdown section named "Plan" with task-list items using [ ] todo, [-] in progress, and [x] done where those statuses are known. For simple questions, skip the plan.';
+      ? 'Agent mode: use Cairn context when it helps, then answer with concrete next steps. For larger troubleshooting, implementation, migration, or debugging requests, include a Markdown section named "Plan" with one task per line using bare checkboxes: [ ] todo, [-] in progress, and [x] done where those statuses are known. For simple capability, identity, greeting, or conceptual questions, answer directly without a plan and without diagnosing current Docker state. Do not execute mutations.'
+      : 'Ask mode: answer directly and concisely with Docker-specific guidance. For larger troubleshooting, implementation, migration, or debugging requests, include a Markdown section named "Plan" with one task per line using bare checkboxes: [ ] todo, [-] in progress, and [x] done where those statuses are known. For simple questions, skip the plan.';
   return [
     modeInstruction,
     history ? `Recent conversation:\n${history}` : "",
@@ -1371,6 +1371,13 @@ function parsePlanLine(
   line: string,
   fallbackStatus: AgentPlanItem["status"],
 ): AgentPlanItem | null {
+  const bareTask = line.match(/^\[([ xX~-])\]\s+(.+)$/);
+  if (bareTask) {
+    return {
+      status: taskStatus(bareTask[1]),
+      text: stripInlineMarkdown(bareTask[2]),
+    };
+  }
   const task = line.match(/^[-*]\s+\[([ xX~-])\]\s+(.+)$/);
   if (task) {
     return {
