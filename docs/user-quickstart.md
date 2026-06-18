@@ -43,6 +43,7 @@ On Windows WSL, projects under `/mnt/c`, `/mnt/d`, or other mounted Windows driv
 - Containers, Images, Volumes, and Networks provide Docker inventory and safe actions.
 - Logs streams container and project logs with pause, search, filters, and export.
 - Terminal opens host, backend, project, or container shells.
+- Agent provides local read-only Docker help through Ollama or an OpenAI-compatible endpoint; see `docs/local-agent.md`.
 - Updates checks service images and base-image lineage, then applies confirmed update plans with rollback handling.
 - Settings manages providers, Docker contexts, registries, update cadence, appearance, backups, audit, and advanced options.
 

@@ -170,6 +170,9 @@ function dockerStopped<T>(value: T): T | Promise<never> {
 }
 
 const callNames: Record<number, string> = {
+  2194297540: "AgentService.ToolCatalog",
+  3181999705: "AgentService.Status",
+  3444129041: "AgentService.Chat",
   1752754799: "DockerService.StopContainer",
   3715102761: "LogsService.StartLogStream",
   48603856: "MetricsService.StartStatsStream",
@@ -719,6 +722,48 @@ function callListCurrentUpdates(filter?: { status?: string[] }) {
 }
 
 const callHandlers: Record<number, (...args: unknown[]) => unknown> = {
+  3444129041: () => ({
+    message:
+      "The local agent mock reviewed the selected Docker context. Check Compose ports, image tags, health checks, and recent logs before applying changes.",
+    toolResults: [
+      {
+        toolID: "docker.engine",
+        title: "Docker engine summary",
+        summary: "Mock engine context",
+        data: JSON.stringify({ serverVersion: "26.1.0" }, null, 2),
+      },
+    ],
+    model: "qwen2.5-coder:7b",
+  }),
+  3181999705: () => ({
+    enabled: true,
+    provider: "ollama",
+    endpoint: "http://127.0.0.1:11434",
+    model: "qwen2.5-coder:7b",
+    reachable: true,
+    availableModels: ["qwen2.5-coder:7b", "llama3.1:8b"],
+    candidateModels: ["gemma4:12b", "qwen2.5-coder:7b", "llama3.1:8b"],
+  }),
+  2194297540: () => [
+    {
+      id: "docker.engine",
+      name: "Docker engine summary",
+      description: "Docker info, version, and disk usage.",
+      readOnly: true,
+    },
+    {
+      id: "docker.projects",
+      name: "Compose projects",
+      description: "Known Compose projects and their status badges.",
+      readOnly: true,
+    },
+    {
+      id: "container.logs",
+      name: "Logs",
+      description: "Recent selected project or container logs.",
+      readOnly: true,
+    },
+  ],
   149806977: backups,
   2274904588: () => "backup-job",
   2356649536: () => "restore-job",
@@ -986,6 +1031,11 @@ const callHandlers: Record<number, (...args: unknown[]) => unknown> = {
     "metrics.sample_interval_seconds": 2,
     "terminal.default_shell": "sh",
     "backups.directory": "/tmp/cairn-backups",
+    "agent.enabled": true,
+    "agent.provider": "ollama",
+    "agent.endpoint": "http://127.0.0.1:11434",
+    "agent.model": "gemma4:12b",
+    "agent.max_context_lines": 400,
   }),
   440305753: () => ["/bin/sh"],
   3501313961: () => [],

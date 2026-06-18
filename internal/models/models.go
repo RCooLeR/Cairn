@@ -711,3 +711,48 @@ type AppUpdateNotice struct {
 	Name        string `json:"name,omitempty"`
 	PublishedAt string `json:"publishedAt,omitempty"`
 }
+
+type AgentStatus struct {
+	Enabled         bool     `json:"enabled"`
+	Provider        string   `json:"provider"`
+	Endpoint        string   `json:"endpoint"`
+	Model           string   `json:"model"`
+	Reachable       bool     `json:"reachable"`
+	AvailableModels []string `json:"availableModels,omitempty"`
+	CandidateModels []string `json:"candidateModels,omitempty"`
+	Error           string   `json:"error,omitempty"`
+}
+
+type AgentToolSpec struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	ReadOnly    bool   `json:"readOnly"`
+}
+
+type AgentScope struct {
+	ProjectID   string `json:"projectID,omitempty"`
+	ContainerID string `json:"containerID,omitempty"`
+	NetworkID   string `json:"networkID,omitempty"`
+	ImageID     string `json:"imageID,omitempty"`
+}
+
+type AgentChatRequest struct {
+	Prompt  string     `json:"prompt"`
+	Scope   AgentScope `json:"scope,omitempty"`
+	ToolIDs []string   `json:"toolIDs,omitempty"`
+}
+
+type AgentToolResult struct {
+	ToolID  string `json:"toolID"`
+	Title   string `json:"title"`
+	Summary string `json:"summary,omitempty"`
+	Data    string `json:"data,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
+type AgentChatResponse struct {
+	Message     string            `json:"message"`
+	ToolResults []AgentToolResult `json:"toolResults,omitempty"`
+	Model       string            `json:"model,omitempty"`
+}

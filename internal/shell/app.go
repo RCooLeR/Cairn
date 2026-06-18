@@ -77,6 +77,13 @@ func Run(assets fs.FS) error {
 	lineageService := &services.ImageLineageService{RuntimeMu: runtimeMu}
 	backupService := &services.BackupService{RuntimeMu: runtimeMu}
 	registryService := &services.RegistryService{Manager: registryManager}
+	agentService := &services.AgentService{
+		Settings: db.Settings(),
+		Audit:    auditRepo,
+		Docker:   dockerService,
+		Project:  projectService,
+		Logs:     logsService,
+	}
 	runtimeController := newAppRuntime(appRuntimeConfig{
 		RootCtx:         ctx,
 		DB:              db,
@@ -127,6 +134,7 @@ func Run(assets fs.FS) error {
 			application.NewService(lineageService),
 			application.NewService(backupService),
 			application.NewService(registryService),
+			application.NewService(agentService),
 			application.NewService(&services.SettingsService{
 				Audit:         auditRepo,
 				Notifications: db.Notifications(),

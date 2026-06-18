@@ -10,6 +10,7 @@ export type PageID =
   | "networks"
   | "logs"
   | "terminal"
+  | "agent"
   | "settings";
 
 export type NavItem = {

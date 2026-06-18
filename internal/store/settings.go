@@ -42,6 +42,11 @@ var settingDefaults = map[string]settingDefault{
 	"terminal.default_shell":          {kind: kindString, value: ""},
 	"security.confirm_destructive":    {kind: kindBool, value: true},
 	"backups.directory":               {kind: kindString, value: ""},
+	"agent.enabled":                   {kind: kindBool, value: true},
+	"agent.provider":                  {kind: kindString, value: "ollama"},
+	"agent.endpoint":                  {kind: kindString, value: "http://127.0.0.1:11434"},
+	"agent.model":                     {kind: kindString, value: "gemma4:12b"},
+	"agent.max_context_lines":         {kind: kindInt, value: 400},
 	"registry.credentials_mode":       {kind: kindString, value: "docker_helper"},
 	"windows.wsl_distro":              {kind: kindString, value: "Ubuntu"},
 	"linux.socket_path":               {kind: kindString, value: "/var/run/docker.sock"},
@@ -318,6 +323,7 @@ func validateSettingEnum(key string, value any) error {
 	allowedValues := map[string]map[string]struct{}{
 		"general.theme":             {"dark": {}, "light": {}, "system": {}},
 		"general.language":          {"en": {}},
+		"agent.provider":            {"ollama": {}, "openai_compatible": {}},
 		"registry.credentials_mode": {"docker_helper": {}, "none": {}},
 		"linux.sudo_mode":           {"ask": {}, "group": {}, "rootless": {}},
 	}

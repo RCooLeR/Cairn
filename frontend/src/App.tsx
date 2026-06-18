@@ -46,6 +46,7 @@ import {
   AlertTriangle,
   ArrowDown,
   Bell,
+  Bot,
   Box,
   CheckCircle2,
   Clock3,
@@ -160,6 +161,7 @@ import {
   TerminalPage,
   type TerminalCommandRequest,
 } from "./components/terminal/TerminalPage";
+import { AgentPage } from "./agent/AgentPage";
 import { useAppStore } from "./state/appStore";
 import { useInventoryStore } from "./state/inventoryStore";
 import {
@@ -591,6 +593,7 @@ const navItems: NavItem[] = [
   { id: "networks", label: "Networks", icon: Network },
   { id: "logs", label: "Logs", icon: ScrollText },
   { id: "terminal", label: "Terminal", icon: Terminal },
+  { id: "agent", label: "Agent", icon: Bot },
   { id: "settings", label: "Settings", icon: SettingsIcon },
 ];
 
@@ -4441,6 +4444,15 @@ function App() {
             }
             projects={projects}
             queuedCommand={queuedTerminalCommand}
+          />
+        );
+      case "agent":
+        return (
+          <AgentPage
+            containers={containers}
+            images={images}
+            networks={networks}
+            projects={projects}
           />
         );
       case "settings":

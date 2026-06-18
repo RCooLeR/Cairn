@@ -50,6 +50,7 @@ export type SettingsSectionID =
   | "registries"
   | "metrics"
   | "terminal"
+  | "agent"
   | "appearance"
   | "backups"
   | "security"
@@ -223,6 +224,7 @@ export function SettingsPage({
     ["registries", "Registries"],
     ["metrics", "Metrics"],
     ["terminal", "Terminal"],
+    ["agent", "Agent"],
     ["appearance", "Appearance"],
     ["backups", "Backups"],
     ["security", "Security & Audit"],
@@ -407,6 +409,64 @@ export function SettingsPage({
                 value={settingString(settings, "terminal.default_shell", "")}
               />
               <ReadOnlySetting label="Paste guard" value="Enabled" />
+            </CardBody>
+          </Card>
+        ) : null}
+
+        {section === "agent" ? (
+          <Card>
+            <CardHeader title="Agent" />
+            <CardBody className="space-y-3">
+              <SettingsCheckboxField
+                checked={settingBool(settings, "agent.enabled", true)}
+                disabled={saving}
+                label="Enable local agent"
+                onChange={(checked) =>
+                  onSettingChange("agent.enabled", checked)
+                }
+              />
+              <SettingsSelectField
+                disabled={saving}
+                label="Provider"
+                onChange={(value) => onSettingChange("agent.provider", value)}
+                options={[
+                  ["ollama", "Ollama"],
+                  ["openai_compatible", "OpenAI-compatible"],
+                ]}
+                value={settingString(settings, "agent.provider", "ollama")}
+              />
+              <SettingsTextSetting
+                disabled={saving}
+                label="Endpoint"
+                onSave={(value) => onSettingChange("agent.endpoint", value)}
+                placeholder="http://127.0.0.1:11434"
+                value={settingString(
+                  settings,
+                  "agent.endpoint",
+                  "http://127.0.0.1:11434",
+                )}
+              />
+              <SettingsTextSetting
+                disabled={saving}
+                label="Preferred model"
+                onSave={(value) => onSettingChange("agent.model", value)}
+                placeholder="gemma4:12b"
+                value={settingString(settings, "agent.model", "gemma4:12b")}
+              />
+              <SettingsNumberSetting
+                disabled={saving}
+                label="Max context lines"
+                max={2000}
+                min={100}
+                onSave={(value) =>
+                  onSettingChange("agent.max_context_lines", value)
+                }
+                value={settingInt(settings, "agent.max_context_lines", 400)}
+              />
+              <ReadOnlySetting
+                label="Fallback order"
+                value="gemma4:12b -> qwen2.5-coder -> deepseek-coder-v2 -> llama3.1 -> mistral -> codellama -> gemma3"
+              />
             </CardBody>
           </Card>
         ) : null}

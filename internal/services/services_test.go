@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -174,6 +175,85 @@ func TestSettingsServiceNotificationsAreNoopWithoutRepository(t *testing.T) {
 	}
 	if err := service.MarkNotificationsRead(ctx, []int64{1, 2, 3}); err != nil {
 		t.Fatalf("MarkNotificationsRead() error = %v, want nil", err)
+	}
+}
+
+func TestAgentServiceStatusSelectsPreferredAvailableModel(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/tags" {
+			t.Fatalf("path = %s, want /api/tags", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"models":[{"name":"llama3.1:8b"},{"name":"qwen2.5-coder:7b"}]}`))
+	}))
+	t.Cleanup(server.Close)
+	if err := db.Settings().SetString(ctx, "agent.endpoint", server.URL); err != nil {
+		t.Fatalf("SetString endpoint: %v", err)
+	}
+
+	status, err := (&AgentService{
+		Settings: db.Settings(),
+		Client:   server.Client(),
+	}).Status(ctx)
+	if err != nil {
+		t.Fatalf("Status() error = %v", err)
+	}
+	if status == nil || !status.Enabled || !status.Reachable {
+		t.Fatalf("Status() = %#v, want enabled and reachable", status)
+	}
+	if status.Model != "qwen2.5-coder:7b" {
+		t.Fatalf("Status().Model = %q, want qwen2.5-coder:7b", status.Model)
+	}
+	if len(status.AvailableModels) != 2 || status.AvailableModels[0] != "llama3.1:8b" {
+		t.Fatalf("AvailableModels = %#v", status.AvailableModels)
+	}
+	persisted, err := db.Settings().GetString(ctx, "agent.model")
+	if err != nil {
+		t.Fatalf("GetString agent.model: %v", err)
+	}
+	if persisted != "qwen2.5-coder:7b" {
+		t.Fatalf("persisted agent.model = %q, want selected fallback", persisted)
+	}
+}
+
+func TestAgentServiceChatUsesSelectedLocalModel(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/tags":
+			_, _ = w.Write([]byte(`{"models":[{"name":"qwen2.5-coder:7b"}]}`))
+		case "/api/chat":
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("ReadAll chat body: %v", err)
+			}
+			if !strings.Contains(string(body), `"model":"qwen2.5-coder:7b"`) {
+				t.Fatalf("chat body = %s, want selected model", body)
+			}
+			_, _ = w.Write([]byte(`{"message":{"content":"Use a multi-stage build and add health checks."}}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	t.Cleanup(server.Close)
+	if err := db.Settings().SetString(ctx, "agent.endpoint", server.URL); err != nil {
+		t.Fatalf("SetString endpoint: %v", err)
+	}
+
+	response, err := (&AgentService{
+		Settings: db.Settings(),
+		Client:   server.Client(),
+	}).Chat(ctx, models.AgentChatRequest{Prompt: "Review this Dockerfile"})
+	if err != nil {
+		t.Fatalf("Chat() error = %v", err)
+	}
+	if response == nil || response.Model != "qwen2.5-coder:7b" {
+		t.Fatalf("Chat() = %#v, want selected model", response)
+	}
+	if !strings.Contains(response.Message, "multi-stage") {
+		t.Fatalf("response.Message = %q", response.Message)
 	}
 }
 

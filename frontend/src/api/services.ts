@@ -1,4 +1,5 @@
 export {
+  AgentService,
   BackupService,
   ComposeService,
   DockerService,
