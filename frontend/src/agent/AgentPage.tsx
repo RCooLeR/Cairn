@@ -1015,11 +1015,18 @@ type MarkdownListItem = {
   text: string;
 };
 
+type MarkdownTable = {
+  alignments: Array<"center" | "left" | "right" | undefined>;
+  headers: string[];
+  rows: string[][];
+};
+
 type MarkdownBlock =
   | { kind: "code"; code: string; language?: string }
   | { kind: "heading"; level: number; text: string }
   | { kind: "list"; items: MarkdownListItem[]; ordered: boolean }
-  | { kind: "paragraph"; text: string };
+  | { kind: "paragraph"; text: string }
+  | { kind: "table"; table: MarkdownTable };
 
 function MarkdownContent({ content }: { content: string }) {
   const blocks = parseMarkdownBlocks(content);
@@ -1073,6 +1080,49 @@ function MarkdownBlockView({ block }: { block: MarkdownBlock }) {
       </ListTag>
     );
   }
+  if (block.kind === "table") {
+    return (
+      <div className="overflow-auto rounded-control border border-border">
+        <table
+          className="min-w-full border-collapse text-left text-xs"
+          data-testid="agent-markdown-table"
+        >
+          <thead className="bg-bg-inset text-text-muted">
+            <tr>
+              {block.table.headers.map((header, index) => (
+                <th
+                  className="border-b border-border px-3 py-2 font-semibold"
+                  key={`${header}-${index}`}
+                  style={{ textAlign: block.table.alignments[index] }}
+                >
+                  {renderInlineMarkdown(header)}
+                </th>
+              ))}
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-border">
+            {block.table.rows.map((row, rowIndex) => (
+              <tr key={`row-${rowIndex}`}>
+                {block.table.headers.map((_, cellIndex) => (
+                  <td
+                    className="max-w-80 px-3 py-2 align-top text-text-primary"
+                    key={`cell-${rowIndex}-${cellIndex}`}
+                    style={{
+                      textAlign: block.table.alignments[cellIndex],
+                    }}
+                  >
+                    <span className="break-words">
+                      {renderInlineMarkdown(row[cellIndex] ?? "")}
+                    </span>
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    );
+  }
   return (
     <p className="whitespace-pre-wrap text-text-primary">
       {renderInlineMarkdown(block.text)}
@@ -1103,7 +1153,8 @@ function parseMarkdownBlocks(content: string): MarkdownBlock[] {
     list = null;
   };
 
-  for (const line of lines) {
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
     const trimmed = line.trim();
     const fence = trimmed.match(/^```([\w-]*)/);
     if (codeLines) {
@@ -1143,6 +1194,14 @@ function parseMarkdownBlocks(content: string): MarkdownBlock[] {
       });
       continue;
     }
+    const table = parseMarkdownTable(lines, index);
+    if (table) {
+      flushParagraph();
+      flushList();
+      blocks.push({ kind: "table", table: table.table });
+      index = table.nextIndex;
+      continue;
+    }
     const unordered = line.match(/^\s*[-*]\s+(?:\[([ xX~-])\]\s+)?(.+)$/);
     const ordered = line.match(/^\s*\d+[.)]\s+(.+)$/);
     if (unordered || ordered) {
@@ -1177,6 +1236,71 @@ function parseMarkdownBlocks(content: string): MarkdownBlock[] {
   flushParagraph();
   flushList();
   return blocks.length > 0 ? blocks : [{ kind: "paragraph", text: content }];
+}
+
+function parseMarkdownTable(
+  lines: string[],
+  startIndex: number,
+): { nextIndex: number; table: MarkdownTable } | null {
+  const headerLine = lines[startIndex]?.trim() ?? "";
+  const separatorLine = lines[startIndex + 1]?.trim() ?? "";
+  if (
+    !isMarkdownTableRow(headerLine) ||
+    !isMarkdownTableSeparator(separatorLine)
+  ) {
+    return null;
+  }
+
+  const headers = splitMarkdownTableRow(headerLine);
+  const alignments = splitMarkdownTableRow(separatorLine).map(tableAlignment);
+  if (headers.length === 0 || alignments.length === 0) {
+    return null;
+  }
+
+  const rows: string[][] = [];
+  let nextIndex = startIndex + 2;
+  for (; nextIndex < lines.length; nextIndex += 1) {
+    const rowLine = lines[nextIndex].trim();
+    if (!isMarkdownTableRow(rowLine) || isMarkdownTableSeparator(rowLine)) {
+      break;
+    }
+    rows.push(splitMarkdownTableRow(rowLine));
+  }
+
+  return {
+    nextIndex: nextIndex - 1,
+    table: {
+      alignments,
+      headers,
+      rows,
+    },
+  };
+}
+
+function isMarkdownTableRow(line: string) {
+  return line.includes("|") && splitMarkdownTableRow(line).length >= 2;
+}
+
+function isMarkdownTableSeparator(line: string) {
+  const cells = splitMarkdownTableRow(line);
+  return cells.length >= 2 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+}
+
+function splitMarkdownTableRow(line: string) {
+  const trimmed = line.trim().replace(/^\|/, "").replace(/\|$/, "");
+  return trimmed.split("|").map((cell) => cell.trim());
+}
+
+function tableAlignment(cell: string): MarkdownTable["alignments"][number] {
+  const left = cell.startsWith(":");
+  const right = cell.endsWith(":");
+  if (left && right) {
+    return "center";
+  }
+  if (right) {
+    return "right";
+  }
+  return "left";
 }
 
 function renderInlineMarkdown(text: string): ReactNode[] {

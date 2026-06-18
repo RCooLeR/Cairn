@@ -51,7 +51,7 @@ For identity, capability, greeting, and general conceptual questions, Cairn skip
 
 ## Conversation UI
 
-Agent responses render common Markdown, including headings, bullet and numbered lists, task lists, inline code, fenced code blocks, bold text, and HTTP links. The transcript scrolls inside the chat card instead of growing the whole page.
+Agent responses render common Markdown, including headings, bullet and numbered lists, task lists, pipe tables, inline code, fenced code blocks, bold text, and HTTP links. The transcript scrolls inside the chat card instead of growing the whole page.
 
 Press `Enter` to send a prompt. Press `Shift+Enter` to insert a newline.
 

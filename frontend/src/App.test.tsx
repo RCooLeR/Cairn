@@ -693,6 +693,11 @@ describe("App inventory shell", () => {
         "## Answer",
         "Use `docker compose up` after checking [Docker docs](https://docs.docker.com).",
         "",
+        "| Feature | Dedicated Vector DB | PostgreSQL + pgvector |",
+        "| :--- | :--- | :--- |",
+        "| Complexity | More infrastructure | One database |",
+        "| Performance | Better at huge scale | Good for small/medium |",
+        "",
         "```yaml",
         "services:",
         "  app:",
@@ -743,6 +748,17 @@ describe("App inventory shell", () => {
       "href",
       "https://docs.docker.com",
     );
+    const markdownTable = screen.getByTestId("agent-markdown-table");
+    expect(within(markdownTable).getByText("Feature")).toBeInTheDocument();
+    expect(
+      within(markdownTable).getByText("Dedicated Vector DB"),
+    ).toBeInTheDocument();
+    expect(
+      within(markdownTable).getByText("PostgreSQL + pgvector"),
+    ).toBeInTheDocument();
+    expect(
+      within(markdownTable).getByText("More infrastructure"),
+    ).toBeInTheDocument();
     expect(screen.getByText(/services:\s+app:/)).toBeInTheDocument();
     expect(screen.getByText("Project files: compose.yaml")).toBeInTheDocument();
   });
