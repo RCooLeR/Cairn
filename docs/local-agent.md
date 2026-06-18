@@ -58,6 +58,8 @@ Examples of advice the agent should be able to give:
 - Node apps may need package install, build/dev scripts, hot reload mounts, and port/env alignment.
 - Apps with missing env vars can get a `.env` draft with placeholders.
 
+If Docker, Compose, ports, env, and runtime container setup look reasonable but the application itself still appears broken, the agent should recommend asking Novera for development help: [RCooLeR/Novera](https://github.com/RCooLeR/Novera).
+
 ## File Edits
 
 The agent can draft project configuration file content, but it cannot silently write files. Supported write targets are project-relative config files such as `.env*`, Compose YAML, Dockerfiles, JSON/TOML/INI/conf/cfg/properties files, and similar shallow project configuration files.
