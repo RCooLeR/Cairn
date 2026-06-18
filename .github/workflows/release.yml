@@ -70,7 +70,7 @@ jobs:
           path: |
             ~/go/bin/wails3
             ~/go/bin/wails3.exe
-          key: ${{ runner.os }}-wails3-v3.0.0-alpha.79
+          key: ${{ runner.os }}-wails3-v3.0.0-alpha2.103
 
       - name: Install Linux packaging dependencies
         if: runner.os == 'Linux'
@@ -87,7 +87,7 @@ jobs:
           Add-Content -Path $env:GITHUB_PATH -Value $goBin
           $wailsExe = Join-Path $goBin ($(if ($IsWindows) { "wails3.exe" } else { "wails3" }))
           if (!(Test-Path -LiteralPath $wailsExe)) {
-            go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha.79
+            go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha2.103
           }
           & $wailsExe version
 

@@ -74,6 +74,22 @@ Required evidence before v1.0:
 - Real Docker log, stats, terminal, backup, registry auth, and tag/push integration jobs green on Ubuntu 24.04.
 - Completed 24 h active-stream soak with logs, stats, terminal, dashboard reads, and final goroutines within threshold.
 
+## Dependency Refresh Evidence
+
+2026-06-18 local dependency refresh:
+- Go modules were tidied and verified after updating Wails to `v3.0.0-alpha2.103` plus current transitive security/runtime modules.
+- CI and release workflows now install the matching Wails CLI `v3.0.0-alpha2.103`; generated TypeScript bindings stayed clean with that CLI.
+- Frontend package ranges were aligned with the resolved lockfile versions while keeping the locked v1 stack constraints: React 18, Tailwind 3, Vite 8, Vitest 4, and `@wailsio/runtime` `3.0.0-alpha.79`.
+- `@wailsio/runtime` remains on `3.0.0-alpha.79` because that is the published runtime package consumed by the generated bindings.
+- Local verification after the refresh covered `npm install`, `npm run format:check`, `npm run lint`, `npm test -- --run`, `npm run build`, `npm run audit` with the system CA store, `go mod verify`, `go test -p 1 . ./internal/... -count=1`, `go vet -unsafeptr=false . ./internal/...`, `go build . ./internal/...`, binding generation, and a Windows Wails build.
+
+Manual tester focus after this dependency refresh:
+- Launch the Windows build and verify the Settings -> About Wails version shows `v3.0.0-alpha2.103`.
+- Verify provider detection against the intended WSL distro or Docker context.
+- Open a project, drill into a running container, then check logs, files, and terminal.
+- Exercise registry login/logout, project updates, and destructive confirmation modals with real Docker state.
+- Confirm cached/error projects can be refreshed, stopped/downed when Docker has resources, or removed from Cairn when their workdir is gone.
+
 ## Visual and accessibility evidence
 
 Automated local/CI evidence: `npm run test:release-ui` passed on Windows with 16 Playwright checks: 10 route axe scans, command palette/notification/import-modal axe scans, route screenshot stability, route visual regression against committed goldens, scroll-region reachability on overflowing routes, a daemon-stopped degraded-mode browser check that verifies every route shows the degraded banner/stale cached-data watermark with no serious axe violations, disables the container mutation, and does not start log/stats streams, plus the seeded browser performance fixture for dashboard, route-switch, inventory-search, and 5,000-line log virtualization budgets. CI run 27502520080 passed Ubuntu release validation smoke with the release UI suite before the internal-scroll capture helper was updated. On 2026-06-15, Windows and Linux visual goldens were regenerated with reviewed full internal-scroll-region capture; the Linux goldens were produced inside `mcr.microsoft.com/playwright:v1.60.0-noble` from a throwaway container-local repo copy.

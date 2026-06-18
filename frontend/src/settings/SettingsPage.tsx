@@ -605,7 +605,7 @@ export function SettingsPage({
                 label="Go"
                 value={version?.goVersion ?? "Unknown"}
               />
-              <ReadOnlySetting label="Wails" value="v3.0.0-alpha.79" />
+              <ReadOnlySetting label="Wails" value="v3.0.0-alpha2.103" />
               <ReadOnlySetting label="Updates" value="Not checked" />
             </CardBody>
           </Card>
