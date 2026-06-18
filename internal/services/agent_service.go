@@ -584,7 +584,10 @@ func endpointURL(base string, path string) string {
 func agentSystemPrompt() string {
 	return strings.Join([]string{
 		"You are Cairn's local Docker agent.",
-		"Use only the provided tool context and the user's prompt. If context is missing, say what to inspect next.",
+		"Answer the user's actual request first. Do not diagnose unrelated current Docker state just because context was provided.",
+		"Use provided tool context only when it is relevant to the current request. Ignore unrelated projects, containers, logs, or errors.",
+		"For identity, capability, greeting, or general conceptual questions, answer directly and briefly; do not inspect or summarize current Docker inventory unless asked.",
+		"If context is missing for a troubleshooting or review request, say what to inspect next.",
 		"Help with Dockerfiles, docker-compose.yml, runtime diagnostics, logs, networking, volumes, image updates, local development, production hardening, and Kubernetes/Compose deployment guidance.",
 		"Also understand ordinary application projects: infer runtimes, ports, services, build steps, and required environment variables from manifests and config files.",
 		"When useful, offer configuration next steps as questions, such as whether to set up PHP/Nginx, Go build containers, or missing env vars.",
@@ -597,6 +600,9 @@ func agentSystemPrompt() string {
 }
 
 func promptWithContext(prompt string, contextText string) string {
+	if strings.TrimSpace(contextText) == "" {
+		return "User request:\n" + prompt + "\n\nCairn tool context:\nNo Cairn tool context was included for this request."
+	}
 	return "User request:\n" + prompt + "\n\nCairn tool context:\n" + contextText
 }
 
@@ -621,6 +627,9 @@ func agentContextText(results []models.AgentToolResult, maxLines int) string {
 }
 
 func (s *AgentService) collectToolResults(ctx context.Context, req models.AgentChatRequest, _ agentConfig) []models.AgentToolResult {
+	if isAgentMetaQuestion(agentCurrentRequest(req.Prompt)) {
+		return nil
+	}
 	toolIDs := requestedAgentTools(req)
 	results := make([]models.AgentToolResult, 0, len(toolIDs))
 	for _, toolID := range toolIDs {
@@ -641,6 +650,9 @@ func requestedAgentTools(req models.AgentChatRequest) []string {
 			selected = append(selected, toolID)
 		}
 	}
+	if req.ToolIDs != nil {
+		return uniqueStringsPreserveOrder(selected)
+	}
 	if len(selected) == 0 {
 		selected = append(selected, "docker.engine", "docker.projects", "docker.containers")
 		if strings.TrimSpace(req.Scope.ProjectID) != "" {
@@ -657,6 +669,52 @@ func requestedAgentTools(req models.AgentChatRequest) []string {
 		}
 	}
 	return uniqueStringsPreserveOrder(selected)
+}
+
+func agentCurrentRequest(prompt string) string {
+	const marker = "Current request:"
+	index := strings.LastIndex(prompt, marker)
+	if index < 0 {
+		return strings.TrimSpace(prompt)
+	}
+	return strings.TrimSpace(prompt[index+len(marker):])
+}
+
+func isAgentMetaQuestion(prompt string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(prompt))
+	normalized = strings.Trim(normalized, " \t\r\n?!.")
+	if normalized == "" {
+		return false
+	}
+	exactPhrases := []string{
+		"what are you",
+		"can you code",
+		"can you edit code",
+		"can you change code",
+		"can you write files",
+		"can you edit files",
+		"how can you help",
+		"what do you do",
+		"hello",
+		"hi",
+		"hey",
+	}
+	for _, phrase := range exactPhrases {
+		if normalized == phrase {
+			return true
+		}
+	}
+	containedPhrases := []string{
+		"who are you",
+		"what can you do",
+		"can you write code",
+	}
+	for _, phrase := range containedPhrases {
+		if normalized == phrase || strings.Contains(normalized, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *AgentService) runTool(ctx context.Context, toolID string, scope models.AgentScope) models.AgentToolResult {

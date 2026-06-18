@@ -276,6 +276,7 @@ export function AgentPage({ projects }: AgentPageProps) {
     const request = AgentService.Chat({
       prompt: buildAgentPrompt(mode, messages, text),
       scope: { projectID: projectID || undefined },
+      toolIDs: shouldUseAgentToolContext(text) ? undefined : [],
     });
     requestRef.current = request;
     try {
@@ -984,7 +985,7 @@ function buildPlanItems({
     model ? `Use ${model}` : "Pick an installed model",
     project ? `Scope to ${project.name}` : "Use all Docker context",
     mode === "agent"
-      ? "Diagnose, plan, then answer"
+      ? "Use context when relevant"
       : "Answer directly with safe next steps",
   ];
 }
@@ -1000,7 +1001,7 @@ function buildAgentPrompt(
     .join("\n");
   const modeInstruction =
     mode === "agent"
-      ? "Agent mode: diagnose the Docker situation, outline a concise plan, then answer with concrete next steps. Do not execute mutations."
+      ? "Agent mode: use Cairn context when it helps, outline a concise plan for troubleshooting or implementation requests, then answer with concrete next steps. For capability, identity, greeting, or conceptual questions, answer directly without diagnosing current Docker state. Do not execute mutations."
       : "Ask mode: answer directly and concisely with Docker-specific guidance.";
   return [
     modeInstruction,
@@ -1009,6 +1010,37 @@ function buildAgentPrompt(
   ]
     .filter(Boolean)
     .join("\n\n");
+}
+
+function shouldUseAgentToolContext(prompt: string) {
+  const normalized = prompt.trim().toLowerCase().replace(/[?!.]+$/g, "");
+  if (!normalized) {
+    return false;
+  }
+  const exactMetaPhrases = [
+    "what are you",
+    "can you code",
+    "can you edit code",
+    "can you change code",
+    "can you write files",
+    "can you edit files",
+    "how can you help",
+    "what do you do",
+    "hello",
+    "hi",
+    "hey",
+  ];
+  if (exactMetaPhrases.some((phrase) => normalized === phrase)) {
+    return false;
+  }
+  const containedMetaPhrases = [
+    "who are you",
+    "what can you do",
+    "can you write code",
+  ];
+  return !containedMetaPhrases.some(
+    (phrase) => normalized === phrase || normalized.includes(phrase),
+  );
 }
 
 function sendDisabledReason(

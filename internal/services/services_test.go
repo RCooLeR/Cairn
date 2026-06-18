@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -255,6 +256,123 @@ func TestAgentServiceChatUsesSelectedLocalModel(t *testing.T) {
 	}
 	if !strings.Contains(response.Message, "multi-stage") {
 		t.Fatalf("response.Message = %q", response.Message)
+	}
+}
+
+func TestAgentServiceChatSkipsDockerContextForMetaQuestions(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	var chatBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/tags":
+			_, _ = w.Write([]byte(`{"models":[{"name":"qwen2.5-coder:7b"}]}`))
+		case "/api/chat":
+			raw, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("ReadAll chat body: %v", err)
+			}
+			chatBody = string(raw)
+			_, _ = w.Write([]byte(`{"message":{"content":"Yes. I can draft Dockerfiles, Compose files, and safe config edits."}}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	t.Cleanup(server.Close)
+	if err := db.Settings().SetString(ctx, "agent.endpoint", server.URL); err != nil {
+		t.Fatalf("SetString endpoint: %v", err)
+	}
+
+	response, err := (&AgentService{
+		Settings: db.Settings(),
+		Client:   server.Client(),
+	}).Chat(ctx, models.AgentChatRequest{
+		Prompt: strings.Join([]string{
+			"Agent mode: diagnose the Docker situation, outline a concise plan, then answer with concrete next steps.",
+			"",
+			"Current request:",
+			"Can you write code?",
+		}, "\n"),
+	})
+	if err != nil {
+		t.Fatalf("Chat() error = %v", err)
+	}
+	if len(response.ToolResults) != 0 {
+		t.Fatalf("ToolResults = %#v, want no Docker context for meta question", response.ToolResults)
+	}
+	if !strings.Contains(chatBody, "For identity, capability, greeting, or general conceptual questions, answer directly") {
+		t.Fatalf("chat body missing direct-answer system guard: %s", chatBody)
+	}
+	if !strings.Contains(chatBody, "No Cairn tool context was included") {
+		t.Fatalf("chat body = %s, want no-context marker", chatBody)
+	}
+	if strings.Contains(chatBody, "Docker service is not available") || strings.Contains(chatBody, "Compose projects") {
+		t.Fatalf("chat body included unrelated Docker context: %s", chatBody)
+	}
+}
+
+func TestAgentServiceChatHonorsExplicitEmptyToolSelection(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	var decoded struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/tags":
+			_, _ = w.Write([]byte(`{"models":[{"name":"qwen2.5-coder:7b"}]}`))
+		case "/api/chat":
+			raw, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("ReadAll chat body: %v", err)
+			}
+			if err := json.Unmarshal(raw, &decoded); err != nil {
+				t.Fatalf("Unmarshal chat body: %v\n%s", err, raw)
+			}
+			_, _ = w.Write([]byte(`{"message":{"content":"Here is a focused answer without inventory context."}}`))
+		default:
+			t.Fatalf("unexpected path %s", r.URL.Path)
+		}
+	}))
+	t.Cleanup(server.Close)
+	if err := db.Settings().SetString(ctx, "agent.endpoint", server.URL); err != nil {
+		t.Fatalf("SetString endpoint: %v", err)
+	}
+
+	response, err := (&AgentService{
+		Settings: db.Settings(),
+		Client:   server.Client(),
+	}).Chat(ctx, models.AgentChatRequest{
+		Prompt:  "Explain Docker image layers briefly",
+		ToolIDs: []string{},
+	})
+	if err != nil {
+		t.Fatalf("Chat() error = %v", err)
+	}
+	if len(response.ToolResults) != 0 {
+		t.Fatalf("ToolResults = %#v, want explicit empty tool selection honored", response.ToolResults)
+	}
+	if len(decoded.Messages) != 2 || decoded.Messages[1].Role != "user" {
+		t.Fatalf("decoded messages = %#v, want system and user messages", decoded.Messages)
+	}
+	userPrompt := decoded.Messages[1].Content
+	if !strings.Contains(userPrompt, "No Cairn tool context was included") {
+		t.Fatalf("user prompt = %q, want no-context marker", userPrompt)
+	}
+	if strings.Contains(userPrompt, "Docker service is not available") {
+		t.Fatalf("user prompt included default Docker tool output: %s", userPrompt)
+	}
+}
+
+func TestAgentMetaQuestionClassifierDoesNotMatchGreetingInsideWords(t *testing.T) {
+	if isAgentMetaQuestion("this container exits after startup") {
+		t.Fatal("isAgentMetaQuestion matched greeting inside another word")
+	}
+	if !isAgentMetaQuestion("Hey. Who are you? What can you do?") {
+		t.Fatal("isAgentMetaQuestion did not match a real meta question")
 	}
 }
 

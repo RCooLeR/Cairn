@@ -47,6 +47,8 @@ The agent can include read-only context from these tools:
 
 Secrets are redacted before file and JSON context is sent to the local model. Registry credentials are never stored by the agent.
 
+For identity, capability, greeting, and general conceptual questions, Cairn skips Docker inventory context and asks the model to answer directly. This prevents unrelated current projects or stopped containers from hijacking simple questions such as "Can you write code?"
+
 ## App Analysis
 
 When a project is selected, Cairn inspects common application files such as `package.json`, `composer.json`, `go.mod`, `requirements.txt`, `pyproject.toml`, Dockerfiles, Compose files, `.env.example`, and shallow config files. The analysis detects likely stacks, runtime/build needs, expected environment variables, and ports.
