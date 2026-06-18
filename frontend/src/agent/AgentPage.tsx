@@ -1605,38 +1605,124 @@ function buildAgentLogItems(
   sending: boolean,
 ): AgentLogItem[] {
   const items: AgentLogItem[] = [];
-  if (sending) {
-    items.push({
-      id: "running",
-      text: "Request running...",
-      tone: "accent",
-    });
+
+  let latestUserIndex = -1;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === "user") {
+      latestUserIndex = index;
+      break;
+    }
   }
-  const latestAssistant = [...messages]
-    .reverse()
-    .find((message) => message.role === "assistant");
-  if (latestAssistant?.model) {
-    items.push({
-      id: "model",
-      text: `Answered by ${latestAssistant.model}`,
-      tone: "ok",
-    });
-  }
-  for (const [index, tool] of toolResults.slice(0, 8).entries()) {
-    items.push({
-      id: `${tool.toolID}-${index}`,
-      text: `${tool.title}${tool.summary ? `: ${tool.summary}` : ""}`,
-      tone: tool.error ? "error" : "ok",
-    });
-  }
-  if (items.length === 0) {
+
+  const latestUser = latestUserIndex >= 0 ? messages[latestUserIndex] : null;
+  if (!latestUser) {
     items.push({
       id: "empty",
       text: "No agent run yet.",
       tone: "neutral",
     });
+    return items;
   }
+
+  items.push({
+    id: "understanding",
+    text: `Understanding request: ${truncateLogText(latestUser.content)}`,
+    tone: sending ? "accent" : "ok",
+  });
+
+  if (sending) {
+    items.push({
+      id: "planning",
+      text: "Creating plan or direct answer shape",
+      tone: "accent",
+    });
+    items.push({
+      id: "context",
+      text: shouldUseAgentToolContext(latestUser.content)
+        ? "Preparing Docker context tools"
+        : "Using direct answer mode without tools",
+      tone: "neutral",
+    });
+    items.push({
+      id: "answering",
+      text: "Waiting for model response",
+      tone: "accent",
+    });
+    return items;
+  }
+
+  const messagesAfterLatestUser = messages.slice(latestUserIndex + 1);
+  const latestAssistant = [...messagesAfterLatestUser]
+    .reverse()
+    .find((message) => message.role === "assistant");
+  const latestSystem = [...messagesAfterLatestUser]
+    .reverse()
+    .find((message) => message.role === "system");
+
+  if (!latestAssistant) {
+    items.push({
+      id: "not-completed",
+      text:
+        latestSystem?.content === "Stopped."
+          ? "Request stopped before final answer"
+          : "No final answer returned",
+      tone: latestSystem?.content === "Stopped." ? "neutral" : "error",
+    });
+    return items;
+  }
+
+  const planItems = latestAssistant
+    ? extractPlanItems(latestAssistant.content)
+    : [];
+  items.push({
+    id: "plan",
+    text:
+      planItems.length > 0
+        ? `Created plan with ${planItems.length} task${planItems.length === 1 ? "" : "s"}`
+        : "Plan not needed for this answer",
+    tone: planItems.length > 0 ? "ok" : "neutral",
+  });
+
+  if (toolResults.length > 0) {
+    for (const [index, tool] of toolResults.slice(0, 8).entries()) {
+      items.push({
+        id: `tool-${tool.toolID}-${index}`,
+        text: tool.error
+          ? `Tool failed: ${tool.title}`
+          : `Used tool: ${tool.title}`,
+        tone: tool.error ? "error" : "ok",
+      });
+    }
+  } else {
+    items.push({
+      id: "tools-none",
+      text: "Used no tools",
+      tone: "neutral",
+    });
+  }
+
+  if (toolResults.length > 8) {
+    items.push({
+      id: "tools-extra",
+      text: `Used ${toolResults.length - 8} more tool${toolResults.length - 8 === 1 ? "" : "s"}`,
+      tone: "neutral",
+    });
+  }
+
+  items.push({
+    id: "final-answer",
+    text: latestAssistant?.model
+      ? `Provided final answer with ${latestAssistant.model}`
+      : "Provided final answer",
+    tone: "ok",
+  });
+
   return items;
+}
+
+function truncateLogText(value: string) {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  return normalized.length > 90 ? `${normalized.slice(0, 87)}...` : normalized;
 }
 
 function sendDisabledReason(

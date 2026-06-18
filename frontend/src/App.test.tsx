@@ -762,7 +762,16 @@ describe("App inventory shell", () => {
       within(markdownTable).getByText("More infrastructure"),
     ).toBeInTheDocument();
     expect(screen.getByText(/services:\s+app:/)).toBeInTheDocument();
-    expect(screen.getByText("Project files: compose.yaml")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Understanding request: Review this Compose project and make a plan",
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Created plan with 3 tasks")).toBeInTheDocument();
+    expect(screen.getByText("Used tool: Project files")).toBeInTheDocument();
+    expect(
+      screen.getByText("Provided final answer with gemma4:12b"),
+    ).toBeInTheDocument();
   });
 
   it("does not convert ordinary agent bullets into plan items", async () => {
