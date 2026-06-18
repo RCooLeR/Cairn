@@ -9,8 +9,10 @@ import {
 import {
   Bot,
   CheckCircle2,
+  Circle,
   FilePenLine,
   ListChecks,
+  Loader2,
   RefreshCw,
   Send,
   Square,
@@ -822,27 +824,51 @@ function AgentPlanPanel({ items }: { items: AgentPlanItem[] }) {
               No plan in the latest answer.
             </div>
           ) : (
-            <div className="space-y-2">
+            <ol className="space-y-1.5">
               {items.map((item, index) => (
-                <div
-                  className="rounded-card border border-border bg-bg-inset p-3"
+                <li
+                  className="flex items-start gap-2 rounded-control px-2 py-1.5 text-sm hover:bg-bg-inset"
                   key={`${item.status}-${item.text}-${index}`}
                 >
-                  <div className="mb-1">
-                    <Badge tone={planStatusTone(item.status)}>
-                      {planStatusLabel(item.status)}
-                    </Badge>
-                  </div>
-                  <div className="break-words text-sm text-text-primary">
+                  <PlanStatusIcon status={item.status} />
+                  <span className="min-w-0 flex-1 break-words text-text-primary">
                     {item.text}
-                  </div>
-                </div>
+                  </span>
+                </li>
               ))}
-            </div>
+            </ol>
           )}
         </div>
       </CardBody>
     </Card>
+  );
+}
+
+function PlanStatusIcon({ status }: { status: AgentPlanItem["status"] }) {
+  if (status === "done") {
+    return (
+      <CheckCircle2
+        aria-label="Done"
+        className="mt-0.5 shrink-0 text-ok"
+        size={16}
+      />
+    );
+  }
+  if (status === "in_progress") {
+    return (
+      <Loader2
+        aria-label="In progress"
+        className="mt-0.5 shrink-0 animate-spin text-accent"
+        size={16}
+      />
+    );
+  }
+  return (
+    <Circle
+      aria-label="Todo"
+      className="mt-0.5 shrink-0 text-text-muted"
+      size={16}
+    />
   );
 }
 
@@ -1474,6 +1500,9 @@ function extractPlanItems(content: string): AgentPlanItem[] {
       }
       break;
     }
+    if (isPlanSectionBoundary(trimmed)) {
+      break;
+    }
     const sectionStatus = planStatusFromText(trimmed.replace(/[:*]+$/g, ""));
     if (sectionStatus) {
       status = sectionStatus;
@@ -1488,7 +1517,7 @@ function extractPlanItems(content: string): AgentPlanItem[] {
   if (items.length > 0) {
     return items.slice(0, 12);
   }
-  return parseGlobalTaskList(lines).slice(0, 12);
+  return [];
 }
 
 function parsePlanLine(
@@ -1518,21 +1547,7 @@ function parsePlanLine(
       text: stripInlineMarkdown(labeled[2]),
     };
   }
-  const bullet = line.match(/^[-*]\s+(.+)$/);
-  if (bullet) {
-    return { status: fallbackStatus, text: stripInlineMarkdown(bullet[1]) };
-  }
-  const numbered = line.match(/^\d+[.)]\s+(.+)$/);
-  if (numbered) {
-    return { status: fallbackStatus, text: stripInlineMarkdown(numbered[1]) };
-  }
   return null;
-}
-
-function parseGlobalTaskList(lines: string[]) {
-  return lines
-    .map((line) => parsePlanLine(line.trim(), "todo"))
-    .filter((item): item is AgentPlanItem => Boolean(item));
 }
 
 function taskStatus(token: string): AgentPlanItem["status"] {
@@ -1559,24 +1574,21 @@ function planStatusFromText(value: string): AgentPlanItem["status"] | null {
   return null;
 }
 
-function planStatusLabel(status: AgentPlanItem["status"]) {
-  if (status === "done") {
-    return "Done";
-  }
-  if (status === "in_progress") {
-    return "In progress";
-  }
-  return "Todo";
-}
-
-function planStatusTone(status: AgentPlanItem["status"]) {
-  if (status === "done") {
-    return "ok";
-  }
-  if (status === "in_progress") {
-    return "accent";
-  }
-  return "neutral";
+function isPlanSectionBoundary(value: string) {
+  const normalized = value
+    .toLowerCase()
+    .replace(/[:*]+$/g, "")
+    .trim();
+  return [
+    "answer",
+    "analysis",
+    "diagnosis",
+    "explanation",
+    "questions",
+    "recommendation",
+    "recommendations",
+    "summary",
+  ].includes(normalized);
 }
 
 function stripInlineMarkdown(value: string) {

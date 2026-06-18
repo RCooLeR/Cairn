@@ -743,7 +743,9 @@ describe("App inventory shell", () => {
     expect(within(plan).getByText("Inspect app files")).toBeInTheDocument();
     expect(within(plan).getByText("Draft Compose changes")).toBeInTheDocument();
     expect(within(plan).getByText("Verify with tests")).toBeInTheDocument();
-    expect(within(plan).getByText("In progress")).toBeInTheDocument();
+    expect(within(plan).getByLabelText("Done")).toBeInTheDocument();
+    expect(within(plan).getByLabelText("In progress")).toBeInTheDocument();
+    expect(within(plan).getByLabelText("Todo")).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "Docker docs" })).toHaveAttribute(
       "href",
       "https://docs.docker.com",
@@ -761,6 +763,48 @@ describe("App inventory shell", () => {
     ).toBeInTheDocument();
     expect(screen.getByText(/services:\s+app:/)).toBeInTheDocument();
     expect(screen.getByText("Project files: compose.yaml")).toBeInTheDocument();
+  });
+
+  it("does not convert ordinary agent bullets into plan items", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    agentServiceMock.Chat.mockResolvedValueOnce({
+      message: [
+        "A RAG stack usually has these layers:",
+        "",
+        "- Vector database such as Qdrant",
+        "- Embedding model",
+        "- LLM runtime",
+        "- Orchestration app",
+      ].join("\n"),
+      toolResults: [],
+      model: "gemma4:12b",
+    });
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Agent/ }),
+    );
+
+    const input = await screen.findByPlaceholderText(
+      "Ask a Docker question...",
+    );
+    fireEvent.change(input, {
+      target: { value: "What belongs in a RAG stack?" },
+    });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await screen.findByText("Vector database such as Qdrant");
+    const plan = await screen.findByTestId("agent-plan-content");
+    expect(
+      within(plan).getByText("No plan in the latest answer."),
+    ).toBeInTheDocument();
+    expect(
+      within(plan).queryByText("Vector database such as Qdrant"),
+    ).not.toBeInTheDocument();
   });
 
   it("opens the notification center and marks notifications read", async () => {
