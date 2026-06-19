@@ -161,7 +161,11 @@ import {
   TerminalPage,
   type TerminalCommandRequest,
 } from "./components/terminal/TerminalPage";
-import { AgentPage } from "./agent/AgentPage";
+import {
+  AgentPage,
+  type AgentPruneKind,
+  type AgentProjectAction,
+} from "./agent/AgentPage";
 import { useAppStore } from "./state/appStore";
 import { useInventoryStore } from "./state/inventoryStore";
 import {
@@ -2982,6 +2986,36 @@ function App() {
     [ensureDockerReady],
   );
 
+  const openAgentPrunePlan = useCallback(
+    async (kind: AgentPruneKind) => {
+      if (!ensureDockerReady()) {
+        return;
+      }
+      setActionError(null);
+      try {
+        const plan = await DockerService.PlanPrune(kind);
+        if (!plan) {
+          throw new Error("Prune plan was empty");
+        }
+        setConfirm({
+          open: true,
+          plan,
+          planKind: "container",
+          targetName: cleanupKindLabel(kind),
+          typedName: "",
+          busy: false,
+        });
+      } catch (error: unknown) {
+        setActionError(
+          error instanceof Error
+            ? error.message
+            : "Unable to create prune plan",
+        );
+      }
+    },
+    [ensureDockerReady],
+  );
+
   const applyUpdatePlan = useCallback(async () => {
     if (!updatePlan.plan) {
       return;
@@ -4447,7 +4481,27 @@ function App() {
           />
         );
       case "agent":
-        return <AgentPage projects={projects} />;
+        return (
+          <AgentPage
+            onCheckUpdates={checkAllUpdates}
+            onOpenUpdates={() => {
+              setActivePage("updates");
+              setUpdatesTab("current");
+            }}
+            onPlanProjectUpdate={(project) =>
+              openUpdatePlan({
+                kind: "project",
+                projectID: project.id,
+                projectName: project.name,
+              })
+            }
+            onPlanPrune={openAgentPrunePlan}
+            onProjectAction={(action: AgentProjectAction, project) =>
+              runProjectAction(action, project)
+            }
+            projects={projects}
+          />
+        );
       case "settings":
         return (
           <SettingsPage

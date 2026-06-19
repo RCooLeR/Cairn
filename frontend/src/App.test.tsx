@@ -822,6 +822,95 @@ describe("App inventory shell", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("offers Cairn update actions from agent requests", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
+    agentServiceMock.Chat.mockResolvedValueOnce({
+      message:
+        "I can prepare the update workflow, but Cairn will ask for confirmation before applying changes.",
+      toolResults: [],
+      model: "gemma4:12b",
+    });
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Agent/ }),
+    );
+
+    const input = await screen.findByPlaceholderText(
+      "Ask a Docker question...",
+    );
+    fireEvent.change(input, {
+      target: {
+        value: "Can you upgrade all images if any upgrades available?",
+      },
+    });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    const actions = await screen.findByTestId("agent-actions-panel");
+    fireEvent.click(
+      within(actions).getByRole("button", { name: /Check updates/ }),
+    );
+    await waitFor(() =>
+      expect(updateServiceMock.CheckAllUpdates).toHaveBeenCalled(),
+    );
+
+    fireEvent.click(
+      within(actions).getByRole("button", { name: /Plan update: app-db/ }),
+    );
+    await waitFor(() =>
+      expect(updateServiceMock.PlanProjectUpdate).toHaveBeenCalledWith(
+        "linux_native/app-db",
+      ),
+    );
+    expect(
+      await screen.findByText("$ docker compose pull app"),
+    ).toBeInTheDocument();
+  });
+
+  it("offers Cairn prune confirmation from agent cleanup requests", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    agentServiceMock.Chat.mockResolvedValueOnce({
+      message:
+        "I can prepare a cleanup preview. Confirm it in Cairn before anything is removed.",
+      toolResults: [],
+      model: "gemma4:12b",
+    });
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Agent/ }),
+    );
+
+    const input = await screen.findByPlaceholderText(
+      "Ask a Docker question...",
+    );
+    fireEvent.change(input, {
+      target: { value: "Clean up dangling images" },
+    });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    const actions = await screen.findByTestId("agent-actions-panel");
+    fireEvent.click(
+      within(actions).getByRole("button", { name: /Plan prune: images/ }),
+    );
+
+    await waitFor(() =>
+      expect(dockerServiceMock.PlanPrune).toHaveBeenCalledWith("images"),
+    );
+    expect(
+      await screen.findByRole("dialog", { name: "Prune images" }),
+    ).toBeInTheDocument();
+  });
+
   it("opens the notification center and marks notifications read", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
     settingsServiceMock.GetNotifications.mockResolvedValue(

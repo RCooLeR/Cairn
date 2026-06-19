@@ -59,6 +59,17 @@ On wide windows, the latest model-returned plan and agent log appear beside the 
 
 The log panel is an activity trail for the latest run. It records steps such as understanding the request, creating a plan or direct answer shape, using context tools, and providing the final model answer. It does not display raw tool summaries as the primary log content.
 
+## Cairn Actions
+
+For supported mutation requests, the Agent screen shows Cairn action buttons instead of relying on raw shell advice. These buttons call existing Cairn workflows:
+
+- Check updates and open the Updates page.
+- Plan a project update through the update preview modal.
+- Run project lifecycle actions such as pull, start, stop, restart, and redeploy.
+- Create prune previews for images, containers, networks, volumes, build cache, or system cleanup.
+
+The local model does not execute Docker mutations directly. Dangerous or state-changing work still goes through Cairn's normal command-plan preview, confirmation modal, audit trail, and update progress flow.
+
 ## App Analysis
 
 When a project is selected, Cairn inspects common application files such as `package.json`, `composer.json`, `go.mod`, `requirements.txt`, `pyproject.toml`, Dockerfiles, Compose files, `.env.example`, and shallow config files. The analysis detects likely stacks, runtime/build needs, expected environment variables, and ports.
@@ -89,4 +100,4 @@ The preview stores a short-lived plan and verifies the original file hash before
 
 ## Limits
 
-The agent does not run Docker commands or apply Docker updates. When it suggests a destructive or mutating Docker action, the user must run that action through Cairn's normal command-plan confirmation flow. Project file edits are limited to the explicit preview/apply flow above.
+The model itself does not run Docker commands. Supported mutations are exposed as Cairn action buttons that open existing safe workflows; unsupported mutations should be treated as guidance until Cairn provides an action for them. Project file edits are limited to the explicit preview/apply flow above.

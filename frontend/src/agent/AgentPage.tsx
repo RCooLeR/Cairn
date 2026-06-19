@@ -31,7 +31,30 @@ import type {
 import { AgentService, SettingsService } from "../api/services";
 import { Badge, Button, Card, CardBody, EmptyState } from "../components/ui";
 
+export type AgentProjectAction =
+  | "pull"
+  | "redeploy"
+  | "restart"
+  | "start"
+  | "stop";
+
+export type AgentPruneKind =
+  | "build-cache"
+  | "containers"
+  | "images"
+  | "networks"
+  | "system"
+  | "volumes";
+
 type AgentPageProps = {
+  onCheckUpdates?: () => Promise<void> | void;
+  onOpenUpdates?: () => void;
+  onPlanProjectUpdate?: (project: ProjectSummary) => Promise<void> | void;
+  onPlanPrune?: (kind: AgentPruneKind) => Promise<void> | void;
+  onProjectAction?: (
+    action: AgentProjectAction,
+    project: ProjectSummary,
+  ) => Promise<void> | void;
   projects: ProjectSummary[];
 };
 
@@ -56,9 +79,46 @@ type AgentLogItem = {
   tone: "accent" | "error" | "neutral" | "ok";
 };
 
+type AgentActionSuggestion =
+  | {
+      description: string;
+      id: string;
+      kind: "check_updates" | "open_updates";
+      label: string;
+    }
+  | {
+      description: string;
+      id: string;
+      kind: "plan_project_update";
+      label: string;
+      project: ProjectSummary;
+    }
+  | {
+      action: AgentProjectAction;
+      description: string;
+      id: string;
+      kind: "project_action";
+      label: string;
+      project: ProjectSummary;
+    }
+  | {
+      description: string;
+      id: string;
+      kind: "prune";
+      label: string;
+      pruneKind: AgentPruneKind;
+    };
+
 const defaultEndpoint = "http://127.0.0.1:11434";
 
-export function AgentPage({ projects }: AgentPageProps) {
+export function AgentPage({
+  onCheckUpdates,
+  onOpenUpdates,
+  onPlanProjectUpdate,
+  onPlanPrune,
+  onProjectAction,
+  projects,
+}: AgentPageProps) {
   const [status, setStatus] = useState<AgentStatus | null>(null);
   const [provider, setProvider] = useState("ollama");
   const [endpoint, setEndpoint] = useState(defaultEndpoint);
@@ -85,6 +145,10 @@ export function AgentPage({ projects }: AgentPageProps) {
   );
   const [editBusy, setEditBusy] = useState(false);
   const [editError, setEditError] = useState<string | null>(null);
+  const [agentActionBusyID, setAgentActionBusyID] = useState("");
+  const [agentActionMessage, setAgentActionMessage] = useState<string | null>(
+    null,
+  );
   const requestRef = useRef<ReturnType<typeof AgentService.Chat> | null>(null);
   const stoppedRef = useRef(false);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
@@ -109,6 +173,33 @@ export function AgentPage({ projects }: AgentPageProps) {
   const logItems = useMemo(
     () => buildAgentLogItems(messages, lastToolResults, sending),
     [lastToolResults, messages, sending],
+  );
+  const latestUserPrompt = useMemo(
+    () => latestUserContent(messages),
+    [messages],
+  );
+  const agentActions = useMemo(
+    () =>
+      detectAgentActionSuggestions({
+        hasCheckUpdates: Boolean(onCheckUpdates),
+        hasOpenUpdates: Boolean(onOpenUpdates),
+        hasPlanProjectUpdate: Boolean(onPlanProjectUpdate),
+        hasPlanPrune: Boolean(onPlanPrune),
+        hasProjectAction: Boolean(onProjectAction),
+        projects,
+        prompt: latestUserPrompt,
+        selectedProject,
+      }),
+    [
+      latestUserPrompt,
+      onCheckUpdates,
+      onOpenUpdates,
+      onPlanProjectUpdate,
+      onPlanPrune,
+      onProjectAction,
+      projects,
+      selectedProject,
+    ],
   );
 
   useEffect(() => {
@@ -301,6 +392,7 @@ export function AgentPage({ projects }: AgentPageProps) {
       return;
     }
     stoppedRef.current = false;
+    setAgentActionMessage(null);
     const userMessage: ChatMessage = {
       id: crypto.randomUUID(),
       role: "user",
@@ -370,6 +462,29 @@ export function AgentPage({ projects }: AgentPageProps) {
         toolResults: response?.toolResults,
       },
     ]);
+  };
+
+  const runAgentAction = async (action: AgentActionSuggestion) => {
+    setAgentActionBusyID(action.id);
+    setAgentActionMessage(null);
+    try {
+      if (action.kind === "check_updates") {
+        await onCheckUpdates?.();
+      } else if (action.kind === "open_updates") {
+        onOpenUpdates?.();
+      } else if (action.kind === "plan_project_update") {
+        await onPlanProjectUpdate?.(action.project);
+      } else if (action.kind === "project_action") {
+        await onProjectAction?.(action.action, action.project);
+      } else if (action.kind === "prune") {
+        await onPlanPrune?.(action.pruneKind);
+      }
+      setAgentActionMessage(agentActionSuccessMessage(action));
+    } catch (nextError) {
+      setAgentActionMessage(errorMessage(nextError, "Agent action failed"));
+    } finally {
+      setAgentActionBusyID("");
+    }
   };
 
   return (
@@ -475,6 +590,7 @@ export function AgentPage({ projects }: AgentPageProps) {
               onClick={() => {
                 setMessages([]);
                 setLastToolResults([]);
+                setAgentActionMessage(null);
               }}
               size="sm"
               variant="ghost"
@@ -499,6 +615,15 @@ export function AgentPage({ projects }: AgentPageProps) {
                 <ChatBubble key={message.id} message={message} />
               ))}
             </div>
+
+            <AgentActionsPanel
+              actions={agentActions}
+              busyID={agentActionBusyID}
+              message={agentActionMessage}
+              onRun={(action) => {
+                void runAgentAction(action);
+              }}
+            />
 
             <div className="rounded-card border border-border bg-bg-card p-3">
               <div className="mb-3 flex flex-wrap gap-2">
@@ -869,6 +994,60 @@ function PlanStatusIcon({ status }: { status: AgentPlanItem["status"] }) {
       className="mt-0.5 shrink-0 text-text-muted"
       size={16}
     />
+  );
+}
+
+function AgentActionsPanel({
+  actions,
+  busyID,
+  message,
+  onRun,
+}: {
+  actions: AgentActionSuggestion[];
+  busyID: string;
+  message: string | null;
+  onRun: (action: AgentActionSuggestion) => void;
+}) {
+  if (actions.length === 0 && !message) {
+    return null;
+  }
+  return (
+    <div
+      className="shrink-0 rounded-card border border-border bg-bg-card p-3"
+      data-testid="agent-actions-panel"
+    >
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+        <div className="text-sm font-semibold text-text-primary">
+          Cairn actions
+        </div>
+        <Badge tone="info">Cairn workflow</Badge>
+      </div>
+      {actions.length > 0 ? (
+        <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+          {actions.map((action) => (
+            <button
+              className="rounded-control border border-border bg-bg-inset px-3 py-2 text-left text-sm hover:border-accent disabled:cursor-not-allowed disabled:opacity-60"
+              disabled={Boolean(busyID)}
+              key={action.id}
+              onClick={() => onRun(action)}
+              type="button"
+            >
+              <div className="font-medium text-text-primary">
+                {busyID === action.id ? "Working..." : action.label}
+              </div>
+              <div className="mt-1 text-xs text-text-muted">
+                {action.description}
+              </div>
+            </button>
+          ))}
+        </div>
+      ) : null}
+      {message ? (
+        <div className="mt-2 rounded-control border border-info/20 bg-info/10 px-3 py-2 text-sm text-info">
+          {message}
+        </div>
+      ) : null}
+    </div>
   );
 }
 
@@ -1423,8 +1602,8 @@ function buildAgentPrompt(
     .join("\n");
   const modeInstruction =
     mode === "agent"
-      ? 'Agent mode: use Cairn context when it helps, then answer with concrete next steps. For larger troubleshooting, implementation, migration, or debugging requests, include a Markdown section named "Plan" with one task per line using bare checkboxes: [ ] todo, [-] in progress, and [x] done where those statuses are known. For simple capability, identity, greeting, or conceptual questions, answer directly without a plan and without diagnosing current Docker state. Do not execute mutations.'
-      : 'Ask mode: answer directly and concisely with Docker-specific guidance. For larger troubleshooting, implementation, migration, or debugging requests, include a Markdown section named "Plan" with one task per line using bare checkboxes: [ ] todo, [-] in progress, and [x] done where those statuses are known. For simple questions, skip the plan.';
+      ? 'Agent mode: use Cairn context when it helps, then answer with concrete next steps. For larger troubleshooting, implementation, migration, or debugging requests, include a Markdown section named "Plan" with one task per line using bare checkboxes: [ ] todo, [-] in progress, and [x] done where those statuses are known. For simple capability, identity, greeting, or conceptual questions, answer directly without a plan and without diagnosing current Docker state. Do not claim that mutations were executed. If the request asks to update, pull, redeploy, restart, stop, start, prune, or otherwise mutate Docker state, explain that Cairn will show safe action buttons and confirmation previews for supported actions.'
+      : 'Ask mode: answer directly and concisely with Docker-specific guidance. For larger troubleshooting, implementation, migration, or debugging requests, include a Markdown section named "Plan" with one task per line using bare checkboxes: [ ] todo, [-] in progress, and [x] done where those statuses are known. For simple questions, skip the plan. Do not claim that mutations were executed; Cairn shows action buttons and confirmation previews for supported mutations.';
   return [
     modeInstruction,
     history ? `Recent conversation:\n${history}` : "",
@@ -1432,6 +1611,236 @@ function buildAgentPrompt(
   ]
     .filter(Boolean)
     .join("\n\n");
+}
+
+function latestUserContent(messages: ChatMessage[]) {
+  return (
+    [...messages].reverse().find((message) => message.role === "user")
+      ?.content ?? ""
+  );
+}
+
+function detectAgentActionSuggestions({
+  hasCheckUpdates,
+  hasOpenUpdates,
+  hasPlanProjectUpdate,
+  hasPlanPrune,
+  hasProjectAction,
+  projects,
+  prompt,
+  selectedProject,
+}: {
+  hasCheckUpdates: boolean;
+  hasOpenUpdates: boolean;
+  hasPlanProjectUpdate: boolean;
+  hasPlanPrune: boolean;
+  hasProjectAction: boolean;
+  projects: ProjectSummary[];
+  prompt: string;
+  selectedProject?: ProjectSummary;
+}): AgentActionSuggestion[] {
+  const normalized = prompt.toLowerCase();
+  if (!normalized.trim()) {
+    return [];
+  }
+  const suggestions: AgentActionSuggestion[] = [];
+  const add = (action: AgentActionSuggestion) => {
+    if (!suggestions.some((item) => item.id === action.id)) {
+      suggestions.push(action);
+    }
+  };
+
+  const updateIntent =
+    /\b(upgrade|update|updates|newer|latest|outdated)\b/.test(normalized) &&
+    /\b(image|images|container|containers|service|services|project|projects|compose|stack|stacks|all|everything)\b/.test(
+      normalized,
+    );
+  if (updateIntent) {
+    if (hasCheckUpdates) {
+      add({
+        description: "Runs Cairn's update detector against known projects.",
+        id: "check-updates",
+        kind: "check_updates",
+        label: "Check updates",
+      });
+    }
+    if (hasOpenUpdates) {
+      add({
+        description: "Opens the Updates page for review and history.",
+        id: "open-updates",
+        kind: "open_updates",
+        label: "Open Updates",
+      });
+    }
+    if (hasPlanProjectUpdate) {
+      for (const project of updateActionProjects(projects, selectedProject)) {
+        add({
+          description: `${projectActionableUpdateCount(project)} actionable update${projectActionableUpdateCount(project) === 1 ? "" : "s"}; opens Cairn's update preview.`,
+          id: `plan-project-update:${project.id}`,
+          kind: "plan_project_update",
+          label: `Plan update: ${project.name}`,
+          project,
+        });
+      }
+    }
+  }
+
+  if (hasProjectAction) {
+    const project =
+      selectedProject ?? (projects.length === 1 ? projects[0] : undefined);
+    if (project) {
+      const projectAction = projectActionIntent(normalized);
+      if (projectAction) {
+        add({
+          action: projectAction,
+          description: projectActionDescription(projectAction, project.name),
+          id: `project-action:${projectAction}:${project.id}`,
+          kind: "project_action",
+          label: `${projectActionLabel(projectAction)} ${project.name}`,
+          project,
+        });
+      }
+    }
+  }
+
+  if (
+    hasPlanPrune &&
+    /\b(prune|cleanup|clean up|remove unused|dangling)\b/.test(normalized)
+  ) {
+    const pruneKind = pruneKindIntent(normalized);
+    add({
+      description: "Opens Cairn's command-plan confirmation before pruning.",
+      id: `prune:${pruneKind}`,
+      kind: "prune",
+      label: `Plan prune: ${pruneKindLabel(pruneKind)}`,
+      pruneKind,
+    });
+  }
+
+  return suggestions.slice(0, 8);
+}
+
+function updateActionProjects(
+  projects: ProjectSummary[],
+  selectedProject?: ProjectSummary,
+) {
+  if (selectedProject && projectActionableUpdateCount(selectedProject) > 0) {
+    return [selectedProject];
+  }
+  const actionable = projects.filter(
+    (project) => projectActionableUpdateCount(project) > 0,
+  );
+  if (actionable.length > 0) {
+    return actionable.slice(0, 5);
+  }
+  return selectedProject
+    ? [selectedProject]
+    : projects.length === 1
+      ? [projects[0]]
+      : [];
+}
+
+function projectActionableUpdateCount(project: ProjectSummary) {
+  const badges = project.updateBadges;
+  return (
+    (badges?.imageUpdates ?? 0) +
+    (badges?.baseUpdates ?? 0) +
+    (badges?.rebuildNeeded ?? 0)
+  );
+}
+
+function projectActionIntent(value: string): AgentProjectAction | null {
+  if (/\b(redeploy|recreate|rebuild)\b/.test(value)) {
+    return "redeploy";
+  }
+  if (/\b(restart|reload)\b/.test(value)) {
+    return "restart";
+  }
+  if (/\b(stop|shutdown|shut down)\b/.test(value)) {
+    return "stop";
+  }
+  if (/\b(start|run|up)\b/.test(value)) {
+    return "start";
+  }
+  if (/\b(pull|fetch)\b/.test(value)) {
+    return "pull";
+  }
+  return null;
+}
+
+function projectActionLabel(action: AgentProjectAction) {
+  switch (action) {
+    case "pull":
+      return "Pull";
+    case "redeploy":
+      return "Redeploy";
+    case "restart":
+      return "Restart";
+    case "start":
+      return "Start";
+    case "stop":
+      return "Stop";
+  }
+}
+
+function projectActionDescription(
+  action: AgentProjectAction,
+  projectName: string,
+) {
+  switch (action) {
+    case "pull":
+      return `Runs compose pull for ${projectName}.`;
+    case "redeploy":
+      return `Creates a redeploy preview for ${projectName}.`;
+    case "restart":
+      return `Restarts ${projectName}.`;
+    case "start":
+      return `Starts ${projectName}.`;
+    case "stop":
+      return `Stops ${projectName}.`;
+  }
+}
+
+function pruneKindIntent(value: string): AgentPruneKind {
+  if (/\b(volume|volumes)\b/.test(value)) {
+    return "volumes";
+  }
+  if (/\b(container|containers)\b/.test(value)) {
+    return "containers";
+  }
+  if (/\b(network|networks)\b/.test(value)) {
+    return "networks";
+  }
+  if (/\b(build cache|builder|cache)\b/.test(value)) {
+    return "build-cache";
+  }
+  if (/\b(system|everything|all)\b/.test(value)) {
+    return "system";
+  }
+  return "images";
+}
+
+function pruneKindLabel(kind: AgentPruneKind) {
+  return kind === "build-cache" ? "build cache" : kind;
+}
+
+function agentActionSuccessMessage(action: AgentActionSuggestion) {
+  if (action.kind === "check_updates") {
+    return "Update check started.";
+  }
+  if (action.kind === "open_updates") {
+    return "Opened Updates.";
+  }
+  if (action.kind === "plan_project_update") {
+    return `Opened update preview for ${action.project.name}.`;
+  }
+  if (action.kind === "project_action") {
+    return `${projectActionLabel(action.action)} requested for ${action.project.name}.`;
+  }
+  if (action.kind === "prune") {
+    return `Opened prune preview for ${pruneKindLabel(action.pruneKind)}.`;
+  }
+  return "Action requested.";
 }
 
 function shouldUseAgentToolContext(prompt: string) {
