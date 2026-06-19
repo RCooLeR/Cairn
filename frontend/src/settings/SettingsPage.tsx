@@ -212,7 +212,7 @@ export function SettingsPage({
   );
   const registryLoginDisabled = registryCredentialMode === "none";
   const registryLoginDisabledReason =
-    "Switch Credential mode to Docker credential helper before logging in from Cairn.";
+    "Switch Credential mode to Prefer Docker credential helper before logging in from Cairn.";
   const hasUnencryptedRegistryCredentials = registryAccounts.some(
     (account) => account.source === "authsFile",
   );
@@ -1125,9 +1125,9 @@ export function SettingsPage({
             />
             <CardBody className="space-y-3">
               <div className="text-sm text-text-muted">
-                Credentials stay in Docker's backend credential store. Cairn
-                only reads account metadata and sends secrets to `docker login`
-                via stdin.
+                Cairn sends secrets to `docker login` via stdin. Docker stores
+                them with a backend credential helper when one is available;
+                otherwise Docker may use config.json.
               </div>
               <SettingsSelectField
                 disabled={saving}
@@ -1136,7 +1136,7 @@ export function SettingsPage({
                   onSettingChange("registry.credentials_mode", value)
                 }
                 options={[
-                  ["docker_helper", "Docker credential helper"],
+                  ["docker_helper", "Prefer Docker credential helper"],
                   ["none", "No Cairn-managed credentials"],
                 ]}
                 value={settingString(
@@ -1149,8 +1149,7 @@ export function SettingsPage({
               hasUnencryptedRegistryCredentials ? (
                 <div className="rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
                   Some registry credentials are still stored in Docker
-                  config.json. Log out and log in again after a credential
-                  helper is available.
+                  config.json because no credential helper handled them.
                 </div>
               ) : null}
               {registryLoginDisabled ? (

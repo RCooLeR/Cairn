@@ -302,7 +302,18 @@ func TestLoginConfiguresCredentialHelperBeforeDockerLogin(t *testing.T) {
 	}
 }
 
-func TestLoginFailsWhenCredentialHelperUnavailable(t *testing.T) {
+func TestLoginFallsBackToDockerConfigWhenCredentialHelperUnavailable(t *testing.T) {
+	var registryHost string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	registryHost = strings.TrimPrefix(server.URL, "http://")
+
 	provider := &fakeRegistryProvider{
 		backendResults: map[string]string{
 			`sh -lc cat "${DOCKER_CONFIG:-$HOME/.docker}/config.json" 2>/dev/null || true`: `{}`,
@@ -315,15 +326,33 @@ func TestLoginFailsWhenCredentialHelperUnavailable(t *testing.T) {
 	manager.Settings = testRegistrySettings(t, registryCredentialModeDockerHelper)
 
 	err := manager.Login(context.Background(), models.RegistryLoginRequest{
-		Registry: "ghcr.io",
+		Registry: registryHost,
 		Username: "ada",
 		Secret:   "token",
 	})
-	if !apperror.IsCode(err, apperror.ProviderNotReady) {
-		t.Fatalf("Login() error = %v, want provider-not-ready", err)
+	if err != nil {
+		t.Fatalf("Login() error = %v", err)
 	}
-	if provider.dockerInput != "" {
-		t.Fatalf("docker login received secret despite missing helper: %q", provider.dockerInput)
+	if provider.dockerInput != "token\n" {
+		t.Fatalf("docker input = %q", provider.dockerInput)
+	}
+	if want := []string{"login", registryHost, "-u", "ada", "--password-stdin"}; !reflect.DeepEqual(provider.dockerArgs, want) {
+		t.Fatalf("docker args = %#v, want %#v", provider.dockerArgs, want)
+	}
+	if provider.backendConfig != "" {
+		t.Fatalf("backend config was rewritten despite missing helper: %s", provider.backendConfig)
+	}
+}
+
+func TestBackendDockerConfigCommandsEscapeWSLDollars(t *testing.T) {
+	provider := &fakeRegistryProvider{providerType: providers.TypeWindowsWSL}
+	readCommand := strings.Join(backendConfigCommand(provider), " ")
+	if !strings.Contains(readCommand, `\${DOCKER_CONFIG:-\$HOME/.docker}`) {
+		t.Fatalf("WSL read command does not escape Docker config variables: %q", readCommand)
+	}
+	writeCommand := strings.Join(backendWriteConfigCommand(provider), " ")
+	if !strings.Contains(writeCommand, `\${DOCKER_CONFIG:-\$HOME/.docker}`) || !strings.Contains(writeCommand, `"\$cfg/config.json"`) {
+		t.Fatalf("WSL write command does not escape Docker config variables: %q", writeCommand)
 	}
 }
 

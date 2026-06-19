@@ -146,7 +146,10 @@ func decodeUTF16LE(bytes []byte) string {
 }
 
 func backendConfigCommand(provider providers.PlatformProvider) []string {
-	if provider.Type() == providers.TypeWindowsWSL || provider.Platform() != providers.PlatformWindows {
+	if provider.Type() == providers.TypeWindowsWSL {
+		return []string{"sh", "-lc", escapeWSLCommandDollarsForRegistry(`cat "${DOCKER_CONFIG:-$HOME/.docker}/config.json" 2>/dev/null || true`)}
+	}
+	if provider.Platform() != providers.PlatformWindows {
 		return []string{"sh", "-lc", `cat "${DOCKER_CONFIG:-$HOME/.docker}/config.json" 2>/dev/null || true`}
 	}
 	return []string{
@@ -159,7 +162,10 @@ func backendConfigCommand(provider providers.PlatformProvider) []string {
 }
 
 func backendWriteConfigCommand(provider providers.PlatformProvider) []string {
-	if provider.Type() == providers.TypeWindowsWSL || provider.Platform() != providers.PlatformWindows {
+	if provider.Type() == providers.TypeWindowsWSL {
+		return []string{"sh", "-lc", escapeWSLCommandDollarsForRegistry(`cfg="${DOCKER_CONFIG:-$HOME/.docker}"; mkdir -p "$cfg"; umask 077; cat > "$cfg/config.json"`)}
+	}
+	if provider.Platform() != providers.PlatformWindows {
 		return []string{"sh", "-lc", `cfg="${DOCKER_CONFIG:-$HOME/.docker}"; mkdir -p "$cfg"; umask 077; cat > "$cfg/config.json"`}
 	}
 	return []string{
@@ -169,6 +175,10 @@ func backendWriteConfigCommand(provider providers.PlatformProvider) []string {
 		"-Command",
 		`$cfg=$env:DOCKER_CONFIG; if ([string]::IsNullOrWhiteSpace($cfg)) { $cfg=Join-Path $env:USERPROFILE '.docker' }; New-Item -ItemType Directory -Force -Path $cfg | Out-Null; $p=Join-Path $cfg 'config.json'; $content=[Console]::In.ReadToEnd(); Set-Content -LiteralPath $p -Value $content -NoNewline -Encoding UTF8`,
 	}
+}
+
+func escapeWSLCommandDollarsForRegistry(command string) string {
+	return strings.ReplaceAll(command, "$", `\$`)
 }
 
 func accountsFromDockerConfig(config dockerConfig, verified time.Time) []models.RegistryAccount {

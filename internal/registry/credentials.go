@@ -29,7 +29,7 @@ func (m *Manager) prepareRegistryLoginStorage(ctx context.Context, provider prov
 			apperror.Conflict,
 			"Registry login is disabled",
 			apperror.WithDetail("Credential mode is set to No Cairn-managed credentials."),
-			apperror.WithRepairHints("Switch Settings > Registries > Credential mode to Docker credential helper before logging in from Cairn."),
+			apperror.WithRepairHints("Switch Settings > Registries > Credential mode to Prefer Docker credential helper before logging in from Cairn."),
 		)
 	default:
 		return apperror.New(apperror.Internal, "Unknown registry credential mode", apperror.WithDetail(mode))
@@ -72,6 +72,9 @@ func (m *Manager) ensureCredentialHelper(ctx context.Context, provider providers
 	if helperForRegistry(config, registry) == "" && strings.TrimSpace(config.CredsStore) == "" {
 		helper, err := m.detectCredentialHelper(ctx, provider)
 		if err != nil {
+			if apperror.IsCode(err, apperror.ProviderNotReady) {
+				return nil
+			}
 			return err
 		}
 		helperChanged, err := setCredentialHelper(rawConfig, registryCredentialConfigKey(registry), helper)
