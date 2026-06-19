@@ -176,6 +176,7 @@ const callNames: Record<number, string> = {
   3291403973: "AgentService.DraftProjectFile",
   3181999705: "AgentService.Status",
   3444129041: "AgentService.Chat",
+  3643241100: "AgentService.ExecuteTool",
   4074296898: "AgentService.PlanFileEdit",
   4257326101: "SettingsService.SetSetting",
   1752754799: "DockerService.StopContainer",

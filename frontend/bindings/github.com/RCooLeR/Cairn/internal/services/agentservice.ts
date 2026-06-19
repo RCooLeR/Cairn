@@ -33,21 +33,27 @@ export function DraftProjectFile(req: models$0.AgentDraftFileRequest): $Cancella
     });
 }
 
+export function ExecuteTool(req: models$0.AgentToolExecutionRequest): $CancellablePromise<models$0.AgentToolResult | null> {
+    return $Call.ByID(3643241100, req).then(($result: any) => {
+        return $$createType9($result);
+    });
+}
+
 export function PlanFileEdit(req: models$0.AgentFileEditRequest): $CancellablePromise<models$0.CommandPlan | null> {
     return $Call.ByID(4074296898, req).then(($result: any) => {
-        return $$createType9($result);
+        return $$createType11($result);
     });
 }
 
 export function Status(): $CancellablePromise<models$0.AgentStatus | null> {
     return $Call.ByID(3181999705).then(($result: any) => {
-        return $$createType11($result);
+        return $$createType13($result);
     });
 }
 
 export function ToolCatalog(): $CancellablePromise<models$0.AgentToolSpec[]> {
     return $Call.ByID(2194297540).then(($result: any) => {
-        return $$createType13($result);
+        return $$createType15($result);
     });
 }
 
@@ -60,9 +66,11 @@ const $$createType4 = models$0.AgentChatResponse.createFrom;
 const $$createType5 = $Create.Nullable($$createType4);
 const $$createType6 = models$0.AgentDraftFileResponse.createFrom;
 const $$createType7 = $Create.Nullable($$createType6);
-const $$createType8 = models$0.CommandPlan.createFrom;
+const $$createType8 = models$0.AgentToolResult.createFrom;
 const $$createType9 = $Create.Nullable($$createType8);
-const $$createType10 = models$0.AgentStatus.createFrom;
+const $$createType10 = models$0.CommandPlan.createFrom;
 const $$createType11 = $Create.Nullable($$createType10);
-const $$createType12 = models$0.AgentToolSpec.createFrom;
-const $$createType13 = $Create.Array($$createType12);
+const $$createType12 = models$0.AgentStatus.createFrom;
+const $$createType13 = $Create.Nullable($$createType12);
+const $$createType14 = models$0.AgentToolSpec.createFrom;
+const $$createType15 = $Create.Array($$createType14);

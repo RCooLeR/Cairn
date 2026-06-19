@@ -13,6 +13,7 @@ export {
     AgentProjectAnalysis,
     AgentScope,
     AgentStatus,
+    AgentToolExecutionRequest,
     AgentToolResult,
     AgentToolSpec,
     AppUpdateNotice,

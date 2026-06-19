@@ -446,6 +446,63 @@ func TestAgentServiceFileEditPlanWritesProjectConfig(t *testing.T) {
 	}
 }
 
+func TestAgentServiceToolCatalogIncludesExecutableDockerTools(t *testing.T) {
+	tools, err := (&AgentService{}).ToolCatalog(context.Background())
+	if err != nil {
+		t.Fatalf("ToolCatalog() error = %v", err)
+	}
+	byID := map[string]models.AgentToolSpec{}
+	for _, tool := range tools {
+		byID[tool.ID] = tool
+	}
+	if !byID["docker.containers"].ReadOnly {
+		t.Fatalf("docker.containers = %#v, want read-only", byID["docker.containers"])
+	}
+	updateTool := byID["updates.check_all"]
+	if updateTool.ReadOnly || !updateTool.RequiresApproval {
+		t.Fatalf("updates.check_all = %#v, want approval-gated executable tool", updateTool)
+	}
+	if byID["docker.prune_plan"].ArgumentSchema == "" {
+		t.Fatalf("docker.prune_plan missing argument schema")
+	}
+}
+
+func TestAgentServiceExecuteToolCreatesCommandPlan(t *testing.T) {
+	ctx := context.Background()
+	plans := security.NewDockerObjectPlanStore(nil)
+	t.Cleanup(plans.Close)
+	service := &AgentService{
+		Docker: &DockerService{
+			Client:      &fakeDockerClient{},
+			ObjectPlans: plans,
+		},
+	}
+
+	result, err := service.ExecuteTool(ctx, models.AgentToolExecutionRequest{
+		ToolID:    "docker.prune_plan",
+		Reason:    "Clean up unused images",
+		Arguments: `{"kind":"images"}`,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteTool() error = %v", err)
+	}
+	if result == nil || result.Error != "" {
+		t.Fatalf("ExecuteTool() = %#v, want successful result", result)
+	}
+	if !strings.Contains(result.Data, "docker image prune --all") {
+		t.Fatalf("result.Data = %s, want prune command plan", result.Data)
+	}
+}
+
+func TestAgentServiceExecuteToolRejectsUnknownTool(t *testing.T) {
+	_, err := (&AgentService{}).ExecuteTool(context.Background(), models.AgentToolExecutionRequest{
+		ToolID: "shell.exec",
+	})
+	if !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("ExecuteTool(unknown) error = %v, want conflict", err)
+	}
+}
+
 func TestProviderServiceApplyInstallPublishesProgress(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

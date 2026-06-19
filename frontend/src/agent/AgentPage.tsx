@@ -24,37 +24,22 @@ import type {
   AgentFileEditResult,
   AgentProjectAnalysis,
   AgentStatus,
+  AgentToolSpec,
   AgentToolResult,
   CommandPlan,
   ProjectSummary,
 } from "../../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
 import { AgentService, SettingsService } from "../api/services";
-import { Badge, Button, Card, CardBody, EmptyState } from "../components/ui";
-
-export type AgentProjectAction =
-  | "pull"
-  | "redeploy"
-  | "restart"
-  | "start"
-  | "stop";
-
-export type AgentPruneKind =
-  | "build-cache"
-  | "containers"
-  | "images"
-  | "networks"
-  | "system"
-  | "volumes";
+import {
+  Badge,
+  Button,
+  Card,
+  CardBody,
+  EmptyState,
+  Modal,
+} from "../components/ui";
 
 type AgentPageProps = {
-  onCheckUpdates?: () => Promise<void> | void;
-  onOpenUpdates?: () => void;
-  onPlanProjectUpdate?: (project: ProjectSummary) => Promise<void> | void;
-  onPlanPrune?: (kind: AgentPruneKind) => Promise<void> | void;
-  onProjectAction?: (
-    action: AgentProjectAction,
-    project: ProjectSummary,
-  ) => Promise<void> | void;
   projects: ProjectSummary[];
 };
 
@@ -79,46 +64,15 @@ type AgentLogItem = {
   tone: "accent" | "error" | "neutral" | "ok";
 };
 
-type AgentActionSuggestion =
-  | {
-      description: string;
-      id: string;
-      kind: "check_updates" | "open_updates";
-      label: string;
-    }
-  | {
-      description: string;
-      id: string;
-      kind: "plan_project_update";
-      label: string;
-      project: ProjectSummary;
-    }
-  | {
-      action: AgentProjectAction;
-      description: string;
-      id: string;
-      kind: "project_action";
-      label: string;
-      project: ProjectSummary;
-    }
-  | {
-      description: string;
-      id: string;
-      kind: "prune";
-      label: string;
-      pruneKind: AgentPruneKind;
-    };
+type AgentToolCall = {
+  arguments: string;
+  reason: string;
+  toolID: string;
+};
 
 const defaultEndpoint = "http://127.0.0.1:11434";
 
-export function AgentPage({
-  onCheckUpdates,
-  onOpenUpdates,
-  onPlanProjectUpdate,
-  onPlanPrune,
-  onProjectAction,
-  projects,
-}: AgentPageProps) {
+export function AgentPage({ projects }: AgentPageProps) {
   const [status, setStatus] = useState<AgentStatus | null>(null);
   const [provider, setProvider] = useState("ollama");
   const [endpoint, setEndpoint] = useState(defaultEndpoint);
@@ -128,6 +82,12 @@ export function AgentPage({
   const [prompt, setPrompt] = useState("");
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [lastToolResults, setLastToolResults] = useState<AgentToolResult[]>([]);
+  const [toolCatalog, setToolCatalog] = useState<AgentToolSpec[]>([]);
+  const [pendingToolCall, setPendingToolCall] = useState<AgentToolCall | null>(
+    null,
+  );
+  const [toolBusy, setToolBusy] = useState(false);
+  const [toolError, setToolError] = useState<string | null>(null);
   const [analysis, setAnalysis] = useState<AgentProjectAnalysis | null>(null);
   const [loadingStatus, setLoadingStatus] = useState(true);
   const [analysisLoading, setAnalysisLoading] = useState(false);
@@ -145,10 +105,6 @@ export function AgentPage({
   );
   const [editBusy, setEditBusy] = useState(false);
   const [editError, setEditError] = useState<string | null>(null);
-  const [agentActionBusyID, setAgentActionBusyID] = useState("");
-  const [agentActionMessage, setAgentActionMessage] = useState<string | null>(
-    null,
-  );
   const requestRef = useRef<ReturnType<typeof AgentService.Chat> | null>(null);
   const stoppedRef = useRef(false);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
@@ -174,32 +130,12 @@ export function AgentPage({
     () => buildAgentLogItems(messages, lastToolResults, sending),
     [lastToolResults, messages, sending],
   );
-  const latestUserPrompt = useMemo(
-    () => latestUserContent(messages),
-    [messages],
-  );
-  const agentActions = useMemo(
+  const pendingToolSpec = useMemo(
     () =>
-      detectAgentActionSuggestions({
-        hasCheckUpdates: Boolean(onCheckUpdates),
-        hasOpenUpdates: Boolean(onOpenUpdates),
-        hasPlanProjectUpdate: Boolean(onPlanProjectUpdate),
-        hasPlanPrune: Boolean(onPlanPrune),
-        hasProjectAction: Boolean(onProjectAction),
-        projects,
-        prompt: latestUserPrompt,
-        selectedProject,
-      }),
-    [
-      latestUserPrompt,
-      onCheckUpdates,
-      onOpenUpdates,
-      onPlanProjectUpdate,
-      onPlanPrune,
-      onProjectAction,
-      projects,
-      selectedProject,
-    ],
+      pendingToolCall
+        ? toolCatalog.find((tool) => tool.id === pendingToolCall.toolID)
+        : undefined,
+    [pendingToolCall, toolCatalog],
   );
 
   useEffect(() => {
@@ -216,8 +152,12 @@ export function AgentPage({
     }
     setError(null);
     try {
-      const nextStatus = await AgentService.Status();
+      const [nextStatus, nextTools] = await Promise.all([
+        AgentService.Status(),
+        AgentService.ToolCatalog(),
+      ]);
       setStatus(nextStatus);
+      setToolCatalog(nextTools ?? []);
       setProvider(nextStatus?.provider || "ollama");
       setEndpoint(nextStatus?.endpoint || defaultEndpoint);
       setModel(nextStatus?.model || "");
@@ -230,12 +170,13 @@ export function AgentPage({
 
   useEffect(() => {
     let cancelled = false;
-    AgentService.Status()
-      .then((nextStatus) => {
+    Promise.all([AgentService.Status(), AgentService.ToolCatalog()])
+      .then(([nextStatus, nextTools]) => {
         if (cancelled) {
           return;
         }
         setStatus(nextStatus);
+        setToolCatalog(nextTools ?? []);
         setProvider(nextStatus?.provider || "ollama");
         setEndpoint(nextStatus?.endpoint || defaultEndpoint);
         setModel(nextStatus?.model || "");
@@ -392,7 +333,8 @@ export function AgentPage({
       return;
     }
     stoppedRef.current = false;
-    setAgentActionMessage(null);
+    setPendingToolCall(null);
+    setToolError(null);
     const userMessage: ChatMessage = {
       id: crypto.randomUUID(),
       role: "user",
@@ -404,7 +346,7 @@ export function AgentPage({
     setError(null);
 
     const request = AgentService.Chat({
-      prompt: buildAgentPrompt(mode, messages, text),
+      prompt: buildAgentPrompt(mode, messages, text, toolCatalog),
       scope: { projectID: projectID || undefined },
       toolIDs: shouldUseAgentToolContext(text) ? undefined : [],
     });
@@ -415,7 +357,11 @@ export function AgentPage({
         return;
       }
       setLastToolResults(response?.toolResults ?? []);
-      appendAssistantResponse(response);
+      const parsed = parseAgentToolRequest(response?.message ?? "");
+      appendAssistantResponse(response, parsed.cleanedMessage);
+      if (parsed.call) {
+        setPendingToolCall(parsed.call);
+      }
       if (response?.model) {
         setModel(response.model);
         setStatus((current) =>
@@ -451,40 +397,103 @@ export function AgentPage({
     ]);
   };
 
-  const appendAssistantResponse = (response: AgentChatResponse | null) => {
+  const appendAssistantResponse = (
+    response: AgentChatResponse | null,
+    contentOverride?: string,
+  ) => {
     setMessages((current) => [
       ...current,
       {
         id: crypto.randomUUID(),
         role: "assistant",
-        content: response?.message?.trim() || "No response returned.",
+        content:
+          contentOverride?.trim() ||
+          response?.message?.trim() ||
+          "No response returned.",
         model: response?.model,
         toolResults: response?.toolResults,
       },
     ]);
   };
 
-  const runAgentAction = async (action: AgentActionSuggestion) => {
-    setAgentActionBusyID(action.id);
-    setAgentActionMessage(null);
-    try {
-      if (action.kind === "check_updates") {
-        await onCheckUpdates?.();
-      } else if (action.kind === "open_updates") {
-        onOpenUpdates?.();
-      } else if (action.kind === "plan_project_update") {
-        await onPlanProjectUpdate?.(action.project);
-      } else if (action.kind === "project_action") {
-        await onProjectAction?.(action.action, action.project);
-      } else if (action.kind === "prune") {
-        await onPlanPrune?.(action.pruneKind);
-      }
-      setAgentActionMessage(agentActionSuccessMessage(action));
-    } catch (nextError) {
-      setAgentActionMessage(errorMessage(nextError, "Agent action failed"));
-    } finally {
-      setAgentActionBusyID("");
+  const approveToolCall = async () => {
+    if (!pendingToolCall) {
+      return;
     }
+    const call = pendingToolCall;
+    setToolBusy(true);
+    setToolError(null);
+    try {
+      const result = await AgentService.ExecuteTool({
+        arguments: call.arguments,
+        reason: call.reason,
+        scope: { projectID: projectID || undefined },
+        toolID: call.toolID,
+      });
+      const safeResult: AgentToolResult = result ?? {
+        toolID: call.toolID,
+        title: call.toolID,
+        error: "Tool returned no result.",
+      };
+      setLastToolResults([safeResult]);
+      const toolMessage: ChatMessage = {
+        id: crypto.randomUUID(),
+        role: "system",
+        content: formatAgentToolResult(safeResult),
+      };
+      const nextMessages = [...messages, toolMessage];
+      setMessages(nextMessages);
+      setPendingToolCall(null);
+      setSending(true);
+      const request = AgentService.Chat({
+        prompt: buildAgentPrompt(
+          mode,
+          nextMessages,
+          "Use the approved Cairn tool result above to continue answering the user's latest request. If another tool is required, request exactly one next tool.",
+          toolCatalog,
+        ),
+        scope: { projectID: projectID || undefined },
+        toolIDs: [],
+      });
+      requestRef.current = request;
+      const response = await request;
+      if (stoppedRef.current) {
+        return;
+      }
+      const parsed = parseAgentToolRequest(response?.message ?? "");
+      appendAssistantResponse(response, parsed.cleanedMessage);
+      if (parsed.call) {
+        setPendingToolCall(parsed.call);
+      }
+      if (response?.model) {
+        setModel(response.model);
+      }
+    } catch (nextError) {
+      setToolError(errorMessage(nextError, "Agent tool failed"));
+    } finally {
+      if (!stoppedRef.current) {
+        setSending(false);
+      }
+      setToolBusy(false);
+      requestRef.current = null;
+    }
+  };
+
+  const declineToolCall = () => {
+    if (!pendingToolCall || toolBusy) {
+      return;
+    }
+    const call = pendingToolCall;
+    setPendingToolCall(null);
+    setToolError(null);
+    setMessages((current) => [
+      ...current,
+      {
+        id: crypto.randomUUID(),
+        role: "system",
+        content: `Tool request declined: ${call.toolID}.`,
+      },
+    ]);
   };
 
   return (
@@ -590,7 +599,8 @@ export function AgentPage({
               onClick={() => {
                 setMessages([]);
                 setLastToolResults([]);
-                setAgentActionMessage(null);
+                setPendingToolCall(null);
+                setToolError(null);
               }}
               size="sm"
               variant="ghost"
@@ -615,15 +625,6 @@ export function AgentPage({
                 <ChatBubble key={message.id} message={message} />
               ))}
             </div>
-
-            <AgentActionsPanel
-              actions={agentActions}
-              busyID={agentActionBusyID}
-              message={agentActionMessage}
-              onRun={(action) => {
-                void runAgentAction(action);
-              }}
-            />
 
             <div className="rounded-card border border-border bg-bg-card p-3">
               <div className="mb-3 flex flex-wrap gap-2">
@@ -723,6 +724,17 @@ export function AgentPage({
           />
         </div>
       </div>
+      <ToolApprovalModal
+        busy={toolBusy}
+        error={toolError}
+        onApprove={() => {
+          void approveToolCall();
+        }}
+        onDecline={declineToolCall}
+        open={Boolean(pendingToolCall)}
+        spec={pendingToolSpec}
+        tool={pendingToolCall}
+      />
     </div>
   );
 }
@@ -997,57 +1009,104 @@ function PlanStatusIcon({ status }: { status: AgentPlanItem["status"] }) {
   );
 }
 
-function AgentActionsPanel({
-  actions,
-  busyID,
-  message,
-  onRun,
+function ToolApprovalModal({
+  busy,
+  error,
+  onApprove,
+  onDecline,
+  open,
+  spec,
+  tool,
 }: {
-  actions: AgentActionSuggestion[];
-  busyID: string;
-  message: string | null;
-  onRun: (action: AgentActionSuggestion) => void;
+  busy: boolean;
+  error: string | null;
+  onApprove: () => void;
+  onDecline: () => void;
+  open: boolean;
+  spec?: AgentToolSpec;
+  tool: AgentToolCall | null;
 }) {
-  if (actions.length === 0 && !message) {
-    return null;
-  }
+  const canApprove = Boolean(tool && spec);
   return (
-    <div
-      className="shrink-0 rounded-card border border-border bg-bg-card p-3"
-      data-testid="agent-actions-panel"
+    <Modal
+      busy={busy}
+      footer={
+        <div className="flex justify-end gap-2">
+          <Button disabled={busy} onClick={onDecline} variant="secondary">
+            Decline
+          </Button>
+          <Button
+            disabled={!canApprove}
+            disabledReason="Unknown tool"
+            loading={busy}
+            onClick={onApprove}
+            variant="primary"
+          >
+            Allow
+          </Button>
+        </div>
+      }
+      onClose={onDecline}
+      open={open}
+      title="Allow Agent Tool?"
     >
-      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-        <div className="text-sm font-semibold text-text-primary">
-          Cairn actions
-        </div>
-        <Badge tone="info">Cairn workflow</Badge>
-      </div>
-      {actions.length > 0 ? (
-        <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
-          {actions.map((action) => (
-            <button
-              className="rounded-control border border-border bg-bg-inset px-3 py-2 text-left text-sm hover:border-accent disabled:cursor-not-allowed disabled:opacity-60"
-              disabled={Boolean(busyID)}
-              key={action.id}
-              onClick={() => onRun(action)}
-              type="button"
-            >
-              <div className="font-medium text-text-primary">
-                {busyID === action.id ? "Working..." : action.label}
+      {tool ? (
+        <div className="space-y-3">
+          <div className="rounded-control border border-border bg-bg-inset p-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="font-semibold text-text-primary">
+                {spec?.name ?? tool.toolID}
+              </span>
+              <Badge tone={spec?.readOnly ? "info" : "warn"}>
+                {spec?.readOnly ? "read-only" : "changes Docker state"}
+              </Badge>
+            </div>
+            <div className="mt-1 text-xs text-text-muted">
+              {spec?.description ?? "This tool is not in the local catalog."}
+            </div>
+          </div>
+
+          <div>
+            <div className="mb-1 text-xs uppercase text-text-muted">Reason</div>
+            <div className="rounded-control border border-border bg-bg-inset p-2 text-text-primary">
+              {tool.reason || "No reason provided."}
+            </div>
+          </div>
+
+          <div>
+            <div className="mb-1 text-xs uppercase text-text-muted">
+              Arguments
+            </div>
+            <pre className="max-h-56 overflow-auto rounded-control border border-border bg-bg-inset p-2 text-xs text-text-primary">
+              {formatToolArguments(tool.arguments)}
+            </pre>
+          </div>
+
+          {spec?.argumentSchema ? (
+            <div>
+              <div className="mb-1 text-xs uppercase text-text-muted">
+                Expected shape
               </div>
-              <div className="mt-1 text-xs text-text-muted">
-                {action.description}
-              </div>
-            </button>
-          ))}
+              <pre className="max-h-32 overflow-auto rounded-control border border-border bg-bg-inset p-2 text-xs text-text-muted">
+                {spec.argumentSchema}
+              </pre>
+            </div>
+          ) : null}
+
+          {!spec ? (
+            <div className="rounded-control border border-error/30 bg-error/10 p-2 text-error">
+              Unknown tool. Decline this request.
+            </div>
+          ) : null}
+
+          {error ? (
+            <div className="rounded-control border border-error/30 bg-error/10 p-2 text-error">
+              {error}
+            </div>
+          ) : null}
         </div>
       ) : null}
-      {message ? (
-        <div className="mt-2 rounded-control border border-info/20 bg-info/10 px-3 py-2 text-sm text-info">
-          {message}
-        </div>
-      ) : null}
-    </div>
+    </Modal>
   );
 }
 
@@ -1595,6 +1654,7 @@ function buildAgentPrompt(
   mode: AgentMode,
   messages: ChatMessage[],
   prompt: string,
+  toolCatalog: AgentToolSpec[],
 ) {
   const history = messages
     .slice(-6)
@@ -1602,10 +1662,22 @@ function buildAgentPrompt(
     .join("\n");
   const modeInstruction =
     mode === "agent"
-      ? 'Agent mode: use Cairn context when it helps, then answer with concrete next steps. For larger troubleshooting, implementation, migration, or debugging requests, include a Markdown section named "Plan" with one task per line using bare checkboxes: [ ] todo, [-] in progress, and [x] done where those statuses are known. For simple capability, identity, greeting, or conceptual questions, answer directly without a plan and without diagnosing current Docker state. Do not claim that mutations were executed. If the request asks to update, pull, redeploy, restart, stop, start, prune, or otherwise mutate Docker state, explain that Cairn will show safe action buttons and confirmation previews for supported actions.'
-      : 'Ask mode: answer directly and concisely with Docker-specific guidance. For larger troubleshooting, implementation, migration, or debugging requests, include a Markdown section named "Plan" with one task per line using bare checkboxes: [ ] todo, [-] in progress, and [x] done where those statuses are known. For simple questions, skip the plan. Do not claim that mutations were executed; Cairn shows action buttons and confirmation previews for supported mutations.';
+      ? 'Agent mode: use Cairn context and Cairn tools when they help. For larger troubleshooting, implementation, migration, or debugging requests, include a Markdown section named "Plan" with one task per line using bare checkboxes: [ ] todo, [-] in progress, and [x] done where those statuses are known. For simple capability, identity, greeting, or conceptual questions, answer directly without a plan and without diagnosing current Docker state. If you need to inspect or change Docker state, request exactly one Cairn tool using a fenced ```cairn-tool JSON block and wait for approval/results. Do not claim that a mutation was executed until a Cairn tool result says it completed.'
+      : 'Ask mode: answer directly and concisely with Docker-specific guidance. For larger troubleshooting, implementation, migration, or debugging requests, include a Markdown section named "Plan" with one task per line using bare checkboxes: [ ] todo, [-] in progress, and [x] done where those statuses are known. For simple questions, skip the plan. If the user asks you to actually inspect or change Docker state, request exactly one Cairn tool using a fenced ```cairn-tool JSON block.';
+  const toolList =
+    toolCatalog.length > 0
+      ? `Available Cairn tools:\n${toolCatalog
+          .map(
+            (tool) =>
+              `- ${tool.id}: ${tool.name}. ${tool.description} Args: ${tool.argumentSchema || "{}"}`,
+          )
+          .join(
+            "\n",
+          )}\n\nTool request format:\n\`\`\`cairn-tool\n{"toolID":"tool.id","reason":"why this tool is needed","arguments":{}}\n\`\`\``
+      : "";
   return [
     modeInstruction,
+    toolList,
     history ? `Recent conversation:\n${history}` : "",
     `Current request:\n${prompt}`,
   ]
@@ -1613,234 +1685,84 @@ function buildAgentPrompt(
     .join("\n\n");
 }
 
-function latestUserContent(messages: ChatMessage[]) {
-  return (
-    [...messages].reverse().find((message) => message.role === "user")
-      ?.content ?? ""
-  );
-}
-
-function detectAgentActionSuggestions({
-  hasCheckUpdates,
-  hasOpenUpdates,
-  hasPlanProjectUpdate,
-  hasPlanPrune,
-  hasProjectAction,
-  projects,
-  prompt,
-  selectedProject,
-}: {
-  hasCheckUpdates: boolean;
-  hasOpenUpdates: boolean;
-  hasPlanProjectUpdate: boolean;
-  hasPlanPrune: boolean;
-  hasProjectAction: boolean;
-  projects: ProjectSummary[];
-  prompt: string;
-  selectedProject?: ProjectSummary;
-}): AgentActionSuggestion[] {
-  const normalized = prompt.toLowerCase();
-  if (!normalized.trim()) {
-    return [];
+function parseAgentToolRequest(message: string): {
+  call: AgentToolCall | null;
+  cleanedMessage: string;
+} {
+  const fence = /```cairn-tool\s*([\s\S]*?)```/i.exec(message);
+  const inline = !fence
+    ? /CAIRN_TOOL_REQUEST\s*({[\s\S]*})/i.exec(message)
+    : null;
+  const raw = (fence?.[1] ?? inline?.[1] ?? "").trim();
+  const cleanedMessage = (
+    fence
+      ? message.replace(fence[0], "")
+      : inline
+        ? message.replace(inline[0], "")
+        : message
+  ).trim();
+  if (!raw) {
+    return { call: null, cleanedMessage };
   }
-  const suggestions: AgentActionSuggestion[] = [];
-  const add = (action: AgentActionSuggestion) => {
-    if (!suggestions.some((item) => item.id === action.id)) {
-      suggestions.push(action);
+  try {
+    const parsed = JSON.parse(raw) as {
+      args?: unknown;
+      arguments?: unknown;
+      reason?: unknown;
+      tool?: unknown;
+      toolID?: unknown;
+    };
+    const toolID =
+      typeof parsed.toolID === "string"
+        ? parsed.toolID
+        : typeof parsed.tool === "string"
+          ? parsed.tool
+          : "";
+    if (!toolID.trim()) {
+      return { call: null, cleanedMessage };
     }
-  };
-
-  const updateIntent =
-    /\b(upgrade|update|updates|newer|latest|outdated)\b/.test(normalized) &&
-    /\b(image|images|container|containers|service|services|project|projects|compose|stack|stacks|all|everything)\b/.test(
-      normalized,
-    );
-  if (updateIntent) {
-    if (hasCheckUpdates) {
-      add({
-        description: "Runs Cairn's update detector against known projects.",
-        id: "check-updates",
-        kind: "check_updates",
-        label: "Check updates",
-      });
-    }
-    if (hasOpenUpdates) {
-      add({
-        description: "Opens the Updates page for review and history.",
-        id: "open-updates",
-        kind: "open_updates",
-        label: "Open Updates",
-      });
-    }
-    if (hasPlanProjectUpdate) {
-      for (const project of updateActionProjects(projects, selectedProject)) {
-        add({
-          description: `${projectActionableUpdateCount(project)} actionable update${projectActionableUpdateCount(project) === 1 ? "" : "s"}; opens Cairn's update preview.`,
-          id: `plan-project-update:${project.id}`,
-          kind: "plan_project_update",
-          label: `Plan update: ${project.name}`,
-          project,
-        });
-      }
-    }
-  }
-
-  if (hasProjectAction) {
-    const project =
-      selectedProject ?? (projects.length === 1 ? projects[0] : undefined);
-    if (project) {
-      const projectAction = projectActionIntent(normalized);
-      if (projectAction) {
-        add({
-          action: projectAction,
-          description: projectActionDescription(projectAction, project.name),
-          id: `project-action:${projectAction}:${project.id}`,
-          kind: "project_action",
-          label: `${projectActionLabel(projectAction)} ${project.name}`,
-          project,
-        });
-      }
-    }
-  }
-
-  if (
-    hasPlanPrune &&
-    /\b(prune|cleanup|clean up|remove unused|dangling)\b/.test(normalized)
-  ) {
-    const pruneKind = pruneKindIntent(normalized);
-    add({
-      description: "Opens Cairn's command-plan confirmation before pruning.",
-      id: `prune:${pruneKind}`,
-      kind: "prune",
-      label: `Plan prune: ${pruneKindLabel(pruneKind)}`,
-      pruneKind,
-    });
-  }
-
-  return suggestions.slice(0, 8);
-}
-
-function updateActionProjects(
-  projects: ProjectSummary[],
-  selectedProject?: ProjectSummary,
-) {
-  if (selectedProject && projectActionableUpdateCount(selectedProject) > 0) {
-    return [selectedProject];
-  }
-  const actionable = projects.filter(
-    (project) => projectActionableUpdateCount(project) > 0,
-  );
-  if (actionable.length > 0) {
-    return actionable.slice(0, 5);
-  }
-  return selectedProject
-    ? [selectedProject]
-    : projects.length === 1
-      ? [projects[0]]
-      : [];
-}
-
-function projectActionableUpdateCount(project: ProjectSummary) {
-  const badges = project.updateBadges;
-  return (
-    (badges?.imageUpdates ?? 0) +
-    (badges?.baseUpdates ?? 0) +
-    (badges?.rebuildNeeded ?? 0)
-  );
-}
-
-function projectActionIntent(value: string): AgentProjectAction | null {
-  if (/\b(redeploy|recreate|rebuild)\b/.test(value)) {
-    return "redeploy";
-  }
-  if (/\b(restart|reload)\b/.test(value)) {
-    return "restart";
-  }
-  if (/\b(stop|shutdown|shut down)\b/.test(value)) {
-    return "stop";
-  }
-  if (/\b(start|run|up)\b/.test(value)) {
-    return "start";
-  }
-  if (/\b(pull|fetch)\b/.test(value)) {
-    return "pull";
-  }
-  return null;
-}
-
-function projectActionLabel(action: AgentProjectAction) {
-  switch (action) {
-    case "pull":
-      return "Pull";
-    case "redeploy":
-      return "Redeploy";
-    case "restart":
-      return "Restart";
-    case "start":
-      return "Start";
-    case "stop":
-      return "Stop";
+    const args = parsed.arguments ?? parsed.args ?? {};
+    return {
+      call: {
+        arguments:
+          typeof args === "string" ? args : JSON.stringify(args ?? {}, null, 2),
+        reason:
+          typeof parsed.reason === "string"
+            ? parsed.reason
+            : "The agent requested this tool.",
+        toolID: toolID.trim(),
+      },
+      cleanedMessage:
+        cleanedMessage ||
+        `I need your approval to run the Cairn tool \`${toolID.trim()}\`.`,
+    };
+  } catch {
+    return {
+      call: null,
+      cleanedMessage:
+        cleanedMessage ||
+        "I tried to request a Cairn tool, but the tool JSON was invalid.",
+    };
   }
 }
 
-function projectActionDescription(
-  action: AgentProjectAction,
-  projectName: string,
-) {
-  switch (action) {
-    case "pull":
-      return `Runs compose pull for ${projectName}.`;
-    case "redeploy":
-      return `Creates a redeploy preview for ${projectName}.`;
-    case "restart":
-      return `Restarts ${projectName}.`;
-    case "start":
-      return `Starts ${projectName}.`;
-    case "stop":
-      return `Stops ${projectName}.`;
+function formatToolArguments(value: string) {
+  try {
+    return JSON.stringify(JSON.parse(value || "{}"), null, 2);
+  } catch {
+    return value || "{}";
   }
 }
 
-function pruneKindIntent(value: string): AgentPruneKind {
-  if (/\b(volume|volumes)\b/.test(value)) {
-    return "volumes";
-  }
-  if (/\b(container|containers)\b/.test(value)) {
-    return "containers";
-  }
-  if (/\b(network|networks)\b/.test(value)) {
-    return "networks";
-  }
-  if (/\b(build cache|builder|cache)\b/.test(value)) {
-    return "build-cache";
-  }
-  if (/\b(system|everything|all)\b/.test(value)) {
-    return "system";
-  }
-  return "images";
-}
-
-function pruneKindLabel(kind: AgentPruneKind) {
-  return kind === "build-cache" ? "build cache" : kind;
-}
-
-function agentActionSuccessMessage(action: AgentActionSuggestion) {
-  if (action.kind === "check_updates") {
-    return "Update check started.";
-  }
-  if (action.kind === "open_updates") {
-    return "Opened Updates.";
-  }
-  if (action.kind === "plan_project_update") {
-    return `Opened update preview for ${action.project.name}.`;
-  }
-  if (action.kind === "project_action") {
-    return `${projectActionLabel(action.action)} requested for ${action.project.name}.`;
-  }
-  if (action.kind === "prune") {
-    return `Opened prune preview for ${pruneKindLabel(action.pruneKind)}.`;
-  }
-  return "Action requested.";
+function formatAgentToolResult(result: AgentToolResult) {
+  return [
+    `Cairn tool result: ${result.title} [${result.toolID}]`,
+    result.summary ? `Summary: ${result.summary}` : "",
+    result.error ? `Error: ${result.error}` : "",
+    result.data ? `Data:\n${result.data}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 function shouldUseAgentToolContext(prompt: string) {

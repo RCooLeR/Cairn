@@ -192,6 +192,7 @@ const agentServiceMock = vi.hoisted(() => ({
   ApplyFileEdit: vi.fn(),
   Chat: vi.fn(),
   DraftProjectFile: vi.fn(),
+  ExecuteTool: vi.fn(),
   PlanFileEdit: vi.fn(),
   Status: vi.fn(),
   ToolCatalog: vi.fn(),
@@ -555,7 +556,30 @@ describe("App inventory shell", () => {
       bytesWritten: 14,
       appliedAt: "2026-06-13T09:00:00Z",
     });
-    agentServiceMock.ToolCatalog.mockResolvedValue([]);
+    agentServiceMock.ToolCatalog.mockResolvedValue([
+      {
+        id: "updates.check_all",
+        name: "Check all updates",
+        description: "Run Cairn's update detector for all known projects.",
+        readOnly: false,
+        requiresApproval: true,
+        argumentSchema: "{}",
+      },
+      {
+        id: "docker.containers",
+        name: "Containers",
+        description: "All containers and status.",
+        readOnly: true,
+        requiresApproval: false,
+        argumentSchema: "{}",
+      },
+    ]);
+    agentServiceMock.ExecuteTool.mockResolvedValue({
+      toolID: "updates.check_all",
+      title: "Check all updates",
+      summary: "Update check started",
+      data: '{\n  "jobID": "updates-check-job"\n}',
+    });
     registryServiceMock.KnownRegistries.mockResolvedValue([
       { name: "Docker Hub", registry: "docker.io" },
     ]);
@@ -822,12 +846,23 @@ describe("App inventory shell", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("offers Cairn update actions from agent requests", async () => {
+  it("asks approval for model-requested Cairn tools and continues with the result", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
     projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
     agentServiceMock.Chat.mockResolvedValueOnce({
+      message: [
+        "I need to check updates first.",
+        "",
+        "```cairn-tool",
+        '{"toolID":"updates.check_all","reason":"Find available image updates before planning changes.","arguments":{}}',
+        "```",
+      ].join("\n"),
+      toolResults: [],
+      model: "gemma4:12b",
+    });
+    agentServiceMock.Chat.mockResolvedValueOnce({
       message:
-        "I can prepare the update workflow, but Cairn will ask for confirmation before applying changes.",
+        "The update check has started. Review update results when it finishes.",
       toolResults: [],
       model: "gemma4:12b",
     });
@@ -851,32 +886,47 @@ describe("App inventory shell", () => {
     });
     fireEvent.keyDown(input, { key: "Enter" });
 
-    const actions = await screen.findByTestId("agent-actions-panel");
-    fireEvent.click(
-      within(actions).getByRole("button", { name: /Check updates/ }),
-    );
-    await waitFor(() =>
-      expect(updateServiceMock.CheckAllUpdates).toHaveBeenCalled(),
-    );
-
-    fireEvent.click(
-      within(actions).getByRole("button", { name: /Plan update: app-db/ }),
-    );
-    await waitFor(() =>
-      expect(updateServiceMock.PlanProjectUpdate).toHaveBeenCalledWith(
-        "linux_native/app-db",
+    const dialog = await screen.findByRole("dialog", {
+      name: "Allow Agent Tool?",
+    });
+    expect(within(dialog).getByText("Check all updates")).toBeInTheDocument();
+    expect(
+      within(dialog).getByText(
+        "Find available image updates before planning changes.",
       ),
+    ).toBeInTheDocument();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Allow" }));
+
+    await waitFor(() =>
+      expect(agentServiceMock.ExecuteTool).toHaveBeenCalledWith({
+        arguments: "{}",
+        reason: "Find available image updates before planning changes.",
+        scope: { projectID: undefined },
+        toolID: "updates.check_all",
+      }),
     );
     expect(
-      await screen.findByText("$ docker compose pull app"),
+      await screen.findByText(
+        "The update check has started. Review update results when it finishes.",
+      ),
     ).toBeInTheDocument();
+    expect(agentServiceMock.Chat).toHaveBeenCalledTimes(2);
+    expect(agentServiceMock.Chat.mock.calls[1][0].prompt).toContain(
+      "Cairn tool result: Check all updates [updates.check_all]",
+    );
   });
 
-  it("offers Cairn prune confirmation from agent cleanup requests", async () => {
+  it("lets users decline a requested Cairn tool", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
     agentServiceMock.Chat.mockResolvedValueOnce({
-      message:
-        "I can prepare a cleanup preview. Confirm it in Cairn before anything is removed.",
+      message: [
+        "I can inspect containers.",
+        "",
+        "```cairn-tool",
+        '{"toolID":"docker.containers","reason":"List containers before diagnosing runtime state.","arguments":{"all":true}}',
+        "```",
+      ].join("\n"),
       toolResults: [],
       model: "gemma4:12b",
     });
@@ -898,17 +948,15 @@ describe("App inventory shell", () => {
     });
     fireEvent.keyDown(input, { key: "Enter" });
 
-    const actions = await screen.findByTestId("agent-actions-panel");
-    fireEvent.click(
-      within(actions).getByRole("button", { name: /Plan prune: images/ }),
-    );
+    const dialog = await screen.findByRole("dialog", {
+      name: "Allow Agent Tool?",
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Decline" }));
 
-    await waitFor(() =>
-      expect(dockerServiceMock.PlanPrune).toHaveBeenCalledWith("images"),
-    );
     expect(
-      await screen.findByRole("dialog", { name: "Prune images" }),
+      await screen.findByText("Tool request declined: docker.containers."),
     ).toBeInTheDocument();
+    expect(agentServiceMock.ExecuteTool).not.toHaveBeenCalled();
   });
 
   it("opens the notification center and marks notifications read", async () => {

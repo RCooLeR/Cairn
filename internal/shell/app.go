@@ -84,6 +84,7 @@ func Run(assets fs.FS) error {
 		Docker:   dockerService,
 		Project:  projectService,
 		Logs:     logsService,
+		Update:   updateService,
 		Plans:    agentFilePlans,
 	}
 	runtimeController := newAppRuntime(appRuntimeConfig{

@@ -371,6 +371,34 @@ export class AgentStatus {
     }
 }
 
+export class AgentToolExecutionRequest {
+    "toolID": string;
+    "reason"?: string;
+    "arguments"?: string;
+    "scope"?: AgentScope;
+
+    /** Creates a new AgentToolExecutionRequest instance. */
+    constructor($$source: Partial<AgentToolExecutionRequest> = {}) {
+        if (!("toolID" in $$source)) {
+            this["toolID"] = "";
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new AgentToolExecutionRequest instance from a string or object.
+     */
+    static createFrom($$source: any = {}): AgentToolExecutionRequest {
+        const $$createField3_0 = $$createType0;
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        if ("scope" in $$parsedSource) {
+            $$parsedSource["scope"] = $$createField3_0($$parsedSource["scope"]);
+        }
+        return new AgentToolExecutionRequest($$parsedSource as Partial<AgentToolExecutionRequest>);
+    }
+}
+
 export class AgentToolResult {
     "toolID": string;
     "title": string;
@@ -404,6 +432,8 @@ export class AgentToolSpec {
     "name": string;
     "description": string;
     "readOnly": boolean;
+    "requiresApproval": boolean;
+    "argumentSchema"?: string;
 
     /** Creates a new AgentToolSpec instance. */
     constructor($$source: Partial<AgentToolSpec> = {}) {
@@ -418,6 +448,9 @@ export class AgentToolSpec {
         }
         if (!("readOnly" in $$source)) {
             this["readOnly"] = false;
+        }
+        if (!("requiresApproval" in $$source)) {
+            this["requiresApproval"] = false;
         }
 
         Object.assign(this, $$source);

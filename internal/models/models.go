@@ -724,10 +724,12 @@ type AgentStatus struct {
 }
 
 type AgentToolSpec struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	ReadOnly    bool   `json:"readOnly"`
+	ID               string `json:"id"`
+	Name             string `json:"name"`
+	Description      string `json:"description"`
+	ReadOnly         bool   `json:"readOnly"`
+	RequiresApproval bool   `json:"requiresApproval"`
+	ArgumentSchema   string `json:"argumentSchema,omitempty"`
 }
 
 type AgentScope struct {
@@ -749,6 +751,13 @@ type AgentToolResult struct {
 	Summary string `json:"summary,omitempty"`
 	Data    string `json:"data,omitempty"`
 	Error   string `json:"error,omitempty"`
+}
+
+type AgentToolExecutionRequest struct {
+	ToolID    string     `json:"toolID"`
+	Reason    string     `json:"reason,omitempty"`
+	Arguments string     `json:"arguments,omitempty"`
+	Scope     AgentScope `json:"scope,omitempty"`
 }
 
 type AgentChatResponse struct {

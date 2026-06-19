@@ -59,16 +59,20 @@ On wide windows, the latest model-returned plan and agent log appear beside the 
 
 The log panel is an activity trail for the latest run. It records steps such as understanding the request, creating a plan or direct answer shape, using context tools, and providing the final model answer. It does not display raw tool summaries as the primary log content.
 
-## Cairn Actions
+## Cairn Tools
 
-For supported mutation requests, the Agent screen shows Cairn action buttons instead of relying on raw shell advice. These buttons call existing Cairn workflows:
+The Agent can request Cairn tools for Docker/app work. The model must ask for one tool at a time using a structured `cairn-tool` JSON block. Cairn then shows an allow/decline dialog with the exact tool, reason, and arguments before execution.
 
-- Check updates and open the Updates page.
-- Plan a project update through the update preview modal.
-- Run project lifecycle actions such as pull, start, stop, restart, and redeploy.
-- Create prune previews for images, containers, networks, volumes, build cache, or system cleanup.
+The toolset covers:
 
-The local model does not execute Docker mutations directly. Dangerous or state-changing work still goes through Cairn's normal command-plan preview, confirmation modal, audit trail, and update progress flow.
+- Docker inventory and inspect data for engine, projects, containers, images, volumes, networks, logs, and container files.
+- Update workflows such as check all updates, check one project, create project/service update plans, and apply approved update plans.
+- Compose project actions such as start, stop, restart, pull, redeploy plan, and down plan.
+- Container actions such as start, stop, restart, kill plan, and remove plan.
+- Image, volume, network, and prune planning/creation workflows, plus approved plan application where Cairn supports it.
+- Project configuration file edit plans for `.env`, Compose YAML, Dockerfiles, and shallow config files, plus approved file-edit application.
+
+Approved tools execute through Cairn services, not raw model text. Destructive or dangerous work still goes through Cairn's command-plan preview, typed confirmation where required, audit trail, and progress flow.
 
 ## App Analysis
 
@@ -100,4 +104,4 @@ The preview stores a short-lived plan and verifies the original file hash before
 
 ## Limits
 
-The model itself does not run Docker commands. Supported mutations are exposed as Cairn action buttons that open existing safe workflows; unsupported mutations should be treated as guidance until Cairn provides an action for them. Project file edits are limited to the explicit preview/apply flow above.
+The model itself does not run arbitrary shell commands. It can only request known Cairn tools, and the user must allow or decline each requested tool. Unsupported mutations should be treated as guidance until Cairn provides a tool for them. Project file edits are limited to the explicit preview/apply flow above.
