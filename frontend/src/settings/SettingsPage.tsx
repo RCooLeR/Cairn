@@ -450,8 +450,12 @@ export function SettingsPage({
                 disabled={saving}
                 label="Preferred model"
                 onSave={(value) => onSettingChange("agent.model", value)}
-                placeholder="gemma4:12b"
-                value={settingString(settings, "agent.model", "gemma4:12b")}
+                placeholder="gemma4:12b-it-q8_0"
+                value={settingString(
+                  settings,
+                  "agent.model",
+                  "gemma4:12b-it-q8_0",
+                )}
               />
               <SettingsNumberSetting
                 disabled={saving}
@@ -465,7 +469,7 @@ export function SettingsPage({
               />
               <ReadOnlySetting
                 label="Fallback order"
-                value="gemma4:12b -> qwen2.5-coder -> deepseek-coder-v2 -> llama3.1 -> mistral -> codellama -> gemma3"
+                value="gemma4:12b-it-q8_0 -> gemma4:12b -> gemma4/devstral/gpt-oss/granite -> qwen2.5-coder -> deepseek-coder-v2 -> llama3.1 -> mistral -> codellama -> gemma3"
               />
             </CardBody>
           </Card>

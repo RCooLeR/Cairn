@@ -1,6 +1,6 @@
 # Local Docker Agent
 
-Cairn includes an optional local LLM agent for Docker-focused help. It is read-only: it can inspect Cairn's Docker inventory, selected project metadata, selected Docker/Compose files, container logs, image details, and network details, but it does not execute mutations.
+Cairn includes an optional local LLM agent for Docker-focused help. It can inspect Cairn's Docker inventory, selected project metadata, selected Docker/Compose files, container logs, image details, and network details. It can also request approval-gated Cairn tools for Docker actions, update workflows, and project file edits.
 
 ## Default Runtime
 
@@ -16,7 +16,7 @@ On startup or refresh, Cairn calls the local model-list endpoint and selects a m
 2. Otherwise choose the first installed model from Cairn's preferred list.
 3. Otherwise choose the first installed model returned by the local runtime.
 
-The preferred order starts with `gemma4:12b`, then coder/general fallbacks such as `qwen2.5-coder`, `deepseek-coder-v2`, `llama3.1`, `mistral`, `codellama`, and `gemma3`.
+The preferred order starts with `gemma4:12b-it-q8_0`, then `gemma4:12b`, then other chat/code-capable fallbacks such as `gemma4:26b`, `devstral-small-2:24b`, `gpt-oss:20b`, `granite4.1:8b`, `qwen2.5-coder`, `deepseek-coder-v2`, `llama3.1`, `mistral`, `codellama`, and `gemma3`.
 
 ## Settings
 
@@ -28,7 +28,7 @@ Open `Settings -> Agent` to change:
 - Preferred model
 - Maximum context lines sent to the model
 
-The selected model is persisted after discovery, so if `gemma4:12b` is not installed and `qwen2.5-coder:7b` is available, Cairn will remember `qwen2.5-coder:7b`.
+The selected model is persisted after discovery, so if `gemma4:12b-it-q8_0` is not installed but `gemma4:12b` is available, Cairn will remember `gemma4:12b`. If neither Gemma 4 preference is installed and `qwen2.5-coder:7b` is available, Cairn will remember `qwen2.5-coder:7b`.
 
 ## Tool Context
 

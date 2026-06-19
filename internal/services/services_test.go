@@ -187,7 +187,7 @@ func TestAgentServiceStatusSelectsPreferredAvailableModel(t *testing.T) {
 		if r.URL.Path != "/api/tags" {
 			t.Fatalf("path = %s, want /api/tags", r.URL.Path)
 		}
-		_, _ = w.Write([]byte(`{"models":[{"name":"llama3.1:8b"},{"name":"qwen2.5-coder:7b"}]}`))
+		_, _ = w.Write([]byte(`{"models":[{"name":"llama3.1:8b"},{"name":"qwen2.5-coder:7b"},{"name":"gemma4:12b"},{"name":"gemma4:12b-it-q8_0"}]}`))
 	}))
 	t.Cleanup(server.Close)
 	if err := db.Settings().SetString(ctx, "agent.endpoint", server.URL); err != nil {
@@ -204,17 +204,17 @@ func TestAgentServiceStatusSelectsPreferredAvailableModel(t *testing.T) {
 	if status == nil || !status.Enabled || !status.Reachable {
 		t.Fatalf("Status() = %#v, want enabled and reachable", status)
 	}
-	if status.Model != "qwen2.5-coder:7b" {
-		t.Fatalf("Status().Model = %q, want qwen2.5-coder:7b", status.Model)
+	if status.Model != "gemma4:12b-it-q8_0" {
+		t.Fatalf("Status().Model = %q, want gemma4:12b-it-q8_0", status.Model)
 	}
-	if len(status.AvailableModels) != 2 || status.AvailableModels[0] != "llama3.1:8b" {
+	if len(status.AvailableModels) != 4 || status.AvailableModels[0] != "llama3.1:8b" {
 		t.Fatalf("AvailableModels = %#v", status.AvailableModels)
 	}
 	persisted, err := db.Settings().GetString(ctx, "agent.model")
 	if err != nil {
 		t.Fatalf("GetString agent.model: %v", err)
 	}
-	if persisted != "qwen2.5-coder:7b" {
+	if persisted != "gemma4:12b-it-q8_0" {
 		t.Fatalf("persisted agent.model = %q, want selected fallback", persisted)
 	}
 }

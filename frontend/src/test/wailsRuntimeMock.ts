@@ -767,7 +767,12 @@ const callHandlers: Record<number, (...args: unknown[]) => unknown> = {
     model: "qwen2.5-coder:7b",
     reachable: true,
     availableModels: ["qwen2.5-coder:7b", "llama3.1:8b"],
-    candidateModels: ["gemma4:12b", "qwen2.5-coder:7b", "llama3.1:8b"],
+    candidateModels: [
+      "gemma4:12b-it-q8_0",
+      "gemma4:12b",
+      "qwen2.5-coder:7b",
+      "llama3.1:8b",
+    ],
   }),
   2194297540: () => [
     {
@@ -1068,7 +1073,7 @@ const callHandlers: Record<number, (...args: unknown[]) => unknown> = {
     "agent.enabled": true,
     "agent.provider": "ollama",
     "agent.endpoint": "http://127.0.0.1:11434",
-    "agent.model": "gemma4:12b",
+    "agent.model": "gemma4:12b-it-q8_0",
     "agent.max_context_lines": 400,
   }),
   440305753: () => ["/bin/sh"],

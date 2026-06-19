@@ -27,7 +27,7 @@ const (
 	agentProviderOllama           = "ollama"
 	agentProviderOpenAICompatible = "openai_compatible"
 	agentDefaultEndpoint          = "http://127.0.0.1:11434"
-	agentDefaultModel             = "gemma4:12b"
+	agentDefaultModel             = "gemma4:12b-it-q8_0"
 )
 
 type AgentService struct {
@@ -475,7 +475,7 @@ func (s *AgentService) Chat(ctx context.Context, req models.AgentChatRequest) (*
 		return nil, apperror.New(
 			apperror.ProviderNotReady,
 			"No local LLM models are installed",
-			apperror.WithRepairHints("Install a local Ollama model such as gemma4:12b, qwen2.5-coder:7b, or llama3.1:8b."),
+			apperror.WithRepairHints("Install a local Ollama model such as gemma4:12b-it-q8_0, gemma4:12b, qwen2.5-coder:7b, or llama3.1:8b."),
 		)
 	}
 
@@ -736,7 +736,14 @@ func (s *AgentService) config(ctx context.Context) agentConfig {
 
 func agentCandidateModels() []string {
 	return []string{
+		"gemma4:12b-it-q8_0",
 		"gemma4:12b",
+		"gemma4:26b",
+		"gemma4:4b",
+		"gemma4:latest",
+		"devstral-small-2:24b",
+		"gpt-oss:20b",
+		"granite4.1:8b",
 		"qwen2.5-coder:14b",
 		"qwen2.5-coder:7b",
 		"deepseek-coder-v2:16b",

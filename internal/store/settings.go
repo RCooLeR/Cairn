@@ -22,6 +22,9 @@ const (
 	kindBool   settingKind = "bool"
 	kindInt    settingKind = "int"
 	kindString settingKind = "string"
+
+	defaultAgentModel       = "gemma4:12b-it-q8_0"
+	legacyDefaultAgentModel = "gemma4:12b"
 )
 
 type settingDefault struct {
@@ -45,7 +48,7 @@ var settingDefaults = map[string]settingDefault{
 	"agent.enabled":                   {kind: kindBool, value: true},
 	"agent.provider":                  {kind: kindString, value: "ollama"},
 	"agent.endpoint":                  {kind: kindString, value: "http://127.0.0.1:11434"},
-	"agent.model":                     {kind: kindString, value: "gemma4:12b"},
+	"agent.model":                     {kind: kindString, value: defaultAgentModel},
 	"agent.max_context_lines":         {kind: kindInt, value: 400},
 	"registry.credentials_mode":       {kind: kindString, value: "docker_helper"},
 	"windows.wsl_distro":              {kind: kindString, value: "Ubuntu"},
@@ -76,7 +79,24 @@ func (r *SettingsRepository) EnsureDefaults(ctx context.Context) error {
 			return err
 		}
 	}
-	return nil
+	return r.upgradeLegacySettingDefaults(ctx, now)
+}
+
+func (r *SettingsRepository) upgradeLegacySettingDefaults(ctx context.Context, now string) error {
+	currentAgentModel, err := json.Marshal(defaultAgentModel)
+	if err != nil {
+		return err
+	}
+	legacyAgentModel, err := json.Marshal(legacyDefaultAgentModel)
+	if err != nil {
+		return err
+	}
+	_, err = r.db.ExecContext(ctx, `
+		UPDATE settings
+		SET value = ?, updated_at = ?
+		WHERE key = ? AND value = ?
+	`, string(currentAgentModel), now, "agent.model", string(legacyAgentModel))
+	return err
 }
 
 func (r *SettingsRepository) GetString(ctx context.Context, key string) (string, error) {

@@ -521,15 +521,20 @@ describe("App inventory shell", () => {
       enabled: true,
       provider: "ollama",
       endpoint: "http://127.0.0.1:11434",
-      model: "gemma4:12b",
+      model: "gemma4:12b-it-q8_0",
       reachable: true,
-      availableModels: ["gemma4:12b", "qwen2.5-coder:7b"],
-      candidateModels: ["gemma4:12b", "qwen2.5-coder:7b", "llama3.1:8b"],
+      availableModels: ["gemma4:12b-it-q8_0", "gemma4:12b", "qwen2.5-coder:7b"],
+      candidateModels: [
+        "gemma4:12b-it-q8_0",
+        "gemma4:12b",
+        "qwen2.5-coder:7b",
+        "llama3.1:8b",
+      ],
     });
     agentServiceMock.Chat.mockResolvedValue({
       message: "Agent response.",
       toolResults: [],
-      model: "gemma4:12b",
+      model: "gemma4:12b-it-q8_0",
     });
     agentServiceMock.AnalyzeProject.mockResolvedValue({
       projectID: "linux_native/app-db",
@@ -547,7 +552,7 @@ describe("App inventory shell", () => {
       path: ".env",
       content: "APP_PORT=8080\n",
       summary: "Drafted .env",
-      model: "gemma4:12b",
+      model: "gemma4:12b-it-q8_0",
     });
     agentServiceMock.PlanFileEdit.mockResolvedValue(agentFileEditPlan());
     agentServiceMock.ApplyFileEdit.mockResolvedValue({
@@ -735,7 +740,7 @@ describe("App inventory shell", () => {
           summary: "compose.yaml",
         },
       ],
-      model: "gemma4:12b",
+      model: "gemma4:12b-it-q8_0",
     });
 
     render(<App />);
@@ -800,7 +805,7 @@ describe("App inventory shell", () => {
     expect(screen.getByText("Created plan with 3 tasks")).toBeInTheDocument();
     expect(screen.getByText("Used tool: Project files")).toBeInTheDocument();
     expect(
-      screen.getByText("Provided final answer with gemma4:12b"),
+      screen.getByText("Provided final answer with gemma4:12b-it-q8_0"),
     ).toBeInTheDocument();
   });
 
@@ -816,7 +821,7 @@ describe("App inventory shell", () => {
         "- Orchestration app",
       ].join("\n"),
       toolResults: [],
-      model: "gemma4:12b",
+      model: "gemma4:12b-it-q8_0",
     });
 
     render(<App />);
@@ -858,13 +863,13 @@ describe("App inventory shell", () => {
         "```",
       ].join("\n"),
       toolResults: [],
-      model: "gemma4:12b",
+      model: "gemma4:12b-it-q8_0",
     });
     agentServiceMock.Chat.mockResolvedValueOnce({
       message:
         "The update check has started. Review update results when it finishes.",
       toolResults: [],
-      model: "gemma4:12b",
+      model: "gemma4:12b-it-q8_0",
     });
 
     render(<App />);
@@ -928,7 +933,7 @@ describe("App inventory shell", () => {
         "```",
       ].join("\n"),
       toolResults: [],
-      model: "gemma4:12b",
+      model: "gemma4:12b-it-q8_0",
     });
 
     render(<App />);

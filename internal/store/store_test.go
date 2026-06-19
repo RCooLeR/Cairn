@@ -99,6 +99,40 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestEnsureDefaultsUpgradesLegacyAgentModelDefault(t *testing.T) {
+	ctx := context.Background()
+	s := openMigratedStore(t, ctx)
+	defer closeStore(t, s)
+
+	if err := s.Settings().SetString(ctx, "agent.model", legacyDefaultAgentModel); err != nil {
+		t.Fatalf("SetString legacy agent model: %v", err)
+	}
+	if err := s.Settings().EnsureDefaults(ctx); err != nil {
+		t.Fatalf("EnsureDefaults legacy upgrade: %v", err)
+	}
+	got, err := s.Settings().GetString(ctx, "agent.model")
+	if err != nil {
+		t.Fatalf("GetString upgraded agent model: %v", err)
+	}
+	if got != defaultAgentModel {
+		t.Fatalf("agent.model = %q, want %q", got, defaultAgentModel)
+	}
+
+	if err := s.Settings().SetString(ctx, "agent.model", "qwen2.5-coder:7b"); err != nil {
+		t.Fatalf("SetString explicit agent model: %v", err)
+	}
+	if err := s.Settings().EnsureDefaults(ctx); err != nil {
+		t.Fatalf("EnsureDefaults explicit model: %v", err)
+	}
+	got, err = s.Settings().GetString(ctx, "agent.model")
+	if err != nil {
+		t.Fatalf("GetString explicit agent model: %v", err)
+	}
+	if got != "qwen2.5-coder:7b" {
+		t.Fatalf("explicit agent.model = %q, want qwen2.5-coder:7b", got)
+	}
+}
+
 func TestMigrateRefusesNewerSchema(t *testing.T) {
 	ctx := context.Background()
 	s := openStore(t, ctx)
