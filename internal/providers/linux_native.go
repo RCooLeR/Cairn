@@ -401,14 +401,18 @@ func (p *LinuxNativeProvider) MapPathToHost(backendPath string) (string, error) 
 }
 
 func buildLinuxInstallSteps() []linuxInstallStep {
+	aptRefreshCommand := strings.Join([]string{
+		"set -e",
+		dockerAptSourceCleanupCommand(),
+		"apt-get update",
+	}, " && ")
 	repositoryCommand := strings.Join([]string{
 		"set -e",
 		"install -m 0755 -d /etc/apt/keyrings",
 		"rm -f /etc/apt/keyrings/docker.gpg",
 		"curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg",
 		"chmod a+r /etc/apt/keyrings/docker.gpg",
-		`. /etc/os-release`,
-		`echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" > /etc/apt/sources.list.d/docker.list`,
+		dockerAptSourceWriteCommand(),
 	}, " && ")
 	verifyCommand := strings.Join([]string{
 		"docker info >/dev/null",
@@ -420,7 +424,7 @@ func buildLinuxInstallSteps() []linuxInstallStep {
 		{
 			Message: "Refresh apt package indexes",
 			Timeout: 10 * time.Minute,
-			Command: []string{"sudo", "apt-get", "update"},
+			Command: []string{"sudo", "sh", "-lc", aptRefreshCommand},
 			RepairHints: []string{
 				"Check internet access and apt repository health, then retry.",
 				"If apt is locked, wait for the other package operation to finish and retry.",

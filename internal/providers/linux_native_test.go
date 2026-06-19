@@ -135,7 +135,7 @@ func TestLinuxNativePlanInstallBuildsUbuntuDockerAptSteps(t *testing.T) {
 		t.Fatalf("commands = %d, want 7: %#v", len(plan.Commands), plan.Commands)
 	}
 	wantCommands := []string{
-		"'sudo' 'apt-get' 'update'",
+		"'sudo' 'sh' '-lc'",
 		"'sudo' 'apt-get' 'install' '-y' 'ca-certificates' 'curl' 'gnupg'",
 		"'sudo' 'sh' '-lc'",
 		"'sudo' 'apt-get' 'update'",
@@ -151,8 +151,14 @@ func TestLinuxNativePlanInstallBuildsUbuntuDockerAptSteps(t *testing.T) {
 			t.Fatalf("command[%d].Risk = %q", index, plan.Commands[index].Risk)
 		}
 	}
+	if !strings.Contains(plan.Commands[0].Command, "rm -f /etc/apt/sources.list.d/docker.list") {
+		t.Fatalf("apt refresh command does not clean stale Docker source list: %q", plan.Commands[0].Command)
+	}
 	if !strings.Contains(plan.Commands[2].Command, "download.docker.com/linux/ubuntu") {
 		t.Fatalf("repository command missing Docker apt source: %q", plan.Commands[2].Command)
+	}
+	if !strings.Contains(plan.Commands[2].Command, "Could not determine Ubuntu codename") {
+		t.Fatalf("repository command does not validate Ubuntu codename: %q", plan.Commands[2].Command)
 	}
 	if !strings.Contains(plan.Commands[6].Command, "docker run --rm hello-world") {
 		t.Fatalf("verify command missing hello-world: %q", plan.Commands[6].Command)

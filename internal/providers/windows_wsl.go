@@ -832,14 +832,14 @@ func buildWSLInstallStepsFor(distro string, distribution string) []wslInstallSte
 	systemdCommand := "printf '[boot]\\nsystemd=true\\n' > /etc/wsl.conf"
 	dockerAptCommand := strings.Join([]string{
 		"set -e",
+		dockerAptSourceCleanupCommand(),
 		"apt-get update",
 		"apt-get install -y ca-certificates curl gnupg",
 		"install -m 0755 -d /etc/apt/keyrings",
 		"rm -f /etc/apt/keyrings/docker.gpg",
 		"curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg",
 		"chmod a+r /etc/apt/keyrings/docker.gpg",
-		`. /etc/os-release`,
-		`echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" > /etc/apt/sources.list.d/docker.list`,
+		dockerAptSourceWriteCommand(),
 		"apt-get update",
 		"apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin",
 		"if ! docker system dial-stdio --help >/dev/null 2>&1; then apt-get install -y socat; fi",
