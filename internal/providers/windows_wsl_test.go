@@ -233,6 +233,26 @@ func TestWindowsWSLRunDockerComposeAndShellCommands(t *testing.T) {
 	}
 }
 
+func TestWindowsWSLRunComposeUsesOperationTimeout(t *testing.T) {
+	t.Parallel()
+	runner := &composeOptionsRunner{}
+	provider := NewWindowsWSL(WindowsWSLOptions{Distro: "cairn-dev", Runner: runner})
+
+	if _, err := provider.RunCompose(context.Background(), `C:\Users\Ada\Project One`, "-f", "compose.yaml", "config"); err != nil {
+		t.Fatalf("RunCompose(config) error = %v", err)
+	}
+	if runner.opts.Timeout != composeCommandTimeout {
+		t.Fatalf("config timeout = %s, want %s", runner.opts.Timeout, composeCommandTimeout)
+	}
+
+	if _, err := provider.RunCompose(context.Background(), `C:\Users\Ada\Project One`, "-f", "compose.yaml", "pull"); err != nil {
+		t.Fatalf("RunCompose(pull) error = %v", err)
+	}
+	if runner.opts.Timeout != dockerOperationTimeout {
+		t.Fatalf("pull timeout = %s, want %s", runner.opts.Timeout, dockerOperationTimeout)
+	}
+}
+
 func TestWindowsWSLDockerDialerUsesDockerDialStdio(t *testing.T) {
 	t.Parallel()
 	runner := newFakeRunner()

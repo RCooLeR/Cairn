@@ -399,14 +399,15 @@ func (p *MacOSColimaProvider) RunCompose(ctx context.Context, workdir string, ar
 func (p *MacOSColimaProvider) RunComposeEnv(ctx context.Context, workdir string, env []string, args ...string) (*CommandResult, error) {
 	name, prefix := p.composeCommand(ctx)
 	composeArgs := append(prefix, args...)
+	timeout := composeTimeoutForArgs(args)
 	if runner, ok := p.runner.(OptionsCommandRunner); ok {
 		return runner.RunWithOptions(ctx, CommandRunOptions{
-			Timeout: composeCommandTimeout,
+			Timeout: timeout,
 			Workdir: workdir,
 			Env:     env,
 		}, name, composeArgs...)
 	}
-	result, err := p.runner.Run(ctx, composeCommandTimeout, name, composeArgs...)
+	result, err := p.runner.Run(ctx, timeout, name, composeArgs...)
 	if result != nil && workdir != "" {
 		result.Workdir = workdir
 	}

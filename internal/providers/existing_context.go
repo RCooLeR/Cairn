@@ -194,14 +194,15 @@ func (p *ExistingContextProvider) RunCompose(ctx context.Context, workdir string
 
 func (p *ExistingContextProvider) RunComposeEnv(ctx context.Context, workdir string, env []string, args ...string) (*CommandResult, error) {
 	composeArgs := append([]string{"--context", p.configuredContext(), "compose"}, args...)
+	timeout := composeTimeoutForArgs(args)
 	if runner, ok := p.runner.(OptionsCommandRunner); ok {
 		return runner.RunWithOptions(ctx, CommandRunOptions{
-			Timeout: composeCommandTimeout,
+			Timeout: timeout,
 			Workdir: workdir,
 			Env:     env,
 		}, "docker", composeArgs...)
 	}
-	result, err := p.runner.Run(ctx, composeCommandTimeout, "docker", composeArgs...)
+	result, err := p.runner.Run(ctx, timeout, "docker", composeArgs...)
 	if result != nil && workdir != "" {
 		result.Workdir = workdir
 	}

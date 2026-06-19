@@ -11,6 +11,8 @@ import (
 	"github.com/RCooLeR/Cairn/internal/providers"
 )
 
+const commandDetailOutputLimit = 6000
+
 func (c *Client) Version(ctx context.Context) (*Version, error) {
 	result, err := c.run(ctx, "", nil, "version", "--format", "json")
 	if commandFailed(result, err) {
@@ -299,10 +301,10 @@ func commandDetail(result *providers.CommandResult, err error) string {
 	parts := []string{}
 	if result != nil {
 		if stderr := strings.TrimSpace(result.Stderr); stderr != "" {
-			parts = append(parts, stderr)
+			parts = append(parts, trimCommandDetailPart(stderr))
 		}
 		if stdout := strings.TrimSpace(result.Stdout); stdout != "" {
-			parts = append(parts, stdout)
+			parts = append(parts, trimCommandDetailPart(stdout))
 		}
 	}
 	if err != nil {
@@ -312,6 +314,16 @@ func commandDetail(result *providers.CommandResult, err error) string {
 		return "docker compose exited without output"
 	}
 	return strings.Join(parts, "\n")
+}
+
+func trimCommandDetailPart(value string) string {
+	if len(value) <= commandDetailOutputLimit {
+		return value
+	}
+	half := commandDetailOutputLimit / 2
+	head := strings.TrimSpace(value[:half])
+	tail := strings.TrimSpace(value[len(value)-half:])
+	return head + "\n... command output truncated; open the action output for the full transcript ...\n" + tail
 }
 
 func stdout(result *providers.CommandResult) string {

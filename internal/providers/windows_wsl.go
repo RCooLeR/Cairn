@@ -395,19 +395,20 @@ func (p *WindowsWSLProvider) RunCompose(ctx context.Context, workdir string, arg
 
 func (p *WindowsWSLProvider) RunComposeEnv(ctx context.Context, workdir string, env []string, args ...string) (*CommandResult, error) {
 	composeArgs := append([]string{"compose"}, args...)
+	timeout := composeTimeoutForArgs(args)
 	if strings.TrimSpace(workdir) == "" {
 		if len(env) == 0 {
-			return p.RunDocker(ctx, composeArgs...)
+			return p.runWSLWithTimeout(ctx, timeout, p.configuredDistro(), append([]string{"docker"}, composeArgs...)...)
 		}
 		shellCommand := shellEnvExports(env) + "exec docker " + shellJoin(composeArgs)
-		return p.runWSL(ctx, p.configuredDistro(), "sh", "-lc", shellCommand)
+		return p.runWSLWithTimeout(ctx, timeout, p.configuredDistro(), "sh", "-lc", shellCommand)
 	}
 	backendWorkdir, err := p.MapPathToBackend(workdir)
 	if err != nil {
 		return nil, err
 	}
 	shellCommand := shellEnvExports(env) + "cd " + shellQuote(backendWorkdir) + " && exec docker " + shellJoin(composeArgs)
-	result, err := p.runWSL(ctx, p.configuredDistro(), "sh", "-lc", shellCommand)
+	result, err := p.runWSLWithTimeout(ctx, timeout, p.configuredDistro(), "sh", "-lc", shellCommand)
 	if result != nil {
 		result.Workdir = backendWorkdir
 	}

@@ -139,6 +139,29 @@ func TestClientReturnsComposeInvalidWithDetail(t *testing.T) {
 	}
 }
 
+func TestComposeCommandErrorTrimsHugeOutput(t *testing.T) {
+	t.Parallel()
+	hugeOutput := strings.Repeat("pulling ollama layer\n", 1000)
+
+	err := composeCommandError(
+		apperror.ComposeInvalid,
+		"Docker Compose failed",
+		&providers.CommandResult{Stdout: hugeOutput, ExitCode: 1},
+		errors.New("exit status 1"),
+	)
+
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) {
+		t.Fatalf("error = %T, want AppError", err)
+	}
+	if len(appErr.Detail) > commandDetailOutputLimit+200 {
+		t.Fatalf("detail length = %d, want trimmed near %d", len(appErr.Detail), commandDetailOutputLimit)
+	}
+	if !strings.Contains(appErr.Detail, "command output truncated") || !strings.Contains(appErr.Detail, "exit status 1") {
+		t.Fatalf("detail did not include truncation marker and exit status: %q", appErr.Detail)
+	}
+}
+
 func TestClientConfigAllTestdataProjectsIntegration(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("real docker compose config integration runs only on Linux")

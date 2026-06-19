@@ -58,6 +58,16 @@ func TestExistingContextRunComposeUsesContextWorkdirAndEnv(t *testing.T) {
 	if got := runner.opts.Env; len(got) != 1 || got[0] != "COMPOSE_PROJECT_NAME=demo" {
 		t.Fatalf("env = %#v", got)
 	}
+
+	if runner.opts.Timeout != composeCommandTimeout {
+		t.Fatalf("config timeout = %s, want %s", runner.opts.Timeout, composeCommandTimeout)
+	}
+	if _, err := provider.RunComposeEnv(context.Background(), "/Users/ada/app", nil, "-f", "compose.yaml", "up", "-d"); err != nil {
+		t.Fatalf("RunComposeEnv(up) error = %v", err)
+	}
+	if runner.opts.Timeout != dockerOperationTimeout {
+		t.Fatalf("up timeout = %s, want %s", runner.opts.Timeout, dockerOperationTimeout)
+	}
 }
 
 func TestManagerListAndSetDockerContextCreatesActiveProvider(t *testing.T) {

@@ -240,6 +240,16 @@ func TestMacOSColimaRunComposeUsesContextWorkdirAndEnv(t *testing.T) {
 	if got := runner.opts.Env; len(got) != 1 || got[0] != "COMPOSE_PROJECT_NAME=demo" {
 		t.Fatalf("env = %#v", got)
 	}
+
+	if runner.opts.Timeout != composeCommandTimeout {
+		t.Fatalf("config timeout = %s, want %s", runner.opts.Timeout, composeCommandTimeout)
+	}
+	if _, err := provider.RunComposeEnv(context.Background(), "/Users/ada/app", nil, "-f", "compose.yaml", "pull"); err != nil {
+		t.Fatalf("RunComposeEnv(pull) error = %v", err)
+	}
+	if runner.opts.Timeout != dockerOperationTimeout {
+		t.Fatalf("pull timeout = %s, want %s", runner.opts.Timeout, dockerOperationTimeout)
+	}
 }
 
 func TestMacOSColimaLifecycleAndShellCommands(t *testing.T) {
