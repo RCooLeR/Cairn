@@ -112,6 +112,35 @@ func TestManagerServiceImageStatusMachine(t *testing.T) {
 	}
 }
 
+func TestManagerServiceImageUsesDockerEnginePlatform(t *testing.T) {
+	ctx := context.Background()
+	db := openUpdatesStore(t)
+	projectID := "windows_wsl_ubuntu/app"
+	seedUpdateProject(t, ctx, db, projectID, []store.ServiceRecord{
+		serviceRecord(projectID, "web", "nginx:1.25", ""),
+	})
+	images := fakeImages{
+		details: map[string]*models.ImageDetail{
+			"nginx:1.25": imageDetail("sha256:web", "docker.io/library/nginx@"+digestA),
+		},
+		info: &models.DockerInfo{
+			OperatingSystem: "Ubuntu 24.04.2 LTS",
+			Architecture:    "x86_64",
+		},
+	}
+	registry := &fakeRegistry{digests: map[string]string{"nginx:1.25": digestB}}
+	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), images, registry, db.Settings(), nil, nil)
+
+	if _, err := manager.CheckProjectUpdates(ctx, projectID); err != nil {
+		t.Fatalf("CheckProjectUpdates() error = %v", err)
+	}
+
+	got := registry.platforms["nginx:1.25"]
+	if got.OS != "linux" || got.Architecture != "amd64" || got.Variant != "" {
+		t.Fatalf("registry platform = %#v, want linux/amd64", got)
+	}
+}
+
 func TestManagerBaseImageStatusMachine(t *testing.T) {
 	ctx := context.Background()
 	db := openUpdatesStore(t)
@@ -992,6 +1021,12 @@ func TestManagerValidationSchedulerAndHelperPaths(t *testing.T) {
 	if got := platformFromString("linux/arm64/v8"); got.OS != "linux" || got.Architecture != "arm64" || got.Variant != "v8" {
 		t.Fatalf("platformFromString = %#v", got)
 	}
+	if got := platformFromDockerInfo(models.DockerInfo{OperatingSystem: "Docker Desktop", Architecture: "aarch64"}); got.OS != "linux" || got.Architecture != "arm64" {
+		t.Fatalf("platformFromDockerInfo = %#v, want linux/arm64", got)
+	}
+	if got := platformFromDockerInfo(models.DockerInfo{OperatingSystem: "Windows Server", Architecture: "x86_64"}); got.OS != "windows" || got.Architecture != "amd64" {
+		t.Fatalf("platformFromDockerInfo windows = %#v, want windows/amd64", got)
+	}
 	if !digestsEqual("SHA256:ABC", "sha256:abc") {
 		t.Fatalf("digestsEqual should ignore case")
 	}
@@ -1268,6 +1303,7 @@ type fakeRegistry struct {
 	errs        map[string]error
 	emptyResult map[string]bool
 	resultErrs  map[string]registryResultError
+	platforms   map[string]registrycore.Platform
 }
 
 type registryResultError struct {
@@ -1275,7 +1311,11 @@ type registryResultError struct {
 	err    error
 }
 
-func (r *fakeRegistry) ResolveDigest(_ context.Context, image string, _ registrycore.ResolveOptions) (*registrycore.DigestResult, error) {
+func (r *fakeRegistry) ResolveDigest(_ context.Context, image string, opts registrycore.ResolveOptions) (*registrycore.DigestResult, error) {
+	if r.platforms == nil {
+		r.platforms = map[string]registrycore.Platform{}
+	}
+	r.platforms[image] = opts.Platform
 	if resultErr, ok := r.resultErrs[image]; ok {
 		return &registrycore.DigestResult{ManifestDigest: resultErr.digest}, resultErr.err
 	}
@@ -1294,6 +1334,7 @@ func (r *fakeRegistry) ResolveDigest(_ context.Context, image string, _ registry
 type fakeImages struct {
 	details map[string]*models.ImageDetail
 	pingErr error
+	info    *models.DockerInfo
 }
 
 func (i fakeImages) GetImage(_ context.Context, id string) (*models.ImageDetail, error) {
@@ -1308,6 +1349,13 @@ func (i fakeImages) Ping(context.Context) error {
 		return i.pingErr
 	}
 	return nil
+}
+
+func (i fakeImages) Info(context.Context) (*models.DockerInfo, error) {
+	if i.info != nil {
+		return i.info, nil
+	}
+	return nil, errors.New("docker info unavailable")
 }
 
 type fakeUpdateCompose struct {

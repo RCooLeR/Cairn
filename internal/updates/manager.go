@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"math/big"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -23,6 +24,10 @@ type RegistryResolver interface {
 
 type ImageInspector interface {
 	GetImage(context.Context, string) (*models.ImageDetail, error)
+}
+
+type dockerInfoProvider interface {
+	Info(context.Context) (*models.DockerInfo, error)
 }
 
 type DockerPinger interface {
@@ -606,7 +611,7 @@ func (m *Manager) remoteDigest(ctx context.Context, imageRef string, platform st
 	if m.Registry == nil {
 		return "", notReady()
 	}
-	result, err := m.Registry.ResolveDigest(ctx, imageRef, registrycore.ResolveOptions{Platform: platformFromString(platform)})
+	result, err := m.Registry.ResolveDigest(ctx, imageRef, registrycore.ResolveOptions{Platform: m.registryPlatform(ctx, platform)})
 	if err != nil {
 		if result != nil && result.ManifestDigest != "" {
 			return result.ManifestDigest, err
@@ -617,6 +622,56 @@ func (m *Manager) remoteDigest(ctx context.Context, imageRef string, platform st
 		return "", apperror.New(apperror.RegistryUnreachable, "Registry digest is unavailable")
 	}
 	return result.ManifestDigest, nil
+}
+
+func (m *Manager) registryPlatform(ctx context.Context, value string) registrycore.Platform {
+	platform := platformFromString(value)
+	if platform.OS != "" && platform.Architecture != "" {
+		return platform
+	}
+	engine := m.enginePlatform(ctx)
+	if platform.OS == "" {
+		platform.OS = engine.OS
+	}
+	if platform.Architecture == "" {
+		platform.Architecture = engine.Architecture
+	}
+	if platform.Variant == "" {
+		platform.Variant = engine.Variant
+	}
+	return platform
+}
+
+func (m *Manager) enginePlatform(ctx context.Context) registrycore.Platform {
+	for _, candidate := range []any{m.Images, m.Docker} {
+		infoProvider, ok := candidate.(dockerInfoProvider)
+		if !ok {
+			continue
+		}
+		info, err := infoProvider.Info(ctx)
+		if err != nil || info == nil {
+			continue
+		}
+		platform := platformFromDockerInfo(*info)
+		if platform.OS != "" && platform.Architecture != "" {
+			return platform
+		}
+	}
+	arch, variant := normalizeRegistryArchitecture(runtime.GOARCH)
+	return registrycore.Platform{OS: "linux", Architecture: arch, Variant: variant}
+}
+
+func platformFromDockerInfo(info models.DockerInfo) registrycore.Platform {
+	osName := "linux"
+	operatingSystem := strings.ToLower(strings.TrimSpace(info.OperatingSystem))
+	if strings.Contains(operatingSystem, "windows") {
+		osName = "windows"
+	}
+	arch, variant := normalizeRegistryArchitecture(info.Architecture)
+	if arch == "" {
+		arch, variant = normalizeRegistryArchitecture(runtime.GOARCH)
+	}
+	return registrycore.Platform{OS: osName, Architecture: arch, Variant: variant}
 }
 
 func (m *Manager) updateBaseRef(ctx context.Context, id int64, localDigest string, remoteDigest string, status models.UpdateStatus, checkedAt time.Time, checkErr string) error {
@@ -816,11 +871,41 @@ func platformFromString(value string) registrycore.Platform {
 	if len(parts) < 2 {
 		return registrycore.Platform{}
 	}
-	platform := registrycore.Platform{OS: parts[0], Architecture: parts[1]}
+	arch, variant := normalizeRegistryArchitecture(parts[1])
+	platform := registrycore.Platform{OS: strings.ToLower(strings.TrimSpace(parts[0])), Architecture: arch}
 	if len(parts) > 2 {
-		platform.Variant = parts[2]
+		platform.Variant = strings.ToLower(strings.TrimSpace(parts[2]))
+	} else {
+		platform.Variant = variant
 	}
 	return platform
+}
+
+func normalizeRegistryArchitecture(value string) (string, string) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	value = strings.ReplaceAll(value, "\\", "/")
+	if strings.Contains(value, "/") {
+		parts := strings.Split(value, "/")
+		arch, variant := normalizeRegistryArchitecture(parts[0])
+		if variant == "" && len(parts) > 1 {
+			variant = strings.TrimSpace(parts[1])
+		}
+		return arch, variant
+	}
+	switch value {
+	case "x86_64", "x86-64", "x64", "amd64":
+		return "amd64", ""
+	case "aarch64", "arm64":
+		return "arm64", ""
+	case "armv7l", "armhf", "arm32v7":
+		return "arm", "v7"
+	case "armv6l", "armel", "arm32v6":
+		return "arm", "v6"
+	case "386", "i386", "i686", "x86":
+		return "386", ""
+	default:
+		return value, ""
+	}
 }
 
 func uniqueNonEmpty(values ...string) []string {
