@@ -2170,6 +2170,62 @@ describe("App inventory shell", () => {
     );
   });
 
+  it("shows Compose command output for project jobs", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
+    projectServiceMock.GetProject.mockResolvedValue(seededProjectDetail());
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", {
+        name: /Projects/,
+      }),
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "app-db" }));
+    await screen.findByRole("button", { name: "Redeploy" });
+
+    emitRuntimeEvent("job:progress", {
+      jobID: "project-job",
+      projectID: "linux_native/app-db",
+      action: "redeploy",
+      command: "docker compose up -d --force-recreate",
+      phase: "running",
+      message: "docker compose up -d --force-recreate",
+    });
+    emitRuntimeEvent("job:progress", {
+      jobID: "project-job",
+      projectID: "linux_native/app-db",
+      action: "redeploy",
+      command: "docker compose up -d --force-recreate",
+      phase: "stdout",
+      message: "Container app Recreated",
+    });
+    emitRuntimeEvent("job:done", {
+      jobID: "project-job",
+      projectID: "linux_native/app-db",
+      action: "redeploy",
+      command: "docker compose up -d --force-recreate",
+      result: "success",
+    });
+
+    const output = await screen.findByRole("region", {
+      name: "Compose command output",
+    });
+    expect(within(output).getByText("Redeploy output")).toBeInTheDocument();
+    expect(
+      within(output).getAllByText("docker compose up -d --force-recreate")
+        .length,
+    ).toBeGreaterThan(0);
+    expect(
+      within(output).getByText("Container app Recreated"),
+    ).toBeInTheDocument();
+    expect(within(output).getByText("success")).toBeInTheDocument();
+  });
+
   it("imports a Compose project through the folder picker", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
     projectServiceMock.RefreshProjects.mockResolvedValueOnce(

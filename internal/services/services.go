@@ -28,16 +28,22 @@ var (
 )
 
 type jobProgressPayload struct {
-	JobID   string   `json:"jobID"`
-	Phase   string   `json:"phase"`
-	Message string   `json:"message"`
-	Pct     *float64 `json:"pct,omitempty"`
+	JobID     string   `json:"jobID"`
+	Phase     string   `json:"phase"`
+	Message   string   `json:"message"`
+	Pct       *float64 `json:"pct,omitempty"`
+	ProjectID string   `json:"projectID,omitempty"`
+	Action    string   `json:"action,omitempty"`
+	Command   string   `json:"command,omitempty"`
 }
 
 type jobDonePayload struct {
-	JobID  string `json:"jobID"`
-	Result string `json:"result,omitempty"`
-	Error  string `json:"error,omitempty"`
+	JobID     string `json:"jobID"`
+	Result    string `json:"result,omitempty"`
+	Error     string `json:"error,omitempty"`
+	ProjectID string `json:"projectID,omitempty"`
+	Action    string `json:"action,omitempty"`
+	Command   string `json:"command,omitempty"`
 }
 
 type DockerClient interface {

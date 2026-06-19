@@ -684,20 +684,20 @@ func (s *ProjectService) runProjectAction(ctx context.Context, action string, pr
 	if err := s.recordProjectAudit(ctx, project, action, command, plan.Risk, "started", 0, nil); err != nil {
 		return err
 	}
-	s.publishJobProgress(jobID, "running", command, nil)
+	s.publishProjectJobProgress(jobID, project.ID, action, command, "running", command, nil)
 
 	result, err := s.executeProjectAction(ctx, action, project, removeVolumes)
 	duration := time.Since(started)
-	s.publishComposeOutput(jobID, result)
+	s.publishProjectComposeOutput(jobID, project.ID, action, command, result)
 	if err != nil {
 		_ = s.recordProjectAudit(ctx, project, action, command, plan.Risk, "failed", duration, err)
-		s.publishJobDone(jobID, "", err)
+		s.publishProjectJobDone(jobID, project.ID, action, command, "", err)
 		return err
 	}
 	if err := s.recordProjectAudit(ctx, project, action, command, plan.Risk, "success", duration, nil); err != nil {
 		return err
 	}
-	s.publishJobDone(jobID, "success", nil)
+	s.publishProjectJobDone(jobID, project.ID, action, command, "success", nil)
 	if s.Detector != nil {
 		_, _ = s.Detector.Reconcile(ctx)
 	}
@@ -1202,16 +1202,31 @@ func (s *ProjectService) recordProjectAudit(ctx context.Context, project store.P
 	return nil
 }
 
-func (s *ProjectService) publishComposeOutput(jobID string, result *providers.CommandResult) {
+func (s *ProjectService) publishProjectComposeOutput(jobID string, projectID string, action string, command string, result *providers.CommandResult) {
 	if result == nil {
 		return
 	}
 	for _, line := range splitOutputLines(result.Stdout) {
-		s.publishJobProgress(jobID, "stdout", line, nil)
+		s.publishProjectJobProgress(jobID, projectID, action, command, "stdout", line, nil)
 	}
 	for _, line := range splitOutputLines(result.Stderr) {
-		s.publishJobProgress(jobID, "stderr", line, nil)
+		s.publishProjectJobProgress(jobID, projectID, action, command, "stderr", line, nil)
 	}
+}
+
+func (s *ProjectService) publishProjectJobProgress(jobID string, projectID string, action string, command string, phase string, message string, pct *float64) {
+	if s.Events == nil {
+		return
+	}
+	s.Events.Publish(bus.Event{Topic: bus.TopicJobProgress, Payload: jobProgressPayload{
+		JobID:     jobID,
+		Phase:     phase,
+		Message:   message,
+		Pct:       pct,
+		ProjectID: projectID,
+		Action:    action,
+		Command:   command,
+	}})
 }
 
 func (s *ProjectService) publishJobProgress(jobID string, phase string, message string, pct *float64) {
@@ -1219,6 +1234,17 @@ func (s *ProjectService) publishJobProgress(jobID string, phase string, message 
 		return
 	}
 	s.Events.Publish(bus.Event{Topic: bus.TopicJobProgress, Payload: jobProgressPayload{JobID: jobID, Phase: phase, Message: message, Pct: pct}})
+}
+
+func (s *ProjectService) publishProjectJobDone(jobID string, projectID string, action string, command string, result string, actionErr error) {
+	if s.Events == nil {
+		return
+	}
+	payload := jobDonePayload{JobID: jobID, Result: result, ProjectID: projectID, Action: action, Command: command}
+	if actionErr != nil {
+		payload.Error = actionErr.Error()
+	}
+	s.Events.Publish(bus.Event{Topic: bus.TopicJobDone, Payload: payload})
 }
 
 func (s *ProjectService) publishJobDone(jobID string, result string, actionErr error) {

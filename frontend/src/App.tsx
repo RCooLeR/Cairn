@@ -281,6 +281,35 @@ type UpdateProgressEntry = {
   pct?: number;
 };
 
+type ProjectJobEvent = UpdateProgressEntry & {
+  projectID?: string;
+  action?: string;
+  command?: string;
+  result?: string;
+  error?: string;
+};
+
+type ProjectCommandOutputLine = {
+  id: string;
+  ts: number;
+  phase: string;
+  message: string;
+  tone: "muted" | "info" | "ok" | "error";
+};
+
+type ProjectCommandOutputState = {
+  projectID: string;
+  jobID: string;
+  action?: string;
+  command?: string;
+  status: "running" | "success" | "failed";
+  startedAt: number;
+  updatedAt: number;
+  lines: ProjectCommandOutputLine[];
+  result?: string;
+  error?: string;
+};
+
 type UpdatePlanState = {
   open: boolean;
   mode: "update" | "rollback";
@@ -592,6 +621,7 @@ type SparkPoint = {
 type SparkPointMap = Record<string, SparkPoint[]>;
 type ProjectMetricSparks = Record<DashboardMetricID, SparkPointMap>;
 
+const maxProjectCommandOutputLines = 300;
 const navItems: NavItem[] = [
   { id: "overview", label: "Overview", icon: Gauge },
   { id: "projects", label: "Projects", icon: LayoutGrid },
@@ -1093,6 +1123,9 @@ function App() {
   const [projectDetailError, setProjectDetailError] = useState<string | null>(
     null,
   );
+  const [projectCommandOutputs, setProjectCommandOutputs] = useState<
+    Record<string, ProjectCommandOutputState>
+  >({});
   const [projectTab, setProjectTab] = useState<ProjectTabID>("overview");
   const [projectFilter, setProjectFilter] = useState<FilterID>("all");
   const [projectSort, setProjectSort] = useState<ProjectSortID>("name");
@@ -1919,9 +1952,14 @@ function App() {
       }
     });
     const offJobProgress = Events.On("job:progress", (event) => {
-      const payload = eventPayload<UpdateProgressEntry>(event);
+      const payload = eventPayload<ProjectJobEvent>(event);
       if (!payload?.jobID) {
         return;
+      }
+      if (payload.projectID) {
+        setProjectCommandOutputs((current) =>
+          appendProjectCommandProgress(current, payload),
+        );
       }
       setUpdatePlan((current) => {
         if (!current.jobID || current.jobID !== payload.jobID) {
@@ -1934,11 +1972,14 @@ function App() {
       });
     });
     const offJobDone = Events.On("job:done", (event) => {
-      const payload = eventPayload<UpdateProgressEntry & { result?: string }>(
-        event,
-      );
+      const payload = eventPayload<ProjectJobEvent>(event);
       if (!payload?.jobID) {
         return;
+      }
+      if (payload.projectID) {
+        setProjectCommandOutputs((current) =>
+          appendProjectCommandDone(current, payload),
+        );
       }
       setUpdatePlan((current) => {
         if (!current.jobID || current.jobID !== payload.jobID) {
@@ -4401,6 +4442,17 @@ function App() {
     setContainerDetailTab("overview");
   }, []);
 
+  const clearProjectCommandOutput = useCallback((projectID: string) => {
+    setProjectCommandOutputs((current) => {
+      if (!current[projectID]) {
+        return current;
+      }
+      const next = { ...current };
+      delete next[projectID];
+      return next;
+    });
+  }, []);
+
   const content = (() => {
     switch (activePage) {
       case "projects":
@@ -4415,6 +4467,7 @@ function App() {
               backups={backups}
               backupsError={backupsError}
               backupsLoading={backupsStatus === "loading"}
+              commandOutput={projectCommandOutputs[projectID] ?? null}
               detail={projectDetail}
               error={projectDetailError}
               loading={projectDetailStatus === "loading"}
@@ -4426,6 +4479,7 @@ function App() {
               onBack={closeProjectDetail}
               onBackupVolume={openBackupVolume}
               onCheckUpdates={checkAllUpdates}
+              onClearCommandOutput={clearProjectCommandOutput}
               onDeleteBackup={openDeleteBackupPlan}
               onIgnoreUpdate={openIgnoreUpdate}
               onOpenContainerDetail={openContainerDetail}
@@ -10341,6 +10395,7 @@ function ProjectDetailPage({
   backups,
   backupsError,
   backupsLoading,
+  commandOutput,
   detail,
   dockerRunning,
   error,
@@ -10354,6 +10409,7 @@ function ProjectDetailPage({
   onBack,
   onBackupVolume,
   onCheckUpdates,
+  onClearCommandOutput,
   onIgnoreUpdate,
   onOpenContainerDetail,
   onOpenContainerTerminal,
@@ -10374,6 +10430,7 @@ function ProjectDetailPage({
   backups: BackupSummary[];
   backupsError: string | null;
   backupsLoading: boolean;
+  commandOutput: ProjectCommandOutputState | null;
   dockerRunning: boolean;
   inventoryLoading: boolean;
   loading: boolean;
@@ -10389,6 +10446,7 @@ function ProjectDetailPage({
   onBack: () => void;
   onBackupVolume: (volume: VolumeSummary) => void;
   onCheckUpdates: () => void;
+  onClearCommandOutput: (projectID: string) => void;
   onIgnoreUpdate: (update: ImageUpdate) => void;
   onOpenContainerDetail: (
     container: ContainerSummary,
@@ -10546,6 +10604,13 @@ function ProjectDetailPage({
         </div>
       ) : null}
 
+      {commandOutput ? (
+        <ProjectCommandOutputPanel
+          output={commandOutput}
+          onClear={() => onClearCommandOutput(project.id)}
+        />
+      ) : null}
+
       <div className="flex flex-wrap gap-2 border-b border-border">
         {projectTabs.map(([id, label]) => (
           <button
@@ -10625,6 +10690,146 @@ function ProjectDetailPage({
       ) : null}
     </div>
   );
+}
+
+function ProjectCommandOutputPanel({
+  onClear,
+  output,
+}: {
+  output: ProjectCommandOutputState;
+  onClear: () => void;
+}) {
+  const title = projectCommandOutputTitle(output.action);
+  const commandText = output.command || title;
+  const transcript = [
+    commandText ? `$ ${commandText}` : "",
+    ...output.lines.map(
+      (line) =>
+        `[${formatLogTimestamp(new Date(line.ts))}] ${line.phase}: ${line.message}`,
+    ),
+  ]
+    .filter(Boolean)
+    .join("\n");
+  return (
+    <section
+      aria-label="Compose command output"
+      className="rounded-card border border-border bg-bg-card"
+    >
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-4 py-3">
+        <div className="flex min-w-0 items-center gap-3">
+          <Terminal className="shrink-0 text-accent" size={18} />
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-2">
+              <h3 className="font-medium text-text-primary">{title}</h3>
+              <Badge tone={projectCommandStatusTone(output.status)}>
+                {output.status}
+              </Badge>
+            </div>
+            <div className="mt-1 truncate font-mono text-xs text-text-muted">
+              {commandText}
+            </div>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <Button
+            icon={<Copy size={15} />}
+            onClick={() => {
+              if (transcript) {
+                void Clipboard.SetText(transcript);
+              }
+            }}
+            size="sm"
+            variant="secondary"
+          >
+            Copy
+          </Button>
+          <Tooltip label="Dismiss output">
+            <Button
+              aria-label="Dismiss command output"
+              icon={<X size={15} />}
+              onClick={onClear}
+              size="icon"
+              variant="ghost"
+            />
+          </Tooltip>
+        </div>
+      </div>
+      <div
+        className="max-h-64 overflow-auto bg-bg-inset p-3 font-mono text-xs leading-5"
+        role="log"
+      >
+        {output.lines.length === 0 ? (
+          <div className="text-text-muted">Waiting for Compose output...</div>
+        ) : (
+          <div className="space-y-1">
+            {output.lines.map((line) => (
+              <div
+                className="grid gap-2 rounded-control px-2 py-1 sm:grid-cols-[6rem_4.5rem_minmax(0,1fr)]"
+                key={line.id}
+              >
+                <span className="text-text-muted">
+                  {formatLogTimestamp(new Date(line.ts))}
+                </span>
+                <span className={projectCommandLineClass(line.tone)}>
+                  {line.phase}
+                </span>
+                <span className="min-w-0 whitespace-pre-wrap break-words text-text-primary">
+                  {line.message}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function projectCommandOutputTitle(action?: string) {
+  switch (action) {
+    case "start":
+      return "Start output";
+    case "stop":
+      return "Stop output";
+    case "restart":
+      return "Restart output";
+    case "pull":
+      return "Pull output";
+    case "redeploy":
+      return "Redeploy output";
+    case "down":
+      return "Down output";
+    default:
+      return "Compose output";
+  }
+}
+
+function projectCommandStatusTone(
+  status: ProjectCommandOutputState["status"],
+): BadgeTone {
+  switch (status) {
+    case "success":
+      return "ok";
+    case "failed":
+      return "error";
+    default:
+      return "info";
+  }
+}
+
+function projectCommandLineClass(
+  tone: ProjectCommandOutputLine["tone"],
+): string {
+  switch (tone) {
+    case "error":
+      return "font-semibold text-error";
+    case "ok":
+      return "font-semibold text-ok";
+    case "info":
+      return "font-semibold text-info";
+    default:
+      return "text-text-muted";
+  }
 }
 
 function serviceDrilldownContainer(
@@ -13634,6 +13839,117 @@ function ContainerBulkActions({
       </Button>
     </div>
   );
+}
+
+function appendProjectCommandProgress(
+  current: Record<string, ProjectCommandOutputState>,
+  payload: ProjectJobEvent,
+): Record<string, ProjectCommandOutputState> {
+  if (!payload.projectID || !payload.jobID) {
+    return current;
+  }
+  const now = Date.now();
+  const existing = current[payload.projectID];
+  const isSameJob = existing?.jobID === payload.jobID;
+  const base: ProjectCommandOutputState = isSameJob
+    ? existing
+    : {
+        projectID: payload.projectID,
+        jobID: payload.jobID,
+        action: payload.action,
+        command: payload.command,
+        status: "running",
+        startedAt: now,
+        updatedAt: now,
+        lines: [],
+      };
+  const message = payload.message?.trim() ?? "";
+  const nextLines = message
+    ? base.lines.concat({
+        id: `${payload.jobID}:${base.lines.length}:${now}`,
+        ts: now,
+        phase: payload.phase || "output",
+        message,
+        tone: projectCommandLineTone(payload.phase),
+      })
+    : base.lines;
+  return {
+    ...current,
+    [payload.projectID]: {
+      ...base,
+      action: payload.action || base.action,
+      command: payload.command || base.command,
+      status: "running",
+      updatedAt: now,
+      lines: nextLines.slice(-maxProjectCommandOutputLines),
+    },
+  };
+}
+
+function appendProjectCommandDone(
+  current: Record<string, ProjectCommandOutputState>,
+  payload: ProjectJobEvent,
+): Record<string, ProjectCommandOutputState> {
+  if (!payload.projectID || !payload.jobID) {
+    return current;
+  }
+  const now = Date.now();
+  const existing = current[payload.projectID];
+  const base: ProjectCommandOutputState =
+    existing?.jobID === payload.jobID
+      ? existing
+      : {
+          projectID: payload.projectID,
+          jobID: payload.jobID,
+          action: payload.action,
+          command: payload.command,
+          status: "running",
+          startedAt: now,
+          updatedAt: now,
+          lines: [],
+        };
+  const failed = Boolean(payload.error);
+  const message = failed
+    ? payload.error || "Command failed"
+    : payload.result
+      ? `Result: ${payload.result}`
+      : "Command finished";
+  const lines = base.lines.concat({
+    id: `${payload.jobID}:done:${now}`,
+    ts: now,
+    phase: failed ? "failed" : "done",
+    message,
+    tone: failed ? "error" : "ok",
+  });
+  return {
+    ...current,
+    [payload.projectID]: {
+      ...base,
+      action: payload.action || base.action,
+      command: payload.command || base.command,
+      status: failed ? "failed" : "success",
+      updatedAt: now,
+      lines: lines.slice(-maxProjectCommandOutputLines),
+      result: payload.result,
+      error: payload.error,
+    },
+  };
+}
+
+function projectCommandLineTone(
+  phase: string | undefined,
+): ProjectCommandOutputLine["tone"] {
+  switch (phase) {
+    case "stderr":
+    case "failed":
+      return "error";
+    case "stdout":
+      return "muted";
+    case "done":
+      return "ok";
+    default:
+      return "info";
+  }
 }
 
 function eventPayload<T>(event: unknown): T | null {

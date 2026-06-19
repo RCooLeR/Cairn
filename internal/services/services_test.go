@@ -1454,9 +1454,17 @@ func TestProjectServiceStartProjectAuditsAndPublishesProgress(t *testing.T) {
 	}
 	if got := receiveEventPayload(t, progress, time.Second); got == nil {
 		t.Fatal("expected job progress event")
+	} else if payload, ok := got.(jobProgressPayload); !ok {
+		t.Fatalf("progress payload = %#v, want jobProgressPayload", got)
+	} else if payload.ProjectID != detail.Summary.ID || payload.Action != "start" || payload.Command == "" {
+		t.Fatalf("progress payload = %#v, want project action metadata", payload)
 	}
 	if got := receiveEventPayload(t, done, time.Second); got == nil {
 		t.Fatal("expected job done event")
+	} else if payload, ok := got.(jobDonePayload); !ok {
+		t.Fatalf("done payload = %#v, want jobDonePayload", got)
+	} else if payload.ProjectID != detail.Summary.ID || payload.Action != "start" || payload.Result != "success" {
+		t.Fatalf("done payload = %#v, want project action metadata", payload)
 	}
 }
 
