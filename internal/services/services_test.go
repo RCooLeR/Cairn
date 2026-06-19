@@ -571,14 +571,35 @@ func TestProviderServiceApplyInstallPublishesProgress(t *testing.T) {
 	}
 }
 
-func TestProviderServiceApplyInstallCancelsRunningProvider(t *testing.T) {
+func TestProviderInstallErrorTextIncludesDetailAndHints(t *testing.T) {
+	err := apperror.New(
+		apperror.ProviderNotReady,
+		"WSL install step failed",
+		apperror.WithDetail("The operation timed out waiting for WSL registration."),
+		apperror.WithRepairHints("Restart Windows after enabling WSL."),
+	)
+
+	text := providerInstallErrorText(err)
+	if !strings.Contains(text, "E_PROVIDER_NOT_READY: WSL install step failed") {
+		t.Fatalf("error text = %q, want code and message", text)
+	}
+	if !strings.Contains(text, "The operation timed out waiting for WSL registration.") {
+		t.Fatalf("error text = %q, want detail", text)
+	}
+	if !strings.Contains(text, "Restart Windows after enabling WSL.") {
+		t.Fatalf("error text = %q, want repair hint", text)
+	}
+}
+
+func TestProviderServiceApplyInstallSurvivesRequestContextCancellation(t *testing.T) {
 	waitCtx, waitCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer waitCancel()
 	installCtx, cancelInstall := context.WithCancel(context.Background())
 	eventBus := bus.New()
 	defer eventBus.Close()
 	db := openServiceTestStore(t)
-	provider := &fakeInstallProvider{blockUntilCancel: true, started: make(chan struct{})}
+	release := make(chan struct{})
+	provider := &fakeInstallProvider{releaseBeforeContextCheck: release, started: make(chan struct{})}
 	manager := providers.NewManager(nil, nil, []providers.PlatformProvider{provider})
 	service := &ProviderService{Manager: manager, Events: eventBus, Audit: db.Audit()}
 
@@ -596,6 +617,7 @@ func TestProviderServiceApplyInstallCancelsRunningProvider(t *testing.T) {
 		t.Fatalf("timed out waiting for install to start: %v", waitCtx.Err())
 	}
 	cancelInstall()
+	close(release)
 
 	for {
 		select {
@@ -608,15 +630,15 @@ func TestProviderServiceApplyInstallCancelsRunningProvider(t *testing.T) {
 				t.Fatalf("payload type = %T", event.Payload)
 			}
 			if payload.Done {
-				if payload.Error == "" || !strings.Contains(payload.Error, "context canceled") {
-					t.Fatalf("final payload error = %q, want context canceled", payload.Error)
+				if payload.Error != "" {
+					t.Fatalf("final payload error = %q, want request cancellation to be ignored", payload.Error)
 				}
 				entries, err := (&SettingsService{Audit: db.Audit()}).GetAuditLog(context.Background(), models.AuditFilter{Topic: "provider.install", Limit: 5})
 				if err != nil {
 					t.Fatalf("GetAuditLog() error = %v", err)
 				}
-				if len(entries) != 1 || entries[0].Result != "failed" {
-					t.Fatalf("provider install audit entries = %#v, want failed entry", entries)
+				if len(entries) != 1 || entries[0].Result != "success" {
+					t.Fatalf("provider install audit entries = %#v, want success entry", entries)
 				}
 				return
 			}
@@ -1896,10 +1918,11 @@ func (r *fakeComposeRunner) MapPathToHost(path string) (string, error) {
 }
 
 type fakeInstallProvider struct {
-	executed         []int
-	blockUntilCancel bool
-	started          chan struct{}
-	startOnce        sync.Once
+	executed                  []int
+	blockUntilCancel          bool
+	releaseBeforeContextCheck chan struct{}
+	started                   chan struct{}
+	startOnce                 sync.Once
 }
 
 func (p *fakeInstallProvider) ID() string          { return "windows_wsl_ubuntu" }
@@ -1937,6 +1960,10 @@ func (p *fakeInstallProvider) ExecuteInstallStep(ctx context.Context, _ string, 
 	}
 	if p.blockUntilCancel {
 		<-ctx.Done()
+		return ctx.Err()
+	}
+	if p.releaseBeforeContextCheck != nil {
+		<-p.releaseBeforeContextCheck
 		return ctx.Err()
 	}
 	return nil

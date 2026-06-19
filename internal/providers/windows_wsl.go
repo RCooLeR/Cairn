@@ -873,7 +873,7 @@ func buildWSLInstallStepsFor(distro string, distribution string) []wslInstallSte
 		{
 			Message: "Ensure the selected distribution runs as WSL2",
 			Timeout: 10 * time.Minute,
-			Command: []string{wslCommandName, "--set-version", distro, "2"},
+			Command: powerShellCommand(wslEnsureVersion2Script(distro)),
 			RepairHints: []string{
 				"Enable virtualization in firmware and make sure the Virtual Machine Platform Windows feature is installed.",
 				"Restart Windows after changing WSL feature or virtualization settings.",
@@ -976,6 +976,23 @@ func wslInstallDistroScript(distro string, distribution string) string {
 		`if ($distros -contains $name) { Write-Output "WSL distro '$name' is already installed."; exit 0 }`,
 		args,
 		`& $wsl @wslArgs`,
+		`exit $LASTEXITCODE`,
+	}, "; ")
+}
+
+func wslEnsureVersion2Script(distro string) string {
+	name := psSingleQuote(distro)
+	return strings.Join([]string{
+		`$ErrorActionPreference = 'Stop'`,
+		`$wsl = (Get-Command wsl.exe -ErrorAction Stop).Source`,
+		fmt.Sprintf(`$name = %s`, name),
+		`$found = $null`,
+		`for ($i = 0; $i -lt 60; $i++) { $rows = @(& $wsl -l -v 2>$null | ForEach-Object { ($_ -replace [char]0, '').Trim() } | Where-Object { $_ }); foreach ($row in $rows) { $clean = ($row -replace '^\*\s*', '').Trim(); if ($clean -eq $name -or $clean -like "$name *") { $found = $clean; break } }; if ($found) { break }; Start-Sleep -Seconds 1 }`,
+		`if (-not $found) { Write-Error "WSL distro '$name' was not found after installation."; exit 1 }`,
+		`$columns = @($found -split '\s+' | Where-Object { $_ })`,
+		`$versionText = if ($columns.Count -gt 0) { $columns[$columns.Count - 1] } else { '' }`,
+		`if ($versionText -eq '2') { Write-Output "WSL distro '$name' is already version 2."; exit 0 }`,
+		`& $wsl --set-version $name 2`,
 		`exit $LASTEXITCODE`,
 	}, "; ")
 }

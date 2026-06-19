@@ -3017,6 +3017,128 @@ describe("App inventory shell", () => {
     ).toBeInTheDocument();
   });
 
+  it("handles provider install progress before ApplyInstall returns a stream handle", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    let resolveApplyInstall:
+      | ((handle: { planID: string; streamID: string }) => void)
+      | undefined;
+    providerServiceMock.ApplyInstall.mockImplementation(
+      () =>
+        new Promise<{ planID: string; streamID: string }>((resolve) => {
+          resolveApplyInstall = resolve;
+        }),
+    );
+    window.localStorage.setItem(
+      "cairn.providerSetup.v1",
+      JSON.stringify({
+        open: true,
+        step: "install",
+        platform: "windows",
+        backend: "windows_wsl_ubuntu",
+        distro: "Ubuntu",
+        colimaProfile: "default",
+        colimaCPU: 2,
+        colimaMemoryGB: 4,
+        colimaDiskGB: 60,
+        detecting: false,
+        detection: null,
+        plan: wslInstallPlan(),
+        planning: false,
+        installing: false,
+        progress: [],
+        detectedProjects: [],
+        selectedProjectIDs: [],
+        detectingProjects: false,
+      }),
+    );
+
+    render(<App />);
+
+    const dialog = await screen.findByRole("dialog", {
+      name: "Set Up Docker Backend",
+    });
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Run auto repair" }),
+    );
+
+    expect(
+      await within(dialog).findByText("Starting auto repair"),
+    ).toBeInTheDocument();
+    emitRuntimeEvent("provider:install:progress", {
+      planID: "plan-wsl-install",
+      streamID: "early-stream",
+      step: 1,
+      totalSteps: 1,
+      message: "Install complete",
+      done: true,
+    });
+
+    expect(
+      await within(dialog).findByText("Windows WSL backend is ready"),
+    ).toBeInTheDocument();
+    await act(async () => {
+      resolveApplyInstall?.({
+        planID: "plan-wsl-install",
+        streamID: "early-stream",
+      });
+    });
+  });
+
+  it("shows provider install failure details once in the progress list", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    window.localStorage.setItem(
+      "cairn.providerSetup.v1",
+      JSON.stringify({
+        open: true,
+        step: "install",
+        platform: "windows",
+        backend: "windows_wsl_ubuntu",
+        distro: "Ubuntu",
+        colimaProfile: "default",
+        colimaCPU: 2,
+        colimaMemoryGB: 4,
+        colimaDiskGB: 60,
+        detecting: false,
+        detection: null,
+        plan: wslInstallPlan(),
+        planning: false,
+        installing: false,
+        progress: [],
+        detectedProjects: [],
+        selectedProjectIDs: [],
+        detectingProjects: false,
+      }),
+    );
+
+    render(<App />);
+
+    const dialog = await screen.findByRole("dialog", {
+      name: "Set Up Docker Backend",
+    });
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Run auto repair" }),
+    );
+    await waitFor(() =>
+      expect(providerServiceMock.ApplyInstall).toHaveBeenCalledWith(
+        "plan-wsl-install",
+      ),
+    );
+    emitRuntimeEvent("provider:install:progress", {
+      planID: "plan-wsl-install",
+      streamID: "setup-stream",
+      step: 3,
+      totalSteps: 10,
+      message: "Install failed",
+      done: true,
+      error: "E_PROVIDER_NOT_READY: WSL install step failed\nWSL stderr detail",
+    });
+
+    expect(
+      await within(dialog).findByText(/WSL stderr detail/),
+    ).toBeInTheDocument();
+    expect(within(dialog).getAllByText(/E_PROVIDER_NOT_READY/)).toHaveLength(1);
+  });
+
   it("saves Windows WSL settings and shows the path mapping panel", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
 

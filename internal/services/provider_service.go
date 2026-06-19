@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
@@ -81,7 +82,7 @@ func (s *ProviderService) ApplyInstall(ctx context.Context, planID string) (*mod
 	streamID := uuid.NewString()
 	progress := make(chan providers.InstallProgress, 8)
 	providerID, command, risk := s.Manager.InstallPlanAuditContext(planID)
-	go s.runProviderInstall(ctx, planID, streamID, providerID, command, risk, progress)
+	go s.runProviderInstall(context.WithoutCancel(ctx), planID, streamID, providerID, command, risk, progress)
 	return &models.InstallProgressHandle{PlanID: planID, StreamID: streamID}, nil
 }
 
@@ -107,7 +108,7 @@ func (s *ProviderService) runProviderInstall(ctx context.Context, planID string,
 			TotalSteps: last.TotalSteps,
 			Message:    "Install failed",
 			Done:       true,
-		}, err.Error())
+		}, providerInstallErrorText(err))
 	} else {
 		if auditErr := s.recordProviderInstallAudit(auditCtx, planID, providerID, command, risk, "success", time.Since(started), nil); auditErr != nil {
 			s.publishProviderInstallProgress(planID, streamID, providers.InstallProgress{
@@ -125,6 +126,24 @@ func (s *ProviderService) runProviderInstall(ctx context.Context, planID string,
 			Done:       true,
 		}, "")
 	}
+}
+
+func providerInstallErrorText(err error) string {
+	if err == nil {
+		return ""
+	}
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) {
+		return err.Error()
+	}
+	parts := []string{appErr.Error()}
+	if detail := strings.TrimSpace(appErr.Detail); detail != "" {
+		parts = append(parts, detail)
+	}
+	if len(appErr.RepairHints) > 0 {
+		parts = append(parts, strings.Join(appErr.RepairHints, "\n"))
+	}
+	return strings.Join(parts, "\n")
 }
 
 func (s *ProviderService) publishProviderInstallProgress(planID string, streamID string, progress providers.InstallProgress, errText string) {

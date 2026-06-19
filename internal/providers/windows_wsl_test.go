@@ -331,6 +331,9 @@ func TestWindowsWSLInstallPlanAndExecution(t *testing.T) {
 	if !strings.Contains(plan.Commands[1].Command, "--name") || !strings.Contains(plan.Commands[1].Command, "cairn-dev") {
 		t.Fatalf("custom distro install command missing --name: %s", plan.Commands[1].Command)
 	}
+	if !strings.Contains(plan.Commands[2].Command, "already version 2") || !strings.Contains(plan.Commands[2].Command, "--set-version") {
+		t.Fatalf("WSL2 conversion command is not idempotent: %s", plan.Commands[2].Command)
+	}
 	if !strings.Contains(plan.Commands[5].Command, "docker-ce") || !strings.Contains(plan.Commands[9].Command, "hello-world") {
 		t.Fatalf("plan commands missing Docker install/verify steps: %#v", plan.Commands)
 	}

@@ -524,6 +524,12 @@ type ProviderSetupState = {
   error?: string;
 };
 
+type ProviderInstallSession = {
+  planID: string;
+  streamID?: string;
+  backend: SetupBackendID;
+};
+
 type ExportLogsState = {
   open: boolean;
   path: string;
@@ -1228,6 +1234,7 @@ function App() {
   const [setup, setSetup] = useState<ProviderSetupState>(
     restoreProviderSetupState,
   );
+  const providerInstallSessionRef = useRef<ProviderInstallSession | null>(null);
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [notificationsLoading, setNotificationsLoading] = useState(false);
@@ -1579,23 +1586,56 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!setup.installStreamID) {
-      return undefined;
-    }
     const off = Events.On("provider:install:progress", (event) => {
       const payload = eventPayload<ProviderInstallProgressPayload>(event);
-      if (!payload || payload.streamID !== setup.installStreamID) {
+      const session = providerInstallSessionRef.current;
+      if (!payload || !session) {
         return;
       }
-      setSetup((current) => ({
-        ...current,
-        step: payload.done && !payload.error ? "verify" : current.step,
-        installing: !payload.done,
-        error: payload.error || current.error,
-        progress: current.progress.concat(payload),
-      }));
+      const matchesPlan = payload.planID === session.planID;
+      const matchesStream = Boolean(
+        session.streamID && payload.streamID === session.streamID,
+      );
+      if (!matchesPlan && !matchesStream) {
+        return;
+      }
+
+      providerInstallSessionRef.current = {
+        ...session,
+        streamID: payload.streamID || session.streamID,
+      };
+      setSetup((current) => {
+        if (
+          current.plan?.planID !== payload.planID &&
+          current.installStreamID !== payload.streamID
+        ) {
+          return current;
+        }
+        const alreadyRecorded = current.progress.some(
+          (entry) =>
+            entry.streamID === payload.streamID &&
+            entry.step === payload.step &&
+            entry.message === payload.message &&
+            entry.done === payload.done &&
+            entry.error === payload.error,
+        );
+        return {
+          ...current,
+          installStreamID: payload.streamID || current.installStreamID,
+          step: payload.done && !payload.error ? "verify" : current.step,
+          installing: !payload.done,
+          error: current.error,
+          progress: alreadyRecorded
+            ? current.progress
+            : current.progress.concat(payload),
+        };
+      });
+
+      if (payload.done) {
+        providerInstallSessionRef.current = null;
+      }
       if (payload.done && !payload.error) {
-        const providerID = providerIDForSetupBackend(setup.backend);
+        const providerID = providerIDForSetupBackend(session.backend);
         if (providerID) {
           void ProviderService.Detect(providerID)
             .then((status) => {
@@ -1620,7 +1660,7 @@ function App() {
       }
     });
     return () => off();
-  }, [refreshInventory, refreshProjects, setup.backend, setup.installStreamID]);
+  }, [refreshInventory, refreshProjects]);
 
   const refreshNotifications = useCallback(async () => {
     setNotificationsLoading(true);
@@ -2714,11 +2754,13 @@ function App() {
   ]);
 
   const closeProviderSetup = useCallback(() => {
+    providerInstallSessionRef.current = null;
     window.localStorage.removeItem(providerSetupStorageKey);
     setSetup(emptyProviderSetup);
   }, []);
 
   const finishProviderSetup = useCallback(() => {
+    providerInstallSessionRef.current = null;
     window.localStorage.removeItem(providerSetupStorageKey);
     setSetup(emptyProviderSetup);
     navigate("overview");
@@ -2898,19 +2940,40 @@ function App() {
     if (!setup.plan?.planID) {
       return;
     }
+    const planID = setup.plan.planID;
+    const backend = setup.backend;
+    providerInstallSessionRef.current = { planID, backend };
     setSetup((current) => ({
       ...current,
       installing: true,
-      progress: [],
+      installStreamID: undefined,
+      progress: [
+        {
+          planID,
+          streamID: "pending",
+          step: 0,
+          totalSteps: setup.plan?.commands.length ?? 0,
+          message: "Starting auto repair",
+          done: false,
+        },
+      ],
       error: undefined,
     }));
     try {
-      const handle = await ProviderService.ApplyInstall(setup.plan.planID);
+      const handle = await ProviderService.ApplyInstall(planID);
+      const currentSession = providerInstallSessionRef.current;
+      if (currentSession?.planID === planID) {
+        providerInstallSessionRef.current = {
+          ...currentSession,
+          streamID: handle?.streamID,
+        };
+      }
       setSetup((current) => ({
         ...current,
         installStreamID: handle?.streamID,
       }));
     } catch (error: unknown) {
+      providerInstallSessionRef.current = null;
       setSetup((current) => ({
         ...current,
         installing: false,
@@ -2918,7 +2981,7 @@ function App() {
           error instanceof Error ? error.message : "Unable to start install",
       }));
     }
-  }, [setup.plan?.planID]);
+  }, [setup.backend, setup.plan]);
 
   const detectSetupProjects = useCallback(async () => {
     setSetup((current) => ({
