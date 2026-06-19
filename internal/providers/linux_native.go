@@ -277,13 +277,7 @@ func (p *LinuxNativeProvider) ExecuteInstallStep(ctx context.Context, planID str
 	sendInstallProgress(progress, step+1, len(plan.Steps), "Running: "+installStep.Message, false)
 	result, err := p.runner.Run(ctx, installStep.Timeout, installStep.Command[0], installStep.Command[1:]...)
 	if err != nil || result == nil || result.ExitCode != 0 {
-		detail := ""
-		if result != nil {
-			detail = strings.TrimSpace(result.Stderr)
-			if detail == "" {
-				detail = strings.TrimSpace(result.Stdout)
-			}
-		}
+		detail := commandFailureDetail(result, err)
 		opts := []apperror.Option{apperror.WithDetail(detail)}
 		if len(installStep.RepairHints) > 0 {
 			opts = append(opts, apperror.WithRepairHints(installStep.RepairHints...))

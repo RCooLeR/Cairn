@@ -350,6 +350,9 @@ func TestWindowsWSLInstallPlanAndExecution(t *testing.T) {
 		t.Fatalf("plan commands missing Docker install/verify steps: %#v", plan.Commands)
 	}
 	steps := buildWSLInstallSteps("cairn-dev")
+	if steps[8].Timeout <= commandTimeout {
+		t.Fatalf("Docker service step timeout = %s, want longer than generic command timeout %s", steps[8].Timeout, commandTimeout)
+	}
 	for _, step := range steps {
 		runner.outputs[strings.Join(step.Command, " ")] = "ok\n"
 	}

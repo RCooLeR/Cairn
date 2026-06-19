@@ -106,3 +106,19 @@ func mergeEnv(base []string, overrides []string) []string {
 	}
 	return merged
 }
+
+func commandFailureDetail(result *CommandResult, err error) string {
+	parts := []string{}
+	if err != nil {
+		parts = append(parts, err.Error())
+	}
+	if result != nil {
+		if stdout := strings.TrimSpace(result.Stdout); stdout != "" {
+			parts = append(parts, "stdout:\n"+stdout)
+		}
+		if stderr := strings.TrimSpace(result.Stderr); stderr != "" {
+			parts = append(parts, "stderr:\n"+stderr)
+		}
+	}
+	return strings.Join(parts, "\n")
+}

@@ -25,6 +25,7 @@ const (
 	defaultWSLDistro      = "Ubuntu"
 	wslCommandName        = "wsl.exe"
 	wslCommandTimeout     = 10 * commandTimeout
+	wslServiceTimeout     = 2 * time.Minute
 	wslInstallTimeout     = 15 * time.Minute
 )
 
@@ -316,13 +317,7 @@ func (p *WindowsWSLProvider) ExecuteInstallStep(ctx context.Context, planID stri
 	sendInstallProgress(progress, step+1, len(plan.Steps), "Running: "+installStep.Message, false)
 	result, err := p.runner.Run(ctx, installStep.Timeout, installStep.Command[0], installStep.Command[1:]...)
 	if err != nil || result == nil || result.ExitCode != 0 {
-		detail := ""
-		if result != nil {
-			detail = strings.TrimSpace(result.Stderr)
-			if detail == "" {
-				detail = strings.TrimSpace(result.Stdout)
-			}
-		}
+		detail := commandFailureDetail(result, err)
 		opts := []apperror.Option{apperror.WithDetail(detail)}
 		if len(installStep.RepairHints) > 0 {
 			opts = append(opts, apperror.WithRepairHints(installStep.RepairHints...))
@@ -881,7 +876,7 @@ func buildWSLInstallStepsFor(distro string, distribution string) []wslInstallSte
 		},
 		{
 			Message: "Enable systemd inside the selected distribution",
-			Timeout: commandTimeout,
+			Timeout: wslCommandTimeout,
 			Command: []string{wslCommandName, "-d", distro, "-u", "root", "--", "sh", "-lc", systemdCommand},
 			RepairHints: []string{
 				"Initialize the Ubuntu distro if WSL reports that the distribution is not ready.",
@@ -890,7 +885,7 @@ func buildWSLInstallStepsFor(distro string, distribution string) []wslInstallSte
 		},
 		{
 			Message: "Restart WSL so systemd configuration takes effect",
-			Timeout: commandTimeout,
+			Timeout: wslCommandTimeout,
 			Command: []string{wslCommandName, "--terminate", distro},
 			RepairHints: []string{
 				"Close running shells or terminals attached to the selected WSL distro, then retry.",
@@ -907,7 +902,7 @@ func buildWSLInstallStepsFor(distro string, distribution string) []wslInstallSte
 		},
 		{
 			Message: "Add the WSL user to the docker group",
-			Timeout: commandTimeout,
+			Timeout: wslCommandTimeout,
 			Command: []string{wslCommandName, "-d", distro, "-u", "root", "--", "sh", "-lc", escapeWSLCommandDollars(groupCommand)},
 			RepairHints: []string{
 				"Finish the Ubuntu first-run user setup, then retry.",
@@ -916,7 +911,7 @@ func buildWSLInstallStepsFor(distro string, distribution string) []wslInstallSte
 		},
 		{
 			Message: "Restart the selected WSL distro so docker group membership applies",
-			Timeout: commandTimeout,
+			Timeout: wslCommandTimeout,
 			Command: []string{wslCommandName, "--terminate", distro},
 			RepairHints: []string{
 				"Close running shells or terminals attached to the selected WSL distro, then retry.",
@@ -924,7 +919,7 @@ func buildWSLInstallStepsFor(distro string, distribution string) []wslInstallSte
 		},
 		{
 			Message: "Enable and start the Docker service",
-			Timeout: commandTimeout,
+			Timeout: wslServiceTimeout,
 			Command: []string{wslCommandName, "-d", distro, "-u", "root", "--", "sh", "-lc", "systemctl enable --now docker"},
 			RepairHints: []string{
 				"Make sure systemd is enabled in /etc/wsl.conf, terminate the distro, and retry.",
