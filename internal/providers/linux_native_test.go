@@ -163,6 +163,9 @@ func TestLinuxNativePlanInstallBuildsUbuntuDockerAptSteps(t *testing.T) {
 	if !strings.Contains(plan.Commands[2].Command, "lsb_release -cs") || !strings.Contains(plan.Commands[2].Command, "24.04) codename=noble") {
 		t.Fatalf("repository command missing codename fallbacks: %q", plan.Commands[2].Command)
 	}
+	if strings.Contains(plan.Commands[2].Command, `\$codename`) || strings.Contains(plan.Commands[2].Command, `\$(dpkg --print-architecture)`) {
+		t.Fatalf("Linux native repository command should not escape shell dollars: %q", plan.Commands[2].Command)
+	}
 	if !strings.Contains(plan.Commands[6].Command, "docker run --rm hello-world") {
 		t.Fatalf("verify command missing hello-world: %q", plan.Commands[6].Command)
 	}

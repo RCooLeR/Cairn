@@ -340,6 +340,12 @@ func TestWindowsWSLInstallPlanAndExecution(t *testing.T) {
 	if !strings.Contains(plan.Commands[5].Command, "lsb_release -cs") || !strings.Contains(plan.Commands[5].Command, "24.04) codename=noble") {
 		t.Fatalf("Docker apt install command missing codename fallbacks: %s", plan.Commands[5].Command)
 	}
+	if !strings.Contains(plan.Commands[5].Command, `\$codename`) || !strings.Contains(plan.Commands[5].Command, `\$(dpkg --print-architecture)`) {
+		t.Fatalf("Docker apt install command does not escape dollars for wsl.exe: %s", plan.Commands[5].Command)
+	}
+	if !strings.Contains(plan.Commands[6].Command, `\$user`) || !strings.Contains(plan.Commands[6].Command, `\$(getent passwd 1000`) {
+		t.Fatalf("Docker group command does not escape dollars for wsl.exe: %s", plan.Commands[6].Command)
+	}
 	if !strings.Contains(plan.Commands[5].Command, "docker-ce") || !strings.Contains(plan.Commands[9].Command, "hello-world") {
 		t.Fatalf("plan commands missing Docker install/verify steps: %#v", plan.Commands)
 	}

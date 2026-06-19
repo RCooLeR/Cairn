@@ -899,7 +899,7 @@ func buildWSLInstallStepsFor(distro string, distribution string) []wslInstallSte
 		{
 			Message: "Install or upgrade Docker Engine, containerd, Compose, and Buildx from Docker's apt repository",
 			Timeout: wslInstallTimeout,
-			Command: []string{wslCommandName, "-d", distro, "-u", "root", "--", "sh", "-lc", dockerAptCommand},
+			Command: []string{wslCommandName, "-d", distro, "-u", "root", "--", "sh", "-lc", escapeWSLCommandDollars(dockerAptCommand)},
 			RepairHints: []string{
 				"Check internet access from inside WSL and retry.",
 				"If apt is locked, wait for the other package operation to finish and retry.",
@@ -908,7 +908,7 @@ func buildWSLInstallStepsFor(distro string, distribution string) []wslInstallSte
 		{
 			Message: "Add the WSL user to the docker group",
 			Timeout: commandTimeout,
-			Command: []string{wslCommandName, "-d", distro, "-u", "root", "--", "sh", "-lc", groupCommand},
+			Command: []string{wslCommandName, "-d", distro, "-u", "root", "--", "sh", "-lc", escapeWSLCommandDollars(groupCommand)},
 			RepairHints: []string{
 				"Finish the Ubuntu first-run user setup, then retry.",
 				"Restart WSL after the group change if Docker access is still denied.",
@@ -999,6 +999,10 @@ func wslEnsureVersion2Script(distro string) string {
 
 func psSingleQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+}
+
+func escapeWSLCommandDollars(command string) string {
+	return strings.ReplaceAll(command, "$", `\$`)
 }
 
 func sendInstallProgress(progress chan<- InstallProgress, step int, totalSteps int, message string, done bool) {
