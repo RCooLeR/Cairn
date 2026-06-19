@@ -162,6 +162,31 @@ func TestComposeCommandErrorTrimsHugeOutput(t *testing.T) {
 	}
 }
 
+func TestComposeCommandErrorAddsNVIDIARuntimeHints(t *testing.T) {
+	t.Parallel()
+
+	err := composeCommandError(
+		apperror.ComposeInvalid,
+		"Compose project action failed",
+		&providers.CommandResult{Stderr: `Error response from daemon: could not select device driver "nvidia" with capabilities: [[gpu]]`, ExitCode: 1},
+		errors.New("exit status 1"),
+	)
+
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) {
+		t.Fatalf("error = %T, want AppError", err)
+	}
+	if appErr.Message != "Compose project requires NVIDIA GPU runtime" {
+		t.Fatalf("message = %q", appErr.Message)
+	}
+	if len(appErr.RepairHints) != 3 {
+		t.Fatalf("repair hints = %#v", appErr.RepairHints)
+	}
+	if !strings.Contains(appErr.RepairHints[0], "NVIDIA Container Toolkit") || !strings.Contains(appErr.RepairHints[2], "CPU-only") {
+		t.Fatalf("repair hints = %#v", appErr.RepairHints)
+	}
+}
+
 func TestClientConfigAllTestdataProjectsIntegration(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("real docker compose config integration runs only on Linux")

@@ -294,7 +294,22 @@ func composeCommandError(code apperror.Code, message string, result *providers.C
 	if code == apperror.ComposeNotFound {
 		hints = append(hints, "Install or upgrade the official Docker Compose v2 plugin.")
 	}
+	if composeNVIDIARuntimeUnavailable(detail) {
+		message = "Compose project requires NVIDIA GPU runtime"
+		hints = append(hints,
+			"Install the NVIDIA driver on the host and the NVIDIA Container Toolkit in the active Docker backend, then restart Docker.",
+			"On WSL, verify `nvidia-smi` works inside the selected distro and test Docker with `docker run --rm --gpus all nvidia/cuda:12.6.3-base-ubuntu24.04 nvidia-smi`.",
+			"If GPU acceleration is optional, disable the service's `gpus` or NVIDIA device reservation in Compose and redeploy the CPU-only variant.",
+		)
+	}
 	return apperror.New(code, message, apperror.WithDetail(detail), apperror.WithRepairHints(hints...))
+}
+
+func composeNVIDIARuntimeUnavailable(detail string) bool {
+	normalized := strings.ToLower(detail)
+	return strings.Contains(normalized, `could not select device driver "nvidia"`) &&
+		strings.Contains(normalized, "capabilities") &&
+		strings.Contains(normalized, "gpu")
 }
 
 func commandDetail(result *providers.CommandResult, err error) string {
