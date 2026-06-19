@@ -322,6 +322,9 @@ func TestWindowsWSLInstallPlanAndExecution(t *testing.T) {
 	if plan.Risk != models.RiskNeedsConfirmation {
 		t.Fatalf("plan risk = %q, want %q", plan.Risk, models.RiskNeedsConfirmation)
 	}
+	if plan.Title != "Install or update Docker Engine in Ubuntu on WSL" {
+		t.Fatalf("plan title = %q", plan.Title)
+	}
 	if got, want := len(plan.Commands), 10; got != want {
 		t.Fatalf("command count = %d, want %d", got, want)
 	}
@@ -351,6 +354,33 @@ func TestWindowsWSLInstallPlanAndExecution(t *testing.T) {
 	}
 	if err := provider.ExecuteInstallStep(context.Background(), plan.PlanID, 0, nil); !apperror.IsCode(err, apperror.PlanExpired) {
 		t.Fatalf("ExecuteInstallStep after completion error = %v, want E_PLAN_EXPIRED", err)
+	}
+}
+
+func TestWindowsWSLDetectWarnsWhenDockerPackagesAreOutdated(t *testing.T) {
+	t.Parallel()
+	runner := newFakeRunner()
+	seedWSLDetectThroughDockerProbe(runner)
+	runner.outputs[wslCommandName+" -d Ubuntu -- sh -lc command -v docker >/dev/null 2>&1"] = "/usr/bin/docker\n"
+	runner.outputs[wslCommandName+" -d Ubuntu -- docker context show"] = "default\n"
+	runner.outputs[wslCommandName+" -d Ubuntu -- docker compose version --short"] = "v2.29.1\n"
+	runner.outputs[wslCommandName+" -d Ubuntu -- docker buildx version"] = "github.com/docker/buildx v0.16.2 123456\n"
+	runner.outputs[wslCommandName+" -d Ubuntu -- sh -lc apt-cache policy docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"] = `docker-ce:
+  Installed: 5:27.1.2-1~ubuntu.24.04~noble
+  Candidate: 5:29.0.3-1~ubuntu.24.04~noble
+docker-compose-plugin:
+  Installed: 2.29.1-1~ubuntu.24.04~noble
+  Candidate: 2.40.3-1~ubuntu.24.04~noble
+`
+	runner.outputs[wslCommandName+" -d Ubuntu -- docker info --format {{.ServerVersion}}"] = "27.1.2\n"
+
+	status, err := NewWindowsWSL(WindowsWSLOptions{Runner: runner}).Detect(context.Background())
+	if err != nil {
+		t.Fatalf("Detect() error = %v", err)
+	}
+	warning := assertWarning(t, status.Warnings, WarningDockerPackagesOutdated)
+	if !strings.Contains(warning.Message, "docker-ce") || !strings.Contains(warning.Message, "docker-compose-plugin") {
+		t.Fatalf("warning = %#v", warning)
 	}
 }
 

@@ -882,13 +882,24 @@ func (m *Manager) insertNotification(ctx context.Context, result string, project
 			body += " " + actionErr.Error()
 		}
 	}
-	_, _ = m.Notify.Insert(ctx, store.NotificationRecord{
+	createdAt := m.now()
+	id, _ := m.Notify.Insert(ctx, store.NotificationRecord{
 		Level:     level,
 		Title:     title,
 		Body:      body,
 		Topic:     "updates",
-		CreatedAt: m.now(),
+		CreatedAt: createdAt,
 	})
+	if id > 0 && m.Events != nil {
+		m.Events.Publish(bus.Event{Topic: bus.TopicNotification, Payload: models.Notification{
+			ID:        id,
+			Level:     level,
+			Title:     title,
+			Body:      body,
+			Topic:     "updates",
+			CreatedAt: createdAt,
+		}})
+	}
 }
 
 func composeOptionsFromProject(project store.ProjectRecord) composecore.ProjectOptions {

@@ -221,6 +221,11 @@ func (p *WindowsWSLProvider) Detect(ctx context.Context) (*models.ProviderStatus
 			true,
 		))
 	}
+	if ubuntuFamily && (status.DockerInstalled || status.ComposeInstalled || status.BuildxInstalled) {
+		if outdated, ok := p.detectDockerPackageUpdates(ctx, selected.Name); ok && len(outdated) > 0 {
+			status.Warnings = append(status.Warnings, dockerPackagesOutdatedWarning(outdated))
+		}
+	}
 	if dockerVersion, ok := p.runWSLText(ctx, selected.Name, "docker", "info", "--format", "{{.ServerVersion}}"); ok {
 		status.DockerRunning = true
 		status.DockerVersion = normalizeDockerVersion(dockerVersion)
@@ -282,13 +287,13 @@ func (p *WindowsWSLProvider) PlanInstall(_ context.Context, opts models.InstallO
 	}
 	plan := &models.CommandPlan{
 		PlanID:   planID,
-		Title:    "Install Docker Engine in Ubuntu on WSL",
+		Title:    "Install or update Docker Engine in Ubuntu on WSL",
 		Risk:     models.RiskNeedsConfirmation,
 		Commands: commands,
 		Effects: []string{
 			"Enable or verify WSL and the selected Ubuntu distro.",
 			"Enable systemd in the selected distro and restart WSL if needed.",
-			"Install Docker Engine, containerd, Compose, and Buildx from Docker's official apt repository.",
+			"Install or upgrade Docker Engine, containerd, Compose, and Buildx from Docker's official apt repository.",
 			"Add the WSL user to the docker group; a WSL restart may be required before group membership applies.",
 			"Enable and start the Docker service, then verify Docker, Compose, Buildx, and hello-world.",
 		},
@@ -542,6 +547,15 @@ func (p *WindowsWSLProvider) runWSLText(ctx context.Context, distro string, args
 		return "", false
 	}
 	return strings.TrimSpace(decodeWSLOutput(result.Stdout)), true
+}
+
+func (p *WindowsWSLProvider) detectDockerPackageUpdates(ctx context.Context, distro string) ([]string, bool) {
+	command := "apt-cache policy " + strings.Join(dockerAptPackages, " ")
+	output, ok := p.runWSLText(ctx, distro, "sh", "-lc", command)
+	if !ok {
+		return nil, false
+	}
+	return aptPolicyOutdatedPackages(output), true
 }
 
 func (p *WindowsWSLProvider) runWSL(ctx context.Context, distro string, args ...string) (*CommandResult, error) {
@@ -883,7 +897,7 @@ func buildWSLInstallStepsFor(distro string, distribution string) []wslInstallSte
 			},
 		},
 		{
-			Message: "Install Docker Engine, containerd, Compose, and Buildx from Docker's apt repository",
+			Message: "Install or upgrade Docker Engine, containerd, Compose, and Buildx from Docker's apt repository",
 			Timeout: wslInstallTimeout,
 			Command: []string{wslCommandName, "-d", distro, "-u", "root", "--", "sh", "-lc", dockerAptCommand},
 			RepairHints: []string{

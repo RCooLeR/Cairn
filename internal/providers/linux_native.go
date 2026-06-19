@@ -3,6 +3,7 @@ package providers
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path"
@@ -24,6 +25,14 @@ const (
 	composeCommandTimeout  = 30 * time.Second
 	socketTimeout          = time.Second
 )
+
+var dockerAptPackages = []string{
+	"docker-ce",
+	"docker-ce-cli",
+	"containerd.io",
+	"docker-buildx-plugin",
+	"docker-compose-plugin",
+}
 
 type LinuxNativeOptions struct {
 	SocketPath string
@@ -196,6 +205,12 @@ func (p *LinuxNativeProvider) Detect(ctx context.Context) (*models.ProviderStatu
 		))
 	}
 
+	if status.DockerInstalled || status.ComposeInstalled || status.BuildxInstalled {
+		if outdated, ok := p.detectDockerPackageUpdates(ctx); ok && len(outdated) > 0 {
+			status.Warnings = append(status.Warnings, dockerPackagesOutdatedWarning(outdated))
+		}
+	}
+
 	if socketOK {
 		if dockerVersion, ok := p.runText(ctx, "docker", "info", "--format", "{{.ServerVersion}}"); ok {
 			status.DockerRunning = true
@@ -233,13 +248,13 @@ func (p *LinuxNativeProvider) PlanInstall(context.Context, models.InstallOptions
 	}
 	plan := &models.CommandPlan{
 		PlanID:   planID,
-		Title:    "Install Docker Engine on Linux",
+		Title:    "Install or update Docker Engine on Linux",
 		Risk:     models.RiskNeedsConfirmation,
 		Commands: commands,
 		Effects: []string{
 			"Install apt prerequisites required by Docker's official repository.",
 			"Add Docker's official apt signing key and repository for this distribution.",
-			"Install Docker Engine, containerd, Compose, and Buildx packages.",
+			"Install or upgrade Docker Engine, containerd, Compose, and Buildx packages.",
 			"Enable and start the Docker service with systemd.",
 			"Verify Docker Engine, Compose, Buildx, and hello-world.",
 		},
@@ -438,9 +453,9 @@ func buildLinuxInstallSteps() []linuxInstallStep {
 			},
 		},
 		{
-			Message: "Install Docker Engine, containerd, Compose, and Buildx",
+			Message: "Install or upgrade Docker Engine, containerd, Compose, and Buildx",
 			Timeout: 20 * time.Minute,
-			Command: []string{"sudo", "apt-get", "install", "-y", "docker-ce", "docker-ce-cli", "containerd.io", "docker-buildx-plugin", "docker-compose-plugin"},
+			Command: append([]string{"sudo", "apt-get", "install", "-y"}, dockerAptPackages...),
 			RepairHints: []string{
 				"If packages cannot be located, verify the Docker apt repository step completed successfully.",
 				"If apt is locked, wait for the other package operation to finish and retry.",
@@ -502,6 +517,15 @@ func (p *LinuxNativeProvider) runText(ctx context.Context, name string, args ...
 	return strings.TrimSpace(result.Stdout), true
 }
 
+func (p *LinuxNativeProvider) detectDockerPackageUpdates(ctx context.Context) ([]string, bool) {
+	args := append([]string{"policy"}, dockerAptPackages...)
+	output, ok := p.runText(ctx, "apt-cache", args...)
+	if !ok {
+		return nil, false
+	}
+	return aptPolicyOutdatedPackages(output), true
+}
+
 func providerProblem(code, message, hint string, recoverable bool) models.ProviderProblem {
 	return models.ProviderProblem{
 		Code:        code,
@@ -556,4 +580,59 @@ func normalizeDockerVersion(value string) string {
 		}
 	}
 	return value
+}
+
+func aptPolicyOutdatedPackages(output string) []string {
+	type packageState struct {
+		name      string
+		installed string
+		candidate string
+	}
+	seen := map[string]bool{}
+	outdated := []string{}
+	current := packageState{}
+	flush := func() {
+		if current.name == "" || seen[current.name] {
+			return
+		}
+		installed := strings.TrimSpace(current.installed)
+		candidate := strings.TrimSpace(current.candidate)
+		if installed == "" || candidate == "" || installed == "(none)" || candidate == "(none)" {
+			return
+		}
+		if installed != candidate {
+			outdated = append(outdated, current.name)
+			seen[current.name] = true
+		}
+	}
+	for _, line := range strings.Split(output, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasSuffix(trimmed, ":") && !strings.Contains(trimmed, " ") {
+			flush()
+			current = packageState{name: strings.TrimSuffix(trimmed, ":")}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "Installed:") {
+			current.installed = strings.TrimSpace(strings.TrimPrefix(trimmed, "Installed:"))
+			continue
+		}
+		if strings.HasPrefix(trimmed, "Candidate:") {
+			current.candidate = strings.TrimSpace(strings.TrimPrefix(trimmed, "Candidate:"))
+		}
+	}
+	flush()
+	return outdated
+}
+
+func dockerPackagesOutdatedWarning(packages []string) models.ProviderWarning {
+	return models.ProviderWarning{
+		Code: WarningDockerPackagesOutdated,
+		Message: fmt.Sprintf(
+			"Docker packages have updates available: %s. Run Auto repair / update to install the current versions.",
+			strings.Join(packages, ", "),
+		),
+	}
 }

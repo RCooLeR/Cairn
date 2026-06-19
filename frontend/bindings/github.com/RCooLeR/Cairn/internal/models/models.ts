@@ -1272,6 +1272,7 @@ export class DashboardMetrics {
     "images": number;
     "volumes": number;
     "diskUsage": DiskUsage;
+    "gpu": GPUMetrics;
     "top"?: MetricRankItem[];
     "recentEvents"?: AuditEntry[];
 
@@ -1292,6 +1293,9 @@ export class DashboardMetrics {
         if (!("diskUsage" in $$source)) {
             this["diskUsage"] = (new DiskUsage());
         }
+        if (!("gpu" in $$source)) {
+            this["gpu"] = (new GPUMetrics());
+        }
 
         Object.assign(this, $$source);
     }
@@ -1301,17 +1305,21 @@ export class DashboardMetrics {
      */
     static createFrom($$source: any = {}): DashboardMetrics {
         const $$createField4_0 = $$createType25;
-        const $$createField5_0 = $$createType27;
-        const $$createField6_0 = $$createType29;
+        const $$createField5_0 = $$createType26;
+        const $$createField6_0 = $$createType28;
+        const $$createField7_0 = $$createType30;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("diskUsage" in $$parsedSource) {
             $$parsedSource["diskUsage"] = $$createField4_0($$parsedSource["diskUsage"]);
         }
+        if ("gpu" in $$parsedSource) {
+            $$parsedSource["gpu"] = $$createField5_0($$parsedSource["gpu"]);
+        }
         if ("top" in $$parsedSource) {
-            $$parsedSource["top"] = $$createField5_0($$parsedSource["top"]);
+            $$parsedSource["top"] = $$createField6_0($$parsedSource["top"]);
         }
         if ("recentEvents" in $$parsedSource) {
-            $$parsedSource["recentEvents"] = $$createField6_0($$parsedSource["recentEvents"]);
+            $$parsedSource["recentEvents"] = $$createField7_0($$parsedSource["recentEvents"]);
         }
         return new DashboardMetrics($$parsedSource as Partial<DashboardMetrics>);
     }
@@ -1353,10 +1361,10 @@ export class DiskUsage {
      * Creates a new DiskUsage instance from a string or object.
      */
     static createFrom($$source: any = {}): DiskUsage {
-        const $$createField0_0 = $$createType30;
-        const $$createField1_0 = $$createType30;
-        const $$createField2_0 = $$createType30;
-        const $$createField3_0 = $$createType30;
+        const $$createField0_0 = $$createType31;
+        const $$createField1_0 = $$createType31;
+        const $$createField2_0 = $$createType31;
+        const $$createField3_0 = $$createType31;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("images" in $$parsedSource) {
             $$parsedSource["images"] = $$createField0_0($$parsedSource["images"]);
@@ -1564,6 +1572,81 @@ export class ExportResult {
     }
 }
 
+export class GPUDeviceMetric {
+    "id": string;
+    "index": number;
+    "name": string;
+    "driverVersion"?: string;
+    "utilizationPercent"?: number;
+    "memoryUsedBytes"?: number;
+    "memoryTotalBytes"?: number;
+    "temperatureCelsius"?: number;
+
+    /** Creates a new GPUDeviceMetric instance. */
+    constructor($$source: Partial<GPUDeviceMetric> = {}) {
+        if (!("id" in $$source)) {
+            this["id"] = "";
+        }
+        if (!("index" in $$source)) {
+            this["index"] = 0;
+        }
+        if (!("name" in $$source)) {
+            this["name"] = "";
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new GPUDeviceMetric instance from a string or object.
+     */
+    static createFrom($$source: any = {}): GPUDeviceMetric {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new GPUDeviceMetric($$parsedSource as Partial<GPUDeviceMetric>);
+    }
+}
+
+export class GPUMetrics {
+    "available": boolean;
+    "source"?: string;
+    "message"?: string;
+    "deviceCount": number;
+    "utilizationPercent"?: number;
+    "memoryUsedBytes"?: number;
+    "memoryTotalBytes"?: number;
+    "temperatureCelsius"?: number;
+    "driverVersion"?: string;
+    "devices"?: GPUDeviceMetric[];
+    "checkedAt": time$0.Time;
+
+    /** Creates a new GPUMetrics instance. */
+    constructor($$source: Partial<GPUMetrics> = {}) {
+        if (!("available" in $$source)) {
+            this["available"] = false;
+        }
+        if (!("deviceCount" in $$source)) {
+            this["deviceCount"] = 0;
+        }
+        if (!("checkedAt" in $$source)) {
+            this["checkedAt"] = null;
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new GPUMetrics instance from a string or object.
+     */
+    static createFrom($$source: any = {}): GPUMetrics {
+        const $$createField9_0 = $$createType33;
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        if ("devices" in $$parsedSource) {
+            $$parsedSource["devices"] = $$createField9_0($$parsedSource["devices"]);
+        }
+        return new GPUMetrics($$parsedSource as Partial<GPUMetrics>);
+    }
+}
+
 export enum HealthStatus {
     /**
      * The Go zero value for the underlying type of the enum.
@@ -1656,7 +1739,7 @@ export class ImageDetail {
      * Creates a new ImageDetail instance from a string or object.
      */
     static createFrom($$source: any = {}): ImageDetail {
-        const $$createField0_0 = $$createType31;
+        const $$createField0_0 = $$createType34;
         const $$createField4_0 = $$createType22;
         const $$createField5_0 = $$createType1;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
@@ -1944,7 +2027,7 @@ export class LogPage {
      * Creates a new LogPage instance from a string or object.
      */
     static createFrom($$source: any = {}): LogPage {
-        const $$createField0_0 = $$createType33;
+        const $$createField0_0 = $$createType36;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("lines" in $$parsedSource) {
             $$parsedSource["lines"] = $$createField0_0($$parsedSource["lines"]);
@@ -2105,10 +2188,10 @@ export class NetworkDetail {
      * Creates a new NetworkDetail instance from a string or object.
      */
     static createFrom($$source: any = {}): NetworkDetail {
-        const $$createField0_0 = $$createType34;
+        const $$createField0_0 = $$createType37;
         const $$createField3_0 = $$createType22;
-        const $$createField4_0 = $$createType36;
-        const $$createField5_0 = $$createType37;
+        const $$createField4_0 = $$createType39;
+        const $$createField5_0 = $$createType40;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("summary" in $$parsedSource) {
             $$parsedSource["summary"] = $$createField0_0($$parsedSource["summary"]);
@@ -2368,10 +2451,10 @@ export class ProjectDetail {
      * Creates a new ProjectDetail instance from a string or object.
      */
     static createFrom($$source: any = {}): ProjectDetail {
-        const $$createField0_0 = $$createType38;
-        const $$createField1_0 = $$createType40;
-        const $$createField2_0 = $$createType37;
-        const $$createField3_0 = $$createType42;
+        const $$createField0_0 = $$createType41;
+        const $$createField1_0 = $$createType43;
+        const $$createField2_0 = $$createType40;
+        const $$createField3_0 = $$createType45;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("summary" in $$parsedSource) {
             $$parsedSource["summary"] = $$createField0_0($$parsedSource["summary"]);
@@ -2471,7 +2554,7 @@ export class ProjectSummary {
      * Creates a new ProjectSummary instance from a string or object.
      */
     static createFrom($$source: any = {}): ProjectSummary {
-        const $$createField11_0 = $$createType43;
+        const $$createField11_0 = $$createType46;
         const $$createField12_0 = $$createType16;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("updateBadges" in $$parsedSource) {
@@ -2502,9 +2585,9 @@ export class ProviderDetail {
      * Creates a new ProviderDetail instance from a string or object.
      */
     static createFrom($$source: any = {}): ProviderDetail {
-        const $$createField0_0 = $$createType44;
+        const $$createField0_0 = $$createType47;
         const $$createField1_0 = $$createType22;
-        const $$createField2_0 = $$createType46;
+        const $$createField2_0 = $$createType49;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("summary" in $$parsedSource) {
             $$parsedSource["summary"] = $$createField0_0($$parsedSource["summary"]);
@@ -2596,8 +2679,8 @@ export class ProviderStatus {
      * Creates a new ProviderStatus instance from a string or object.
      */
     static createFrom($$source: any = {}): ProviderStatus {
-        const $$createField12_0 = $$createType46;
-        const $$createField13_0 = $$createType48;
+        const $$createField12_0 = $$createType49;
+        const $$createField13_0 = $$createType51;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("problems" in $$parsedSource) {
             $$parsedSource["problems"] = $$createField12_0($$parsedSource["problems"]);
@@ -2645,7 +2728,7 @@ export class ProviderSummary {
      * Creates a new ProviderSummary instance from a string or object.
      */
     static createFrom($$source: any = {}): ProviderSummary {
-        const $$createField4_0 = $$createType49;
+        const $$createField4_0 = $$createType52;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("status" in $$parsedSource) {
             $$parsedSource["status"] = $$createField4_0($$parsedSource["status"]);
@@ -2902,7 +2985,7 @@ export class RunImageRequest {
      * Creates a new RunImageRequest instance from a string or object.
      */
     static createFrom($$source: any = {}): RunImageRequest {
-        const $$createField2_0 = $$createType51;
+        const $$createField2_0 = $$createType54;
         const $$createField3_0 = $$createType19;
         const $$createField4_0 = $$createType21;
         const $$createField7_0 = $$createType1;
@@ -2944,7 +3027,7 @@ export class Series {
      * Creates a new Series instance from a string or object.
      */
     static createFrom($$source: any = {}): Series {
-        const $$createField2_0 = $$createType53;
+        const $$createField2_0 = $$createType56;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("points" in $$parsedSource) {
             $$parsedSource["points"] = $$createField2_0($$parsedSource["points"]);
@@ -2969,7 +3052,7 @@ export class SeriesBundle {
      * Creates a new SeriesBundle instance from a string or object.
      */
     static createFrom($$source: any = {}): SeriesBundle {
-        const $$createField0_0 = $$createType55;
+        const $$createField0_0 = $$createType58;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("series" in $$parsedSource) {
             $$parsedSource["series"] = $$createField0_0($$parsedSource["series"]);
@@ -3153,8 +3236,8 @@ export class UpdateFilter {
      * Creates a new UpdateFilter instance from a string or object.
      */
     static createFrom($$source: any = {}): UpdateFilter {
-        const $$createField1_0 = $$createType56;
-        const $$createField2_0 = $$createType57;
+        const $$createField1_0 = $$createType59;
+        const $$createField2_0 = $$createType60;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("status" in $$parsedSource) {
             $$parsedSource["status"] = $$createField1_0($$parsedSource["status"]);
@@ -3266,7 +3349,7 @@ export class UpdatePlan {
      * Creates a new UpdatePlan instance from a string or object.
      */
     static createFrom($$source: any = {}): UpdatePlan {
-        const $$createField2_0 = $$createType59;
+        const $$createField2_0 = $$createType62;
         const $$createField3_0 = $$createType12;
         const $$createField4_0 = $$createType1;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
@@ -3390,9 +3473,9 @@ export class VolumeDetail {
      * Creates a new VolumeDetail instance from a string or object.
      */
     static createFrom($$source: any = {}): VolumeDetail {
-        const $$createField0_0 = $$createType60;
+        const $$createField0_0 = $$createType63;
         const $$createField1_0 = $$createType22;
-        const $$createField2_0 = $$createType37;
+        const $$createField2_0 = $$createType40;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("summary" in $$parsedSource) {
             $$parsedSource["summary"] = $$createField0_0($$parsedSource["summary"]);
@@ -3497,38 +3580,41 @@ const $$createType22 = $Create.Map($Create.Any, $Create.Any);
 const $$createType23 = ContainerFileEntry.createFrom;
 const $$createType24 = $Create.Array($$createType23);
 const $$createType25 = DiskUsage.createFrom;
-const $$createType26 = MetricRankItem.createFrom;
-const $$createType27 = $Create.Array($$createType26);
-const $$createType28 = AuditEntry.createFrom;
-const $$createType29 = $Create.Array($$createType28);
-const $$createType30 = DiskUsageCategory.createFrom;
-const $$createType31 = ImageSummary.createFrom;
-const $$createType32 = LogLine.createFrom;
+const $$createType26 = GPUMetrics.createFrom;
+const $$createType27 = MetricRankItem.createFrom;
+const $$createType28 = $Create.Array($$createType27);
+const $$createType29 = AuditEntry.createFrom;
+const $$createType30 = $Create.Array($$createType29);
+const $$createType31 = DiskUsageCategory.createFrom;
+const $$createType32 = GPUDeviceMetric.createFrom;
 const $$createType33 = $Create.Array($$createType32);
-const $$createType34 = NetworkSummary.createFrom;
-const $$createType35 = NetworkIPAMConfig.createFrom;
+const $$createType34 = ImageSummary.createFrom;
+const $$createType35 = LogLine.createFrom;
 const $$createType36 = $Create.Array($$createType35);
-const $$createType37 = $Create.Array($$createType17);
-const $$createType38 = ProjectSummary.createFrom;
-const $$createType39 = ComposeServiceStatus.createFrom;
-const $$createType40 = $Create.Array($$createType39);
-const $$createType41 = ComposeConfigResult.createFrom;
-const $$createType42 = $Create.Nullable($$createType41);
-const $$createType43 = UpdateBadges.createFrom;
-const $$createType44 = ProviderSummary.createFrom;
-const $$createType45 = ProviderProblem.createFrom;
-const $$createType46 = $Create.Array($$createType45);
-const $$createType47 = ProviderWarning.createFrom;
-const $$createType48 = $Create.Array($$createType47);
-const $$createType49 = ProviderStatus.createFrom;
-const $$createType50 = PortMapping.createFrom;
+const $$createType37 = NetworkSummary.createFrom;
+const $$createType38 = NetworkIPAMConfig.createFrom;
+const $$createType39 = $Create.Array($$createType38);
+const $$createType40 = $Create.Array($$createType17);
+const $$createType41 = ProjectSummary.createFrom;
+const $$createType42 = ComposeServiceStatus.createFrom;
+const $$createType43 = $Create.Array($$createType42);
+const $$createType44 = ComposeConfigResult.createFrom;
+const $$createType45 = $Create.Nullable($$createType44);
+const $$createType46 = UpdateBadges.createFrom;
+const $$createType47 = ProviderSummary.createFrom;
+const $$createType48 = ProviderProblem.createFrom;
+const $$createType49 = $Create.Array($$createType48);
+const $$createType50 = ProviderWarning.createFrom;
 const $$createType51 = $Create.Array($$createType50);
-const $$createType52 = Point.createFrom;
-const $$createType53 = $Create.Array($$createType52);
-const $$createType54 = Series.createFrom;
-const $$createType55 = $Create.Array($$createType54);
-const $$createType56 = $Create.Array($Create.Any);
-const $$createType57 = $Create.Array($Create.Any);
-const $$createType58 = UpdatePlanItem.createFrom;
-const $$createType59 = $Create.Array($$createType58);
-const $$createType60 = VolumeSummary.createFrom;
+const $$createType52 = ProviderStatus.createFrom;
+const $$createType53 = PortMapping.createFrom;
+const $$createType54 = $Create.Array($$createType53);
+const $$createType55 = Point.createFrom;
+const $$createType56 = $Create.Array($$createType55);
+const $$createType57 = Series.createFrom;
+const $$createType58 = $Create.Array($$createType57);
+const $$createType59 = $Create.Array($Create.Any);
+const $$createType60 = $Create.Array($Create.Any);
+const $$createType61 = UpdatePlanItem.createFrom;
+const $$createType62 = $Create.Array($$createType61);
+const $$createType63 = VolumeSummary.createFrom;

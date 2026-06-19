@@ -125,7 +125,7 @@ func TestLinuxNativePlanInstallBuildsUbuntuDockerAptSteps(t *testing.T) {
 		t.Fatalf("PlanInstall() error = %v", err)
 	}
 
-	if plan.Title != "Install Docker Engine on Linux" {
+	if plan.Title != "Install or update Docker Engine on Linux" {
 		t.Fatalf("Title = %q", plan.Title)
 	}
 	if plan.Risk != models.RiskNeedsConfirmation {
@@ -162,6 +162,64 @@ func TestLinuxNativePlanInstallBuildsUbuntuDockerAptSteps(t *testing.T) {
 	}
 	if plan.ExpiresAt.IsZero() {
 		t.Fatalf("ExpiresAt was not set")
+	}
+}
+
+func TestLinuxNativeDetectWarnsWhenDockerPackagesAreOutdated(t *testing.T) {
+	t.Parallel()
+	runner := newFakeRunner()
+	runner.paths["docker"] = "/usr/bin/docker"
+	runner.outputs["docker context show"] = "default\n"
+	runner.outputs["docker compose version --short"] = "v2.29.1\n"
+	runner.outputs["docker buildx version"] = "github.com/docker/buildx v0.16.2 123456\n"
+	runner.outputs["docker info --format {{.ServerVersion}}"] = "27.1.2\n"
+	runner.outputs["apt-cache policy docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"] = `docker-ce:
+  Installed: 5:27.1.2-1~ubuntu.24.04~noble
+  Candidate: 5:29.0.3-1~ubuntu.24.04~noble
+docker-ce-cli:
+  Installed: 5:29.0.3-1~ubuntu.24.04~noble
+  Candidate: 5:29.0.3-1~ubuntu.24.04~noble
+containerd.io:
+  Installed: 1.7.28-1
+  Candidate: 1.7.28-1
+docker-buildx-plugin:
+  Installed: 0.16.2-1~ubuntu.24.04~noble
+  Candidate: 0.30.1-1~ubuntu.24.04~noble
+docker-compose-plugin:
+  Installed: 2.29.1-1~ubuntu.24.04~noble
+  Candidate: 2.29.1-1~ubuntu.24.04~noble
+`
+	probe := &fakeLinuxProbe{
+		paths: map[string]fakeFileInfo{
+			"/run/systemd/system": {isDir: true},
+			defaultDockerSocket:   {},
+		},
+	}
+
+	status, err := NewLinuxNative(LinuxNativeOptions{Runner: runner, Probe: probe}).Detect(context.Background())
+	if err != nil {
+		t.Fatalf("Detect() error = %v", err)
+	}
+	warning := assertWarning(t, status.Warnings, WarningDockerPackagesOutdated)
+	if !strings.Contains(warning.Message, "docker-ce") || !strings.Contains(warning.Message, "docker-buildx-plugin") {
+		t.Fatalf("warning = %#v", warning)
+	}
+}
+
+func TestAptPolicyOutdatedPackages(t *testing.T) {
+	t.Parallel()
+	got := aptPolicyOutdatedPackages(`docker-ce:
+  Installed: 5:28.0.0
+  Candidate: 5:29.0.0
+docker-ce-cli:
+  Installed: 5:29.0.0
+  Candidate: 5:29.0.0
+docker-compose-plugin:
+  Installed: (none)
+  Candidate: 2.40.3
+`)
+	if !reflect.DeepEqual(got, []string{"docker-ce"}) {
+		t.Fatalf("aptPolicyOutdatedPackages() = %#v", got)
 	}
 }
 
@@ -326,6 +384,17 @@ func assertProblem(t *testing.T, problems []models.ProviderProblem, code string)
 	}
 	t.Fatalf("problem %s not found in %#v", code, problems)
 	return models.ProviderProblem{}
+}
+
+func assertWarning(t *testing.T, warnings []models.ProviderWarning, code string) models.ProviderWarning {
+	t.Helper()
+	for _, warning := range warnings {
+		if warning.Code == code {
+			return warning
+		}
+	}
+	t.Fatalf("warning %q not found in %#v", code, warnings)
+	return models.ProviderWarning{}
 }
 
 type composeOptionsRunner struct {

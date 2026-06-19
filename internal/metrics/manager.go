@@ -145,6 +145,7 @@ func (m *Manager) GetDashboardMetrics(ctx context.Context) (*models.DashboardMet
 		Images:     len(images),
 		Volumes:    len(volumes),
 		DiskUsage:  *usage,
+		GPU:        m.gpuMetrics(ctx),
 		Top:        m.topContainers(),
 	}
 	if m.Projects != nil {
@@ -517,6 +518,30 @@ func (m *Manager) refreshDockerInfo(ctx context.Context) {
 	m.mu.Unlock()
 }
 
+func (m *Manager) gpuMetrics(ctx context.Context) models.GPUMetrics {
+	m.ensureReady()
+	now := m.now()
+	m.mu.Lock()
+	if !m.gpuCacheAt.IsZero() && now.Sub(m.gpuCacheAt) < m.gpuCacheTTL {
+		cached := cloneGPUMetrics(m.gpuCache)
+		m.mu.Unlock()
+		return cached
+	}
+	probe := m.gpuProbe
+	m.mu.Unlock()
+
+	metrics := probe.ProbeGPUs(ctx)
+	if metrics.CheckedAt.IsZero() {
+		metrics.CheckedAt = now
+	}
+
+	m.mu.Lock()
+	m.gpuCache = cloneGPUMetrics(metrics)
+	m.gpuCacheAt = now
+	m.mu.Unlock()
+	return metrics
+}
+
 func newStreamSession(manager *Manager, streamID string, scope models.StatsScope) *streamSession {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &streamSession{
@@ -542,7 +567,11 @@ func (s *streamSession) run() {
 			if len(samples) == 0 {
 				continue
 			}
-			s.manager.publish(bus.TopicStatsSample, SamplePayload{StreamID: s.id, Samples: samples})
+			s.manager.publish(bus.TopicStatsSample, SamplePayload{
+				StreamID: s.id,
+				Samples:  samples,
+				GPU:      s.manager.gpuMetrics(s.ctx),
+			})
 		}
 	}
 }
@@ -648,11 +677,17 @@ func (m *Manager) ensureReady() {
 	if m.retainInterval <= 0 {
 		m.retainInterval = defaultRetainInterval
 	}
+	if m.gpuCacheTTL <= 0 {
+		m.gpuCacheTTL = defaultGPUCacheTTL
+	}
 	if m.topN <= 0 {
 		m.topN = defaultTopN
 	}
 	if m.now == nil {
 		m.now = func() time.Time { return time.Now().UTC() }
+	}
+	if m.gpuProbe == nil {
+		m.gpuProbe = nvidiaSMIProbe{}
 	}
 }
 
@@ -662,8 +697,10 @@ func (m *Manager) applyOptions(opts Options) {
 	m.publishInterval = opts.PublishInterval
 	m.persistInterval = opts.PersistInterval
 	m.retainInterval = opts.RetainInterval
+	m.gpuCacheTTL = opts.GPUCacheTTL
 	m.topN = opts.TopN
 	m.now = opts.Now
+	m.gpuProbe = opts.GPUProbe
 	m.ensureReady()
 }
 

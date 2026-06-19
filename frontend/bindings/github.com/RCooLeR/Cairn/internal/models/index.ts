@@ -48,6 +48,8 @@ export {
     EnvVar,
     ExportLogsRequest,
     ExportResult,
+    GPUDeviceMetric,
+    GPUMetrics,
     HealthStatus,
     HubSearchResult,
     IgnoreUpdateRequest,

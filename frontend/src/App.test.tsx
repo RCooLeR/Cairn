@@ -15,6 +15,7 @@ import type {
   CommandPlan,
   DashboardMetrics,
   DiskUsageCategory,
+  GPUMetrics,
   CheatsheetEntry,
   ContainerDetail,
   ContainerFileListing,
@@ -1095,12 +1096,18 @@ describe("App inventory shell", () => {
     render(<App />);
 
     await screen.findByText("Docker Engine - Running");
+    expect(await screen.findByText("18% / 2.0 GiB")).toBeInTheDocument();
     await waitFor(() =>
       expect(metricsServiceMock.StartStatsStream).toHaveBeenCalled(),
     );
 
     emitRuntimeEvent("stats:sample", {
       streamID: "stats-stream-1",
+      gpu: {
+        ...seededGPUMetrics(),
+        utilizationPercent: 27,
+        memoryUsedBytes: 3 * 1024 * 1024 * 1024,
+      },
       samples: [
         statsSample({
           cpuPercent: 31.2,
@@ -1112,6 +1119,7 @@ describe("App inventory shell", () => {
     });
 
     expect(await screen.findByText("31.2% CPU")).toBeInTheDocument();
+    expect(await screen.findByText("27% / 3.0 GiB")).toBeInTheDocument();
     expect(screen.getByText("Resource Usage")).toBeInTheDocument();
     expect(screen.queryByText("Top Containers")).toBeNull();
     expect(screen.queryByText("Recent Events")).toBeNull();
@@ -2746,7 +2754,7 @@ describe("App inventory shell", () => {
     ).toBeInTheDocument();
 
     fireEvent.click(
-      within(dialog).getByRole("button", { name: "Create install plan" }),
+      within(dialog).getByRole("button", { name: "Review auto repair" }),
     );
     await waitFor(() =>
       expect(providerServiceMock.PlanInstall).toHaveBeenCalledWith(
@@ -2763,7 +2771,9 @@ describe("App inventory shell", () => {
       ),
     ).toBeInTheDocument();
 
-    fireEvent.click(within(dialog).getByRole("button", { name: "Install" }));
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Run auto repair" }),
+    );
     await waitFor(() =>
       expect(providerServiceMock.ApplyInstall).toHaveBeenCalledWith(
         "plan-wsl-install",
@@ -2929,7 +2939,7 @@ describe("App inventory shell", () => {
     );
 
     fireEvent.click(
-      within(dialog).getByRole("button", { name: "Create install plan" }),
+      within(dialog).getByRole("button", { name: "Review auto repair" }),
     );
     await waitFor(() =>
       expect(providerServiceMock.PlanInstall).toHaveBeenCalledWith(
@@ -2944,7 +2954,9 @@ describe("App inventory shell", () => {
       await within(dialog).findByText("sudo apt-get update"),
     ).toBeInTheDocument();
 
-    fireEvent.click(within(dialog).getByRole("button", { name: "Install" }));
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Run auto repair" }),
+    );
     await waitFor(() =>
       expect(providerServiceMock.ApplyInstall).toHaveBeenCalledWith(
         "plan-linux-install",
@@ -2996,7 +3008,9 @@ describe("App inventory shell", () => {
       name: "Set Up Docker Backend",
     });
     expect(
-      within(dialog).getByText("Install Docker Engine in Ubuntu on WSL"),
+      within(dialog).getByText(
+        "Install or update Docker Engine in Ubuntu on WSL",
+      ),
     ).toBeInTheDocument();
     expect(
       within(dialog).getByText("wsl.exe --install Ubuntu --name cairn-dev"),
@@ -3342,7 +3356,7 @@ describe("App inventory shell", () => {
     ).toBeInTheDocument();
 
     fireEvent.click(
-      within(dialog).getByRole("button", { name: "Create install plan" }),
+      within(dialog).getByRole("button", { name: "Review auto repair" }),
     );
     await waitFor(() =>
       expect(providerServiceMock.PlanInstall).toHaveBeenCalledWith(
@@ -3357,7 +3371,9 @@ describe("App inventory shell", () => {
       await within(dialog).findByText("brew install colima"),
     ).toBeInTheDocument();
 
-    fireEvent.click(within(dialog).getByRole("button", { name: "Install" }));
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Run auto repair" }),
+    );
     await waitFor(() =>
       expect(providerServiceMock.ApplyInstall).toHaveBeenCalledWith(
         "plan-colima-install",
@@ -3559,6 +3575,7 @@ function seededDashboardMetrics(): DashboardMetrics {
     images: 1,
     volumes: 1,
     diskUsage: seededSnapshot().diskUsage,
+    gpu: seededGPUMetrics(),
     top: [
       {
         id: "container-1",
@@ -3579,6 +3596,32 @@ function seededDashboardMetrics(): DashboardMetrics {
       },
     ],
   } as DashboardMetrics;
+}
+
+function seededGPUMetrics(): GPUMetrics {
+  return {
+    available: true,
+    source: "nvidia-smi",
+    deviceCount: 1,
+    utilizationPercent: 18,
+    memoryUsedBytes: 2 * 1024 * 1024 * 1024,
+    memoryTotalBytes: 8 * 1024 * 1024 * 1024,
+    temperatureCelsius: 54,
+    driverVersion: "555.85",
+    devices: [
+      {
+        id: "0",
+        index: 0,
+        name: "NVIDIA GeForce RTX 4090",
+        driverVersion: "555.85",
+        utilizationPercent: 18,
+        memoryUsedBytes: 2 * 1024 * 1024 * 1024,
+        memoryTotalBytes: 8 * 1024 * 1024 * 1024,
+        temperatureCelsius: 54,
+      },
+    ],
+    checkedAt: "2026-06-13T09:00:00Z",
+  } as GPUMetrics;
 }
 
 function seededSnapshot(): InventorySnapshot {
@@ -3827,6 +3870,7 @@ function seedScaleDashboardMetrics(
     images: snapshot.images.length,
     volumes: snapshot.volumes.length,
     diskUsage: snapshot.diskUsage ?? seededSnapshot().diskUsage,
+    gpu: seededGPUMetrics(),
     top: snapshot.containers.slice(0, 10).map((container) => ({
       id: container.id,
       name: container.name,
@@ -4610,7 +4654,7 @@ function projectDownVolumesPlan(): CommandPlan {
 function wslInstallPlan(): CommandPlan {
   return {
     planID: "plan-wsl-install",
-    title: "Install Docker Engine in Ubuntu on WSL",
+    title: "Install or update Docker Engine in Ubuntu on WSL",
     risk: Risk.RiskNeedsConfirmation,
     commands: [
       {
@@ -4628,7 +4672,7 @@ function wslInstallPlan(): CommandPlan {
 function colimaInstallPlan(): CommandPlan {
   return {
     planID: "plan-colima-install",
-    title: "Install and start Colima",
+    title: "Install or update Colima backend",
     risk: Risk.RiskNeedsConfirmation,
     commands: [
       {
@@ -4646,7 +4690,7 @@ function colimaInstallPlan(): CommandPlan {
 function linuxInstallPlan(): CommandPlan {
   return {
     planID: "plan-linux-install",
-    title: "Install Docker Engine on Linux",
+    title: "Install or update Docker Engine on Linux",
     risk: Risk.RiskNeedsConfirmation,
     commands: [
       {

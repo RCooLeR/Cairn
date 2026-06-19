@@ -109,43 +109,49 @@ export function Modal({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6">
-      <section
-        aria-labelledby={titleID}
-        aria-modal="true"
-        className={cx(
-          "w-full rounded-card border border-border bg-bg-panel",
-          sizeClasses[size],
-        )}
-        ref={panelRef}
-        role="dialog"
-        tabIndex={-1}
-      >
-        <header
+    <div className="fixed inset-0 z-50 overflow-y-auto bg-black/60 p-3 sm:p-6">
+      <div className="flex min-h-full items-start justify-center py-2 sm:py-6">
+        <section
+          aria-labelledby={titleID}
+          aria-modal="true"
           className={cx(
-            "flex items-center justify-between border-b px-4 py-3",
-            danger ? "border-error/40 text-error" : "border-border",
+            "flex max-h-[calc(100vh-2.5rem)] w-full flex-col overflow-hidden rounded-card border border-border bg-bg-panel sm:max-h-[calc(100vh-4.5rem)]",
+            sizeClasses[size],
           )}
+          ref={panelRef}
+          role="dialog"
+          tabIndex={-1}
         >
-          <h2 className="text-base font-semibold" id={titleID}>
-            {title}
-          </h2>
-          <Button
-            aria-label="Close"
-            disabled={busy}
-            disabledReason="Action is running"
-            data-modal-close
-            icon={<X size={16} />}
-            onClick={onClose}
-            size="icon"
-            variant="ghost"
-          />
-        </header>
-        <div className="p-4 text-sm text-text-secondary">{children}</div>
-        {footer ? (
-          <footer className="border-t border-border px-4 py-3">{footer}</footer>
-        ) : null}
-      </section>
+          <header
+            className={cx(
+              "flex shrink-0 items-center justify-between border-b px-4 py-3",
+              danger ? "border-error/40 text-error" : "border-border",
+            )}
+          >
+            <h2 className="text-base font-semibold" id={titleID}>
+              {title}
+            </h2>
+            <Button
+              aria-label="Close"
+              disabled={busy}
+              disabledReason="Action is running"
+              data-modal-close
+              icon={<X size={16} />}
+              onClick={onClose}
+              size="icon"
+              variant="ghost"
+            />
+          </header>
+          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-4 text-sm text-text-secondary">
+            {children}
+          </div>
+          {footer ? (
+            <footer className="shrink-0 border-t border-border px-4 py-3">
+              {footer}
+            </footer>
+          ) : null}
+        </section>
+      </div>
     </div>
   );
 }

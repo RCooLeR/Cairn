@@ -25,6 +25,8 @@ const (
 	colimaInstallTimeout   = 20 * time.Minute
 )
 
+var colimaBrewPackages = []string{"docker", "docker-compose", "docker-buildx", "colima"}
+
 type MacOSColimaOptions struct {
 	Profile  string
 	CPU      int
@@ -158,6 +160,12 @@ func (p *MacOSColimaProvider) Detect(ctx context.Context) (*models.ProviderStatu
 		))
 	}
 
+	if _, err := p.runner.LookPath(brewCommandName); err == nil {
+		if outdated, ok := p.detectHomebrewUpdates(ctx); ok && len(outdated) > 0 {
+			status.Warnings = append(status.Warnings, dockerPackagesOutdatedWarning(outdated))
+		}
+	}
+
 	if _, err := p.runner.LookPath(colimaCommandName); err != nil {
 		status.Problems = append(status.Problems, providerProblem(
 			ProblemColimaMissing,
@@ -271,11 +279,11 @@ func (p *MacOSColimaProvider) PlanInstall(_ context.Context, opts models.Install
 	}
 	plan := &models.CommandPlan{
 		PlanID:   planID,
-		Title:    "Install and start Colima",
+		Title:    "Install or update Colima backend",
 		Risk:     models.RiskNeedsConfirmation,
 		Commands: commands,
 		Effects: []string{
-			"Install Docker CLI, Docker Compose, and Colima with Homebrew.",
+			"Install or upgrade Docker CLI, Docker Compose, Docker Buildx, and Colima with Homebrew.",
 			"Start the selected Colima profile with the configured CPU, memory, and disk limits.",
 			"Select the Colima Docker context and verify Docker, Compose, Buildx, and hello-world.",
 		},
@@ -511,6 +519,15 @@ func (p *MacOSColimaProvider) colimaStatus(ctx context.Context) (colimaStatusInf
 	return status, strings.EqualFold(status.Status, "running")
 }
 
+func (p *MacOSColimaProvider) detectHomebrewUpdates(ctx context.Context) ([]string, bool) {
+	args := append([]string{"outdated", "--quiet"}, colimaBrewPackages...)
+	output, ok := p.runText(ctx, brewCommandName, args...)
+	if !ok {
+		return nil, false
+	}
+	return homebrewOutdatedPackages(output), true
+}
+
 func (p *MacOSColimaProvider) configuredProfile() string {
 	if strings.TrimSpace(p.profile) != "" {
 		return strings.TrimSpace(p.profile)
@@ -561,21 +578,27 @@ func buildColimaInstallSteps(profile string, cpu, memoryGB, diskGB int) []colima
 	contextName := colimaContextName(profile)
 	return []colimaInstallStep{
 		{
-			Message:     "Install Docker CLI with Homebrew",
+			Message:     "Install or upgrade Docker CLI with Homebrew",
 			Timeout:     colimaInstallTimeout,
-			Command:     []string{brewCommandName, "install", "docker"},
+			Command:     brewInstallOrUpgradeCommand("docker"),
 			RepairHints: []string{"Verify Homebrew is installed and network access is available."},
 		},
 		{
-			Message:     "Install Docker Compose with Homebrew",
+			Message:     "Install or upgrade Docker Compose with Homebrew",
 			Timeout:     colimaInstallTimeout,
-			Command:     []string{brewCommandName, "install", "docker-compose"},
+			Command:     brewInstallOrUpgradeCommand("docker-compose"),
 			RepairHints: []string{"Verify the docker-compose formula is available on this Homebrew installation."},
 		},
 		{
-			Message:     "Install Colima with Homebrew",
+			Message:     "Install or upgrade Docker Buildx with Homebrew",
 			Timeout:     colimaInstallTimeout,
-			Command:     []string{brewCommandName, "install", "colima"},
+			Command:     brewInstallOrUpgradeCommand("docker-buildx"),
+			RepairHints: []string{"Verify the docker-buildx formula is available on this Homebrew installation."},
+		},
+		{
+			Message:     "Install or upgrade Colima with Homebrew",
+			Timeout:     colimaInstallTimeout,
+			Command:     brewInstallOrUpgradeCommand("colima"),
 			RepairHints: []string{"Verify Homebrew can install Colima on this macOS version."},
 		},
 		{
@@ -616,6 +639,26 @@ func buildColimaInstallSteps(profile string, cpu, memoryGB, diskGB int) []colima
 			RepairHints: []string{"Verify the Colima daemon can pull images from Docker Hub."},
 		},
 	}
+}
+
+func brewInstallOrUpgradeCommand(formula string) []string {
+	formula = shellQuote(formula)
+	command := fmt.Sprintf("%s list --formula %s >/dev/null 2>&1 && %s upgrade %s || %s install %s", brewCommandName, formula, brewCommandName, formula, brewCommandName, formula)
+	return []string{"sh", "-lc", command}
+}
+
+func homebrewOutdatedPackages(output string) []string {
+	seen := map[string]bool{}
+	outdated := []string{}
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) == 0 || seen[fields[0]] {
+			continue
+		}
+		seen[fields[0]] = true
+		outdated = append(outdated, fields[0])
+	}
+	return outdated
 }
 
 func colimaContextName(profile string) string {

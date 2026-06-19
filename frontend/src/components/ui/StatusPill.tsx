@@ -4,11 +4,15 @@ type StatusPillProps = {
   label: string;
   ok: boolean;
   value?: string;
+  title?: string;
 };
 
-export function StatusPill({ label, ok, value }: StatusPillProps) {
+export function StatusPill({ label, ok, title, value }: StatusPillProps) {
   return (
-    <div className="rounded-control border border-border bg-bg-inset p-3">
+    <div
+      className="rounded-control border border-border bg-bg-inset p-3"
+      title={title}
+    >
       <div className="flex items-center gap-2">
         <StatusDot tone={ok ? "ok" : "neutral"} />
         <span>{label}</span>

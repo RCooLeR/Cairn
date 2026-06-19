@@ -60,6 +60,15 @@ func TestManagerStreamsPersistsAndRanksSamples(t *testing.T) {
 		PersistInterval:    10 * time.Millisecond,
 		RetainInterval:     time.Hour,
 		Now:                func() time.Time { return now },
+		GPUProbe: GPUProbeFunc(func(context.Context) models.GPUMetrics {
+			return models.GPUMetrics{
+				Available:          true,
+				Source:             "test",
+				DeviceCount:        1,
+				UtilizationPercent: 12,
+				CheckedAt:          now,
+			}
+		}),
 	})
 	t.Cleanup(manager.StopAll)
 
@@ -78,6 +87,9 @@ func TestManagerStreamsPersistsAndRanksSamples(t *testing.T) {
 			}
 			if payload.StreamID != streamID {
 				t.Fatalf("stream id = %q, want %q", payload.StreamID, streamID)
+			}
+			if !payload.GPU.Available || payload.GPU.UtilizationPercent != 12 {
+				t.Fatalf("GPU payload = %#v", payload.GPU)
 			}
 			if len(payload.Samples) > 0 && payload.Samples[0].CPUPercent > 0 {
 				sample = payload.Samples[0]

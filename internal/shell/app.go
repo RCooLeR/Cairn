@@ -2,20 +2,27 @@ package shell
 
 import (
 	"context"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/bus"
+	dockercore "github.com/RCooLeR/Cairn/internal/docker"
+	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
 	registrycore "github.com/RCooLeR/Cairn/internal/registry"
 	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/services"
 	"github.com/RCooLeR/Cairn/internal/store"
 	"github.com/wailsapp/wails/v3/pkg/application"
+	"github.com/wailsapp/wails/v3/pkg/events"
+	wailsnotifications "github.com/wailsapp/wails/v3/pkg/services/notifications"
 )
 
 const (
@@ -120,12 +127,14 @@ func Run(assets fs.FS) error {
 		}
 	}
 
+	notificationService := wailsnotifications.New()
 	app := application.New(application.Options{
 		Name:         appName,
 		Description:  appDescription,
 		Icon:         icon,
 		MarshalError: apperror.Marshal,
 		Services: []application.Service{
+			application.NewService(notificationService),
 			application.NewService(providerService),
 			application.NewService(dockerService),
 			application.NewService(projectService),
@@ -156,10 +165,14 @@ func Run(assets fs.FS) error {
 			DisableLogging: true,
 		},
 		Mac: application.MacOptions{
-			ApplicationShouldTerminateAfterLastWindowClosed: true,
+			ApplicationShouldTerminateAfterLastWindowClosed: false,
 		},
 		Linux: application.LinuxOptions{
-			ProgramName: "cairn",
+			ProgramName:                   "cairn",
+			DisableQuitOnLastWindowClosed: true,
+		},
+		Windows: application.WindowsOptions{
+			DisableQuitOnLastWindowClosed: true,
 		},
 	})
 
@@ -183,6 +196,10 @@ func Run(assets fs.FS) error {
 			Theme: application.Dark,
 		},
 	})
+	quitRequested := &atomic.Bool{}
+	trayNoticeShown := &atomic.Bool{}
+	configureSystemTray(app, mainWindow, icon, notificationService, quitRequested, trayNoticeShown)
+	startDesktopNotificationBridge(ctx, eventBus, notificationService)
 	forwardBusEvents(ctx, eventBus, mainWindow, []bus.Topic{
 		bus.TopicProviderChanged,
 		bus.TopicDockerConnected,
@@ -199,9 +216,161 @@ func Run(assets fs.FS) error {
 		bus.TopicStatsSample,
 		bus.TopicJobProgress,
 		bus.TopicJobDone,
+		bus.TopicNotification,
 	})
 
 	return app.Run()
+}
+
+func configureSystemTray(
+	app *application.App,
+	window application.Window,
+	icon []byte,
+	notificationService *wailsnotifications.NotificationService,
+	quitRequested *atomic.Bool,
+	trayNoticeShown *atomic.Bool,
+) {
+	if app == nil || window == nil {
+		return
+	}
+	showWindow := func() {
+		window.Show()
+		if window.IsMinimised() {
+			window.UnMinimise()
+		}
+		window.Focus()
+	}
+	hideWindow := func() {
+		window.Hide()
+	}
+	quitApp := func() {
+		quitRequested.Store(true)
+		app.Quit()
+	}
+
+	menu := application.NewMenu()
+	menu.Add("Show Cairn").OnClick(func(*application.Context) { showWindow() })
+	menu.Add("Hide to tray").OnClick(func(*application.Context) { hideWindow() })
+	menu.AddSeparator()
+	menu.Add("Quit Cairn").OnClick(func(*application.Context) { quitApp() })
+
+	tray := app.SystemTray.New()
+	tray.SetIcon(icon).
+		SetMenu(menu).
+		OnClick(showWindow).
+		OnDoubleClick(showWindow)
+	tray.SetTooltip(appName)
+
+	window.RegisterHook(events.Common.WindowClosing, func(event *application.WindowEvent) {
+		if quitRequested.Load() {
+			return
+		}
+		event.Cancel()
+		hideWindow()
+		if trayNoticeShown.CompareAndSwap(false, true) {
+			sendDesktopNotification(notificationService, "cairn-hidden-to-tray", "Cairn is still running", "Use the tray icon to restore or quit Cairn.", nil)
+		}
+	})
+	window.OnWindowEvent(events.Common.WindowMinimise, func(*application.WindowEvent) {
+		if quitRequested.Load() {
+			return
+		}
+		hideWindow()
+	})
+}
+
+func startDesktopNotificationBridge(ctx context.Context, eventBus bus.Bus, notificationService *wailsnotifications.NotificationService) {
+	if eventBus == nil || notificationService == nil {
+		return
+	}
+	for _, topic := range []bus.Topic{bus.TopicNotification, bus.TopicDockerDisconnected} {
+		topic := topic
+		events := eventBus.Subscribe(ctx, topic, 16)
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case event, ok := <-events:
+					if !ok {
+						return
+					}
+					sendDesktopNotificationForEvent(notificationService, event)
+				}
+			}
+		}()
+	}
+}
+
+func sendDesktopNotificationForEvent(notificationService *wailsnotifications.NotificationService, event bus.Event) {
+	switch event.Topic {
+	case bus.TopicNotification:
+		switch payload := event.Payload.(type) {
+		case models.Notification:
+			sendDesktopNotification(
+				notificationService,
+				fmt.Sprintf("cairn-notification-%d", payload.ID),
+				payload.Title,
+				payload.Body,
+				map[string]any{"topic": payload.Topic, "level": payload.Level, "id": payload.ID},
+			)
+		case *models.Notification:
+			if payload != nil {
+				sendDesktopNotification(
+					notificationService,
+					fmt.Sprintf("cairn-notification-%d", payload.ID),
+					payload.Title,
+					payload.Body,
+					map[string]any{"topic": payload.Topic, "level": payload.Level, "id": payload.ID},
+				)
+			}
+		}
+	case bus.TopicDockerDisconnected:
+		body := "Cairn lost connection to Docker."
+		if payload, ok := event.Payload.(dockercore.DisconnectedPayload); ok && strings.TrimSpace(payload.Reason) != "" {
+			body = "Cairn lost connection to Docker: " + payload.Reason
+		}
+		sendDesktopNotification(notificationService, "cairn-docker-disconnected", "Docker disconnected", body, map[string]any{"topic": string(event.Topic)})
+	}
+}
+
+func sendDesktopNotification(
+	notificationService *wailsnotifications.NotificationService,
+	id string,
+	title string,
+	body string,
+	data map[string]any,
+) {
+	if notificationService == nil || strings.TrimSpace(title) == "" {
+		return
+	}
+	authorized, err := notificationService.CheckNotificationAuthorization()
+	if err != nil {
+		slog.Debug("desktop notification authorization check failed", "error", err)
+		return
+	}
+	if !authorized {
+		authorized, err = notificationService.RequestNotificationAuthorization()
+		if err != nil {
+			slog.Debug("desktop notification authorization request failed", "error", err)
+			return
+		}
+	}
+	if !authorized {
+		return
+	}
+	if strings.TrimSpace(id) == "" {
+		id = fmt.Sprintf("cairn-%d", time.Now().UnixNano())
+	}
+	err = notificationService.SendNotification(wailsnotifications.NotificationOptions{
+		ID:    id,
+		Title: strings.TrimSpace(title),
+		Body:  strings.TrimSpace(body),
+		Data:  data,
+	})
+	if err != nil {
+		slog.Debug("desktop notification send failed", "error", err)
+	}
 }
 
 func defaultProviderSet() []providers.PlatformProvider {

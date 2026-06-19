@@ -36,9 +36,10 @@ const (
 	ProblemContextMissing             = "CONTEXT_MISSING"
 	ProblemContextNotSelected         = "CONTEXT_NOT_SELECTED"
 
-	WarningSystemdMissing = "SYSTEMD_MISSING"
-	WarningBrewMissing    = "BREW_MISSING"
-	WarningUnencryptedTCP = "UNENCRYPTED_TCP_CONTEXT"
+	WarningSystemdMissing         = "SYSTEMD_MISSING"
+	WarningBrewMissing            = "BREW_MISSING"
+	WarningUnencryptedTCP         = "UNENCRYPTED_TCP_CONTEXT"
+	WarningDockerPackagesOutdated = "DOCKER_PACKAGES_OUTDATED"
 )
 
 type CommandResult struct {

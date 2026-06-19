@@ -8,6 +8,7 @@ import type {
   DashboardMetrics,
   DockerContextInfo,
   ExportResult,
+  GPUMetrics,
   HubSearchResult,
   ImageDetail,
   ImageLineage,
@@ -22,6 +23,7 @@ import type {
   PortBinding,
   ProviderProblem,
   ProviderStatus,
+  ProviderWarning,
   ProjectDetail,
   ProjectSummary,
   ProviderSummary,
@@ -564,6 +566,7 @@ type StatsSample = {
 type StatsSamplePayload = {
   streamID: string;
   samples?: StatsSample[];
+  gpu?: GPUMetrics;
 };
 
 type DashboardChartPoint = {
@@ -1243,6 +1246,7 @@ function App() {
   const [latestSamples, setLatestSamples] = useState<
     Record<string, StatsSample>
   >({});
+  const [liveGPU, setLiveGPU] = useState<GPUMetrics | null>(null);
   const [containerSparks, setContainerSparks] = useState<
     Record<string, SparkPoint[]>
   >({});
@@ -1591,12 +1595,32 @@ function App() {
         progress: current.progress.concat(payload),
       }));
       if (payload.done && !payload.error) {
+        const providerID = providerIDForSetupBackend(setup.backend);
+        if (providerID) {
+          void ProviderService.Detect(providerID)
+            .then((status) => {
+              setSetup((current) => ({
+                ...current,
+                detection: status ?? current.detection,
+                detectError: undefined,
+              }));
+            })
+            .catch((error: unknown) => {
+              setSetup((current) => ({
+                ...current,
+                detectError:
+                  error instanceof Error
+                    ? error.message
+                    : "Provider verification failed",
+              }));
+            });
+        }
         void refreshInventory();
         void refreshProjects();
       }
     });
     return () => off();
-  }, [refreshInventory, refreshProjects, setup.installStreamID]);
+  }, [refreshInventory, refreshProjects, setup.backend, setup.installStreamID]);
 
   const refreshNotifications = useCallback(async () => {
     setNotificationsLoading(true);
@@ -1615,6 +1639,21 @@ function App() {
 
   useEffect(() => {
     void refreshNotifications();
+  }, [refreshNotifications]);
+
+  useEffect(() => {
+    const off = Events.On("notification", (event) => {
+      const notification = eventPayload<Notification>(event);
+      if (!notification?.id) {
+        void refreshNotifications();
+        return;
+      }
+      setNotifications((current) => [
+        notification,
+        ...current.filter((item) => item.id !== notification.id),
+      ]);
+    });
+    return () => off();
   }, [refreshNotifications]);
 
   const markAllNotificationsRead = useCallback(async () => {
@@ -2073,6 +2112,9 @@ function App() {
       if (!payload || payload.streamID !== statsStreamIDRef.current) {
         return;
       }
+      if (payload.gpu) {
+        setLiveGPU(payload.gpu);
+      }
       const samples = (payload.samples ?? []).filter(isStatsSample);
       if (samples.length === 0) {
         return;
@@ -2119,6 +2161,7 @@ function App() {
       setProjectSparks({});
       setProjectMetricSparks(emptyProjectMetricSparks());
       setChartPoints([]);
+      setLiveGPU(null);
       return undefined;
     }
     let cancelled = false;
@@ -2623,6 +2666,37 @@ function App() {
       ...emptyProviderSetup,
       open: true,
       platform,
+      backend,
+      distro: wslDistro.trim() || "Ubuntu",
+      colimaProfile: colimaProfile.trim() || "default",
+      colimaCPU,
+      colimaMemoryGB,
+      colimaDiskGB,
+    });
+  }, [
+    activeProvider,
+    colimaCPU,
+    colimaDiskGB,
+    colimaMemoryGB,
+    colimaProfile,
+    wslDistro,
+  ]);
+
+  const openProviderSetupForRepair = useCallback(() => {
+    const platform =
+      setupPlatformFromProvider(activeProvider) ?? detectClientSetupPlatform();
+    const backend =
+      activeProvider?.kind === "linux_native" ||
+      activeProvider?.kind === "macos_colima" ||
+      activeProvider?.kind === "windows_wsl_ubuntu"
+        ? activeProvider.kind
+        : recommendedSetupBackend(platform);
+    setRepairOpen(false);
+    setSetup({
+      ...emptyProviderSetup,
+      open: true,
+      step: "checks",
+      platform: setupPlatformForBackend(backend, platform),
       backend,
       distro: wslDistro.trim() || "Ubuntu",
       colimaProfile: colimaProfile.trim() || "default",
@@ -4713,6 +4787,7 @@ function App() {
             dockerRunning={dockerRunning}
             images={images}
             latestSamples={latestSamples}
+            liveGPU={liveGPU}
             metricsStreamError={statsStreamError}
             mutationsDisabled={mutationsDisabled}
             mutationDisabledReason={mutationDisabledReason}
@@ -5031,6 +5106,7 @@ function App() {
         error={repairError}
         onChangePermissionMode={setPermissionMode}
         onClose={() => setRepairOpen(false)}
+        onOpenSetup={openProviderSetupForRepair}
         onRetry={() => {
           void retryProviderDetection();
         }}
@@ -5456,6 +5532,7 @@ function RepairProviderModal({
   error,
   onChangePermissionMode,
   onClose,
+  onOpenSetup,
   onRetry,
   onSavePermission,
   open,
@@ -5468,6 +5545,7 @@ function RepairProviderModal({
   error: string | null;
   onChangePermissionMode: (mode: PermissionMode) => void;
   onClose: () => void;
+  onOpenSetup: () => void;
   onRetry: () => void;
   onSavePermission: () => void;
   open: boolean;
@@ -5583,6 +5661,13 @@ function RepairProviderModal({
               Save permission mode
             </Button>
           ) : null}
+          <Button
+            disabled={busy}
+            icon={<Wrench size={15} />}
+            onClick={onOpenSetup}
+          >
+            Auto repair / update
+          </Button>
         </div>
       </div>
     </Modal>
@@ -5647,7 +5732,13 @@ function ProviderSetupModal({
         ? macOSSetupCheckRows(setup.detection)
         : windowsSetupCheckRows(setup.detection);
   const hasProblems = Boolean(setup.detection?.problems?.length);
-  const canPlan = !setup.detecting && Boolean(setup.detection) && hasProblems;
+  const hasBackendUpdates = providerHasUpdateWarnings(setup.detection);
+  const canPlan = !setup.detecting && Boolean(setup.detection);
+  const repairActionLabel = hasProblems
+    ? "Review auto repair"
+    : hasBackendUpdates
+      ? "Review backend update"
+      : "Review repair / update";
   const completed =
     setup.detection?.healthy ||
     setup.progress.some((entry) => entry.done && !entry.error);
@@ -5975,12 +6066,12 @@ function ProviderSetupModal({
               ) : setup.backend !== "existing_context" ? (
                 <Button
                   disabled={!canPlan}
-                  disabledReason="Run checks before creating an install plan"
+                  disabledReason="Run checks before creating a repair plan"
                   icon={<Wrench size={15} />}
                   loading={setup.planning}
                   onClick={onPlanInstall}
                 >
-                  Create install plan
+                  {repairActionLabel}
                 </Button>
               ) : null}
             </div>
@@ -6002,21 +6093,27 @@ function ProviderSetupModal({
                         ? "Linux may ask for sudo approval while packages install."
                         : "Windows may ask for administrator approval when WSL features are enabled."}
                   </p>
+                  <p className="mt-1 text-sm text-text-muted">
+                    Cairn will run the selected commands after confirmation.
+                    Nothing needs to be copied into a terminal.
+                  </p>
                 </div>
                 <div className="space-y-2">
                   {setup.plan.commands.map((command) => (
-                    <div
+                    <details
                       className="rounded-card border border-border bg-bg-inset p-3"
                       key={`${command.order}:${command.command}`}
                     >
-                      <div className="mb-2 flex items-center gap-2 text-sm">
+                      <summary className="flex cursor-pointer items-center gap-2 text-sm">
                         <Badge tone="warn">Step {command.order}</Badge>
                         <span className="font-medium text-text-primary">
                           {command.explanation}
                         </span>
+                      </summary>
+                      <div className="mt-3">
+                        <CodePreview value={command.command} />
                       </div>
-                      <CodePreview value={command.command} />
-                    </div>
+                    </details>
                   ))}
                 </div>
               </div>
@@ -6074,7 +6171,7 @@ function ProviderSetupModal({
                 loading={setup.installing}
                 onClick={onApplyInstall}
               >
-                Install
+                Run auto repair
               </Button>
             </div>
           </section>
@@ -6473,6 +6570,7 @@ type OverviewProps = {
   containers: ContainerSummary[];
   images: ImageSummary[];
   latestSamples: Record<string, StatsSample>;
+  liveGPU: GPUMetrics | null;
   metricsStreamError: string | null;
   volumes: VolumeSummary[];
   projectMetricSparks: ProjectMetricSparks;
@@ -6505,6 +6603,7 @@ function OverviewPage({
   dockerRunning,
   images,
   latestSamples,
+  liveGPU,
   metricsStreamError,
   mutationsDisabled,
   mutationDisabledReason,
@@ -6749,6 +6848,12 @@ function OverviewPage({
       totalBytes: diskTotal,
       reclaimable: diskReclaimable,
     },
+    gpu: {
+      available: false,
+      message: "GPU metrics have not been loaded yet",
+      deviceCount: 0,
+      checkedAt: null,
+    },
   };
   const diskBytes = dashboard?.diskUsage.totalBytes ?? diskTotal;
   const reclaimableBytes = dashboard?.diskUsage.reclaimable ?? diskReclaimable;
@@ -6808,7 +6913,11 @@ function OverviewPage({
       ) : null}
 
       <section className="grid gap-3 xl:grid-cols-[360px_minmax(0,1fr)]">
-        <EngineHeroCard dockerRunning={dockerRunning} provider={provider} />
+        <EngineHeroCard
+          dockerRunning={dockerRunning}
+          gpu={liveGPU ?? counts.gpu}
+          provider={provider}
+        />
         <DashboardCountsStrip
           containers={containers}
           counts={counts}
@@ -6912,13 +7021,17 @@ function OverviewPage({
 
 function EngineHeroCard({
   dockerRunning,
+  gpu,
   provider,
 }: {
   dockerRunning: boolean;
+  gpu: GPUMetrics;
   provider: ProviderSummary | null;
 }) {
   const context = provider?.status?.currentContext || "default";
   const version = provider?.status?.dockerVersion || "unknown";
+  const gpuValue = formatGPUStatus(gpu);
+  const gpuTitle = formatGPUTitle(gpu);
   return (
     <Card
       className={!dockerRunning ? "border-neutral/30 bg-bg-inset" : undefined}
@@ -6939,10 +7052,16 @@ function EngineHeroCard({
               </div>
             </div>
           </div>
-          <div className="mt-3 grid gap-2 text-xs sm:grid-cols-3">
+          <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
             <StatusPill label="Provider" ok={provider?.healthy ?? false} />
             <StatusPill label="Context" ok={dockerRunning} value={context} />
             <StatusPill label="Engine" ok={dockerRunning} value={version} />
+            <StatusPill
+              label="GPU"
+              ok={gpu.available}
+              title={gpuTitle}
+              value={gpuValue}
+            />
           </div>
         </div>
         <div className="sm:hidden">
@@ -16415,6 +16534,16 @@ function macOSSetupCheckRows(status: ProviderStatus | null) {
       problem("BUILDX_MISSING"),
       status?.buildxInstalled,
     ),
+    setupWarningCheckRow(
+      "Docker tools current",
+      status,
+      warning("DOCKER_PACKAGES_OUTDATED"),
+      Boolean(
+        status?.dockerInstalled &&
+        status?.composeInstalled &&
+        status?.buildxInstalled,
+      ),
+    ),
     setupCheckRow("Colima installed", status, problem("COLIMA_MISSING")),
     setupCheckRow("Colima running", status, problem("COLIMA_STOPPED")),
     setupCheckRow("Colima context ready", status, problem("CONTEXT_MISSING")),
@@ -16459,6 +16588,16 @@ function linuxSetupCheckRows(status: ProviderStatus | null) {
       problem("BUILDX_MISSING"),
       status?.buildxInstalled,
     ),
+    setupWarningCheckRow(
+      "Docker packages current",
+      status,
+      warning("DOCKER_PACKAGES_OUTDATED"),
+      Boolean(
+        status?.dockerInstalled &&
+        status?.composeInstalled &&
+        status?.buildxInstalled,
+      ),
+    ),
     setupCheckRow(
       "Docker socket accessible",
       status,
@@ -16477,6 +16616,8 @@ function linuxSetupCheckRows(status: ProviderStatus | null) {
 function windowsSetupCheckRows(status: ProviderStatus | null) {
   const problem = (code: string) =>
     status?.problems?.find((entry) => entry.code === code) ?? null;
+  const warning = (code: string) =>
+    status?.warnings?.find((entry) => entry.code === code) ?? null;
   return [
     setupCheckRow("WSL installed", status, problem("WSL_MISSING")),
     setupCheckRow("Ubuntu distro present", status, problem("UBUNTU_MISSING")),
@@ -16500,6 +16641,16 @@ function windowsSetupCheckRows(status: ProviderStatus | null) {
       problem("BUILDX_MISSING"),
       status?.buildxInstalled,
     ),
+    setupWarningCheckRow(
+      "Docker packages current",
+      status,
+      warning("DOCKER_PACKAGES_OUTDATED"),
+      Boolean(
+        status?.dockerInstalled &&
+        status?.composeInstalled &&
+        status?.buildxInstalled,
+      ),
+    ),
     setupCheckRow(
       "Docker daemon reachable",
       status,
@@ -16507,6 +16658,14 @@ function windowsSetupCheckRows(status: ProviderStatus | null) {
       status?.dockerRunning,
     ),
   ];
+}
+
+function providerHasUpdateWarnings(status: ProviderStatus | null) {
+  return Boolean(
+    status?.warnings?.some(
+      (warning) => warning.code === "DOCKER_PACKAGES_OUTDATED",
+    ),
+  );
 }
 
 function isEditableElement(target: EventTarget | null) {
@@ -16550,6 +16709,36 @@ function setupCheckRow(
     };
   }
   return { label, state: "ok" as StatusToneID, detail: "Ready" };
+}
+
+function setupWarningCheckRow(
+  label: string,
+  status: ProviderStatus | null,
+  warning: ProviderWarning | null,
+  okFlag?: boolean,
+) {
+  if (!status) {
+    return {
+      label,
+      state: "neutral" as StatusToneID,
+      detail: "Not checked yet",
+    };
+  }
+  if (warning) {
+    return {
+      label,
+      state: "warn" as StatusToneID,
+      detail: warning.message,
+    };
+  }
+  if (okFlag === false) {
+    return {
+      label,
+      state: "neutral" as StatusToneID,
+      detail: "Not detected yet",
+    };
+  }
+  return { label, state: "ok" as StatusToneID, detail: "Current" };
 }
 
 function filterAuditEntries(entries: AuditEntry[], filter: AuditFilterState) {
@@ -17445,6 +17634,45 @@ function formatMemory(used?: number, limit?: number) {
   return limit
     ? `${formatBytes(used)} / ${formatBytes(limit)}`
     : formatBytes(used);
+}
+
+function formatGPUStatus(gpu: GPUMetrics) {
+  if (!gpu.available) {
+    return "unavailable";
+  }
+  const utilization = `${(gpu.utilizationPercent ?? 0).toFixed(0)}%`;
+  const memoryTotal = gpu.memoryTotalBytes ?? 0;
+  const memoryUsed = gpu.memoryUsedBytes ?? 0;
+  if (memoryTotal > 0) {
+    return `${utilization} / ${formatBytes(memoryUsed)}`;
+  }
+  return utilization;
+}
+
+function formatGPUTitle(gpu: GPUMetrics) {
+  if (!gpu.available) {
+    return gpu.message || "GPU metrics unavailable";
+  }
+  const devices = gpu.devices ?? [];
+  const deviceCount = gpu.deviceCount || devices.length || 1;
+  const header = `${deviceCount} GPU${deviceCount === 1 ? "" : "s"} via ${
+    gpu.source || "GPU probe"
+  }`;
+  const lines = devices.map((device) => {
+    const memory =
+      (device.memoryTotalBytes ?? 0) > 0
+        ? `, ${formatBytes(device.memoryUsedBytes ?? 0)} / ${formatBytes(
+            device.memoryTotalBytes,
+          )}`
+        : "";
+    const temperatureCelsius = device.temperatureCelsius ?? 0;
+    const temperature =
+      temperatureCelsius > 0 ? `, ${temperatureCelsius.toFixed(0)}C` : "";
+    return `${device.name || `GPU ${device.index}`}: ${(
+      device.utilizationPercent ?? 0
+    ).toFixed(0)}%${memory}${temperature}`;
+  });
+  return [header, ...lines].join("\n");
 }
 
 function shortID(value: string) {

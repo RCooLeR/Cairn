@@ -286,6 +286,24 @@ describe("UI kit", () => {
     expect(screen.getByRole("dialog", { name: "Confirm" })).toHaveFocus();
   });
 
+  it("constrains modal content to an internal scroll area", () => {
+    const onClose = vi.fn();
+
+    render(
+      <Modal onClose={onClose} open title="Long repair plan">
+        <div>Scrollable modal content</div>
+      </Modal>,
+    );
+
+    const dialog = screen.getByRole("dialog", { name: "Long repair plan" });
+    const content = screen.getByText("Scrollable modal content").parentElement;
+
+    expect(dialog).toHaveClass("max-h-[calc(100vh-2.5rem)]");
+    expect(dialog).toHaveClass("overflow-hidden");
+    expect(content).toHaveClass("overflow-y-auto");
+    expect(content).toHaveClass("overscroll-contain");
+  });
+
   it("does not steal input focus when an open modal rerenders", () => {
     const modal = (onClose: () => void) => (
       <Modal onClose={onClose} open title="Registry Login">

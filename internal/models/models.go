@@ -388,8 +388,34 @@ type DashboardMetrics struct {
 	Images       int              `json:"images"`
 	Volumes      int              `json:"volumes"`
 	DiskUsage    DiskUsage        `json:"diskUsage"`
+	GPU          GPUMetrics       `json:"gpu"`
 	Top          []MetricRankItem `json:"top,omitempty"`
 	RecentEvents []AuditEntry     `json:"recentEvents,omitempty"`
+}
+
+type GPUMetrics struct {
+	Available          bool              `json:"available"`
+	Source             string            `json:"source,omitempty"`
+	Message            string            `json:"message,omitempty"`
+	DeviceCount        int               `json:"deviceCount"`
+	UtilizationPercent float64           `json:"utilizationPercent,omitempty"`
+	MemoryUsedBytes    int64             `json:"memoryUsedBytes,omitempty"`
+	MemoryTotalBytes   int64             `json:"memoryTotalBytes,omitempty"`
+	TemperatureCelsius float64           `json:"temperatureCelsius,omitempty"`
+	DriverVersion      string            `json:"driverVersion,omitempty"`
+	Devices            []GPUDeviceMetric `json:"devices,omitempty"`
+	CheckedAt          time.Time         `json:"checkedAt"`
+}
+
+type GPUDeviceMetric struct {
+	ID                 string  `json:"id"`
+	Index              int     `json:"index"`
+	Name               string  `json:"name"`
+	DriverVersion      string  `json:"driverVersion,omitempty"`
+	UtilizationPercent float64 `json:"utilizationPercent,omitempty"`
+	MemoryUsedBytes    int64   `json:"memoryUsedBytes,omitempty"`
+	MemoryTotalBytes   int64   `json:"memoryTotalBytes,omitempty"`
+	TemperatureCelsius float64 `json:"temperatureCelsius,omitempty"`
 }
 
 type MetricRankItem struct {

@@ -989,10 +989,10 @@ export function CommandPalette<T extends string>({
     <div
       aria-label="Command palette"
       aria-modal="true"
-      className="fixed inset-0 z-50 flex items-start justify-center bg-black/55 px-4 py-20"
+      className="fixed inset-0 z-50 overflow-y-auto bg-black/55 px-4 py-6 sm:py-20"
       role="dialog"
     >
-      <div className="w-full max-w-2xl overflow-hidden rounded-card border border-border bg-bg-panel shadow-2xl">
+      <div className="mx-auto w-full max-w-2xl overflow-hidden rounded-card border border-border bg-bg-panel shadow-2xl">
         <div className="flex h-12 items-center gap-2 border-b border-border px-3">
           <Command size={17} />
           <input

@@ -81,6 +81,21 @@ func TestMacOSColimaDetectHealthy(t *testing.T) {
 	}
 }
 
+func TestMacOSColimaDetectWarnsWhenHomebrewPackagesAreOutdated(t *testing.T) {
+	t.Parallel()
+	runner := healthyColimaRunner()
+	runner.outputs["brew outdated --quiet docker docker-compose docker-buildx colima"] = "docker\ncolima\n"
+
+	status, err := NewMacOSColima(MacOSColimaOptions{Runner: runner, HomeDir: "/Users/ada"}).Detect(context.Background())
+	if err != nil {
+		t.Fatalf("Detect() error = %v", err)
+	}
+	warning := assertWarning(t, status.Warnings, WarningDockerPackagesOutdated)
+	if !strings.Contains(warning.Message, "docker") || !strings.Contains(warning.Message, "colima") {
+		t.Fatalf("warning = %#v", warning)
+	}
+}
+
 func TestMacOSColimaDetectProblemCases(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -163,11 +178,14 @@ func TestMacOSColimaPlanInstallAndExecute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PlanInstall() error = %v", err)
 	}
-	if plan.Risk != models.RiskNeedsConfirmation || len(plan.Commands) != 8 {
+	if plan.Risk != models.RiskNeedsConfirmation || len(plan.Commands) != 9 {
 		t.Fatalf("plan = %#v", plan)
 	}
-	if !strings.Contains(plan.Commands[3].Command, "'--cpu' '6' '--memory' '12' '--disk' '100'") {
-		t.Fatalf("colima start command = %q", plan.Commands[3].Command)
+	if plan.Title != "Install or update Colima backend" {
+		t.Fatalf("title = %q", plan.Title)
+	}
+	if !strings.Contains(plan.Commands[4].Command, "'--cpu' '6' '--memory' '12' '--disk' '100'") {
+		t.Fatalf("colima start command = %q", plan.Commands[4].Command)
 	}
 	provider.installMu.Lock()
 	steps := append([]colimaInstallStep(nil), provider.installPlans[plan.PlanID].Steps...)

@@ -23,6 +23,7 @@ const (
 	defaultPublishInterval     = time.Second
 	defaultPersistInterval     = 10 * time.Second
 	defaultRetainInterval      = time.Hour
+	defaultGPUCacheTTL         = 5 * time.Second
 	defaultTopN                = 8
 	maxPendingPersistSamples   = 10000
 	streamRetryFallbackSamples = 5
@@ -44,8 +45,20 @@ type Options struct {
 	PublishInterval    time.Duration
 	PersistInterval    time.Duration
 	RetainInterval     time.Duration
+	GPUCacheTTL        time.Duration
 	TopN               int
 	Now                func() time.Time
+	GPUProbe           GPUProbe
+}
+
+type GPUProbe interface {
+	ProbeGPUs(context.Context) models.GPUMetrics
+}
+
+type GPUProbeFunc func(context.Context) models.GPUMetrics
+
+func (f GPUProbeFunc) ProbeGPUs(ctx context.Context) models.GPUMetrics {
+	return f(ctx)
 }
 
 type Manager struct {
@@ -61,8 +74,10 @@ type Manager struct {
 	publishInterval    time.Duration
 	persistInterval    time.Duration
 	retainInterval     time.Duration
+	gpuCacheTTL        time.Duration
 	topN               int
 	now                func() time.Time
+	gpuProbe           GPUProbe
 
 	mu           sync.Mutex
 	ctx          context.Context
@@ -77,6 +92,8 @@ type Manager struct {
 	pending      []store.MetricsSampleRecord
 	lastRetain   time.Time
 	onlineCPUs   uint32
+	gpuCache     models.GPUMetrics
+	gpuCacheAt   time.Time
 	flushMu      sync.Mutex
 }
 
@@ -105,8 +122,9 @@ type Sample struct {
 }
 
 type SamplePayload struct {
-	StreamID string   `json:"streamID"`
-	Samples  []Sample `json:"samples"`
+	StreamID string            `json:"streamID"`
+	Samples  []Sample          `json:"samples"`
+	GPU      models.GPUMetrics `json:"gpu"`
 }
 
 type containerWatcher struct {

@@ -458,6 +458,7 @@ function dashboardMetrics() {
     images: 1,
     volumes: 1,
     diskUsage: diskUsage(),
+    gpu: unavailableGPU(),
     top: [
       {
         id: "container-1",
@@ -479,6 +480,7 @@ function seededDashboardMetrics() {
     images: seededCounts.images,
     volumes: seededCounts.volumes,
     diskUsage: seededDiskUsage(),
+    gpu: seededGPU(),
     top: containers.slice(0, 8).map((item) => ({
       id: item.id,
       name: item.name,
@@ -487,6 +489,42 @@ function seededDashboardMetrics() {
       memoryBytes: item.memoryBytes,
     })),
     recentEvents: auditEntries(),
+  };
+}
+
+function unavailableGPU() {
+  return {
+    available: false,
+    source: "nvidia-smi",
+    message: "nvidia-smi was not found",
+    deviceCount: 0,
+    checkedAt: "2026-06-13T09:00:00Z",
+  };
+}
+
+function seededGPU() {
+  return {
+    available: true,
+    source: "nvidia-smi",
+    deviceCount: 1,
+    utilizationPercent: 18,
+    memoryUsedBytes: 2 * 1024 * 1024 * 1024,
+    memoryTotalBytes: 8 * 1024 * 1024 * 1024,
+    temperatureCelsius: 54,
+    driverVersion: "555.85",
+    devices: [
+      {
+        id: "0",
+        index: 0,
+        name: "NVIDIA GeForce RTX 4090",
+        driverVersion: "555.85",
+        utilizationPercent: 18,
+        memoryUsedBytes: 2 * 1024 * 1024 * 1024,
+        memoryTotalBytes: 8 * 1024 * 1024 * 1024,
+        temperatureCelsius: 54,
+      },
+    ],
+    checkedAt: "2026-06-13T09:00:00Z",
   };
 }
 
@@ -987,7 +1025,10 @@ const callHandlers: Record<number, (...args: unknown[]) => unknown> = {
     },
   ],
   1372038617: () =>
-    commandPlan("Install Docker Engine on Linux", "sudo apt-get update"),
+    commandPlan(
+      "Install or update Docker Engine on Linux",
+      "sudo apt-get update",
+    ),
   1935115277: () =>
     commandPlan(
       "Restart Docker backend",
