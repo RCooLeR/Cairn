@@ -337,6 +337,9 @@ func TestWindowsWSLInstallPlanAndExecution(t *testing.T) {
 	if !strings.Contains(plan.Commands[5].Command, "rm -f /etc/apt/sources.list.d/docker.list") || !strings.Contains(plan.Commands[5].Command, "Could not determine Ubuntu codename") {
 		t.Fatalf("Docker apt install command does not clean stale source lists or validate codename: %s", plan.Commands[5].Command)
 	}
+	if !strings.Contains(plan.Commands[5].Command, "lsb_release -cs") || !strings.Contains(plan.Commands[5].Command, "24.04) codename=noble") {
+		t.Fatalf("Docker apt install command missing codename fallbacks: %s", plan.Commands[5].Command)
+	}
 	if !strings.Contains(plan.Commands[5].Command, "docker-ce") || !strings.Contains(plan.Commands[9].Command, "hello-world") {
 		t.Fatalf("plan commands missing Docker install/verify steps: %#v", plan.Commands)
 	}
