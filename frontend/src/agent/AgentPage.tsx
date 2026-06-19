@@ -6,6 +6,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
+import { create } from "zustand";
 import {
   Bot,
   CheckCircle2,
@@ -72,20 +73,72 @@ type AgentToolCall = {
 
 const defaultEndpoint = "http://127.0.0.1:11434";
 
+type AgentSessionState = {
+  lastToolResults: AgentToolResult[];
+  messages: ChatMessage[];
+  mode: AgentMode;
+  pendingToolCall: AgentToolCall | null;
+  projectID: string;
+  prompt: string;
+  clearConversation: () => void;
+  setLastToolResults: (
+    next:
+      | AgentToolResult[]
+      | ((current: AgentToolResult[]) => AgentToolResult[]),
+  ) => void;
+  setMessages: (
+    next: ChatMessage[] | ((current: ChatMessage[]) => ChatMessage[]),
+  ) => void;
+  setMode: (mode: AgentMode) => void;
+  setPendingToolCall: (call: AgentToolCall | null) => void;
+  setProjectID: (projectID: string) => void;
+  setPrompt: (prompt: string) => void;
+};
+
+const initialAgentSession = {
+  lastToolResults: [] as AgentToolResult[],
+  messages: [] as ChatMessage[],
+  mode: "ask" as AgentMode,
+  pendingToolCall: null as AgentToolCall | null,
+  projectID: "",
+  prompt: "",
+};
+
+const useAgentSessionStore = create<AgentSessionState>((set) => ({
+  ...initialAgentSession,
+  clearConversation: () =>
+    set({
+      lastToolResults: [],
+      messages: [],
+      pendingToolCall: null,
+    }),
+  setLastToolResults: (next) =>
+    set((state) => ({
+      lastToolResults:
+        typeof next === "function" ? next(state.lastToolResults) : next,
+    })),
+  setMessages: (next) =>
+    set((state) => ({
+      messages: typeof next === "function" ? next(state.messages) : next,
+    })),
+  setMode: (mode) => set({ mode }),
+  setPendingToolCall: (pendingToolCall) => set({ pendingToolCall }),
+  setProjectID: (projectID) => set({ projectID }),
+  setPrompt: (prompt) => set({ prompt }),
+}));
+
+export function resetAgentSessionForTest() {
+  useAgentSessionStore.setState({
+    ...initialAgentSession,
+  });
+}
+
 export function AgentPage({ projects }: AgentPageProps) {
   const [status, setStatus] = useState<AgentStatus | null>(null);
   const [provider, setProvider] = useState("ollama");
   const [endpoint, setEndpoint] = useState(defaultEndpoint);
   const [model, setModel] = useState("");
-  const [projectID, setProjectID] = useState("");
-  const [mode, setMode] = useState<AgentMode>("ask");
-  const [prompt, setPrompt] = useState("");
-  const [messages, setMessages] = useState<ChatMessage[]>([]);
-  const [lastToolResults, setLastToolResults] = useState<AgentToolResult[]>([]);
   const [toolCatalog, setToolCatalog] = useState<AgentToolSpec[]>([]);
-  const [pendingToolCall, setPendingToolCall] = useState<AgentToolCall | null>(
-    null,
-  );
   const [toolBusy, setToolBusy] = useState(false);
   const [toolError, setToolError] = useState<string | null>(null);
   const [analysis, setAnalysis] = useState<AgentProjectAnalysis | null>(null);
@@ -108,6 +161,22 @@ export function AgentPage({ projects }: AgentPageProps) {
   const requestRef = useRef<ReturnType<typeof AgentService.Chat> | null>(null);
   const stoppedRef = useRef(false);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
+  const autoLoadedAnalysisProjectRef = useRef<string | null>(null);
+  const {
+    clearConversation,
+    lastToolResults,
+    messages,
+    mode,
+    pendingToolCall,
+    projectID,
+    prompt,
+    setLastToolResults,
+    setMessages,
+    setMode,
+    setPendingToolCall,
+    setProjectID,
+    setPrompt,
+  } = useAgentSessionStore();
 
   const selectedProject = projects.find((project) => project.id === projectID);
   const availableModels = useMemo(
@@ -223,6 +292,7 @@ export function AgentPage({ projects }: AgentPageProps) {
     setEditPlan(null);
     setEditResult(null);
     setEditError(null);
+    autoLoadedAnalysisProjectRef.current = nextProjectID || null;
     if (nextProjectID) {
       void loadProjectAnalysis(nextProjectID);
     }
@@ -232,6 +302,7 @@ export function AgentPage({ projects }: AgentPageProps) {
     if (!targetProjectID) {
       return;
     }
+    autoLoadedAnalysisProjectRef.current = targetProjectID;
     setAnalysisLoading(true);
     setEditError(null);
     try {
@@ -243,6 +314,18 @@ export function AgentPage({ projects }: AgentPageProps) {
       setAnalysisLoading(false);
     }
   };
+
+  useEffect(() => {
+    if (
+      !projectID ||
+      analysis ||
+      analysisLoading ||
+      autoLoadedAnalysisProjectRef.current === projectID
+    ) {
+      return;
+    }
+    void loadProjectAnalysis(projectID);
+  }, [analysis, analysisLoading, projectID]);
 
   const draftProjectFile = async () => {
     if (!projectID || !editPath.trim() || !editInstruction.trim()) {
@@ -597,9 +680,7 @@ export function AgentPage({ projects }: AgentPageProps) {
               disabled={messages.length === 0 || sending}
               icon={<Trash2 size={15} />}
               onClick={() => {
-                setMessages([]);
-                setLastToolResults([]);
-                setPendingToolCall(null);
+                clearConversation();
                 setToolError(null);
               }}
               size="sm"

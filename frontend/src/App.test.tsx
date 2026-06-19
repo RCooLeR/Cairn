@@ -58,6 +58,7 @@ import {
 } from "./components/terminal/terminalEncoding";
 import { useAppStore } from "./state/appStore";
 import { useInventoryStore } from "./state/inventoryStore";
+import { resetAgentSessionForTest } from "./agent/AgentPage";
 
 const inventoryMock = vi.hoisted(() => ({
   getInventorySnapshot: vi.fn<() => Promise<InventorySnapshot>>(),
@@ -637,6 +638,7 @@ describe("App inventory shell", () => {
       volumeDetails: {},
       networkDetails: {},
     });
+    resetAgentSessionForTest();
   });
 
   afterEach(() => {
@@ -807,6 +809,43 @@ describe("App inventory shell", () => {
     expect(
       screen.getByText("Provided final answer with gemma4:12b-it-q8_0"),
     ).toBeInTheDocument();
+  });
+
+  it("keeps the agent conversation when navigating away and back", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    agentServiceMock.Chat.mockResolvedValueOnce({
+      message: "Persistent agent answer.",
+      toolResults: [],
+      model: "gemma4:12b-it-q8_0",
+    });
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    const nav = screen.getByRole("navigation", { name: "Main navigation" });
+    fireEvent.click(within(nav).getByRole("button", { name: /Agent/ }));
+
+    const input = await screen.findByPlaceholderText(
+      "Ask a Docker question...",
+    );
+    fireEvent.change(input, {
+      target: { value: "Remember this conversation" },
+    });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    await screen.findByText("Persistent agent answer.");
+    fireEvent.click(within(nav).getByRole("button", { name: /Projects/ }));
+    await screen.findByRole("heading", { name: "Projects" });
+    fireEvent.click(within(nav).getByRole("button", { name: /Agent/ }));
+
+    const transcript = await screen.findByTestId("agent-transcript");
+    expect(
+      within(transcript).getByText("Remember this conversation"),
+    ).toBeInTheDocument();
+    expect(
+      within(transcript).getByText("Persistent agent answer."),
+    ).toBeInTheDocument();
+    expect(agentServiceMock.Chat).toHaveBeenCalledTimes(1);
   });
 
   it("does not convert ordinary agent bullets into plan items", async () => {
