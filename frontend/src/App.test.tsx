@@ -5018,5 +5018,7 @@ function healthyProviderStatus(): ProviderStatus {
     dockerVersion: "26.1.0",
     composeVersion: "v2.27.0",
     currentContext: "default",
+    nvidiaGPUDetected: false,
+    nvidiaContainerRuntime: false,
   };
 }

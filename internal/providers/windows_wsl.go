@@ -29,6 +29,11 @@ const (
 	wslInstallTimeout     = 15 * time.Minute
 )
 
+const (
+	wslNVIDIAGPUCheckCommand     = "command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1"
+	wslNVIDIARuntimeCheckCommand = "docker info 2>/dev/null | sed -n 's/^ Runtimes: //p' | grep -Eq '(^|[[:space:]])nvidia([[:space:]]|$)'"
+)
+
 var windowsDrivePathPattern = regexp.MustCompile(`^[A-Za-z]:[\\/]?`)
 
 type WindowsWSLOptions struct {
@@ -239,6 +244,16 @@ func (p *WindowsWSLProvider) Detect(ctx context.Context) (*models.ProviderStatus
 			true,
 		))
 	}
+	status.NVIDIAGPUDetected = p.wslNVIDIAGPUAvailable(ctx, selected.Name)
+	if status.NVIDIAGPUDetected && status.DockerRunning {
+		status.NVIDIAContainerRuntime = p.wslDockerNVIDIARuntimeAvailable(ctx, selected.Name)
+		if !status.NVIDIAContainerRuntime {
+			status.Warnings = append(status.Warnings, models.ProviderWarning{
+				Code:    WarningNVIDIARuntimeMissing,
+				Message: "An NVIDIA GPU is visible in WSL, but Docker is not configured with the NVIDIA container runtime.",
+			})
+		}
+	}
 
 	status.Installed = status.DockerInstalled && status.ComposeInstalled && status.BuildxInstalled
 	status.Running = status.DockerRunning
@@ -296,6 +311,7 @@ func (p *WindowsWSLProvider) PlanInstall(_ context.Context, opts models.InstallO
 			"Enable systemd in the selected distro and restart WSL if needed.",
 			"Install or upgrade Docker Engine, containerd, Compose, and Buildx from Docker's official apt repository.",
 			"Add the WSL user to the docker group; a WSL restart may be required before group membership applies.",
+			"Configure NVIDIA Container Toolkit when an NVIDIA GPU is exposed to WSL.",
 			"Enable and start the Docker service, then verify Docker, Compose, Buildx, and hello-world.",
 		},
 		ExpiresAt: time.Now().UTC().Add(security.DefaultPlanTTL),
@@ -552,6 +568,14 @@ func (p *WindowsWSLProvider) detectDockerPackageUpdates(ctx context.Context, dis
 		return nil, false
 	}
 	return aptPolicyOutdatedPackages(output), true
+}
+
+func (p *WindowsWSLProvider) wslNVIDIAGPUAvailable(ctx context.Context, distro string) bool {
+	return p.runWSLOK(ctx, distro, "sh", "-lc", wslNVIDIAGPUCheckCommand)
+}
+
+func (p *WindowsWSLProvider) wslDockerNVIDIARuntimeAvailable(ctx context.Context, distro string) bool {
+	return p.runWSLOK(ctx, distro, "sh", "-lc", wslNVIDIARuntimeCheckCommand)
 }
 
 func (p *WindowsWSLProvider) runWSL(ctx context.Context, distro string, args ...string) (*CommandResult, error) {
@@ -840,6 +864,21 @@ func buildWSLInstallStepsFor(distro string, distribution string) []wslInstallSte
 		"apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin",
 		"if ! docker system dial-stdio --help >/dev/null 2>&1; then apt-get install -y socat; fi",
 	}, " && ")
+	nvidiaToolkitCommand := strings.Join([]string{
+		"set -e",
+		`if ! ` + wslNVIDIAGPUCheckCommand + `; then echo "No NVIDIA GPU is exposed to WSL; skipping NVIDIA Container Toolkit."; exit 0; fi`,
+		`if ` + wslNVIDIARuntimeCheckCommand + `; then echo "NVIDIA container runtime is already configured."; exit 0; fi`,
+		"apt-get update",
+		"apt-get install -y --no-install-recommends ca-certificates curl gnupg",
+		"rm -f /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg /etc/apt/sources.list.d/nvidia-container-toolkit.list",
+		"curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg",
+		`curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' > /etc/apt/sources.list.d/nvidia-container-toolkit.list`,
+		"apt-get update",
+		"apt-get install -y --no-install-recommends nvidia-container-toolkit",
+		"nvidia-ctk runtime configure --runtime=docker",
+		"systemctl restart docker",
+		wslNVIDIARuntimeCheckCommand,
+	}, " && ")
 	groupCommand := `user="$(getent passwd 1000 | cut -d: -f1)"; if [ -z "$user" ]; then echo "No non-root WSL user was found for docker group membership." >&2; exit 1; fi; usermod -aG docker "$user"`
 	verifyCommand := strings.Join([]string{
 		"docker info >/dev/null",
@@ -924,6 +963,16 @@ func buildWSLInstallStepsFor(distro string, distribution string) []wslInstallSte
 			Command: []string{wslCommandName, "-d", distro, "-u", "root", "--", "sh", "-lc", "systemctl enable --now docker"},
 			RepairHints: []string{
 				"Make sure systemd is enabled in /etc/wsl.conf, terminate the distro, and retry.",
+			},
+		},
+		{
+			Message: "Install NVIDIA Container Toolkit when a WSL GPU is available",
+			Timeout: wslInstallTimeout,
+			Command: []string{wslCommandName, "-d", distro, "-u", "root", "--", "sh", "-lc", escapeWSLCommandDollars(nvidiaToolkitCommand)},
+			RepairHints: []string{
+				"Install or update the Windows NVIDIA driver; do not install Linux NVIDIA display drivers inside WSL.",
+				"Check internet access to nvidia.github.io from inside WSL and retry.",
+				"Run `nvidia-smi` inside WSL to confirm the GPU is exposed before retrying.",
 			},
 		},
 		{

@@ -416,6 +416,15 @@ func assertWarning(t *testing.T, warnings []models.ProviderWarning, code string)
 	return models.ProviderWarning{}
 }
 
+func assertNoWarning(t *testing.T, warnings []models.ProviderWarning, code string) {
+	t.Helper()
+	for _, warning := range warnings {
+		if warning.Code == code {
+			t.Fatalf("unexpected warning %s in %#v", code, warnings)
+		}
+	}
+}
+
 type composeOptionsRunner struct {
 	opts CommandRunOptions
 }

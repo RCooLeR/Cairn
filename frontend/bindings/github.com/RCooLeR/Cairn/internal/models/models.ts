@@ -2645,6 +2645,8 @@ export class ProviderStatus {
     "backendVersion"?: string;
     "currentContext"?: string;
     "dockerHost"?: string;
+    "nvidiaGPUDetected": boolean;
+    "nvidiaContainerRuntime": boolean;
     "problems"?: ProviderProblem[];
     "warnings"?: ProviderWarning[];
 
@@ -2671,6 +2673,12 @@ export class ProviderStatus {
         if (!("buildxInstalled" in $$source)) {
             this["buildxInstalled"] = false;
         }
+        if (!("nvidiaGPUDetected" in $$source)) {
+            this["nvidiaGPUDetected"] = false;
+        }
+        if (!("nvidiaContainerRuntime" in $$source)) {
+            this["nvidiaContainerRuntime"] = false;
+        }
 
         Object.assign(this, $$source);
     }
@@ -2679,14 +2687,14 @@ export class ProviderStatus {
      * Creates a new ProviderStatus instance from a string or object.
      */
     static createFrom($$source: any = {}): ProviderStatus {
-        const $$createField12_0 = $$createType49;
-        const $$createField13_0 = $$createType51;
+        const $$createField14_0 = $$createType49;
+        const $$createField15_0 = $$createType51;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("problems" in $$parsedSource) {
-            $$parsedSource["problems"] = $$createField12_0($$parsedSource["problems"]);
+            $$parsedSource["problems"] = $$createField14_0($$parsedSource["problems"]);
         }
         if ("warnings" in $$parsedSource) {
-            $$parsedSource["warnings"] = $$createField13_0($$parsedSource["warnings"]);
+            $$parsedSource["warnings"] = $$createField15_0($$parsedSource["warnings"]);
         }
         return new ProviderStatus($$parsedSource as Partial<ProviderStatus>);
     }

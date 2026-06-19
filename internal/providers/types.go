@@ -40,6 +40,7 @@ const (
 	WarningBrewMissing            = "BREW_MISSING"
 	WarningUnencryptedTCP         = "UNENCRYPTED_TCP_CONTEXT"
 	WarningDockerPackagesOutdated = "DOCKER_PACKAGES_OUTDATED"
+	WarningNVIDIARuntimeMissing   = "NVIDIA_RUNTIME_MISSING"
 )
 
 type CommandResult struct {

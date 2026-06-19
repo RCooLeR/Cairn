@@ -18,20 +18,22 @@ type ProviderDetail struct {
 }
 
 type ProviderStatus struct {
-	Installed        bool              `json:"installed"`
-	Running          bool              `json:"running"`
-	Healthy          bool              `json:"healthy"`
-	DockerInstalled  bool              `json:"dockerInstalled"`
-	DockerRunning    bool              `json:"dockerRunning"`
-	ComposeInstalled bool              `json:"composeInstalled"`
-	BuildxInstalled  bool              `json:"buildxInstalled"`
-	DockerVersion    string            `json:"dockerVersion,omitempty"`
-	ComposeVersion   string            `json:"composeVersion,omitempty"`
-	BackendVersion   string            `json:"backendVersion,omitempty"`
-	CurrentContext   string            `json:"currentContext,omitempty"`
-	DockerHost       string            `json:"dockerHost,omitempty"`
-	Problems         []ProviderProblem `json:"problems,omitempty"`
-	Warnings         []ProviderWarning `json:"warnings,omitempty"`
+	Installed              bool              `json:"installed"`
+	Running                bool              `json:"running"`
+	Healthy                bool              `json:"healthy"`
+	DockerInstalled        bool              `json:"dockerInstalled"`
+	DockerRunning          bool              `json:"dockerRunning"`
+	ComposeInstalled       bool              `json:"composeInstalled"`
+	BuildxInstalled        bool              `json:"buildxInstalled"`
+	DockerVersion          string            `json:"dockerVersion,omitempty"`
+	ComposeVersion         string            `json:"composeVersion,omitempty"`
+	BackendVersion         string            `json:"backendVersion,omitempty"`
+	CurrentContext         string            `json:"currentContext,omitempty"`
+	DockerHost             string            `json:"dockerHost,omitempty"`
+	NVIDIAGPUDetected      bool              `json:"nvidiaGPUDetected"`
+	NVIDIAContainerRuntime bool              `json:"nvidiaContainerRuntime"`
+	Problems               []ProviderProblem `json:"problems,omitempty"`
+	Warnings               []ProviderWarning `json:"warnings,omitempty"`
 }
 
 type ProviderProblem struct {

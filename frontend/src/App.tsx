@@ -5849,13 +5849,23 @@ function ProviderSetupModal({
         ? macOSSetupCheckRows(setup.detection)
         : windowsSetupCheckRows(setup.detection);
   const hasProblems = Boolean(setup.detection?.problems?.length);
-  const hasBackendUpdates = providerHasUpdateWarnings(setup.detection);
+  const hasBackendUpdates = providerHasWarning(
+    setup.detection,
+    "DOCKER_PACKAGES_OUTDATED",
+  );
+  const hasNVIDIARuntimeRepair = providerHasWarning(
+    setup.detection,
+    "NVIDIA_RUNTIME_MISSING",
+  );
+  const hasActionableWarnings = hasBackendUpdates || hasNVIDIARuntimeRepair;
   const canPlan = !setup.detecting && Boolean(setup.detection);
   const repairActionLabel = hasProblems
     ? "Review auto repair"
-    : hasBackendUpdates
-      ? "Review backend update"
-      : "Review repair / update";
+    : hasNVIDIARuntimeRepair
+      ? "Review GPU runtime install"
+      : hasBackendUpdates
+        ? "Review backend update"
+        : "Review repair / update";
   const completed =
     setup.detection?.healthy ||
     setup.progress.some((entry) => entry.done && !entry.error);
@@ -6173,7 +6183,7 @@ function ProviderSetupModal({
               {setup.backend === "existing_context" ? (
                 <Button onClick={onOpenDockerContexts}>Open Settings</Button>
               ) : null}
-              {setup.detection?.healthy ? (
+              {setup.detection?.healthy && !hasActionableWarnings ? (
                 <Button
                   icon={<CheckCircle2 size={15} />}
                   onClick={() => onStep("verify")}
@@ -17036,15 +17046,12 @@ function windowsSetupCheckRows(status: ProviderStatus | null) {
       problem("DOCKERD_DOWN"),
       status?.dockerRunning,
     ),
+    setupNVIDIACheckRow(status, warning("NVIDIA_RUNTIME_MISSING")),
   ];
 }
 
-function providerHasUpdateWarnings(status: ProviderStatus | null) {
-  return Boolean(
-    status?.warnings?.some(
-      (warning) => warning.code === "DOCKER_PACKAGES_OUTDATED",
-    ),
-  );
+function providerHasWarning(status: ProviderStatus | null, code: string) {
+  return Boolean(status?.warnings?.some((warning) => warning.code === code));
 }
 
 function isEditableElement(target: EventTarget | null) {
@@ -17118,6 +17125,45 @@ function setupWarningCheckRow(
     };
   }
   return { label, state: "ok" as StatusToneID, detail: "Current" };
+}
+
+function setupNVIDIACheckRow(
+  status: ProviderStatus | null,
+  warning: ProviderWarning | null,
+) {
+  if (!status) {
+    return {
+      label: "NVIDIA GPU runtime",
+      state: "neutral" as StatusToneID,
+      detail: "Not checked yet",
+    };
+  }
+  if (!status.nvidiaGPUDetected) {
+    return {
+      label: "NVIDIA GPU runtime",
+      state: "neutral" as StatusToneID,
+      detail: "No NVIDIA GPU exposed to this backend",
+    };
+  }
+  if (warning) {
+    return {
+      label: "NVIDIA GPU runtime",
+      state: "warn" as StatusToneID,
+      detail: warning.message,
+    };
+  }
+  if (status.nvidiaContainerRuntime) {
+    return {
+      label: "NVIDIA GPU runtime",
+      state: "ok" as StatusToneID,
+      detail: "Ready",
+    };
+  }
+  return {
+    label: "NVIDIA GPU runtime",
+    state: "neutral" as StatusToneID,
+    detail: "Not detected yet",
+  };
 }
 
 function filterAuditEntries(entries: AuditEntry[], filter: AuditFilterState) {

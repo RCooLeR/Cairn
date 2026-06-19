@@ -345,7 +345,7 @@ func TestWindowsWSLInstallPlanAndExecution(t *testing.T) {
 	if plan.Title != "Install or update Docker Engine in Ubuntu on WSL" {
 		t.Fatalf("plan title = %q", plan.Title)
 	}
-	if got, want := len(plan.Commands), 10; got != want {
+	if got, want := len(plan.Commands), 11; got != want {
 		t.Fatalf("command count = %d, want %d", got, want)
 	}
 	if !strings.Contains(plan.Commands[1].Command, "--name") || !strings.Contains(plan.Commands[1].Command, "cairn-dev") {
@@ -366,8 +366,14 @@ func TestWindowsWSLInstallPlanAndExecution(t *testing.T) {
 	if !strings.Contains(plan.Commands[6].Command, `\$user`) || !strings.Contains(plan.Commands[6].Command, `\$(getent passwd 1000`) {
 		t.Fatalf("Docker group command does not escape dollars for wsl.exe: %s", plan.Commands[6].Command)
 	}
-	if !strings.Contains(plan.Commands[5].Command, "docker-ce") || !strings.Contains(plan.Commands[9].Command, "hello-world") {
+	if !strings.Contains(plan.Commands[5].Command, "docker-ce") || !strings.Contains(plan.Commands[10].Command, "hello-world") {
 		t.Fatalf("plan commands missing Docker install/verify steps: %#v", plan.Commands)
+	}
+	if !strings.Contains(plan.Commands[9].Command, "nvidia-container-toolkit") || !strings.Contains(plan.Commands[9].Command, "nvidia-ctk runtime configure") {
+		t.Fatalf("NVIDIA runtime command missing toolkit install/configuration: %s", plan.Commands[9].Command)
+	}
+	if !strings.Contains(plan.Commands[9].Command, `\$`) {
+		t.Fatalf("NVIDIA runtime command should escape shell dollars for wsl.exe: %s", plan.Commands[9].Command)
 	}
 	steps := buildWSLInstallSteps("cairn-dev")
 	if steps[8].Timeout <= commandTimeout {
@@ -393,6 +399,53 @@ func TestWindowsWSLInstallPlanAndExecution(t *testing.T) {
 	if err := provider.ExecuteInstallStep(context.Background(), plan.PlanID, 0, nil); !apperror.IsCode(err, apperror.PlanExpired) {
 		t.Fatalf("ExecuteInstallStep after completion error = %v, want E_PLAN_EXPIRED", err)
 	}
+}
+
+func TestWindowsWSLDetectWarnsWhenNVIDIARuntimeMissing(t *testing.T) {
+	t.Parallel()
+	runner := newFakeRunner()
+	seedWSLDetectThroughDockerProbe(runner)
+	runner.outputs[wslCommandName+" -d Ubuntu -- sh -lc command -v docker >/dev/null 2>&1"] = "/usr/bin/docker\n"
+	runner.outputs[wslCommandName+" -d Ubuntu -- docker context show"] = "default\n"
+	runner.outputs[wslCommandName+" -d Ubuntu -- docker compose version --short"] = "v2.29.1\n"
+	runner.outputs[wslCommandName+" -d Ubuntu -- docker buildx version"] = "github.com/docker/buildx v0.16.2 123456\n"
+	runner.outputs[wslCommandName+" -d Ubuntu -- docker info --format {{.ServerVersion}}"] = "27.1.2\n"
+	runner.outputs[wslCommandName+" -d Ubuntu -- sh -lc "+wslNVIDIAGPUCheckCommand] = "GPU 0: NVIDIA RTX\n"
+	runner.errors[wslCommandName+" -d Ubuntu -- sh -lc "+wslNVIDIARuntimeCheckCommand] = errors.New("runtime missing")
+
+	status, err := NewWindowsWSL(WindowsWSLOptions{Runner: runner}).Detect(context.Background())
+	if err != nil {
+		t.Fatalf("Detect() error = %v", err)
+	}
+	if !status.NVIDIAGPUDetected || status.NVIDIAContainerRuntime {
+		t.Fatalf("NVIDIA flags = gpu %v runtime %v", status.NVIDIAGPUDetected, status.NVIDIAContainerRuntime)
+	}
+	warning := assertWarning(t, status.Warnings, WarningNVIDIARuntimeMissing)
+	if !strings.Contains(warning.Message, "NVIDIA GPU") || !strings.Contains(warning.Message, "runtime") {
+		t.Fatalf("warning = %#v", warning)
+	}
+}
+
+func TestWindowsWSLDetectMarksNVIDIARuntimeReady(t *testing.T) {
+	t.Parallel()
+	runner := newFakeRunner()
+	seedWSLDetectThroughDockerProbe(runner)
+	runner.outputs[wslCommandName+" -d Ubuntu -- sh -lc command -v docker >/dev/null 2>&1"] = "/usr/bin/docker\n"
+	runner.outputs[wslCommandName+" -d Ubuntu -- docker context show"] = "default\n"
+	runner.outputs[wslCommandName+" -d Ubuntu -- docker compose version --short"] = "v2.29.1\n"
+	runner.outputs[wslCommandName+" -d Ubuntu -- docker buildx version"] = "github.com/docker/buildx v0.16.2 123456\n"
+	runner.outputs[wslCommandName+" -d Ubuntu -- docker info --format {{.ServerVersion}}"] = "27.1.2\n"
+	runner.outputs[wslCommandName+" -d Ubuntu -- sh -lc "+wslNVIDIAGPUCheckCommand] = "GPU 0: NVIDIA RTX\n"
+	runner.outputs[wslCommandName+" -d Ubuntu -- sh -lc "+wslNVIDIARuntimeCheckCommand] = "nvidia\n"
+
+	status, err := NewWindowsWSL(WindowsWSLOptions{Runner: runner}).Detect(context.Background())
+	if err != nil {
+		t.Fatalf("Detect() error = %v", err)
+	}
+	if !status.NVIDIAGPUDetected || !status.NVIDIAContainerRuntime {
+		t.Fatalf("NVIDIA flags = gpu %v runtime %v", status.NVIDIAGPUDetected, status.NVIDIAContainerRuntime)
+	}
+	assertNoWarning(t, status.Warnings, WarningNVIDIARuntimeMissing)
 }
 
 func TestWindowsWSLDetectWarnsWhenDockerPackagesAreOutdated(t *testing.T) {
