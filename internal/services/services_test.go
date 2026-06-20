@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1122,6 +1123,12 @@ func TestProjectServiceImportProject(t *testing.T) {
 	runner.outputs[root+"|-f "+composeFile+" config"] = providers.CommandResult{
 		Stdout: "services:\n  app:\n    image: nginx:alpine\n  db:\n    image: postgres:16-alpine\n",
 	}
+	runner.outputs[root+"|-f "+composeFile+" ps --format json --all"] = providers.CommandResult{
+		Stdout: "[]",
+	}
+	runner.outputs[root+"|-f "+composeFile+" up -d"] = providers.CommandResult{
+		Stdout: "Container app Started\nContainer db Started\n",
+	}
 	service := &ProjectService{
 		Client:     composecore.NewClient(runner),
 		Projects:   db.Projects(),
@@ -1138,6 +1145,71 @@ func TestProjectServiceImportProject(t *testing.T) {
 	}
 	if len(detail.Services) != 2 || detail.Services[0].Name != "app" || detail.Services[1].Name != "db" {
 		t.Fatalf("services = %#v", detail.Services)
+	}
+	if !runner.hasCall(root + "|-f " + composeFile + " up -d") {
+		t.Fatalf("compose calls = %#v, want auto deploy", runner.calls)
+	}
+	projects, err := service.ListProjects(ctx)
+	if err != nil {
+		t.Fatalf("ListProjects() error = %v", err)
+	}
+	if len(projects) != 1 || projects[0].ID != "linux_native/app-db" {
+		t.Fatalf("projects = %#v", projects)
+	}
+}
+
+func TestProjectServiceImportProjectSkipsAutoDeployWhenContainersExist(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	root, composeFile := writeServiceComposeProject(t, "app-db")
+	runner := newFakeComposeRunner()
+	runner.outputs[root+"|-f "+composeFile+" config"] = providers.CommandResult{
+		Stdout: "services:\n  app:\n    image: nginx:alpine\n",
+	}
+	runner.outputs[root+"|-f "+composeFile+" ps --format json --all"] = providers.CommandResult{
+		Stdout: `[{"ID":"abc","Name":"app-db-app-1","Project":"app-db","Service":"app","State":"running"}]`,
+	}
+	service := &ProjectService{
+		Client:     composecore.NewClient(runner),
+		Projects:   db.Projects(),
+		ProviderID: "linux_native",
+	}
+
+	if _, err := service.ImportProject(ctx, models.ImportProjectRequest{FolderPath: root}); err != nil {
+		t.Fatalf("ImportProject() error = %v", err)
+	}
+	if runner.hasCall(root + "|-f " + composeFile + " up -d") {
+		t.Fatalf("compose calls = %#v, did not want auto deploy", runner.calls)
+	}
+}
+
+func TestProjectServiceImportProjectKeepsProjectWhenAutoDeployFails(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	root, composeFile := writeServiceComposeProject(t, "app-db")
+	runner := newFakeComposeRunner()
+	runner.outputs[root+"|-f "+composeFile+" config"] = providers.CommandResult{
+		Stdout: "services:\n  app:\n    image: nginx:alpine\n",
+	}
+	runner.outputs[root+"|-f "+composeFile+" ps --format json --all"] = providers.CommandResult{
+		Stdout: "[]",
+	}
+	runner.errors[root+"|-f "+composeFile+" up -d"] = errors.New("nvidia runtime is not available")
+	service := &ProjectService{
+		Client:     composecore.NewClient(runner),
+		Projects:   db.Projects(),
+		ProviderID: "linux_native",
+	}
+
+	detail, err := service.ImportProject(ctx, models.ImportProjectRequest{FolderPath: root})
+	if err != nil {
+		t.Fatalf("ImportProject() error = %v", err)
+	}
+	if detail.Summary.ID != "linux_native/app-db" {
+		t.Fatalf("detail summary = %#v", detail.Summary)
+	}
+	if !runner.hasCall(root + "|-f " + composeFile + " up -d") {
+		t.Fatalf("compose calls = %#v, want auto deploy attempt", runner.calls)
 	}
 	projects, err := service.ListProjects(ctx)
 	if err != nil {
@@ -1876,6 +1948,7 @@ func (f *fakeDockerClient) RemoveNetwork(_ context.Context, id string) error {
 
 type fakeComposeRunner struct {
 	outputs       map[string]providers.CommandResult
+	errors        map[string]error
 	calls         []string
 	hostToBackend map[string]string
 	backendToHost map[string]string
@@ -1884,6 +1957,7 @@ type fakeComposeRunner struct {
 func newFakeComposeRunner() *fakeComposeRunner {
 	return &fakeComposeRunner{
 		outputs:       map[string]providers.CommandResult{},
+		errors:        map[string]error{},
 		hostToBackend: map[string]string{},
 		backendToHost: map[string]string{},
 	}
@@ -1896,9 +1970,15 @@ func (r *fakeComposeRunner) RunCompose(ctx context.Context, workdir string, args
 func (r *fakeComposeRunner) RunComposeEnv(_ context.Context, workdir string, _ []string, args ...string) (*providers.CommandResult, error) {
 	key := workdir + "|" + strings.Join(args, " ")
 	r.calls = append(r.calls, key)
-	result := r.outputs[key]
+	result, ok := r.outputs[key]
+	if !ok && strings.HasSuffix(key, " ps --format json --all") {
+		result = providers.CommandResult{Stdout: `[{"ID":"existing","Name":"existing-app-1","Project":"existing","Service":"app","State":"running"}]`}
+	}
 	result.Workdir = workdir
 	result.Command = append([]string{"docker", "compose"}, args...)
+	if err := r.errors[key]; err != nil {
+		return &result, err
+	}
 	return &result, nil
 }
 

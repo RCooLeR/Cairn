@@ -13,6 +13,7 @@ const (
 	ProjectActionStop     = "stop"
 	ProjectActionRestart  = "restart"
 	ProjectActionPull     = "pull"
+	ProjectActionDeploy   = "deploy"
 	ProjectActionRedeploy = "redeploy"
 	ProjectActionDown     = "down"
 )
@@ -35,7 +36,7 @@ func NewProjectPlanStore(now func() time.Time) *ProjectPlanStore {
 func NewProjectActionPlan(plan models.CommandPlan, action string, projectID string, removeVolumes bool) (ProjectPlan, error) {
 	action = strings.ToLower(strings.TrimSpace(action))
 	switch action {
-	case ProjectActionStart, ProjectActionStop, ProjectActionRestart, ProjectActionPull, ProjectActionRedeploy, ProjectActionDown:
+	case ProjectActionStart, ProjectActionStop, ProjectActionRestart, ProjectActionPull, ProjectActionDeploy, ProjectActionRedeploy, ProjectActionDown:
 	default:
 		return ProjectPlan{}, apperror.New(apperror.Conflict, "Unsupported project action", apperror.WithDetail(action))
 	}

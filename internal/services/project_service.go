@@ -114,11 +114,12 @@ func (s *ProjectService) ImportProject(ctx context.Context, req models.ImportPro
 	if projectName == "" {
 		projectName = "project"
 	}
-	config, err := s.Client.Config(ctx, composecore.ProjectOptions{
+	importOpts := composecore.ProjectOptions{
 		Workdir:     workdir,
 		Files:       files,
 		ProjectName: projectName,
-	})
+	}
+	config, err := s.Client.Config(ctx, importOpts)
 	if err != nil {
 		detail := err.Error()
 		if config != nil && len(config.Errors) > 0 {
@@ -167,10 +168,22 @@ func (s *ProjectService) ImportProject(ctx context.Context, req models.ImportPro
 	if err := s.Projects.SaveSnapshot(ctx, s.ProviderID, []store.ProjectRecord{project}, services, now, time.Time{}); err != nil {
 		return nil, apperror.Wrap(apperror.Internal, "Import project failed", err)
 	}
-	if s.Detector != nil {
+	if s.shouldAutoDeployImportedProject(ctx, importOpts) {
+		if err := s.runProjectAction(ctx, security.ProjectActionDeploy, projectID, false, nil); err != nil && s.Detector != nil {
+			_, _ = s.Detector.Reconcile(ctx)
+		}
+	} else if s.Detector != nil {
 		_, _ = s.Detector.Reconcile(ctx)
 	}
 	return s.getProject(ctx, projectID)
+}
+
+func (s *ProjectService) shouldAutoDeployImportedProject(ctx context.Context, opts composecore.ProjectOptions) bool {
+	statuses, err := s.Client.Ps(ctx, opts)
+	if err != nil {
+		return false
+	}
+	return len(statuses) == 0
 }
 
 func (s *ProjectService) RemoveProjectFromList(ctx context.Context, projectID string) error {
@@ -863,6 +876,8 @@ func (s *ProjectService) executeProjectAction(ctx context.Context, action string
 		return s.Client.Restart(ctx, opts)
 	case security.ProjectActionPull:
 		return s.executeProjectPull(ctx, project, opts)
+	case security.ProjectActionDeploy:
+		return s.Client.Up(ctx, opts, false)
 	case security.ProjectActionRedeploy:
 		return s.Client.Up(ctx, opts, true)
 	case security.ProjectActionDown:
@@ -1077,6 +1092,8 @@ func projectActionTitle(action string, name string, removeVolumes bool) string {
 	switch action {
 	case security.ProjectActionPull:
 		return "Pull images for " + name
+	case security.ProjectActionDeploy:
+		return "Deploy " + name
 	case security.ProjectActionRedeploy:
 		return "Redeploy " + name
 	case security.ProjectActionDown:
@@ -1110,6 +1127,8 @@ func projectActionExplanation(action string, removeVolumes bool) string {
 		return "Restarts the Compose project services in place."
 	case security.ProjectActionPull:
 		return "Pulls images declared by the Compose project."
+	case security.ProjectActionDeploy:
+		return "Runs docker compose up -d for the project."
 	case security.ProjectActionRedeploy:
 		return "Runs docker compose up -d --force-recreate for the project."
 	case security.ProjectActionDown:
@@ -1130,6 +1149,8 @@ func projectCommandDisplay(project store.ProjectRecord, action string, removeVol
 		}
 	}
 	switch action {
+	case security.ProjectActionDeploy:
+		args = append(args, "up", "-d")
 	case security.ProjectActionRedeploy:
 		args = append(args, "up", "-d", "--force-recreate")
 	case security.ProjectActionDown:
