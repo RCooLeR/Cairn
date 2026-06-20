@@ -31,12 +31,14 @@ func (nvidiaSMIProbe) ProbeGPUs(ctx context.Context) models.GPUMetrics {
 
 	probeCtx, cancel := context.WithTimeout(ctx, gpuProbeTimeout)
 	defer cancel()
-	output, err := exec.CommandContext(
+	cmd := exec.CommandContext(
 		probeCtx,
 		path,
 		"--query-gpu=index,name,driver_version,temperature.gpu,utilization.gpu,memory.used,memory.total",
 		"--format=csv,noheader,nounits",
-	).Output()
+	)
+	configureBackgroundCommand(cmd)
+	output, err := cmd.Output()
 	if errors.Is(probeCtx.Err(), context.DeadlineExceeded) {
 		return unavailableGPUMetrics("GPU probe timed out", now)
 	}
