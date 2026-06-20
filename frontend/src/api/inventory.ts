@@ -30,9 +30,18 @@ export type InventorySnapshot = {
 type Settled<T> = PromiseSettledResult<T>;
 
 export async function getInventorySnapshot(): Promise<InventorySnapshot> {
-  const providers = await ProviderService.ListProviders().catch(() => []);
-  const [info, version, diskUsage, containers, images, volumes, networks] =
+  const [
+    providerResult,
+    info,
+    version,
+    diskUsage,
+    containers,
+    images,
+    volumes,
+    networks,
+  ] =
     await Promise.allSettled([
+      ProviderService.ListProviders(),
       DockerService.Info(),
       DockerService.Version(),
       DockerService.DiskUsage(),
@@ -51,7 +60,7 @@ export async function getInventorySnapshot(): Promise<InventorySnapshot> {
   ]);
 
   return {
-    providers,
+    providers: valueOr(providerResult, []),
     dockerInfo: valueOr(info, null),
     dockerVersion: valueOr(version, null),
     diskUsage: valueOr(diskUsage, null),
@@ -62,6 +71,7 @@ export async function getInventorySnapshot(): Promise<InventorySnapshot> {
     volumeDetails,
     networkDetails,
     degradedReason: firstError([
+      providerResult,
       info,
       version,
       diskUsage,

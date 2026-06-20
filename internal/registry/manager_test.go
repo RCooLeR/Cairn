@@ -455,7 +455,10 @@ func TestAuthDoesNotTreatUnexpectedClientStatusAsLoggedIn(t *testing.T) {
 	}))
 	defer server.Close()
 	registryHost := strings.TrimPrefix(server.URL, "http://")
-	manager := NewManager(fakeResolver{provider: &fakeRegistryProvider{}}, nil)
+	auth := base64.StdEncoding.EncodeToString([]byte("ada:token"))
+	manager := NewManager(fakeResolver{provider: &fakeRegistryProvider{
+		backendStdout: `{"auths":{"` + registryHost + `":{"auth":"` + auth + `"}}}`,
+	}}, nil)
 
 	status, err := manager.TestAuth(context.Background(), registryHost)
 	if err != nil {
@@ -463,6 +466,39 @@ func TestAuthDoesNotTreatUnexpectedClientStatusAsLoggedIn(t *testing.T) {
 	}
 	if status.LoggedIn || !strings.Contains(status.Error, "404") {
 		t.Fatalf("status = %#v, want logged out 404 error", status)
+	}
+}
+
+func TestAuthDoesNotTreatAnonymousBearerTokenAsLoggedIn(t *testing.T) {
+	t.Parallel()
+	var serverURL string
+	tokenRequested := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/token":
+			tokenRequested = true
+			_ = json.NewEncoder(w).Encode(map[string]string{"token": "anonymous"})
+		case "/v2/":
+			w.Header().Set("WWW-Authenticate", `Bearer realm="`+serverURL+`/token",service="registry.test"`)
+			w.WriteHeader(http.StatusUnauthorized)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	serverURL = server.URL
+	registryHost := strings.TrimPrefix(server.URL, "http://")
+	manager := NewManager(fakeResolver{provider: &fakeRegistryProvider{}}, nil)
+
+	status, err := manager.TestAuth(context.Background(), registryHost)
+	if err != nil {
+		t.Fatalf("TestAuth() error = %v", err)
+	}
+	if status.LoggedIn || !strings.Contains(status.Error, "credentials") {
+		t.Fatalf("status = %#v, want logged out credential error", status)
+	}
+	if tokenRequested {
+		t.Fatal("anonymous token endpoint was requested without stored credentials")
 	}
 }
 

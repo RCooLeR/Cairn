@@ -436,7 +436,7 @@ func buildLinuxInstallSteps() []linuxInstallStep {
 		},
 		{
 			Message: "Add Docker's official apt signing key and repository",
-			Timeout: commandTimeout,
+			Timeout: 2 * time.Minute,
 			Command: []string{"sudo", "sh", "-lc", repositoryCommand},
 			RepairHints: []string{
 				"Confirm this host is an Ubuntu or Debian-family distribution with /etc/os-release.",

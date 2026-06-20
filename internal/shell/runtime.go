@@ -158,7 +158,9 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 		Objects:     r.db.Objects(),
 	}
 	logsManager := logsvc.NewManager(dockerClient, r.events, logsvc.Options{})
-	metricsManager := metrics.NewManager(dockerClient, r.db.Metrics(), r.projects, r.audit, r.events, metrics.Options{})
+	metricsManager := metrics.NewManager(dockerClient, r.db.Metrics(), r.projects, r.audit, r.events, metrics.Options{
+		GPUProbe: metrics.NewProviderGPUProbe(provider),
+	})
 	metricsManager.ContextName = contextName
 	metricsManager.Start(runtimeCtx)
 	terminalManager := terminal.NewManager(provider, dockerClient, r.projects, r.events, terminal.Options{})

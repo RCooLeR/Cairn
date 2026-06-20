@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -90,6 +91,24 @@ func DefaultPath() (string, error) {
 	return filepath.Join(dir, dbFileName), nil
 }
 
+func sqliteDSN(path string) string {
+	query := url.Values{}
+	for _, pragma := range []string{
+		"busy_timeout=5000",
+		"foreign_keys=ON",
+		"journal_mode=WAL",
+		"synchronous=NORMAL",
+	} {
+		query.Add("_pragma", pragma)
+	}
+
+	separator := "?"
+	if strings.Contains(path, "?") {
+		separator = "&"
+	}
+	return path + separator + query.Encode()
+}
+
 func Open(ctx context.Context, path string) (*Store, error) {
 	if path == "" {
 		defaultPath, err := DefaultPath()
@@ -103,14 +122,15 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		return nil, err
 	}
 
-	writer, err := sql.Open(driverName, path)
+	dsn := sqliteDSN(path)
+	writer, err := sql.Open(driverName, dsn)
 	if err != nil {
 		return nil, err
 	}
 	writer.SetMaxOpenConns(1)
 	writer.SetMaxIdleConns(1)
 
-	reader, err := sql.Open(driverName, path)
+	reader, err := sql.Open(driverName, dsn)
 	if err != nil {
 		_ = writer.Close()
 		return nil, err

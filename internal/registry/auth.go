@@ -49,7 +49,10 @@ func (m *Manager) Login(ctx context.Context, req models.RegistryLoginRequest) er
 		return registryCommandError("Registry login failed", result, runErr)
 	}
 
-	status, err := m.TestAuth(ctx, registry)
+	status, err := m.testAuthWithCredential(ctx, registry, credential{
+		Username: username,
+		Password: secret,
+	})
 	if err != nil {
 		return err
 	}
@@ -86,10 +89,19 @@ func (m *Manager) TestAuth(ctx context.Context, registry string) (*models.Regist
 		return nil, err
 	}
 	creds, _ := m.credentialForRegistry(ctx, provider, registry)
+	return m.testAuthWithCredential(ctx, registry, creds)
+}
+
+func (m *Manager) testAuthWithCredential(ctx context.Context, registry string, creds credential) (*models.RegistryAuthStatus, error) {
+	registry = normalizeRegistryHost(registry)
 	status := &models.RegistryAuthStatus{
 		Registry:   registry,
 		Username:   creds.Username,
 		VerifiedAt: m.now(),
+	}
+	if !hasRegistryCredential(creds) {
+		status.Error = "registry credentials not found"
+		return status, nil
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.registryBaseURL(registry)+"/v2/", nil)
 	if err != nil {
@@ -114,6 +126,10 @@ func (m *Manager) TestAuth(ctx context.Context, registry string) (*models.Regist
 		status.Error = resp.Status
 	}
 	return status, nil
+}
+
+func hasRegistryCredential(creds credential) bool {
+	return creds.Username != "" || creds.Password != "" || creds.IdentityToken != ""
 }
 
 func (m *Manager) credentialForRegistry(ctx context.Context, provider providers.PlatformProvider, registry string) (credential, error) {

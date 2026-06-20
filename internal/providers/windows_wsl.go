@@ -46,6 +46,7 @@ type WindowsWSLProvider struct {
 	distro       string
 	runner       CommandRunner
 	stdioDialer  WSLStdioDialer
+	configMu     sync.RWMutex
 	installMu    sync.Mutex
 	installPlans map[string]wslInstallPlan
 }
@@ -88,6 +89,8 @@ func NewWindowsWSL(opts WindowsWSLOptions) *WindowsWSLProvider {
 }
 
 func (p *WindowsWSLProvider) SetDistro(distro string) {
+	p.configMu.Lock()
+	defer p.configMu.Unlock()
 	p.distro = strings.TrimSpace(distro)
 }
 
@@ -135,17 +138,18 @@ func (p *WindowsWSLProvider) Detect(ctx context.Context) (*models.ProviderStatus
 		return status, nil
 	}
 
-	selected, ok := selectWSLDistro(distros, p.distro)
+	configuredDistro := p.configuredDistro()
+	selected, ok := selectWSLDistro(distros, configuredDistro)
 	if !ok {
 		status.Problems = append(status.Problems, providerProblem(
 			ProblemUbuntuMissing,
-			fmt.Sprintf("Configured WSL distro %q was not found.", p.configuredDistro()),
+			fmt.Sprintf("Configured WSL distro %q was not found.", configuredDistro),
 			"Select an installed WSL 2 distro in Settings.",
 			true,
 		))
 		return status, nil
 	}
-	p.distro = selected.Name
+	p.SetDistro(selected.Name)
 
 	if selected.Version != 2 {
 		status.Problems = append(status.Problems, providerProblem(
@@ -525,6 +529,8 @@ func normalizeBackslashBackendPath(value string) (string, bool) {
 }
 
 func (p *WindowsWSLProvider) configuredDistro() string {
+	p.configMu.RLock()
+	defer p.configMu.RUnlock()
 	if strings.TrimSpace(p.distro) != "" {
 		return strings.TrimSpace(p.distro)
 	}

@@ -61,7 +61,7 @@ func (s *AgentService) Status(ctx context.Context) (*models.AgentStatus, error) 
 	if !cfg.Enabled {
 		return status, nil
 	}
-	available, err := s.resolveModel(ctx, &cfg)
+	available, err := s.resolveModel(ctx, &cfg, false)
 	status.AvailableModels = available
 	status.Model = cfg.Model
 	status.Reachable = err == nil
@@ -82,6 +82,13 @@ func (s *AgentService) ExecuteTool(ctx context.Context, req models.AgentToolExec
 	spec, ok := agentToolSpecByID(toolID)
 	if !ok {
 		return nil, apperror.New(apperror.Conflict, "Unknown agent tool", apperror.WithDetail(toolID))
+	}
+	if !spec.ReadOnly && !s.config(ctx).Enabled {
+		return nil, apperror.New(
+			apperror.ProviderNotReady,
+			"Local agent is disabled",
+			apperror.WithRepairHints("Enable the local agent in Settings before allowing it to run Docker actions or edit files."),
+		)
 	}
 	args, err := decodeAgentToolArgs(req.Arguments)
 	if err != nil {
@@ -464,7 +471,7 @@ func (s *AgentService) Chat(ctx context.Context, req models.AgentChatRequest) (*
 			apperror.WithRepairHints("Enable the local agent in Settings and make sure Ollama or the configured local endpoint is running."),
 		)
 	}
-	if available, err := s.resolveModel(ctx, &cfg); err != nil {
+	if available, err := s.resolveModel(ctx, &cfg, true); err != nil {
 		return nil, apperror.Wrap(
 			apperror.ProviderNotReady,
 			"Local agent endpoint is not reachable",
@@ -511,7 +518,7 @@ func (s *AgentService) DraftProjectFile(ctx context.Context, req models.AgentDra
 	if !cfg.Enabled {
 		return nil, apperror.New(apperror.ProviderNotReady, "Local agent is disabled")
 	}
-	if available, err := s.resolveModel(ctx, &cfg); err != nil {
+	if available, err := s.resolveModel(ctx, &cfg, true); err != nil {
 		return nil, apperror.Wrap(apperror.ProviderNotReady, "Local agent endpoint is not reachable", err)
 	} else if len(available) == 0 {
 		return nil, apperror.New(apperror.ProviderNotReady, "No local LLM models are installed")
@@ -622,6 +629,11 @@ func (s *AgentService) ApplyFileEdit(ctx context.Context, planID string, typedNa
 	if err != nil {
 		return nil, err
 	}
+	_, absPath, err := resolveAgentProjectPath(plan.WorkingDir, plan.RelativePath)
+	if err != nil {
+		return nil, err
+	}
+	plan.AbsolutePath = absPath
 	if plan.OriginalHash != "" {
 		raw, err := os.ReadFile(plan.AbsolutePath)
 		if err != nil {
@@ -638,6 +650,11 @@ func (s *AgentService) ApplyFileEdit(ctx context.Context, planID string, typedNa
 	if err := os.MkdirAll(filepath.Dir(plan.AbsolutePath), 0o755); err != nil {
 		return nil, err
 	}
+	_, absPath, err = resolveAgentProjectPath(plan.WorkingDir, plan.RelativePath)
+	if err != nil {
+		return nil, err
+	}
+	plan.AbsolutePath = absPath
 	perm := fs.FileMode(0o644)
 	if strings.HasPrefix(filepath.Base(plan.RelativePath), ".env") {
 		perm = 0o600
@@ -762,7 +779,7 @@ func agentCandidateModels() []string {
 	}
 }
 
-func (s *AgentService) resolveModel(ctx context.Context, cfg *agentConfig) ([]string, error) {
+func (s *AgentService) resolveModel(ctx context.Context, cfg *agentConfig, persistFallback bool) ([]string, error) {
 	available, err := s.listModels(ctx, *cfg)
 	if err != nil {
 		return nil, err
@@ -786,7 +803,7 @@ func (s *AgentService) resolveModel(ctx context.Context, cfg *agentConfig) ([]st
 	}
 	if selected != "" && selected != cfg.Model {
 		cfg.Model = selected
-		if s.Settings != nil {
+		if persistFallback && s.Settings != nil {
 			_ = s.Settings.SetString(ctx, "agent.model", selected)
 		}
 	}
@@ -1492,6 +1509,10 @@ func readAgentProjectFiles(root string) ([]models.AgentProjectFile, error) {
 	if err != nil || !info.IsDir() {
 		return nil, fmt.Errorf("project working directory is not readable: %s", root)
 	}
+	realRoot, err := filepath.EvalSymlinks(absRoot)
+	if err != nil {
+		return nil, err
+	}
 	var paths []string
 	err = filepath.WalkDir(absRoot, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -1510,6 +1531,9 @@ func readAgentProjectFiles(root string) ([]models.AgentProjectFile, error) {
 		}
 		rel, _ := filepath.Rel(absRoot, path)
 		if entry.IsDir() || !agentFileCandidate(rel) {
+			return nil
+		}
+		if err := ensureAgentPathWithinRoot(realRoot, path); err != nil {
 			return nil
 		}
 		paths = append(paths, path)
@@ -1615,7 +1639,58 @@ func resolveAgentProjectPath(root string, relPath string) (string, string, error
 	if back == ".." || strings.HasPrefix(back, ".."+string(os.PathSeparator)) {
 		return "", "", apperror.New(apperror.Conflict, "File path must stay inside the project")
 	}
+	realRoot, err := filepath.EvalSymlinks(absRoot)
+	if err != nil {
+		return "", "", err
+	}
+	if err := ensureAgentPathWithinRoot(realRoot, absPath); err != nil {
+		return "", "", err
+	}
 	return filepath.ToSlash(back), absPath, nil
+}
+
+func ensureAgentPathWithinRoot(realRoot string, absPath string) error {
+	target, err := filepath.EvalSymlinks(absPath)
+	if err == nil {
+		return requireAgentPathWithinRoot(realRoot, target)
+	}
+	if !os.IsNotExist(err) {
+		return err
+	}
+	parent := filepath.Dir(absPath)
+	for {
+		target, err = filepath.EvalSymlinks(parent)
+		if err == nil {
+			return requireAgentPathWithinRoot(realRoot, target)
+		}
+		if !os.IsNotExist(err) {
+			return err
+		}
+		next := filepath.Dir(parent)
+		if next == parent {
+			return err
+		}
+		parent = next
+	}
+}
+
+func requireAgentPathWithinRoot(realRoot string, target string) error {
+	absRoot, err := filepath.Abs(realRoot)
+	if err != nil {
+		return err
+	}
+	absTarget, err := filepath.Abs(target)
+	if err != nil {
+		return err
+	}
+	back, err := filepath.Rel(absRoot, absTarget)
+	if err != nil {
+		return err
+	}
+	if back == ".." || strings.HasPrefix(back, ".."+string(os.PathSeparator)) || filepath.IsAbs(back) {
+		return apperror.New(apperror.Conflict, "File path must stay inside the project")
+	}
+	return nil
 }
 
 func pathBase(value string) string {

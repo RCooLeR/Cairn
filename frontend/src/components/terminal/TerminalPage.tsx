@@ -12,6 +12,7 @@ import "@xterm/xterm/css/xterm.css";
 import {
   Check,
   ChevronDown,
+  ClipboardPaste,
   Command,
   Container,
   Copy,
@@ -23,7 +24,15 @@ import {
   Terminal as TerminalIcon,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  forwardRef,
+  useCallback,
+  useEffect,
+  useImperativeHandle,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import { Clipboard, Events } from "@wailsio/runtime";
 
@@ -98,6 +107,24 @@ type PendingRun = {
 
 type PlaceholderValues = Record<string, string>;
 
+type TerminalSurfaceHandle = {
+  focus: () => void;
+  getSelection: () => string;
+};
+
+type TerminalSurfaceProps = {
+  active: boolean;
+  onCopyShortcut: (session: TerminalSessionInfo) => Promise<void>;
+  onInput: (session: TerminalSessionInfo, data: string) => Promise<void>;
+  onPasteShortcut: (session: TerminalSessionInfo) => Promise<void>;
+  session: TerminalSessionInfo;
+};
+
+type TerminalShortcutEvent = Pick<
+  KeyboardEvent,
+  "altKey" | "ctrlKey" | "key" | "metaKey" | "shiftKey"
+>;
+
 export function TerminalPage({
   containers,
   initialSession,
@@ -127,6 +154,9 @@ export function TerminalPage({
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const pendingTimer = useRef<number | null>(null);
+  const terminalSurfaceRefs = useRef<
+    Record<string, TerminalSurfaceHandle | null>
+  >({});
 
   const activeSession = useMemo(
     () => sessions.find((session) => session.id === activeSessionID) ?? null,
@@ -451,6 +481,53 @@ export function TerminalPage({
     [],
   );
 
+  const copyTerminalSelection = useCallback(
+    async (session: TerminalSessionInfo | null = activeSession) => {
+      if (!session) {
+        setStatus("Open a terminal before copying");
+        return;
+      }
+      const selection =
+        terminalSurfaceRefs.current[session.id]?.getSelection() ?? "";
+      if (!selection) {
+        setStatus("Select terminal text to copy");
+        return;
+      }
+      try {
+        await Clipboard.SetText(selection);
+        setStatus("Terminal selection copied");
+      } catch (copyError: unknown) {
+        setError(errorMessage(copyError, "Unable to copy terminal selection"));
+      } finally {
+        terminalSurfaceRefs.current[session.id]?.focus();
+      }
+    },
+    [activeSession],
+  );
+
+  const pasteClipboardToTerminal = useCallback(
+    async (session: TerminalSessionInfo | null = activeSession) => {
+      if (!session) {
+        setStatus("Open a terminal before pasting");
+        return;
+      }
+      try {
+        const text = await Clipboard.Text();
+        if (!text) {
+          setStatus("Clipboard is empty");
+          return;
+        }
+        await sendInput(session, text);
+        setStatus("Clipboard pasted");
+      } catch (pasteError: unknown) {
+        setError(errorMessage(pasteError, "Unable to paste clipboard text"));
+      } finally {
+        terminalSurfaceRefs.current[session.id]?.focus();
+      }
+    },
+    [activeSession, sendInput],
+  );
+
   const writeCommand = useCallback(
     async (sessionID: string, command: string) => {
       await TerminalService.WriteTerminal(
@@ -727,24 +804,46 @@ export function TerminalPage({
         </div>
 
         {activeSession ? (
-          <div className="border-b border-border px-3 py-2 text-xs text-text-muted">
-            <span className="font-medium text-text-secondary">
-              {activeSession.title}
-            </span>
-            <span className="mx-2">/</span>
-            <span>{activeSession.shell || "shell"}</span>
-            {activeSession.isRoot ? (
-              <>
-                <span className="mx-2">/</span>
-                <span className="text-error">root</span>
-              </>
-            ) : null}
-            {activeSession.workingDir ? (
-              <>
-                <span className="mx-2">/</span>
-                <span>{activeSession.workingDir}</span>
-              </>
-            ) : null}
+          <div className="flex flex-wrap items-center gap-2 border-b border-border px-3 py-2 text-xs text-text-muted">
+            <div className="min-w-0 flex-1 truncate">
+              <span className="font-medium text-text-secondary">
+                {activeSession.title}
+              </span>
+              <span className="mx-2">/</span>
+              <span>{activeSession.shell || "shell"}</span>
+              {activeSession.isRoot ? (
+                <>
+                  <span className="mx-2">/</span>
+                  <span className="text-error">root</span>
+                </>
+              ) : null}
+              {activeSession.workingDir ? (
+                <>
+                  <span className="mx-2">/</span>
+                  <span>{activeSession.workingDir}</span>
+                </>
+              ) : null}
+            </div>
+            <Button
+              icon={<Copy size={14} />}
+              onClick={() => {
+                void copyTerminalSelection();
+              }}
+              size="sm"
+              variant="ghost"
+            >
+              Copy
+            </Button>
+            <Button
+              icon={<ClipboardPaste size={14} />}
+              onClick={() => {
+                void pasteClipboardToTerminal();
+              }}
+              size="sm"
+              variant="ghost"
+            >
+              Paste
+            </Button>
           </div>
         ) : null}
 
@@ -753,7 +852,12 @@ export function TerminalPage({
             <TerminalSurface
               active={session.id === activeSessionID}
               key={session.id}
+              onCopyShortcut={copyTerminalSelection}
               onInput={sendInput}
+              onPasteShortcut={pasteClipboardToTerminal}
+              ref={(handle) => {
+                terminalSurfaceRefs.current[session.id] = handle;
+              }}
               session={session}
             />
           ))}
@@ -1073,117 +1177,149 @@ export function CommandPalette<T extends string>({
   );
 }
 
-function TerminalSurface({
-  active,
-  onInput,
-  session,
-}: {
-  active: boolean;
-  onInput: (session: TerminalSessionInfo, data: string) => Promise<void>;
-  session: TerminalSessionInfo;
-}) {
-  const hostRef = useRef<HTMLDivElement | null>(null);
-  const terminalRef = useRef<XTerm | null>(null);
-  const resizeTimer = useRef<number | null>(null);
-  const onInputRef = useRef(onInput);
-  const sessionRef = useRef(session);
+const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurfaceProps>(
+  function TerminalSurface(
+    { active, onCopyShortcut, onInput, onPasteShortcut, session },
+    ref,
+  ) {
+    const hostRef = useRef<HTMLDivElement | null>(null);
+    const terminalRef = useRef<XTerm | null>(null);
+    const resizeTimer = useRef<number | null>(null);
+    const onCopyShortcutRef = useRef(onCopyShortcut);
+    const onInputRef = useRef(onInput);
+    const onPasteShortcutRef = useRef(onPasteShortcut);
+    const sessionRef = useRef(session);
 
-  useEffect(() => {
-    onInputRef.current = onInput;
-  }, [onInput]);
+    useImperativeHandle(
+      ref,
+      () => ({
+        focus: () => terminalRef.current?.focus(),
+        getSelection: () => terminalRef.current?.getSelection() ?? "",
+      }),
+      [],
+    );
 
-  useEffect(() => {
-    sessionRef.current = session;
-  }, [session]);
+    useEffect(() => {
+      onCopyShortcutRef.current = onCopyShortcut;
+    }, [onCopyShortcut]);
 
-  useEffect(() => {
-    if (!hostRef.current) {
-      return undefined;
-    }
-    const sessionID = session.id;
-    const terminal = new XTerm({
-      allowProposedApi: false,
-      convertEol: true,
-      cursorBlink: true,
-      fontFamily:
-        "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
-      fontSize: 13,
-      scrollback: 10000,
-      theme: terminalThemeFromCSS(),
-    });
-    terminal.open(hostRef.current);
-    terminalRef.current = terminal;
-    const disposable = terminal.onData((data) => {
-      void onInputRef.current(sessionRef.current, data);
-    });
-    const resize = () => {
+    useEffect(() => {
+      onInputRef.current = onInput;
+    }, [onInput]);
+
+    useEffect(() => {
+      onPasteShortcutRef.current = onPasteShortcut;
+    }, [onPasteShortcut]);
+
+    useEffect(() => {
+      sessionRef.current = session;
+    }, [session]);
+
+    useEffect(() => {
       if (!hostRef.current) {
-        return;
+        return undefined;
       }
-      const rect = hostRef.current.getBoundingClientRect();
-      const cols = Math.max(40, Math.floor(rect.width / 8.2));
-      const rows = Math.max(10, Math.floor(rect.height / 17.5));
-      terminal.resize(cols, rows);
-      if (resizeTimer.current !== null) {
-        window.clearTimeout(resizeTimer.current);
-      }
-      resizeTimer.current = window.setTimeout(() => {
-        void TerminalService.ResizeTerminal(sessionID, cols, rows);
-      }, 100);
-    };
-    resize();
-    let observer: ResizeObserver | null = null;
-    if (typeof ResizeObserver !== "undefined") {
-      observer = new ResizeObserver(resize);
-      observer.observe(hostRef.current);
-    }
-    let themeObserver: MutationObserver | null = null;
-    const applyTheme = () => {
-      if (terminal.options) {
-        terminal.options.theme = terminalThemeFromCSS();
-      }
-    };
-    if (typeof MutationObserver !== "undefined") {
-      themeObserver = new MutationObserver(applyTheme);
-      themeObserver.observe(document.documentElement, {
-        attributeFilter: ["data-theme", "style"],
-        attributes: true,
+      const sessionID = session.id;
+      const terminal = new XTerm({
+        allowProposedApi: false,
+        convertEol: true,
+        cursorBlink: true,
+        fontFamily:
+          "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+        fontSize: 13,
+        scrollback: 10000,
+        theme: terminalThemeFromCSS(),
       });
-    }
-    return () => {
-      if (resizeTimer.current !== null) {
-        window.clearTimeout(resizeTimer.current);
+      terminal.attachCustomKeyEventHandler((event) => {
+        if (event.type !== "keydown") {
+          return true;
+        }
+        if (isTerminalCopyShortcut(event)) {
+          event.preventDefault();
+          void onCopyShortcutRef.current(sessionRef.current);
+          return false;
+        }
+        if (isTerminalPasteShortcut(event)) {
+          event.preventDefault();
+          void onPasteShortcutRef.current(sessionRef.current);
+          return false;
+        }
+        return true;
+      });
+      terminal.open(hostRef.current);
+      terminalRef.current = terminal;
+      const disposable = terminal.onData((data) => {
+        void onInputRef.current(sessionRef.current, data);
+      });
+      const resize = () => {
+        if (!hostRef.current) {
+          return;
+        }
+        const rect = hostRef.current.getBoundingClientRect();
+        const cols = Math.max(40, Math.floor(rect.width / 8.2));
+        const rows = Math.max(10, Math.floor(rect.height / 17.5));
+        terminal.resize(cols, rows);
+        if (resizeTimer.current !== null) {
+          window.clearTimeout(resizeTimer.current);
+        }
+        resizeTimer.current = window.setTimeout(() => {
+          void TerminalService.ResizeTerminal(sessionID, cols, rows);
+        }, 100);
+      };
+      resize();
+      let observer: ResizeObserver | null = null;
+      if (typeof ResizeObserver !== "undefined") {
+        observer = new ResizeObserver(resize);
+        observer.observe(hostRef.current);
       }
-      observer?.disconnect();
-      themeObserver?.disconnect();
-      disposable.dispose();
-      terminal.dispose();
-      terminalRef.current = null;
-    };
-  }, [session.id]);
-
-  useEffect(() => {
-    const off = Events.On("terminal:data", (event) => {
-      const payload = eventPayload<TerminalDataPayload>(event);
-      if (!payload || payload.sessionID !== session.id) {
-        return;
+      let themeObserver: MutationObserver | null = null;
+      const applyTheme = () => {
+        if (terminal.options) {
+          terminal.options.theme = terminalThemeFromCSS();
+        }
+      };
+      if (typeof MutationObserver !== "undefined") {
+        themeObserver = new MutationObserver(applyTheme);
+        themeObserver.observe(document.documentElement, {
+          attributeFilter: ["data-theme", "style"],
+          attributes: true,
+        });
       }
-      terminalRef.current?.write(decodeBase64Bytes(payload.dataBase64));
-    });
-    return () => off();
-  }, [session.id]);
+      return () => {
+        if (resizeTimer.current !== null) {
+          window.clearTimeout(resizeTimer.current);
+        }
+        observer?.disconnect();
+        themeObserver?.disconnect();
+        disposable.dispose();
+        terminal.dispose();
+        terminalRef.current = null;
+      };
+    }, [session.id]);
 
-  return (
-    <div
-      aria-labelledby={`terminal-tab-${session.id}`}
-      className={active ? "absolute inset-0 p-2" : "hidden"}
-      data-terminal-session={session.id}
-      id={`terminal-panel-${session.id}`}
-      ref={hostRef}
-      role="tabpanel"
-    />
-  );
-}
+    useEffect(() => {
+      const off = Events.On("terminal:data", (event) => {
+        const payload = eventPayload<TerminalDataPayload>(event);
+        if (!payload || payload.sessionID !== session.id) {
+          return;
+        }
+        terminalRef.current?.write(decodeBase64Bytes(payload.dataBase64));
+      });
+      return () => off();
+    }, [session.id]);
+
+    return (
+      <div
+        aria-labelledby={`terminal-tab-${session.id}`}
+        className={active ? "absolute inset-0 p-2" : "hidden"}
+        data-terminal-session={session.id}
+        id={`terminal-panel-${session.id}`}
+        ref={hostRef}
+        role="tabpanel"
+      />
+    );
+  },
+);
 
 function terminalThemeFromCSS() {
   return {
@@ -1376,6 +1512,30 @@ function shouldGuardPaste(session: TerminalSessionInfo, data: string) {
   const normalized = data.replace(/\r/g, "\n");
   const lines = normalized.split("\n").filter((line) => line.trim() !== "");
   return lines.length > 1;
+}
+
+export function isTerminalCopyShortcut(event: TerminalShortcutEvent) {
+  if (event.altKey) {
+    return false;
+  }
+  const key = event.key.toLowerCase();
+  return (
+    (event.ctrlKey && event.shiftKey && !event.metaKey && key === "c") ||
+    (event.metaKey && !event.ctrlKey && key === "c") ||
+    (event.ctrlKey && !event.metaKey && event.key === "Insert")
+  );
+}
+
+export function isTerminalPasteShortcut(event: TerminalShortcutEvent) {
+  if (event.altKey) {
+    return false;
+  }
+  const key = event.key.toLowerCase();
+  return (
+    (event.ctrlKey && event.shiftKey && !event.metaKey && key === "v") ||
+    (event.metaKey && !event.ctrlKey && key === "v") ||
+    (event.shiftKey && !event.metaKey && event.key === "Insert")
+  );
 }
 
 function eventPayload<T>(event: unknown): T | null {

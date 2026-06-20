@@ -162,10 +162,85 @@ const presentations: Record<
   },
 };
 
+export type ParsedAppError = {
+  code?: AppErrorCode;
+  title: string;
+  body: string;
+  detail?: string;
+};
+
 export function appErrorPresentation(code: AppErrorCode): AppErrorPresentation {
   return { code, ...presentations[code] };
 }
 
 export function isAppErrorCode(code: string): code is AppErrorCode {
   return APP_ERROR_CODES.includes(code as AppErrorCode);
+}
+
+export function parseAppErrorText(text: string): ParsedAppError {
+  const raw = text.trim();
+  const structured = parseStructuredAppError(raw);
+  const code = structured.code ?? codeFromMessage(structured.message ?? raw);
+  if (code) {
+    const presentation = appErrorPresentation(code);
+    return {
+      code,
+      title: presentation.title,
+      body: cleanAppErrorMessage(structured.message ?? raw, code),
+      detail: structured.detail,
+    };
+  }
+  return {
+    title: "Action failed",
+    body: structured.message ?? raw,
+    detail: structured.detail,
+  };
+}
+
+function parseStructuredAppError(text: string): {
+  code?: AppErrorCode;
+  message?: string;
+  detail?: string;
+} {
+  if (!text.startsWith("{")) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(text) as {
+      message?: unknown;
+      cause?: { code?: unknown; message?: unknown; detail?: unknown };
+    };
+    const causeCode =
+      typeof parsed.cause?.code === "string" ? parsed.cause.code : "";
+    const message =
+      typeof parsed.cause?.message === "string"
+        ? parsed.cause.message
+        : typeof parsed.message === "string"
+          ? parsed.message
+          : undefined;
+    const detail =
+      typeof parsed.cause?.detail === "string" ? parsed.cause.detail : "";
+    return {
+      code: isAppErrorCode(causeCode) ? causeCode : undefined,
+      message,
+      detail: detail.trim() || undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
+function codeFromMessage(message: string): AppErrorCode | undefined {
+  const match = message.match(/\b(E_[A-Z_]+)\b/);
+  const code = match?.[1] ?? "";
+  return isAppErrorCode(code) ? code : undefined;
+}
+
+function cleanAppErrorMessage(message: string, code: AppErrorCode) {
+  const trimmed = message.trim();
+  const prefix = `${code}:`;
+  if (trimmed.startsWith(prefix)) {
+    return trimmed.slice(prefix.length).trim();
+  }
+  return trimmed;
 }

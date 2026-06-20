@@ -15,6 +15,7 @@ function rankItem(
 ): MetricRankItem {
   return {
     cpuPercent,
+    gpuMemoryBytes: 0,
     id,
     kind: "container",
     memoryBytes,
@@ -49,6 +50,7 @@ describe("dashboardTopRows", () => {
       rankItem("highCpu", 42, 1024),
       {
         cpuPercent: 10,
+        gpuMemoryBytes: 0,
         id: "highMemory",
         kind: "container",
         memoryBytes: 2048,
@@ -71,6 +73,7 @@ describe("dashboardTopRows", () => {
 describe("chartColors", () => {
   it("references theme CSS variables instead of fixed colors", () => {
     expect(chartColors.cpu).toBe("rgb(var(--chart-cpu))");
+    expect(chartColors.gpu).toBe("rgb(var(--chart-gpu))");
     expect(chartColors.grid).toBe("rgb(var(--chart-grid) / 0.55)");
     expect(Object.values(chartColors).join(" ")).not.toMatch(
       /#[0-9a-f]{3,8}|rgba\(/i,

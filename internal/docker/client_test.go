@@ -298,6 +298,33 @@ func TestClientContainerStatsUsesStreamAndOneShot(t *testing.T) {
 	}
 }
 
+func TestClientContainerProcessPIDsParsesTopOutput(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	api.tops["abc123"] = container.TopResponse{
+		Titles: []string{"UID", "PID", "CMD"},
+		Processes: [][]string{
+			{"root", "4242", "ollama"},
+			{"1000", "4343", "python"},
+			{"1000", "not-a-pid", "ignored"},
+		},
+	}
+	client := New(fakeDockerProvider{}, nil)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	pids, err := client.ContainerProcessPIDs(ctx, "abc123")
+	if err != nil {
+		t.Fatalf("ContainerProcessPIDs() error = %v", err)
+	}
+	if !reflect.DeepEqual(pids, []int{4242, 4343}) {
+		t.Fatalf("pids = %#v, want [4242 4343]", pids)
+	}
+}
+
 func TestCancelReadCloserCancelsOnlyOnClose(t *testing.T) {
 	t.Parallel()
 	canceled := false
@@ -1976,6 +2003,7 @@ type fakeAPI struct {
 	eventErrs         chan error
 	stats             map[string][]container.StatsResponse
 	statsCalls        []statsCall
+	tops              map[string]container.TopResponse
 	execCreates       []execCreateCall
 	execAttachCtxs    []context.Context
 	execAttachOpts    []container.ExecAttachOptions
@@ -2053,6 +2081,7 @@ func newFakeAPI() *fakeAPI {
 		events:            make(chan events.Message, 16),
 		eventErrs:         make(chan error, 4),
 		stats:             map[string][]container.StatsResponse{},
+		tops:              map[string]container.TopResponse{},
 		execInspects:      map[string]container.ExecInspect{},
 		execOutputs:       map[string]string{},
 		execExitCodes:     map[string]int{},
@@ -2163,6 +2192,15 @@ func (a *fakeAPI) ContainerStatsOneShot(_ context.Context, id string) (container
 		entries = entries[len(entries)-1:]
 	}
 	return container.StatsResponseReader{Body: statsReader(entries), OSType: "linux"}, nil
+}
+
+func (a *fakeAPI) ContainerTop(_ context.Context, id string, _ []string) (container.TopResponse, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if top, ok := a.tops[id]; ok {
+		return top, nil
+	}
+	return container.TopResponse{Titles: []string{"PID"}}, nil
 }
 
 func (a *fakeAPI) ContainerExecCreate(_ context.Context, containerID string, opts container.ExecOptions) (container.ExecCreateResponse, error) {

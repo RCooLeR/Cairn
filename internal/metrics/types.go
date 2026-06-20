@@ -37,6 +37,7 @@ type DockerClient interface {
 	ListImages(context.Context) ([]models.ImageSummary, error)
 	ListVolumes(context.Context) ([]models.VolumeSummary, error)
 	ContainerStats(context.Context, string, dockercore.StatsOptions) (*dockercore.StatsReader, error)
+	ContainerProcessPIDs(context.Context, string) ([]int, error)
 }
 
 type Options struct {
@@ -94,7 +95,14 @@ type Manager struct {
 	onlineCPUs   uint32
 	gpuCache     models.GPUMetrics
 	gpuCacheAt   time.Time
+	gpuUsage     map[string]containerGPUUsage
 	flushMu      sync.Mutex
+}
+
+type containerGPUUsage struct {
+	memoryBytes        int64
+	utilizationPercent float64
+	deviceIDs          []string
 }
 
 type Sample struct {
@@ -109,6 +117,9 @@ type Sample struct {
 	CPUPercent       float64             `json:"cpuPercent"`
 	MemoryBytes      int64               `json:"memoryBytes"`
 	MemoryLimitBytes int64               `json:"memoryLimitBytes,omitempty"`
+	GPUMemoryBytes   int64               `json:"gpuMemoryBytes"`
+	GPULoadPercent   float64             `json:"gpuUtilizationPercent"`
+	GPUDeviceIDs     []string            `json:"gpuDeviceIDs"`
 	NetworkRXBytes   int64               `json:"networkRxBytes"`
 	NetworkTXBytes   int64               `json:"networkTxBytes"`
 	NetworkRXRate    float64             `json:"networkRxRate"`

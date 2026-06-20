@@ -21,22 +21,24 @@ type MetricsRepository struct {
 }
 
 type MetricsSampleRecord struct {
-	ProviderID       string
-	ProjectID        string
-	ServiceID        string
-	ContainerID      string
-	CPUPercent       float64
-	CPUPercentMax    float64
-	MemoryBytes      int64
-	MemoryBytesMax   int64
-	MemoryLimitBytes int64
-	NetworkRXBytes   int64
-	NetworkTXBytes   int64
-	BlockReadBytes   int64
-	BlockWriteBytes  int64
-	PIDs             int64
-	Resolution       string
-	SampledAt        time.Time
+	ProviderID        string
+	ProjectID         string
+	ServiceID         string
+	ContainerID       string
+	CPUPercent        float64
+	CPUPercentMax     float64
+	MemoryBytes       int64
+	MemoryBytesMax    int64
+	MemoryLimitBytes  int64
+	GPUMemoryBytes    int64
+	GPUMemoryBytesMax int64
+	NetworkRXBytes    int64
+	NetworkTXBytes    int64
+	BlockReadBytes    int64
+	BlockWriteBytes   int64
+	PIDs              int64
+	Resolution        string
+	SampledAt         time.Time
 }
 
 type MetricsSeriesFilter struct {
@@ -87,6 +89,7 @@ func (r *MetricsRepository) QuerySeries(ctx context.Context, filter MetricsSerie
 		SELECT sampled_at,
 			COALESCE(SUM(cpu_percent), 0),
 			COALESCE(SUM(memory_bytes), 0),
+			COALESCE(SUM(gpu_memory_bytes), 0),
 			COALESCE(SUM(network_rx_bytes), 0),
 			COALESCE(SUM(network_tx_bytes), 0),
 			COALESCE(SUM(block_read_bytes), 0),
@@ -117,10 +120,10 @@ func (r *MetricsRepository) QuerySeries(ctx context.Context, filter MetricsSerie
 	bundle := emptySeriesBundle()
 	for rows.Next() {
 		var (
-			tsText                        string
-			cpu, mem, rx, txBytes, br, bw float64
+			tsText                             string
+			cpu, mem, gpu, rx, txBytes, br, bw float64
 		)
-		if err := rows.Scan(&tsText, &cpu, &mem, &rx, &txBytes, &br, &bw); err != nil {
+		if err := rows.Scan(&tsText, &cpu, &mem, &gpu, &rx, &txBytes, &br, &bw); err != nil {
 			return nil, err
 		}
 		ts, err := parseMetricTime(tsText)
@@ -129,10 +132,11 @@ func (r *MetricsRepository) QuerySeries(ctx context.Context, filter MetricsSerie
 		}
 		bundle.Series[0].Points = append(bundle.Series[0].Points, models.Point{TS: ts, Value: cpu})
 		bundle.Series[1].Points = append(bundle.Series[1].Points, models.Point{TS: ts, Value: mem})
-		bundle.Series[2].Points = append(bundle.Series[2].Points, models.Point{TS: ts, Value: rx})
-		bundle.Series[3].Points = append(bundle.Series[3].Points, models.Point{TS: ts, Value: txBytes})
-		bundle.Series[4].Points = append(bundle.Series[4].Points, models.Point{TS: ts, Value: br})
-		bundle.Series[5].Points = append(bundle.Series[5].Points, models.Point{TS: ts, Value: bw})
+		bundle.Series[2].Points = append(bundle.Series[2].Points, models.Point{TS: ts, Value: gpu})
+		bundle.Series[3].Points = append(bundle.Series[3].Points, models.Point{TS: ts, Value: rx})
+		bundle.Series[4].Points = append(bundle.Series[4].Points, models.Point{TS: ts, Value: txBytes})
+		bundle.Series[5].Points = append(bundle.Series[5].Points, models.Point{TS: ts, Value: br})
+		bundle.Series[6].Points = append(bundle.Series[6].Points, models.Point{TS: ts, Value: bw})
 	}
 	return bundle, rows.Err()
 }
@@ -186,11 +190,11 @@ func insertMetricsRecords(ctx context.Context, tx *sql.Tx, records []MetricsSamp
 		INSERT INTO metrics_samples (
 			provider_id, project_id, service_id, container_id,
 			cpu_percent, cpu_percent_max, memory_bytes, memory_bytes_max,
-			memory_limit_bytes, network_rx_bytes, network_tx_bytes,
+			memory_limit_bytes, gpu_memory_bytes, network_rx_bytes, network_tx_bytes,
 			block_read_bytes, block_write_bytes, pids, resolution, sampled_at
 		)
 		VALUES (?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''),
-			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
 		return err
@@ -214,7 +218,7 @@ func insertMetricsRecords(ctx context.Context, tx *sql.Tx, records []MetricsSamp
 		if _, err := stmt.ExecContext(ctx,
 			record.ProviderID, record.ProjectID, record.ServiceID, record.ContainerID,
 			record.CPUPercent, record.CPUPercentMax, record.MemoryBytes, record.MemoryBytesMax,
-			record.MemoryLimitBytes, record.NetworkRXBytes, record.NetworkTXBytes,
+			record.MemoryLimitBytes, record.GPUMemoryBytes, record.NetworkRXBytes, record.NetworkTXBytes,
 			record.BlockReadBytes, record.BlockWriteBytes, record.PIDs, record.Resolution,
 			formatTime(record.SampledAt),
 		); err != nil {
@@ -230,7 +234,7 @@ func downsampleMetrics(ctx context.Context, tx *sql.Tx, fromResolution string, t
 			COALESCE(container_id, ''), COALESCE(cpu_percent, 0),
 			COALESCE(cpu_percent_max, 0), COALESCE(memory_bytes, 0),
 			COALESCE(memory_bytes_max, 0), COALESCE(memory_limit_bytes, 0),
-			COALESCE(network_rx_bytes, 0), COALESCE(network_tx_bytes, 0),
+			COALESCE(gpu_memory_bytes, 0), COALESCE(network_rx_bytes, 0), COALESCE(network_tx_bytes, 0),
 			COALESCE(block_read_bytes, 0), COALESCE(block_write_bytes, 0),
 			COALESCE(pids, 0), sampled_at
 		FROM metrics_samples
@@ -257,6 +261,7 @@ func downsampleMetrics(ctx context.Context, tx *sql.Tx, fromResolution string, t
 			&record.MemoryBytes,
 			&record.MemoryBytesMax,
 			&record.MemoryLimitBytes,
+			&record.GPUMemoryBytes,
 			&record.NetworkRXBytes,
 			&record.NetworkTXBytes,
 			&record.BlockReadBytes,
@@ -332,6 +337,7 @@ type metricsAggregate struct {
 	memorySum      int64
 	memoryMax      int64
 	memoryLimitMax int64
+	gpuMemoryMax   int64
 	networkRXMax   int64
 	networkTXMax   int64
 	blockReadMax   int64
@@ -346,6 +352,7 @@ func (a *metricsAggregate) add(record MetricsSampleRecord) {
 	a.memorySum += record.MemoryBytes
 	a.memoryMax = maxInt64(a.memoryMax, maxInt64(record.MemoryBytesMax, record.MemoryBytes))
 	a.memoryLimitMax = maxInt64(a.memoryLimitMax, record.MemoryLimitBytes)
+	a.gpuMemoryMax = maxInt64(a.gpuMemoryMax, maxInt64(record.GPUMemoryBytesMax, record.GPUMemoryBytes))
 	a.networkRXMax = maxInt64(a.networkRXMax, record.NetworkRXBytes)
 	a.networkTXMax = maxInt64(a.networkTXMax, record.NetworkTXBytes)
 	a.blockReadMax = maxInt64(a.blockReadMax, record.BlockReadBytes)
@@ -361,22 +368,24 @@ func (a *metricsAggregate) record(key metricsBucketKey, resolution string) Metri
 		cpu = a.cpuSum / float64(a.count)
 	}
 	return MetricsSampleRecord{
-		ProviderID:       key.providerID,
-		ProjectID:        key.projectID,
-		ServiceID:        key.serviceID,
-		ContainerID:      key.containerID,
-		CPUPercent:       cpu,
-		CPUPercentMax:    a.cpuMax,
-		MemoryBytes:      memory,
-		MemoryBytesMax:   a.memoryMax,
-		MemoryLimitBytes: a.memoryLimitMax,
-		NetworkRXBytes:   a.networkRXMax,
-		NetworkTXBytes:   a.networkTXMax,
-		BlockReadBytes:   a.blockReadMax,
-		BlockWriteBytes:  a.blockWriteMax,
-		PIDs:             a.pidsMax,
-		Resolution:       resolution,
-		SampledAt:        key.bucket,
+		ProviderID:        key.providerID,
+		ProjectID:         key.projectID,
+		ServiceID:         key.serviceID,
+		ContainerID:       key.containerID,
+		CPUPercent:        cpu,
+		CPUPercentMax:     a.cpuMax,
+		MemoryBytes:       memory,
+		MemoryBytesMax:    a.memoryMax,
+		MemoryLimitBytes:  a.memoryLimitMax,
+		GPUMemoryBytes:    a.gpuMemoryMax,
+		GPUMemoryBytesMax: a.gpuMemoryMax,
+		NetworkRXBytes:    a.networkRXMax,
+		NetworkTXBytes:    a.networkTXMax,
+		BlockReadBytes:    a.blockReadMax,
+		BlockWriteBytes:   a.blockWriteMax,
+		PIDs:              a.pidsMax,
+		Resolution:        resolution,
+		SampledAt:         key.bucket,
 	}
 }
 
@@ -384,6 +393,7 @@ func emptySeriesBundle() *models.SeriesBundle {
 	return &models.SeriesBundle{Series: []models.Series{
 		{Name: "cpu", Unit: "percent"},
 		{Name: "mem", Unit: "bytes"},
+		{Name: "gpu", Unit: "bytes"},
 		{Name: "netRx", Unit: "bytes"},
 		{Name: "netTx", Unit: "bytes"},
 		{Name: "blockR", Unit: "bytes"},

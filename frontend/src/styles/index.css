@@ -21,6 +21,7 @@
   --chart-axis: 139 148 158;
   --chart-grid: 139 148 158;
   --chart-cpu: 45 212 167;
+  --chart-gpu: 236 72 153;
   --chart-memory: 167 139 250;
   --chart-network-rx: 77 159 255;
   --chart-network-tx: 128 183 255;
@@ -70,6 +71,7 @@
   --chart-axis: 100 116 139;
   --chart-grid: 148 163 184;
   --chart-cpu: 13 148 136;
+  --chart-gpu: 219 39 119;
   --chart-memory: 124 58 237;
   --chart-network-rx: 37 99 235;
   --chart-network-tx: 14 165 233;
@@ -107,6 +109,7 @@
     --chart-axis: 139 148 158;
     --chart-grid: 139 148 158;
     --chart-cpu: 45 212 167;
+    --chart-gpu: 236 72 153;
     --chart-memory: 167 139 250;
     --chart-network-rx: 77 159 255;
     --chart-network-tx: 128 183 255;

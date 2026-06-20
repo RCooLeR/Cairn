@@ -31,6 +31,9 @@ if (!$SkipLinuxIcons) {
   Push-Location $Root
   try {
     go run ./tools/iconset -input $icon -linux-dir (Join-Path $Root "build/linux/icons") -name cairn
+    if ($LASTEXITCODE -ne 0) {
+      throw "Linux icon generation failed with exit code $LASTEXITCODE"
+    }
   } finally {
     Pop-Location
   }

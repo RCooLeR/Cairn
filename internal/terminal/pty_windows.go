@@ -24,13 +24,14 @@ var procUpdateProcThreadAttribute = windows.NewLazySystemDLL("kernel32.dll").New
 type windowsPTYStarter struct{}
 
 type windowsPTYSession struct {
-	processMu sync.Mutex
-	process   windows.Handle
-	thread    windows.Handle
-	console   windows.Handle
-	attr      *windows.ProcThreadAttributeListContainer
-	input     *os.File
-	output    *os.File
+	processMu   sync.Mutex
+	lifecycleMu sync.RWMutex
+	process     windows.Handle
+	thread      windows.Handle
+	console     windows.Handle
+	attr        *windows.ProcThreadAttributeListContainer
+	input       *os.File
+	output      *os.File
 
 	closeOnce sync.Once
 	waitOnce  sync.Once
@@ -73,46 +74,57 @@ func (windowsPTYStarter) Start(_ context.Context, spec PTYSpec) (PTYSession, err
 }
 
 func (s *windowsPTYSession) Read(p []byte) (int, error) {
-	if s.output == nil {
+	output := s.outputFile()
+	if output == nil {
 		return 0, os.ErrClosed
 	}
-	var done uint32
-	err := windows.ReadFile(windows.Handle(s.output.Fd()), p, &done, nil)
-	return int(done), err
+	return output.Read(p)
 }
 
 func (s *windowsPTYSession) Write(p []byte) (int, error) {
-	if s.input == nil {
+	input := s.inputFile()
+	if input == nil {
 		return 0, os.ErrClosed
 	}
-	var done uint32
-	err := windows.WriteFile(windows.Handle(s.input.Fd()), p, &done, nil)
-	return int(done), err
+	return input.Write(p)
 }
 
 func (s *windowsPTYSession) Close() error {
 	var err error
 	s.closeOnce.Do(func() {
-		if s.input != nil {
-			err = errors.Join(err, s.input.Close())
+		s.lifecycleMu.Lock()
+		input := s.input
+		output := s.output
+		console := s.console
+		attr := s.attr
+		thread := s.thread
+		s.input = nil
+		s.output = nil
+		s.console = 0
+		s.attr = nil
+		s.thread = 0
+		if input != nil {
+			err = errors.Join(err, input.Close())
 		}
-		if s.output != nil {
-			err = errors.Join(err, s.output.Close())
+		if output != nil {
+			err = errors.Join(err, output.Close())
 		}
-		if s.console != 0 {
-			windows.ClosePseudoConsole(s.console)
+		if console != 0 {
+			windows.ClosePseudoConsole(console)
 		}
+		if attr != nil {
+			attr.Delete()
+		}
+		if thread != 0 {
+			err = errors.Join(err, windows.CloseHandle(thread))
+		}
+		s.lifecycleMu.Unlock()
+
 		if process := s.processHandle(); process != 0 {
 			if exited := waitForProcess(process, 0); !exited {
 				_ = windows.TerminateProcess(process, 1)
 				time.Sleep(200 * time.Millisecond)
 			}
-		}
-		if s.attr != nil {
-			s.attr.Delete()
-		}
-		if s.thread != 0 {
-			err = errors.Join(err, windows.CloseHandle(s.thread))
 		}
 	})
 	return err
@@ -120,7 +132,24 @@ func (s *windowsPTYSession) Close() error {
 
 func (s *windowsPTYSession) Resize(cols int, rows int) error {
 	cols, rows = normalizeDimensions(cols, rows)
+	s.lifecycleMu.RLock()
+	defer s.lifecycleMu.RUnlock()
+	if s.console == 0 {
+		return os.ErrClosed
+	}
 	return windows.ResizePseudoConsole(s.console, windows.Coord{X: int16(cols), Y: int16(rows)})
+}
+
+func (s *windowsPTYSession) inputFile() *os.File {
+	s.lifecycleMu.RLock()
+	defer s.lifecycleMu.RUnlock()
+	return s.input
+}
+
+func (s *windowsPTYSession) outputFile() *os.File {
+	s.lifecycleMu.RLock()
+	defer s.lifecycleMu.RUnlock()
+	return s.output
 }
 
 func (s *windowsPTYSession) Wait() int {

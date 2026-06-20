@@ -1,7 +1,18 @@
 # Wails Server Mode Dockerfile
 # Multi-stage build for minimal image size
 
-# Build stage
+# Frontend build stage
+FROM node:24-alpine AS frontend
+
+WORKDIR /app/frontend
+
+COPY frontend/package*.json ./
+RUN npm ci
+
+COPY frontend ./
+RUN npm run build
+
+# Go build stage
 FROM golang:1.26.4-alpine AS builder
 
 WORKDIR /app
@@ -11,6 +22,7 @@ RUN apk add --no-cache git
 
 # Copy source code
 COPY . .
+COPY --from=frontend /app/frontend/dist /app/frontend/dist
 
 # Download dependencies without rewriting go.mod/go.sum during reproducible builds.
 RUN go mod download && go mod verify

@@ -30,17 +30,17 @@ func TestMetricsRepositoryQueryAndRetentionDownsample(t *testing.T) {
 	err := repo.InsertBatch(ctx, []MetricsSampleRecord{
 		{
 			ProviderID: "linux_native", ProjectID: "project", ServiceID: "project::web", ContainerID: "c1",
-			CPUPercent: 20, MemoryBytes: 100, NetworkRXBytes: 10, NetworkTXBytes: 20,
+			CPUPercent: 20, MemoryBytes: 100, GPUMemoryBytes: 1024, NetworkRXBytes: 10, NetworkTXBytes: 20,
 			BlockReadBytes: 30, BlockWriteBytes: 40, PIDs: 2, SampledAt: now.Add(-90 * time.Minute),
 		},
 		{
 			ProviderID: "linux_native", ProjectID: "project", ServiceID: "project::web", ContainerID: "c1",
-			CPUPercent: 40, MemoryBytes: 300, NetworkRXBytes: 30, NetworkTXBytes: 50,
+			CPUPercent: 40, MemoryBytes: 300, GPUMemoryBytes: 4096, NetworkRXBytes: 30, NetworkTXBytes: 50,
 			BlockReadBytes: 70, BlockWriteBytes: 90, PIDs: 3, SampledAt: now.Add(-90*time.Minute + 20*time.Second),
 		},
 		{
 			ProviderID: "linux_native", ProjectID: "project", ServiceID: "project::web", ContainerID: "c1",
-			CPUPercent: 60, MemoryBytes: 500, NetworkRXBytes: 80, NetworkTXBytes: 130,
+			CPUPercent: 60, MemoryBytes: 500, GPUMemoryBytes: 2048, NetworkRXBytes: 80, NetworkTXBytes: 130,
 			BlockReadBytes: 170, BlockWriteBytes: 190, PIDs: 4, SampledAt: now.Add(-20 * time.Minute),
 		},
 	})
@@ -59,6 +59,9 @@ func TestMetricsRepositoryQueryAndRetentionDownsample(t *testing.T) {
 	}
 	if points := raw.Series[0].Points; len(points) != 1 || points[0].Value != 60 {
 		t.Fatalf("raw CPU points = %#v, want latest raw sample", points)
+	}
+	if points := raw.Series[2].Points; len(points) != 1 || points[0].Value != 2048 {
+		t.Fatalf("raw GPU points = %#v, want latest raw sample", points)
 	}
 
 	if err := repo.RetainAndDownsample(ctx, now); err != nil {
@@ -82,5 +85,8 @@ func TestMetricsRepositoryQueryAndRetentionDownsample(t *testing.T) {
 	}
 	if points := downsampled.Series[1].Points; len(points) != 1 || points[0].Value != 200 {
 		t.Fatalf("1m memory points = %#v, want average 200", points)
+	}
+	if points := downsampled.Series[2].Points; len(points) != 1 || points[0].Value != 4096 {
+		t.Fatalf("1m GPU points = %#v, want max 4096", points)
 	}
 }

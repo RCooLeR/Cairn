@@ -267,6 +267,9 @@ vi.mock("@monaco-editor/react", () => ({
 
 vi.mock("@xterm/xterm", () => ({
   Terminal: class {
+    attachCustomKeyEventHandler = vi.fn();
+    focus = vi.fn();
+    getSelection = vi.fn(() => "");
     open = vi.fn();
     resize = vi.fn();
     write = vi.fn();
@@ -306,6 +309,7 @@ vi.mock("@wailsio/runtime", () => ({
   },
   Clipboard: {
     SetText: runtimeMock.setClipboardText,
+    Text: vi.fn().mockResolvedValue(""),
   },
   Browser: {
     OpenURL: runtimeMock.openURL,
@@ -3434,6 +3438,9 @@ describe("App inventory shell", () => {
       }),
     );
     clickSettingsSection("Security & Audit");
+    fireEvent.change(await screen.findByLabelText("Range"), {
+      target: { value: "all" },
+    });
 
     expect(await screen.findByText("update.apply")).toBeInTheDocument();
     expect(screen.getByText("container.start")).toBeInTheDocument();

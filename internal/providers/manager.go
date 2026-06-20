@@ -85,7 +85,7 @@ func NewDefaultManager(repo *store.ProviderRepository, settings *store.SettingsR
 }
 
 func (m *Manager) Detect(ctx context.Context, providerID string) (*models.ProviderStatus, error) {
-	provider, ok := m.providers[providerID]
+	provider, ok := m.providerByID(providerID)
 	if !ok {
 		return nil, apperror.New(apperror.NotFound, "Provider was not found")
 	}
@@ -110,8 +110,9 @@ func (m *Manager) DetectAll(ctx context.Context) (map[string]*models.ProviderSta
 	if err := m.ensureProviderRecords(ctx); err != nil {
 		return nil, err
 	}
-	for _, id := range m.order {
-		m.applyProviderSettings(ctx, m.providers[id])
+	providers := m.providerSnapshot()
+	for _, provider := range providers {
+		m.applyProviderSettings(ctx, provider)
 	}
 
 	type detectResult struct {
@@ -119,9 +120,9 @@ func (m *Manager) DetectAll(ctx context.Context) (map[string]*models.ProviderSta
 		status *models.ProviderStatus
 		err    error
 	}
-	results := make(chan detectResult, len(m.providers))
-	for _, id := range m.order {
-		provider := m.providers[id]
+	results := make(chan detectResult, len(providers))
+	for _, provider := range providers {
+		provider := provider
 		go func() {
 			detectCtx, cancel := context.WithTimeout(ctx, detectBudgetFor(provider))
 			defer cancel()
@@ -130,9 +131,9 @@ func (m *Manager) DetectAll(ctx context.Context) (map[string]*models.ProviderSta
 		}()
 	}
 
-	statuses := make(map[string]*models.ProviderStatus, len(m.providers))
+	statuses := make(map[string]*models.ProviderStatus, len(providers))
 	var joined error
-	for range m.providers {
+	for range providers {
 		result := <-results
 		if result.err != nil {
 			joined = errors.Join(joined, result.err)
@@ -206,7 +207,7 @@ func (m *Manager) SetActiveProvider(ctx context.Context, providerID string) erro
 			return err
 		}
 	}
-	if _, ok := m.providers[providerID]; !ok {
+	if _, ok := m.providerByID(providerID); !ok {
 		return apperror.New(apperror.NotFound, "Provider was not found")
 	}
 	if err := m.settings.SetString(ctx, "provider.active_id", providerID); err != nil {
@@ -257,13 +258,13 @@ func (m *Manager) ActiveProvider(ctx context.Context) (PlatformProvider, error) 
 }
 
 func (m *Manager) ApplySavedSettings(ctx context.Context) {
-	for _, id := range m.order {
-		m.applyProviderSettings(ctx, m.providers[id])
+	for _, provider := range m.providerSnapshot() {
+		m.applyProviderSettings(ctx, provider)
 	}
 }
 
 func (m *Manager) PlanInstall(ctx context.Context, providerID string, opts models.InstallOptions) (*models.CommandPlan, error) {
-	provider, ok := m.providers[providerID]
+	provider, ok := m.providerByID(providerID)
 	if !ok {
 		return nil, apperror.New(apperror.NotFound, "Provider was not found")
 	}
@@ -308,7 +309,7 @@ func (m *Manager) ApplyInstall(ctx context.Context, planID string, progress chan
 	if !ok {
 		return apperror.New(apperror.PlanExpired, "Install plan expired or was not found")
 	}
-	provider, ok := m.providers[record.providerID]
+	provider, ok := m.providerByID(record.providerID)
 	if !ok {
 		return apperror.New(apperror.NotFound, "Provider was not found")
 	}
@@ -322,7 +323,7 @@ func (m *Manager) ApplyInstall(ctx context.Context, planID string, progress chan
 }
 
 func (m *Manager) Start(ctx context.Context, providerID string) error {
-	provider, ok := m.providers[providerID]
+	provider, ok := m.providerByID(providerID)
 	if !ok {
 		return apperror.New(apperror.NotFound, "Provider was not found")
 	}
@@ -331,7 +332,7 @@ func (m *Manager) Start(ctx context.Context, providerID string) error {
 }
 
 func (m *Manager) Stop(ctx context.Context, providerID string) error {
-	provider, ok := m.providers[providerID]
+	provider, ok := m.providerByID(providerID)
 	if !ok {
 		return apperror.New(apperror.NotFound, "Provider was not found")
 	}
@@ -340,7 +341,7 @@ func (m *Manager) Stop(ctx context.Context, providerID string) error {
 }
 
 func (m *Manager) Restart(ctx context.Context, providerID string) error {
-	provider, ok := m.providers[providerID]
+	provider, ok := m.providerByID(providerID)
 	if !ok {
 		return apperror.New(apperror.NotFound, "Provider was not found")
 	}
@@ -349,7 +350,7 @@ func (m *Manager) Restart(ctx context.Context, providerID string) error {
 }
 
 func (m *Manager) PlanLifecycle(ctx context.Context, action string, providerID string) (security.ProviderPlan, error) {
-	provider, ok := m.providers[providerID]
+	provider, ok := m.providerByID(providerID)
 	if !ok {
 		return security.ProviderPlan{}, apperror.New(apperror.NotFound, "Provider was not found")
 	}
@@ -362,7 +363,7 @@ func (m *Manager) PlanLifecycle(ctx context.Context, action string, providerID s
 }
 
 func (m *Manager) LifecycleCommand(ctx context.Context, action string, providerID string) (string, error) {
-	provider, ok := m.providers[providerID]
+	provider, ok := m.providerByID(providerID)
 	if !ok {
 		return "", apperror.New(apperror.NotFound, "Provider was not found")
 	}
@@ -379,7 +380,7 @@ func (m *Manager) ListDockerContexts(ctx context.Context) ([]models.DockerContex
 }
 
 func (m *Manager) ListWSLDistros(ctx context.Context) ([]models.WSLDistroInfo, error) {
-	for _, provider := range m.providers {
+	for _, provider := range m.providerSnapshot() {
 		if provider.Type() != TypeWindowsWSL {
 			continue
 		}
@@ -412,8 +413,8 @@ func (m *Manager) SetDockerContext(ctx context.Context, name string) error {
 }
 
 func (m *Manager) ensureProviderRecords(ctx context.Context) error {
-	for _, id := range m.order {
-		if err := m.ensureProviderRecord(ctx, m.providers[id]); err != nil {
+	for _, provider := range m.providerSnapshot() {
+		if err := m.ensureProviderRecord(ctx, provider); err != nil {
 			return err
 		}
 	}
@@ -470,7 +471,7 @@ func (m *Manager) updateActiveAfterDetect(ctx context.Context, statuses map[stri
 			return
 		}
 	}
-	for _, id := range m.order {
+	for _, id := range m.providerIDsSnapshot() {
 		if status, ok := statuses[id]; ok && status.Healthy {
 			m.setActiveBestEffort(ctx, id)
 			return
@@ -483,6 +484,31 @@ func (m *Manager) setActiveBestEffort(ctx context.Context, providerID string) {
 	m.mu.Lock()
 	m.activeID = providerID
 	m.mu.Unlock()
+}
+
+func (m *Manager) providerByID(providerID string) (PlatformProvider, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	provider, ok := m.providers[providerID]
+	return provider, ok
+}
+
+func (m *Manager) providerSnapshot() []PlatformProvider {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	providers := make([]PlatformProvider, 0, len(m.order))
+	for _, id := range m.order {
+		if provider := m.providers[id]; provider != nil {
+			providers = append(providers, provider)
+		}
+	}
+	return providers
+}
+
+func (m *Manager) providerIDsSnapshot() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return append([]string(nil), m.order...)
 }
 
 func (m *Manager) applyProviderSettings(ctx context.Context, provider PlatformProvider) {

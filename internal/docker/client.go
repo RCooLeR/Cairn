@@ -66,6 +66,7 @@ type APIClient interface {
 	ContainerLogs(context.Context, string, container.LogsOptions) (io.ReadCloser, error)
 	ContainerStats(context.Context, string, bool) (container.StatsResponseReader, error)
 	ContainerStatsOneShot(context.Context, string) (container.StatsResponseReader, error)
+	ContainerTop(context.Context, string, []string) (container.TopResponse, error)
 	ContainerExecCreate(context.Context, string, container.ExecOptions) (container.ExecCreateResponse, error)
 	ContainerExecAttach(context.Context, string, container.ExecAttachOptions) (dockertypes.HijackedResponse, error)
 	ContainerExecResize(context.Context, string, container.ResizeOptions) error

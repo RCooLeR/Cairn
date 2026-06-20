@@ -50,6 +50,7 @@ export {
     ExportResult,
     GPUDeviceMetric,
     GPUMetrics,
+    GPUProcessMetric,
     HealthStatus,
     HubSearchResult,
     IgnoreUpdateRequest,

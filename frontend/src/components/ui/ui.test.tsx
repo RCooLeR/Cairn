@@ -1,7 +1,11 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
-import { APP_ERROR_CODES, appErrorPresentation } from "../../api/errors";
+import {
+  APP_ERROR_CODES,
+  appErrorPresentation,
+  parseAppErrorText,
+} from "../../api/errors";
 import { useToastQueue } from "../../hooks/useToastQueue";
 import {
   Button,
@@ -370,6 +374,23 @@ describe("UI kit", () => {
       "permission",
     );
     expect(appErrorPresentation("E_NOT_FOUND").surface).toBe("toast");
+  });
+
+  it("turns structured app errors into readable UI copy", () => {
+    const parsed = parseAppErrorText(
+      JSON.stringify({
+        message: "E_COMPOSE_INVALID: Compose project action failed",
+        cause: {
+          code: "E_COMPOSE_INVALID",
+          message: "Compose project action failed",
+          detail: "docker compose pull failed",
+        },
+      }),
+    );
+
+    expect(parsed.title).toBe("Compose file is invalid");
+    expect(parsed.body).toBe("Compose project action failed");
+    expect(parsed.detail).toBe("docker compose pull failed");
   });
 
   it("windows large table row sets for seed-scale inventory pages", () => {

@@ -114,9 +114,9 @@ func (s *ProviderService) runProviderInstall(ctx context.Context, planID string,
 			s.publishProviderInstallProgress(planID, streamID, providers.InstallProgress{
 				Step:       last.Step,
 				TotalSteps: last.TotalSteps,
-				Message:    "Install failed",
+				Message:    "Install complete",
 				Done:       true,
-			}, auditErr.Error())
+			}, "Install completed, but the audit entry could not be recorded: "+auditErr.Error())
 			return
 		}
 		s.publishProviderInstallProgress(planID, streamID, providers.InstallProgress{

@@ -68,6 +68,9 @@ export const Clipboard = {
   async SetText(text: string) {
     clipboardWrites.push(text);
   },
+  async Text() {
+    return clipboardWrites[clipboardWrites.length - 1] ?? "";
+  },
 };
 
 export const Browser = {

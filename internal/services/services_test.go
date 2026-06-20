@@ -220,6 +220,42 @@ func TestAgentServiceStatusSelectsPreferredAvailableModel(t *testing.T) {
 	}
 }
 
+func TestAgentServiceStatusDoesNotPersistFallbackModel(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/tags" {
+			t.Fatalf("path = %s, want /api/tags", r.URL.Path)
+		}
+		_, _ = w.Write([]byte(`{"models":[{"name":"qwen2.5-coder:7b"}]}`))
+	}))
+	t.Cleanup(server.Close)
+	if err := db.Settings().SetString(ctx, "agent.endpoint", server.URL); err != nil {
+		t.Fatalf("SetString endpoint: %v", err)
+	}
+	if err := db.Settings().SetString(ctx, "agent.model", "missing:latest"); err != nil {
+		t.Fatalf("SetString agent model: %v", err)
+	}
+
+	status, err := (&AgentService{
+		Settings: db.Settings(),
+		Client:   server.Client(),
+	}).Status(ctx)
+	if err != nil {
+		t.Fatalf("Status() error = %v", err)
+	}
+	if status.Model != "qwen2.5-coder:7b" {
+		t.Fatalf("Status().Model = %q, want fallback", status.Model)
+	}
+	persisted, err := db.Settings().GetString(ctx, "agent.model")
+	if err != nil {
+		t.Fatalf("GetString agent.model: %v", err)
+	}
+	if persisted != "missing:latest" {
+		t.Fatalf("persisted agent.model = %q, want original setting", persisted)
+	}
+}
+
 func TestAgentServiceChatUsesSelectedLocalModel(t *testing.T) {
 	ctx := context.Background()
 	db := openServiceTestStore(t)
@@ -244,6 +280,9 @@ func TestAgentServiceChatUsesSelectedLocalModel(t *testing.T) {
 	if err := db.Settings().SetString(ctx, "agent.endpoint", server.URL); err != nil {
 		t.Fatalf("SetString endpoint: %v", err)
 	}
+	if err := db.Settings().SetString(ctx, "agent.model", "missing:latest"); err != nil {
+		t.Fatalf("SetString agent model: %v", err)
+	}
 
 	response, err := (&AgentService{
 		Settings: db.Settings(),
@@ -257,6 +296,13 @@ func TestAgentServiceChatUsesSelectedLocalModel(t *testing.T) {
 	}
 	if !strings.Contains(response.Message, "multi-stage") {
 		t.Fatalf("response.Message = %q", response.Message)
+	}
+	persisted, err := db.Settings().GetString(ctx, "agent.model")
+	if err != nil {
+		t.Fatalf("GetString agent.model: %v", err)
+	}
+	if persisted != "qwen2.5-coder:7b" {
+		t.Fatalf("persisted agent.model = %q, want chat fallback", persisted)
 	}
 }
 
@@ -447,6 +493,41 @@ func TestAgentServiceFileEditPlanWritesProjectConfig(t *testing.T) {
 	}
 }
 
+func TestAgentServiceFileEditRejectsSymlinkEscape(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	projectService, projectID, root := importAgentTestProject(t, ctx, db)
+	outsideDir := t.TempDir()
+	outsideFile := filepath.Join(outsideDir, ".env.local")
+	if err := os.WriteFile(outsideFile, []byte("SECRET=outside\n"), 0o600); err != nil {
+		t.Fatalf("write outside file: %v", err)
+	}
+	linkPath := filepath.Join(root, ".env.local")
+	if err := os.Symlink(outsideFile, linkPath); err != nil {
+		t.Skipf("symlink creation is unavailable in this environment: %v", err)
+	}
+	planStore := security.NewAgentFileEditPlanStore(nil)
+	t.Cleanup(planStore.Close)
+	service := &AgentService{Project: projectService, Plans: planStore, Audit: db.Audit()}
+
+	_, err := service.PlanFileEdit(ctx, models.AgentFileEditRequest{
+		ProjectID: projectID,
+		Path:      ".env.local",
+		Content:   "SECRET=changed\n",
+		Reason:    "try to edit through a symlink",
+	})
+	if !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("PlanFileEdit() error = %v, want conflict", err)
+	}
+	raw, err := os.ReadFile(outsideFile)
+	if err != nil {
+		t.Fatalf("read outside file: %v", err)
+	}
+	if string(raw) != "SECRET=outside\n" {
+		t.Fatalf("outside file changed: %q", raw)
+	}
+}
+
 func TestAgentServiceToolCatalogIncludesExecutableDockerTools(t *testing.T) {
 	tools, err := (&AgentService{}).ToolCatalog(context.Background())
 	if err != nil {
@@ -492,6 +573,31 @@ func TestAgentServiceExecuteToolCreatesCommandPlan(t *testing.T) {
 	}
 	if !strings.Contains(result.Data, "docker image prune --all") {
 		t.Fatalf("result.Data = %s, want prune command plan", result.Data)
+	}
+}
+
+func TestAgentServiceExecuteToolRejectsMutationsWhenDisabled(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	if err := db.Settings().SetBool(ctx, "agent.enabled", false); err != nil {
+		t.Fatalf("SetBool(agent.enabled) error = %v", err)
+	}
+	plans := security.NewDockerObjectPlanStore(nil)
+	t.Cleanup(plans.Close)
+	service := &AgentService{
+		Settings: db.Settings(),
+		Docker: &DockerService{
+			Client:      &fakeDockerClient{},
+			ObjectPlans: plans,
+		},
+	}
+
+	_, err := service.ExecuteTool(ctx, models.AgentToolExecutionRequest{
+		ToolID:    "docker.prune_plan",
+		Arguments: `{"kind":"images"}`,
+	})
+	if !apperror.IsCode(err, apperror.ProviderNotReady) {
+		t.Fatalf("ExecuteTool() error = %v, want provider-not-ready", err)
 	}
 }
 

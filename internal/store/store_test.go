@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
@@ -13,6 +14,8 @@ import (
 
 	"github.com/RCooLeR/Cairn/internal/models"
 )
+
+const expectedMigrationCount = 6
 
 func TestMigrateFreshDatabaseCreatesV1Schema(t *testing.T) {
 	ctx := context.Background()
@@ -72,8 +75,8 @@ func TestMigrateFreshDatabaseCreatesV1Schema(t *testing.T) {
 		}
 	}
 
-	if got := migrationCount(t, ctx, s); got != 5 {
-		t.Fatalf("migration count = %d, want 5", got)
+	if got := migrationCount(t, ctx, s); got != expectedMigrationCount {
+		t.Fatalf("migration count = %d, want %d", got, expectedMigrationCount)
 	}
 }
 
@@ -94,8 +97,8 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	if err := s.Migrate(ctx); err != nil {
 		t.Fatalf("second migrate: %v", err)
 	}
-	if got := migrationCount(t, ctx, s); got != 5 {
-		t.Fatalf("migration count after rerun = %d, want 5", got)
+	if got := migrationCount(t, ctx, s); got != expectedMigrationCount {
+		t.Fatalf("migration count after rerun = %d, want %d", got, expectedMigrationCount)
 	}
 }
 
@@ -215,8 +218,8 @@ func TestReleaseDBFixtureUpgrade(t *testing.T) {
 	if err := upgraded.Migrate(ctx); err != nil {
 		t.Fatalf("migrate release fixture: %v", err)
 	}
-	if got := migrationCount(t, ctx, upgraded); got != 5 {
-		t.Fatalf("migration count = %d, want 5", got)
+	if got := migrationCount(t, ctx, upgraded); got != expectedMigrationCount {
+		t.Fatalf("migration count = %d, want %d", got, expectedMigrationCount)
 	}
 
 	settings := upgraded.Settings()
@@ -295,6 +298,12 @@ func TestPragmas(t *testing.T) {
 	}
 	if got := queryPragmaInt(t, ctx, s, "synchronous"); got != 1 {
 		t.Fatalf("synchronous = %d, want NORMAL(1)", got)
+	}
+	if got := queryPragmaIntDB(t, ctx, s.reader, "foreign_keys"); got != 1 {
+		t.Fatalf("reader foreign_keys = %d, want 1", got)
+	}
+	if got := queryPragmaIntDB(t, ctx, s.reader, "busy_timeout"); got != 5000 {
+		t.Fatalf("reader busy_timeout = %d, want 5000", got)
 	}
 }
 
@@ -647,8 +656,14 @@ func migrationCount(t *testing.T, ctx context.Context, s *Store) int {
 func queryPragmaInt(t *testing.T, ctx context.Context, s *Store, name string) int {
 	t.Helper()
 
+	return queryPragmaIntDB(t, ctx, s.writer, name)
+}
+
+func queryPragmaIntDB(t *testing.T, ctx context.Context, db *sql.DB, name string) int {
+	t.Helper()
+
 	var value int
-	if err := s.writer.QueryRowContext(ctx, "PRAGMA "+name).Scan(&value); err != nil {
+	if err := db.QueryRowContext(ctx, "PRAGMA "+name).Scan(&value); err != nil {
 		t.Fatalf("PRAGMA %s: %v", name, err)
 	}
 	return value

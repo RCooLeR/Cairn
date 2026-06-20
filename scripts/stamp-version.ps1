@@ -37,6 +37,13 @@ function Set-Text([string]$RelativePath, [string]$Text) {
   [System.IO.File]::WriteAllText($path, $Text, $encoding)
 }
 
+function Replace-Required([string]$Text, [string]$Pattern, [string]$Replacement, [string]$RelativePath) {
+  if (![regex]::IsMatch($Text, $Pattern)) {
+    throw "Could not find version pattern in $RelativePath"
+  }
+  return [regex]::Replace($Text, $Pattern, $Replacement)
+}
+
 function Update-Text([string]$RelativePath, [scriptblock]$Mutate) {
   $path = Join-Path $Root $RelativePath
   $text = [System.IO.File]::ReadAllText($path)
@@ -55,40 +62,42 @@ if ([string]::IsNullOrWhiteSpace($BuildDate)) {
 
 Update-Text "build/config.yml" {
   param($text)
-  $text -replace 'version: "\d+\.\d+\.\d+(?:[+-][0-9A-Za-z.-]+)?" # The application version', "version: `"$semver`" # The application version"
+  Replace-Required $text 'version: "\d+\.\d+\.\d+(?:[+-][0-9A-Za-z.-]+)?" # The application version' "version: `"$semver`" # The application version" "build/config.yml"
 }
 
 Update-Text "build/windows/info.json" {
   param($text)
-  $text = $text -replace '"file_version": "\d+\.\d+\.\d+"', "`"file_version`": `"$semver`""
-  $text = $text -replace '"ProductVersion": "\d+\.\d+\.\d+"', "`"ProductVersion`": `"$semver`""
-  $text = $text -replace '"FileVersion": "\d+\.\d+\.\d+"', "`"FileVersion`": `"$semver`""
+  $text = Replace-Required $text '"file_version": "\d+\.\d+\.\d+(?:\.\d+)?"' "`"file_version`": `"$fileVersion`"" "build/windows/info.json"
+  $text = Replace-Required $text '"ProductVersion": "\d+\.\d+\.\d+(?:[+-][0-9A-Za-z.-]+)?"' "`"ProductVersion`": `"$semver`"" "build/windows/info.json"
+  if ([regex]::IsMatch($text, '"FileVersion": "\d+\.\d+\.\d+(?:\.\d+)?"')) {
+    $text = [regex]::Replace($text, '"FileVersion": "\d+\.\d+\.\d+(?:\.\d+)?"', "`"FileVersion`": `"$fileVersion`"")
+  }
   $text
 }
 
 Update-Text "build/windows/wails.exe.manifest" {
   param($text)
-  $text -replace '(<assemblyIdentity type="win32" name="app\.cairn\.desktop" version=")[^"]+(")', "`${1}$fileVersion`$2"
+  Replace-Required $text '(<assemblyIdentity type="win32" name="app\.cairn\.desktop" version=")[^"]+(")' "`$1$fileVersion`$2" "build/windows/wails.exe.manifest"
 }
 
 Update-Text "build/windows/nsis/wails_tools.nsh" {
   param($text)
-  $text = $text -replace '!define INFO_PRODUCTVERSION "\d+\.\d+\.\d+(?:[+-][0-9A-Za-z.-]+)?"', "!define INFO_PRODUCTVERSION `"$semver`""
+  $text = Replace-Required $text '!define INFO_PRODUCTVERSION "\d+\.\d+\.\d+(?:[+-][0-9A-Za-z.-]+)?"' "!define INFO_PRODUCTVERSION `"$semver`"" "build/windows/nsis/wails_tools.nsh"
   $text
 }
 
 foreach ($plist in @("build/darwin/Info.plist", "build/darwin/Info.dev.plist")) {
   Update-Text $plist {
     param($text)
-    $text = $text -replace '<key>CFBundleVersion</key>\s*<string>[^<]+</string>', "<key>CFBundleVersion</key>`n            <string>$semver</string>"
-    $text = $text -replace '<key>CFBundleShortVersionString</key>\s*<string>[^<]+</string>', "<key>CFBundleShortVersionString</key>`n            <string>$semver</string>"
+    $text = Replace-Required $text '<key>CFBundleVersion</key>\s*<string>[^<]+</string>' "<key>CFBundleVersion</key>`n            <string>$semver</string>" $plist
+    $text = Replace-Required $text '<key>CFBundleShortVersionString</key>\s*<string>[^<]+</string>' "<key>CFBundleShortVersionString</key>`n            <string>$semver</string>" $plist
     $text
   }
 }
 
 Update-Text "build/linux/nfpm/nfpm.yaml" {
   param($text)
-  $text -replace 'version: "\d+\.\d+\.\d+(?:[+-][0-9A-Za-z.-]+)?"', "version: `"$semver`""
+  Replace-Required $text 'version: "\d+\.\d+\.\d+(?:[+-][0-9A-Za-z.-]+)?"' "version: `"$semver`"" "build/linux/nfpm/nfpm.yaml"
 }
 
 $envFile = Join-Path $Root ".release-version.env"

@@ -38,6 +38,7 @@ jobs:
             task: darwin:package
     env:
       CAIRN_ARTIFACT_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
+      RELEASE_INPUT_VERSION: ${{ inputs.version }}
       WINDOWS_SIGN_PFX_BASE64: ${{ secrets.WINDOWS_SIGN_PFX_BASE64 }}
       WINDOWS_SIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGN_PFX_PASSWORD }}
       MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
@@ -105,7 +106,7 @@ jobs:
       - name: Stamp release version and assets
         shell: pwsh
         run: |
-          $inputVersion = "${{ inputs.version }}"
+          $inputVersion = $env:RELEASE_INPUT_VERSION
           if ($env:GITHUB_REF_TYPE -eq "tag") {
             $inputVersion = $env:GITHUB_REF_NAME
           }

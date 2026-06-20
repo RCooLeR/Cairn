@@ -121,6 +121,7 @@ func (m *Manager) GetDashboardMetrics(ctx context.Context) (*models.DashboardMet
 	if err := m.requireDocker(); err != nil {
 		return nil, err
 	}
+	gpu := m.gpuMetrics(ctx)
 	containers, err := m.Docker.ListContainers(ctx, models.ContainerListOptions{All: true})
 	if err != nil {
 		return nil, err
@@ -145,7 +146,7 @@ func (m *Manager) GetDashboardMetrics(ctx context.Context) (*models.DashboardMet
 		Images:     len(images),
 		Volumes:    len(volumes),
 		DiskUsage:  *usage,
-		GPU:        m.gpuMetrics(ctx),
+		GPU:        gpu,
 		Top:        m.topContainers(),
 	}
 	if m.Projects != nil {
@@ -367,6 +368,7 @@ func (m *Manager) buildSample(containerID string, raw container.StatsResponse) (
 	previous, hasPrevious := m.previous[containerID]
 	summary := m.containers[containerID]
 	onlineCPUs := m.onlineCPUs
+	gpuUsage := m.gpuUsage[containerID]
 	m.previous[containerID] = raw
 	m.mu.Unlock()
 
@@ -416,6 +418,9 @@ func (m *Manager) buildSample(containerID string, raw container.StatsResponse) (
 		CPUPercent:       cpu,
 		MemoryBytes:      memoryUsageBytes(raw.MemoryStats),
 		MemoryLimitBytes: memoryLimitBytes(raw.MemoryStats),
+		GPUMemoryBytes:   gpuUsage.memoryBytes,
+		GPULoadPercent:   gpuUsage.utilizationPercent,
+		GPUDeviceIDs:     append([]string(nil), gpuUsage.deviceIDs...),
 		NetworkRXBytes:   uintToInt64(rx),
 		NetworkTXBytes:   uintToInt64(txBytes),
 		NetworkRXRate:    netRXRate,
@@ -534,12 +539,241 @@ func (m *Manager) gpuMetrics(ctx context.Context) models.GPUMetrics {
 	if metrics.CheckedAt.IsZero() {
 		metrics.CheckedAt = now
 	}
+	metrics = m.attributeGPUMetrics(ctx, metrics)
 
 	m.mu.Lock()
 	m.gpuCache = cloneGPUMetrics(metrics)
 	m.gpuCacheAt = now
 	m.mu.Unlock()
 	return metrics
+}
+
+func (m *Manager) attributeGPUMetrics(ctx context.Context, metrics models.GPUMetrics) models.GPUMetrics {
+	if m.Docker == nil {
+		m.setGPUUsage(nil)
+		return metrics
+	}
+	if !metrics.Available {
+		return metrics
+	}
+	if len(metrics.Processes) == 0 {
+		m.setGPUUsage(nil)
+		return metrics
+	}
+
+	containers := m.gpuAttributionContainers(ctx)
+	if len(containers) == 0 {
+		m.setGPUUsage(nil)
+		return metrics
+	}
+
+	containersByID := containerLookup(containers)
+	ollamaContainer, hasOllamaContainer := ollamaAttributionContainer(containers)
+	pidToContainer := make(map[int]models.ContainerSummary)
+	for _, container := range containers {
+		if container.ID == "" {
+			continue
+		}
+		pids, err := m.Docker.ContainerProcessPIDs(ctx, container.ID)
+		if err != nil {
+			continue
+		}
+		for _, pid := range pids {
+			if pid > 0 {
+				pidToContainer[pid] = container
+			}
+		}
+	}
+
+	usage := make(map[string]containerGPUUsage)
+	for i := range metrics.Processes {
+		process := &metrics.Processes[i]
+		container, ok := lookupContainer(containersByID, process.ContainerID)
+		if !ok {
+			container, ok = pidToContainer[process.PID]
+		}
+		if !ok && isSyntheticOllamaProcess(*process) && hasOllamaContainer {
+			container = ollamaContainer
+			ok = true
+		}
+		if !ok {
+			continue
+		}
+		process.ContainerID = container.ID
+		process.ContainerName = container.Name
+		process.ProjectID = container.ProjectID
+		process.Service = container.Service
+
+		containerUsage := usage[container.ID]
+		containerUsage.memoryBytes += process.MemoryBytes
+		containerUsage.utilizationPercent += process.GPULoadPercent
+		if process.DeviceID != "" && !contains(containerUsage.deviceIDs, process.DeviceID) {
+			containerUsage.deviceIDs = append(containerUsage.deviceIDs, process.DeviceID)
+		}
+		usage[container.ID] = containerUsage
+	}
+	applyGPUUtilizationFallback(usage, metrics.UtilizationPercent)
+	for id, item := range usage {
+		sort.Strings(item.deviceIDs)
+		usage[id] = item
+	}
+	m.setGPUUsage(usage)
+	return metrics
+}
+
+func applyGPUUtilizationFallback(usage map[string]containerGPUUsage, utilization float64) {
+	if utilization <= 0 || len(usage) == 0 {
+		return
+	}
+	var assigned float64
+	var totalMemory int64
+	for _, item := range usage {
+		assigned += item.utilizationPercent
+		totalMemory += item.memoryBytes
+	}
+	if assigned > 0 {
+		return
+	}
+	if len(usage) == 1 {
+		for id, item := range usage {
+			item.utilizationPercent = utilization
+			usage[id] = item
+		}
+		return
+	}
+	if totalMemory <= 0 {
+		return
+	}
+	for id, item := range usage {
+		if item.memoryBytes <= 0 {
+			continue
+		}
+		item.utilizationPercent = utilization * float64(item.memoryBytes) / float64(totalMemory)
+		usage[id] = item
+	}
+}
+
+func isSyntheticOllamaProcess(process models.GPUProcessMetric) bool {
+	return process.PID == 0 &&
+		process.ContainerID == "" &&
+		process.MemoryBytes > 0 &&
+		strings.HasPrefix(strings.ToLower(process.ProcessName), ollamaProcessName+":")
+}
+
+func ollamaAttributionContainer(containers []models.ContainerSummary) (models.ContainerSummary, bool) {
+	portMatches := make([]models.ContainerSummary, 0, 1)
+	nameMatches := make([]models.ContainerSummary, 0, 1)
+	for _, container := range containers {
+		if strings.ToLower(container.State) != "running" {
+			continue
+		}
+		if containerHasPort(container, "11434") {
+			portMatches = append(portMatches, container)
+		}
+		needle := strings.ToLower(strings.Join([]string{
+			container.Name,
+			container.Image,
+			container.Service,
+		}, " "))
+		if strings.Contains(needle, ollamaProcessName) {
+			nameMatches = append(nameMatches, container)
+		}
+	}
+	if len(portMatches) == 1 {
+		return portMatches[0], true
+	}
+	if len(nameMatches) == 1 {
+		return nameMatches[0], true
+	}
+	return models.ContainerSummary{}, false
+}
+
+func containerHasPort(container models.ContainerSummary, port string) bool {
+	for _, binding := range container.Ports {
+		if binding.ContainerPort == port || binding.HostPort == port {
+			return true
+		}
+	}
+	return false
+}
+
+func containerLookup(containers []models.ContainerSummary) map[string]models.ContainerSummary {
+	lookup := make(map[string]models.ContainerSummary, len(containers)*2)
+	for _, container := range containers {
+		id := strings.ToLower(strings.TrimSpace(container.ID))
+		if id == "" {
+			continue
+		}
+		lookup[id] = container
+		if len(id) >= 12 {
+			lookup[id[:12]] = container
+		}
+	}
+	return lookup
+}
+
+func lookupContainer(lookup map[string]models.ContainerSummary, id string) (models.ContainerSummary, bool) {
+	target := strings.ToLower(strings.TrimSpace(id))
+	if target == "" {
+		return models.ContainerSummary{}, false
+	}
+	if container, ok := lookup[target]; ok {
+		return container, true
+	}
+	if len(target) >= 12 {
+		if container, ok := lookup[target[:12]]; ok {
+			return container, true
+		}
+	}
+	for known, container := range lookup {
+		if len(target) >= 12 && strings.HasPrefix(known, target) {
+			return container, true
+		}
+		if len(known) >= 12 && strings.HasPrefix(target, known) {
+			return container, true
+		}
+	}
+	return models.ContainerSummary{}, false
+}
+
+func (m *Manager) gpuAttributionContainers(ctx context.Context) []models.ContainerSummary {
+	m.mu.Lock()
+	cached := make([]models.ContainerSummary, 0, len(m.containers))
+	for _, container := range m.containers {
+		cached = append(cached, container)
+	}
+	m.mu.Unlock()
+	if len(cached) > 0 {
+		return cached
+	}
+	containers, err := m.Docker.ListContainers(ctx, models.ContainerListOptions{All: false})
+	if err != nil {
+		return nil
+	}
+	return containers
+}
+
+func (m *Manager) setGPUUsage(usage map[string]containerGPUUsage) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if usage == nil {
+		usage = map[string]containerGPUUsage{}
+	}
+	m.gpuUsage = usage
+	for id, summary := range m.containers {
+		item := usage[id]
+		summary.GPUMemoryBytes = item.memoryBytes
+		summary.GPULoadPercent = item.utilizationPercent
+		summary.GPUDeviceIDs = append([]string(nil), item.deviceIDs...)
+		m.containers[id] = summary
+	}
+	for id, sample := range m.latest {
+		item := usage[id]
+		sample.GPUMemoryBytes = item.memoryBytes
+		sample.GPULoadPercent = item.utilizationPercent
+		sample.GPUDeviceIDs = append([]string(nil), item.deviceIDs...)
+		m.latest[id] = sample
+	}
 }
 
 func newStreamSession(manager *Manager, streamID string, scope models.StatsScope) *streamSession {
@@ -563,6 +797,7 @@ func (s *streamSession) run() {
 		case <-s.ctx.Done():
 			return
 		case <-ticker.C:
+			gpu := s.manager.gpuMetrics(s.ctx)
 			samples := s.manager.latestForScope(s.scope)
 			if len(samples) == 0 {
 				continue
@@ -570,7 +805,7 @@ func (s *streamSession) run() {
 			s.manager.publish(bus.TopicStatsSample, SamplePayload{
 				StreamID: s.id,
 				Samples:  samples,
-				GPU:      s.manager.gpuMetrics(s.ctx),
+				GPU:      gpu,
 			})
 		}
 	}
@@ -601,14 +836,19 @@ func (m *Manager) topContainers() []models.MetricRankItem {
 			name = sample.ContainerID
 		}
 		items = append(items, models.MetricRankItem{
-			ID:          sample.ContainerID,
-			Name:        name,
-			Kind:        ScopeContainer,
-			CPUPercent:  sample.CPUPercent,
-			MemoryBytes: sample.MemoryBytes,
+			ID:             sample.ContainerID,
+			Name:           name,
+			Kind:           ScopeContainer,
+			CPUPercent:     sample.CPUPercent,
+			MemoryBytes:    sample.MemoryBytes,
+			GPUMemoryBytes: sample.GPUMemoryBytes,
+			GPULoadPercent: sample.GPULoadPercent,
 		})
 	}
 	sort.Slice(items, func(i int, j int) bool {
+		if items[i].GPUMemoryBytes != items[j].GPUMemoryBytes {
+			return items[i].GPUMemoryBytes > items[j].GPUMemoryBytes
+		}
 		if items[i].CPUPercent == items[j].CPUPercent {
 			return items[i].MemoryBytes > items[j].MemoryBytes
 		}
@@ -661,6 +901,9 @@ func (m *Manager) ensureReady() {
 	}
 	if m.lastAccepted == nil {
 		m.lastAccepted = map[string]time.Time{}
+	}
+	if m.gpuUsage == nil {
+		m.gpuUsage = map[string]containerGPUUsage{}
 	}
 	if m.visibleInterval <= 0 {
 		m.visibleInterval = defaultVisibleInterval
@@ -739,6 +982,7 @@ func recordFromSample(sample Sample) store.MetricsSampleRecord {
 		CPUPercent:       sample.CPUPercent,
 		MemoryBytes:      sample.MemoryBytes,
 		MemoryLimitBytes: sample.MemoryLimitBytes,
+		GPUMemoryBytes:   sample.GPUMemoryBytes,
 		NetworkRXBytes:   sample.NetworkRXBytes,
 		NetworkTXBytes:   sample.NetworkTXBytes,
 		BlockReadBytes:   sample.BlockReadBytes,

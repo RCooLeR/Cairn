@@ -119,30 +119,33 @@ type ContainerListOptions struct {
 }
 
 type ContainerSummary struct {
-	ID          string        `json:"id"`
-	Name        string        `json:"name"`
-	Image       string        `json:"image"`
-	ImageID     string        `json:"imageID,omitempty"`
-	Status      string        `json:"status"`
-	State       string        `json:"state"`
-	Health      HealthStatus  `json:"health"`
-	ProjectID   string        `json:"projectID,omitempty"`
-	Service     string        `json:"service,omitempty"`
-	Ports       []PortBinding `json:"ports,omitempty"`
-	CPUPercent  float64       `json:"cpuPercent,omitempty"`
-	MemoryBytes int64         `json:"memoryBytes,omitempty"`
-	MemoryLimit int64         `json:"memoryLimit,omitempty"`
-	NetRxRate   int64         `json:"netRxRate,omitempty"`
-	NetTxRate   int64         `json:"netTxRate,omitempty"`
-	Restarts    int           `json:"restarts,omitempty"`
-	NetworkName string        `json:"networkName,omitempty"`
-	EndpointID  string        `json:"endpointID,omitempty"`
-	IPv4Address string        `json:"ipv4Address,omitempty"`
-	IPv6Address string        `json:"ipv6Address,omitempty"`
-	Gateway     string        `json:"gateway,omitempty"`
-	MacAddress  string        `json:"macAddress,omitempty"`
-	Aliases     []string      `json:"aliases,omitempty"`
-	CreatedAt   time.Time     `json:"createdAt"`
+	ID             string        `json:"id"`
+	Name           string        `json:"name"`
+	Image          string        `json:"image"`
+	ImageID        string        `json:"imageID,omitempty"`
+	Status         string        `json:"status"`
+	State          string        `json:"state"`
+	Health         HealthStatus  `json:"health"`
+	ProjectID      string        `json:"projectID,omitempty"`
+	Service        string        `json:"service,omitempty"`
+	Ports          []PortBinding `json:"ports,omitempty"`
+	CPUPercent     float64       `json:"cpuPercent,omitempty"`
+	MemoryBytes    int64         `json:"memoryBytes,omitempty"`
+	MemoryLimit    int64         `json:"memoryLimit,omitempty"`
+	GPUMemoryBytes int64         `json:"gpuMemoryBytes,omitempty"`
+	GPULoadPercent float64       `json:"gpuUtilizationPercent,omitempty"`
+	GPUDeviceIDs   []string      `json:"gpuDeviceIDs,omitempty"`
+	NetRxRate      int64         `json:"netRxRate,omitempty"`
+	NetTxRate      int64         `json:"netTxRate,omitempty"`
+	Restarts       int           `json:"restarts,omitempty"`
+	NetworkName    string        `json:"networkName,omitempty"`
+	EndpointID     string        `json:"endpointID,omitempty"`
+	IPv4Address    string        `json:"ipv4Address,omitempty"`
+	IPv6Address    string        `json:"ipv6Address,omitempty"`
+	Gateway        string        `json:"gateway,omitempty"`
+	MacAddress     string        `json:"macAddress,omitempty"`
+	Aliases        []string      `json:"aliases,omitempty"`
+	CreatedAt      time.Time     `json:"createdAt"`
 }
 
 type ContainerDetail struct {
@@ -331,6 +334,9 @@ type ProjectSummary struct {
 	ServicesTotal   int           `json:"servicesTotal"`
 	CPUPercent      float64       `json:"cpuPercent"`
 	MemoryBytes     int64         `json:"memoryBytes"`
+	GPUMemoryBytes  int64         `json:"gpuMemoryBytes,omitempty"`
+	GPULoadPercent  float64       `json:"gpuUtilizationPercent,omitempty"`
+	GPUDeviceIDs    []string      `json:"gpuDeviceIDs,omitempty"`
 	NetRxRate       int64         `json:"netRxRate"`
 	NetTxRate       int64         `json:"netTxRate"`
 	UpdateBadges    UpdateBadges  `json:"updateBadges"`
@@ -373,15 +379,18 @@ type ComposeRawFile struct {
 }
 
 type ComposeServiceStatus struct {
-	Name        string        `json:"name"`
-	Image       string        `json:"image,omitempty"`
-	Replicas    int           `json:"replicas"`
-	Running     int           `json:"running"`
-	Status      ProjectStatus `json:"status"`
-	Health      HealthStatus  `json:"health"`
-	Ports       []PortBinding `json:"ports,omitempty"`
-	CPUPercent  float64       `json:"cpuPercent,omitempty"`
-	MemoryBytes int64         `json:"memoryBytes,omitempty"`
+	Name           string        `json:"name"`
+	Image          string        `json:"image,omitempty"`
+	Replicas       int           `json:"replicas"`
+	Running        int           `json:"running"`
+	Status         ProjectStatus `json:"status"`
+	Health         HealthStatus  `json:"health"`
+	Ports          []PortBinding `json:"ports,omitempty"`
+	CPUPercent     float64       `json:"cpuPercent,omitempty"`
+	MemoryBytes    int64         `json:"memoryBytes,omitempty"`
+	GPUMemoryBytes int64         `json:"gpuMemoryBytes,omitempty"`
+	GPULoadPercent float64       `json:"gpuUtilizationPercent,omitempty"`
+	GPUDeviceIDs   []string      `json:"gpuDeviceIDs,omitempty"`
 }
 
 type DashboardMetrics struct {
@@ -396,21 +405,23 @@ type DashboardMetrics struct {
 }
 
 type GPUMetrics struct {
-	Available          bool              `json:"available"`
-	Source             string            `json:"source,omitempty"`
-	Message            string            `json:"message,omitempty"`
-	DeviceCount        int               `json:"deviceCount"`
-	UtilizationPercent float64           `json:"utilizationPercent,omitempty"`
-	MemoryUsedBytes    int64             `json:"memoryUsedBytes,omitempty"`
-	MemoryTotalBytes   int64             `json:"memoryTotalBytes,omitempty"`
-	TemperatureCelsius float64           `json:"temperatureCelsius,omitempty"`
-	DriverVersion      string            `json:"driverVersion,omitempty"`
-	Devices            []GPUDeviceMetric `json:"devices,omitempty"`
-	CheckedAt          time.Time         `json:"checkedAt"`
+	Available          bool               `json:"available"`
+	Source             string             `json:"source,omitempty"`
+	Message            string             `json:"message,omitempty"`
+	DeviceCount        int                `json:"deviceCount"`
+	UtilizationPercent float64            `json:"utilizationPercent,omitempty"`
+	MemoryUsedBytes    int64              `json:"memoryUsedBytes,omitempty"`
+	MemoryTotalBytes   int64              `json:"memoryTotalBytes,omitempty"`
+	TemperatureCelsius float64            `json:"temperatureCelsius,omitempty"`
+	DriverVersion      string             `json:"driverVersion,omitempty"`
+	Devices            []GPUDeviceMetric  `json:"devices,omitempty"`
+	Processes          []GPUProcessMetric `json:"processes,omitempty"`
+	CheckedAt          time.Time          `json:"checkedAt"`
 }
 
 type GPUDeviceMetric struct {
 	ID                 string  `json:"id"`
+	UUID               string  `json:"uuid,omitempty"`
 	Index              int     `json:"index"`
 	Name               string  `json:"name"`
 	DriverVersion      string  `json:"driverVersion,omitempty"`
@@ -420,12 +431,28 @@ type GPUDeviceMetric struct {
 	TemperatureCelsius float64 `json:"temperatureCelsius,omitempty"`
 }
 
+type GPUProcessMetric struct {
+	PID            int     `json:"pid"`
+	DeviceID       string  `json:"deviceID,omitempty"`
+	DeviceUUID     string  `json:"deviceUUID,omitempty"`
+	DeviceIndex    int     `json:"deviceIndex,omitempty"`
+	ProcessName    string  `json:"processName,omitempty"`
+	MemoryBytes    int64   `json:"memoryBytes,omitempty"`
+	GPULoadPercent float64 `json:"gpuUtilizationPercent,omitempty"`
+	ContainerID    string  `json:"containerID,omitempty"`
+	ContainerName  string  `json:"containerName,omitempty"`
+	ProjectID      string  `json:"projectID,omitempty"`
+	Service        string  `json:"service,omitempty"`
+}
+
 type MetricRankItem struct {
-	ID          string  `json:"id"`
-	Name        string  `json:"name"`
-	Kind        string  `json:"kind"`
-	CPUPercent  float64 `json:"cpuPercent,omitempty"`
-	MemoryBytes int64   `json:"memoryBytes,omitempty"`
+	ID             string  `json:"id"`
+	Name           string  `json:"name"`
+	Kind           string  `json:"kind"`
+	CPUPercent     float64 `json:"cpuPercent,omitempty"`
+	MemoryBytes    int64   `json:"memoryBytes,omitempty"`
+	GPUMemoryBytes int64   `json:"gpuMemoryBytes,omitempty"`
+	GPULoadPercent float64 `json:"gpuUtilizationPercent,omitempty"`
 }
 
 type TimeRange struct {

@@ -120,6 +120,7 @@ import {
 import { Browser, Clipboard, Dialogs, Events } from "@wailsio/runtime";
 
 import { getAppVersion } from "./api/app";
+import { parseAppErrorText } from "./api/errors";
 import {
   BackupService,
   DockerService,
@@ -334,7 +335,7 @@ type IgnoreUpdateState = {
   error?: string;
 };
 
-type ContainerAction = "start" | "stop" | "restart" | "kill";
+type ContainerAction = "start" | "stop" | "restart" | "kill" | "remove";
 type ProjectAction =
   | "start"
   | "stop"
@@ -579,7 +580,7 @@ type LogErrorPayload = {
   error?: string;
 };
 
-type DashboardMetricID = "cpu" | "memory" | "network";
+type DashboardMetricID = "cpu" | "gpu" | "memory" | "network";
 type DashboardRangeID = "5m" | "1h" | "24h";
 
 type StatsSample = {
@@ -591,6 +592,9 @@ type StatsSample = {
   restartCount?: number;
   uptimeSeconds?: number;
   cpuPercent: number;
+  gpuDeviceIDs?: string[];
+  gpuMemoryBytes?: number;
+  gpuUtilizationPercent?: number;
   memoryBytes: number;
   memoryLimitBytes?: number;
   networkRxRate: number;
@@ -608,6 +612,7 @@ type DashboardChartPoint = {
   ts: number;
   label: string;
   cpu: number;
+  gpu: number;
   memory: number;
   netRx: number;
   netTx: number;
@@ -622,6 +627,7 @@ type SparkPointMap = Record<string, SparkPoint[]>;
 type ProjectMetricSparks = Record<DashboardMetricID, SparkPointMap>;
 
 const maxProjectCommandOutputLines = 300;
+const projectStatsFrameMs = 2 * 1000;
 const navItems: NavItem[] = [
   { id: "overview", label: "Overview", icon: Gauge },
   { id: "projects", label: "Projects", icon: LayoutGrid },
@@ -1226,6 +1232,10 @@ function App() {
   const [terminalInitialSession, setTerminalInitialSession] =
     useState<TerminalSessionInfo | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
+  const parsedActionError = useMemo(
+    () => (actionError ? parseAppErrorText(actionError) : null),
+    [actionError],
+  );
   const [providerActionBusy, setProviderActionBusy] = useState(false);
   const [repairOpen, setRepairOpen] = useState(false);
   const [repairError, setRepairError] = useState<string | null>(null);
@@ -1281,11 +1291,13 @@ function App() {
   const [chartPaused, setChartPaused] = useState(false);
   const chartPausedRef = useRef(false);
   const statsStreamIDRef = useRef<string | null>(null);
+  const lastProjectStatsFrameAtRef = useRef(0);
   const [statsStreamError, setStatsStreamError] = useState<string | null>(null);
   const [chartPoints, setChartPoints] = useState<DashboardChartPoint[]>([]);
   const [latestSamples, setLatestSamples] = useState<
     Record<string, StatsSample>
   >({});
+  const latestSamplesRef = useRef<Record<string, StatsSample>>({});
   const [liveGPU, setLiveGPU] = useState<GPUMetrics | null>(null);
   const [containerSparks, setContainerSparks] = useState<
     Record<string, SparkPoint[]>
@@ -1389,7 +1401,12 @@ function App() {
     setProjectsError(null);
     try {
       const nextProjects = await ProjectService.RefreshProjects();
-      setProjects(nextProjects ?? []);
+      setProjects(
+        applyStatsSamplesToProjects(
+          nextProjects ?? [],
+          Object.values(latestSamplesRef.current),
+        ),
+      );
       setProjectsStatus("ready");
     } catch (error: unknown) {
       setProjectsError(
@@ -1407,7 +1424,12 @@ function App() {
       if (!detail) {
         throw new Error("Project was not found");
       }
-      setProjectDetail(detail);
+      setProjectDetail(
+        applyStatsSamplesToProjectDetail(
+          detail,
+          Object.values(latestSamplesRef.current),
+        ),
+      );
       setProjectDetailStatus("ready");
     } catch (error: unknown) {
       setProjectDetail(null);
@@ -2201,13 +2223,19 @@ function App() {
         return;
       }
       const label = sampleLabel(samples[0]);
-      setLatestSamples((current) => {
-        const next = { ...current };
-        for (const sample of samples) {
-          next[sample.containerID] = sample;
-        }
-        return next;
-      });
+      const receivedAt = Date.now();
+      const shouldUpdateProjectFrame =
+        receivedAt - lastProjectStatsFrameAtRef.current >= projectStatsFrameMs;
+      const mergedSamples = mergeStatsSamples(
+        latestSamplesRef.current,
+        samples,
+      );
+      const allSamples = Object.values(mergedSamples);
+      latestSamplesRef.current = mergedSamples;
+      useInventoryStore.setState((current) => ({
+        containers: applyStatsSamplesToContainers(current.containers, samples),
+      }));
+      setLatestSamples(mergedSamples);
       setContainerSparks((current) =>
         appendSparkEntries(
           current,
@@ -2218,16 +2246,29 @@ function App() {
           })),
         ),
       );
-      setProjectSparks((current) =>
-        appendSparkEntries(current, projectSparkEntries(samples, label)),
-      );
-      setProjectMetricSparks((current) =>
-        appendProjectMetricSparkEntries(current, samples, label),
-      );
-      if (!chartPausedRef.current) {
-        setChartPoints((current) =>
-          trimChartPoints(current.concat(aggregateChartPoint(samples, label))),
+      if (shouldUpdateProjectFrame) {
+        lastProjectStatsFrameAtRef.current = receivedAt;
+        setProjects((current) =>
+          applyStatsSamplesToProjects(current, allSamples),
         );
+        setProjectDetail((current) =>
+          current
+            ? applyStatsSamplesToProjectDetail(current, allSamples)
+            : current,
+        );
+        setProjectSparks((current) =>
+          appendSparkEntries(current, projectSparkEntries(allSamples, label)),
+        );
+        setProjectMetricSparks((current) =>
+          appendProjectMetricSparkEntries(current, allSamples, label),
+        );
+        if (!chartPausedRef.current) {
+          setChartPoints((current) =>
+            trimChartPoints(
+              current.concat(aggregateChartPoint(allSamples, label)),
+            ),
+          );
+        }
       }
     });
     return () => off();
@@ -2236,7 +2277,9 @@ function App() {
   useEffect(() => {
     if (!dockerRunning) {
       statsStreamIDRef.current = null;
+      lastProjectStatsFrameAtRef.current = 0;
       setStatsStreamError(null);
+      latestSamplesRef.current = {};
       setLatestSamples({});
       setContainerSparks({});
       setProjectSparks({});
@@ -3036,12 +3079,16 @@ function App() {
     try {
       const nextProjects = await ProjectService.RefreshProjects();
       const detected = nextProjects ?? [];
-      setProjects(detected);
+      const liveDetected = applyStatsSamplesToProjects(
+        detected,
+        Object.values(latestSamplesRef.current),
+      );
+      setProjects(liveDetected);
       setProjectsStatus("ready");
       setSetup((current) => ({
         ...current,
-        detectedProjects: detected,
-        selectedProjectIDs: detected.map((project) => project.id),
+        detectedProjects: liveDetected,
+        selectedProjectIDs: liveDetected.map((project) => project.id),
         detectingProjects: false,
       }));
     } catch (error: unknown) {
@@ -3323,10 +3370,27 @@ function App() {
           await DockerService.StopContainer(container.id, 10);
         } else if (action === "restart") {
           await DockerService.RestartContainer(container.id, 10);
-        } else {
+        } else if (action === "kill") {
           const plan = await DockerService.PlanKillContainer(container.id);
           if (!plan) {
             throw new Error("Kill plan was empty");
+          }
+          setConfirm({
+            open: true,
+            plan,
+            planKind: "container",
+            targetName: container.name,
+            typedName: "",
+            busy: false,
+          });
+          return;
+        } else {
+          const plan = await DockerService.PlanRemoveContainer(container.id, {
+            force: containerCanStop(container),
+            removeVolumes: false,
+          });
+          if (!plan) {
+            throw new Error("Remove plan was empty");
           }
           setConfirm({
             open: true,
@@ -3356,7 +3420,7 @@ function App() {
   );
 
   const runBulkContainerAction = useCallback(
-    async (action: Exclude<ContainerAction, "kill">) => {
+    async (action: Exclude<ContainerAction, "kill" | "remove">) => {
       if (!ensureDockerReady()) {
         return;
       }
@@ -4480,6 +4544,7 @@ function App() {
               onBackupVolume={openBackupVolume}
               onCheckUpdates={checkAllUpdates}
               onClearCommandOutput={clearProjectCommandOutput}
+              onContainerAction={runContainerAction}
               onDeleteBackup={openDeleteBackupPlan}
               onIgnoreUpdate={openIgnoreUpdate}
               onOpenContainerDetail={openContainerDetail}
@@ -4773,9 +4838,13 @@ function App() {
           }
           return (
             <ContainerDetailPage
+              actionBusyIDs={busyActionIDs}
               container={activeContainer}
               dockerRunning={dockerRunning}
               inventoryLoading={inventoryStatus === "loading"}
+              mutationsDisabled={mutationsDisabled}
+              mutationDisabledReason={mutationDisabledReason}
+              onAction={runContainerAction}
               onBack={closeContainerDetail}
               onOpenContainerTerminal={openContainerTerminal}
               onTabChange={setContainerDetailTab}
@@ -5137,14 +5206,20 @@ function App() {
             providerRepairNeeded={providerRepairNeeded}
             providerWarnings={providerWarnings}
           />
-          {actionError ? (
+          {parsedActionError ? (
             <div
               className="flex items-start gap-3 border-b border-error/20 bg-error/10 px-6 py-3 text-sm text-error"
               role="alert"
             >
               <AlertTriangle className="mt-0.5 shrink-0" size={16} />
-              <div className="max-h-32 min-w-0 flex-1 overflow-auto break-words font-mono text-xs leading-5">
-                {actionError}
+              <div className="max-h-40 min-w-0 flex-1 overflow-auto break-words leading-5">
+                <div className="font-semibold">{parsedActionError.title}</div>
+                <div className="mt-1 text-xs">{parsedActionError.body}</div>
+                {parsedActionError.detail ? (
+                  <pre className="mt-2 whitespace-pre-wrap font-mono text-xs">
+                    {parsedActionError.detail}
+                  </pre>
+                ) : null}
               </div>
               <Tooltip label="Dismiss error">
                 <Button
@@ -7318,11 +7393,19 @@ function ResourceUsagePanel({
   const title =
     metric === "cpu"
       ? `${(latest?.cpu ?? 0).toFixed(1)}% CPU`
-      : metric === "memory"
-        ? `${formatBytes(latest?.memory ?? 0)} memory`
-        : `${formatRate(latest?.netRx ?? 0)} RX / ${formatRate(latest?.netTx ?? 0)} TX`;
+      : metric === "gpu"
+        ? `${formatBytes(latest?.gpu ?? 0)} GPU memory`
+        : metric === "memory"
+          ? `${formatBytes(latest?.memory ?? 0)} memory`
+          : `${formatRate(latest?.netRx ?? 0)} RX / ${formatRate(latest?.netTx ?? 0)} TX`;
   const Icon =
-    metric === "cpu" ? Cpu : metric === "memory" ? MemoryStick : Wifi;
+    metric === "cpu"
+      ? Cpu
+      : metric === "gpu"
+        ? Gauge
+        : metric === "memory"
+          ? MemoryStick
+          : Wifi;
   return (
     <Card>
       <CardHeader
@@ -7374,7 +7457,7 @@ function ResourceUsagePanel({
             </div>
           </div>
           <div className="flex rounded-control border border-border bg-bg-inset p-0.5">
-            {(["cpu", "memory", "network"] as DashboardMetricID[]).map(
+            {(["cpu", "gpu", "memory", "network"] as DashboardMetricID[]).map(
               (item) => (
                 <button
                   className={[
@@ -7416,7 +7499,7 @@ function ResourceUsagePanel({
                 stroke={chartColors.axis}
                 tick={{ fontSize: 11 }}
                 tickFormatter={(value) =>
-                  metric === "memory"
+                  metric === "memory" || metric === "gpu"
                     ? formatBytes(Number(value))
                     : metric === "network"
                       ? formatRate(Number(value))
@@ -7447,6 +7530,18 @@ function ResourceUsagePanel({
                   isAnimationActive={false}
                   name="Memory"
                   stroke={chartColors.memory}
+                  strokeWidth={2}
+                  type="monotone"
+                />
+              ) : null}
+              {metric === "gpu" ? (
+                <Area
+                  dataKey="gpu"
+                  fill={chartColors.gpu}
+                  fillOpacity={0.2}
+                  isAnimationActive={false}
+                  name="GPU memory"
+                  stroke={chartColors.gpu}
                   strokeWidth={2}
                   type="monotone"
                 />
@@ -7680,6 +7775,7 @@ function ContainerHealthPanel({
                 <th className="px-3 py-2 text-left font-medium">Status</th>
                 <th className="px-3 py-2 text-left font-medium">CPU</th>
                 <th className="px-3 py-2 text-left font-medium">Memory</th>
+                <th className="px-3 py-2 text-left font-medium">GPU</th>
                 <th className="px-3 py-2 text-left font-medium">Uptime</th>
               </tr>
             </thead>
@@ -7723,6 +7819,13 @@ function ContainerHealthPanel({
                     <td className="truncate px-3 py-2 text-text-muted">
                       {formatBytes(
                         sample?.memoryBytes ?? container.memoryBytes,
+                      )}
+                    </td>
+                    <td className="truncate px-3 py-2 text-text-muted">
+                      {formatGPUUsage(
+                        sample?.gpuMemoryBytes ?? container.gpuMemoryBytes,
+                        sample?.gpuUtilizationPercent ??
+                          container.gpuUtilizationPercent,
                       )}
                     </td>
                     <td className="truncate px-3 py-2 text-text-muted">
@@ -10003,13 +10106,20 @@ function ProjectCard({
           </div>
         </div>
 
-        <div className="grid grid-cols-3 gap-2 text-sm">
+        <div className="grid grid-cols-2 gap-2 text-sm xl:grid-cols-4">
           <MiniMetric
             label="Services"
             value={`${project.servicesRunning}/${project.servicesTotal}`}
           />
           <MiniMetric label="CPU" value={`${project.cpuPercent.toFixed(1)}%`} />
           <MiniMetric label="RAM" value={formatBytes(project.memoryBytes)} />
+          <MiniMetric
+            label="GPU"
+            value={formatGPUUsage(
+              project.gpuMemoryBytes,
+              project.gpuUtilizationPercent,
+            )}
+          />
         </div>
 
         <div className="h-10 overflow-hidden rounded-control border border-border bg-bg-inset px-2 py-2">
@@ -10218,6 +10328,17 @@ function ProjectList({
           sortable: true,
         },
         {
+          id: "gpu",
+          header: "GPU",
+          render: (project) =>
+            formatGPUUsage(
+              project.gpuMemoryBytes,
+              project.gpuUtilizationPercent,
+            ),
+          sortValue: (project) => project.gpuMemoryBytes ?? 0,
+          sortable: true,
+        },
+        {
           id: "ports",
           header: "Ports",
           render: (project) => <PortList ports={project.ports ?? []} />,
@@ -10420,6 +10541,7 @@ function ProjectDetailPage({
   onBackupVolume,
   onCheckUpdates,
   onClearCommandOutput,
+  onContainerAction,
   onIgnoreUpdate,
   onOpenContainerDetail,
   onOpenContainerTerminal,
@@ -10457,6 +10579,10 @@ function ProjectDetailPage({
   onBackupVolume: (volume: VolumeSummary) => void;
   onCheckUpdates: () => void;
   onClearCommandOutput: (projectID: string) => void;
+  onContainerAction: (
+    action: ContainerAction,
+    container: ContainerSummary,
+  ) => void;
   onIgnoreUpdate: (update: ImageUpdate) => void;
   onOpenContainerDetail: (
     container: ContainerSummary,
@@ -10641,7 +10767,12 @@ function ProjectDetailPage({
 
       {tab === "overview" ? (
         <ProjectOverviewTab
+          actionBusyIDs={actionBusyIDs}
           detail={detail}
+          dockerRunning={dockerRunning}
+          mutationsDisabled={mutationsDisabled}
+          mutationDisabledReason={mutationDisabledReason}
+          onAction={onContainerAction}
           onOpenContainerDrilldown={openContainerDrilldown}
         />
       ) : null}
@@ -10653,8 +10784,12 @@ function ProjectDetailPage({
       ) : null}
       {tab === "containers" ? (
         <ProjectContainersTab
+          actionBusyIDs={actionBusyIDs}
           detail={detail}
           dockerRunning={dockerRunning}
+          mutationsDisabled={mutationsDisabled}
+          mutationDisabledReason={mutationDisabledReason}
+          onAction={onContainerAction}
           onOpenContainerDrilldown={openContainerDrilldown}
           onOpenContainerTerminal={onOpenContainerTerminal}
         />
@@ -10932,10 +11067,20 @@ function ServiceNameButton({
 }
 
 function ProjectOverviewTab({
+  actionBusyIDs,
   detail,
+  dockerRunning,
+  mutationsDisabled,
+  mutationDisabledReason,
+  onAction,
   onOpenContainerDrilldown,
 }: {
+  actionBusyIDs: Set<string>;
   detail: ProjectDetail;
+  dockerRunning: boolean;
+  mutationsDisabled: boolean;
+  mutationDisabledReason: string;
+  onAction: (action: ContainerAction, container: ContainerSummary) => void;
   onOpenContainerDrilldown: (
     container: ContainerSummary,
     tab?: ContainerDrilldownTabID,
@@ -10944,6 +11089,10 @@ function ProjectOverviewTab({
   const project = detail.summary;
   const services = detail.services ?? [];
   const containers = detail.containers ?? [];
+  const actionDisabled = mutationsDisabled || !dockerRunning;
+  const actionDisabledReason = mutationsDisabled
+    ? mutationDisabledReason
+    : "Docker engine is not running";
   return (
     <div className="space-y-4">
       <div className="grid gap-3 md:grid-cols-4">
@@ -10991,7 +11140,7 @@ function ProjectOverviewTab({
                     {service.status || "unknown"}
                   </Badge>
                 </div>
-                <div className="grid grid-cols-3 gap-2">
+                <div className="grid grid-cols-2 gap-2 xl:grid-cols-4">
                   <MiniMetric
                     label="Replicas"
                     value={`${service.running}/${service.replicas}`}
@@ -11004,6 +11153,13 @@ function ProjectOverviewTab({
                     label="RAM"
                     value={formatBytes(service.memoryBytes ?? 0)}
                   />
+                  <MiniMetric
+                    label="GPU"
+                    value={formatGPUUsage(
+                      service.gpuMemoryBytes,
+                      service.gpuUtilizationPercent,
+                    )}
+                  />
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
                   <Badge tone={healthTone(service.health)}>
@@ -11011,6 +11167,16 @@ function ProjectOverviewTab({
                   </Badge>
                   <PortList ports={service.ports ?? []} />
                 </div>
+                {drilldownContainer ? (
+                  <ContainerControlActions
+                    actionBusyIDs={actionBusyIDs}
+                    container={drilldownContainer}
+                    mutationsDisabled={actionDisabled}
+                    mutationDisabledReason={actionDisabledReason}
+                    onAction={onAction}
+                    showKill={false}
+                  />
+                ) : null}
               </CardBody>
             </Card>
           );
@@ -11087,6 +11253,31 @@ function ProjectServicesTab({
           header: "Ports",
           render: (service) => <PortList ports={service.ports ?? []} />,
         },
+        {
+          id: "cpu",
+          header: "CPU",
+          render: (service) => `${(service.cpuPercent ?? 0).toFixed(1)}%`,
+          sortValue: (service) => service.cpuPercent ?? 0,
+          sortable: true,
+        },
+        {
+          id: "ram",
+          header: "RAM",
+          render: (service) => formatBytes(service.memoryBytes ?? 0),
+          sortValue: (service) => service.memoryBytes ?? 0,
+          sortable: true,
+        },
+        {
+          id: "gpu",
+          header: "GPU",
+          render: (service) =>
+            formatGPUUsage(
+              service.gpuMemoryBytes,
+              service.gpuUtilizationPercent,
+            ),
+          sortValue: (service) => service.gpuMemoryBytes ?? 0,
+          sortable: true,
+        },
       ]}
       empty={
         <EmptyState
@@ -11102,13 +11293,21 @@ function ProjectServicesTab({
 }
 
 function ProjectContainersTab({
+  actionBusyIDs,
   detail,
   dockerRunning,
+  mutationsDisabled,
+  mutationDisabledReason,
+  onAction,
   onOpenContainerDrilldown,
   onOpenContainerTerminal,
 }: {
+  actionBusyIDs: Set<string>;
   detail: ProjectDetail;
   dockerRunning: boolean;
+  mutationsDisabled: boolean;
+  mutationDisabledReason: string;
+  onAction: (action: ContainerAction, container: ContainerSummary) => void;
   onOpenContainerDrilldown: (
     container: ContainerSummary,
     tab?: ContainerDrilldownTabID,
@@ -11116,6 +11315,10 @@ function ProjectContainersTab({
   onOpenContainerTerminal: (container: ContainerSummary) => void;
 }) {
   const containers = detail.containers ?? [];
+  const actionDisabled = mutationsDisabled || !dockerRunning;
+  const actionDisabledReason = mutationsDisabled
+    ? mutationDisabledReason
+    : "Docker engine is not running";
 
   return (
     <div className="space-y-4">
@@ -11168,10 +11371,44 @@ function ProjectContainersTab({
             render: (container) => <PortList ports={container.ports ?? []} />,
           },
           {
+            id: "cpu",
+            header: "CPU",
+            render: (container) => `${(container.cpuPercent ?? 0).toFixed(1)}%`,
+            sortValue: (container) => container.cpuPercent ?? 0,
+            sortable: true,
+          },
+          {
+            id: "ram",
+            header: "RAM",
+            render: (container) =>
+              formatMemory(container.memoryBytes, container.memoryLimit),
+            sortValue: (container) => container.memoryBytes ?? 0,
+            sortable: true,
+          },
+          {
+            id: "gpu",
+            header: "GPU",
+            render: (container) =>
+              formatGPUUsage(
+                container.gpuMemoryBytes,
+                container.gpuUtilizationPercent,
+              ),
+            sortValue: (container) => container.gpuMemoryBytes ?? 0,
+            sortable: true,
+          },
+          {
             id: "actions",
             header: "Actions",
             render: (container) => (
               <div className="flex justify-end gap-1">
+                <ContainerControlActions
+                  actionBusyIDs={actionBusyIDs}
+                  container={container}
+                  mutationsDisabled={actionDisabled}
+                  mutationDisabledReason={actionDisabledReason}
+                  onAction={onAction}
+                  showKill={false}
+                />
                 <Tooltip label="Open logs">
                   <Button
                     aria-label={`Open logs for ${container.name}`}
@@ -12248,9 +12485,13 @@ function MiniMetric({ label, value }: { label: string; value: string }) {
 }
 
 function ContainerDetailPage({
+  actionBusyIDs,
   container,
   dockerRunning,
   inventoryLoading,
+  mutationsDisabled,
+  mutationDisabledReason,
+  onAction,
   onBack,
   onOpenContainerTerminal,
   onTabChange,
@@ -12259,18 +12500,26 @@ function ContainerDetailPage({
   projectsLoading,
   tab,
 }: {
+  actionBusyIDs: Set<string>;
   container: ContainerSummary;
   dockerRunning: boolean;
   inventoryLoading: boolean;
+  mutationsDisabled: boolean;
+  mutationDisabledReason: string;
   project: ProjectSummary | null;
   projectsLoading: boolean;
   tab: ContainerDrilldownTabID;
+  onAction: (action: ContainerAction, container: ContainerSummary) => void;
   onBack: () => void;
   onOpenContainerTerminal: (container: ContainerSummary) => void;
   onTabChange: (tab: ContainerDrilldownTabID) => void;
   onToast: (toast: ToastInput) => void;
 }) {
   const projectLabel = project?.name ?? container.projectID ?? "Ungrouped";
+  const actionDisabled = mutationsDisabled || !dockerRunning;
+  const actionDisabledReason = mutationsDisabled
+    ? mutationDisabledReason
+    : "Docker engine is not running";
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-start justify-between gap-3">
@@ -12292,6 +12541,14 @@ function ContainerDetailPage({
           </div>
         </div>
         <div className="flex flex-wrap justify-end gap-2">
+          <ContainerControlActions
+            actionBusyIDs={actionBusyIDs}
+            container={container}
+            labels
+            mutationsDisabled={actionDisabled}
+            mutationDisabledReason={actionDisabledReason}
+            onAction={onAction}
+          />
           <Button
             disabled={!dockerRunning}
             disabledReason="Docker engine is not running"
@@ -12329,7 +12586,7 @@ type ContainersPageProps = {
   selectedIDs: Set<string>;
   actionBusyIDs: Set<string>;
   onAction: (action: ContainerAction, container: ContainerSummary) => void;
-  onBulkAction: (action: Exclude<ContainerAction, "kill">) => void;
+  onBulkAction: (action: Exclude<ContainerAction, "kill" | "remove">) => void;
   onFilterChange: (filter: FilterID) => void;
   onInspect: (container: ContainerSummary) => void;
   onOpen: (container: ContainerSummary) => void;
@@ -12462,6 +12719,19 @@ function ContainersPage({
               formatMemory(container.memoryBytes, container.memoryLimit),
             sortable: true,
             sortValue: (container) => container.memoryBytes ?? 0,
+          },
+          {
+            id: "gpu",
+            header: "GPU",
+            defaultWidth: 120,
+            minWidth: 100,
+            render: (container) =>
+              formatGPUUsage(
+                container.gpuMemoryBytes,
+                container.gpuUtilizationPercent,
+              ),
+            sortable: true,
+            sortValue: (container) => container.gpuMemoryBytes ?? 0,
           },
           {
             id: "health",
@@ -13401,6 +13671,18 @@ function NetworkContainersTab({
           sortValue: (container) => container.memoryBytes ?? 0,
         },
         {
+          id: "gpu",
+          header: "GPU",
+          defaultWidth: 110,
+          render: (container) =>
+            formatGPUUsage(
+              container.gpuMemoryBytes,
+              container.gpuUtilizationPercent,
+            ),
+          sortable: true,
+          sortValue: (container) => container.gpuMemoryBytes ?? 0,
+        },
+        {
           id: "io",
           header: "Network IO",
           defaultWidth: 180,
@@ -13708,6 +13990,132 @@ function ImageRowActions({
   );
 }
 
+function containerCanStop(container: ContainerSummary) {
+  return (
+    container.state === "running" ||
+    container.state === "paused" ||
+    container.state === "restarting"
+  );
+}
+
+function containerCanStart(container: ContainerSummary) {
+  return container.state !== "running" && container.state !== "restarting";
+}
+
+function ContainerControlActions({
+  actionBusyIDs,
+  className = "",
+  container,
+  labels = false,
+  mutationsDisabled,
+  mutationDisabledReason,
+  onAction,
+  showKill = true,
+  showRemove = true,
+}: {
+  actionBusyIDs: Set<string>;
+  className?: string;
+  container: ContainerSummary;
+  labels?: boolean;
+  mutationsDisabled: boolean;
+  mutationDisabledReason: string;
+  onAction: (action: ContainerAction, container: ContainerSummary) => void;
+  showKill?: boolean;
+  showRemove?: boolean;
+}) {
+  const canStart = containerCanStart(container);
+  const canStop = containerCanStop(container);
+  const primaryAction: ContainerAction = canStart ? "start" : "stop";
+  const primaryLabel = canStart ? "Start" : "Stop";
+  const size = labels ? "sm" : "icon";
+
+  const disabledFor = (
+    action: ContainerAction,
+    label: string,
+    blocked = false,
+    blockedReason = "",
+  ) => {
+    if (mutationsDisabled) {
+      return mutationDisabledReason;
+    }
+    if (blocked) {
+      return blockedReason;
+    }
+    if (actionBusyIDs.has(`${action}:${container.id}`)) {
+      return `${label} is already running`;
+    }
+    return "";
+  };
+  const renderAction = (
+    action: ContainerAction,
+    label: string,
+    icon: ReactNode,
+    options: {
+      blocked?: boolean;
+      blockedReason?: string;
+      variant?: "secondary" | "ghost" | "danger";
+    } = {},
+  ) => {
+    const disabledReason = disabledFor(
+      action,
+      label,
+      options.blocked,
+      options.blockedReason,
+    );
+    const button = (
+      <Button
+        aria-label={`${label} ${container.name}`}
+        disabled={Boolean(disabledReason)}
+        disabledReason={disabledReason}
+        icon={icon}
+        loading={actionBusyIDs.has(`${action}:${container.id}`)}
+        onClick={() => onAction(action, container)}
+        size={size}
+        variant={options.variant ?? "secondary"}
+      >
+        {labels ? label : null}
+      </Button>
+    );
+    return labels ? (
+      button
+    ) : (
+      <Tooltip label={label} key={action}>
+        {button}
+      </Tooltip>
+    );
+  };
+
+  return (
+    <div
+      className={["flex flex-wrap items-center justify-end gap-1", className]
+        .filter(Boolean)
+        .join(" ")}
+    >
+      {renderAction(
+        primaryAction,
+        primaryLabel,
+        primaryAction === "start" ? <Play size={15} /> : <Square size={15} />,
+      )}
+      {renderAction("restart", "Restart", <RotateCw size={15} />, {
+        blocked: !canStop,
+        blockedReason: "Container is not running",
+      })}
+      {showKill
+        ? renderAction("kill", "Kill", <Skull size={15} />, {
+            blocked: !canStop,
+            blockedReason: "Container is not running",
+            variant: "danger",
+          })
+        : null}
+      {showRemove
+        ? renderAction("remove", "Delete", <Trash2 size={15} />, {
+            variant: "danger",
+          })
+        : null}
+    </div>
+  );
+}
+
 function ContainerRowActions({
   busyIDs,
   container,
@@ -13725,64 +14133,15 @@ function ContainerRowActions({
   onInspect: (container: ContainerSummary) => void;
   onRename: (container: ContainerSummary) => void;
 }) {
-  const canStop =
-    container.state === "running" ||
-    container.state === "paused" ||
-    container.state === "restarting";
-  const canStart =
-    container.state !== "running" && container.state !== "restarting";
   return (
     <div className="flex justify-end gap-1">
-      <Tooltip label={canStart ? "Start" : "Stop"}>
-        <Button
-          aria-label={`${canStart ? "Start" : "Stop"} ${container.name}`}
-          disabled={
-            mutationsDisabled ||
-            busyIDs.has(`${canStart ? "start" : "stop"}:${container.id}`)
-          }
-          disabledReason={mutationDisabledReason}
-          icon={canStart ? <Play size={15} /> : <Square size={15} />}
-          onClick={() => onAction(canStart ? "start" : "stop", container)}
-          size="icon"
-          variant="ghost"
-        />
-      </Tooltip>
-      <Tooltip label="Restart">
-        <Button
-          aria-label={`Restart ${container.name}`}
-          disabled={
-            mutationsDisabled ||
-            !canStop ||
-            busyIDs.has(`restart:${container.id}`)
-          }
-          disabledReason={
-            mutationsDisabled
-              ? mutationDisabledReason
-              : "Container is not running"
-          }
-          icon={<RotateCw size={15} />}
-          onClick={() => onAction("restart", container)}
-          size="icon"
-          variant="ghost"
-        />
-      </Tooltip>
-      <Tooltip label="Kill">
-        <Button
-          aria-label={`Kill ${container.name}`}
-          disabled={
-            mutationsDisabled || !canStop || busyIDs.has(`kill:${container.id}`)
-          }
-          disabledReason={
-            mutationsDisabled
-              ? mutationDisabledReason
-              : "Container is not running"
-          }
-          icon={<Skull size={15} />}
-          onClick={() => onAction("kill", container)}
-          size="icon"
-          variant="ghost"
-        />
-      </Tooltip>
+      <ContainerControlActions
+        actionBusyIDs={busyIDs}
+        container={container}
+        mutationsDisabled={mutationsDisabled}
+        mutationDisabledReason={mutationDisabledReason}
+        onAction={onAction}
+      />
       <Tooltip label="Rename">
         <Button
           aria-label={`Rename ${container.name}`}
@@ -13812,7 +14171,7 @@ function ContainerBulkActions({
   busyIDs: Set<string>;
   mutationsDisabled: boolean;
   mutationDisabledReason: string;
-  onAction: (action: Exclude<ContainerAction, "kill">) => void;
+  onAction: (action: Exclude<ContainerAction, "kill" | "remove">) => void;
 }) {
   return (
     <div className="flex items-center gap-1">
@@ -17418,6 +17777,7 @@ function aggregateChartPoint(
     ts: Date.now(),
     label,
     cpu: samples.reduce((sum, sample) => sum + sample.cpuPercent, 0),
+    gpu: samples.reduce((sum, sample) => sum + (sample.gpuMemoryBytes ?? 0), 0),
     memory: samples.reduce((sum, sample) => sum + sample.memoryBytes, 0),
     netRx: samples.reduce((sum, sample) => sum + sample.networkRxRate, 0),
     netTx: samples.reduce((sum, sample) => sum + sample.networkTxRate, 0),
@@ -17448,8 +17808,198 @@ function appendSparkEntries(
   return next;
 }
 
+type SampleAggregate = {
+  cpuPercent: number;
+  gpuDeviceIDs: Set<string>;
+  gpuMemoryBytes: number;
+  gpuUtilizationPercent: number;
+  memoryBytes: number;
+  netRxRate: number;
+  netTxRate: number;
+};
+
+function newSampleAggregate(): SampleAggregate {
+  return {
+    cpuPercent: 0,
+    gpuDeviceIDs: new Set<string>(),
+    gpuMemoryBytes: 0,
+    gpuUtilizationPercent: 0,
+    memoryBytes: 0,
+    netRxRate: 0,
+    netTxRate: 0,
+  };
+}
+
+function addSampleToAggregate(aggregate: SampleAggregate, sample: StatsSample) {
+  aggregate.cpuPercent += sample.cpuPercent;
+  aggregate.gpuMemoryBytes += sample.gpuMemoryBytes ?? 0;
+  aggregate.gpuUtilizationPercent += sample.gpuUtilizationPercent ?? 0;
+  aggregate.memoryBytes += sample.memoryBytes;
+  aggregate.netRxRate += sample.networkRxRate;
+  aggregate.netTxRate += sample.networkTxRate;
+  for (const deviceID of sample.gpuDeviceIDs ?? []) {
+    if (deviceID) {
+      aggregate.gpuDeviceIDs.add(deviceID);
+    }
+  }
+}
+
+function aggregateDeviceIDs(aggregate: SampleAggregate) {
+  return Array.from(aggregate.gpuDeviceIDs).sort();
+}
+
+function mergeStatsSamples(
+  current: Record<string, StatsSample>,
+  samples: StatsSample[],
+) {
+  const next = { ...current };
+  for (const sample of samples) {
+    next[sample.containerID] = sample;
+  }
+  return next;
+}
+
+function applyStatsSamplesToContainers(
+  containers: ContainerSummary[],
+  samples: StatsSample[],
+) {
+  const byID = new Map(samples.map((sample) => [sample.containerID, sample]));
+  let changed = false;
+  const next = containers.map((container) => {
+    const sample = byID.get(container.id);
+    if (!sample) {
+      return container;
+    }
+    changed = true;
+    return {
+      ...container,
+      cpuPercent: sample.cpuPercent,
+      gpuDeviceIDs: sample.gpuDeviceIDs ?? [],
+      gpuMemoryBytes: sample.gpuMemoryBytes ?? 0,
+      gpuUtilizationPercent: sample.gpuUtilizationPercent ?? 0,
+      memoryBytes: sample.memoryBytes,
+      memoryLimit: sample.memoryLimitBytes ?? container.memoryLimit,
+      netRxRate: sample.networkRxRate,
+      netTxRate: sample.networkTxRate,
+      restarts: sample.restartCount ?? container.restarts,
+    };
+  });
+  return changed ? next : containers;
+}
+
+function projectAggregates(samples: StatsSample[]) {
+  const byProject = new Map<string, SampleAggregate>();
+  for (const sample of samples) {
+    if (!sample.projectID) {
+      continue;
+    }
+    const aggregate = byProject.get(sample.projectID) ?? newSampleAggregate();
+    addSampleToAggregate(aggregate, sample);
+    byProject.set(sample.projectID, aggregate);
+  }
+  return byProject;
+}
+
+function applyProjectAggregate(
+  project: ProjectSummary,
+  aggregate: SampleAggregate,
+): ProjectSummary {
+  return {
+    ...project,
+    cpuPercent: aggregate.cpuPercent,
+    gpuDeviceIDs: aggregateDeviceIDs(aggregate),
+    gpuMemoryBytes: aggregate.gpuMemoryBytes,
+    gpuUtilizationPercent: aggregate.gpuUtilizationPercent,
+    memoryBytes: aggregate.memoryBytes,
+    netRxRate: aggregate.netRxRate,
+    netTxRate: aggregate.netTxRate,
+  };
+}
+
+function applyStatsSamplesToProjects(
+  projects: ProjectSummary[],
+  samples: StatsSample[],
+) {
+  const byProject = projectAggregates(samples);
+  if (byProject.size === 0) {
+    return projects;
+  }
+  let changed = false;
+  const next = projects.map((project) => {
+    const aggregate = byProject.get(project.id);
+    if (!aggregate) {
+      return project;
+    }
+    changed = true;
+    return applyProjectAggregate(project, aggregate);
+  });
+  return changed ? next : projects;
+}
+
+function applyStatsSamplesToProjectDetail(
+  detail: ProjectDetail,
+  samples: StatsSample[],
+): ProjectDetail {
+  const projectID = detail.summary.id;
+  const projectSamples = samples.filter(
+    (sample) => sample.projectID === projectID,
+  );
+  if (projectSamples.length === 0) {
+    return detail;
+  }
+
+  const projectAggregate = projectAggregates(projectSamples).get(projectID);
+  const serviceAggregates = new Map<string, SampleAggregate>();
+  for (const sample of projectSamples) {
+    const serviceName = sampleServiceName(sample);
+    if (!serviceName) {
+      continue;
+    }
+    const aggregate =
+      serviceAggregates.get(serviceName) ?? newSampleAggregate();
+    addSampleToAggregate(aggregate, sample);
+    serviceAggregates.set(serviceName, aggregate);
+  }
+
+  return {
+    ...detail,
+    containers: applyStatsSamplesToContainers(
+      detail.containers ?? [],
+      projectSamples,
+    ),
+    services: (detail.services ?? []).map((service) => {
+      const aggregate = serviceAggregates.get(service.name);
+      if (!aggregate) {
+        return service;
+      }
+      return {
+        ...service,
+        cpuPercent: aggregate.cpuPercent,
+        gpuDeviceIDs: aggregateDeviceIDs(aggregate),
+        gpuMemoryBytes: aggregate.gpuMemoryBytes,
+        gpuUtilizationPercent: aggregate.gpuUtilizationPercent,
+        memoryBytes: aggregate.memoryBytes,
+      };
+    }),
+    summary: projectAggregate
+      ? applyProjectAggregate(detail.summary, projectAggregate)
+      : detail.summary,
+  };
+}
+
+function sampleServiceName(sample: StatsSample) {
+  if (!sample.serviceID) {
+    return "";
+  }
+  const marker = "::";
+  const markerIndex = sample.serviceID.lastIndexOf(marker);
+  return markerIndex >= 0
+    ? sample.serviceID.slice(markerIndex + marker.length)
+    : sample.serviceID;
+}
+
 function emptyProjectMetricSparks(): ProjectMetricSparks {
-  return { cpu: {}, memory: {}, network: {} };
+  return { cpu: {}, gpu: {}, memory: {}, network: {} };
 }
 
 function appendProjectMetricSparkEntries(
@@ -17461,6 +18011,10 @@ function appendProjectMetricSparkEntries(
     cpu: appendSparkEntries(
       current.cpu,
       projectSparkEntries(samples, label, "cpu"),
+    ),
+    gpu: appendSparkEntries(
+      current.gpu,
+      projectSparkEntries(samples, label, "gpu"),
     ),
     memory: appendSparkEntries(
       current.memory,
@@ -17498,6 +18052,8 @@ function statsSampleMetricValue(
   metric: DashboardMetricID,
 ) {
   switch (metric) {
+    case "gpu":
+      return sample.gpuMemoryBytes ?? 0;
     case "memory":
       return sample.memoryBytes;
     case "network":
@@ -17507,6 +18063,18 @@ function statsSampleMetricValue(
   }
 }
 
+function formatGPUUsage(memoryBytes?: number, utilizationPercent?: number) {
+  const memory = memoryBytes ?? 0;
+  const utilization = utilizationPercent ?? 0;
+  if (utilization > 0 && memory > 0) {
+    return `${utilization.toFixed(0)}% / ${formatBytes(memory)}`;
+  }
+  if (utilization > 0) {
+    return `${utilization.toFixed(0)}%`;
+  }
+  return formatBytes(memory);
+}
+
 function projectActivityScore(project: ProjectSummary, points?: SparkPoint[]) {
   const latest = points?.[points.length - 1]?.value ?? project.cpuPercent;
   return latest + project.memoryBytes / 1024 / 1024 / 1024;
@@ -17514,6 +18082,8 @@ function projectActivityScore(project: ProjectSummary, points?: SparkPoint[]) {
 
 function dashboardMetricColor(metric: DashboardMetricID) {
   switch (metric) {
+    case "gpu":
+      return chartColors.gpu;
     case "memory":
       return chartColors.memory;
     case "network":
@@ -17525,6 +18095,8 @@ function dashboardMetricColor(metric: DashboardMetricID) {
 
 function dashboardMetricLabel(metric: DashboardMetricID) {
   switch (metric) {
+    case "gpu":
+      return "GPU memory";
     case "memory":
       return "memory";
     case "network":
@@ -17551,7 +18123,7 @@ function formatMetricValue(
   value: number,
   key?: string,
 ) {
-  if (metric === "memory") {
+  if (metric === "memory" || metric === "gpu") {
     return formatBytes(value);
   }
   if (metric === "network" || key === "netRx" || key === "netTx") {
@@ -18156,6 +18728,12 @@ function containerRows(container: ContainerSummary): Array<[string, string]> {
     ["Health", container.health],
     ["Project", container.projectID ?? "-"],
     ["Service", container.service ?? "-"],
+    ["CPU", `${(container.cpuPercent ?? 0).toFixed(1)}%`],
+    ["Memory", formatMemory(container.memoryBytes, container.memoryLimit)],
+    [
+      "GPU",
+      formatGPUUsage(container.gpuMemoryBytes, container.gpuUtilizationPercent),
+    ],
     ["Created", formatDate(container.createdAt)],
     ["Restarts", String(container.restarts ?? 0)],
   ];

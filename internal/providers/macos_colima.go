@@ -44,6 +44,7 @@ type MacOSColimaProvider struct {
 	runner   CommandRunner
 	homeDir  string
 
+	configMu     sync.RWMutex
 	installMu    sync.Mutex
 	installPlans map[string]colimaInstallPlan
 }
@@ -88,6 +89,8 @@ func NewMacOSColima(opts MacOSColimaOptions) *MacOSColimaProvider {
 }
 
 func (p *MacOSColimaProvider) SetColimaConfig(profile string, cpu, memoryGB, diskGB int) {
+	p.configMu.Lock()
+	defer p.configMu.Unlock()
 	p.profile = strings.TrimSpace(profile)
 	if cpu > 0 {
 		p.cpu = cpu
@@ -524,6 +527,8 @@ func (p *MacOSColimaProvider) detectHomebrewUpdates(ctx context.Context) ([]stri
 }
 
 func (p *MacOSColimaProvider) configuredProfile() string {
+	p.configMu.RLock()
+	defer p.configMu.RUnlock()
 	if strings.TrimSpace(p.profile) != "" {
 		return strings.TrimSpace(p.profile)
 	}
@@ -531,6 +536,8 @@ func (p *MacOSColimaProvider) configuredProfile() string {
 }
 
 func (p *MacOSColimaProvider) configuredCPU() int {
+	p.configMu.RLock()
+	defer p.configMu.RUnlock()
 	if p.cpu > 0 {
 		return p.cpu
 	}
@@ -538,6 +545,8 @@ func (p *MacOSColimaProvider) configuredCPU() int {
 }
 
 func (p *MacOSColimaProvider) configuredMemoryGB() int {
+	p.configMu.RLock()
+	defer p.configMu.RUnlock()
 	if p.memoryGB > 0 {
 		return p.memoryGB
 	}
@@ -545,6 +554,8 @@ func (p *MacOSColimaProvider) configuredMemoryGB() int {
 }
 
 func (p *MacOSColimaProvider) configuredDiskGB() int {
+	p.configMu.RLock()
+	defer p.configMu.RUnlock()
 	if p.diskGB > 0 {
 		return p.diskGB
 	}

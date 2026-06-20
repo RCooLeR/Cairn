@@ -49,6 +49,7 @@ func TestManagerStreamsPersistsAndRanksSamples(t *testing.T) {
 			statsResponse(now, 100, 1000, 100, 100, 0),
 			statsResponse(now.Add(3*time.Second), 300, 2000, 250, 200, 4096),
 		}},
+		processPIDs: map[string][]int{"c1": {4242}},
 	}
 	events := bus.New()
 	defer events.Close()
@@ -66,7 +67,14 @@ func TestManagerStreamsPersistsAndRanksSamples(t *testing.T) {
 				Source:             "test",
 				DeviceCount:        1,
 				UtilizationPercent: 12,
-				CheckedAt:          now,
+				Devices:            []models.GPUDeviceMetric{{ID: "0", UUID: "GPU-0"}},
+				Processes: []models.GPUProcessMetric{{
+					PID:         4242,
+					DeviceID:    "0",
+					DeviceUUID:  "GPU-0",
+					MemoryBytes: 2 * 1024 * 1024 * 1024,
+				}},
+				CheckedAt: now,
 			}
 		}),
 	})
@@ -104,6 +112,9 @@ func TestManagerStreamsPersistsAndRanksSamples(t *testing.T) {
 	if sample.ProjectID != "linux_native/demo" || sample.ServiceID != "linux_native/demo::web" || sample.RestartCount != 2 {
 		t.Fatalf("sample metadata = %#v", sample)
 	}
+	if sample.GPUMemoryBytes != 2*1024*1024*1024 || len(sample.GPUDeviceIDs) != 1 || sample.GPUDeviceIDs[0] != "0" {
+		t.Fatalf("sample GPU attribution = %#v", sample)
+	}
 
 	dashboard, err := manager.GetDashboardMetrics(ctx)
 	if err != nil {
@@ -111,6 +122,9 @@ func TestManagerStreamsPersistsAndRanksSamples(t *testing.T) {
 	}
 	if dashboard.Containers != 1 || len(dashboard.Top) != 1 || dashboard.Top[0].ID != "c1" {
 		t.Fatalf("dashboard = %#v", dashboard)
+	}
+	if dashboard.Top[0].GPUMemoryBytes != 2*1024*1024*1024 {
+		t.Fatalf("dashboard top GPU memory = %d", dashboard.Top[0].GPUMemoryBytes)
 	}
 
 	manager.StopAll()
@@ -342,6 +356,156 @@ func TestManagerQueriesStopsFallbackAndScopes(t *testing.T) {
 	}
 }
 
+func TestManagerAttributesGPUProcessesToContainers(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	docker := &fakeMetricsDocker{
+		containers: []models.ContainerSummary{{
+			ID:        "c1",
+			Name:      "ollama",
+			State:     "running",
+			ProjectID: "linux_native/ai",
+			Service:   "llm",
+		}},
+		processPIDs: map[string][]int{"c1": {4242}},
+	}
+	manager := NewManager(docker, nil, nil, nil, nil, Options{Now: func() time.Time { return now }})
+	manager.ensureReady()
+	manager.containers["c1"] = docker.containers[0]
+
+	metrics := manager.attributeGPUMetrics(ctx, models.GPUMetrics{
+		Available:          true,
+		UtilizationPercent: 37,
+		Devices:            []models.GPUDeviceMetric{{ID: "0", UUID: "GPU-0"}},
+		Processes: []models.GPUProcessMetric{{
+			PID:         4242,
+			DeviceID:    "0",
+			DeviceUUID:  "GPU-0",
+			MemoryBytes: 3 * 1024 * 1024 * 1024,
+		}},
+	})
+
+	if len(metrics.Processes) != 1 {
+		t.Fatalf("process count = %d, want 1", len(metrics.Processes))
+	}
+	process := metrics.Processes[0]
+	if process.ContainerID != "c1" || process.ProjectID != "linux_native/ai" || process.Service != "llm" {
+		t.Fatalf("attributed process = %#v", process)
+	}
+	sample, ok := manager.buildSample("c1", statsResponse(now, 100, 1000, 100, 10, 10))
+	if !ok {
+		t.Fatal("buildSample() ok = false")
+	}
+	if sample.GPUMemoryBytes != 3*1024*1024*1024 {
+		t.Fatalf("sample GPU memory = %d", sample.GPUMemoryBytes)
+	}
+	if sample.GPULoadPercent != 37 {
+		t.Fatalf("sample GPU load = %.1f", sample.GPULoadPercent)
+	}
+	if len(sample.GPUDeviceIDs) != 1 || sample.GPUDeviceIDs[0] != "0" {
+		t.Fatalf("sample GPU devices = %#v", sample.GPUDeviceIDs)
+	}
+}
+
+func TestManagerAttributesGPUProcessesByContainerID(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	containerID := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	docker := &fakeMetricsDocker{
+		containers: []models.ContainerSummary{{
+			ID:        containerID,
+			Name:      "verity-ollama-1",
+			State:     "running",
+			ProjectID: "windows_wsl_ubuntu/verity",
+			Service:   "ollama",
+		}},
+	}
+	manager := NewManager(docker, nil, nil, nil, nil, Options{Now: func() time.Time { return now }})
+	manager.ensureReady()
+	manager.containers[containerID] = docker.containers[0]
+
+	metrics := manager.attributeGPUMetrics(ctx, models.GPUMetrics{
+		Available:          true,
+		UtilizationPercent: 42,
+		Devices:            []models.GPUDeviceMetric{{ID: "0", UUID: "GPU-0"}},
+		Processes: []models.GPUProcessMetric{{
+			PID:         99999,
+			DeviceID:    "0",
+			DeviceUUID:  "GPU-0",
+			MemoryBytes: 5 * 1024 * 1024 * 1024,
+			ContainerID: containerID[:12],
+		}},
+	})
+
+	if len(metrics.Processes) != 1 {
+		t.Fatalf("process count = %d, want 1", len(metrics.Processes))
+	}
+	process := metrics.Processes[0]
+	if process.ContainerID != containerID || process.ProjectID != "windows_wsl_ubuntu/verity" || process.Service != "ollama" {
+		t.Fatalf("attributed process = %#v", process)
+	}
+	sample, ok := manager.buildSample(containerID, statsResponse(now, 100, 1000, 100, 10, 10))
+	if !ok {
+		t.Fatal("buildSample() ok = false")
+	}
+	if sample.GPUMemoryBytes != 5*1024*1024*1024 {
+		t.Fatalf("sample GPU memory = %d", sample.GPUMemoryBytes)
+	}
+	if sample.GPULoadPercent != 42 {
+		t.Fatalf("sample GPU load = %.1f", sample.GPULoadPercent)
+	}
+}
+
+func TestManagerAttributesSyntheticOllamaGPUProcess(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	now := time.Date(2026, 6, 19, 12, 0, 0, 0, time.UTC)
+	docker := &fakeMetricsDocker{
+		containers: []models.ContainerSummary{{
+			ID:        "ollama1",
+			Name:      "verity-ollama-1",
+			Image:     "ollama/ollama:latest",
+			State:     "running",
+			ProjectID: "windows_wsl_ubuntu/verity",
+			Service:   "ollama",
+			Ports:     []models.PortBinding{{HostPort: "11434", ContainerPort: "11434", Protocol: "tcp"}},
+		}},
+	}
+	manager := NewManager(docker, nil, nil, nil, nil, Options{Now: func() time.Time { return now }})
+	manager.ensureReady()
+	manager.containers["ollama1"] = docker.containers[0]
+
+	metrics := manager.attributeGPUMetrics(ctx, models.GPUMetrics{
+		Available:          true,
+		UtilizationPercent: 55,
+		Devices:            []models.GPUDeviceMetric{{ID: "0", UUID: "GPU-0"}},
+		Processes: []models.GPUProcessMetric{{
+			ProcessName: ollamaProcessName + ":gemma4:26b",
+			MemoryBytes: 16486770933,
+		}},
+	})
+
+	if len(metrics.Processes) != 1 {
+		t.Fatalf("process count = %d, want 1", len(metrics.Processes))
+	}
+	process := metrics.Processes[0]
+	if process.ContainerID != "ollama1" || process.ProjectID != "windows_wsl_ubuntu/verity" || process.Service != "ollama" {
+		t.Fatalf("attributed process = %#v", process)
+	}
+	sample, ok := manager.buildSample("ollama1", statsResponse(now, 100, 1000, 100, 10, 10))
+	if !ok {
+		t.Fatal("buildSample() ok = false")
+	}
+	if sample.GPUMemoryBytes != 16486770933 {
+		t.Fatalf("sample GPU memory = %d", sample.GPUMemoryBytes)
+	}
+	if sample.GPULoadPercent != 55 {
+		t.Fatalf("sample GPU load = %.1f", sample.GPULoadPercent)
+	}
+}
+
 type fakeMetricsDocker struct {
 	mu             sync.Mutex
 	containers     []models.ContainerSummary
@@ -349,6 +513,7 @@ type fakeMetricsDocker struct {
 	volumes        []models.VolumeSummary
 	diskUsage      *models.DiskUsage
 	stats          map[string][]container.StatsResponse
+	processPIDs    map[string][]int
 	calls          []dockercore.StatsOptions
 	streamErrors   int
 	oneShotErrors  int
@@ -429,6 +594,12 @@ func (f *fakeMetricsDocker) ContainerStats(_ context.Context, id string, opts do
 		_ = encoder.Encode(entry)
 	}
 	return &dockercore.StatsReader{Body: io.NopCloser(bytes.NewReader(buf.Bytes())), OSType: "linux"}, nil
+}
+
+func (f *fakeMetricsDocker) ContainerProcessPIDs(_ context.Context, id string) ([]int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]int(nil), f.processPIDs[id]...), nil
 }
 
 func statsResponse(read time.Time, cpu uint64, system uint64, memory uint64, rx uint64, blockRead uint64) container.StatsResponse {

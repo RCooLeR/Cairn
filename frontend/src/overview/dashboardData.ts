@@ -4,6 +4,7 @@ type DashboardStatsSample = {
   containerID: string;
   containerName?: string;
   cpuPercent: number;
+  gpuMemoryBytes?: number;
   memoryBytes: number;
 };
 
@@ -24,6 +25,7 @@ export type ContainerStatusChartSegment = {
 export const chartColors = {
   axis: "rgb(var(--chart-axis))",
   cpu: "rgb(var(--chart-cpu))",
+  gpu: "rgb(var(--chart-gpu))",
   grid: "rgb(var(--chart-grid) / 0.55)",
   memory: "rgb(var(--chart-memory))",
   networkRx: "rgb(var(--chart-network-rx))",
@@ -53,11 +55,13 @@ export function dashboardTopRows(
         name: sample.containerName || shortID(sample.containerID),
         kind: "container",
         cpuPercent: sample.cpuPercent,
+        gpuMemoryBytes: sample.gpuMemoryBytes ?? 0,
         memoryBytes: sample.memoryBytes,
       }),
     )
     .sort(
       (left, right) =>
+        (right.gpuMemoryBytes ?? 0) - (left.gpuMemoryBytes ?? 0) ||
         (right.cpuPercent ?? 0) - (left.cpuPercent ?? 0) ||
         (right.memoryBytes ?? 0) - (left.memoryBytes ?? 0),
     )
