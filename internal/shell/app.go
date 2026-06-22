@@ -119,6 +119,7 @@ func Run(assets fs.FS) error {
 		if activeProvider, err := providerManager.ActiveProvider(ctx); err == nil && activeProvider != nil {
 			runtimeProvider = activeProvider
 		}
+		maybeAutoInstallWindowsDockerCLIShim(ctx, db.Settings(), runtimeProvider)
 		if _, err := runtimeController.RebindProvider(ctx, runtimeProvider); err != nil {
 			cancel()
 			eventBus.Close()
@@ -151,6 +152,7 @@ func Run(assets fs.FS) error {
 				Audit:         auditRepo,
 				Notifications: db.Notifications(),
 				Settings:      db.Settings(),
+				Autostart:     services.NewAutostartManager(),
 			}),
 		},
 		OnShutdown: func() {
@@ -181,7 +183,7 @@ func Run(assets fs.FS) error {
 		Title:            appName,
 		Width:            1280,
 		Height:           800,
-		MinWidth:         1100,
+		MinWidth:         1024,
 		MinHeight:        700,
 		InitialPosition:  application.WindowCentered,
 		BackgroundColour: application.NewRGB(13, 17, 23),
@@ -220,6 +222,20 @@ func Run(assets fs.FS) error {
 	})
 
 	return app.Run()
+}
+
+func maybeAutoInstallWindowsDockerCLIShim(ctx context.Context, settings *store.SettingsRepository, provider providers.PlatformProvider) {
+	if runtime.GOOS != "windows" || provider == nil || provider.Type() != providers.TypeWindowsWSL {
+		return
+	}
+	status, err := services.EnsureWindowsDockerCLIShim(ctx, settings)
+	if err != nil {
+		slog.Debug("Windows Docker CLI shim auto-install skipped", "error", err)
+		return
+	}
+	if status != nil && status.Installed && strings.TrimSpace(status.DockerOnPath) == "" {
+		slog.Info("Windows Docker CLI shim installed; open a new shell to use docker commands", "path", status.CommandPath)
+	}
 }
 
 func configureSystemTray(

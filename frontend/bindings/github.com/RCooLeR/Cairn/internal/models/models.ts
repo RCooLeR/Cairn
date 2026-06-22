@@ -3621,6 +3621,45 @@ export class WSLDistroInfo {
     }
 }
 
+export class WindowsDockerCLIShimStatus {
+    "supported": boolean;
+    "installed": boolean;
+    "directory"?: string;
+    "commandPath"?: string;
+    "scriptPath"?: string;
+    "distro"?: string;
+    "onUserPath": boolean;
+    "dockerOnPath"?: string;
+    "needsNewShell": boolean;
+    "message"?: string;
+
+    /** Creates a new WindowsDockerCLIShimStatus instance. */
+    constructor($$source: Partial<WindowsDockerCLIShimStatus> = {}) {
+        if (!("supported" in $$source)) {
+            this["supported"] = false;
+        }
+        if (!("installed" in $$source)) {
+            this["installed"] = false;
+        }
+        if (!("onUserPath" in $$source)) {
+            this["onUserPath"] = false;
+        }
+        if (!("needsNewShell" in $$source)) {
+            this["needsNewShell"] = false;
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new WindowsDockerCLIShimStatus instance from a string or object.
+     */
+    static createFrom($$source: any = {}): WindowsDockerCLIShimStatus {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new WindowsDockerCLIShimStatus($$parsedSource as Partial<WindowsDockerCLIShimStatus>);
+    }
+}
+
 // Private type creation functions
 const $$createType0 = AgentScope.createFrom;
 const $$createType1 = $Create.Array($Create.Any);

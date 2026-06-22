@@ -1,11 +1,15 @@
-import { useState } from "react";
+import { type ReactNode, useEffect, useState } from "react";
 import {
+  Bot,
   Download,
+  FolderOpen,
+  Info,
   KeyRound,
   LogIn,
   RefreshCw,
   Server,
   ShieldAlert,
+  ShieldCheck,
   Terminal,
   Wrench,
 } from "lucide-react";
@@ -17,8 +21,10 @@ import type {
   RegistryAccount,
   RegistryAuthStatus,
   VersionInfo,
+  WindowsDockerCLIShimStatus,
   WSLDistroInfo,
 } from "../../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
+import { SettingsService } from "../api/services";
 import {
   Badge,
   Button,
@@ -55,6 +61,7 @@ export type SettingsSectionID =
   | "backups"
   | "security"
   | "advanced"
+  | "help"
   | "about";
 export type AuditRangeID = "24h" | "7d" | "30d" | "90d" | "all";
 export type AuditFilterState = {
@@ -203,6 +210,10 @@ export function SettingsPage({
 }) {
   const [selectedAuditEntry, setSelectedAuditEntry] =
     useState<AuditEntry | null>(null);
+  const [dockerShimStatus, setDockerShimStatus] =
+    useState<WindowsDockerCLIShimStatus | null>(null);
+  const [dockerShimLoading, setDockerShimLoading] = useState(false);
+  const [dockerShimError, setDockerShimError] = useState<string | null>(null);
   const activeStatus = activeProvider?.status;
   const providerKind = activeProvider?.kind || "windows_wsl_ubuntu";
   const registryCredentialMode = settingString(
@@ -229,8 +240,42 @@ export function SettingsPage({
     ["backups", "Backups"],
     ["security", "Security & Audit"],
     ["advanced", "Advanced"],
+    ["help", "Help"],
     ["about", "About"],
   ];
+  const refreshDockerShimStatus = async () => {
+    setDockerShimLoading(true);
+    setDockerShimError(null);
+    try {
+      setDockerShimStatus(
+        await SettingsService.GetWindowsDockerCLIShimStatus(),
+      );
+    } catch (err) {
+      setDockerShimError(
+        err instanceof Error ? err.message : "Unable to load Docker CLI shim status",
+      );
+    } finally {
+      setDockerShimLoading(false);
+    }
+  };
+  const installDockerShim = async () => {
+    setDockerShimLoading(true);
+    setDockerShimError(null);
+    try {
+      setDockerShimStatus(await SettingsService.InstallWindowsDockerCLIShim());
+    } catch (err) {
+      setDockerShimError(
+        err instanceof Error ? err.message : "Unable to install Docker CLI shim",
+      );
+    } finally {
+      setDockerShimLoading(false);
+    }
+  };
+  useEffect(() => {
+    if (section === "providers" && providerKind === "windows_wsl_ubuntu") {
+      void refreshDockerShimStatus();
+    }
+  }, [providerKind, section, wslDistro]);
   return (
     <div className="grid gap-4 xl:grid-cols-[220px_minmax(0,1fr)]">
       <div className="xl:hidden">
@@ -657,22 +702,158 @@ export function SettingsPage({
           </Card>
         ) : null}
 
+        {section === "help" ? (
+          <div className="space-y-4">
+            <Card>
+              <CardHeader
+                status={<Badge tone="accent">local docs</Badge>}
+                title="Help"
+              />
+              <CardBody className="space-y-4">
+                <div className="grid gap-3 lg:grid-cols-2">
+                  <HelpCard
+                    icon={<Server size={18} />}
+                    items={[
+                      "Use Settings > Providers when Docker is not reachable or the wrong backend is selected.",
+                      "Windows WSL expects an Ubuntu-family WSL2 distro with systemd, Docker Engine, Compose, and Buildx inside the distro.",
+                      "Auto repair runs the provider plan directly; no command copy/paste is needed.",
+                    ]}
+                    title="Backend Setup"
+                  />
+                  <HelpCard
+                    icon={<FolderOpen size={18} />}
+                    items={[
+                      "Import folders that contain compose.yaml, compose.yml, docker-compose.yml, or docker-compose.yaml.",
+                      "On Windows WSL, heavy projects perform better inside the WSL filesystem than under /mnt/c.",
+                      "If a new import has no containers yet, Cairn deploys it instead of requiring a separate redeploy step.",
+                    ]}
+                    title="Projects"
+                  />
+                  <HelpCard
+                    icon={<ShieldCheck size={18} />}
+                    items={[
+                      "Mutations use plan, preview, confirm, execute, and audit.",
+                      "Destructive actions require confirmation, and dangerous actions require typing the target name.",
+                      "Registry secrets are passed to Docker through stdin and are not persisted by Cairn.",
+                    ]}
+                    title="Safety"
+                  />
+                  <HelpCard
+                    icon={<Terminal size={18} />}
+                    items={[
+                      "Terminal opens host, backend, project, and running container sessions.",
+                      "Container images may only have /bin/sh or /bin/ash; shell-less images should use logs, files, and inspect.",
+                      "On Windows, Cairn can install a user-local docker.cmd shim for PowerShell commands.",
+                    ]}
+                    title="Terminal"
+                  />
+                  <HelpCard
+                    icon={<RefreshCw size={18} />}
+                    items={[
+                      "Updates checks image tags, base-image lineage, registry reachability, and rebuild needs.",
+                      "Use Check now before applying updates when registry rate limits or auth warnings are shown.",
+                      "Project update actions still go through a confirmed command plan.",
+                    ]}
+                    title="Updates"
+                  />
+                  <HelpCard
+                    icon={<Bot size={18} />}
+                    items={[
+                      "The local agent defaults to Ollama at http://127.0.0.1:11434.",
+                      "Agent tools can inspect Docker inventory, logs, project files, and request approved Docker actions.",
+                      "Project file edits are previewed and applied through Cairn plans, not silent writes.",
+                    ]}
+                    title="Local Agent"
+                  />
+                </div>
+              </CardBody>
+            </Card>
+
+            <Card>
+              <CardHeader title="Documentation Files" />
+              <CardBody className="grid gap-3 md:grid-cols-2">
+                <ReadOnlySetting
+                  label="Quickstart"
+                  value="docs/user-quickstart.md"
+                />
+                <ReadOnlySetting
+                  label="Provider troubleshooting"
+                  value="docs/provider-troubleshooting.md"
+                />
+                <ReadOnlySetting
+                  label="Local agent"
+                  value="docs/local-agent.md"
+                />
+                <ReadOnlySetting
+                  label="User guide"
+                  value="docs/help.md"
+                />
+              </CardBody>
+            </Card>
+          </div>
+        ) : null}
+
         {section === "about" ? (
-          <Card>
-            <CardHeader title="About" />
-            <CardBody className="grid gap-3 sm:grid-cols-2">
-              <ReadOnlySetting
-                label="Version"
-                value={version?.version ?? "Unknown"}
+          <div className="space-y-4">
+            <Card>
+              <CardHeader
+                status={<Badge tone="accent">v1.0</Badge>}
+                title="About Cairn"
               />
-              <ReadOnlySetting
-                label="Go"
-                value={version?.goVersion ?? "Unknown"}
-              />
-              <ReadOnlySetting label="Wails" value="v3.0.0-alpha2.103" />
-              <ReadOnlySetting label="Updates" value="Not checked" />
-            </CardBody>
-          </Card>
+              <CardBody className="space-y-4">
+                <div className="flex items-start gap-3 rounded-card border border-border bg-bg-inset p-4">
+                  <Info className="mt-0.5 text-accent" size={19} />
+                  <div className="min-w-0">
+                    <div className="font-medium text-text-primary">
+                      Compose-first Docker management for desktop.
+                    </div>
+                    <div className="mt-1 text-sm text-text-muted">
+                      Cairn manages Docker backends, Compose projects,
+                      containers, images, volumes, networks, logs, terminals,
+                      updates, backups, registries, and the local Docker agent.
+                    </div>
+                  </div>
+                </div>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <ReadOnlySetting
+                    label="Version"
+                    value={version?.version ?? "Unknown"}
+                  />
+                  <ReadOnlySetting
+                    label="Go"
+                    value={version?.goVersion ?? "Unknown"}
+                  />
+                  <ReadOnlySetting label="Wails" value="v3.0.0-alpha2.103" />
+                  <ReadOnlySetting
+                    label="Commit"
+                    value={version?.commit || "Development build"}
+                  />
+                  <ReadOnlySetting
+                    label="Build date"
+                    value={version?.buildDate || "Development build"}
+                  />
+                  <ReadOnlySetting
+                    label="Release notes"
+                    value="docs/release-notes-v1.0.0.md"
+                  />
+                </div>
+              </CardBody>
+            </Card>
+
+            <Card>
+              <CardHeader title="Project Links" />
+              <CardBody className="grid gap-3 sm:grid-cols-2">
+                <ReadOnlySetting
+                  label="Repository"
+                  value="github.com/RCooLeR/Cairn"
+                />
+                <ReadOnlySetting
+                  label="Development help"
+                  value="github.com/RCooLeR/Novera"
+                />
+              </CardBody>
+            </Card>
+          </div>
         ) : null}
 
         {section === "providers" ? (
@@ -817,6 +998,99 @@ export function SettingsPage({
                       ))}
                   </datalist>
                 </label>
+
+                <div className="rounded-card border border-border bg-bg-inset">
+                  <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-3 py-2">
+                    <div>
+                      <div className="text-sm font-medium text-text-primary">
+                        Windows Docker CLI shim
+                      </div>
+                      <div className="text-xs text-text-muted">
+                        Provides a Windows `docker` command that forwards to the
+                        selected WSL distro.
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <Button
+                        icon={<RefreshCw size={15} />}
+                        loading={dockerShimLoading}
+                        onClick={() => void refreshDockerShimStatus()}
+                        size="sm"
+                        variant="secondary"
+                      >
+                        Refresh
+                      </Button>
+                      <Button
+                        icon={<Terminal size={15} />}
+                        loading={dockerShimLoading}
+                        onClick={() => void installDockerShim()}
+                        size="sm"
+                      >
+                        Install shim
+                      </Button>
+                    </div>
+                  </div>
+                  <div className="space-y-2 p-3 text-sm">
+                    {dockerShimError ? (
+                      <div className="rounded-control border border-error/30 bg-error/10 px-3 py-2 text-error">
+                        {dockerShimError}
+                      </div>
+                    ) : null}
+                    {dockerShimStatus ? (
+                      <>
+                        <div className="flex flex-wrap gap-2">
+                          <Badge
+                            tone={
+                              dockerShimStatus.installed ? "ok" : "warn"
+                            }
+                          >
+                            {dockerShimStatus.installed
+                              ? "installed"
+                              : "not installed"}
+                          </Badge>
+                          <Badge
+                            tone={
+                              dockerShimStatus.onUserPath ? "ok" : "warn"
+                            }
+                          >
+                            {dockerShimStatus.onUserPath
+                              ? "on PATH"
+                              : "not on PATH"}
+                          </Badge>
+                          {dockerShimStatus.needsNewShell ? (
+                            <Badge tone="info">open new shell</Badge>
+                          ) : null}
+                        </div>
+                        <div className="grid gap-2 md:grid-cols-2">
+                          <ReadOnlySetting
+                            label="Command"
+                            value={dockerShimStatus.commandPath || "-"}
+                          />
+                          <ReadOnlySetting
+                            label="Distro"
+                            value={dockerShimStatus.distro || wslDistro}
+                          />
+                        </div>
+                        {dockerShimStatus.dockerOnPath ? (
+                          <ReadOnlySetting
+                            label="Current docker on PATH"
+                            value={dockerShimStatus.dockerOnPath}
+                          />
+                        ) : null}
+                        <div className="rounded-control border border-info/30 bg-info/10 px-3 py-2 text-info">
+                          {dockerShimStatus.message ||
+                            "Install or refresh the shim, then open a new PowerShell window and run `docker ps`."}
+                        </div>
+                      </>
+                    ) : dockerShimLoading ? (
+                      <TableSkeleton />
+                    ) : (
+                      <div className="text-text-muted">
+                        Refresh to check the Windows Docker CLI shim.
+                      </div>
+                    )}
+                  </div>
+                </div>
 
                 <div className="rounded-card border border-border bg-bg-inset">
                   <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-3 py-2">
@@ -1377,6 +1651,33 @@ function ReadOnlySetting({ label, value }: { label: string; value: string }) {
       </div>
       <div className="mt-1 text-text-primary">{value}</div>
     </div>
+  );
+}
+
+function HelpCard({
+  icon,
+  items,
+  title,
+}: {
+  icon: ReactNode;
+  items: string[];
+  title: string;
+}) {
+  return (
+    <section className="rounded-card border border-border bg-bg-inset p-4">
+      <div className="flex items-center gap-2 font-medium text-text-primary">
+        <span className="text-accent">{icon}</span>
+        {title}
+      </div>
+      <ul className="mt-3 space-y-2 text-sm text-text-secondary">
+        {items.map((item) => (
+          <li className="flex gap-2" key={item}>
+            <span className="mt-2 h-1.5 w-1.5 shrink-0 rounded-full bg-accent" />
+            <span>{item}</span>
+          </li>
+        ))}
+      </ul>
+    </section>
   );
 }
 

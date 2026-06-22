@@ -151,6 +151,7 @@ type SettingsService struct {
 	Audit         *store.AuditRepository
 	Notifications *store.NotificationRepository
 	Settings      *store.SettingsRepository
+	Autostart     AutostartManager
 }
 
 var notReadyErr = apperror.New(

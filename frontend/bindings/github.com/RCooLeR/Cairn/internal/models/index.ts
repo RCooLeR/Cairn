@@ -110,5 +110,6 @@ export {
     VersionInfo,
     VolumeDetail,
     VolumeSummary,
-    WSLDistroInfo
+    WSLDistroInfo,
+    WindowsDockerCLIShimStatus
 } from "./models.js";

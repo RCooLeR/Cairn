@@ -855,7 +855,13 @@ func buildWSLInstallStepsFor(distro string, distribution string) []wslInstallSte
 	if strings.TrimSpace(distribution) == "" {
 		distribution = defaultWSLDistro
 	}
-	systemdCommand := "printf '[boot]\\nsystemd=true\\n' > /etc/wsl.conf"
+	systemdCommand := strings.Join([]string{
+		`set -e`,
+		`tmp="$(mktemp)"`,
+		`if [ -f /etc/wsl.conf ]; then awk 'BEGIN{inboot=0;wrote=0;sawboot=0} /^\[boot\][[:space:]]*$/{if(inboot&&!wrote){print "systemd=true";wrote=1} inboot=1;sawboot=1;print;next} /^\[.*\][[:space:]]*$/{if(inboot&&!wrote){print "systemd=true";wrote=1} inboot=0;print;next} inboot&&/^[[:space:]]*systemd[[:space:]]*=/{if(!wrote){print "systemd=true";wrote=1} next} {print} END{if(inboot&&!wrote) print "systemd=true"; if(!sawboot) print "[boot]\nsystemd=true"}' /etc/wsl.conf > "$tmp"; else printf "[boot]\nsystemd=true\n" > "$tmp"; fi`,
+		`install -m 0644 "$tmp" /etc/wsl.conf`,
+		`rm -f "$tmp"`,
+	}, " && ")
 	dockerAptCommand := strings.Join([]string{
 		"set -e",
 		dockerAptSourceCleanupCommand(),
@@ -932,9 +938,9 @@ func buildWSLInstallStepsFor(distro string, distribution string) []wslInstallSte
 		{
 			Message: "Restart WSL so systemd configuration takes effect",
 			Timeout: wslCommandTimeout,
-			Command: []string{wslCommandName, "--terminate", distro},
+			Command: []string{wslCommandName, "--shutdown"},
 			RepairHints: []string{
-				"Close running shells or terminals attached to the selected WSL distro, then retry.",
+				"Close running shells or terminals attached to WSL, then retry.",
 			},
 		},
 		{

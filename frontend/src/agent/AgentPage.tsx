@@ -603,7 +603,7 @@ export function AgentPage({ projects }: AgentPageProps) {
           </div>
         </div>
         <CardBody className="space-y-3">
-          <div className="grid gap-3 xl:grid-cols-[180px_minmax(220px,1fr)_240px_260px]">
+          <div className="grid gap-3 lg:grid-cols-2 xl:grid-cols-[180px_minmax(220px,1fr)_240px_260px]">
             <AgentSelect
               disabled={savingKey === "agent.provider"}
               label="Provider"

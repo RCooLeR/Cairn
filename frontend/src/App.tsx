@@ -68,6 +68,8 @@ import {
   LogIn,
   MemoryStick,
   PackagePlus,
+  PanelLeftClose,
+  PanelLeftOpen,
   Pencil,
   Plus,
   Network,
@@ -204,6 +206,7 @@ import { frontendVersion } from "./version";
 import type { NavItem, PageID } from "./types/navigation";
 
 const logoUrl = "/cairn-logo.png";
+const iconUrl = "/cairn-icon.png";
 const MonacoEditor = lazy(() => import("@monaco-editor/react"));
 
 type AppUpdateNotice = {
@@ -1112,6 +1115,9 @@ function App() {
   const refreshNetworks = useInventoryStore((state) => state.refreshNetworks);
 
   const [activePage, setActivePage] = useState<PageID>("overview");
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    return window.localStorage.getItem("cairn.sidebar.collapsed") === "true";
+  });
   const [dashboardRefreshToken, setDashboardRefreshToken] = useState(0);
   const [settingsSection, setSettingsSection] =
     useState<SettingsSectionID>("providers");
@@ -1320,6 +1326,13 @@ function App() {
     setNetworkTab("overview");
     setSearch("");
   }, []);
+
+  useEffect(() => {
+    window.localStorage.setItem(
+      "cairn.sidebar.collapsed",
+      String(sidebarCollapsed),
+    );
+  }, [sidebarCollapsed]);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -5008,15 +5021,50 @@ function App() {
 
   return (
     <main className="h-screen overflow-hidden bg-bg-app text-text-primary">
-      <div className="grid h-full min-h-0 grid-cols-1 lg:grid-cols-[236px_1fr]">
-        <aside className="flex min-h-0 flex-col border-b border-border bg-bg-panel lg:h-full lg:border-b-0 lg:border-r">
-          <div className="flex h-16 items-center gap-3 border-b border-border px-4">
+      <div
+        className={[
+          "grid h-full min-h-0 transition-[grid-template-columns]",
+          sidebarCollapsed
+            ? "grid-cols-[72px_1fr]"
+            : "grid-cols-1 lg:grid-cols-[236px_1fr]",
+        ].join(" ")}
+      >
+        <aside
+          className={[
+            "flex min-h-0 flex-col border-border bg-bg-panel",
+            sidebarCollapsed
+              ? "h-full border-r"
+              : "border-b lg:h-full lg:border-b-0 lg:border-r",
+          ].join(" ")}
+        >
+          <div
+            className={[
+              "flex h-16 items-center gap-3 border-b border-border px-4",
+              sidebarCollapsed ? "justify-center px-2" : "",
+            ].join(" ")}
+          >
             <img
               src={logoUrl}
               alt="Cairn"
-              className="h-9 max-w-32 object-contain"
+              className={[
+                "h-9 max-w-32 object-contain",
+                sidebarCollapsed ? "hidden" : "",
+              ].join(" ")}
             />
-            <div className="min-w-0">
+            <img
+              src={iconUrl}
+              alt=""
+              aria-hidden="true"
+              className={[
+                "h-9 w-9 object-contain",
+                sidebarCollapsed ? "block" : "hidden",
+              ].join(" ")}
+            />
+            <div
+              className={["min-w-0", sidebarCollapsed ? "hidden" : ""].join(
+                " ",
+              )}
+            >
               <div className="truncate text-xs text-text-muted">
                 {versionLabel}
               </div>
@@ -5024,7 +5072,12 @@ function App() {
           </div>
 
           <nav
-            className="flex min-h-0 gap-2 overflow-x-auto px-2 py-3 lg:flex-1 lg:flex-col lg:space-y-1 lg:overflow-y-auto lg:overflow-x-hidden"
+            className={[
+              "flex min-h-0 gap-2 px-2 py-3",
+              sidebarCollapsed
+                ? "flex-1 flex-col space-y-1 overflow-y-auto overflow-x-hidden px-3"
+                : "overflow-x-auto lg:flex-1 lg:flex-col lg:space-y-1 lg:overflow-y-auto lg:overflow-x-hidden",
+            ].join(" ")}
             aria-label="Main navigation"
           >
             {navItems.map((item) => {
@@ -5038,65 +5091,143 @@ function App() {
                 <button
                   key={item.id}
                   className={[
-                    "flex h-10 w-auto shrink-0 items-center gap-3 rounded-control px-3 text-left text-sm transition lg:w-full",
+                    "relative flex h-10 shrink-0 items-center gap-3 rounded-control text-left text-sm transition",
+                    sidebarCollapsed
+                      ? "w-full justify-center px-0"
+                      : "w-auto px-3 lg:w-full",
                     active
                       ? "bg-accent/10 text-accent shadow-[inset_3px_0_0_rgb(45_212_167)]"
                       : "text-text-secondary hover:bg-bg-card hover:text-text-primary",
                   ].join(" ")}
                   onClick={() => navigate(item.id)}
+                  title={sidebarCollapsed ? item.label : undefined}
                   type="button"
                 >
                   <Icon size={18} strokeWidth={1.8} />
-                  <span className="flex-1 truncate">{item.label}</span>
-                  {badge ? <Badge>{badge}</Badge> : null}
+                  <span
+                    className={[
+                      "flex-1 truncate",
+                      sidebarCollapsed ? "sr-only" : "",
+                    ].join(" ")}
+                  >
+                    {item.label}
+                  </span>
+                  {badge ? (
+                    sidebarCollapsed ? (
+                      <span className="absolute right-0.5 top-0.5 flex h-4 min-w-4 items-center justify-center rounded-full border border-border bg-bg-inset px-1 text-[10px] font-semibold text-text-secondary">
+                        {badge}
+                      </span>
+                    ) : (
+                      <Badge>{badge}</Badge>
+                    )
+                  ) : null}
                 </button>
               );
             })}
           </nav>
 
-          <div className="hidden border-t border-border p-3 lg:block">
-            <div className="rounded-card border border-border bg-bg-inset p-3">
-              <div className="flex items-center gap-2 text-sm">
-                <StatusDot tone={statusTone} />
-                <span className="font-medium">Docker Engine</span>
-                <span className="ml-auto text-xs text-text-muted">
-                  {statusLabel}
-                </span>
-              </div>
-              <div className="mt-2 truncate font-mono text-xs text-text-muted">
-                {providerName}
-              </div>
-              <div className="mt-2 truncate text-xs text-text-muted">
-                {dockerVersion?.serverVersion
-                  ? `Engine ${dockerVersion.serverVersion}`
-                  : "No engine version"}
-              </div>
-              {!dockerRunning ? (
-                <div className="mt-3 flex gap-2">
-                  <Button
-                    icon={<Wrench size={14} />}
-                    loading={providerActionBusy}
-                    onClick={() => {
-                      if (dockerStopped) {
-                        void startProvider();
-                      } else if (noProviderConfigured) {
-                        openProviderSetup();
-                      } else {
-                        setRepairOpen(true);
-                      }
-                    }}
-                    size="sm"
-                    variant="secondary"
-                  >
-                    {dockerStopped
-                      ? "Start"
-                      : noProviderConfigured
-                        ? "Set up"
-                        : "Repair"}
-                  </Button>
+          <div
+            className={[
+              "border-t border-border",
+              sidebarCollapsed ? "block p-2" : "hidden p-3 lg:block",
+            ].join(" ")}
+          >
+            <Tooltip
+              label={sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"}
+            >
+              <Button
+                aria-label={
+                  sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar"
+                }
+                className={
+                  sidebarCollapsed ? "mx-auto" : "w-full justify-start"
+                }
+                icon={
+                  sidebarCollapsed ? (
+                    <PanelLeftOpen size={15} />
+                  ) : (
+                    <PanelLeftClose size={15} />
+                  )
+                }
+                onClick={() => setSidebarCollapsed((current) => !current)}
+                size={sidebarCollapsed ? "icon" : "sm"}
+                variant="secondary"
+              >
+                {sidebarCollapsed ? null : "Collapse sidebar"}
+              </Button>
+            </Tooltip>
+            {sidebarCollapsed ? (
+              <Tooltip
+                label={`Docker Engine: ${statusLabel}. ${providerName}${
+                  dockerVersion?.serverVersion
+                    ? `. Engine ${dockerVersion.serverVersion}`
+                    : ""
+                }`}
+              >
+                <button
+                  aria-label={`Docker Engine ${statusLabel}`}
+                  className="mx-auto mt-2 flex h-10 w-10 items-center justify-center rounded-control border border-border bg-bg-inset transition hover:border-border-strong"
+                  onClick={() => {
+                    if (dockerRunning) {
+                      return;
+                    }
+                    if (dockerStopped) {
+                      void startProvider();
+                    } else if (noProviderConfigured) {
+                      openProviderSetup();
+                    } else {
+                      setRepairOpen(true);
+                    }
+                  }}
+                  type="button"
+                >
+                  <StatusDot tone={statusTone} />
+                </button>
+              </Tooltip>
+            ) : (
+              <div className="mt-3 rounded-card border border-border bg-bg-inset p-3">
+                <div className="flex items-center gap-2 text-sm">
+                  <StatusDot tone={statusTone} />
+                  <span className="font-medium">Docker Engine</span>
+                  <span className="ml-auto text-xs text-text-muted">
+                    {statusLabel}
+                  </span>
                 </div>
-              ) : null}
-            </div>
+                <div className="mt-2 truncate font-mono text-xs text-text-muted">
+                  {providerName}
+                </div>
+                <div className="mt-2 truncate text-xs text-text-muted">
+                  {dockerVersion?.serverVersion
+                    ? `Engine ${dockerVersion.serverVersion}`
+                    : "No engine version"}
+                </div>
+                {!dockerRunning ? (
+                  <div className="mt-3 flex gap-2">
+                    <Button
+                      icon={<Wrench size={14} />}
+                      loading={providerActionBusy}
+                      onClick={() => {
+                        if (dockerStopped) {
+                          void startProvider();
+                        } else if (noProviderConfigured) {
+                          openProviderSetup();
+                        } else {
+                          setRepairOpen(true);
+                        }
+                      }}
+                      size="sm"
+                      variant="secondary"
+                    >
+                      {dockerStopped
+                        ? "Start"
+                        : noProviderConfigured
+                          ? "Set up"
+                          : "Repair"}
+                    </Button>
+                  </div>
+                ) : null}
+              </div>
+            )}
           </div>
         </aside>
 

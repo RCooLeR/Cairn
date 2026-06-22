@@ -2,12 +2,14 @@ package shell
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 
 	backupcore "github.com/RCooLeR/Cairn/internal/backups"
 	"github.com/RCooLeR/Cairn/internal/bus"
 	composecore "github.com/RCooLeR/Cairn/internal/compose"
 	dockercore "github.com/RCooLeR/Cairn/internal/docker"
+	"github.com/RCooLeR/Cairn/internal/dockerbridge"
 	lineagecore "github.com/RCooLeR/Cairn/internal/lineage"
 	"github.com/RCooLeR/Cairn/internal/logsvc"
 	"github.com/RCooLeR/Cairn/internal/metrics"
@@ -51,6 +53,7 @@ type appRuntime struct {
 	terminal *terminal.Manager
 	backups  *backupcore.Manager
 	updates  *updatescore.Manager
+	bridge   *dockerbridge.Manager
 }
 
 type appRuntimeState string
@@ -91,6 +94,7 @@ type runtimeHandles struct {
 	terminal *terminal.Manager
 	backups  *backupcore.Manager
 	updates  *updatescore.Manager
+	bridge   *dockerbridge.Manager
 }
 
 func newAppRuntime(cfg appRuntimeConfig) *appRuntime {
@@ -146,6 +150,10 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 	dockerClient.StartHealthLoop(runtimeCtx)
 	dockerClient.StartObjectEventLoop(runtimeCtx)
 	dockerClient.StartReconcileLoop(runtimeCtx)
+	dockerBridge := dockerbridge.New(provider, dockerbridge.Options{})
+	if err := dockerBridge.Start(runtimeCtx); err != nil {
+		slog.Debug("Docker CLI bridge unavailable", "provider", provider.ID(), "error", err)
+	}
 
 	composeClient := composecore.NewClient(provider)
 	projectDetector := &composecore.ProjectDetector{
@@ -186,6 +194,7 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 	r.terminal = terminalManager
 	r.backups = backupManager
 	r.updates = updateManager
+	r.bridge = dockerBridge
 	r.state = runtimeStateRunning
 
 	r.dockerService.Client = dockerClient
@@ -254,6 +263,7 @@ func (r *appRuntime) detachLocked() runtimeHandles {
 		terminal: r.terminal,
 		backups:  r.backups,
 		updates:  r.updates,
+		bridge:   r.bridge,
 	}
 	r.cancel = nil
 	r.docker = nil
@@ -262,6 +272,7 @@ func (r *appRuntime) detachLocked() runtimeHandles {
 	r.terminal = nil
 	r.backups = nil
 	r.updates = nil
+	r.bridge = nil
 	return handles
 }
 
@@ -283,6 +294,9 @@ func (h runtimeHandles) stop() {
 	}
 	if h.terminal != nil {
 		h.terminal.StopAll()
+	}
+	if h.bridge != nil {
+		h.bridge.Stop()
 	}
 	if h.docker != nil {
 		_ = h.docker.Close()

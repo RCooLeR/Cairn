@@ -598,8 +598,8 @@ export function TerminalPage({
   );
 
   return (
-    <div className="grid h-[calc(100vh-9rem)] min-h-[620px] gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
-      <section className="flex min-h-0 min-w-0 flex-col overflow-hidden rounded-card border border-border bg-bg-panel">
+    <div className="grid min-h-[calc(100vh-9rem)] gap-4 xl:h-[calc(100vh-9rem)] xl:min-h-[620px] xl:grid-cols-[minmax(0,1fr)_320px]">
+      <section className="flex min-h-[520px] min-w-0 flex-col overflow-hidden rounded-card border border-border bg-bg-panel xl:min-h-0">
         <div className="space-y-2 border-b border-border px-3 py-3">
           <div className="flex flex-wrap items-center gap-2">
             <Button
@@ -655,7 +655,7 @@ export function TerminalPage({
             </Button>
           </div>
 
-          <div className="grid gap-2 md:grid-cols-[minmax(0,1fr)_156px_110px_minmax(120px,0.45fr)_auto]">
+          <div className="grid gap-2 lg:grid-cols-2 xl:grid-cols-[minmax(0,1fr)_156px_110px_minmax(120px,0.45fr)_auto]">
             <select
               aria-label="Container terminal"
               className="h-9 min-w-0 rounded-control border border-border bg-bg-inset px-2 text-sm"
@@ -733,6 +733,7 @@ export function TerminalPage({
             />
             <Button
               aria-label="Open container terminal"
+              className="w-full lg:col-span-2 xl:col-span-1 xl:w-auto"
               disabled={!selectedTerminalContainerID}
               icon={<TerminalIcon size={15} />}
               loading={busy}
@@ -881,7 +882,7 @@ export function TerminalPage({
         </div>
       </section>
 
-      <aside className="flex min-h-0 flex-col">
+      <aside className="flex min-h-[320px] flex-col xl:min-h-0">
         <Card className="flex min-h-0 flex-1 flex-col">
           <CardHeader
             actions={

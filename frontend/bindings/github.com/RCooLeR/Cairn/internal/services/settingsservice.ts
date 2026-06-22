@@ -45,6 +45,18 @@ export function GetSettings(): $CancellablePromise<{ [_ in string]?: any }> {
     });
 }
 
+export function GetWindowsDockerCLIShimStatus(): $CancellablePromise<models$0.WindowsDockerCLIShimStatus | null> {
+    return $Call.ByID(2511644653).then(($result: any) => {
+        return $$createType12($result);
+    });
+}
+
+export function InstallWindowsDockerCLIShim(): $CancellablePromise<models$0.WindowsDockerCLIShimStatus | null> {
+    return $Call.ByID(3382582880).then(($result: any) => {
+        return $$createType12($result);
+    });
+}
+
 export function MarkNotificationsRead(ids: number[]): $CancellablePromise<void> {
     return $Call.ByID(1784483204, ids);
 }
@@ -69,3 +81,5 @@ const $$createType7 = $Create.Array($$createType6);
 const $$createType8 = models$0.Notification.createFrom;
 const $$createType9 = $Create.Array($$createType8);
 const $$createType10 = $Create.Map($Create.Any, $Create.Any);
+const $$createType11 = models$0.WindowsDockerCLIShimStatus.createFrom;
+const $$createType12 = $Create.Nullable($$createType11);

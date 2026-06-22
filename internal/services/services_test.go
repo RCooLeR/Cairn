@@ -24,6 +24,26 @@ import (
 	"github.com/RCooLeR/Cairn/internal/store"
 )
 
+type fakeAutostartManager struct {
+	enabled bool
+	setErr  error
+
+	setCalls []bool
+}
+
+func (m *fakeAutostartManager) Enabled(context.Context) (bool, error) {
+	return m.enabled, nil
+}
+
+func (m *fakeAutostartManager) SetEnabled(_ context.Context, enabled bool) error {
+	m.setCalls = append(m.setCalls, enabled)
+	if m.setErr != nil {
+		return m.setErr
+	}
+	m.enabled = enabled
+	return nil
+}
+
 func TestAppVersionReturnsVersionInfo(t *testing.T) {
 	t.Setenv("GOTOOLCHAIN", "local")
 
@@ -129,6 +149,61 @@ func TestSettingsServiceRoundTripsPersistedSettings(t *testing.T) {
 	}
 	if settings["security.confirm_destructive"] != true {
 		t.Fatalf("security.confirm_destructive = %#v, want true", settings["security.confirm_destructive"])
+	}
+}
+
+func TestSettingsServiceSetAutostartUpdatesOperatingSystem(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	autostart := &fakeAutostartManager{}
+	service := &SettingsService{Settings: db.Settings(), Autostart: autostart}
+
+	if err := service.SetSetting(ctx, "general.autostart_app", true); err != nil {
+		t.Fatalf("SetSetting(general.autostart_app) error = %v", err)
+	}
+	if len(autostart.setCalls) != 1 || !autostart.setCalls[0] {
+		t.Fatalf("autostart set calls = %#v, want [true]", autostart.setCalls)
+	}
+	persisted, err := db.Settings().GetBool(ctx, "general.autostart_app")
+	if err != nil {
+		t.Fatalf("GetBool(general.autostart_app) error = %v", err)
+	}
+	if !persisted {
+		t.Fatalf("general.autostart_app was not persisted")
+	}
+}
+
+func TestSettingsServiceSetAutostartDoesNotPersistOnOperatingSystemFailure(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	autostart := &fakeAutostartManager{setErr: errors.New("registry denied")}
+	service := &SettingsService{Settings: db.Settings(), Autostart: autostart}
+
+	err := service.SetSetting(ctx, "general.autostart_app", true)
+	if !apperror.IsCode(err, apperror.Internal) {
+		t.Fatalf("SetSetting error = %v, want %s", err, apperror.Internal)
+	}
+	persisted, err := db.Settings().GetBool(ctx, "general.autostart_app")
+	if err != nil {
+		t.Fatalf("GetBool(general.autostart_app) error = %v", err)
+	}
+	if persisted {
+		t.Fatalf("general.autostart_app persisted after OS failure")
+	}
+}
+
+func TestSettingsServiceGetSettingsReflectsOperatingSystemAutostart(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	autostart := &fakeAutostartManager{enabled: true}
+	service := &SettingsService{Settings: db.Settings(), Autostart: autostart}
+
+	settings, err := service.GetSettings(ctx)
+	if err != nil {
+		t.Fatalf("GetSettings() error = %v", err)
+	}
+	if settings["general.autostart_app"] != true {
+		t.Fatalf("general.autostart_app = %#v, want true", settings["general.autostart_app"])
 	}
 }
 

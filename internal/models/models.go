@@ -74,6 +74,19 @@ type WSLDistroInfo struct {
 	Default bool   `json:"default"`
 }
 
+type WindowsDockerCLIShimStatus struct {
+	Supported     bool   `json:"supported"`
+	Installed     bool   `json:"installed"`
+	Directory     string `json:"directory,omitempty"`
+	CommandPath   string `json:"commandPath,omitempty"`
+	ScriptPath    string `json:"scriptPath,omitempty"`
+	Distro        string `json:"distro,omitempty"`
+	OnUserPath    bool   `json:"onUserPath"`
+	DockerOnPath  string `json:"dockerOnPath,omitempty"`
+	NeedsNewShell bool   `json:"needsNewShell"`
+	Message       string `json:"message,omitempty"`
+}
+
 type DockerInfo struct {
 	ID              string `json:"id,omitempty"`
 	Name            string `json:"name,omitempty"`

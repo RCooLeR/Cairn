@@ -20,15 +20,41 @@ var (
 	appUpdateURL        = "https://api.github.com/repos/RCooLeR/Cairn/releases/latest"
 )
 
+const generalAutostartAppSetting = "general.autostart_app"
+
 func (s *SettingsService) GetSettings(ctx context.Context) (map[string]any, error) {
 	if s.Settings != nil {
-		return s.Settings.All(ctx)
+		settings, err := s.Settings.All(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if s.Autostart != nil {
+			enabled, err := s.Autostart.Enabled(ctx)
+			if err == nil {
+				settings[generalAutostartAppSetting] = enabled
+			}
+		}
+		return settings, nil
 	}
 	return map[string]any{}, nil
 }
 
 func (s *SettingsService) SetSetting(ctx context.Context, key string, value any) error {
 	if s.Settings != nil {
+		if strings.TrimSpace(strings.ToLower(key)) == generalAutostartAppSetting && s.Autostart != nil {
+			enabled, ok := value.(bool)
+			if ok {
+				if err := s.Autostart.SetEnabled(ctx, enabled); err != nil {
+					return apperror.Wrap(
+						apperror.Internal,
+						"Update login autostart failed",
+						err,
+						apperror.WithDetail(err.Error()),
+						apperror.WithRepairHints("Run Cairn from the installed application path and try again."),
+					)
+				}
+			}
+		}
 		return s.Settings.SetValue(ctx, key, value)
 	}
 	return notReady()

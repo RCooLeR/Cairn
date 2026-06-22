@@ -24,7 +24,7 @@ Unsigned development builds are for smoke testing only. Release builds should be
 4. If checks pass, continue to project detection.
 5. If checks fail, use the repair hints shown in the setup flow or Settings -> Providers.
 
-Cairn never exposes Docker on TCP. Windows WSL uses the selected distro through WSL stdio transport, and macOS Colima uses the Colima/Docker context owned by that provider.
+Cairn never exposes Docker on TCP. Windows WSL uses the selected distro through WSL stdio transport, and macOS Colima uses the Colima/Docker context owned by that provider. On Windows, Cairn keeps a private named-pipe bridge at `npipe:////./pipe/cairn_docker_engine` while the Windows WSL provider is active. It does not claim Docker Desktop's global pipes. When the Windows WSL provider is active and Windows cannot resolve `docker`, Cairn automatically installs a user-local CLI shim on startup. You can also install or refresh it from **Settings > Providers > Windows Docker CLI shim > Install shim**. Cairn writes a small `docker.cmd` launcher to `%LOCALAPPDATA%\Cairn\cli`, adds that directory to the user PATH, and forwards commands into the selected WSL distro. Open a new PowerShell window after the first install so Windows loads the updated PATH.
 
 ## Import Projects
 
