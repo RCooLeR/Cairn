@@ -14,5 +14,5 @@ func defaultPipes() []string {
 }
 
 func listenPipe(string) (net.Listener, error) {
-	return nil, errors.New("Windows named pipes are not available on this platform")
+	return nil, errors.New("windows named pipes are not available on this platform")
 }

@@ -14,6 +14,7 @@ import (
 )
 
 const windowsAutostartRunKey = `Software\Microsoft\Windows\CurrentVersion\Run`
+const appAutostartName = "Cairn"
 
 type windowsAutostartManager struct{}
 

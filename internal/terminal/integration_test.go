@@ -88,7 +88,7 @@ func TestManagerRealDockerContainerTerminalIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenContainerTerminal() error = %v", err)
 	}
-	if info.Kind != KindContainer || info.Shell != "/bin/sh" || !info.IsRoot {
+	if info.Kind != KindContainer || info.Shell != "/bin/sh" || info.IsRoot || info.User != "" {
 		t.Fatalf("session info = %#v", info)
 	}
 	if err := manager.ResizeTerminal(ctx, info.ID, 132, 43); err != nil {
