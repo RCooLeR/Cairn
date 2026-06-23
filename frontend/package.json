@@ -58,7 +58,7 @@
     "vitest": "^4.1.8"
   },
   "overrides": {
-    "dompurify": "^3.4.10",
+    "dompurify": "^3.4.11",
     "@vitejs/plugin-react": "$@vitejs/plugin-react",
     "@vitejs/plugin-react-swc": "^4.3.1",
     "vite": "$vite"

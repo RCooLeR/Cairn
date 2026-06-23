@@ -514,10 +514,26 @@ type CreateNetworkState = {
   error?: string;
 };
 
+type ImportProjectStepID = "open" | "review" | "build";
+type ImportProjectStepStatus = "pending" | "running" | "done" | "error";
+type ImportProjectLogTone = "muted" | "info" | "ok" | "error";
+
+type ImportProjectLogEntry = {
+  id: string;
+  ts: number;
+  step: ImportProjectStepID;
+  message: string;
+  tone: ImportProjectLogTone;
+};
+
 type ImportProjectState = {
   open: boolean;
   folderPath: string;
   busy: boolean;
+  jobID?: string;
+  projectID?: string;
+  steps: Record<ImportProjectStepID, ImportProjectStepStatus>;
+  progress: ImportProjectLogEntry[];
   error?: string;
   imported?: ProjectDetail | null;
 };
@@ -630,6 +646,15 @@ type SparkPointMap = Record<string, SparkPoint[]>;
 type ProjectMetricSparks = Record<DashboardMetricID, SparkPointMap>;
 
 const maxProjectCommandOutputLines = 300;
+const maxImportProjectLogLines = 120;
+const importProjectStepOrder: Array<{
+  id: ImportProjectStepID;
+  label: string;
+}> = [
+  { id: "open", label: "Open dir" },
+  { id: "review", label: "Review YAML" },
+  { id: "build", label: "Build containers" },
+];
 const projectStatsFrameMs = 2 * 1000;
 const navItems: NavItem[] = [
   { id: "overview", label: "Overview", icon: Gauge },
@@ -807,6 +832,8 @@ const emptyImportProject: ImportProjectState = {
   open: false,
   folderPath: "",
   busy: false,
+  steps: initialImportProjectSteps(),
+  progress: [],
   imported: null,
 };
 
@@ -1231,6 +1258,7 @@ function App() {
     useState<CreateNetworkState>(emptyCreateNetwork);
   const [importProject, setImportProject] =
     useState<ImportProjectState>(emptyImportProject);
+  const importProjectOpenRef = useRef(false);
   const [selectedContainerIDs, setSelectedContainerIDs] = useState(
     () => new Set<string>(),
   );
@@ -1242,6 +1270,11 @@ function App() {
     () => (actionError ? parseAppErrorText(actionError) : null),
     [actionError],
   );
+
+  useEffect(() => {
+    importProjectOpenRef.current = importProject.open;
+  }, [importProject.open]);
+
   const [providerActionBusy, setProviderActionBusy] = useState(false);
   const [repairOpen, setRepairOpen] = useState(false);
   const [repairError, setRepairError] = useState<string | null>(null);
@@ -1996,6 +2029,9 @@ function App() {
           appendProjectCommandProgress(current, payload),
         );
       }
+      setImportProject((current) =>
+        appendImportProjectProgressFromJob(current, payload),
+      );
       setUpdatePlan((current) => {
         if (!current.jobID || current.jobID !== payload.jobID) {
           return current;
@@ -2016,6 +2052,9 @@ function App() {
           appendProjectCommandDone(current, payload),
         );
       }
+      setImportProject((current) =>
+        appendImportProjectDoneFromJob(current, payload),
+      );
       setUpdatePlan((current) => {
         if (!current.jobID || current.jobID !== payload.jobID) {
           return current;
@@ -4222,6 +4261,10 @@ function App() {
         setImportProject((current) => ({
           ...current,
           folderPath,
+          jobID: undefined,
+          projectID: undefined,
+          steps: initialImportProjectSteps(),
+          progress: [],
           error: undefined,
           imported: null,
         }));
@@ -4229,6 +4272,10 @@ function App() {
     } catch (error: unknown) {
       setImportProject((current) => ({
         ...current,
+        jobID: undefined,
+        projectID: undefined,
+        steps: initialImportProjectSteps(),
+        progress: [],
         error:
           error instanceof Error
             ? error.message
@@ -4246,9 +4293,20 @@ function App() {
       }));
       return;
     }
+    const jobID = newImportProjectJobID();
     setImportProject((current) => ({
       ...current,
       busy: true,
+      jobID,
+      projectID: undefined,
+      steps: {
+        open: "running",
+        review: "pending",
+        build: "pending",
+      },
+      progress: [
+        importProjectLogEntry("open", `Opening ${folderPath}`, "info", jobID),
+      ],
       error: undefined,
       imported: null,
     }));
@@ -4256,25 +4314,50 @@ function App() {
       const detail = await ProjectService.ImportProject({
         folderPath,
         composeFilePaths: [],
+        jobID,
       });
       setImportProject((current) => ({
         ...current,
+        projectID: detail?.summary.id ?? current.projectID,
+        steps: completeImportProjectSteps(current.steps),
         busy: false,
         imported: detail,
         error: undefined,
       }));
       await refreshProjects();
       setActivePage("projects");
+      if (!importProjectOpenRef.current && detail) {
+        pushToast({
+          level: "ok",
+          title: "Import started",
+          body: `${detail.summary.name} is building in the background.`,
+        });
+      }
     } catch (error: unknown) {
+      const message =
+        error instanceof Error ? error.message : "Unable to import project";
       setImportProject((current) => ({
         ...current,
+        steps: failImportProjectSteps(current.steps),
+        progress: appendImportProjectLog(current.progress, {
+          step: current.steps.review === "running" ? "review" : "open",
+          message,
+          tone: "error",
+          jobID,
+        }),
         busy: false,
         imported: null,
-        error:
-          error instanceof Error ? error.message : "Unable to import project",
+        error: message,
       }));
+      if (!importProjectOpenRef.current) {
+        pushToast({
+          level: "error",
+          title: "Import failed",
+          body: message,
+        });
+      }
     }
-  }, [importProject.folderPath, refreshProjects]);
+  }, [importProject.folderPath, pushToast, refreshProjects]);
 
   const toggleContainerSelection = useCallback((id: string) => {
     setSelectedContainerIDs((current) => {
@@ -5657,11 +5740,19 @@ function App() {
           setImportProject((current) => ({
             ...current,
             folderPath,
+            jobID: undefined,
+            projectID: undefined,
+            steps: initialImportProjectSteps(),
+            progress: [],
             error: undefined,
             imported: null,
           }))
         }
-        onClose={() => setImportProject(emptyImportProject)}
+        onClose={() =>
+          setImportProject((current) =>
+            current.busy ? { ...current, open: false } : emptyImportProject,
+          )
+        }
         onSubmit={() => {
           void submitImportProject();
         }}
@@ -14341,6 +14432,278 @@ function ContainerBulkActions({
   );
 }
 
+function initialImportProjectSteps(): Record<
+  ImportProjectStepID,
+  ImportProjectStepStatus
+> {
+  return {
+    open: "pending",
+    review: "pending",
+    build: "pending",
+  };
+}
+
+function newImportProjectJobID() {
+  return `import-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function importProjectLogEntry(
+  step: ImportProjectStepID,
+  message: string,
+  tone: ImportProjectLogTone,
+  jobID?: string,
+): ImportProjectLogEntry {
+  const ts = Date.now();
+  return {
+    id: `${jobID ?? "import"}:${step}:${ts}:${Math.random()
+      .toString(36)
+      .slice(2, 7)}`,
+    ts,
+    step,
+    message,
+    tone,
+  };
+}
+
+function appendImportProjectLog(
+  current: ImportProjectLogEntry[],
+  entry: {
+    step: ImportProjectStepID;
+    message?: string;
+    tone: ImportProjectLogTone;
+    jobID?: string;
+  },
+) {
+  const message = entry.message?.trim() ?? "";
+  if (!message) {
+    return current;
+  }
+  return current
+    .concat(importProjectLogEntry(entry.step, message, entry.tone, entry.jobID))
+    .slice(-maxImportProjectLogLines);
+}
+
+function completeImportProjectSteps(
+  steps: Record<ImportProjectStepID, ImportProjectStepStatus>,
+): Record<ImportProjectStepID, ImportProjectStepStatus> {
+  return {
+    open: steps.open === "error" ? "error" : "done",
+    review: steps.review === "error" ? "error" : "done",
+    build: steps.build === "pending" ? "running" : steps.build,
+  };
+}
+
+function failImportProjectSteps(
+  steps: Record<ImportProjectStepID, ImportProjectStepStatus>,
+): Record<ImportProjectStepID, ImportProjectStepStatus> {
+  const next = { ...steps };
+  const running = importProjectStepOrder.find(
+    (step) => steps[step.id] === "running",
+  );
+  if (running) {
+    next[running.id] = "error";
+    return next;
+  }
+  const pending = importProjectStepOrder.find(
+    (step) => steps[step.id] === "pending",
+  );
+  next[pending?.id ?? "open"] = "error";
+  return next;
+}
+
+function setImportProjectStepStatus(
+  steps: Record<ImportProjectStepID, ImportProjectStepStatus>,
+  step: ImportProjectStepID,
+  status: ImportProjectStepStatus,
+): Record<ImportProjectStepID, ImportProjectStepStatus> {
+  const next = { ...steps };
+  const index = importProjectStepOrder.findIndex((item) => item.id === step);
+  for (let i = 0; i < index; i += 1) {
+    const previous = importProjectStepOrder[i].id;
+    if (next[previous] !== "error") {
+      next[previous] = "done";
+    }
+  }
+  next[step] = status;
+  return next;
+}
+
+function appendImportProjectProgressFromJob(
+  current: ImportProjectState,
+  payload: ProjectJobEvent,
+): ImportProjectState {
+  if (!payload.jobID) {
+    return current;
+  }
+  if (payload.action === "import") {
+    if (!current.jobID || current.jobID !== payload.jobID) {
+      return current;
+    }
+    const step = importProjectStepFromPhase(payload.phase);
+    const done = (payload.pct ?? 0) >= 100;
+    return {
+      ...current,
+      projectID: payload.projectID || current.projectID,
+      steps: setImportProjectStepStatus(
+        current.steps,
+        step,
+        done ? "done" : "running",
+      ),
+      progress: appendImportProjectLog(current.progress, {
+        step,
+        message: payload.message,
+        tone: importProjectLogToneFromPhase(payload.phase),
+        jobID: payload.jobID,
+      }),
+    };
+  }
+  if (
+    payload.action !== "deploy" ||
+    !current.projectID ||
+    payload.projectID !== current.projectID
+  ) {
+    return current;
+  }
+  return {
+    ...current,
+    steps: setImportProjectStepStatus(current.steps, "build", "running"),
+    progress: appendImportProjectLog(current.progress, {
+      step: "build",
+      message: payload.message,
+      tone: importProjectLogToneFromPhase(payload.phase),
+      jobID: payload.jobID,
+    }),
+  };
+}
+
+function appendImportProjectDoneFromJob(
+  current: ImportProjectState,
+  payload: ProjectJobEvent,
+): ImportProjectState {
+  if (!payload.jobID) {
+    return current;
+  }
+  const failed = Boolean(payload.error);
+  if (payload.action === "import") {
+    if (!current.jobID || current.jobID !== payload.jobID) {
+      return current;
+    }
+    return {
+      ...current,
+      projectID: payload.projectID || current.projectID,
+      steps: failed
+        ? failImportProjectSteps(current.steps)
+        : completeImportProjectSteps(current.steps),
+      progress: appendImportProjectLog(current.progress, {
+        step: failed ? importProjectFirstActiveStep(current.steps) : "review",
+        message: failed
+          ? payload.error || "Import failed"
+          : "Import request finished",
+        tone: failed ? "error" : "ok",
+        jobID: payload.jobID,
+      }),
+    };
+  }
+  if (
+    payload.action !== "deploy" ||
+    !current.projectID ||
+    payload.projectID !== current.projectID
+  ) {
+    return current;
+  }
+  return {
+    ...current,
+    steps: setImportProjectStepStatus(
+      current.steps,
+      "build",
+      failed ? "error" : "done",
+    ),
+    progress: appendImportProjectLog(current.progress, {
+      step: "build",
+      message: failed
+        ? payload.error || "Container build failed"
+        : payload.result
+          ? `Result: ${payload.result}`
+          : "Container build finished",
+      tone: failed ? "error" : "ok",
+      jobID: payload.jobID,
+    }),
+  };
+}
+
+function importProjectStepFromPhase(
+  phase: string | undefined,
+): ImportProjectStepID {
+  switch (phase) {
+    case "review":
+      return "review";
+    case "build":
+      return "build";
+    default:
+      return "open";
+  }
+}
+
+function importProjectFirstActiveStep(
+  steps: Record<ImportProjectStepID, ImportProjectStepStatus>,
+): ImportProjectStepID {
+  return (
+    importProjectStepOrder.find((step) => steps[step.id] === "running")?.id ??
+    importProjectStepOrder.find((step) => steps[step.id] === "pending")?.id ??
+    "build"
+  );
+}
+
+function importProjectLogToneFromPhase(
+  phase: string | undefined,
+): ImportProjectLogTone {
+  switch (phase) {
+    case "stderr":
+    case "failed":
+      return "error";
+    case "stdout":
+      return "muted";
+    case "done":
+      return "ok";
+    default:
+      return "info";
+  }
+}
+
+function importProjectStepClass(status: ImportProjectStepStatus) {
+  switch (status) {
+    case "done":
+      return "border-ok/30 bg-ok/10 text-ok";
+    case "running":
+      return "border-info/30 bg-info/10 text-info";
+    case "error":
+      return "border-error/30 bg-error/10 text-error";
+    default:
+      return "border-border bg-bg-inset text-text-secondary";
+  }
+}
+
+function importProjectLogToneClass(tone: ImportProjectLogTone) {
+  switch (tone) {
+    case "ok":
+      return "text-ok";
+    case "error":
+      return "text-error";
+    case "info":
+      return "text-info";
+    default:
+      return "text-text-secondary";
+  }
+}
+
+function formatLogClock(ts: number) {
+  return new Date(ts).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
 function appendProjectCommandProgress(
   current: Record<string, ProjectCommandOutputState>,
   payload: ProjectJobEvent,
@@ -16385,15 +16748,20 @@ function ImportProjectModal({
   const wslMount = state.folderPath.replace(/\\/g, "/").startsWith("/mnt/");
   return (
     <Modal
-      busy={state.busy}
       footer={
-        <ModalActions
-          busy={state.busy}
-          disabled={!state.folderPath.trim()}
-          onCancel={onClose}
-          onSubmit={onSubmit}
-          submitLabel="Import"
-        />
+        <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
+          <Button onClick={onClose} variant="secondary">
+            {state.busy ? "Close" : "Cancel"}
+          </Button>
+          <Button
+            disabled={!state.folderPath.trim() || state.busy}
+            loading={state.busy}
+            onClick={onSubmit}
+            variant="primary"
+          >
+            Import
+          </Button>
+        </div>
       }
       onClose={onClose}
       open={state.open}
@@ -16408,11 +16776,16 @@ function ImportProjectModal({
           <div className="mt-1 flex flex-col gap-2 sm:flex-row">
             <input
               className="h-9 min-w-0 flex-1 rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
+              disabled={state.busy}
               onChange={(event) => onChange(event.target.value)}
               placeholder="/home/me/project"
               value={state.folderPath}
             />
-            <Button icon={<FolderOpen size={16} />} onClick={onBrowse}>
+            <Button
+              disabled={state.busy}
+              icon={<FolderOpen size={16} />}
+              onClick={onBrowse}
+            >
               Browse
             </Button>
           </div>
@@ -16447,6 +16820,52 @@ function ImportProjectModal({
           </div>
         ) : null}
 
+        <ImportProjectSteps steps={state.steps} />
+
+        <div className="rounded-card border border-border bg-bg-inset p-3">
+          <div className="flex items-center justify-between gap-3">
+            <div className="text-xs font-medium uppercase text-text-muted">
+              Progress log
+            </div>
+            {state.busy ? (
+              <Badge tone="info">running</Badge>
+            ) : state.error ? (
+              <Badge tone="error">failed</Badge>
+            ) : state.imported ? (
+              <Badge tone="ok">imported</Badge>
+            ) : null}
+          </div>
+          <div
+            aria-live="polite"
+            className="mt-2 max-h-44 min-h-24 overflow-y-auto rounded-control border border-border bg-bg-app p-2 font-mono text-xs"
+            role="log"
+          >
+            {state.progress.length ? (
+              <div className="space-y-1">
+                {state.progress.map((line) => (
+                  <div className="flex gap-2" key={line.id}>
+                    <span className="w-16 shrink-0 text-text-muted">
+                      {formatLogClock(line.ts)}
+                    </span>
+                    <span className="w-14 shrink-0 uppercase text-text-muted">
+                      {line.step}
+                    </span>
+                    <span
+                      className={`min-w-0 flex-1 whitespace-pre-wrap break-words ${importProjectLogToneClass(
+                        line.tone,
+                      )}`}
+                    >
+                      {line.message}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="text-text-muted">No import activity yet</div>
+            )}
+          </div>
+        </div>
+
         {wslMount ? (
           <div className="rounded-card border border-warn/30 bg-warn/10 px-3 py-2 text-sm text-warn">
             WSL mount paths may be slower than files stored inside the distro.
@@ -16465,6 +16884,56 @@ function ImportProjectModal({
         ) : null}
       </div>
     </Modal>
+  );
+}
+
+function ImportProjectSteps({
+  steps,
+}: {
+  steps: Record<ImportProjectStepID, ImportProjectStepStatus>;
+}) {
+  return (
+    <div className="grid gap-2 sm:grid-cols-3">
+      {importProjectStepOrder.map((step) => {
+        const status = steps[step.id];
+        return (
+          <div
+            className={`flex items-center gap-2 rounded-card border px-3 py-2 ${importProjectStepClass(
+              status,
+            )}`}
+            key={step.id}
+          >
+            <ImportProjectStepIcon status={status} />
+            <div className="min-w-0">
+              <div className="truncate text-sm font-medium">{step.label}</div>
+              <div className="text-xs capitalize text-text-muted">
+                {status}
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function ImportProjectStepIcon({
+  status,
+}: {
+  status: ImportProjectStepStatus;
+}) {
+  if (status === "done") {
+    return <CheckCircle2 className="h-4 w-4 shrink-0 text-ok" />;
+  }
+  if (status === "error") {
+    return <AlertTriangle className="h-4 w-4 shrink-0 text-error" />;
+  }
+  return (
+    <Clock3
+      className={`h-4 w-4 shrink-0 ${
+        status === "running" ? "animate-pulse text-info" : "text-text-muted"
+      }`}
+    />
   );
 }
 

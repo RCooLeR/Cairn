@@ -27,7 +27,7 @@ function Require-Any([string]$Pattern, [string]$Description) {
 
 switch ($Platform) {
   "windows" {
-    Require-Any "cairn-*-installer.exe" "NSIS installer"
+    Require-Any "cairn-*-installer*.exe" "NSIS installer"
   }
   "linux" {
     Require-Any "*.AppImage" "AppImage"

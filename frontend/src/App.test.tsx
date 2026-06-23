@@ -2269,13 +2269,94 @@ describe("App inventory shell", () => {
     fireEvent.click(screen.getByRole("button", { name: "Import" }));
 
     await waitFor(() =>
-      expect(projectServiceMock.ImportProject).toHaveBeenCalledWith({
-        folderPath:
-          "E:\\Development\\projects\\apps\\rcooler\\Cairn\\testdata\\projects\\app-db",
-        composeFilePaths: [],
-      }),
+      expect(projectServiceMock.ImportProject).toHaveBeenCalledWith(
+        expect.objectContaining({
+          folderPath:
+            "E:\\Development\\projects\\apps\\rcooler\\Cairn\\testdata\\projects\\app-db",
+          composeFilePaths: [],
+          jobID: expect.any(String),
+        }),
+      ),
     );
     expect(await screen.findByText("Imported app-db")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(projectServiceMock.RefreshProjects).toHaveBeenCalledTimes(2),
+    );
+  });
+
+  it("streams import progress and closes while build continues", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValueOnce(
+      [],
+    ).mockResolvedValueOnce([seededProject()]);
+    runtimeMock.openFile.mockResolvedValue(
+      "E:\\Development\\projects\\apps\\rcooler\\Cairn\\testdata\\projects\\app-db",
+    );
+    let resolveImport: ((detail: ProjectDetail) => void) | undefined;
+    projectServiceMock.ImportProject.mockImplementationOnce(
+      () =>
+        new Promise<ProjectDetail>((resolve) => {
+          resolveImport = resolve;
+        }),
+    );
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", {
+        name: /Projects/,
+      }),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Import Project" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Browse" }));
+    await waitFor(() =>
+      expect(screen.getByLabelText("Folder")).toHaveValue(
+        "E:\\Development\\projects\\apps\\rcooler\\Cairn\\testdata\\projects\\app-db",
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Import" }));
+
+    await waitFor(() =>
+      expect(projectServiceMock.ImportProject).toHaveBeenCalled(),
+    );
+    const importCalls = projectServiceMock.ImportProject.mock.calls;
+    const request = importCalls[importCalls.length - 1][0] as { jobID: string };
+    expect(request.jobID).toEqual(expect.any(String));
+
+    emitRuntimeEvent("job:progress", {
+      jobID: request.jobID,
+      projectID: "linux_native/app-db",
+      action: "import",
+      phase: "review",
+      message: "Compose YAML valid: 1 service(s)",
+    });
+    expect(
+      await screen.findByText("Compose YAML valid: 1 service(s)"),
+    ).toBeInTheDocument();
+
+    emitRuntimeEvent("job:progress", {
+      jobID: "deploy-job",
+      projectID: "linux_native/app-db",
+      action: "deploy",
+      phase: "stdout",
+      message: "Container app Started",
+    });
+    expect(await screen.findByText("Container app Started")).toBeInTheDocument();
+
+    const closeButtons = screen.getAllByRole("button", { name: "Close" });
+    fireEvent.click(closeButtons[closeButtons.length - 1]);
+    expect(
+      screen.queryByRole("dialog", { name: "Import Project" }),
+    ).not.toBeInTheDocument();
+
+    await act(async () => {
+      resolveImport?.(seededProjectDetail());
+    });
     await waitFor(() =>
       expect(projectServiceMock.RefreshProjects).toHaveBeenCalledTimes(2),
     );

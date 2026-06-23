@@ -1327,9 +1327,7 @@ func TestProjectServiceImportProject(t *testing.T) {
 	if len(detail.Services) != 2 || detail.Services[0].Name != "app" || detail.Services[1].Name != "db" {
 		t.Fatalf("services = %#v", detail.Services)
 	}
-	if !runner.hasCall(root + "|-f " + composeFile + " up -d") {
-		t.Fatalf("compose calls = %#v, want auto deploy", runner.calls)
-	}
+	waitForComposeCall(t, runner, root+"|-f "+composeFile+" up -d")
 	projects, err := service.ListProjects(ctx)
 	if err != nil {
 		t.Fatalf("ListProjects() error = %v", err)
@@ -1389,9 +1387,7 @@ func TestProjectServiceImportProjectKeepsProjectWhenAutoDeployFails(t *testing.T
 	if detail.Summary.ID != "linux_native/app-db" {
 		t.Fatalf("detail summary = %#v", detail.Summary)
 	}
-	if !runner.hasCall(root + "|-f " + composeFile + " up -d") {
-		t.Fatalf("compose calls = %#v, want auto deploy attempt", runner.calls)
-	}
+	waitForComposeCall(t, runner, root+"|-f "+composeFile+" up -d")
 	projects, err := service.ListProjects(ctx)
 	if err != nil {
 		t.Fatalf("ListProjects() error = %v", err)
@@ -1677,8 +1673,6 @@ func TestProjectServiceStartProjectAuditsAndPublishesProgress(t *testing.T) {
 	runner.outputs[root+"|-f "+composeFile+" start"] = providers.CommandResult{Stdout: "Container app Started\n"}
 	eventBus := bus.New()
 	defer eventBus.Close()
-	progress := eventBus.Subscribe(ctx, bus.TopicJobProgress, 8)
-	done := eventBus.Subscribe(ctx, bus.TopicJobDone, 8)
 	service := &ProjectService{
 		Client:     composecore.NewClient(runner),
 		Projects:   db.Projects(),
@@ -1692,6 +1686,8 @@ func TestProjectServiceStartProjectAuditsAndPublishesProgress(t *testing.T) {
 		t.Fatalf("ImportProject() error = %v", err)
 	}
 
+	progress := eventBus.Subscribe(ctx, bus.TopicJobProgress, 8)
+	done := eventBus.Subscribe(ctx, bus.TopicJobDone, 8)
 	if err := service.StartProject(ctx, detail.Summary.ID); err != nil {
 		t.Fatalf("StartProject() error = %v", err)
 	}
@@ -2128,6 +2124,7 @@ func (f *fakeDockerClient) RemoveNetwork(_ context.Context, id string) error {
 }
 
 type fakeComposeRunner struct {
+	mu            sync.Mutex
 	outputs       map[string]providers.CommandResult
 	errors        map[string]error
 	calls         []string
@@ -2150,26 +2147,49 @@ func (r *fakeComposeRunner) RunCompose(ctx context.Context, workdir string, args
 
 func (r *fakeComposeRunner) RunComposeEnv(_ context.Context, workdir string, _ []string, args ...string) (*providers.CommandResult, error) {
 	key := workdir + "|" + strings.Join(args, " ")
+	r.mu.Lock()
 	r.calls = append(r.calls, key)
 	result, ok := r.outputs[key]
 	if !ok && strings.HasSuffix(key, " ps --format json --all") {
 		result = providers.CommandResult{Stdout: `[{"ID":"existing","Name":"existing-app-1","Project":"existing","Service":"app","State":"running"}]`}
 	}
+	runErr := r.errors[key]
+	r.mu.Unlock()
 	result.Workdir = workdir
 	result.Command = append([]string{"docker", "compose"}, args...)
-	if err := r.errors[key]; err != nil {
-		return &result, err
+	if runErr != nil {
+		return &result, runErr
 	}
 	return &result, nil
 }
 
 func (r *fakeComposeRunner) hasCall(want string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	for _, call := range r.calls {
 		if call == want {
 			return true
 		}
 	}
 	return false
+}
+
+func (r *fakeComposeRunner) callsSnapshot() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.calls...)
+}
+
+func waitForComposeCall(t *testing.T, runner *fakeComposeRunner, want string) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if runner.hasCall(want) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("compose calls = %#v, want %s", runner.callsSnapshot(), want)
 }
 
 func (r *fakeComposeRunner) MapPathToBackend(path string) (string, error) {

@@ -376,6 +376,7 @@ type ProjectDetail struct {
 type ImportProjectRequest struct {
 	FolderPath       string   `json:"folderPath,omitempty"`
 	ComposeFilePaths []string `json:"composeFilePaths,omitempty"`
+	JobID            string   `json:"jobID,omitempty"`
 }
 
 type ComposeConfigResult struct {

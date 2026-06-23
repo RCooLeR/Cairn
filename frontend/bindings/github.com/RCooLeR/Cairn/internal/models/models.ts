@@ -1946,6 +1946,7 @@ export class ImageUpdate {
 export class ImportProjectRequest {
     "folderPath"?: string;
     "composeFilePaths"?: string[];
+    "jobID"?: string;
 
     /** Creates a new ImportProjectRequest instance. */
     constructor($$source: Partial<ImportProjectRequest> = {}) {
