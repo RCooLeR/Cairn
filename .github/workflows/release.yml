@@ -121,10 +121,9 @@ jobs:
           $env:VITE_CAIRN_VERSION = $env:CAIRN_VERSION
           wails3 task ${{ matrix.task }} APP_VERSION=$env:CAIRN_VERSION GIT_COMMIT=$env:CAIRN_COMMIT BUILD_DATE=$env:CAIRN_BUILD_DATE INSTALL_SCOPE=user
 
-      - name: Require Windows signing secrets for tag releases
+      - name: Note unsigned Windows release
         if: startsWith(github.ref, 'refs/tags/v') && matrix.platform == 'windows' && (env.WINDOWS_SIGN_PFX_BASE64 == '' || env.WINDOWS_SIGN_PFX_PASSWORD == '')
-        shell: pwsh
-        run: throw "WINDOWS_SIGN_PFX_BASE64 and WINDOWS_SIGN_PFX_PASSWORD are required for tagged Windows releases."
+        run: echo "Windows signing secrets are not configured. The NSIS installer will be published with an -unsigned suffix."
 
       - name: Sign Windows installer
         if: matrix.platform == 'windows' && env.WINDOWS_SIGN_PFX_BASE64 != '' && env.WINDOWS_SIGN_PFX_PASSWORD != ''
@@ -142,10 +141,9 @@ jobs:
         run: |
           Get-ChildItem bin -Filter "cairn-*-installer.exe" | Rename-Item -NewName { $_.BaseName + "-unsigned" + $_.Extension }
 
-      - name: Require macOS signing secrets for tag releases
+      - name: Note unsigned macOS release
         if: startsWith(github.ref, 'refs/tags/v') && matrix.platform == 'darwin' && (env.MACOS_CERTIFICATE_BASE64 == '' || env.MACOS_SIGN_IDENTITY == '' || env.MACOS_NOTARY_KEY == '' || env.MACOS_NOTARY_KEY_ID == '' || env.MACOS_NOTARY_ISSUER_ID == '')
-        shell: pwsh
-        run: throw "macOS certificate, signing identity, and notarytool API key secrets are required for tagged macOS releases."
+        run: echo "macOS signing/notary secrets are not configured. The DMG will be published with an -unsigned suffix."
 
       - name: Sign and notarize macOS dmg
         if: matrix.platform == 'darwin' && env.MACOS_CERTIFICATE_BASE64 != ''
@@ -221,6 +219,11 @@ jobs:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
     steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
       - name: Download package artifacts
         uses: actions/download-artifact@v4
         with:
@@ -228,11 +231,14 @@ jobs:
           pattern: cairn-*-${{ github.ref_name }}*
           merge-multiple: true
 
-      - name: Create GitHub Release
+      - name: List release artifacts
+        run: find release-artifacts -maxdepth 1 -type f -print | sort
+
+      - name: Publish GitHub Release
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean
         env:
           GITHUB_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "${GITHUB_REF_NAME}" release-artifacts/* \
-            --verify-tag \
-            --generate-notes \
-            --title "${GITHUB_REF_NAME}"

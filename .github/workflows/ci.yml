@@ -101,6 +101,14 @@ jobs:
         shell: pwsh
         run: ./scripts/run-govulncheck.ps1
 
+      - name: GoReleaser config check
+        if: runner.os == 'Linux'
+        uses: goreleaser/goreleaser-action@v7
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: check
+
       - name: Docker reconnect integration
         if: runner.os == 'Linux'
         env:

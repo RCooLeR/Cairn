@@ -95,12 +95,25 @@ Run in development mode:
 task dev
 ```
 
+## Releases
+
+CI builds native installers on each target OS and GoReleaser publishes tagged releases with checksums:
+
+- Windows: NSIS installer.
+- Linux: AppImage and Debian package.
+- macOS: DMG installer.
+
+Push a semver tag such as `v1.0.0` to run the release workflow. If code-signing secrets are not configured, Windows and macOS artifacts are published with an `-unsigned` suffix.
+
+More detail: [docs/release-process.md](docs/release-process.md).
+
 ## Documentation
 
 - [docs/help.md](docs/help.md) - user guide and common workflows.
 - [docs/user-quickstart.md](docs/user-quickstart.md) - first launch and daily use.
 - [docs/provider-troubleshooting.md](docs/provider-troubleshooting.md) - backend checks and fixes.
 - [docs/local-agent.md](docs/local-agent.md) - local Docker agent behavior.
+- [docs/release-process.md](docs/release-process.md) - CI packaging and GoReleaser publishing.
 - [docs/release-notes-v1.0.0.md](docs/release-notes-v1.0.0.md) - release notes.
 - [docs/manual-platform-validation.md](docs/manual-platform-validation.md) - manual platform validation.
 

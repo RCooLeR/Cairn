@@ -8,6 +8,7 @@ This directory contains user-facing and validation documentation for Cairn.
 - [user-quickstart.md](user-quickstart.md) - first launch, import, daily use, safety, backups, and updates.
 - [provider-troubleshooting.md](provider-troubleshooting.md) - Windows WSL, Linux native, macOS Colima, and existing context repair notes.
 - [local-agent.md](local-agent.md) - local Docker agent setup, tools, limits, and file-edit flow.
+- [release-process.md](release-process.md) - CI packaging, GoReleaser publishing, signing, and tagging.
 - [release-notes-v1.0.0.md](release-notes-v1.0.0.md) - v1.0 release notes.
 
 ## Validation Docs

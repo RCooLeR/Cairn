@@ -1,0 +1,52 @@
+version: 2
+
+project_name: cairn
+
+builds:
+  - skip: true
+
+archives: []
+
+checksum:
+  name_template: "cairn_{{ .Version }}_checksums.txt"
+  algorithm: sha256
+  extra_files:
+    - glob: ./release-artifacts/*.exe
+    - glob: ./release-artifacts/*.AppImage
+    - glob: ./release-artifacts/*.deb
+    - glob: ./release-artifacts/*.dmg
+    - glob: ./release-artifacts/*.spdx.json
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  github:
+    owner: RCooLeR
+    name: Cairn
+  name_template: "Cairn {{ .Tag }}"
+  replace_existing_artifacts: true
+  mode: replace
+  header: |
+    Cairn is a Compose-first Docker management desktop app for Windows, macOS, and Linux.
+
+    This release is assembled from native Wails packages built on GitHub-hosted Windows, Linux, and macOS runners.
+  footer: |
+    ## Artifact Notes
+
+    - Windows: NSIS installer.
+    - Linux: AppImage and Debian package.
+    - macOS: DMG installer.
+    - Files ending in `-unsigned` were built without code-signing secrets configured in CI.
+    - Verify downloads with the attached `cairn_{{ .Version }}_checksums.txt` file.
+  extra_files:
+    - glob: ./release-artifacts/*.exe
+    - glob: ./release-artifacts/*.AppImage
+    - glob: ./release-artifacts/*.deb
+    - glob: ./release-artifacts/*.dmg
+    - glob: ./release-artifacts/*.spdx.json
