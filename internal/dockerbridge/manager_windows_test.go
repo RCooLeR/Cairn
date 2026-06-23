@@ -27,7 +27,7 @@ func (fakeBridgeProvider) DockerDialContext(context.Context) (func(context.Conte
 	return func(context.Context, string, string) (net.Conn, error) {
 		client, server := net.Pipe()
 		go func() {
-			defer server.Close()
+			defer func() { _ = server.Close() }()
 			_, _ = io.Copy(server, server)
 		}()
 		return client, nil
@@ -48,7 +48,7 @@ func TestManagerForwardsNamedPipeToProviderDialer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("DialPipe() error = %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if _, err := conn.Write([]byte("ping")); err != nil {
 		t.Fatalf("Write() error = %v", err)

@@ -1,4 +1,9 @@
 services:
   logger:
     image: busybox:1.36
-    command: ["sh", "-c", "i=0; while true; do i=$$((i+1)); echo line-$$i; done"]
+    command:
+      [
+        "sh",
+        "-c",
+        "i=0; while true; do j=0; while [ $$j -lt 125 ]; do i=$$((i+1)); j=$$((j+1)); echo line-$$i; done; usleep 20000; done",
+      ]

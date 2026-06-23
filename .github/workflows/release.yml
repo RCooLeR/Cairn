@@ -234,6 +234,11 @@ jobs:
       - name: List release artifacts
         run: find release-artifacts -maxdepth 1 -type f -print | sort
 
+      - name: Remove existing release before rerun
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release delete "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --yes || true
+
       - name: Publish GitHub Release
         uses: goreleaser/goreleaser-action@v7
         with:
@@ -242,3 +247,4 @@ jobs:
           args: release --clean --skip=validate
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          GODEBUG: http2client=0

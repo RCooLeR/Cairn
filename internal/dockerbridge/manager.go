@@ -163,7 +163,7 @@ func (m *Manager) handle(ctx context.Context, client net.Conn, dialContext func(
 		_ = client.Close()
 		return
 	}
-	defer backend.Close()
+	defer func() { _ = backend.Close() }()
 
 	done := make(chan struct{})
 	var once sync.Once
