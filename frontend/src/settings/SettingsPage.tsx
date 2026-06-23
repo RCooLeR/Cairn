@@ -1,4 +1,4 @@
-import { type ReactNode, useEffect, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useState } from "react";
 import {
   Bot,
   Download,
@@ -243,7 +243,7 @@ export function SettingsPage({
     ["help", "Help"],
     ["about", "About"],
   ];
-  const refreshDockerShimStatus = async () => {
+  const refreshDockerShimStatus = useCallback(async () => {
     setDockerShimLoading(true);
     setDockerShimError(null);
     try {
@@ -257,7 +257,7 @@ export function SettingsPage({
     } finally {
       setDockerShimLoading(false);
     }
-  };
+  }, []);
   const installDockerShim = async () => {
     setDockerShimLoading(true);
     setDockerShimError(null);
@@ -273,9 +273,13 @@ export function SettingsPage({
   };
   useEffect(() => {
     if (section === "providers" && providerKind === "windows_wsl_ubuntu") {
-      void refreshDockerShimStatus();
+      const timer = window.setTimeout(() => {
+        void refreshDockerShimStatus();
+      }, 0);
+      return () => window.clearTimeout(timer);
     }
-  }, [providerKind, section, wslDistro]);
+    return undefined;
+  }, [providerKind, refreshDockerShimStatus, section, wslDistro]);
   return (
     <div className="grid gap-4 xl:grid-cols-[220px_minmax(0,1fr)]">
       <div className="xl:hidden">

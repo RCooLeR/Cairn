@@ -286,19 +286,7 @@ export function AgentPage({ projects }: AgentPageProps) {
     }
   };
 
-  const changeProject = (nextProjectID: string) => {
-    setProjectID(nextProjectID);
-    setAnalysis(null);
-    setEditPlan(null);
-    setEditResult(null);
-    setEditError(null);
-    autoLoadedAnalysisProjectRef.current = nextProjectID || null;
-    if (nextProjectID) {
-      void loadProjectAnalysis(nextProjectID);
-    }
-  };
-
-  const loadProjectAnalysis = async (targetProjectID = projectID) => {
+  const loadProjectAnalysis = useCallback(async (targetProjectID = projectID) => {
     if (!targetProjectID) {
       return;
     }
@@ -313,6 +301,18 @@ export function AgentPage({ projects }: AgentPageProps) {
     } finally {
       setAnalysisLoading(false);
     }
+  }, [projectID]);
+
+  const changeProject = (nextProjectID: string) => {
+    setProjectID(nextProjectID);
+    setAnalysis(null);
+    setEditPlan(null);
+    setEditResult(null);
+    setEditError(null);
+    autoLoadedAnalysisProjectRef.current = nextProjectID || null;
+    if (nextProjectID) {
+      void loadProjectAnalysis(nextProjectID);
+    }
   };
 
   useEffect(() => {
@@ -325,7 +325,7 @@ export function AgentPage({ projects }: AgentPageProps) {
       return;
     }
     void loadProjectAnalysis(projectID);
-  }, [analysis, analysisLoading, projectID]);
+  }, [analysis, analysisLoading, loadProjectAnalysis, projectID]);
 
   const draftProjectFile = async () => {
     if (!projectID || !editPath.trim() || !editInstruction.trim()) {
