@@ -116,6 +116,9 @@ func TestManagerRealDockerBackupRestoreRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PlanRestoreVolume(new) error = %v", err)
 	}
+	if restorePlan.Risk != models.RiskNeedsConfirmation || restorePlan.RequiresTypedName != "" {
+		t.Fatalf("new restore plan = %#v, want confirmation without typed name", restorePlan)
+	}
 	restoreJob, err := manager.ApplyRestore(ctx, restorePlan.PlanID, "")
 	if err != nil {
 		t.Fatalf("ApplyRestore(new) error = %v", err)

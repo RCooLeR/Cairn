@@ -403,6 +403,39 @@ func TestRestoreOverwriteRequiresTypedNameAndRunsHelper(t *testing.T) {
 	}
 }
 
+func TestRestoreIntoNewVolumeRequiresConfirmationOnly(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	mgr, _, _ := newTestManager(t)
+	dir := t.TempDir()
+	archivePath := filepath.Join(dir, "app-db.tar.gz")
+	payload := []byte("backup-data")
+	if err := os.WriteFile(archivePath, payload, 0o600); err != nil {
+		t.Fatalf("write archive: %v", err)
+	}
+	sum := sha256.Sum256(payload)
+	if err := writeSidecar(metadataPathForArchive(archivePath), BackupSidecar{
+		FormatVersion: formatVersion,
+		Volume:        "app-db",
+		Project:       "app",
+		SHA256:        hex.EncodeToString(sum[:]),
+	}); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+
+	plan, err := mgr.PlanRestoreVolume(ctx, models.RestoreVolumeRequest{
+		SourcePath: archivePath,
+		VolumeName: "app-db-restored",
+		Overwrite:  false,
+	})
+	if err != nil {
+		t.Fatalf("PlanRestoreVolume() error = %v", err)
+	}
+	if plan.Risk != models.RiskNeedsConfirmation || plan.RequiresTypedName != "" {
+		t.Fatalf("plan = %#v, want confirmation without typed name", plan)
+	}
+}
+
 func TestRestoreReverifiesChecksumBeforeRunningHelper(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

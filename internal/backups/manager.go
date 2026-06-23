@@ -291,7 +291,7 @@ func (m *Manager) PlanRestoreVolume(ctx context.Context, req models.RestoreVolum
 	if err != nil {
 		return nil, err
 	}
-	risk := models.RiskDestructive
+	risk := models.RiskNeedsConfirmation
 	requiresTypedName := ""
 	if req.Overwrite {
 		risk = models.RiskDangerous
