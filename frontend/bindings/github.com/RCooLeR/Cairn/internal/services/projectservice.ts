@@ -61,6 +61,12 @@ export function RestartProject(projectID: string): $CancellablePromise<void> {
     return $Call.ByID(3364293751, projectID);
 }
 
+export function ReviewImportProject(req: models$0.ImportProjectRequest): $CancellablePromise<models$0.ImportProjectReview | null> {
+    return $Call.ByID(850741191, req).then(($result: any) => {
+        return $$createType7($result);
+    });
+}
+
 export function StartProject(projectID: string): $CancellablePromise<void> {
     return $Call.ByID(1592654942, projectID);
 }
@@ -76,3 +82,5 @@ const $$createType2 = models$0.ProjectSummary.createFrom;
 const $$createType3 = $Create.Array($$createType2);
 const $$createType4 = models$0.CommandPlan.createFrom;
 const $$createType5 = $Create.Nullable($$createType4);
+const $$createType6 = models$0.ImportProjectReview.createFrom;
+const $$createType7 = $Create.Nullable($$createType6);

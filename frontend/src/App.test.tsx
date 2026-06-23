@@ -22,6 +22,7 @@ import type {
   ImageLineage,
   ImageSummary,
   ImageUpdate,
+  ImportProjectReview,
   LogLine,
   NetworkSummary,
   Notification,
@@ -117,6 +118,7 @@ const projectServiceMock = vi.hoisted(() => ({
   RefreshProjects: vi.fn(),
   ListProjects: vi.fn(),
   GetProject: vi.fn(),
+  ReviewImportProject: vi.fn(),
   ImportProject: vi.fn(),
   StartProject: vi.fn(),
   StopProject: vi.fn(),
@@ -390,6 +392,9 @@ describe("App inventory shell", () => {
     projectServiceMock.RefreshProjects.mockResolvedValue([]);
     projectServiceMock.ListProjects.mockResolvedValue([]);
     projectServiceMock.GetProject.mockResolvedValue(null);
+    projectServiceMock.ReviewImportProject.mockResolvedValue(
+      seededImportProjectReview(),
+    );
     projectServiceMock.ImportProject.mockResolvedValue(seededProjectDetail());
     projectServiceMock.StartProject.mockResolvedValue(undefined);
     projectServiceMock.StopProject.mockResolvedValue(undefined);
@@ -2265,6 +2270,23 @@ describe("App inventory shell", () => {
     expect(screen.getByLabelText("Folder")).toHaveValue(
       "E:\\Development\\projects\\apps\\rcooler\\Cairn\\testdata\\projects\\app-db",
     );
+    await waitFor(() =>
+      expect(projectServiceMock.ReviewImportProject).toHaveBeenCalledWith({
+        folderPath:
+          "E:\\Development\\projects\\apps\\rcooler\\Cairn\\testdata\\projects\\app-db",
+        composeFilePaths: [],
+      }),
+    );
+    expect(
+      await screen.findByRole("tab", { name: /compose\.yaml/ }),
+    ).toBeInTheDocument();
+    expect(await screen.findByTestId("monaco-viewer")).toHaveTextContent(
+      "image: cairn/app:latest",
+    );
+    fireEvent.click(screen.getByRole("tab", { name: /\.env/ }));
+    expect(screen.getByTestId("monaco-viewer")).toHaveTextContent(
+      "APP_ENV=local",
+    );
 
     fireEvent.click(screen.getByRole("button", { name: "Import" }));
 
@@ -2319,6 +2341,9 @@ describe("App inventory shell", () => {
         "E:\\Development\\projects\\apps\\rcooler\\Cairn\\testdata\\projects\\app-db",
       ),
     );
+    expect(await screen.findByTestId("monaco-viewer")).toHaveTextContent(
+      "image: cairn/app:latest",
+    );
     fireEvent.click(screen.getByRole("button", { name: "Import" }));
 
     await waitFor(() =>
@@ -2329,24 +2354,15 @@ describe("App inventory shell", () => {
     expect(request.jobID).toEqual(expect.any(String));
 
     emitRuntimeEvent("job:progress", {
-      jobID: request.jobID,
-      projectID: "linux_native/app-db",
-      action: "import",
-      phase: "review",
-      message: "Compose YAML valid: 1 service(s)",
-    });
-    expect(
-      await screen.findByText("Compose YAML valid: 1 service(s)"),
-    ).toBeInTheDocument();
-
-    emitRuntimeEvent("job:progress", {
       jobID: "deploy-job",
       projectID: "linux_native/app-db",
       action: "deploy",
       phase: "stdout",
       message: "Container app Started",
     });
-    expect(await screen.findByText("Container app Started")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Container app Started"),
+    ).toBeInTheDocument();
 
     const closeButtons = screen.getAllByRole("button", { name: "Close" });
     fireEvent.click(closeButtons[closeButtons.length - 1]);
@@ -4279,6 +4295,29 @@ function seededProjectDetail(): ProjectDetail {
       valid: true,
       errors: [],
     },
+  };
+}
+
+function seededImportProjectReview(): ImportProjectReview {
+  const detail = seededProjectDetail();
+  return {
+    folderPath:
+      "E:\\Development\\projects\\apps\\rcooler\\Cairn\\testdata\\projects\\app-db",
+    projectID: "linux_native/app-db",
+    projectName: "app-db",
+    compose: detail.compose ?? {
+      rawFiles: [],
+      resolvedYAML: "",
+      valid: true,
+    },
+    envFiles: [
+      {
+        path: "E:\\Development\\projects\\apps\\rcooler\\Cairn\\testdata\\projects\\app-db\\.env",
+        content: "APP_ENV=local\n",
+      },
+    ],
+    services: ["app", "db"],
+    buildRequired: true,
   };
 }
 

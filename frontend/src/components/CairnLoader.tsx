@@ -40,15 +40,46 @@ const LOG_LINES = [
 ];
 
 // label, icon, and per-service fill curve (staggered) from the original app.js.
-const SERVICES: { key: string; label: string; icon: string; fill: (p: number) => number }[] = [
-  { key: "core", label: "Core Services", icon: "▣", fill: (p) => Math.min(100, p * 155) },
-  { key: "engine", label: "Docker Engine", icon: "⬡", fill: (p) => Math.min(100, Math.max(0, (p - 0.1) * 130)) },
-  { key: "compose", label: "Compose Module", icon: "◇", fill: (p) => Math.min(100, Math.max(0, (p - 0.24) * 118)) },
-  { key: "network", label: "Network Layer", icon: "◌", fill: (p) => Math.min(100, Math.max(0, (p - 0.42) * 110)) },
-  { key: "agent", label: "Local Agent", icon: "⌂", fill: (p) => Math.min(100, Math.max(0, (p - 0.58) * 110)) },
+const SERVICES: {
+  key: string;
+  label: string;
+  icon: string;
+  fill: (p: number) => number;
+}[] = [
+  {
+    key: "core",
+    label: "Core Services",
+    icon: "▣",
+    fill: (p) => Math.min(100, p * 155),
+  },
+  {
+    key: "engine",
+    label: "Docker Engine",
+    icon: "⬡",
+    fill: (p) => Math.min(100, Math.max(0, (p - 0.1) * 130)),
+  },
+  {
+    key: "compose",
+    label: "Compose Module",
+    icon: "◇",
+    fill: (p) => Math.min(100, Math.max(0, (p - 0.24) * 118)),
+  },
+  {
+    key: "network",
+    label: "Network Layer",
+    icon: "◌",
+    fill: (p) => Math.min(100, Math.max(0, (p - 0.42) * 110)),
+  },
+  {
+    key: "agent",
+    label: "Local Agent",
+    icon: "⌂",
+    fill: (p) => Math.min(100, Math.max(0, (p - 0.58) * 110)),
+  },
 ];
 
-const easeOutCubic = (t: number) => 1 - Math.pow(1 - Math.min(1, Math.max(0, t)), 3);
+const easeOutCubic = (t: number) =>
+  1 - Math.pow(1 - Math.min(1, Math.max(0, t)), 3);
 
 function stateFor(p: number): string {
   if (p < 0.15) return "Booting";
@@ -60,7 +91,15 @@ function stateFor(p: number): string {
 }
 
 type RGB = [number, number, number];
-type Particle = { x: number; y: number; vx: number; vy: number; r: number; color: RGB; phase: number };
+type Particle = {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  r: number;
+  color: RGB;
+  phase: number;
+};
 type Ring = { radius: number; speed: number; offset: number };
 
 export default function CairnLoader({ onDone }: { onDone: () => void }) {
@@ -206,7 +245,12 @@ export default function CairnLoader({ onDone }: { onDone: () => void }) {
       ctx.setLineDash([]);
 
       const beamY = cy - scale * 0.22 + ((now * 0.055) % (scale * 0.44));
-      const beam = ctx.createLinearGradient(cx - scale * 0.34, beamY, cx + scale * 0.34, beamY);
+      const beam = ctx.createLinearGradient(
+        cx - scale * 0.34,
+        beamY,
+        cx + scale * 0.34,
+        beamY,
+      );
       beam.addColorStop(0, "rgba(22,216,207,0)");
       beam.addColorStop(0.35, "rgba(22,216,207,0.16)");
       beam.addColorStop(0.5, "rgba(255,255,255,0.42)");
@@ -240,7 +284,10 @@ export default function CairnLoader({ onDone }: { onDone: () => void }) {
           const dy = a.y - b.y;
           const d2 = dx * dx + dy * dy;
           if (d2 < 11500) {
-            ctx.strokeStyle = rgba(mix(a.color, b.color, 0.5), 0.045 * (1 - d2 / 11500));
+            ctx.strokeStyle = rgba(
+              mix(a.color, b.color, 0.5),
+              0.045 * (1 - d2 / 11500),
+            );
             ctx.lineWidth = 1;
             ctx.beginPath();
             ctx.moveTo(a.x, a.y);
@@ -266,7 +313,10 @@ export default function CairnLoader({ onDone }: { onDone: () => void }) {
 
   // ---- HUD values from progress ----
   const pct = Math.max(1, Math.round(prog * 100));
-  const logCount = Math.max(3, Math.min(LOG_LINES.length, Math.floor(prog * LOG_LINES.length) + 1));
+  const logCount = Math.max(
+    3,
+    Math.min(LOG_LINES.length, Math.floor(prog * LOG_LINES.length) + 1),
+  );
 
   return (
     <div

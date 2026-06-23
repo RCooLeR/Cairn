@@ -39,17 +39,16 @@ export async function getInventorySnapshot(): Promise<InventorySnapshot> {
     images,
     volumes,
     networks,
-  ] =
-    await Promise.allSettled([
-      ProviderService.ListProviders(),
-      DockerService.Info(),
-      DockerService.Version(),
-      DockerService.DiskUsage(),
-      DockerService.ListContainers({ all: true }),
-      DockerService.ListImages(),
-      DockerService.ListVolumes(),
-      DockerService.ListNetworks(),
-    ]);
+  ] = await Promise.allSettled([
+    ProviderService.ListProviders(),
+    DockerService.Info(),
+    DockerService.Version(),
+    DockerService.DiskUsage(),
+    DockerService.ListContainers({ all: true }),
+    DockerService.ListImages(),
+    DockerService.ListVolumes(),
+    DockerService.ListNetworks(),
+  ]);
 
   const volumeSummaries = valueOr(volumes, []);
   const networkSummaries = valueOr(networks, []);

@@ -32,9 +32,7 @@ describe("ErrorBoundary", () => {
       </ErrorBoundary>,
     );
 
-    expect(screen.getByRole("alert")).toHaveTextContent(
-      "Cairn hit a UI error",
-    );
+    expect(screen.getByRole("alert")).toHaveTextContent("Cairn hit a UI error");
     expect(screen.getByText("boom")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Reload Cairn" })).toBeEnabled();
   });

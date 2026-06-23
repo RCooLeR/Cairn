@@ -379,6 +379,16 @@ type ImportProjectRequest struct {
 	JobID            string   `json:"jobID,omitempty"`
 }
 
+type ImportProjectReview struct {
+	FolderPath    string              `json:"folderPath"`
+	ProjectID     string              `json:"projectID"`
+	ProjectName   string              `json:"projectName"`
+	Compose       ComposeConfigResult `json:"compose"`
+	EnvFiles      []ComposeRawFile    `json:"envFiles,omitempty"`
+	Services      []string            `json:"services,omitempty"`
+	BuildRequired bool                `json:"buildRequired"`
+}
+
 type ComposeConfigResult struct {
 	RawFiles     []ComposeRawFile `json:"rawFiles,omitempty"`
 	ResolvedYAML string           `json:"resolvedYAML"`

@@ -38,9 +38,7 @@ export class ErrorBoundary extends React.Component<
             <p className="text-sm font-semibold text-error">
               Something went wrong
             </p>
-            <h1 className="mt-2 text-xl font-semibold">
-              Cairn hit a UI error
-            </h1>
+            <h1 className="mt-2 text-xl font-semibold">Cairn hit a UI error</h1>
             <p className="mt-3 text-sm text-text-secondary">
               Reload the window to recover. The app state on disk is preserved.
             </p>

@@ -286,22 +286,25 @@ export function AgentPage({ projects }: AgentPageProps) {
     }
   };
 
-  const loadProjectAnalysis = useCallback(async (targetProjectID = projectID) => {
-    if (!targetProjectID) {
-      return;
-    }
-    autoLoadedAnalysisProjectRef.current = targetProjectID;
-    setAnalysisLoading(true);
-    setEditError(null);
-    try {
-      const nextAnalysis = await AgentService.AnalyzeProject(targetProjectID);
-      setAnalysis(nextAnalysis);
-    } catch (nextError) {
-      setEditError(errorMessage(nextError, "Unable to analyze project"));
-    } finally {
-      setAnalysisLoading(false);
-    }
-  }, [projectID]);
+  const loadProjectAnalysis = useCallback(
+    async (targetProjectID = projectID) => {
+      if (!targetProjectID) {
+        return;
+      }
+      autoLoadedAnalysisProjectRef.current = targetProjectID;
+      setAnalysisLoading(true);
+      setEditError(null);
+      try {
+        const nextAnalysis = await AgentService.AnalyzeProject(targetProjectID);
+        setAnalysis(nextAnalysis);
+      } catch (nextError) {
+        setEditError(errorMessage(nextError, "Unable to analyze project"));
+      } finally {
+        setAnalysisLoading(false);
+      }
+    },
+    [projectID],
+  );
 
   const changeProject = (nextProjectID: string) => {
     setProjectID(nextProjectID);

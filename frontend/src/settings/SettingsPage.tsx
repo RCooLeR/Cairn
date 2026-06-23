@@ -252,7 +252,9 @@ export function SettingsPage({
       );
     } catch (err) {
       setDockerShimError(
-        err instanceof Error ? err.message : "Unable to load Docker CLI shim status",
+        err instanceof Error
+          ? err.message
+          : "Unable to load Docker CLI shim status",
       );
     } finally {
       setDockerShimLoading(false);
@@ -265,7 +267,9 @@ export function SettingsPage({
       setDockerShimStatus(await SettingsService.InstallWindowsDockerCLIShim());
     } catch (err) {
       setDockerShimError(
-        err instanceof Error ? err.message : "Unable to install Docker CLI shim",
+        err instanceof Error
+          ? err.message
+          : "Unable to install Docker CLI shim",
       );
     } finally {
       setDockerShimLoading(false);
@@ -788,10 +792,7 @@ export function SettingsPage({
                   label="Local agent"
                   value="docs/local-agent.md"
                 />
-                <ReadOnlySetting
-                  label="User guide"
-                  value="docs/help.md"
-                />
+                <ReadOnlySetting label="User guide" value="docs/help.md" />
               </CardBody>
             </Card>
           </div>
@@ -1044,18 +1045,14 @@ export function SettingsPage({
                       <>
                         <div className="flex flex-wrap gap-2">
                           <Badge
-                            tone={
-                              dockerShimStatus.installed ? "ok" : "warn"
-                            }
+                            tone={dockerShimStatus.installed ? "ok" : "warn"}
                           >
                             {dockerShimStatus.installed
                               ? "installed"
                               : "not installed"}
                           </Badge>
                           <Badge
-                            tone={
-                              dockerShimStatus.onUserPath ? "ok" : "warn"
-                            }
+                            tone={dockerShimStatus.onUserPath ? "ok" : "warn"}
                           >
                             {dockerShimStatus.onUserPath
                               ? "on PATH"

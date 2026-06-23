@@ -100,6 +100,56 @@ func (s *ProjectService) getProject(ctx context.Context, projectID string) (*mod
 	}, nil
 }
 
+func (s *ProjectService) ReviewImportProject(ctx context.Context, req models.ImportProjectRequest) (*models.ImportProjectReview, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
+	if s.Client == nil || s.Projects == nil || strings.TrimSpace(s.ProviderID) == "" {
+		return nil, notReady()
+	}
+	workdir, files, err := resolveImportFiles(req)
+	if err != nil {
+		return nil, err
+	}
+	projectName := composecore.NormalizeProjectName(filepath.Base(workdir))
+	if projectName == "" {
+		projectName = "project"
+	}
+	projectID := composecore.ProjectID(s.ProviderID, projectName)
+	importOpts := composecore.ProjectOptions{
+		Workdir:     workdir,
+		Files:       files,
+		ProjectName: projectName,
+	}
+	config, err := s.Client.Config(ctx, importOpts)
+	if config == nil {
+		return nil, err
+	}
+	config.API.RawFiles = readComposeRawFiles(store.ProjectRecord{
+		WorkingDir:   workdir,
+		ComposeFiles: files,
+	})
+	if err != nil {
+		config.API.Valid = false
+		if len(config.API.Errors) == 0 {
+			config.API.Errors = []string{err.Error()}
+		}
+	}
+	services := make([]string, 0, len(config.Services))
+	for _, service := range config.Services {
+		services = append(services, service.Name)
+	}
+	sort.Strings(services)
+	return &models.ImportProjectReview{
+		FolderPath:    workdir,
+		ProjectID:     projectID,
+		ProjectName:   projectName,
+		Compose:       config.API,
+		EnvFiles:      readImportEnvFiles(workdir, config.EnvFiles),
+		Services:      services,
+		BuildRequired: s.shouldAutoDeployImportedProject(ctx, importOpts),
+	}, nil
+}
+
 func (s *ProjectService) ImportProject(ctx context.Context, req models.ImportProjectRequest) (*models.ProjectDetail, error) {
 	unlock := s.lockRuntime()
 	defer unlock()
@@ -1382,6 +1432,46 @@ func readComposeRawFiles(project store.ProjectRecord) []models.ComposeRawFile {
 		}
 		rawFiles = append(rawFiles, models.ComposeRawFile{
 			Path:    path,
+			Content: string(content),
+		})
+	}
+	return rawFiles
+}
+
+func readImportEnvFiles(workdir string, envFiles []string) []models.ComposeRawFile {
+	candidates := make([]string, 0, len(envFiles)+1)
+	candidates = append(candidates, filepath.Join(workdir, ".env"))
+	for _, file := range envFiles {
+		file = strings.TrimSpace(file)
+		if file == "" {
+			continue
+		}
+		if !filepath.IsAbs(file) {
+			file = filepath.Join(workdir, file)
+		}
+		candidates = append(candidates, file)
+	}
+	seen := map[string]struct{}{}
+	rawFiles := make([]models.ComposeRawFile, 0, len(candidates))
+	for _, file := range candidates {
+		absFile, err := filepath.Abs(file)
+		if err != nil {
+			continue
+		}
+		if _, exists := seen[absFile]; exists {
+			continue
+		}
+		seen[absFile] = struct{}{}
+		info, err := os.Stat(absFile)
+		if err != nil || info.IsDir() {
+			continue
+		}
+		content, err := os.ReadFile(absFile)
+		if err != nil {
+			continue
+		}
+		rawFiles = append(rawFiles, models.ComposeRawFile{
+			Path:    absFile,
 			Content: string(content),
 		})
 	}

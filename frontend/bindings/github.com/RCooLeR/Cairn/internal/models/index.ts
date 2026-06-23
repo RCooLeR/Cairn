@@ -59,6 +59,7 @@ export {
     ImageSummary,
     ImageUpdate,
     ImportProjectRequest,
+    ImportProjectReview,
     InstallOptions,
     InstallProgressHandle,
     LineageSource,

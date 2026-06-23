@@ -1967,6 +1967,57 @@ export class ImportProjectRequest {
     }
 }
 
+export class ImportProjectReview {
+    "folderPath": string;
+    "projectID": string;
+    "projectName": string;
+    "compose": ComposeConfigResult;
+    "envFiles"?: ComposeRawFile[];
+    "services"?: string[];
+    "buildRequired": boolean;
+
+    /** Creates a new ImportProjectReview instance. */
+    constructor($$source: Partial<ImportProjectReview> = {}) {
+        if (!("folderPath" in $$source)) {
+            this["folderPath"] = "";
+        }
+        if (!("projectID" in $$source)) {
+            this["projectID"] = "";
+        }
+        if (!("projectName" in $$source)) {
+            this["projectName"] = "";
+        }
+        if (!("compose" in $$source)) {
+            this["compose"] = (new ComposeConfigResult());
+        }
+        if (!("buildRequired" in $$source)) {
+            this["buildRequired"] = false;
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new ImportProjectReview instance from a string or object.
+     */
+    static createFrom($$source: any = {}): ImportProjectReview {
+        const $$createField3_0 = $$createType37;
+        const $$createField4_0 = $$createType14;
+        const $$createField5_0 = $$createType1;
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        if ("compose" in $$parsedSource) {
+            $$parsedSource["compose"] = $$createField3_0($$parsedSource["compose"]);
+        }
+        if ("envFiles" in $$parsedSource) {
+            $$parsedSource["envFiles"] = $$createField4_0($$parsedSource["envFiles"]);
+        }
+        if ("services" in $$parsedSource) {
+            $$parsedSource["services"] = $$createField5_0($$parsedSource["services"]);
+        }
+        return new ImportProjectReview($$parsedSource as Partial<ImportProjectReview>);
+    }
+}
+
 export class InstallOptions {
     "backend"?: string;
     "version"?: string;
@@ -2079,7 +2130,7 @@ export class LogPage {
      * Creates a new LogPage instance from a string or object.
      */
     static createFrom($$source: any = {}): LogPage {
-        const $$createField0_0 = $$createType38;
+        const $$createField0_0 = $$createType39;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("lines" in $$parsedSource) {
             $$parsedSource["lines"] = $$createField0_0($$parsedSource["lines"]);
@@ -2242,10 +2293,10 @@ export class NetworkDetail {
      * Creates a new NetworkDetail instance from a string or object.
      */
     static createFrom($$source: any = {}): NetworkDetail {
-        const $$createField0_0 = $$createType39;
+        const $$createField0_0 = $$createType40;
         const $$createField3_0 = $$createType22;
-        const $$createField4_0 = $$createType41;
-        const $$createField5_0 = $$createType42;
+        const $$createField4_0 = $$createType42;
+        const $$createField5_0 = $$createType43;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("summary" in $$parsedSource) {
             $$parsedSource["summary"] = $$createField0_0($$parsedSource["summary"]);
@@ -2505,9 +2556,9 @@ export class ProjectDetail {
      * Creates a new ProjectDetail instance from a string or object.
      */
     static createFrom($$source: any = {}): ProjectDetail {
-        const $$createField0_0 = $$createType43;
-        const $$createField1_0 = $$createType45;
-        const $$createField2_0 = $$createType42;
+        const $$createField0_0 = $$createType44;
+        const $$createField1_0 = $$createType46;
+        const $$createField2_0 = $$createType43;
         const $$createField3_0 = $$createType47;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("summary" in $$parsedSource) {
@@ -3544,7 +3595,7 @@ export class VolumeDetail {
     static createFrom($$source: any = {}): VolumeDetail {
         const $$createField0_0 = $$createType65;
         const $$createField1_0 = $$createType22;
-        const $$createField2_0 = $$createType42;
+        const $$createField2_0 = $$createType43;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("summary" in $$parsedSource) {
             $$parsedSource["summary"] = $$createField0_0($$parsedSource["summary"]);
@@ -3699,17 +3750,17 @@ const $$createType33 = $Create.Array($$createType32);
 const $$createType34 = GPUProcessMetric.createFrom;
 const $$createType35 = $Create.Array($$createType34);
 const $$createType36 = ImageSummary.createFrom;
-const $$createType37 = LogLine.createFrom;
-const $$createType38 = $Create.Array($$createType37);
-const $$createType39 = NetworkSummary.createFrom;
-const $$createType40 = NetworkIPAMConfig.createFrom;
-const $$createType41 = $Create.Array($$createType40);
-const $$createType42 = $Create.Array($$createType17);
-const $$createType43 = ProjectSummary.createFrom;
-const $$createType44 = ComposeServiceStatus.createFrom;
-const $$createType45 = $Create.Array($$createType44);
-const $$createType46 = ComposeConfigResult.createFrom;
-const $$createType47 = $Create.Nullable($$createType46);
+const $$createType37 = ComposeConfigResult.createFrom;
+const $$createType38 = LogLine.createFrom;
+const $$createType39 = $Create.Array($$createType38);
+const $$createType40 = NetworkSummary.createFrom;
+const $$createType41 = NetworkIPAMConfig.createFrom;
+const $$createType42 = $Create.Array($$createType41);
+const $$createType43 = $Create.Array($$createType17);
+const $$createType44 = ProjectSummary.createFrom;
+const $$createType45 = ComposeServiceStatus.createFrom;
+const $$createType46 = $Create.Array($$createType45);
+const $$createType47 = $Create.Nullable($$createType37);
 const $$createType48 = UpdateBadges.createFrom;
 const $$createType49 = ProviderSummary.createFrom;
 const $$createType50 = ProviderProblem.createFrom;

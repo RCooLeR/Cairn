@@ -25,6 +25,7 @@ import type {
   ProviderStatus,
   ProviderWarning,
   ProjectDetail,
+  ImportProjectReview,
   ProjectSummary,
   ProviderSummary,
   RegistryAccount,
@@ -149,6 +150,7 @@ import {
   StatusDot,
   StatusPill,
   TableSkeleton,
+  Tabs,
   ToastViewport,
   Tooltip,
 } from "./components/ui";
@@ -526,10 +528,20 @@ type ImportProjectLogEntry = {
   tone: ImportProjectLogTone;
 };
 
+type ImportReviewEditorFile = {
+  id: string;
+  kind: "compose" | "env";
+  path: string;
+  content: string;
+};
+
 type ImportProjectState = {
   open: boolean;
   folderPath: string;
   busy: boolean;
+  reviewLoading: boolean;
+  review?: ImportProjectReview | null;
+  activeReviewTab: string;
   jobID?: string;
   projectID?: string;
   steps: Record<ImportProjectStepID, ImportProjectStepStatus>;
@@ -832,6 +844,9 @@ const emptyImportProject: ImportProjectState = {
   open: false,
   folderPath: "",
   busy: false,
+  reviewLoading: false,
+  review: null,
+  activeReviewTab: "",
   steps: initialImportProjectSteps(),
   progress: [],
   imported: null,
@@ -4247,6 +4262,85 @@ function App() {
     [ensureDockerReady],
   );
 
+  const reviewImportProjectFolder = useCallback(async (folderPath: string) => {
+    const trimmed = folderPath.trim();
+    if (!trimmed) {
+      setImportProject((current) => ({
+        ...current,
+        error: "Choose a project folder",
+      }));
+      return;
+    }
+    setImportProject((current) => ({
+      ...current,
+      folderPath: trimmed,
+      reviewLoading: true,
+      review: null,
+      activeReviewTab: "",
+      jobID: undefined,
+      projectID: undefined,
+      steps: {
+        open: "running",
+        review: "pending",
+        build: "pending",
+      },
+      progress: [
+        importProjectLogEntry("open", `Opening ${trimmed}`, "info", "review"),
+      ],
+      error: undefined,
+      imported: null,
+    }));
+    try {
+      const review = await ProjectService.ReviewImportProject({
+        folderPath: trimmed,
+        composeFilePaths: [],
+      });
+      setImportProject((current) => ({
+        ...current,
+        folderPath: review?.folderPath || trimmed,
+        review,
+        reviewLoading: false,
+        activeReviewTab: firstImportReviewTabID(review),
+        projectID: review?.projectID || current.projectID,
+        steps: {
+          open: "done",
+          review: review?.compose.valid ? "done" : "error",
+          build: "pending",
+        },
+        progress: appendImportProjectLog(current.progress, {
+          step: "review",
+          message: review
+            ? review.compose.valid
+              ? `Loaded ${importReviewEditorFiles(review).length} file(s) for review`
+              : review.compose.errors?.join("\n") || "Compose YAML is invalid"
+            : "No review data returned",
+          tone: review?.compose.valid ? "ok" : "error",
+          jobID: "review",
+        }),
+        error: review?.compose.valid
+          ? undefined
+          : review?.compose.errors?.join("\n") || "Compose YAML is invalid",
+      }));
+    } catch (error: unknown) {
+      const message =
+        error instanceof Error ? error.message : "Unable to review project";
+      setImportProject((current) => ({
+        ...current,
+        reviewLoading: false,
+        review: null,
+        activeReviewTab: "",
+        steps: failImportProjectSteps(current.steps),
+        progress: appendImportProjectLog(current.progress, {
+          step: "review",
+          message,
+          tone: "error",
+          jobID: "review",
+        }),
+        error: message,
+      }));
+    }
+  }, []);
+
   const browseImportFolder = useCallback(async () => {
     try {
       const selected = await Dialogs.OpenFile({
@@ -4258,20 +4352,14 @@ function App() {
       });
       const folderPath = Array.isArray(selected) ? selected[0] : selected;
       if (folderPath) {
-        setImportProject((current) => ({
-          ...current,
-          folderPath,
-          jobID: undefined,
-          projectID: undefined,
-          steps: initialImportProjectSteps(),
-          progress: [],
-          error: undefined,
-          imported: null,
-        }));
+        await reviewImportProjectFolder(folderPath);
       }
     } catch (error: unknown) {
       setImportProject((current) => ({
         ...current,
+        reviewLoading: false,
+        review: null,
+        activeReviewTab: "",
         jobID: undefined,
         projectID: undefined,
         steps: initialImportProjectSteps(),
@@ -4282,7 +4370,7 @@ function App() {
             : "Unable to open folder picker",
       }));
     }
-  }, []);
+  }, [reviewImportProjectFolder]);
 
   const submitImportProject = useCallback(async () => {
     const folderPath = importProject.folderPath.trim();
@@ -4293,20 +4381,39 @@ function App() {
       }));
       return;
     }
+    if (
+      !importProject.review ||
+      importProject.review.folderPath !== folderPath
+    ) {
+      await reviewImportProjectFolder(folderPath);
+      return;
+    }
+    if (!importProject.review.compose.valid) {
+      setImportProject((current) => ({
+        ...current,
+        error:
+          current.review?.compose.errors?.join("\n") ||
+          "Compose YAML is invalid",
+      }));
+      return;
+    }
     const jobID = newImportProjectJobID();
     setImportProject((current) => ({
       ...current,
       busy: true,
       jobID,
-      projectID: undefined,
+      projectID: current.review?.projectID || current.projectID,
       steps: {
-        open: "running",
-        review: "pending",
-        build: "pending",
+        open: "done",
+        review: "done",
+        build: "running",
       },
-      progress: [
-        importProjectLogEntry("open", `Opening ${folderPath}`, "info", jobID),
-      ],
+      progress: appendImportProjectLog(current.progress, {
+        step: "build",
+        message: "Confirmed. Importing project and building containers",
+        tone: "info",
+        jobID,
+      }),
       error: undefined,
       imported: null,
     }));
@@ -4320,7 +4427,7 @@ function App() {
         ...current,
         projectID: detail?.summary.id ?? current.projectID,
         steps: completeImportProjectSteps(current.steps),
-        busy: false,
+        busy: current.review?.buildRequired ? current.busy : false,
         imported: detail,
         error: undefined,
       }));
@@ -4340,7 +4447,7 @@ function App() {
         ...current,
         steps: failImportProjectSteps(current.steps),
         progress: appendImportProjectLog(current.progress, {
-          step: current.steps.review === "running" ? "review" : "open",
+          step: importProjectFirstActiveStep(current.steps),
           message,
           tone: "error",
           jobID,
@@ -4357,7 +4464,13 @@ function App() {
         });
       }
     }
-  }, [importProject.folderPath, pushToast, refreshProjects]);
+  }, [
+    importProject.folderPath,
+    importProject.review,
+    pushToast,
+    refreshProjects,
+    reviewImportProjectFolder,
+  ]);
 
   const toggleContainerSelection = useCallback((id: string) => {
     setSelectedContainerIDs((current) => {
@@ -5740,6 +5853,9 @@ function App() {
           setImportProject((current) => ({
             ...current,
             folderPath,
+            reviewLoading: false,
+            review: null,
+            activeReviewTab: "",
             jobID: undefined,
             projectID: undefined,
             steps: initialImportProjectSteps(),
@@ -5752,6 +5868,9 @@ function App() {
           setImportProject((current) =>
             current.busy ? { ...current, open: false } : emptyImportProject,
           )
+        }
+        onReviewTabChange={(activeReviewTab) =>
+          setImportProject((current) => ({ ...current, activeReviewTab }))
         }
         onSubmit={() => {
           void submitImportProject();
@@ -14443,6 +14562,37 @@ function initialImportProjectSteps(): Record<
   };
 }
 
+function importReviewEditorFiles(
+  review: ImportProjectReview | null | undefined,
+): ImportReviewEditorFile[] {
+  if (!review) {
+    return [];
+  }
+  const composeFiles: ImportReviewEditorFile[] = (
+    review.compose.rawFiles ?? []
+  ).map((file) => ({
+    id: `compose:${file.path}`,
+    kind: "compose" as const,
+    path: file.path,
+    content: file.content,
+  }));
+  const envFiles: ImportReviewEditorFile[] = (review.envFiles ?? []).map(
+    (file) => ({
+      id: `env:${file.path}`,
+      kind: "env" as const,
+      path: file.path,
+      content: file.content,
+    }),
+  );
+  return composeFiles.concat(envFiles);
+}
+
+function firstImportReviewTabID(
+  review: ImportProjectReview | null | undefined,
+) {
+  return importReviewEditorFiles(review)[0]?.id ?? "";
+}
+
 function newImportProjectJobID() {
   return `import-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -14540,6 +14690,12 @@ function appendImportProjectProgressFromJob(
       return current;
     }
     const step = importProjectStepFromPhase(payload.phase);
+    if (current.review && current.busy && step !== "build") {
+      return {
+        ...current,
+        projectID: payload.projectID || current.projectID,
+      };
+    }
     const done = (payload.pct ?? 0) >= 100;
     return {
       ...current,
@@ -14613,6 +14769,7 @@ function appendImportProjectDoneFromJob(
   }
   return {
     ...current,
+    busy: false,
     steps: setImportProjectStepStatus(
       current.steps,
       "build",
@@ -16734,6 +16891,7 @@ function ImportProjectModal({
   onBrowse,
   onChange,
   onClose,
+  onReviewTabChange,
   onSubmit,
   state,
 }: {
@@ -16741,27 +16899,47 @@ function ImportProjectModal({
   onBrowse: () => void;
   onChange: (folderPath: string) => void;
   onClose: () => void;
+  onReviewTabChange: (tabID: string) => void;
   onSubmit: () => void;
 }) {
-  const previewName = projectNameFromPath(state.folderPath);
-  const candidates = composeFileCandidates(state.folderPath);
+  const reviewed = Boolean(
+    state.review && state.review.folderPath === state.folderPath.trim(),
+  );
+  const previewName =
+    state.review?.projectName || projectNameFromPath(state.folderPath);
+  const candidates = state.review
+    ? (state.review.compose.rawFiles ?? []).map((file) => file.path)
+    : composeFileCandidates(state.folderPath);
   const wslMount = state.folderPath.replace(/\\/g, "/").startsWith("/mnt/");
+  const primaryLabel = reviewed ? "Import" : "Review";
+  const primaryDisabled =
+    !state.folderPath.trim() ||
+    state.reviewLoading ||
+    (reviewed && !state.review?.compose.valid);
   return (
     <Modal
       footer={
-        <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
-          <Button onClick={onClose} variant="secondary">
-            {state.busy ? "Close" : "Cancel"}
-          </Button>
-          <Button
-            disabled={!state.folderPath.trim() || state.busy}
-            loading={state.busy}
-            onClick={onSubmit}
-            variant="primary"
-          >
-            Import
-          </Button>
-        </div>
+        state.busy || state.imported ? (
+          <div className="flex justify-end">
+            <Button onClick={onClose} variant="primary">
+              Close
+            </Button>
+          </div>
+        ) : (
+          <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
+            <Button onClick={onClose} variant="secondary">
+              Cancel
+            </Button>
+            <Button
+              disabled={primaryDisabled}
+              loading={state.reviewLoading}
+              onClick={onSubmit}
+              variant="primary"
+            >
+              {primaryLabel}
+            </Button>
+          </div>
+        )
       }
       onClose={onClose}
       open={state.open}
@@ -16776,13 +16954,13 @@ function ImportProjectModal({
           <div className="mt-1 flex flex-col gap-2 sm:flex-row">
             <input
               className="h-9 min-w-0 flex-1 rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
-              disabled={state.busy}
+              disabled={state.busy || state.reviewLoading}
               onChange={(event) => onChange(event.target.value)}
               placeholder="/home/me/project"
               value={state.folderPath}
             />
             <Button
-              disabled={state.busy}
+              disabled={state.busy || state.reviewLoading}
               icon={<FolderOpen size={16} />}
               onClick={onBrowse}
             >
@@ -16814,10 +16992,22 @@ function ImportProjectModal({
                 {previewName || "-"}
               </div>
               <div className="mt-3 text-xs text-text-muted">
-                {state.imported?.summary.id ?? "Pending validation"}
+                {state.projectID ??
+                  state.imported?.summary.id ??
+                  "Pending review"}
               </div>
             </div>
           </div>
+        ) : null}
+
+        {state.reviewLoading ? (
+          <Skeleton className="h-[360px] w-full" />
+        ) : state.review ? (
+          <ImportProjectReviewEditor
+            activeID={state.activeReviewTab}
+            onChange={onReviewTabChange}
+            review={state.review}
+          />
         ) : null}
 
         <ImportProjectSteps steps={state.steps} />
@@ -16887,6 +17077,59 @@ function ImportProjectModal({
   );
 }
 
+function ImportProjectReviewEditor({
+  activeID,
+  onChange,
+  review,
+}: {
+  activeID: string;
+  onChange: (tabID: string) => void;
+  review: ImportProjectReview;
+}) {
+  const files = importReviewEditorFiles(review);
+  const activeFile = files.find((file) => file.id === activeID) ?? files[0];
+  if (!activeFile) {
+    return (
+      <div className="rounded-card border border-border bg-bg-inset p-3 text-sm text-text-muted">
+        No Compose or env files were available for review.
+      </div>
+    );
+  }
+  return (
+    <div className="overflow-hidden rounded-card border border-border">
+      <Tabs
+        activeID={activeFile.id}
+        items={files.map((file) => ({
+          id: file.id,
+          label:
+            file.kind === "env"
+              ? `.env ${shortPath(file.path)}`
+              : shortPath(file.path),
+        }))}
+        onChange={onChange}
+      >
+        <div className="border-b border-border bg-bg-inset px-3 py-2 text-xs text-text-muted">
+          {activeFile.path}
+        </div>
+        <Suspense fallback={<Skeleton className="h-[340px] w-full" />}>
+          <MonacoEditor
+            height="340px"
+            language={activeFile.kind === "env" ? "properties" : "yaml"}
+            options={{
+              minimap: { enabled: false },
+              readOnly: true,
+              scrollBeyondLastLine: false,
+              wordWrap: "on",
+            }}
+            theme="vs-dark"
+            value={activeFile.content || "# Empty file"}
+          />
+        </Suspense>
+      </Tabs>
+    </div>
+  );
+}
+
 function ImportProjectSteps({
   steps,
 }: {
@@ -16906,9 +17149,7 @@ function ImportProjectSteps({
             <ImportProjectStepIcon status={status} />
             <div className="min-w-0">
               <div className="truncate text-sm font-medium">{step.label}</div>
-              <div className="text-xs capitalize text-text-muted">
-                {status}
-              </div>
+              <div className="text-xs capitalize text-text-muted">{status}</div>
             </div>
           </div>
         );
