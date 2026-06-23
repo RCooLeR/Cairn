@@ -240,10 +240,14 @@ func TestManagerProjectTerminalRegistersProjectInfo(t *testing.T) {
 	if started.spec.WorkingDir != "/home/ada/demo" {
 		t.Fatalf("WorkingDir = %q", started.spec.WorkingDir)
 	}
-	expectedComposeFile := strings.Join([]string{
-		filepath.Join(projects.record.WorkingDir, "compose.yml"),
-		filepath.Join(projects.record.WorkingDir, "/opt/extra.yml"),
-	}, string(os.PathListSeparator))
+	expectedFiles := make([]string, 0, len(projects.record.ComposeFiles))
+	for _, file := range projects.record.ComposeFiles {
+		if !filepath.IsAbs(file) {
+			file = filepath.Join(projects.record.WorkingDir, file)
+		}
+		expectedFiles = append(expectedFiles, file)
+	}
+	expectedComposeFile := strings.Join(expectedFiles, string(os.PathListSeparator))
 	if started.spec.Env["COMPOSE_PROJECT_NAME"] != "demo" ||
 		started.spec.Env["COMPOSE_FILE"] != expectedComposeFile ||
 		started.spec.Env["EXTRA"] != "1" {
