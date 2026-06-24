@@ -203,7 +203,7 @@ jobs:
         run: ./scripts/run-release-validation.ps1 -Suite debian-deb-container
 
       - name: Upload package artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cairn-${{ matrix.platform }}-${{ env.CAIRN_ARTIFACT_REF }}
           if-no-files-found: error
