@@ -225,7 +225,7 @@ jobs:
           fetch-depth: 0
 
       - name: Download package artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: release-artifacts
           pattern: cairn-*-${{ github.ref_name }}*
