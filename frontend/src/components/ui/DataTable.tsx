@@ -10,6 +10,7 @@ const virtualViewportHeight = 420;
 const virtualOverscanRows = 6;
 const virtualizeRowThreshold = 120;
 const defaultColumnWidth = 180;
+const maxColumnWidth = 1200;
 const minColumnWidth = 80;
 const selectionColumnWidth = 40;
 const columnMenuWidth = 220;
@@ -202,7 +203,10 @@ export function DataTable<T>({
   };
 
   const resizeColumn = (column: DataTableColumn<T>, width: number) => {
-    const nextWidth = Math.max(column.minWidth ?? minColumnWidth, width);
+    const nextWidth = Math.min(
+      maxColumnWidth,
+      Math.max(column.minWidth ?? minColumnWidth, width),
+    );
     setColumnWidths((current) => ({ ...current, [column.id]: nextWidth }));
   };
 
@@ -422,6 +426,9 @@ export function DataTable<T>({
                   <span
                     aria-label={`Resize ${columnLabel(column)} column`}
                     aria-orientation="vertical"
+                    aria-valuemax={maxColumnWidth}
+                    aria-valuemin={column.minWidth ?? minColumnWidth}
+                    aria-valuenow={getColumnWidth(column)}
                     className="group absolute bottom-0 right-0 top-0 z-20 w-4 cursor-col-resize touch-none focus:outline-none"
                     onDoubleClick={(event) => {
                       event.preventDefault();

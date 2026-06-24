@@ -751,7 +751,7 @@ export function TerminalPage({
         <div
           aria-label="Terminal sessions"
           className="flex min-h-11 items-center gap-2 overflow-x-auto border-b border-border bg-bg-inset px-2 py-2"
-          role="tablist"
+          role={sessions.length > 0 ? "tablist" : undefined}
         >
           {sessions.map((session, index) => {
             const active = activeSessionID === session.id;
