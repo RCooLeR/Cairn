@@ -8,7 +8,10 @@ $ErrorActionPreference = "Stop"
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 $root = (Resolve-Path (Join-Path $scriptDir "..")).Path
 if ([string]::IsNullOrWhiteSpace($SpecPath)) {
-  $SpecPath = Join-Path $root "dev-docs/06-testing.md"
+  $candidateSpec = Join-Path $root "dev-docs/06-testing.md"
+  if (Test-Path -LiteralPath $candidateSpec -PathType Leaf) {
+    $SpecPath = $candidateSpec
+  }
 }
 if ([string]::IsNullOrWhiteSpace($ManualPath)) {
   $ManualPath = Join-Path $root "docs/manual-platform-validation.md"
@@ -78,7 +81,11 @@ function Assert-Phrases([string]$Platform, [string]$Text, [string[]]$Phrases, [S
   }
 }
 
-$null = Read-PlatformSpec $SpecPath
+if (![string]::IsNullOrWhiteSpace($SpecPath)) {
+  $null = Read-PlatformSpec $SpecPath
+} else {
+  Write-Host "dev-docs/06-testing.md not present; validating committed manual platform matrix phrases only."
+}
 $todoText = Read-FullMatrixTodo $ManualPath
 $errors = [System.Collections.Generic.List[string]]::new()
 
@@ -118,4 +125,4 @@ if ($errors.Count -gt 0) {
   throw "manual platform matrix validation failed with $($errors.Count) issue(s)."
 }
 
-Write-Host "manual platform matrix validated against dev-docs/06-testing.md section 2."
+Write-Host "manual platform matrix validated."

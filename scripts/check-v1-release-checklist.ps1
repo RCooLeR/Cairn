@@ -8,7 +8,10 @@ $ErrorActionPreference = "Stop"
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 $root = (Resolve-Path (Join-Path $scriptDir "..")).Path
 if ([string]::IsNullOrWhiteSpace($SpecPath)) {
-  $SpecPath = Join-Path $root "dev-docs/06-testing.md"
+  $candidateSpec = Join-Path $root "dev-docs/06-testing.md"
+  if (Test-Path -LiteralPath $candidateSpec -PathType Leaf) {
+    $SpecPath = $candidateSpec
+  }
 }
 if ([string]::IsNullOrWhiteSpace($ChecklistPath)) {
   $ChecklistPath = Join-Path $root "docs/v1-release-checklist.md"
@@ -107,7 +110,29 @@ function ConvertTo-ChecklistIdentity([string]$Value) {
   return $normalized.Trim()
 }
 
-$expectedItems = Read-NormativeChecklistItems $SpecPath
+function Default-ChecklistItems {
+  return @(
+    "All P0 features pass on Linux native",
+    "All P0 features pass on Windows WSL",
+    "All P0 features pass on macOS (Colima + existing context)",
+    "Update + lineage + registry-account test suite green (section 5 all 14 cases)",
+    "Visual-regression and axe accessibility suites green",
+    "No destructive action without confirmation (section 6 suite green)",
+    "No plaintext secrets anywhere (redaction suite green)",
+    "No Docker TCP exposure configured by Cairn",
+    "Performance targets met at seeded scale (section 7)",
+    "Installers install/uninstall cleanly on all 3 OS",
+    "App handles Docker-stopped state gracefully on all pages",
+    "Crash-free soak: 24 h run with active streams, zero goroutine leaks (pprof check)"
+  ) | ForEach-Object { ConvertTo-ChecklistIdentity $_ }
+}
+
+if (![string]::IsNullOrWhiteSpace($SpecPath)) {
+  $expectedItems = Read-NormativeChecklistItems $SpecPath
+} else {
+  Write-Host "dev-docs/06-testing.md not present; validating against the embedded v1 checklist item set."
+  $expectedItems = Default-ChecklistItems
+}
 $rows = Read-EvidenceRows $ChecklistPath
 $allowedStatuses = @("green", "in_progress", "blocked_by_platform")
 $errors = [System.Collections.Generic.List[string]]::new()
