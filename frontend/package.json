@@ -45,7 +45,7 @@
     "autoprefixer": "^10.5.0",
     "eslint": "^9.39.4",
     "eslint-plugin-react-hooks": "^7.1.1",
-    "globals": "^16.5.0",
+    "globals": "^17.6.0",
     "jsdom": "^27.4.0",
     "pixelmatch": "^7.2.0",
     "pngjs": "^7.0.0",
