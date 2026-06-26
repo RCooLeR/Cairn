@@ -411,13 +411,16 @@ func (p *WindowsWSLProvider) DockerDialContext(ctx context.Context) (func(contex
 	}, nil
 }
 
-// DialStream relays a TCP connection to 127.0.0.1:<port> inside the selected
-// WSL distro over a socat stdio tunnel, reusing the same process-stdio dialer as
-// the Docker socket bridge so no WSL IP resolution is required. Used by the host
-// port forwarder.
+// DialStream dials a TCP connection to a published port inside the selected WSL
+// distro. The address can change across WSL restarts, so it is resolved fresh
+// per connection.
 func (p *WindowsWSLProvider) DialStream(ctx context.Context, port int) (net.Conn, error) {
-	command := []string{wslCommandName, "-d", p.configuredDistro(), "--", "socat", "-", fmt.Sprintf("TCP:127.0.0.1:%d", port)}
-	return p.stdioDialer(ctx, command)
+	ip, err := p.backendIP(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var dialer net.Dialer
+	return dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
 }
 
 // DialPacket dials a UDP datagram connection to a published port inside the
@@ -441,7 +444,7 @@ func (p *WindowsWSLProvider) backendIP(ctx context.Context) (string, error) {
 			}
 		}
 	}
-	return "", apperror.New(apperror.ProviderNotReady, "Could not resolve the WSL distro IP for UDP port forwarding")
+	return "", apperror.New(apperror.ProviderNotReady, "Could not resolve the WSL distro IP for port forwarding")
 }
 
 func (p *WindowsWSLProvider) DockerContext(ctx context.Context) (string, error) {
@@ -956,8 +959,8 @@ func buildWSLInstallStepsFor(distro string, distribution string) []wslInstallSte
 		"chmod a+r /etc/apt/keyrings/docker.gpg",
 		dockerAptSourceWriteCommand(),
 		"apt-get update",
-		// socat backs both the Docker socket dial-stdio fallback and the host
-		// port forwarder's TCP relay, so install it unconditionally.
+		// socat backs the Docker socket dial-stdio fallback on older engines, so
+		// install it unconditionally.
 		"apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin socat",
 	}, " && ")
 	nvidiaToolkitCommand := strings.Join([]string{

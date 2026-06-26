@@ -4,9 +4,9 @@
 //
 // For each running container port with a host binding it opens a host listener
 // on the mirrored interface (0.0.0.0 stays LAN-reachable, 127.0.0.1 stays
-// loopback) and relays traffic into the distro: TCP over a stdio socat tunnel
-// (robust, no WSL IP needed) and UDP over a direct datagram dial to the distro
-// IP (a stdio stream cannot preserve datagram boundaries).
+// loopback) and relays traffic into the distro. TCP and UDP dial the current
+// WSL distro IP; the provider resolves it fresh so restarts do not require a
+// static portproxy entry.
 package portforward
 
 import (

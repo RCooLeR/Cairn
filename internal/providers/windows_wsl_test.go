@@ -382,6 +382,21 @@ func TestWindowsWSLDockerDialerRequiresAvailableTransport(t *testing.T) {
 	}
 }
 
+func TestWindowsWSLBackendIPSelectsFirstNonLoopbackIPv4(t *testing.T) {
+	t.Parallel()
+	runner := newFakeRunner()
+	runner.outputs[wslCommandName+" -d cairn-dev -- sh -lc hostname -I"] = "127.0.0.1 172.19.124.14 172.20.0.1 fe80::1\n"
+	provider := NewWindowsWSL(WindowsWSLOptions{Distro: "cairn-dev", Runner: runner})
+
+	ip, err := provider.backendIP(context.Background())
+	if err != nil {
+		t.Fatalf("backendIP() error = %v", err)
+	}
+	if ip != "172.19.124.14" {
+		t.Fatalf("backendIP() = %q, want first non-loopback IPv4", ip)
+	}
+}
+
 func TestWindowsWSLInstallPlanAndExecution(t *testing.T) {
 	t.Parallel()
 	runner := newFakeRunner()
