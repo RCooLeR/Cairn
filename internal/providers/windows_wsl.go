@@ -32,6 +32,7 @@ const (
 const (
 	wslNVIDIAGPUCheckCommand     = "command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1"
 	wslNVIDIARuntimeCheckCommand = "docker info 2>/dev/null | sed -n 's/^ Runtimes: //p' | grep -Eq '(^|[[:space:]])nvidia([[:space:]]|$)'"
+	wslSystemdEnabledCommand     = `awk 'BEGIN{inboot=0;found=0} /^\[boot\][[:space:]]*$/{inboot=1;next} /^\[.*\][[:space:]]*$/{inboot=0;next} inboot&&/^[[:space:]]*systemd[[:space:]]*=[[:space:]]*true[[:space:]]*$/{found=1} END{exit found?0:1}' /etc/wsl.conf`
 )
 
 var windowsDrivePathPattern = regexp.MustCompile(`^[A-Za-z]:[\\/]?`)
@@ -127,7 +128,16 @@ func (p *WindowsWSLProvider) Detect(ctx context.Context) (*models.ProviderStatus
 		status.BackendVersion = fmt.Sprintf("WSL %d", defaultVersion)
 	}
 
-	distros, ok := p.listDistros(ctx)
+	distros, ok, unavailable := p.listDistrosForDetect(ctx)
+	if unavailable {
+		status.Problems = append(status.Problems, providerProblem(
+			ProblemWSLUnavailable,
+			"WSL could not list installed distributions.",
+			"Close stale WSL/Docker processes, run `wsl --shutdown`, then reopen Cairn.",
+			true,
+		))
+		return status, nil
+	}
 	if !ok || len(distros) == 0 {
 		status.Problems = append(status.Problems, providerProblem(
 			ProblemUbuntuMissing,
@@ -176,11 +186,27 @@ func (p *WindowsWSLProvider) Detect(ctx context.Context) (*models.ProviderStatus
 		dockerStartHint = "Start Docker Engine inside the selected WSL distro, or check that its service manager is configured."
 	}
 
-	if !p.runWSLOK(ctx, selected.Name, "test", "-d", "/run/systemd/system") {
+	systemdResult, systemdErr := p.runWSL(ctx, selected.Name, "test", "-d", "/run/systemd/system")
+	if isWSLInvocationFailure(systemdResult, systemdErr) {
+		status.Problems = append(status.Problems, providerProblem(
+			ProblemWSLUnavailable,
+			fmt.Sprintf("WSL could not execute commands in distro %q.", selected.Name),
+			"Close stale WSL/Docker processes, run `wsl --shutdown`, then reopen Cairn.",
+			true,
+		))
+		return status, nil
+	}
+	if systemdResult == nil || systemdResult.ExitCode != 0 {
+		message := fmt.Sprintf("systemd is not enabled in WSL distro %q.", selected.Name)
+		hint := "Enable systemd in /etc/wsl.conf, run `wsl --shutdown`, then reopen Cairn."
+		if p.runWSLOK(ctx, selected.Name, "sh", "-lc", wslSystemdEnabledCommand) {
+			message = fmt.Sprintf("systemd is enabled but not running yet in WSL distro %q.", selected.Name)
+			hint = "Run `wsl --shutdown`, close any WSL shells, then reopen Cairn so systemd can start."
+		}
 		status.Problems = append(status.Problems, providerProblem(
 			ProblemSystemdOff,
-			fmt.Sprintf("systemd is not enabled in WSL distro %q.", selected.Name),
-			"Enable systemd in /etc/wsl.conf, run `wsl --shutdown`, then reopen Cairn.",
+			message,
+			hint,
 			true,
 		))
 	}
@@ -269,7 +295,10 @@ func (p *WindowsWSLProvider) ListDistros(ctx context.Context) ([]models.WSLDistr
 	if _, err := p.runner.LookPath(wslCommandName); err != nil {
 		return nil, apperror.New(apperror.ProviderNotReady, "WSL is not installed or wsl.exe is not on PATH")
 	}
-	distros, ok := p.listDistros(ctx)
+	distros, ok, unavailable := p.listDistrosForDetect(ctx)
+	if unavailable {
+		return nil, apperror.New(apperror.ProviderNotReady, "WSL could not list installed distributions")
+	}
 	if !ok {
 		return nil, apperror.New(apperror.ProviderNotReady, "WSL distros are not available")
 	}
@@ -380,6 +409,39 @@ func (p *WindowsWSLProvider) DockerDialContext(ctx context.Context) (func(contex
 	return func(ctx context.Context, _, _ string) (net.Conn, error) {
 		return p.stdioDialer(ctx, command)
 	}, nil
+}
+
+// DialStream relays a TCP connection to 127.0.0.1:<port> inside the selected
+// WSL distro over a socat stdio tunnel, reusing the same process-stdio dialer as
+// the Docker socket bridge so no WSL IP resolution is required. Used by the host
+// port forwarder.
+func (p *WindowsWSLProvider) DialStream(ctx context.Context, port int) (net.Conn, error) {
+	command := []string{wslCommandName, "-d", p.configuredDistro(), "--", "socat", "-", fmt.Sprintf("TCP:127.0.0.1:%d", port)}
+	return p.stdioDialer(ctx, command)
+}
+
+// DialPacket dials a UDP datagram connection to a published port inside the
+// selected WSL distro. UDP cannot be relayed over a stdio stream without losing
+// datagram boundaries, so it dials the distro IP directly. The address can
+// change across WSL restarts, so it is resolved fresh per session.
+func (p *WindowsWSLProvider) DialPacket(ctx context.Context, port int) (net.Conn, error) {
+	ip, err := p.backendIP(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var dialer net.Dialer
+	return dialer.DialContext(ctx, "udp", net.JoinHostPort(ip, strconv.Itoa(port)))
+}
+
+func (p *WindowsWSLProvider) backendIP(ctx context.Context) (string, error) {
+	if output, ok := p.runWSLText(ctx, p.configuredDistro(), "sh", "-lc", "hostname -I"); ok {
+		for _, field := range strings.Fields(output) {
+			if ip := net.ParseIP(strings.TrimSpace(field)); ip != nil && ip.To4() != nil && !ip.IsLoopback() {
+				return ip.String(), nil
+			}
+		}
+	}
+	return "", apperror.New(apperror.ProviderNotReady, "Could not resolve the WSL distro IP for UDP port forwarding")
 }
 
 func (p *WindowsWSLProvider) DockerContext(ctx context.Context) (string, error) {
@@ -546,12 +608,20 @@ func (p *WindowsWSLProvider) detectDefaultWSLVersion(ctx context.Context) (int, 
 }
 
 func (p *WindowsWSLProvider) listDistros(ctx context.Context) ([]wslDistro, bool) {
+	distros, ok, _ := p.listDistrosForDetect(ctx)
+	return distros, ok
+}
+
+func (p *WindowsWSLProvider) listDistrosForDetect(ctx context.Context) ([]wslDistro, bool, bool) {
 	result, err := p.runner.Run(ctx, wslCommandTimeout, wslCommandName, "-l", "-v")
+	if isWSLInvocationFailure(result, err) {
+		return nil, false, true
+	}
 	if err != nil || result == nil || result.ExitCode != 0 {
-		return nil, false
+		return nil, false, false
 	}
 	distros, err := parseWSLListVerbose(result.Stdout)
-	return distros, err == nil
+	return distros, err == nil, false
 }
 
 func (p *WindowsWSLProvider) runWSLOK(ctx context.Context, distro string, args ...string) bool {
@@ -601,6 +671,19 @@ func (p *WindowsWSLProvider) runWSLWithOptions(ctx context.Context, timeout time
 		}, wslCommandName, wslArgs...)
 	}
 	return p.runner.Run(ctx, timeout, wslCommandName, wslArgs...)
+}
+
+func isWSLInvocationFailure(result *CommandResult, err error) bool {
+	if err == nil {
+		return false
+	}
+	if result == nil || result.ExitCode == -1 {
+		return true
+	}
+	detail := strings.ToLower(decodeWSLOutput(commandFailureDetail(result, err)))
+	return strings.Contains(detail, "wsl/service/") ||
+		strings.Contains(detail, "lacked sufficient buffer space") ||
+		strings.Contains(detail, "queue was full")
 }
 
 func (p *WindowsWSLProvider) dockerDialCommand(ctx context.Context) ([]string, error) {
@@ -857,10 +940,10 @@ func buildWSLInstallStepsFor(distro string, distribution string) []wslInstallSte
 	}
 	systemdCommand := strings.Join([]string{
 		`set -e`,
-		`tmp="$(mktemp)"`,
-		`if [ -f /etc/wsl.conf ]; then awk 'BEGIN{inboot=0;wrote=0;sawboot=0} /^\[boot\][[:space:]]*$/{if(inboot&&!wrote){print "systemd=true";wrote=1} inboot=1;sawboot=1;print;next} /^\[.*\][[:space:]]*$/{if(inboot&&!wrote){print "systemd=true";wrote=1} inboot=0;print;next} inboot&&/^[[:space:]]*systemd[[:space:]]*=/{if(!wrote){print "systemd=true";wrote=1} next} {print} END{if(inboot&&!wrote) print "systemd=true"; if(!sawboot) print "[boot]\nsystemd=true"}' /etc/wsl.conf > "$tmp"; else printf "[boot]\nsystemd=true\n" > "$tmp"; fi`,
-		`install -m 0644 "$tmp" /etc/wsl.conf`,
-		`rm -f "$tmp"`,
+		`rm -f /etc/wsl.conf.cairn-tmp`,
+		`trap 'rm -f /etc/wsl.conf.cairn-tmp' EXIT`,
+		`if [ -f /etc/wsl.conf ]; then awk 'BEGIN{inboot=0;wrote=0;sawboot=0} /^\[boot\][[:space:]]*$/{if(inboot&&!wrote){print "systemd=true";wrote=1} inboot=1;sawboot=1;print;next} /^\[.*\][[:space:]]*$/{if(inboot&&!wrote){print "systemd=true";wrote=1} inboot=0;print;next} inboot&&/^[[:space:]]*systemd[[:space:]]*=/{if(!wrote){print "systemd=true";wrote=1} next} {print} END{if(inboot&&!wrote) print "systemd=true"; if(!sawboot) print "[boot]\nsystemd=true"}' /etc/wsl.conf > /etc/wsl.conf.cairn-tmp; else printf "[boot]\nsystemd=true\n" > /etc/wsl.conf.cairn-tmp; fi`,
+		`install -m 0644 /etc/wsl.conf.cairn-tmp /etc/wsl.conf`,
 	}, " && ")
 	dockerAptCommand := strings.Join([]string{
 		"set -e",
@@ -873,8 +956,9 @@ func buildWSLInstallStepsFor(distro string, distribution string) []wslInstallSte
 		"chmod a+r /etc/apt/keyrings/docker.gpg",
 		dockerAptSourceWriteCommand(),
 		"apt-get update",
-		"apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin",
-		"if ! docker system dial-stdio --help >/dev/null 2>&1; then apt-get install -y socat; fi",
+		// socat backs both the Docker socket dial-stdio fallback and the host
+		// port forwarder's TCP relay, so install it unconditionally.
+		"apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin socat",
 	}, " && ")
 	nvidiaToolkitCommand := strings.Join([]string{
 		"set -e",

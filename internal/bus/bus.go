@@ -14,6 +14,7 @@ const (
 	TopicProviderStatus          Topic = "provider:status"
 	TopicProviderInstallProgress Topic = "provider:install:progress"
 	TopicDockerConnected         Topic = "docker:connected"
+	TopicDockerReconnecting      Topic = "docker:reconnecting"
 	TopicDockerDisconnected      Topic = "docker:disconnected"
 	TopicObjectsChanged          Topic = "objects:changed"
 	TopicProjectChanged          Topic = "project:changed"
@@ -30,6 +31,7 @@ const (
 	TopicJobProgress             Topic = "job:progress"
 	TopicJobDone                 Topic = "job:done"
 	TopicNotification            Topic = "notification"
+	TopicPortForwardChanged      Topic = "portforward:changed"
 )
 
 type Event struct {

@@ -307,7 +307,6 @@ func (c *Client) Reconcile(ctx context.Context) error {
 
 func (c *Client) StartReconcileLoop(ctx context.Context) {
 	go func() {
-		_ = c.Reconcile(ctx)
 		interval := c.reconcileEvery
 		if interval <= 0 {
 			interval = defaultReconcileEvery
@@ -362,6 +361,10 @@ func (c *Client) objectEventLoop(ctx context.Context, changes chan<- objectChang
 			backoff = nextBackoff(backoff, c.backoffMax)
 			continue
 		}
+		if c.usesProcessBackedTransport() {
+			c.objectPollLoop(ctx)
+			return
+		}
 		backoff = c.backoffMin
 		if backoff <= 0 {
 			backoff = defaultBackoffMin
@@ -412,6 +415,26 @@ func (c *Client) objectEventLoop(ctx context.Context, changes chan<- objectChang
 			return
 		}
 		backoff = nextBackoff(backoff, c.backoffMax)
+	}
+}
+
+func (c *Client) objectPollLoop(ctx context.Context) {
+	interval := c.reconcileEvery
+	if interval <= 0 {
+		interval = defaultReconcileEvery
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := c.Reconcile(ctx); err != nil {
+				c.disconnect(mapDockerError("poll Docker objects", err))
+				return
+			}
+		}
 	}
 }
 

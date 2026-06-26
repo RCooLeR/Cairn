@@ -198,6 +198,20 @@ type PortBinding struct {
 	Protocol      string `json:"protocol"`
 }
 
+// PortForward describes a single Windows host port that Cairn relays into the
+// WSL backend so a published container port behaves like Docker Desktop's host
+// networking. Status is "active" when the host listener is bound, or "error"
+// (with Reason) when the port could not be bound (e.g. already in use).
+type PortForward struct {
+	Protocol      string `json:"protocol"`
+	HostPort      int    `json:"hostPort"`
+	BindAddr      string `json:"bindAddr"`
+	ContainerID   string `json:"containerID,omitempty"`
+	ContainerName string `json:"containerName,omitempty"`
+	Status        string `json:"status"`
+	Reason        string `json:"reason,omitempty"`
+}
+
 type PortMapping struct {
 	HostIP        string `json:"hostIP,omitempty"`
 	HostPort      string `json:"hostPort,omitempty"`
@@ -300,13 +314,16 @@ type CreateVolumeRequest struct {
 }
 
 type NetworkSummary struct {
-	ID         string            `json:"id"`
-	Name       string            `json:"name"`
-	Driver     string            `json:"driver"`
-	Scope      string            `json:"scope,omitempty"`
-	Internal   bool              `json:"internal"`
-	Attachable bool              `json:"attachable"`
-	Labels     map[string]string `json:"labels,omitempty"`
+	ID             string            `json:"id"`
+	Name           string            `json:"name"`
+	Driver         string            `json:"driver"`
+	Scope          string            `json:"scope,omitempty"`
+	Subnet         string            `json:"subnet,omitempty"`
+	Gateway        string            `json:"gateway,omitempty"`
+	ContainerCount int               `json:"containerCount"`
+	Internal       bool              `json:"internal"`
+	Attachable     bool              `json:"attachable"`
+	Labels         map[string]string `json:"labels,omitempty"`
 }
 
 type NetworkDetail struct {

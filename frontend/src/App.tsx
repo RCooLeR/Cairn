@@ -1136,6 +1136,10 @@ function App() {
   const setVersionError = useAppStore((state) => state.setVersionError);
   const setVersionLoading = useAppStore((state) => state.setVersionLoading);
   const inventoryStatus = useInventoryStore((state) => state.status);
+  const inventoryConnection = useInventoryStore((state) => state.connection);
+  const setInventoryConnection = useInventoryStore(
+    (state) => state.setConnection,
+  );
   const inventoryError = useInventoryStore((state) => state.error);
   const lastLoadedAt = useInventoryStore((state) => state.lastLoadedAt);
   const providers = useInventoryStore((state) => state.providers);
@@ -1155,6 +1159,8 @@ function App() {
   const refreshImages = useInventoryStore((state) => state.refreshImages);
   const refreshVolumes = useInventoryStore((state) => state.refreshVolumes);
   const refreshNetworks = useInventoryStore((state) => state.refreshNetworks);
+  const setNetworkDetail = useInventoryStore((state) => state.setNetworkDetail);
+  const setVolumeDetail = useInventoryStore((state) => state.setVolumeDetail);
 
   const [activePage, setActivePage] = useState<PageID>("overview");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
@@ -1524,6 +1530,10 @@ function App() {
       setUpdates(nextUpdates ?? []);
       setUpdatesStatus("ready");
     } catch (error: unknown) {
+      if (isProviderReadinessError(error)) {
+        setUpdatesStatus("ready");
+        return;
+      }
       setUpdatesError(
         error instanceof Error ? error.message : "Unable to load updates",
       );
@@ -1541,6 +1551,10 @@ function App() {
       setIgnoredUpdates(nextUpdates ?? []);
       setIgnoredUpdatesStatus("ready");
     } catch (error: unknown) {
+      if (isProviderReadinessError(error)) {
+        setIgnoredUpdatesStatus("ready");
+        return;
+      }
       setIgnoredUpdatesError(
         error instanceof Error
           ? error.message
@@ -1558,6 +1572,10 @@ function App() {
       setUpdateHistory(nextHistory ?? []);
       setUpdateHistoryStatus("ready");
     } catch (error: unknown) {
+      if (isProviderReadinessError(error)) {
+        setUpdateHistoryStatus("ready");
+        return;
+      }
       setUpdateHistoryError(
         error instanceof Error
           ? error.message
@@ -1992,7 +2010,36 @@ function App() {
     500,
     refreshRuntimeSurfacesForObjects,
   );
-  useDebouncedRuntimeEvent("provider:changed", 250, refreshRuntimeSurfaces);
+  const handleProviderChanged = useCallback(() => {
+    // A provider rebind tears down the old health loop without emitting a
+    // terminal docker event, so reset the heartbeat. Otherwise a stale
+    // "reconnecting"/"disconnected" banner from the previous provider could
+    // linger and mislabel the new provider's state.
+    setInventoryConnection("connecting");
+    refreshRuntimeSurfaces();
+  }, [refreshRuntimeSurfaces, setInventoryConnection]);
+  useDebouncedRuntimeEvent("provider:changed", 250, handleProviderChanged);
+
+  // Track the Docker engine heartbeat from the backend. The health loop only
+  // emits "disconnected" after its grace period, so these events let the UI
+  // show a calm "reconnecting" state for transient blips instead of an error.
+  useEffect(() => {
+    const offConnected = Events.On("docker:connected", () => {
+      setInventoryConnection("connected");
+      void refreshInventory();
+    });
+    const offReconnecting = Events.On("docker:reconnecting", () => {
+      setInventoryConnection("reconnecting");
+    });
+    const offDisconnected = Events.On("docker:disconnected", () => {
+      setInventoryConnection("disconnected");
+    });
+    return () => {
+      offConnected();
+      offReconnecting();
+      offDisconnected();
+    };
+  }, [refreshInventory, setInventoryConnection]);
 
   useEffect(() => {
     const offCheck = Events.On("updates:check:progress", (event) => {
@@ -2243,6 +2290,22 @@ function App() {
     Boolean(activeProvider && providerStatus?.installed) &&
     !dockerRunning &&
     !providerRepairNeeded;
+  // Connection-state-driven banner flags. The heartbeat is authoritative for
+  // "is the engine reachable": while it reports "connected" we suppress the
+  // hard "not reachable" banner even if a single inventory call hiccupped.
+  const dockerReconnecting = inventoryConnection === "reconnecting";
+  const dockerChecking =
+    inventoryConnection === "connecting" && !dockerStopped && !lastLoadedAt;
+  // Show the hard "not reachable" banner only once the heartbeat is NOT in a
+  // healthy or recovering state. While "connected" (a transient single-call
+  // hiccup) or "reconnecting" (within the grace window) it stays suppressed, so
+  // a brief blip never flashes an error.
+  const dockerUnreachable =
+    inventoryConnection !== "connected" &&
+    inventoryConnection !== "reconnecting" &&
+    (inventoryConnection === "disconnected" ||
+      dockerStopped ||
+      Boolean(inventoryError));
   const staleMode =
     !dockerRunning &&
     Boolean(lastLoadedAt) &&
@@ -2904,6 +2967,91 @@ function App() {
     wslDistro,
   ]);
 
+  const openProviderSetupForUpdate = useCallback(async () => {
+    const platform =
+      setupPlatformFromProvider(activeProvider) ?? detectClientSetupPlatform();
+    const backend =
+      activeProvider?.kind === "linux_native" ||
+      activeProvider?.kind === "macos_colima" ||
+      activeProvider?.kind === "windows_wsl_ubuntu"
+        ? activeProvider.kind
+        : recommendedSetupBackend(platform);
+    const providerID = providerIDForSetupBackend(backend);
+    const distro = wslDistro.trim() || "Ubuntu";
+    const profile = colimaProfile.trim() || "default";
+    setRepairOpen(false);
+    setSetup({
+      ...emptyProviderSetup,
+      open: true,
+      step: "install",
+      platform: setupPlatformForBackend(backend, platform),
+      backend,
+      distro,
+      colimaProfile: profile,
+      colimaCPU,
+      colimaMemoryGB,
+      colimaDiskGB,
+      detection: activeProvider?.status ?? null,
+      planning: Boolean(providerID),
+      error: providerID
+        ? undefined
+        : "No provider backend can be updated automatically.",
+    });
+    if (!providerID) {
+      return;
+    }
+    try {
+      const extra =
+        backend === "macos_colima"
+          ? {
+              profile,
+              cpu: String(colimaCPU),
+              memoryGB: String(colimaMemoryGB),
+              diskGB: String(colimaDiskGB),
+            }
+          : backend === "linux_native"
+            ? {
+                socketPath: settingString(
+                  appSettings,
+                  "linux.socket_path",
+                  "/var/run/docker.sock",
+                ),
+              }
+            : { distro };
+      const plan = await ProviderService.PlanInstall(providerID, {
+        backend: providerID,
+        extra,
+      });
+      if (!plan) {
+        throw new Error("Install plan was empty");
+      }
+      setSetup((current) => ({
+        ...current,
+        step: "install",
+        plan,
+        planning: false,
+      }));
+    } catch (error: unknown) {
+      setSetup((current) => ({
+        ...current,
+        step: "install",
+        planning: false,
+        error:
+          error instanceof Error
+            ? error.message
+            : "Unable to create update plan",
+      }));
+    }
+  }, [
+    activeProvider,
+    appSettings,
+    colimaCPU,
+    colimaDiskGB,
+    colimaMemoryGB,
+    colimaProfile,
+    wslDistro,
+  ]);
+
   const closeProviderSetup = useCallback(() => {
     providerInstallSessionRef.current = null;
     window.localStorage.removeItem(providerSetupStorageKey);
@@ -3195,17 +3343,11 @@ function App() {
     if (!mutationsDisabled) {
       return true;
     }
-    setActionError(mutationDisabledReason);
-    if (providerRepairNeeded || noProviderConfigured) {
-      setRepairOpen(true);
-    }
+    setActionError((current) =>
+      current === mutationDisabledReason ? current : mutationDisabledReason,
+    );
     return false;
-  }, [
-    mutationDisabledReason,
-    mutationsDisabled,
-    noProviderConfigured,
-    providerRepairNeeded,
-  ]);
+  }, [mutationDisabledReason, mutationsDisabled]);
 
   const checkAllUpdates = useCallback(async () => {
     if (!ensureDockerReady()) {
@@ -4653,6 +4795,9 @@ function App() {
       }
       DockerService.GetVolume(volume.name)
         .then((nextDetail) => {
+          if (nextDetail) {
+            setVolumeDetail(volume.name, nextDetail);
+          }
           setInspect({
             open: true,
             title: volume.name,
@@ -4674,7 +4819,28 @@ function App() {
           });
         });
     },
-    [volumeDetails],
+    [setVolumeDetail, volumeDetails],
+  );
+
+  const loadNetworkDetail = useCallback(
+    async (networkID: string) => {
+      if (!networkID) {
+        return;
+      }
+      try {
+        const detail = await DockerService.GetNetwork(networkID);
+        if (detail) {
+          setNetworkDetail(networkID, detail);
+        }
+      } catch (error: unknown) {
+        setActionError(
+          error instanceof Error
+            ? error.message
+            : "Unable to load network detail",
+        );
+      }
+    },
+    [setNetworkDetail],
   );
 
   const openNetworkDetail = useCallback(
@@ -4687,10 +4853,10 @@ function App() {
       setNetworkTab("overview");
       setSearch("");
       if (!networkDetails[network.id]) {
-        void refreshNetworks();
+        void loadNetworkDetail(network.id);
       }
     },
-    [networkDetails, refreshNetworks],
+    [loadNetworkDetail, networkDetails],
   );
 
   const openContainerDetail = useCallback(
@@ -5148,7 +5314,12 @@ function App() {
               }}
               onOpenContainerInspect={openContainerInspect}
               onOpenContainerTerminal={openContainerTerminal}
-              onRefresh={refreshNetworks}
+              onRefresh={() => {
+                if (activeNetworkID) {
+                  return loadNetworkDetail(activeNetworkID);
+                }
+                return Promise.resolve();
+              }}
               onRemove={openRemoveNetworkPlan}
               onTabChange={setNetworkTab}
               tab={networkTab}
@@ -5512,7 +5683,10 @@ function App() {
           <GlobalStateBanner
             appUpdateNotice={appUpdateNotice}
             busy={providerActionBusy}
+            dockerChecking={dockerChecking}
+            dockerReconnecting={dockerReconnecting}
             dockerStopped={dockerStopped}
+            dockerUnreachable={dockerUnreachable}
             inventoryError={inventoryError}
             noProviderConfigured={noProviderConfigured}
             onOpenAppUpdate={() => {
@@ -5520,6 +5694,7 @@ function App() {
                 window.open(appUpdateNotice.url, "_blank", "noopener");
               }
             }}
+            onOpenProviderUpdate={openProviderSetupForUpdate}
             onOpenRepair={() => setRepairOpen(true)}
             onOpenSetup={openProviderSetup}
             onRetry={() => {
@@ -5884,10 +6059,14 @@ function App() {
 function GlobalStateBanner({
   appUpdateNotice,
   busy,
+  dockerChecking,
+  dockerReconnecting,
   dockerStopped,
+  dockerUnreachable,
   inventoryError,
   noProviderConfigured,
   onOpenAppUpdate,
+  onOpenProviderUpdate,
   onOpenRepair,
   onOpenSetup,
   onRetry,
@@ -5899,10 +6078,14 @@ function GlobalStateBanner({
 }: {
   appUpdateNotice: AppUpdateNotice | null;
   busy: boolean;
+  dockerChecking: boolean;
+  dockerReconnecting: boolean;
   dockerStopped: boolean;
+  dockerUnreachable: boolean;
   inventoryError: string | null;
   noProviderConfigured: boolean;
   onOpenAppUpdate: () => void;
+  onOpenProviderUpdate: () => void;
   onOpenRepair: () => void;
   onOpenSetup: () => void;
   onRetry: () => void;
@@ -5914,6 +6097,8 @@ function GlobalStateBanner({
 }) {
   const primaryProblem = permissionProblem ?? providerProblems[0] ?? null;
   const warning = providerWarnings[0] ?? null;
+  // Transient connection states retry automatically, so they show no buttons.
+  const quiet = dockerReconnecting || dockerChecking;
   const state = providerRepairNeeded
     ? {
         tone: "error" as const,
@@ -5932,23 +6117,46 @@ function GlobalStateBanner({
           body: "Set up a provider before running Docker actions.",
           action: null,
         }
-      : dockerStopped || inventoryError
+      : dockerReconnecting
         ? {
-            tone: "warn" as const,
-            icon: <AlertTriangle size={17} />,
-            title: "Docker is not reachable",
-            body:
-              inventoryError ??
-              "Cached data is visible; Docker actions are disabled until the engine is running.",
+            tone: "info" as const,
+            icon: <RefreshCw size={17} />,
+            title: "Reconnecting to Docker…",
+            body: "The engine connection dropped — retrying automatically.",
             action: null,
           }
-        : warning
+        : dockerChecking
+          ? {
+              tone: "info" as const,
+              icon: <RefreshCw size={17} />,
+              title: "Checking Docker…",
+              body: "Connecting to the Docker engine.",
+              action: null,
+            }
+          : dockerUnreachable
+            ? {
+                tone: "warn" as const,
+                icon: <AlertTriangle size={17} />,
+                title: "Docker is not reachable",
+                body:
+                  inventoryError ??
+                  "Cached data is visible; Docker actions are disabled until the engine is running.",
+                action: null,
+              }
+            : warning
           ? {
               tone: "info" as const,
               icon: <AlertTriangle size={17} />,
               title: warning.message,
               body: "Provider warning",
-              action: null,
+              action: {
+                label:
+                  warning.code === "DOCKER_PACKAGES_OUTDATED"
+                    ? "Update"
+                    : "Repair / update",
+                icon: <Wrench size={15} />,
+                onClick: onOpenProviderUpdate,
+              },
             }
           : appUpdateNotice
             ? {
@@ -5960,6 +6168,7 @@ function GlobalStateBanner({
                   "A new desktop app release is ready to download.",
                 action: {
                   label: "Download",
+                  icon: <Download size={15} />,
                   onClick: onOpenAppUpdate,
                 },
               }
@@ -6004,7 +6213,7 @@ function GlobalStateBanner({
             Set up
           </Button>
         ) : null}
-        {dockerStopped ? (
+        {dockerStopped && !quiet ? (
           <Button
             icon={<Play size={15} />}
             loading={busy}
@@ -6017,14 +6226,14 @@ function GlobalStateBanner({
         ) : null}
         {state.action ? (
           <Button
-            icon={<Download size={15} />}
+            icon={state.action.icon}
             onClick={state.action.onClick}
             size="sm"
             variant="secondary"
           >
             {state.action.label}
           </Button>
-        ) : (
+        ) : quiet ? null : (
           <Button
             icon={<RefreshCw size={15} />}
             loading={busy}
@@ -6660,6 +6869,12 @@ function ProviderSetupModal({
                   ))}
                 </div>
               </div>
+            ) : setup.planning ? (
+              <EmptyState
+                body="Cairn is preparing the backend repair/update commands."
+                icon={<RefreshCw className="animate-spin" size={28} />}
+                title="Preparing update plan"
+              />
             ) : (
               <EmptyState
                 body="Run checks and create a plan before installation starts."
@@ -13578,19 +13793,23 @@ function NetworksPage({
           {
             id: "subnet",
             header: "Subnet",
-            render: (network) => networkDetails[network.id]?.subnet || "-",
+            render: (network) =>
+              network.subnet || networkDetails[network.id]?.subnet || "-",
           },
           {
             id: "gateway",
             header: "Gateway",
-            render: (network) => networkDetails[network.id]?.gateway || "-",
+            render: (network) =>
+              network.gateway || networkDetails[network.id]?.gateway || "-",
           },
           {
             id: "containers",
             header: "Containers",
             render: (network) => (
               <Badge tone="neutral">
-                {networkDetails[network.id]?.containers?.length ?? 0}
+                {networkDetails[network.id]?.containers?.length ??
+                  network.containerCount ??
+                  0}
               </Badge>
             ),
           },
@@ -18252,6 +18471,24 @@ function windowsSetupCheckRows(status: ProviderStatus | null) {
 
 function providerHasWarning(status: ProviderStatus | null, code: string) {
   return Boolean(status?.warnings?.some((warning) => warning.code === code));
+}
+
+function isProviderReadinessError(error: unknown) {
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === "string"
+        ? error
+        : "";
+  if (!message) {
+    return false;
+  }
+  const parsed = parseAppErrorText(message);
+  return (
+    parsed.code === "E_PROVIDER_NOT_READY" ||
+    parsed.code === "E_DOCKER_UNREACHABLE" ||
+    parsed.code === "E_PROVIDER_DETECT_FAILED"
+  );
 }
 
 function isEditableElement(target: EventTarget | null) {

@@ -14,6 +14,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/logsvc"
 	"github.com/RCooLeR/Cairn/internal/metrics"
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/portforward"
 	"github.com/RCooLeR/Cairn/internal/providers"
 	registrycore "github.com/RCooLeR/Cairn/internal/registry"
 	"github.com/RCooLeR/Cairn/internal/services"
@@ -43,17 +44,18 @@ type appRuntime struct {
 	lineageService  *services.ImageLineageService
 	backupService   *services.BackupService
 
-	opMu     sync.Mutex
-	mu       sync.Mutex
-	state    appRuntimeState
-	cancel   context.CancelFunc
-	docker   *dockercore.Client
-	logs     *logsvc.Manager
-	metrics  *metrics.Manager
-	terminal *terminal.Manager
-	backups  *backupcore.Manager
-	updates  *updatescore.Manager
-	bridge   *dockerbridge.Manager
+	opMu        sync.Mutex
+	mu          sync.Mutex
+	state       appRuntimeState
+	cancel      context.CancelFunc
+	docker      *dockercore.Client
+	logs        *logsvc.Manager
+	metrics     *metrics.Manager
+	terminal    *terminal.Manager
+	backups     *backupcore.Manager
+	updates     *updatescore.Manager
+	bridge      *dockerbridge.Manager
+	portforward *portforward.Manager
 }
 
 type appRuntimeState string
@@ -87,14 +89,15 @@ type appRuntimeConfig struct {
 }
 
 type runtimeHandles struct {
-	cancel   context.CancelFunc
-	docker   *dockercore.Client
-	logs     *logsvc.Manager
-	metrics  *metrics.Manager
-	terminal *terminal.Manager
-	backups  *backupcore.Manager
-	updates  *updatescore.Manager
-	bridge   *dockerbridge.Manager
+	cancel      context.CancelFunc
+	docker      *dockercore.Client
+	logs        *logsvc.Manager
+	metrics     *metrics.Manager
+	terminal    *terminal.Manager
+	backups     *backupcore.Manager
+	updates     *updatescore.Manager
+	bridge      *dockerbridge.Manager
+	portforward *portforward.Manager
 }
 
 func newAppRuntime(cfg appRuntimeConfig) *appRuntime {
@@ -155,19 +158,31 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 		slog.Debug("Docker CLI bridge unavailable", "provider", provider.ID(), "error", err)
 	}
 
+	// Host port forwarding mirrors published container ports onto the Windows
+	// host (Docker Desktop parity). Only the WSL backend needs it; native and
+	// Colima already bind host ports directly.
+	var portForwardManager *portforward.Manager
+	if dialer, ok := provider.(portforward.Dialer); ok && provider.Type() == providers.TypeWindowsWSL {
+		portForwardManager = portforward.NewManager(dockerClient, dialer, r.events, portforward.Options{Enabled: true})
+		portForwardManager.Start(runtimeCtx)
+	}
+
 	composeClient := composecore.NewClient(provider)
 	projectDetector := &composecore.ProjectDetector{
-		ProviderID:  provider.ID(),
-		ContextName: contextName,
-		Docker:      dockerClient,
-		Compose:     composeClient,
-		PathMapper:  provider,
-		Projects:    r.projects,
-		Objects:     r.db.Objects(),
+		ProviderID:        provider.ID(),
+		ContextName:       contextName,
+		Docker:            dockerClient,
+		Compose:           composeClient,
+		PathMapper:        provider,
+		Projects:          r.projects,
+		Objects:           r.db.Objects(),
+		ConfigConcurrency: composeConfigConcurrency(provider),
 	}
 	logsManager := logsvc.NewManager(dockerClient, r.events, logsvc.Options{})
 	metricsManager := metrics.NewManager(dockerClient, r.db.Metrics(), r.projects, r.audit, r.events, metrics.Options{
-		GPUProbe: metrics.NewProviderGPUProbe(provider),
+		GPUProbe:              metrics.NewProviderGPUProbe(provider),
+		DisableStreamingStats: disableStreamingStats(provider),
+		StatsConcurrency:      statsConcurrency(provider),
 	})
 	metricsManager.ContextName = contextName
 	metricsManager.Start(runtimeCtx)
@@ -195,6 +210,7 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 	r.backups = backupManager
 	r.updates = updateManager
 	r.bridge = dockerBridge
+	r.portforward = portForwardManager
 	r.state = runtimeStateRunning
 
 	r.dockerService.Client = dockerClient
@@ -256,14 +272,15 @@ func (r *appRuntime) StopAll() {
 
 func (r *appRuntime) detachLocked() runtimeHandles {
 	handles := runtimeHandles{
-		cancel:   r.cancel,
-		docker:   r.docker,
-		logs:     r.logs,
-		metrics:  r.metrics,
-		terminal: r.terminal,
-		backups:  r.backups,
-		updates:  r.updates,
-		bridge:   r.bridge,
+		cancel:      r.cancel,
+		docker:      r.docker,
+		logs:        r.logs,
+		metrics:     r.metrics,
+		terminal:    r.terminal,
+		backups:     r.backups,
+		updates:     r.updates,
+		bridge:      r.bridge,
+		portforward: r.portforward,
 	}
 	r.cancel = nil
 	r.docker = nil
@@ -273,6 +290,7 @@ func (r *appRuntime) detachLocked() runtimeHandles {
 	r.backups = nil
 	r.updates = nil
 	r.bridge = nil
+	r.portforward = nil
 	return handles
 }
 
@@ -298,9 +316,30 @@ func (h runtimeHandles) stop() {
 	if h.bridge != nil {
 		h.bridge.Stop()
 	}
+	if h.portforward != nil {
+		h.portforward.StopAll()
+	}
 	if h.docker != nil {
 		_ = h.docker.Close()
 	}
+}
+
+func composeConfigConcurrency(provider providers.PlatformProvider) int {
+	if provider != nil && provider.Type() == providers.TypeWindowsWSL {
+		return 1
+	}
+	return 0
+}
+
+func disableStreamingStats(provider providers.PlatformProvider) bool {
+	return provider != nil && provider.Type() == providers.TypeWindowsWSL
+}
+
+func statsConcurrency(provider providers.PlatformProvider) int {
+	if provider != nil && provider.Type() == providers.TypeWindowsWSL {
+		return 1
+	}
+	return 0
 }
 
 func (r *appRuntime) clearServicesLocked() {

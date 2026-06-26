@@ -385,6 +385,7 @@ describe("App inventory shell", () => {
       id: "network-new",
       name: "created_network",
       driver: "bridge",
+      containerCount: 0,
       internal: false,
       attachable: false,
     });
@@ -635,6 +636,7 @@ describe("App inventory shell", () => {
     });
     useInventoryStore.setState({
       status: "idle",
+      connection: "connecting",
       error: null,
       lastLoadedAt: null,
       providers: [],
@@ -2983,6 +2985,60 @@ describe("App inventory shell", () => {
     expect(providerServiceMock.ListDockerContexts).toHaveBeenCalled();
   });
 
+  it("opens the backend update plan from provider update warnings", async () => {
+    const snapshot = seededSnapshot();
+    inventoryMock.getInventorySnapshot.mockResolvedValue({
+      ...snapshot,
+      providers: [
+        {
+          id: "windows_wsl_ubuntu",
+          name: "Windows WSL Ubuntu",
+          kind: "windows_wsl_ubuntu",
+          active: true,
+          status: {
+            ...healthyProviderStatus(),
+            warnings: [
+              {
+                code: "DOCKER_PACKAGES_OUTDATED",
+                message:
+                  "Docker packages have updates available: docker-buildx-plugin.",
+              },
+            ],
+          },
+          healthy: true,
+        },
+      ],
+    });
+
+    render(<App />);
+
+    expect(
+      await screen.findByText(/Docker packages have updates available/),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Update" }));
+
+    const dialog = await screen.findByRole("dialog", {
+      name: "Set Up Docker Backend",
+    });
+    await waitFor(() =>
+      expect(providerServiceMock.PlanInstall).toHaveBeenCalledWith(
+        "windows_wsl_ubuntu",
+        expect.objectContaining({
+          backend: "windows_wsl_ubuntu",
+          extra: { distro: "Ubuntu" },
+        }),
+      ),
+    );
+    expect(
+      await within(dialog).findByText(
+        "Install or update Docker Engine in Ubuntu on WSL",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByText("wsl.exe --install Ubuntu --name cairn-dev"),
+    ).toBeInTheDocument();
+  });
+
   it("detects projects before completing onboarding", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(noProviderSnapshot());
     projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
@@ -3791,6 +3847,104 @@ describe("App inventory shell", () => {
     expect(dockerServiceMock.ListImages).toHaveBeenCalled();
     expect(inventoryMock.getInventorySnapshot).toHaveBeenCalledTimes(1);
   });
+
+  it("shows a calm reconnecting banner on docker:reconnecting without flashing an error", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+    await screen.findByText("Docker Engine - Running");
+
+    emitRuntimeEvent("docker:reconnecting", {
+      reason: "ping failed",
+      attempt: 1,
+    });
+
+    expect(screen.getByText("Reconnecting to Docker…")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Docker is not reachable"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("surfaces a not-reachable banner on docker:disconnected", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+    await screen.findByText("Docker Engine - Running");
+
+    emitRuntimeEvent("docker:disconnected", { reason: "daemon stopped" });
+
+    expect(screen.getByText("Docker is not reachable")).toBeInTheDocument();
+  });
+
+  it("clears the not-reachable banner on docker:connected even when the follow-up refresh is degraded", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+    await screen.findByText("Docker Engine - Running");
+
+    emitRuntimeEvent("docker:disconnected", { reason: "daemon stopped" });
+    expect(screen.getByText("Docker is not reachable")).toBeInTheDocument();
+
+    // The refresh triggered by docker:connected returns a degraded snapshot.
+    // The banner must still leave "not reachable" because the EVENT moved the
+    // heartbeat off "disconnected" — proving it is the event, not the refresh,
+    // that clears the connection state.
+    inventoryMock.getInventorySnapshot.mockResolvedValue({
+      ...seededSnapshot(),
+      degradedReason: "transient blip",
+    });
+    emitRuntimeEvent("docker:connected", {
+      host: "unix:///var/run/docker.sock",
+      context: "default",
+    });
+
+    await waitFor(() =>
+      expect(
+        screen.queryByText("Docker is not reachable"),
+      ).not.toBeInTheDocument(),
+    );
+  });
+
+  it("keeps the error banner hidden while connected despite a transient inventory error", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+    await screen.findByText("Docker Engine - Running");
+
+    // Heartbeat says connected; a single inventory call hiccups. The hard
+    // "Docker is not reachable" banner must stay suppressed.
+    act(() => {
+      useInventoryStore.setState({
+        status: "error",
+        error: "Docker daemon ping failed",
+      });
+    });
+
+    expect(
+      screen.queryByText("Docker is not reachable"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("resets the stale connection banner when the provider changes", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+    await screen.findByText("Docker Engine - Running");
+
+    emitRuntimeEvent("docker:disconnected", { reason: "daemon stopped" });
+    expect(screen.getByText("Docker is not reachable")).toBeInTheDocument();
+
+    // Switching providers tears down the old heartbeat with no terminal event;
+    // the stale "disconnected" banner must not linger for the new provider.
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    emitRuntimeEvent("provider:changed", { id: "linux_native" });
+
+    await waitFor(() =>
+      expect(
+        screen.queryByText("Docker is not reachable"),
+      ).not.toBeInTheDocument(),
+    );
+  });
 });
 
 function clickSettingsSection(name: string) {
@@ -3944,6 +4098,7 @@ function seededSnapshot(): InventorySnapshot {
     name: "cairn_default",
     driver: "bridge",
     scope: "local",
+    containerCount: 1,
     internal: false,
     attachable: true,
     labels: { "com.docker.compose.project": "cairn" },
@@ -4090,6 +4245,7 @@ function seedScaleSnapshot(projects: ProjectSummary[]): InventorySnapshot {
       name: `network-${index}`,
       driver: "bridge",
       scope: "local",
+      containerCount: index % 4,
       internal: index % 5 === 0,
       attachable: true,
       labels: {

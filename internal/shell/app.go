@@ -205,6 +205,7 @@ func Run(assets fs.FS) error {
 	forwardBusEvents(ctx, eventBus, mainWindow, []bus.Topic{
 		bus.TopicProviderChanged,
 		bus.TopicDockerConnected,
+		bus.TopicDockerReconnecting,
 		bus.TopicDockerDisconnected,
 		bus.TopicObjectsChanged,
 		bus.TopicProjectChanged,
@@ -299,7 +300,12 @@ func startDesktopNotificationBridge(ctx context.Context, eventBus bus.Bus, notif
 	if eventBus == nil || notificationService == nil {
 		return
 	}
-	for _, topic := range []bus.Topic{bus.TopicNotification, bus.TopicDockerDisconnected} {
+	// Track whether an unresolved disconnect notification is showing so a later
+	// recovery can replace it with a single "reconnected" toast. Deliberately
+	// does NOT subscribe to TopicDockerReconnecting — grace-period blips must
+	// stay silent.
+	wasDisconnected := &atomic.Bool{}
+	for _, topic := range []bus.Topic{bus.TopicNotification, bus.TopicDockerDisconnected, bus.TopicDockerConnected} {
 		topic := topic
 		events := eventBus.Subscribe(ctx, topic, 16)
 		go func() {
@@ -311,14 +317,14 @@ func startDesktopNotificationBridge(ctx context.Context, eventBus bus.Bus, notif
 					if !ok {
 						return
 					}
-					sendDesktopNotificationForEvent(notificationService, event)
+					sendDesktopNotificationForEvent(notificationService, event, wasDisconnected)
 				}
 			}
 		}()
 	}
 }
 
-func sendDesktopNotificationForEvent(notificationService *wailsnotifications.NotificationService, event bus.Event) {
+func sendDesktopNotificationForEvent(notificationService *wailsnotifications.NotificationService, event bus.Event, wasDisconnected *atomic.Bool) {
 	switch event.Topic {
 	case bus.TopicNotification:
 		switch payload := event.Payload.(type) {
@@ -342,11 +348,21 @@ func sendDesktopNotificationForEvent(notificationService *wailsnotifications.Not
 			}
 		}
 	case bus.TopicDockerDisconnected:
+		if wasDisconnected != nil {
+			wasDisconnected.Store(true)
+		}
 		body := "Cairn lost connection to Docker."
 		if payload, ok := event.Payload.(dockercore.DisconnectedPayload); ok && strings.TrimSpace(payload.Reason) != "" {
 			body = "Cairn lost connection to Docker: " + payload.Reason
 		}
 		sendDesktopNotification(notificationService, "cairn-docker-disconnected", "Docker disconnected", body, map[string]any{"topic": string(event.Topic)})
+	case bus.TopicDockerConnected:
+		// Only notify on recovery if a disconnect notification is outstanding.
+		// Reusing the same notification ID replaces the stale "disconnected"
+		// toast rather than stacking a second one.
+		if wasDisconnected != nil && wasDisconnected.CompareAndSwap(true, false) {
+			sendDesktopNotification(notificationService, "cairn-docker-disconnected", "Docker reconnected", "Cairn reconnected to Docker.", map[string]any{"topic": string(event.Topic)})
+		}
 	}
 }
 

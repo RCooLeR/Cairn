@@ -538,6 +538,7 @@ func hasBlockingProblem(problems []models.ProviderProblem) bool {
 	for _, problem := range problems {
 		switch problem.Code {
 		case ProblemWSLMissing,
+			ProblemWSLUnavailable,
 			ProblemUbuntuMissing,
 			ProblemWSL2Required,
 			ProblemSystemdOff,

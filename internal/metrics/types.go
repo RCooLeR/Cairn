@@ -41,15 +41,17 @@ type DockerClient interface {
 }
 
 type Options struct {
-	VisibleInterval    time.Duration
-	BackgroundInterval time.Duration
-	PublishInterval    time.Duration
-	PersistInterval    time.Duration
-	RetainInterval     time.Duration
-	GPUCacheTTL        time.Duration
-	TopN               int
-	Now                func() time.Time
-	GPUProbe           GPUProbe
+	VisibleInterval       time.Duration
+	BackgroundInterval    time.Duration
+	PublishInterval       time.Duration
+	PersistInterval       time.Duration
+	RetainInterval        time.Duration
+	GPUCacheTTL           time.Duration
+	TopN                  int
+	DisableStreamingStats bool
+	StatsConcurrency      int
+	Now                   func() time.Time
+	GPUProbe              GPUProbe
 }
 
 type GPUProbe interface {
@@ -70,15 +72,17 @@ type Manager struct {
 	Events      bus.Bus
 	ContextName string
 
-	visibleInterval    time.Duration
-	backgroundInterval time.Duration
-	publishInterval    time.Duration
-	persistInterval    time.Duration
-	retainInterval     time.Duration
-	gpuCacheTTL        time.Duration
-	topN               int
-	now                func() time.Time
-	gpuProbe           GPUProbe
+	visibleInterval       time.Duration
+	backgroundInterval    time.Duration
+	publishInterval       time.Duration
+	persistInterval       time.Duration
+	retainInterval        time.Duration
+	gpuCacheTTL           time.Duration
+	topN                  int
+	disableStreamingStats bool
+	statsSemaphore        chan struct{}
+	now                   func() time.Time
+	gpuProbe              GPUProbe
 
 	mu           sync.Mutex
 	ctx          context.Context

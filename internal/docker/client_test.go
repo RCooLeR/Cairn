@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -165,6 +166,21 @@ func TestClientConnectUsesProviderDialer(t *testing.T) {
 	}
 	if gotHost != "unix:///var/run/docker.sock" || !gotDialer {
 		t.Fatalf("factory host=%q dialer=%t", gotHost, gotDialer)
+	}
+	if !client.usesProcessBackedTransport() {
+		t.Fatal("process-backed transport flag = false, want true")
+	}
+}
+
+func TestProcessBackedHTTPClientDisablesKeepAlives(t *testing.T) {
+	t.Parallel()
+	httpClient := processBackedHTTPClient()
+	transport, ok := httpClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport = %T, want *http.Transport", httpClient.Transport)
+	}
+	if !transport.DisableKeepAlives {
+		t.Fatal("DisableKeepAlives = false, want true")
 	}
 }
 
@@ -551,13 +567,14 @@ func TestClientListContainerFilesNotFound(t *testing.T) {
 	}
 }
 
-func TestClientHealthLoopDisconnectsAndReconnects(t *testing.T) {
+func TestClientHealthLoopRecoversWithinGraceWithoutDisconnect(t *testing.T) {
 	t.Parallel()
 	rootCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	eventBus := bus.New()
 	defer eventBus.Close()
 	connected := eventBus.Subscribe(rootCtx, bus.TopicDockerConnected, 4)
+	reconnecting := eventBus.Subscribe(rootCtx, bus.TopicDockerReconnecting, 4)
 	disconnected := eventBus.Subscribe(rootCtx, bus.TopicDockerDisconnected, 4)
 
 	first := newFakeAPI()
@@ -567,6 +584,7 @@ func TestClientHealthLoopDisconnectsAndReconnects(t *testing.T) {
 	client.pingInterval = 10 * time.Millisecond
 	client.backoffMin = 10 * time.Millisecond
 	client.backoffMax = 20 * time.Millisecond
+	client.failureThreshold = 3
 	client.factory = func(string) (APIClient, error) {
 		if len(clients) == 0 {
 			return nil, errors.New("no fake clients left")
@@ -583,6 +601,87 @@ func TestClientHealthLoopDisconnectsAndReconnects(t *testing.T) {
 
 	client.StartHealthLoop(rootCtx)
 
+	// The grace period publishes a "reconnecting" event instead of immediately
+	// reporting the connection as lost.
+	select {
+	case event := <-reconnecting:
+		payload, ok := event.Payload.(ReconnectingPayload)
+		if !ok || payload.Reason == "" || payload.Attempt != 1 {
+			t.Fatalf("reconnecting payload = %#v", event.Payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for docker:reconnecting")
+	}
+
+	// The first reconnect attempt uses the healthy `second` client, so the
+	// connection recovers within the grace window before the threshold is hit.
+	select {
+	case <-connected:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for docker:connected after recovery")
+	}
+
+	// Because recovery happened within the grace window, "disconnected" must
+	// never be published.
+	select {
+	case event := <-disconnected:
+		t.Fatalf("unexpected docker:disconnected during grace recovery: %#v", event.Payload)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestClientHealthLoopDisconnectsAfterGraceThreshold(t *testing.T) {
+	t.Parallel()
+	rootCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	eventBus := bus.New()
+	defer eventBus.Close()
+	connected := eventBus.Subscribe(rootCtx, bus.TopicDockerConnected, 8)
+	reconnecting := eventBus.Subscribe(rootCtx, bus.TopicDockerReconnecting, 8)
+	disconnected := eventBus.Subscribe(rootCtx, bus.TopicDockerDisconnected, 8)
+
+	first := newFakeAPI()
+	second := newFakeAPI()
+	// The initial Connect uses `first`; the next two reconnect attempts fail to
+	// exceed the grace threshold, then `second` succeeds. initialDone is written
+	// before StartHealthLoop spawns the health-loop goroutine, and
+	// reconnectAttempts is only touched from that goroutine, so no extra
+	// synchronization is needed.
+	initialDone := false
+	reconnectAttempts := 0
+	client := New(fakeDockerProvider{}, eventBus)
+	client.pingInterval = 10 * time.Millisecond
+	client.backoffMin = 10 * time.Millisecond
+	client.backoffMax = 20 * time.Millisecond
+	client.failureThreshold = 2
+	client.factory = func(string) (APIClient, error) {
+		if !initialDone {
+			initialDone = true
+			return first, nil
+		}
+		reconnectAttempts++
+		if reconnectAttempts <= 2 {
+			return nil, errors.New("connect failed")
+		}
+		return second, nil
+	}
+	if err := client.Connect(rootCtx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	<-connected
+	first.setPingError(errors.New("daemon stopped"))
+
+	client.StartHealthLoop(rootCtx)
+
+	select {
+	case event := <-reconnecting:
+		if payload, ok := event.Payload.(ReconnectingPayload); !ok || payload.Attempt != 1 {
+			t.Fatalf("first reconnecting payload = %#v", event.Payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for docker:reconnecting")
+	}
+
 	select {
 	case event := <-disconnected:
 		payload, ok := event.Payload.(DisconnectedPayload)
@@ -590,13 +689,22 @@ func TestClientHealthLoopDisconnectsAndReconnects(t *testing.T) {
 			t.Fatalf("disconnected payload = %#v", event.Payload)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for docker:disconnected")
+		t.Fatal("timed out waiting for docker:disconnected after grace threshold")
 	}
 
 	select {
 	case <-connected:
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for docker:connected after reconnect")
+	}
+
+	// Exactly one disconnect must be published even though reconnect attempts
+	// continued past the threshold; otherwise the desktop-notification bridge
+	// would fire repeated "Docker disconnected" toasts.
+	select {
+	case event := <-disconnected:
+		t.Fatalf("second docker:disconnected published: %#v", event.Payload)
+	default:
 	}
 }
 
@@ -699,6 +807,9 @@ func TestClientObjectsDTOsRawInspectAndCacheReconcile(t *testing.T) {
 	if len(networks) != 1 || networks[0].Name != "demo_default" || !networks[0].Attachable {
 		t.Fatalf("networks = %#v", networks)
 	}
+	if networks[0].Subnet != "172.22.0.0/16" || networks[0].Gateway != "172.22.0.1" || networks[0].ContainerCount != 1 {
+		t.Fatalf("network summary detail = %#v", networks[0])
+	}
 	networkDetail, err := client.GetNetwork(ctx, "net1")
 	if err != nil {
 		t.Fatalf("GetNetwork() error = %v", err)
@@ -772,6 +883,37 @@ func TestClientObjectEventsAreCoalesced(t *testing.T) {
 	payload := waitObjectsChanged(t, ctx, changed, time.Second)
 	if payload.Kind != "container" || len(payload.IDs) != 1 || payload.IDs[0] != fakeContainerID {
 		t.Fatalf("objects:changed payload = %#v", payload)
+	}
+}
+
+func TestClientProcessBackedTransportDoesNotOpenDockerEventStream(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	api := newFakeAPI()
+	seedFakeObjects(api)
+	client := New(fakeDialerProvider{
+		host: "unix:///var/run/docker.sock",
+		dialer: func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("test dialer should not be called by fake API")
+		},
+	}, nil)
+	client.reconcileEvery = 10 * time.Millisecond
+	client.factoryWithDialer = func(string, func(context.Context, string, string) (net.Conn, error)) (APIClient, error) {
+		return api, nil
+	}
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	client.StartObjectEventLoop(ctx)
+	time.Sleep(50 * time.Millisecond)
+
+	api.mu.Lock()
+	eventCalls := api.eventCalls
+	api.mu.Unlock()
+	if eventCalls != 0 {
+		t.Fatalf("Docker Events calls = %d, want 0 for process-backed transport", eventCalls)
 	}
 }
 
@@ -2001,6 +2143,7 @@ type fakeAPI struct {
 	networkRaw        map[string][]byte
 	events            chan events.Message
 	eventErrs         chan error
+	eventCalls        int
 	stats             map[string][]container.StatsResponse
 	statsCalls        []statsCall
 	tops              map[string]container.TopResponse
@@ -2556,6 +2699,9 @@ func (a *fakeAPI) NetworksPrune(context.Context, filters.Args) (network.PruneRep
 }
 
 func (a *fakeAPI) Events(context.Context, events.ListOptions) (<-chan events.Message, <-chan error) {
+	a.mu.Lock()
+	a.eventCalls++
+	a.mu.Unlock()
 	return a.events, a.eventErrs
 }
 

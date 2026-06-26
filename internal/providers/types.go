@@ -22,6 +22,7 @@ const (
 
 const (
 	ProblemWSLMissing                 = "WSL_MISSING"
+	ProblemWSLUnavailable             = "WSL_UNAVAILABLE"
 	ProblemUbuntuMissing              = "UBUNTU_MISSING"
 	ProblemWSL2Required               = "WSL2_REQUIRED"
 	ProblemSystemdOff                 = "SYSTEMD_OFF"

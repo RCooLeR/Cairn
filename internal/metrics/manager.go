@@ -248,6 +248,14 @@ func (m *Manager) reconcileOnce(ctx context.Context) error {
 }
 
 func (m *Manager) watchContainer(ctx context.Context, containerID string) {
+	if m.disableStreamingStats {
+		for ctx.Err() == nil {
+			_ = m.sampleOneShot(ctx, containerID)
+			sleepContext(ctx, m.sampleInterval(containerID))
+		}
+		return
+	}
+
 	failures := 0
 	fallbackSamples := 0
 	for ctx.Err() == nil {
@@ -287,6 +295,12 @@ func (m *Manager) streamRetryDelay(containerID string, failures int) time.Durati
 }
 
 func (m *Manager) streamContainer(ctx context.Context, containerID string) error {
+	release, err := m.acquireStatsSlot(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	reader, err := m.Docker.ContainerStats(ctx, containerID, dockercore.StatsOptions{Stream: true})
 	if err != nil {
 		return err
@@ -312,6 +326,12 @@ func (m *Manager) streamContainer(ctx context.Context, containerID string) error
 }
 
 func (m *Manager) sampleOneShot(ctx context.Context, containerID string) error {
+	release, err := m.acquireStatsSlot(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	reader, err := m.Docker.ContainerStats(ctx, containerID, dockercore.StatsOptions{OneShot: true})
 	if err != nil {
 		return err
@@ -942,9 +962,27 @@ func (m *Manager) applyOptions(opts Options) {
 	m.retainInterval = opts.RetainInterval
 	m.gpuCacheTTL = opts.GPUCacheTTL
 	m.topN = opts.TopN
+	m.disableStreamingStats = opts.DisableStreamingStats
+	if opts.StatsConcurrency > 0 {
+		m.statsSemaphore = make(chan struct{}, opts.StatsConcurrency)
+	} else {
+		m.statsSemaphore = nil
+	}
 	m.now = opts.Now
 	m.gpuProbe = opts.GPUProbe
 	m.ensureReady()
+}
+
+func (m *Manager) acquireStatsSlot(ctx context.Context) (func(), error) {
+	if m.statsSemaphore == nil {
+		return func() {}, nil
+	}
+	select {
+	case m.statsSemaphore <- struct{}{}:
+		return func() { <-m.statsSemaphore }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func (m *Manager) requireDocker() error {

@@ -30,33 +30,17 @@ export type InventorySnapshot = {
 type Settled<T> = PromiseSettledResult<T>;
 
 export async function getInventorySnapshot(): Promise<InventorySnapshot> {
-  const [
-    providerResult,
-    info,
-    version,
-    diskUsage,
-    containers,
-    images,
-    volumes,
-    networks,
-  ] = await Promise.allSettled([
-    ProviderService.ListProviders(),
-    DockerService.Info(),
-    DockerService.Version(),
-    DockerService.DiskUsage(),
-    DockerService.ListContainers({ all: true }),
-    DockerService.ListImages(),
-    DockerService.ListVolumes(),
-    DockerService.ListNetworks(),
-  ]);
+  const providerResult = await settle(ProviderService.ListProviders());
+  const info = await settle(DockerService.Info());
+  const version = await settle(DockerService.Version());
+  const diskUsage = await settle(DockerService.DiskUsage());
+  const containers = await settle(DockerService.ListContainers({ all: true }));
+  const images = await settle(DockerService.ListImages());
+  const volumes = await settle(DockerService.ListVolumes());
+  const networks = await settle(DockerService.ListNetworks());
 
   const volumeSummaries = valueOr(volumes, []);
   const networkSummaries = valueOr(networks, []);
-
-  const [volumeDetails, networkDetails] = await Promise.all([
-    loadVolumeDetails(volumeSummaries),
-    loadNetworkDetails(networkSummaries),
-  ]);
 
   return {
     providers: valueOr(providerResult, []),
@@ -67,8 +51,8 @@ export async function getInventorySnapshot(): Promise<InventorySnapshot> {
     images: valueOr(images, []),
     volumes: volumeSummaries,
     networks: networkSummaries,
-    volumeDetails,
-    networkDetails,
+    volumeDetails: {},
+    networkDetails: {},
     degradedReason: firstError([
       providerResult,
       info,
@@ -82,50 +66,12 @@ export async function getInventorySnapshot(): Promise<InventorySnapshot> {
   };
 }
 
-async function loadVolumeDetails(
-  volumes: VolumeSummary[],
-): Promise<Record<string, VolumeDetail>> {
-  const entries = await Promise.allSettled(
-    volumes.map(
-      async (volume) =>
-        [volume.name, await DockerService.GetVolume(volume.name)] as const,
-    ),
-  );
-  return Object.fromEntries(
-    entries
-      .filter(
-        (
-          entry,
-        ): entry is PromiseFulfilledResult<
-          readonly [string, VolumeDetail | null]
-        > => entry.status === "fulfilled",
-      )
-      .filter((entry) => entry.value[1] !== null)
-      .map((entry) => [entry.value[0], entry.value[1] as VolumeDetail]),
-  );
-}
-
-async function loadNetworkDetails(
-  networks: NetworkSummary[],
-): Promise<Record<string, NetworkDetail>> {
-  const entries = await Promise.allSettled(
-    networks.map(
-      async (network) =>
-        [network.id, await DockerService.GetNetwork(network.id)] as const,
-    ),
-  );
-  return Object.fromEntries(
-    entries
-      .filter(
-        (
-          entry,
-        ): entry is PromiseFulfilledResult<
-          readonly [string, NetworkDetail | null]
-        > => entry.status === "fulfilled",
-      )
-      .filter((entry) => entry.value[1] !== null)
-      .map((entry) => [entry.value[0], entry.value[1] as NetworkDetail]),
-  );
+async function settle<T>(promise: Promise<T>): Promise<Settled<T>> {
+  try {
+    return { status: "fulfilled", value: await promise };
+  } catch (reason) {
+    return { status: "rejected", reason };
+  }
 }
 
 function valueOr<T>(result: Settled<T>, fallback: T): T {

@@ -267,14 +267,18 @@ func mapVolumeDetail(raw volume.Volume, containers []models.ContainerSummary) *m
 }
 
 func mapNetworkSummary(raw network.Summary) models.NetworkSummary {
+	subnet, gateway := networkIPAM(raw)
 	return models.NetworkSummary{
-		ID:         raw.ID,
-		Name:       raw.Name,
-		Driver:     raw.Driver,
-		Scope:      raw.Scope,
-		Internal:   raw.Internal,
-		Attachable: raw.Attachable,
-		Labels:     copyStringMap(raw.Labels),
+		ID:             raw.ID,
+		Name:           raw.Name,
+		Driver:         raw.Driver,
+		Scope:          raw.Scope,
+		Subnet:         subnet,
+		Gateway:        gateway,
+		ContainerCount: len(raw.Containers),
+		Internal:       raw.Internal,
+		Attachable:     raw.Attachable,
+		Labels:         copyStringMap(raw.Labels),
 	}
 }
 

@@ -176,6 +176,58 @@ func TestWindowsWSLDetectProblemCases(t *testing.T) {
 	}
 }
 
+func TestWindowsWSLDetectExplainsSystemdConfiguredButNotRunning(t *testing.T) {
+	t.Parallel()
+	runner := newFakeRunner()
+	seedWSLDetectThroughDockerProbe(runner)
+	delete(runner.outputs, wslCommandName+" -d Ubuntu -- test -d /run/systemd/system")
+	runner.errors[wslCommandName+" -d Ubuntu -- test -d /run/systemd/system"] = errors.New("missing")
+	runner.outputs[wslCommandName+" -d Ubuntu -- sh -lc "+wslSystemdEnabledCommand] = ""
+
+	status, err := NewWindowsWSL(WindowsWSLOptions{Runner: runner}).Detect(context.Background())
+	if err != nil {
+		t.Fatalf("Detect() error = %v", err)
+	}
+	problem := assertProblem(t, status.Problems, ProblemSystemdOff)
+	if !strings.Contains(problem.Message, "enabled but not running yet") {
+		t.Fatalf("problem message = %q", problem.Message)
+	}
+	if !strings.Contains(problem.RepairHint, "wsl --shutdown") || strings.Contains(problem.RepairHint, "Enable systemd") {
+		t.Fatalf("repair hint = %q", problem.RepairHint)
+	}
+}
+
+func TestWindowsWSLDetectDoesNotMisclassifyWSLServiceFailureAsSystemdOff(t *testing.T) {
+	t.Parallel()
+	runner := newFakeRunner()
+	seedWSLDetectThroughDockerProbe(runner)
+	key := wslCommandName + " -d Ubuntu -- test -d /run/systemd/system"
+	delete(runner.outputs, key)
+	runner.errors[key] = errors.New(utf16LE("Wsl/Service/0x80072747: An operation on a socket could not be performed because the system lacked sufficient buffer space or because a queue was full."))
+
+	status, err := NewWindowsWSL(WindowsWSLOptions{Runner: runner}).Detect(context.Background())
+	if err != nil {
+		t.Fatalf("Detect() error = %v", err)
+	}
+	assertProblem(t, status.Problems, ProblemWSLUnavailable)
+	assertNoProblem(t, status.Problems, ProblemSystemdOff)
+}
+
+func TestWindowsWSLDetectReportsWSLUnavailableWhenDistroListFails(t *testing.T) {
+	t.Parallel()
+	runner := newFakeRunner()
+	runner.paths[wslCommandName] = `C:\Windows\System32\wsl.exe`
+	runner.outputs[wslCommandName+" --status"] = "Default Version: 2\n"
+	runner.errors[wslCommandName+" -l -v"] = errors.New("Wsl/Service/0x80072747: An operation on a socket could not be performed because the system lacked sufficient buffer space or because a queue was full.")
+
+	status, err := NewWindowsWSL(WindowsWSLOptions{Runner: runner}).Detect(context.Background())
+	if err != nil {
+		t.Fatalf("Detect() error = %v", err)
+	}
+	assertProblem(t, status.Problems, ProblemWSLUnavailable)
+	assertNoProblem(t, status.Problems, ProblemUbuntuMissing)
+}
+
 func TestWindowsWSLRunDockerComposeAndShellCommands(t *testing.T) {
 	t.Parallel()
 	runner := newFakeRunner()
@@ -353,6 +405,12 @@ func TestWindowsWSLInstallPlanAndExecution(t *testing.T) {
 	}
 	if !strings.Contains(plan.Commands[2].Command, "already version 2") || !strings.Contains(plan.Commands[2].Command, "--set-version") {
 		t.Fatalf("WSL2 conversion command is not idempotent: %s", plan.Commands[2].Command)
+	}
+	if strings.Contains(plan.Commands[3].Command, "$tmp") || strings.Contains(plan.Commands[3].Command, "mktemp") {
+		t.Fatalf("systemd command should not rely on shell temp variables through wsl.exe: %s", plan.Commands[3].Command)
+	}
+	if !strings.Contains(plan.Commands[3].Command, "/etc/wsl.conf.cairn-tmp") || !strings.Contains(plan.Commands[3].Command, "trap") {
+		t.Fatalf("systemd command missing fixed temp file cleanup: %s", plan.Commands[3].Command)
 	}
 	if !strings.Contains(plan.Commands[5].Command, "rm -f /etc/apt/sources.list.d/docker.list") || !strings.Contains(plan.Commands[5].Command, "Could not determine Ubuntu codename") {
 		t.Fatalf("Docker apt install command does not clean stale source lists or validate codename: %s", plan.Commands[5].Command)

@@ -77,7 +77,7 @@ Update-Text "build/windows/info.json" {
 
 Update-Text "build/windows/wails.exe.manifest" {
   param($text)
-  Replace-Required $text '(<assemblyIdentity type="win32" name="app\.cairn\.desktop" version=")[^"]+(")' "`$1$fileVersion`$2" "build/windows/wails.exe.manifest"
+  Replace-Required $text '(<assemblyIdentity type="win32" name="app\.cairn\.desktop" version=")[^"]+(")' "`${1}$fileVersion`${2}" "build/windows/wails.exe.manifest"
 }
 
 Update-Text "build/windows/nsis/wails_tools.nsh" {

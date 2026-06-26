@@ -280,6 +280,60 @@ func TestWatchContainerRetriesStreamAfterFallbackFailures(t *testing.T) {
 	}
 }
 
+func TestWatchContainerCanDisableStreamingStats(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sampled := make(chan struct{})
+	var sampledOnce sync.Once
+	now := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)
+	docker := &fakeMetricsDocker{
+		stats: map[string][]container.StatsResponse{"c1": {
+			statsResponse(now, 100, 1000, 100, 100, 0),
+			statsResponse(now.Add(time.Second), 200, 2000, 150, 120, 0),
+		}},
+		afterStatsCall: func(_ int, oneShotCalls int) {
+			if oneShotCalls >= 1 {
+				sampledOnce.Do(func() {
+					close(sampled)
+				})
+			}
+		},
+	}
+	manager := NewManager(docker, nil, nil, nil, nil, Options{
+		BackgroundInterval:    time.Millisecond,
+		DisableStreamingStats: true,
+		StatsConcurrency:      1,
+	})
+	manager.mu.Lock()
+	manager.containers["c1"] = models.ContainerSummary{ID: "c1", Name: "web"}
+	manager.mu.Unlock()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		manager.watchContainer(ctx, "c1")
+	}()
+
+	select {
+	case <-sampled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watcher did not collect one-shot stats")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("watcher did not stop after context cancellation")
+	}
+	if docker.streamCalls != 0 {
+		t.Fatalf("stream stats calls = %d, want 0", docker.streamCalls)
+	}
+	if docker.oneShotCalls == 0 {
+		t.Fatal("one-shot stats calls = 0, want at least 1")
+	}
+}
+
 func TestManagerQueriesStopsFallbackAndScopes(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)

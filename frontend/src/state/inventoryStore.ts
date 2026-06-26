@@ -18,8 +18,20 @@ import { getInventorySnapshot } from "../api/inventory";
 
 type LoadStatus = "idle" | "loading" | "ready" | "error";
 
+// ConnectionState tracks the Docker engine heartbeat independently of the
+// inventory load status. It is driven by the backend docker:connected /
+// docker:reconnecting / docker:disconnected events (plus successful snapshots),
+// so a transient blip shows a calm "reconnecting" state rather than flashing a
+// hard error from a single failed inventory call.
+export type ConnectionState =
+  | "connecting"
+  | "connected"
+  | "reconnecting"
+  | "disconnected";
+
 type InventoryState = {
   status: LoadStatus;
+  connection: ConnectionState;
   error: string | null;
   lastLoadedAt: number | null;
   providers: ProviderSummary[];
@@ -39,14 +51,18 @@ type InventoryState = {
   refreshNetworks: () => Promise<void>;
   setContainers: (containers: ContainerSummary[]) => void;
   setImages: (images: ImageSummary[]) => void;
+  setNetworkDetail: (id: string, detail: NetworkDetail) => void;
   setVolumes: (volumes: VolumeSummary[]) => void;
+  setVolumeDetail: (name: string, detail: VolumeDetail) => void;
   setNetworks: (networks: NetworkSummary[]) => void;
+  setConnection: (connection: ConnectionState) => void;
 };
 
 let refreshPromise: Promise<void> | null = null;
 
 export const useInventoryStore = create<InventoryState>((set) => ({
   status: "idle",
+  connection: "connecting",
   error: null,
   lastLoadedAt: null,
   providers: [],
@@ -67,8 +83,19 @@ export const useInventoryStore = create<InventoryState>((set) => ({
       set({ status: "loading", error: null });
       try {
         const snapshot = await getInventorySnapshot();
-        set({
+        set((state) => ({
           status: snapshot.degradedReason ? "error" : "ready",
+          // A clean snapshot proves the engine is reachable. A degraded snapshot
+          // while we believed we were connected means the engine just turned
+          // flaky: downgrade to a calm "reconnecting" rather than leaving a
+          // stale "connected" that hides the degraded state with no banner.
+          // Startup ("connecting") and already-down states are left for the
+          // heartbeat events to resolve.
+          connection: snapshot.degradedReason
+            ? state.connection === "connected"
+              ? "reconnecting"
+              : state.connection
+            : "connected",
           error: snapshot.degradedReason,
           lastLoadedAt: Date.now(),
           providers: snapshot.providers,
@@ -81,7 +108,7 @@ export const useInventoryStore = create<InventoryState>((set) => ({
           networks: snapshot.networks,
           volumeDetails: snapshot.volumeDetails,
           networkDetails: snapshot.networkDetails,
-        });
+        }));
       } catch (error) {
         set({
           status: "error",
@@ -114,8 +141,7 @@ export const useInventoryStore = create<InventoryState>((set) => ({
   refreshVolumes: async () => {
     try {
       const volumes = await DockerService.ListVolumes();
-      const volumeDetails = await loadVolumeDetails(volumes);
-      setInventoryPatch(set, { volumes, volumeDetails });
+      setInventoryPatch(set, { volumes });
     } catch (error) {
       setInventoryError(set, error);
     }
@@ -123,16 +149,24 @@ export const useInventoryStore = create<InventoryState>((set) => ({
   refreshNetworks: async () => {
     try {
       const networks = await DockerService.ListNetworks();
-      const networkDetails = await loadNetworkDetails(networks);
-      setInventoryPatch(set, { networks, networkDetails });
+      setInventoryPatch(set, { networks });
     } catch (error) {
       setInventoryError(set, error);
     }
   },
   setContainers: (containers) => set({ containers }),
   setImages: (images) => set({ images }),
+  setNetworkDetail: (id, detail) =>
+    set((current) => ({
+      networkDetails: { ...current.networkDetails, [id]: detail },
+    })),
   setVolumes: (volumes) => set({ volumes }),
+  setVolumeDetail: (name, detail) =>
+    set((current) => ({
+      volumeDetails: { ...current.volumeDetails, [name]: detail },
+    })),
   setNetworks: (networks) => set({ networks }),
+  setConnection: (connection) => set({ connection }),
 }));
 
 function setInventoryPatch(
@@ -156,50 +190,4 @@ function setInventoryError(
     error: error instanceof Error ? error.message : "Docker is not reachable",
     lastLoadedAt: Date.now(),
   });
-}
-
-async function loadVolumeDetails(
-  volumes: VolumeSummary[],
-): Promise<Record<string, VolumeDetail>> {
-  const entries = await Promise.allSettled(
-    volumes.map(
-      async (volume) =>
-        [volume.name, await DockerService.GetVolume(volume.name)] as const,
-    ),
-  );
-  return Object.fromEntries(
-    entries
-      .filter(
-        (
-          entry,
-        ): entry is PromiseFulfilledResult<
-          readonly [string, VolumeDetail | null]
-        > => entry.status === "fulfilled",
-      )
-      .filter((entry) => entry.value[1] !== null)
-      .map((entry) => [entry.value[0], entry.value[1] as VolumeDetail]),
-  );
-}
-
-async function loadNetworkDetails(
-  networks: NetworkSummary[],
-): Promise<Record<string, NetworkDetail>> {
-  const entries = await Promise.allSettled(
-    networks.map(
-      async (network) =>
-        [network.id, await DockerService.GetNetwork(network.id)] as const,
-    ),
-  );
-  return Object.fromEntries(
-    entries
-      .filter(
-        (
-          entry,
-        ): entry is PromiseFulfilledResult<
-          readonly [string, NetworkDetail | null]
-        > => entry.status === "fulfilled",
-      )
-      .filter((entry) => entry.value[1] !== null)
-      .map((entry) => [entry.value[0], entry.value[1] as NetworkDetail]),
-  );
 }

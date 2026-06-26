@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -38,6 +39,11 @@ const (
 	defaultEventBatchWindow = 250 * time.Millisecond
 	defaultBackoffMin       = time.Second
 	defaultBackoffMax       = 30 * time.Second
+	// defaultFailureThreshold is how many consecutive recovery attempts must
+	// fail after a ping error before the connection is reported as
+	// disconnected. Until then the client only reports "reconnecting", so a
+	// brief backend blip does not flash a disconnected banner.
+	defaultFailureThreshold = 3
 )
 
 type Provider interface {
@@ -108,6 +114,11 @@ type DisconnectedPayload struct {
 	Reason string `json:"reason"`
 }
 
+type ReconnectingPayload struct {
+	Reason  string `json:"reason"`
+	Attempt int    `json:"attempt"`
+}
+
 type ObjectsChangedPayload struct {
 	Kind string   `json:"kind"`
 	IDs  []string `json:"ids"`
@@ -121,19 +132,21 @@ type Client struct {
 	factory           func(string) (APIClient, error)
 	factoryWithDialer func(string, func(context.Context, string, string) (net.Conn, error)) (APIClient, error)
 
-	reconnectMu    sync.Mutex
-	mu             sync.RWMutex
-	api            APIClient
-	host           string
-	contextName    string
-	unaryTimeout   time.Duration
-	pingInterval   time.Duration
-	reconcileEvery time.Duration
-	eventBatch     time.Duration
-	backoffMin     time.Duration
-	backoffMax     time.Duration
-	connectedOnce  bool
-	shellCache     map[string][]string
+	reconnectMu      sync.Mutex
+	mu               sync.RWMutex
+	api              APIClient
+	host             string
+	contextName      string
+	processBacked    bool
+	unaryTimeout     time.Duration
+	pingInterval     time.Duration
+	reconcileEvery   time.Duration
+	eventBatch       time.Duration
+	backoffMin       time.Duration
+	backoffMax       time.Duration
+	failureThreshold int
+	connectedOnce    bool
+	shellCache       map[string][]string
 }
 
 func New(provider Provider, eventBus bus.Bus) *Client {
@@ -149,6 +162,7 @@ func New(provider Provider, eventBus bus.Bus) *Client {
 		eventBatch:        defaultEventBatchWindow,
 		backoffMin:        defaultBackoffMin,
 		backoffMax:        defaultBackoffMax,
+		failureThreshold:  defaultFailureThreshold,
 	}
 }
 
@@ -201,6 +215,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	c.api = api
 	c.host = host
 	c.contextName = contextName
+	c.processBacked = dialContext != nil
 	c.connectedOnce = true
 	c.mu.Unlock()
 	if old != nil {
@@ -218,6 +233,7 @@ func (c *Client) Close() error {
 	c.mu.Lock()
 	api := c.api
 	c.api = nil
+	c.processBacked = false
 	c.mu.Unlock()
 	if api == nil {
 		return nil
@@ -291,7 +307,6 @@ func (c *Client) StartHealthLoop(ctx context.Context) {
 func (c *Client) healthLoop(ctx context.Context) {
 	timer := time.NewTimer(c.pingInterval)
 	defer timer.Stop()
-	backoff := c.backoffMin
 	for {
 		select {
 		case <-ctx.Done():
@@ -300,29 +315,63 @@ func (c *Client) healthLoop(ctx context.Context) {
 		}
 
 		if err := c.Ping(ctx); err == nil {
-			backoff = c.backoffMin
 			timer.Reset(c.pingInterval)
 			continue
+		} else if c.handleConnectionLoss(ctx, err) {
+			timer.Reset(c.pingInterval)
 		} else {
-			c.disconnect(err)
+			return
+		}
+	}
+}
+
+// handleConnectionLoss runs the grace period and reconnect loop after a ping
+// failure. To avoid alarming the user over a transient blip, it publishes a
+// "reconnecting" event and retries quietly with exponential backoff; it only
+// publishes "disconnected" once failureThreshold consecutive recovery attempts
+// have failed. It returns true once the connection is restored (Connect has
+// published "connected"), or false if ctx was cancelled.
+func (c *Client) handleConnectionLoss(ctx context.Context, firstErr error) bool {
+	threshold := c.failureThreshold
+	if threshold < 1 {
+		threshold = 1
+	}
+	attempt := 1
+	backoff := c.backoffMin
+	disconnected := false
+	lastErr := firstErr
+	// Only announce a grace period when one actually exists. With threshold<=1
+	// there is no grace window, so we go straight to disconnect below without a
+	// transient reconnecting flash.
+	if threshold > 1 {
+		c.publish(bus.TopicDockerReconnecting, ReconnectingPayload{Reason: firstErr.Error(), Attempt: attempt})
+	}
+
+	for {
+		if !disconnected && attempt >= threshold {
+			c.disconnect(lastErr)
+			disconnected = true
 		}
 
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(backoff):
-			}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(backoff):
+		}
 
-			if err := c.Connect(ctx); err == nil {
-				backoff = c.backoffMin
-				timer.Reset(c.pingInterval)
-				break
-			}
-			backoff *= 2
-			if backoff > c.backoffMax {
-				backoff = c.backoffMax
-			}
+		if err := c.Connect(ctx); err == nil {
+			return true
+		} else {
+			lastErr = err
+		}
+
+		attempt++
+		if !disconnected {
+			c.publish(bus.TopicDockerReconnecting, ReconnectingPayload{Reason: lastErr.Error(), Attempt: attempt})
+		}
+		backoff *= 2
+		if backoff > c.backoffMax {
+			backoff = c.backoffMax
 		}
 	}
 }
@@ -352,6 +401,7 @@ func (c *Client) disconnect(err error) {
 	c.mu.Lock()
 	api := c.api
 	c.api = nil
+	c.processBacked = false
 	reason := err.Error()
 	c.mu.Unlock()
 	if api != nil {
@@ -380,9 +430,11 @@ func newSDKClient(host string) (APIClient, error) {
 }
 
 func newSDKClientWithDialer(host string, dialContext func(context.Context, string, string) (net.Conn, error)) (APIClient, error) {
-	opts := []dockerclient.Opt{
-		dockerclient.WithHost(host),
+	opts := []dockerclient.Opt{}
+	if dialContext != nil {
+		opts = append(opts, dockerclient.WithHTTPClient(processBackedHTTPClient()))
 	}
+	opts = append(opts, dockerclient.WithHost(host))
 	if dialContext != nil {
 		opts = append(opts, dockerclient.WithDialContext(dialContext))
 	}
@@ -392,11 +444,28 @@ func newSDKClientWithDialer(host string, dialContext func(context.Context, strin
 	)
 }
 
+func processBackedHTTPClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			DisableKeepAlives: true,
+			MaxIdleConns:      0,
+			IdleConnTimeout:   time.Second,
+		},
+		CheckRedirect: dockerclient.CheckRedirect,
+	}
+}
+
 func (c *Client) newAPIClient(host string, dialContext func(context.Context, string, string) (net.Conn, error)) (APIClient, error) {
 	if dialContext != nil && c.factoryWithDialer != nil {
 		return c.factoryWithDialer(host, dialContext)
 	}
 	return c.factory(host)
+}
+
+func (c *Client) usesProcessBackedTransport() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.processBacked
 }
 
 func mapDockerError(action string, err error) error {

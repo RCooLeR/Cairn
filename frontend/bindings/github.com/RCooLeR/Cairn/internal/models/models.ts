@@ -2344,6 +2344,9 @@ export class NetworkSummary {
     "name": string;
     "driver": string;
     "scope"?: string;
+    "subnet"?: string;
+    "gateway"?: string;
+    "containerCount": number;
     "internal": boolean;
     "attachable": boolean;
     "labels"?: { [_ in string]?: string };
@@ -2359,6 +2362,9 @@ export class NetworkSummary {
         if (!("driver" in $$source)) {
             this["driver"] = "";
         }
+        if (!("containerCount" in $$source)) {
+            this["containerCount"] = 0;
+        }
         if (!("internal" in $$source)) {
             this["internal"] = false;
         }
@@ -2373,10 +2379,10 @@ export class NetworkSummary {
      * Creates a new NetworkSummary instance from a string or object.
      */
     static createFrom($$source: any = {}): NetworkSummary {
-        const $$createField6_0 = $$createType22;
+        const $$createField9_0 = $$createType22;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("labels" in $$parsedSource) {
-            $$parsedSource["labels"] = $$createField6_0($$parsedSource["labels"]);
+            $$parsedSource["labels"] = $$createField9_0($$parsedSource["labels"]);
         }
         return new NetworkSummary($$parsedSource as Partial<NetworkSummary>);
     }
