@@ -11,17 +11,18 @@ import (
 func TestNewAppRuntimeUsesNamedConfigAndStoppedState(t *testing.T) {
 	runtimeMu := &sync.RWMutex{}
 	runtimeController := newAppRuntime(appRuntimeConfig{
-		RootCtx:         context.Background(),
-		ServiceMu:       runtimeMu,
-		DockerService:   &services.DockerService{RuntimeMu: runtimeMu},
-		ProjectService:  &services.ProjectService{RuntimeMu: runtimeMu},
-		ComposeService:  &services.ComposeService{RuntimeMu: runtimeMu},
-		MetricsService:  &services.MetricsService{RuntimeMu: runtimeMu},
-		LogsService:     &services.LogsService{RuntimeMu: runtimeMu},
-		TerminalService: &services.TerminalService{RuntimeMu: runtimeMu},
-		UpdateService:   &services.UpdateService{RuntimeMu: runtimeMu},
-		LineageService:  &services.ImageLineageService{RuntimeMu: runtimeMu},
-		BackupService:   &services.BackupService{RuntimeMu: runtimeMu},
+		RootCtx:            context.Background(),
+		ServiceMu:          runtimeMu,
+		DockerService:      &services.DockerService{RuntimeMu: runtimeMu},
+		ProjectService:     &services.ProjectService{RuntimeMu: runtimeMu},
+		ComposeService:     &services.ComposeService{RuntimeMu: runtimeMu},
+		MetricsService:     &services.MetricsService{RuntimeMu: runtimeMu},
+		LogsService:        &services.LogsService{RuntimeMu: runtimeMu},
+		TerminalService:    &services.TerminalService{RuntimeMu: runtimeMu},
+		UpdateService:      &services.UpdateService{RuntimeMu: runtimeMu},
+		LineageService:     &services.ImageLineageService{RuntimeMu: runtimeMu},
+		BackupService:      &services.BackupService{RuntimeMu: runtimeMu},
+		PortForwardService: &services.PortForwardService{RuntimeMu: runtimeMu},
 	})
 
 	if runtimeController.state != runtimeStateStopped {
@@ -40,17 +41,18 @@ func TestAppRuntimeNilProviderClearsServicesAndReturnsStopped(t *testing.T) {
 		ContextName: "old-context",
 	}
 	runtimeController := newAppRuntime(appRuntimeConfig{
-		RootCtx:         context.Background(),
-		ServiceMu:       runtimeMu,
-		DockerService:   &services.DockerService{RuntimeMu: runtimeMu},
-		ProjectService:  projectService,
-		ComposeService:  &services.ComposeService{RuntimeMu: runtimeMu},
-		MetricsService:  &services.MetricsService{RuntimeMu: runtimeMu},
-		LogsService:     &services.LogsService{RuntimeMu: runtimeMu},
-		TerminalService: &services.TerminalService{RuntimeMu: runtimeMu},
-		UpdateService:   &services.UpdateService{RuntimeMu: runtimeMu},
-		LineageService:  &services.ImageLineageService{RuntimeMu: runtimeMu},
-		BackupService:   &services.BackupService{RuntimeMu: runtimeMu},
+		RootCtx:            context.Background(),
+		ServiceMu:          runtimeMu,
+		DockerService:      &services.DockerService{RuntimeMu: runtimeMu},
+		ProjectService:     projectService,
+		ComposeService:     &services.ComposeService{RuntimeMu: runtimeMu},
+		MetricsService:     &services.MetricsService{RuntimeMu: runtimeMu},
+		LogsService:        &services.LogsService{RuntimeMu: runtimeMu},
+		TerminalService:    &services.TerminalService{RuntimeMu: runtimeMu},
+		UpdateService:      &services.UpdateService{RuntimeMu: runtimeMu},
+		LineageService:     &services.ImageLineageService{RuntimeMu: runtimeMu},
+		BackupService:      &services.BackupService{RuntimeMu: runtimeMu},
+		PortForwardService: &services.PortForwardService{RuntimeMu: runtimeMu},
 	})
 
 	summary, err := runtimeController.RebindProvider(context.Background(), nil)

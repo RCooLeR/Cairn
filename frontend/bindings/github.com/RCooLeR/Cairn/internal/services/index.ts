@@ -8,6 +8,7 @@ import * as DockerService from "./dockerservice.js";
 import * as ImageLineageService from "./imagelineageservice.js";
 import * as LogsService from "./logsservice.js";
 import * as MetricsService from "./metricsservice.js";
+import * as PortForwardService from "./portforwardservice.js";
 import * as ProjectService from "./projectservice.js";
 import * as ProviderService from "./providerservice.js";
 import * as RegistryService from "./registryservice.js";
@@ -22,6 +23,7 @@ export {
     ImageLineageService,
     LogsService,
     MetricsService,
+    PortForwardService,
     ProjectService,
     ProviderService,
     RegistryService,

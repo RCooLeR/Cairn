@@ -34,15 +34,16 @@ type appRuntime struct {
 	projects        *store.ProjectRepository
 	serviceMu       *sync.RWMutex
 
-	dockerService   *services.DockerService
-	projectService  *services.ProjectService
-	composeService  *services.ComposeService
-	metricsService  *services.MetricsService
-	logsService     *services.LogsService
-	terminalService *services.TerminalService
-	updateService   *services.UpdateService
-	lineageService  *services.ImageLineageService
-	backupService   *services.BackupService
+	dockerService      *services.DockerService
+	projectService     *services.ProjectService
+	composeService     *services.ComposeService
+	metricsService     *services.MetricsService
+	logsService        *services.LogsService
+	terminalService    *services.TerminalService
+	updateService      *services.UpdateService
+	lineageService     *services.ImageLineageService
+	backupService      *services.BackupService
+	portForwardService *services.PortForwardService
 
 	opMu        sync.Mutex
 	mu          sync.Mutex
@@ -77,15 +78,16 @@ type appRuntimeConfig struct {
 	Events          bus.Bus
 	ServiceMu       *sync.RWMutex
 
-	DockerService   *services.DockerService
-	ProjectService  *services.ProjectService
-	ComposeService  *services.ComposeService
-	MetricsService  *services.MetricsService
-	LogsService     *services.LogsService
-	TerminalService *services.TerminalService
-	UpdateService   *services.UpdateService
-	LineageService  *services.ImageLineageService
-	BackupService   *services.BackupService
+	DockerService      *services.DockerService
+	ProjectService     *services.ProjectService
+	ComposeService     *services.ComposeService
+	MetricsService     *services.MetricsService
+	LogsService        *services.LogsService
+	TerminalService    *services.TerminalService
+	UpdateService      *services.UpdateService
+	LineageService     *services.ImageLineageService
+	BackupService      *services.BackupService
+	PortForwardService *services.PortForwardService
 }
 
 type runtimeHandles struct {
@@ -102,24 +104,25 @@ type runtimeHandles struct {
 
 func newAppRuntime(cfg appRuntimeConfig) *appRuntime {
 	return &appRuntime{
-		rootCtx:         cfg.RootCtx,
-		db:              cfg.DB,
-		events:          cfg.Events,
-		providerManager: cfg.ProviderManager,
-		registryManager: cfg.RegistryManager,
-		audit:           cfg.Audit,
-		projects:        cfg.Projects,
-		serviceMu:       cfg.ServiceMu,
-		dockerService:   cfg.DockerService,
-		projectService:  cfg.ProjectService,
-		composeService:  cfg.ComposeService,
-		metricsService:  cfg.MetricsService,
-		logsService:     cfg.LogsService,
-		terminalService: cfg.TerminalService,
-		updateService:   cfg.UpdateService,
-		lineageService:  cfg.LineageService,
-		backupService:   cfg.BackupService,
-		state:           runtimeStateStopped,
+		rootCtx:            cfg.RootCtx,
+		db:                 cfg.DB,
+		events:             cfg.Events,
+		providerManager:    cfg.ProviderManager,
+		registryManager:    cfg.RegistryManager,
+		audit:              cfg.Audit,
+		projects:           cfg.Projects,
+		serviceMu:          cfg.ServiceMu,
+		dockerService:      cfg.DockerService,
+		projectService:     cfg.ProjectService,
+		composeService:     cfg.ComposeService,
+		metricsService:     cfg.MetricsService,
+		logsService:        cfg.LogsService,
+		terminalService:    cfg.TerminalService,
+		updateService:      cfg.UpdateService,
+		lineageService:     cfg.LineageService,
+		backupService:      cfg.BackupService,
+		portForwardService: cfg.PortForwardService,
+		state:              runtimeStateStopped,
 	}
 }
 
@@ -229,6 +232,7 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 	r.updateService.Manager = updateManager
 	r.lineageService.Manager = lineageManager
 	r.backupService.Manager = backupManager
+	r.portForwardService.Manager = portForwardManager
 	r.mu.Unlock()
 	if r.serviceMu != nil {
 		r.serviceMu.Unlock()
@@ -359,4 +363,5 @@ func (r *appRuntime) clearServicesLocked() {
 	r.updateService.Manager = nil
 	r.lineageService.Manager = nil
 	r.backupService.Manager = nil
+	r.portForwardService.Manager = nil
 }

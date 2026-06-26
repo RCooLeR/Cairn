@@ -14,6 +14,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/logsvc"
 	"github.com/RCooLeR/Cairn/internal/metrics"
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/portforward"
 	registrycore "github.com/RCooLeR/Cairn/internal/registry"
 	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/store"
@@ -144,6 +145,10 @@ type BackupService struct {
 	Manager   *backups.Manager
 	RuntimeMu *sync.RWMutex
 }
+type PortForwardService struct {
+	Manager   *portforward.Manager
+	RuntimeMu *sync.RWMutex
+}
 type RegistryService struct {
 	Manager *registrycore.Manager
 }
@@ -181,6 +186,7 @@ func (s *TerminalService) lockRuntime() func()     { return lockRuntime(s.Runtim
 func (s *UpdateService) lockRuntime() func()       { return lockRuntime(s.RuntimeMu) }
 func (s *ImageLineageService) lockRuntime() func() { return lockRuntime(s.RuntimeMu) }
 func (s *BackupService) lockRuntime() func()       { return lockRuntime(s.RuntimeMu) }
+func (s *PortForwardService) lockRuntime() func()  { return lockRuntime(s.RuntimeMu) }
 
 func (s *DockerService) Ping(ctx context.Context) error {
 	unlock := s.lockRuntime()

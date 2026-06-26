@@ -212,6 +212,15 @@ type PortForward struct {
 	Reason        string `json:"reason,omitempty"`
 }
 
+// PortForwardStatus is the UI-facing snapshot of host port forwarding. Supported
+// is false on backends that bind host ports natively (Linux/Colima), where no
+// forwarding is needed.
+type PortForwardStatus struct {
+	Supported bool          `json:"supported"`
+	Enabled   bool          `json:"enabled"`
+	Forwards  []PortForward `json:"forwards"`
+}
+
 type PortMapping struct {
 	HostIP        string `json:"hostIP,omitempty"`
 	HostPort      string `json:"hostPort,omitempty"`

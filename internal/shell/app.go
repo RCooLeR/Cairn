@@ -84,6 +84,7 @@ func Run(assets fs.FS) error {
 	updateService := &services.UpdateService{RuntimeMu: runtimeMu}
 	lineageService := &services.ImageLineageService{RuntimeMu: runtimeMu}
 	backupService := &services.BackupService{RuntimeMu: runtimeMu}
+	portForwardService := &services.PortForwardService{RuntimeMu: runtimeMu}
 	registryService := &services.RegistryService{Manager: registryManager}
 	agentService := &services.AgentService{
 		Settings: db.Settings(),
@@ -95,23 +96,24 @@ func Run(assets fs.FS) error {
 		Plans:    agentFilePlans,
 	}
 	runtimeController := newAppRuntime(appRuntimeConfig{
-		RootCtx:         ctx,
-		DB:              db,
-		ProviderManager: providerManager,
-		RegistryManager: registryManager,
-		Audit:           auditRepo,
-		Projects:        projectRepo,
-		Events:          eventBus,
-		ServiceMu:       runtimeMu,
-		DockerService:   dockerService,
-		ProjectService:  projectService,
-		ComposeService:  composeService,
-		MetricsService:  metricsService,
-		LogsService:     logsService,
-		TerminalService: terminalService,
-		UpdateService:   updateService,
-		LineageService:  lineageService,
-		BackupService:   backupService,
+		RootCtx:            ctx,
+		DB:                 db,
+		ProviderManager:    providerManager,
+		RegistryManager:    registryManager,
+		Audit:              auditRepo,
+		Projects:           projectRepo,
+		Events:             eventBus,
+		ServiceMu:          runtimeMu,
+		DockerService:      dockerService,
+		ProjectService:     projectService,
+		ComposeService:     composeService,
+		MetricsService:     metricsService,
+		LogsService:        logsService,
+		TerminalService:    terminalService,
+		UpdateService:      updateService,
+		LineageService:     lineageService,
+		BackupService:      backupService,
+		PortForwardService: portForwardService,
 	})
 	providerService.Runtime = runtimeController
 	if len(providerSet) > 0 {
@@ -146,6 +148,7 @@ func Run(assets fs.FS) error {
 			application.NewService(updateService),
 			application.NewService(lineageService),
 			application.NewService(backupService),
+			application.NewService(portForwardService),
 			application.NewService(registryService),
 			application.NewService(agentService),
 			application.NewService(&services.SettingsService{
@@ -220,6 +223,7 @@ func Run(assets fs.FS) error {
 		bus.TopicJobProgress,
 		bus.TopicJobDone,
 		bus.TopicNotification,
+		bus.TopicPortForwardChanged,
 	})
 
 	return app.Run()

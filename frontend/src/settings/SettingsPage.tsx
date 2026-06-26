@@ -40,6 +40,7 @@ import {
   DockerContextsTable,
   RegistryAccountsTable,
 } from "../components/settings/SettingsTables";
+import { PortForwardingPanel } from "../components/settings/PortForwardingPanel";
 import {
   settingBool,
   settingInt,
@@ -1320,6 +1321,12 @@ export function SettingsPage({
               </section>
             </CardBody>
           </Card>
+        ) : null}
+
+        {section === "providers" ? (
+          <div className="mt-4">
+            <PortForwardingPanel />
+          </div>
         ) : null}
 
         {section === "contexts" ? (

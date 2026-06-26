@@ -6144,35 +6144,35 @@ function GlobalStateBanner({
                 action: null,
               }
             : warning
-          ? {
-              tone: "info" as const,
-              icon: <AlertTriangle size={17} />,
-              title: warning.message,
-              body: "Provider warning",
-              action: {
-                label:
-                  warning.code === "DOCKER_PACKAGES_OUTDATED"
-                    ? "Update"
-                    : "Repair / update",
-                icon: <Wrench size={15} />,
-                onClick: onOpenProviderUpdate,
-              },
-            }
-          : appUpdateNotice
-            ? {
-                tone: "info" as const,
-                icon: <Download size={17} />,
-                title: `Cairn ${appUpdateNotice.version} is available`,
-                body:
-                  appUpdateNotice.name ??
-                  "A new desktop app release is ready to download.",
-                action: {
-                  label: "Download",
-                  icon: <Download size={15} />,
-                  onClick: onOpenAppUpdate,
-                },
-              }
-            : null;
+              ? {
+                  tone: "info" as const,
+                  icon: <AlertTriangle size={17} />,
+                  title: warning.message,
+                  body: "Provider warning",
+                  action: {
+                    label:
+                      warning.code === "DOCKER_PACKAGES_OUTDATED"
+                        ? "Update"
+                        : "Repair / update",
+                    icon: <Wrench size={15} />,
+                    onClick: onOpenProviderUpdate,
+                  },
+                }
+              : appUpdateNotice
+                ? {
+                    tone: "info" as const,
+                    icon: <Download size={17} />,
+                    title: `Cairn ${appUpdateNotice.version} is available`,
+                    body:
+                      appUpdateNotice.name ??
+                      "A new desktop app release is ready to download.",
+                    action: {
+                      label: "Download",
+                      icon: <Download size={15} />,
+                      onClick: onOpenAppUpdate,
+                    },
+                  }
+                : null;
 
   if (!state) {
     return null;

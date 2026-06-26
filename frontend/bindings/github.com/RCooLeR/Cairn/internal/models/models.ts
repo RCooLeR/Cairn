@@ -2519,6 +2519,86 @@ export class PortBinding {
     }
 }
 
+/**
+ * PortForward describes a single Windows host port that Cairn relays into the
+ * WSL backend so a published container port behaves like Docker Desktop's host
+ * networking. Status is "active" when the host listener is bound, or "error"
+ * (with Reason) when the port could not be bound (e.g. already in use).
+ */
+export class PortForward {
+    "protocol": string;
+    "hostPort": number;
+    "bindAddr": string;
+    "containerID"?: string;
+    "containerName"?: string;
+    "status": string;
+    "reason"?: string;
+
+    /** Creates a new PortForward instance. */
+    constructor($$source: Partial<PortForward> = {}) {
+        if (!("protocol" in $$source)) {
+            this["protocol"] = "";
+        }
+        if (!("hostPort" in $$source)) {
+            this["hostPort"] = 0;
+        }
+        if (!("bindAddr" in $$source)) {
+            this["bindAddr"] = "";
+        }
+        if (!("status" in $$source)) {
+            this["status"] = "";
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new PortForward instance from a string or object.
+     */
+    static createFrom($$source: any = {}): PortForward {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new PortForward($$parsedSource as Partial<PortForward>);
+    }
+}
+
+/**
+ * PortForwardStatus is the UI-facing snapshot of host port forwarding. Supported
+ * is false on backends that bind host ports natively (Linux/Colima), where no
+ * forwarding is needed.
+ */
+export class PortForwardStatus {
+    "supported": boolean;
+    "enabled": boolean;
+    "forwards": PortForward[];
+
+    /** Creates a new PortForwardStatus instance. */
+    constructor($$source: Partial<PortForwardStatus> = {}) {
+        if (!("supported" in $$source)) {
+            this["supported"] = false;
+        }
+        if (!("enabled" in $$source)) {
+            this["enabled"] = false;
+        }
+        if (!("forwards" in $$source)) {
+            this["forwards"] = [];
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new PortForwardStatus instance from a string or object.
+     */
+    static createFrom($$source: any = {}): PortForwardStatus {
+        const $$createField2_0 = $$createType45;
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        if ("forwards" in $$parsedSource) {
+            $$parsedSource["forwards"] = $$createField2_0($$parsedSource["forwards"]);
+        }
+        return new PortForwardStatus($$parsedSource as Partial<PortForwardStatus>);
+    }
+}
+
 export class PortMapping {
     "hostIP"?: string;
     "hostPort"?: string;
@@ -2562,10 +2642,10 @@ export class ProjectDetail {
      * Creates a new ProjectDetail instance from a string or object.
      */
     static createFrom($$source: any = {}): ProjectDetail {
-        const $$createField0_0 = $$createType44;
-        const $$createField1_0 = $$createType46;
+        const $$createField0_0 = $$createType46;
+        const $$createField1_0 = $$createType48;
         const $$createField2_0 = $$createType43;
-        const $$createField3_0 = $$createType47;
+        const $$createField3_0 = $$createType49;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("summary" in $$parsedSource) {
             $$parsedSource["summary"] = $$createField0_0($$parsedSource["summary"]);
@@ -2669,7 +2749,7 @@ export class ProjectSummary {
      */
     static createFrom($$source: any = {}): ProjectSummary {
         const $$createField11_0 = $$createType1;
-        const $$createField14_0 = $$createType48;
+        const $$createField14_0 = $$createType50;
         const $$createField15_0 = $$createType16;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("gpuDeviceIDs" in $$parsedSource) {
@@ -2703,9 +2783,9 @@ export class ProviderDetail {
      * Creates a new ProviderDetail instance from a string or object.
      */
     static createFrom($$source: any = {}): ProviderDetail {
-        const $$createField0_0 = $$createType49;
+        const $$createField0_0 = $$createType51;
         const $$createField1_0 = $$createType22;
-        const $$createField2_0 = $$createType51;
+        const $$createField2_0 = $$createType53;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("summary" in $$parsedSource) {
             $$parsedSource["summary"] = $$createField0_0($$parsedSource["summary"]);
@@ -2805,8 +2885,8 @@ export class ProviderStatus {
      * Creates a new ProviderStatus instance from a string or object.
      */
     static createFrom($$source: any = {}): ProviderStatus {
-        const $$createField14_0 = $$createType51;
-        const $$createField15_0 = $$createType53;
+        const $$createField14_0 = $$createType53;
+        const $$createField15_0 = $$createType55;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("problems" in $$parsedSource) {
             $$parsedSource["problems"] = $$createField14_0($$parsedSource["problems"]);
@@ -2854,7 +2934,7 @@ export class ProviderSummary {
      * Creates a new ProviderSummary instance from a string or object.
      */
     static createFrom($$source: any = {}): ProviderSummary {
-        const $$createField4_0 = $$createType54;
+        const $$createField4_0 = $$createType56;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("status" in $$parsedSource) {
             $$parsedSource["status"] = $$createField4_0($$parsedSource["status"]);
@@ -3111,7 +3191,7 @@ export class RunImageRequest {
      * Creates a new RunImageRequest instance from a string or object.
      */
     static createFrom($$source: any = {}): RunImageRequest {
-        const $$createField2_0 = $$createType56;
+        const $$createField2_0 = $$createType58;
         const $$createField3_0 = $$createType19;
         const $$createField4_0 = $$createType21;
         const $$createField7_0 = $$createType1;
@@ -3153,7 +3233,7 @@ export class Series {
      * Creates a new Series instance from a string or object.
      */
     static createFrom($$source: any = {}): Series {
-        const $$createField2_0 = $$createType58;
+        const $$createField2_0 = $$createType60;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("points" in $$parsedSource) {
             $$parsedSource["points"] = $$createField2_0($$parsedSource["points"]);
@@ -3178,7 +3258,7 @@ export class SeriesBundle {
      * Creates a new SeriesBundle instance from a string or object.
      */
     static createFrom($$source: any = {}): SeriesBundle {
-        const $$createField0_0 = $$createType60;
+        const $$createField0_0 = $$createType62;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("series" in $$parsedSource) {
             $$parsedSource["series"] = $$createField0_0($$parsedSource["series"]);
@@ -3362,8 +3442,8 @@ export class UpdateFilter {
      * Creates a new UpdateFilter instance from a string or object.
      */
     static createFrom($$source: any = {}): UpdateFilter {
-        const $$createField1_0 = $$createType61;
-        const $$createField2_0 = $$createType62;
+        const $$createField1_0 = $$createType63;
+        const $$createField2_0 = $$createType64;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("status" in $$parsedSource) {
             $$parsedSource["status"] = $$createField1_0($$parsedSource["status"]);
@@ -3475,7 +3555,7 @@ export class UpdatePlan {
      * Creates a new UpdatePlan instance from a string or object.
      */
     static createFrom($$source: any = {}): UpdatePlan {
-        const $$createField2_0 = $$createType64;
+        const $$createField2_0 = $$createType66;
         const $$createField3_0 = $$createType12;
         const $$createField4_0 = $$createType1;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
@@ -3599,7 +3679,7 @@ export class VolumeDetail {
      * Creates a new VolumeDetail instance from a string or object.
      */
     static createFrom($$source: any = {}): VolumeDetail {
-        const $$createField0_0 = $$createType65;
+        const $$createField0_0 = $$createType67;
         const $$createField1_0 = $$createType22;
         const $$createField2_0 = $$createType43;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
@@ -3763,25 +3843,27 @@ const $$createType40 = NetworkSummary.createFrom;
 const $$createType41 = NetworkIPAMConfig.createFrom;
 const $$createType42 = $Create.Array($$createType41);
 const $$createType43 = $Create.Array($$createType17);
-const $$createType44 = ProjectSummary.createFrom;
-const $$createType45 = ComposeServiceStatus.createFrom;
-const $$createType46 = $Create.Array($$createType45);
-const $$createType47 = $Create.Nullable($$createType37);
-const $$createType48 = UpdateBadges.createFrom;
-const $$createType49 = ProviderSummary.createFrom;
-const $$createType50 = ProviderProblem.createFrom;
-const $$createType51 = $Create.Array($$createType50);
-const $$createType52 = ProviderWarning.createFrom;
+const $$createType44 = PortForward.createFrom;
+const $$createType45 = $Create.Array($$createType44);
+const $$createType46 = ProjectSummary.createFrom;
+const $$createType47 = ComposeServiceStatus.createFrom;
+const $$createType48 = $Create.Array($$createType47);
+const $$createType49 = $Create.Nullable($$createType37);
+const $$createType50 = UpdateBadges.createFrom;
+const $$createType51 = ProviderSummary.createFrom;
+const $$createType52 = ProviderProblem.createFrom;
 const $$createType53 = $Create.Array($$createType52);
-const $$createType54 = ProviderStatus.createFrom;
-const $$createType55 = PortMapping.createFrom;
-const $$createType56 = $Create.Array($$createType55);
-const $$createType57 = Point.createFrom;
+const $$createType54 = ProviderWarning.createFrom;
+const $$createType55 = $Create.Array($$createType54);
+const $$createType56 = ProviderStatus.createFrom;
+const $$createType57 = PortMapping.createFrom;
 const $$createType58 = $Create.Array($$createType57);
-const $$createType59 = Series.createFrom;
+const $$createType59 = Point.createFrom;
 const $$createType60 = $Create.Array($$createType59);
-const $$createType61 = $Create.Array($Create.Any);
-const $$createType62 = $Create.Array($Create.Any);
-const $$createType63 = UpdatePlanItem.createFrom;
-const $$createType64 = $Create.Array($$createType63);
-const $$createType65 = VolumeSummary.createFrom;
+const $$createType61 = Series.createFrom;
+const $$createType62 = $Create.Array($$createType61);
+const $$createType63 = $Create.Array($Create.Any);
+const $$createType64 = $Create.Array($Create.Any);
+const $$createType65 = UpdatePlanItem.createFrom;
+const $$createType66 = $Create.Array($$createType65);
+const $$createType67 = VolumeSummary.createFrom;

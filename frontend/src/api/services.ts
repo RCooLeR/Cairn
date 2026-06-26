@@ -6,6 +6,7 @@ export {
   ImageLineageService,
   LogsService,
   MetricsService,
+  PortForwardService,
   ProjectService,
   ProviderService,
   RegistryService,

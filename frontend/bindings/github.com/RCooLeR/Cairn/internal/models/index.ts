@@ -76,6 +76,8 @@ export {
     PlannedCommand,
     Point,
     PortBinding,
+    PortForward,
+    PortForwardStatus,
     PortMapping,
     ProjectDetail,
     ProjectStatus,

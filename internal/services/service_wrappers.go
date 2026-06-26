@@ -51,6 +51,29 @@ func (s *MetricsService) StopStream(_ context.Context, streamID string) error {
 	return s.Manager.StopStream(streamID)
 }
 
+func (s *PortForwardService) GetStatus(_ context.Context) (*models.PortForwardStatus, error) {
+	unlock := s.lockRuntime()
+	defer unlock()
+	if s.Manager == nil {
+		return &models.PortForwardStatus{Forwards: []models.PortForward{}}, nil
+	}
+	return &models.PortForwardStatus{
+		Supported: true,
+		Enabled:   s.Manager.Enabled(),
+		Forwards:  s.Manager.ListForwards(),
+	}, nil
+}
+
+func (s *PortForwardService) SetEnabled(_ context.Context, enabled bool) error {
+	unlock := s.lockRuntime()
+	defer unlock()
+	if s.Manager == nil {
+		return notReady()
+	}
+	s.Manager.SetEnabled(enabled)
+	return nil
+}
+
 func (s *LogsService) StartLogStream(ctx context.Context, req models.LogStreamRequest) (string, error) {
 	unlock := s.lockRuntime()
 	defer unlock()
