@@ -192,7 +192,7 @@ jobs:
           cache-dependency-path: frontend/package-lock.json
 
       - name: Cache Wails CLI
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/go/bin/wails3
@@ -231,7 +231,7 @@ jobs:
 
       - name: Cache Playwright browsers
         if: runner.os == 'Linux'
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/.cache/ms-playwright
           key: ${{ runner.os }}-playwright-${{ hashFiles('frontend/package-lock.json') }}
