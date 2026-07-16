@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { getAppVersion } from "../api/app";
 
@@ -25,6 +25,8 @@ const FINISH_MS = 700; // CAP → 100% once ready
 const HOLD_MS = 440; // dwell at 100% before fading
 const FADE_MS = 620; // must match the .leaving transition in cairn-loader.css
 const MAX_WAIT_MS = 12000; // give up waiting for the backend and dismiss anyway
+const PROGRESS_TICK_MS = 50;
+const REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
 
 const LOG_LINES = [
   "[10:24:31] Boot sequence initiated",
@@ -102,26 +104,71 @@ type Particle = {
 };
 type Ring = { radius: number; speed: number; offset: number };
 
+function prefersReducedMotion() {
+  return (
+    typeof window.matchMedia === "function" &&
+    window.matchMedia(REDUCED_MOTION_QUERY).matches
+  );
+}
+
+function usePrefersReducedMotion() {
+  const [reducedMotion, setReducedMotion] = useState(prefersReducedMotion);
+
+  useEffect(() => {
+    if (typeof window.matchMedia !== "function") {
+      return undefined;
+    }
+    const mediaQuery = window.matchMedia(REDUCED_MOTION_QUERY);
+    const onChange = (event: MediaQueryListEvent) => {
+      setReducedMotion(event.matches);
+    };
+    mediaQuery.addEventListener("change", onChange);
+    return () => mediaQuery.removeEventListener("change", onChange);
+  }, []);
+
+  return reducedMotion;
+}
+
 export default function CairnLoader({ onDone }: { onDone: () => void }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const reducedMotion = usePrefersReducedMotion();
   const [prog, setProg] = useState(0.01);
   const [leaving, setLeaving] = useState(false);
   const leavingRef = useRef(false);
   const doneRef = useRef(false);
   const readyRef = useRef(false); // backend responded (or we gave up waiting)
+  const finishFallbackTimerRef = useRef<number | null>(null);
+  const onDoneRef = useRef(onDone);
 
-  const finish = () => {
+  useEffect(() => {
+    onDoneRef.current = onDone;
+  }, [onDone]);
+
+  const finish = useCallback(() => {
     if (doneRef.current) return;
     doneRef.current = true;
-    onDone();
-  };
+    if (finishFallbackTimerRef.current !== null) {
+      window.clearTimeout(finishFallbackTimerRef.current);
+      finishFallbackTimerRef.current = null;
+    }
+    onDoneRef.current();
+  }, []);
 
-  const beginLeave = () => {
+  const beginLeave = useCallback(() => {
     if (leavingRef.current) return;
     leavingRef.current = true;
     setLeaving(true);
-    window.setTimeout(finish, FADE_MS + 160); // fallback if transitionend doesn't fire
-  };
+    finishFallbackTimerRef.current = window.setTimeout(finish, FADE_MS + 160); // fallback if transitionend doesn't fire
+  }, [finish]);
+
+  useEffect(
+    () => () => {
+      if (finishFallbackTimerRef.current !== null) {
+        window.clearTimeout(finishFallbackTimerRef.current);
+      }
+    },
+    [],
+  );
 
   // ---- readiness: hold the bar at CAP until Cairn's Go backend answers ----
   useEffect(() => {
@@ -149,6 +196,57 @@ export default function CairnLoader({ onDone }: { onDone: () => void }) {
     };
   }, []);
 
+  // Progress and readiness must continue even when reduced motion disables the
+  // canvas RAF loop. A modest timer keeps this state machine independent from
+  // decorative animation and avoids React updates on every painted frame.
+  useEffect(() => {
+    const start = performance.now();
+    let completed = false;
+    let finishStart = 0;
+    let finishFrom = 0;
+    let holdTimer: number | null = null;
+    let progressTimer: number | null = null;
+
+    const updateProgress = () => {
+      if (leavingRef.current) {
+        if (progressTimer !== null) {
+          window.clearInterval(progressTimer);
+          progressTimer = null;
+        }
+        return;
+      }
+
+      const now = performance.now();
+      let progress: number;
+      if (finishStart === 0) {
+        progress = Math.min(CAP, easeOutCubic((now - start) / RAMP_MS));
+        if (readyRef.current && now - start >= MIN_MS) {
+          finishStart = now;
+          finishFrom = progress;
+        }
+      } else {
+        const t = Math.min(1, (now - finishStart) / FINISH_MS);
+        progress = finishFrom + (1 - finishFrom) * easeOutCubic(t);
+        if (t >= 1 && !completed) {
+          completed = true;
+          holdTimer = window.setTimeout(beginLeave, HOLD_MS);
+        }
+      }
+      setProg(progress);
+    };
+
+    updateProgress();
+    progressTimer = window.setInterval(updateProgress, PROGRESS_TICK_MS);
+    return () => {
+      if (progressTimer !== null) {
+        window.clearInterval(progressTimer);
+      }
+      if (holdTimer !== null) {
+        window.clearTimeout(holdTimer);
+      }
+    };
+  }, [beginLeave]);
+
   // ---- canvas FX (rings + particles + links + scan beam), ported from app.js
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -170,10 +268,6 @@ export default function CairnLoader({ onDone }: { onDone: () => void }) {
     let particles: Particle[] = [];
     let rings: Ring[] = [];
     let raf = 0;
-    const start = performance.now();
-    let completed = false;
-    let finishStart = 0; // timestamp when CAP → 100% began
-    let finishFrom = 0; // progress at the moment the finish began
 
     const buildFx = () => {
       const count = Math.min(110, Math.floor((w * h) / 19000));
@@ -206,25 +300,7 @@ export default function CairnLoader({ onDone }: { onDone: () => void }) {
       buildFx();
     };
 
-    const draw = (now: number) => {
-      // Ramp to CAP, hold there until the backend is ready, then ease to 100%.
-      let progress: number;
-      if (finishStart === 0) {
-        progress = Math.min(CAP, easeOutCubic((now - start) / RAMP_MS));
-        if (readyRef.current && now - start >= MIN_MS) {
-          finishStart = now;
-          finishFrom = progress;
-        }
-      } else {
-        const t = Math.min(1, (now - finishStart) / FINISH_MS);
-        progress = finishFrom + (1 - finishFrom) * easeOutCubic(t);
-        if (t >= 1 && !completed) {
-          completed = true;
-          window.setTimeout(beginLeave, HOLD_MS);
-        }
-      }
-      setProg(progress);
-
+    const drawFrame = (now: number, animate: boolean) => {
       ctx.clearRect(0, 0, w, h);
       ctx.save();
       ctx.globalCompositeOperation = "screen";
@@ -264,12 +340,14 @@ export default function CairnLoader({ onDone }: { onDone: () => void }) {
       ctx.stroke();
 
       for (const p of particles) {
-        p.x += p.vx;
-        p.y += p.vy;
-        if (p.x < -20) p.x = w + 20;
-        if (p.x > w + 20) p.x = -20;
-        if (p.y < -20) p.y = h + 20;
-        if (p.y > h + 20) p.y = -20;
+        if (animate) {
+          p.x += p.vx;
+          p.y += p.vy;
+          if (p.x < -20) p.x = w + 20;
+          if (p.x > w + 20) p.x = -20;
+          if (p.y < -20) p.y = h + 20;
+          if (p.y > h + 20) p.y = -20;
+        }
         const a = 0.12 + (Math.sin(now * 0.001 + p.phase) + 1) * 0.13;
         ctx.fillStyle = rgba(p.color, a);
         ctx.beginPath();
@@ -297,19 +375,32 @@ export default function CairnLoader({ onDone }: { onDone: () => void }) {
         }
       }
       ctx.restore();
-
-      if (!leavingRef.current) raf = requestAnimationFrame(draw);
     };
 
-    resize();
-    window.addEventListener("resize", resize);
-    raf = requestAnimationFrame(draw);
+    const animate = (now: number) => {
+      drawFrame(now, true);
+      if (!leavingRef.current) raf = requestAnimationFrame(animate);
+    };
+
+    const resizeCanvas = () => {
+      resize();
+      if (reducedMotion) {
+        drawFrame(0, false);
+      }
+    };
+
+    resizeCanvas();
+    window.addEventListener("resize", resizeCanvas);
+    if (!reducedMotion && !leavingRef.current) {
+      raf = requestAnimationFrame(animate);
+    }
     return () => {
-      cancelAnimationFrame(raf);
-      window.removeEventListener("resize", resize);
+      if (raf !== 0) {
+        cancelAnimationFrame(raf);
+      }
+      window.removeEventListener("resize", resizeCanvas);
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [reducedMotion]);
 
   // ---- HUD values from progress ----
   const pct = Math.max(1, Math.round(prog * 100));
