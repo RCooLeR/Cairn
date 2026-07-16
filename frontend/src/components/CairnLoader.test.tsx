@@ -1,11 +1,21 @@
+import { useEffect } from "react";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { getAppVersion } from "../api/app";
+import type { VersionInfo } from "../../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
+import {
+  APP_VERSION_BOOTSTRAP_TIMEOUT_MS,
+  resetAppVersionBootstrapForTest,
+  useAppStore,
+} from "../state/appStore";
 import CairnLoader from "./CairnLoader";
 
-vi.mock("../api/app", () => ({
+const appApiMock = vi.hoisted(() => ({
   getAppVersion: vi.fn(),
+}));
+
+vi.mock("../api/app", () => ({
+  getAppVersion: appApiMock.getAppVersion,
 }));
 
 type MotionPreferenceController = {
@@ -22,10 +32,8 @@ let requestAnimationFrameMock: ReturnType<typeof vi.fn>;
 describe("CairnLoader", () => {
   beforeEach(() => {
     vi.useFakeTimers();
-    vi.mocked(getAppVersion).mockResolvedValue({
-      version: "test-version",
-      goVersion: "test-go",
-    });
+    appApiMock.getAppVersion.mockReset();
+    resetAppVersionBootstrapForTest();
     motionPreference = createMotionPreferenceController();
     vi.stubGlobal(
       "matchMedia",
@@ -50,7 +58,7 @@ describe("CairnLoader", () => {
 
   it("exposes progress without swallowing the keyboard-accessible skip control", () => {
     const onDone = vi.fn();
-    render(<CairnLoader onDone={onDone} />);
+    const view = render(<CairnLoader onDone={onDone} />);
 
     const progress = screen.getByRole("progressbar", {
       name: "Initializing Cairn",
@@ -69,10 +77,17 @@ describe("CairnLoader", () => {
 
     act(() => vi.advanceTimersByTime(780));
     expect(onDone).toHaveBeenCalledTimes(1);
+
+    view.unmount();
+    markVersionReady();
+    act(() => vi.advanceTimersByTime(20_000));
+    expect(onDone).toHaveBeenCalledTimes(1);
+    expect(appApiMock.getAppVersion).not.toHaveBeenCalled();
   });
 
   it("renders one static canvas frame without RAF and still completes in reduced motion", async () => {
     motionPreference.setMatches(true);
+    markVersionReady();
     const onDone = vi.fn();
 
     render(<CairnLoader onDone={onDone} />);
@@ -88,6 +103,7 @@ describe("CairnLoader", () => {
       screen.getByRole("progressbar", { name: "Initializing Cairn" }),
     ).toHaveAttribute("aria-valuenow", "100");
     expect(onDone).toHaveBeenCalledTimes(1);
+    expect(appApiMock.getAppVersion).not.toHaveBeenCalled();
     expect(requestAnimationFrameMock).not.toHaveBeenCalled();
   });
 
@@ -128,8 +144,6 @@ describe("CairnLoader", () => {
   });
 
   it("uses neutral presentation copy while backend readiness is unknown", async () => {
-    vi.mocked(getAppVersion).mockReturnValue(new Promise(() => undefined));
-
     render(<CairnLoader onDone={vi.fn()} />);
     await act(async () => {
       await vi.advanceTimersByTimeAsync(3_000);
@@ -143,7 +157,122 @@ describe("CairnLoader", () => {
     expect(screen.getByText("Runtime Integration")).toBeVisible();
     expect(screen.getByText("Assistant Interface")).toBeVisible();
   });
+
+  it("waits for the shared version result without owning another request", async () => {
+    const onDone = vi.fn();
+    render(<CairnLoader onDone={onDone} />);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_000);
+    });
+
+    expect(
+      screen.getByRole("progressbar", { name: "Initializing Cairn" }),
+    ).toHaveAttribute("aria-valuenow", "90");
+    expect(onDone).not.toHaveBeenCalled();
+
+    markVersionReady();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_500);
+    });
+
+    expect(onDone).toHaveBeenCalledTimes(1);
+    expect(appApiMock.getAppVersion).not.toHaveBeenCalled();
+  });
+
+  it("cleans up while shared readiness is still delayed", () => {
+    const onDone = vi.fn();
+    const view = render(<CairnLoader onDone={onDone} />);
+
+    act(() => vi.advanceTimersByTime(3_000));
+    view.unmount();
+    markVersionReady();
+    act(() => vi.advanceTimersByTime(20_000));
+
+    expect(onDone).not.toHaveBeenCalled();
+    expect(appApiMock.getAppVersion).not.toHaveBeenCalled();
+  });
+
+  it("uses its presentation timeout without starting or retrying version work", async () => {
+    const onDone = vi.fn();
+    render(<CairnLoader onDone={onDone} />);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(15_000);
+    });
+
+    expect(onDone).toHaveBeenCalledTimes(1);
+    expect(appApiMock.getAppVersion).not.toHaveBeenCalled();
+  });
+
+  it("dismisses after the shared owner times out and cancels one request", async () => {
+    const request = cancellableDeferred<VersionInfo>();
+    appApiMock.getAppVersion.mockReturnValue(request.promise);
+    const onDone = vi.fn();
+
+    render(
+      <>
+        <CairnLoader onDone={onDone} />
+        <VersionBootstrapOwner />
+      </>,
+    );
+
+    expect(appApiMock.getAppVersion).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(APP_VERSION_BOOTSTRAP_TIMEOUT_MS);
+    });
+
+    expect(request.cancel).toHaveBeenCalledTimes(1);
+    expect(useAppStore.getState()).toMatchObject({
+      versionLoading: false,
+      versionError: "App version request timed out after 10 seconds.",
+    });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_500);
+    });
+
+    expect(onDone).toHaveBeenCalledTimes(1);
+    expect(appApiMock.getAppVersion).toHaveBeenCalledTimes(1);
+  });
 });
+
+function VersionBootstrapOwner() {
+  const loadVersion = useAppStore((state) => state.loadVersion);
+
+  useEffect(() => {
+    void loadVersion();
+  }, [loadVersion]);
+
+  return null;
+}
+
+function markVersionReady() {
+  act(() => {
+    useAppStore.setState({
+      version: {
+        version: "test-version",
+        goVersion: "test-go",
+      },
+    });
+  });
+}
+
+function cancellableDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const cancel = vi.fn(() => Promise.resolve());
+  const base = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return {
+    cancel,
+    promise: Object.assign(base, { cancel }),
+    reject,
+    resolve,
+  };
+}
 
 function createMotionPreferenceController(): MotionPreferenceController {
   let matches = false;

@@ -121,9 +121,8 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { Browser, Clipboard, Dialogs, Events } from "@wailsio/runtime";
+import { Browser, Dialogs, Events } from "@wailsio/runtime";
 
-import { getAppVersion } from "./api/app";
 import { parseAppErrorText } from "./api/errors";
 import {
   BackupService,
@@ -199,6 +198,11 @@ import {
   registryStorageLabel,
 } from "./settings/registryUi";
 import { useDebouncedRuntimeEvent } from "./hooks/useDebouncedRuntimeEvent";
+import {
+  ClipboardProvider,
+  type ClipboardFeedback,
+  useClipboard,
+} from "./hooks/useClipboard";
 import { useToastQueue, type ToastInput } from "./hooks/useToastQueue";
 import {
   chartColors,
@@ -208,7 +212,6 @@ import {
 import { dateMillis, formatDate, relativeTime, toDate } from "./utils/time";
 import { riskTone, type BadgeTone } from "./utils/tones";
 import { normalizeCairnReleaseURL } from "./utils/appUpdateURL";
-import { frontendVersion } from "./version";
 import type { NavItem, PageID } from "./types/navigation";
 
 const logoUrl = "/cairn-logo.png";
@@ -1179,9 +1182,9 @@ const emptyExportLogs: ExportLogsState = {
 function App() {
   const version = useAppStore((state) => state.version);
   const versionLoading = useAppStore((state) => state.versionLoading);
-  const setVersion = useAppStore((state) => state.setVersion);
-  const setVersionError = useAppStore((state) => state.setVersionError);
-  const setVersionLoading = useAppStore((state) => state.setVersionLoading);
+  const versionError = useAppStore((state) => state.versionError);
+  const loadVersion = useAppStore((state) => state.loadVersion);
+  const retryVersion = useAppStore((state) => state.retryVersion);
   const inventoryStatus = useInventoryStore((state) => state.status);
   const inventoryConnection = useInventoryStore((state) => state.connection);
   const setInventoryConnection = useInventoryStore(
@@ -1430,6 +1433,11 @@ function App() {
   const [settingsMessage, setSettingsMessage] = useState<string | null>(null);
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const { pushToast, toasts } = useToastQueue();
+  const onClipboardFeedback = useCallback(
+    (feedback: ClipboardFeedback) => pushToast(feedback),
+    [pushToast],
+  );
+  const copyText = useClipboard(onClipboardFeedback);
   const [settingsStatus, setSettingsStatus] =
     useState<SettingsReadStatus>("loading");
   const [settingsLoadError, setSettingsLoadError] = useState<string | null>(
@@ -1826,38 +1834,8 @@ function App() {
   }, []);
 
   useEffect(() => {
-    let active = true;
-    setVersionLoading(true);
-
-    getAppVersion()
-      .then((nextVersion) => {
-        if (active) {
-          setVersion(nextVersion);
-        }
-      })
-      .catch((error: unknown) => {
-        if (active) {
-          setVersion({
-            version: frontendVersion,
-            goVersion: "Unavailable",
-          });
-          setVersionError(
-            error instanceof Error
-              ? error.message
-              : "Unable to load app version",
-          );
-        }
-      })
-      .finally(() => {
-        if (active) {
-          setVersionLoading(false);
-        }
-      });
-
-    return () => {
-      active = false;
-    };
-  }, [setVersion, setVersionError, setVersionLoading]);
+    void loadVersion();
+  }, [loadVersion]);
 
   useEffect(() => {
     settingsLifecycleMountedRef.current = true;
@@ -5811,15 +5789,15 @@ function App() {
       try {
         await Browser.OpenURL(hostPathFileURL(workdir));
       } catch {
-        await Clipboard.SetText(workdir);
-        pushToast({
-          body: workdir,
-          level: "warn",
-          title: "Folder path copied",
+        await copyText(workdir, {
+          failureTitle: "Unable to open folder",
+          successBody:
+            "The folder could not be opened, so its path was copied.",
+          successTitle: "Folder path copied",
         });
       }
     },
-    [pushToast],
+    [copyText],
   );
 
   const openAppUpdate = useCallback(async () => {
@@ -6538,7 +6516,7 @@ function App() {
     }
   })();
 
-  return (
+  const appContent = (
     <main className="h-screen overflow-hidden bg-bg-app text-text-primary">
       <div
         className={[
@@ -6584,9 +6562,30 @@ function App() {
                 " ",
               )}
             >
-              <div className="truncate text-xs text-text-muted">
-                {versionLabel}
-              </div>
+              {versionError ? (
+                <button
+                  aria-label={
+                    versionLoading
+                      ? "Retrying app version"
+                      : "Retry app version"
+                  }
+                  className="truncate text-xs text-warn hover:text-text-primary disabled:cursor-wait disabled:opacity-70"
+                  disabled={versionLoading}
+                  onClick={() => {
+                    void retryVersion();
+                  }}
+                  title={versionError}
+                  type="button"
+                >
+                  {versionLoading
+                    ? "Retrying version..."
+                    : `${versionLabel} · Retry`}
+                </button>
+              ) : (
+                <div className="truncate text-xs text-text-muted">
+                  {versionLabel}
+                </div>
+              )}
             </div>
           </div>
 
@@ -7124,7 +7123,9 @@ function App() {
         }
         onClose={() => setPushImage(emptyPushImage)}
         onCopyPull={(ref) => {
-          void Clipboard.SetText(`docker pull ${ref}`);
+          void copyText(`docker pull ${ref}`, {
+            successTitle: "Pull command copied",
+          });
         }}
         onLogin={openRegistryLogin}
         onRefreshAccounts={() => {
@@ -7221,6 +7222,10 @@ function App() {
         state={importProject}
       />
     </main>
+  );
+
+  return (
+    <ClipboardProvider copyText={copyText}>{appContent}</ClipboardProvider>
   );
 }
 
@@ -9835,6 +9840,7 @@ function LogsPage({
   projects,
   projectsLoading,
 }: LogsPageProps) {
+  const copyText = useClipboard();
   const [scope, setScope] = useState<LogScope>(initialScope ?? "all");
   const [selectedProjectID, setSelectedProjectID] = useState(
     initialProjectID ?? "",
@@ -10325,14 +10331,16 @@ function LogsPage({
       onToast({
         action: (
           <Button
-            icon={<FolderOpen size={15} />}
+            icon={<Copy size={15} />}
             onClick={() => {
-              void Clipboard.SetText(result.path);
+              void copyText(result.path, {
+                successTitle: "Log path copied",
+              });
             }}
             size="sm"
             variant="secondary"
           >
-            Open folder
+            Copy path
           </Button>
         ),
         body: `${formatCount(result.lineCount)} lines saved`,
@@ -10346,7 +10354,7 @@ function LogsPage({
         error: error instanceof Error ? error.message : "Unable to export logs",
       }));
     }
-  }, [exportLogs.path, exportLogs.range, onToast, scope, streamIDs]);
+  }, [copyText, exportLogs.path, exportLogs.range, onToast, scope, streamIDs]);
 
   const streamLabel =
     lockedScope && scope === "project" && selectedProjectID
@@ -12733,6 +12741,7 @@ function ProjectCommandOutputPanel({
   output: ProjectCommandOutputState;
   onClear: () => void;
 }) {
+  const copyText = useClipboard();
   const title = projectCommandOutputTitle(output.action);
   const commandText = output.command || title;
   const transcript = [
@@ -12769,7 +12778,9 @@ function ProjectCommandOutputPanel({
             icon={<Copy size={15} />}
             onClick={() => {
               if (transcript) {
-                void Clipboard.SetText(transcript);
+                void copyText(transcript, {
+                  successTitle: "Command output copied",
+                });
               }
             }}
             size="sm"
@@ -13520,11 +13531,7 @@ function ContainerDrilldownPanel({
           />
         ) : null}
         {tab === "files" ? (
-          <ContainerFilesPanel
-            container={container}
-            key={container.id}
-            onToast={onToast}
-          />
+          <ContainerFilesPanel container={container} key={container.id} />
         ) : null}
         {tab === "terminal" ? (
           <div className="flex flex-wrap items-center justify-between gap-3 rounded-control border border-border bg-bg-inset p-3">
@@ -13663,13 +13670,8 @@ function ContainerOverviewPanel({
   );
 }
 
-function ContainerFilesPanel({
-  container,
-  onToast,
-}: {
-  container: ContainerSummary;
-  onToast: (toast: ToastInput) => void;
-}) {
+function ContainerFilesPanel({ container }: { container: ContainerSummary }) {
+  const copyText = useClipboard();
   const [pathValue, setPathValue] = useState("/");
   const [draftPath, setDraftPath] = useState("/");
   const [listingState, setListingState] = useState<{
@@ -13864,11 +13866,8 @@ function ContainerFilesPanel({
                               aria-label={`Copy path for ${entry.name}`}
                               icon={<Copy size={15} />}
                               onClick={() => {
-                                void Clipboard.SetText(entry.path);
-                                onToast({
-                                  body: entry.path,
-                                  level: "ok",
-                                  title: "Path copied",
+                                void copyText(entry.path, {
+                                  successTitle: "Path copied",
                                 });
                               }}
                               size="icon"
@@ -15707,6 +15706,7 @@ function NetworkLabelsTab({
   labels: Array<{ key: string; value: string }>;
   networkID: string;
 }) {
+  const copyText = useClipboard();
   return (
     <DataTable
       ariaLabel="Network labels"
@@ -15737,7 +15737,9 @@ function NetworkLabelsTab({
                   aria-label={`Copy ${label.key}`}
                   icon={<Copy size={15} />}
                   onClick={() => {
-                    void Clipboard.SetText(label.value);
+                    void copyText(label.value, {
+                      successTitle: "Label value copied",
+                    });
                   }}
                   size="icon"
                   variant="ghost"
@@ -15837,6 +15839,7 @@ function RowActions({
   onInspect: () => void;
   onRemove?: () => void;
 }) {
+  const copyText = useClipboard();
   return (
     <div className="flex justify-end gap-1">
       <Tooltip label={inspectLabel}>
@@ -15866,7 +15869,7 @@ function RowActions({
           aria-label={`Copy ${label}`}
           icon={<Copy size={15} />}
           onClick={() => {
-            void navigator.clipboard?.writeText(id);
+            void copyText(id, { successTitle: "ID copied" });
           }}
           size="icon"
           variant="ghost"
@@ -16935,6 +16938,7 @@ function LineageField({
   value: string;
   copyable?: boolean;
 }) {
+  const copyText = useClipboard();
   return (
     <div className="min-w-0">
       <div className="text-xs text-text-muted">{label}</div>
@@ -16950,7 +16954,7 @@ function LineageField({
             aria-label={`Copy ${label}`}
             icon={<Copy size={14} />}
             onClick={() => {
-              void Clipboard.SetText(value);
+              void copyText(value, { successTitle: `${label} copied` });
             }}
             size="icon"
             variant="ghost"
@@ -17213,6 +17217,7 @@ function UpdatePlanModal({
   onChange: (patch: Partial<UpdatePlanState>) => void;
   onClose: () => void;
 }) {
+  const copyText = useClipboard();
   const plan = state.plan;
   const targetLabel =
     state.target?.kind === "project"
@@ -17325,7 +17330,9 @@ function UpdatePlanModal({
                   icon={<Copy size={15} />}
                   onClick={() => {
                     if (commandText) {
-                      void Clipboard.SetText(commandText);
+                      void copyText(commandText, {
+                        successTitle: "Plan commands copied",
+                      });
                     }
                   }}
                   size="sm"
@@ -19098,11 +19105,12 @@ function PortList({ ports }: { ports: PortBinding[] }) {
 }
 
 function MonoCopy({ value }: { value: string }) {
+  const copyText = useClipboard();
   return (
     <button
       className="font-mono text-xs text-text-secondary hover:text-accent"
       onClick={() => {
-        void navigator.clipboard?.writeText(value);
+        void copyText(value, { successTitle: "ID copied" });
       }}
       title={value}
       type="button"

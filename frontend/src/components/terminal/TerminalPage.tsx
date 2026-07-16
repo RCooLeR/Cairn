@@ -38,6 +38,7 @@ import {
 import { Clipboard, Events } from "@wailsio/runtime";
 
 import { SettingsService, TerminalService } from "../../api/services";
+import { useClipboard } from "../../hooks/useClipboard";
 import {
   Badge,
   Button,
@@ -169,6 +170,7 @@ export function TerminalPage({
   projects,
   queuedCommand,
 }: TerminalPageProps) {
+  const copyText = useClipboard();
   const [terminalSessions, setTerminalSessions] =
     useState<TerminalSessionsState>({
       activeSessionID: null,
@@ -598,6 +600,8 @@ export function TerminalPage({
 
   const copyTerminalSelection = useCallback(
     async (session: TerminalSessionInfo | null = activeSession) => {
+      setError(null);
+      setStatus(null);
       if (!session) {
         setStatus("Open a terminal before copying");
         return;
@@ -609,15 +613,19 @@ export function TerminalPage({
         return;
       }
       try {
-        await Clipboard.SetText(selection);
-        setStatus("Terminal selection copied");
-      } catch (copyError: unknown) {
-        setError(errorMessage(copyError, "Unable to copy terminal selection"));
+        const result = await copyText(selection, { announce: false });
+        if (result.ok) {
+          setError(null);
+          setStatus("Terminal selection copied");
+        } else {
+          setStatus(null);
+          setError(result.message);
+        }
       } finally {
         terminalSurfaceRefs.current[session.id]?.focus();
       }
     },
-    [activeSession],
+    [activeSession, copyText],
   );
 
   const pasteClipboardToTerminal = useCallback(
@@ -693,14 +701,21 @@ export function TerminalPage({
     return () => window.clearTimeout(timer);
   }, [onCommandConsumed, queuedCommand, scheduleCommand]);
 
-  const copyCommand = useCallback(async (command: string) => {
-    try {
-      await Clipboard.SetText(command);
-      setStatus("Command copied");
-    } catch (copyError: unknown) {
-      setError(errorMessage(copyError, "Unable to copy terminal command"));
-    }
-  }, []);
+  const copyCommand = useCallback(
+    async (command: string) => {
+      setError(null);
+      setStatus(null);
+      const result = await copyText(command, { announce: false });
+      if (result.ok) {
+        setError(null);
+        setStatus("Command copied");
+      } else {
+        setStatus(null);
+        setError(result.message);
+      }
+    },
+    [copyText],
+  );
 
   const runCheatsheetEntry = useCallback(
     (entry: CheatsheetEntry) => {
@@ -1250,6 +1265,7 @@ export function CommandPalette<T extends string>({
   open,
   pages,
 }: CommandPaletteProps<T>) {
+  const copyText = useClipboard();
   const [query, setQuery] = useState("");
   const [commands, setCommands] = useState<CheatsheetEntry[]>([]);
 
@@ -1338,7 +1354,9 @@ export function CommandPalette<T extends string>({
                   if (entry.runnable && entry.risk === "safe") {
                     onRunSafeCommand(entry.command);
                   } else {
-                    void Clipboard.SetText(entry.command);
+                    void copyText(entry.command, {
+                      successTitle: "Command copied",
+                    });
                   }
                   onClose();
                 }}

@@ -1,4 +1,7 @@
-import type { TerminalSessionInfo } from "../../../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
+import type {
+  Risk,
+  TerminalSessionInfo,
+} from "../../../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
 
 import {
   act,
@@ -43,6 +46,7 @@ const runtimeMock = vi.hoisted(() => {
 
 const xtermMock = vi.hoisted(() => ({
   dataHandlers: [] as Array<(data: string) => void>,
+  selection: "",
 }));
 
 vi.mock("../../api/services", () => ({
@@ -64,7 +68,7 @@ vi.mock("@xterm/xterm", () => ({
     attachCustomKeyEventHandler = vi.fn();
     dispose = vi.fn();
     focus = vi.fn();
-    getSelection = vi.fn(() => "");
+    getSelection = vi.fn(() => xtermMock.selection);
     open = vi.fn();
     resize = vi.fn();
     write = vi.fn();
@@ -75,7 +79,15 @@ vi.mock("@xterm/xterm", () => ({
   },
 }));
 
+import {
+  ClipboardProvider,
+  type CopyText,
+  writeClipboardText,
+} from "../../hooks/useClipboard";
 import { TerminalPage } from "./TerminalPage";
+
+const terminalTestCopyText: CopyText = (text) =>
+  writeClipboardText(text, { SetText: runtimeMock.setClipboardText });
 
 describe("TerminalPage operation and session lifecycle", () => {
   beforeEach(() => {
@@ -83,6 +95,7 @@ describe("TerminalPage operation and session lifecycle", () => {
     vi.clearAllMocks();
     runtimeMock.listeners.clear();
     xtermMock.dataHandlers.length = 0;
+    xtermMock.selection = "";
     runtimeMock.clipboardText.mockResolvedValue("");
     runtimeMock.setClipboardText.mockResolvedValue(undefined);
     settingsServiceMock.GetCheatsheet.mockResolvedValue([]);
@@ -267,6 +280,72 @@ describe("TerminalPage operation and session lifecycle", () => {
     expect(terminalServiceMock.WriteTerminal).toHaveBeenCalledTimes(2);
   });
 
+  it("replaces terminal copy success when the next attempt fails", async () => {
+    terminalServiceMock.ListTerminalSessions.mockResolvedValue([
+      terminalSession({ id: "alpha", title: "Alpha" }),
+    ]);
+    xtermMock.selection = "selected output";
+
+    renderTerminalPage();
+    await screen.findByRole("tab", { name: "Alpha" });
+    fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+
+    await waitFor(() =>
+      expect(runtimeMock.setClipboardText).toHaveBeenCalledWith(
+        "selected output",
+      ),
+    );
+    expect(
+      await screen.findByText("Terminal selection copied"),
+    ).toBeInTheDocument();
+
+    runtimeMock.setClipboardText.mockRejectedValueOnce(new Error("denied"));
+    fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+
+    expect(
+      await screen.findByText("Cairn could not write to the system clipboard."),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("Terminal selection copied"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("replaces command copy failure when the next attempt succeeds", async () => {
+    settingsServiceMock.GetCheatsheet.mockResolvedValue([
+      {
+        category: "Safety",
+        command: "docker system prune",
+        description: "Remove unused Docker objects",
+        risk: "dangerous" as Risk,
+        runnable: false,
+      },
+    ]);
+    runtimeMock.setClipboardText.mockRejectedValueOnce(new Error("denied"));
+
+    renderTerminalPage();
+    const commandRow = (await screen.findByText("docker system prune")).closest(
+      "div.rounded-control",
+    );
+    expect(commandRow).not.toBeNull();
+    const copyCommandButton = within(commandRow as HTMLElement).getByRole(
+      "button",
+      { name: "Copy" },
+    );
+    fireEvent.click(copyCommandButton);
+
+    expect(
+      await screen.findByText("Cairn could not write to the system clipboard."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Command copied")).not.toBeInTheDocument();
+
+    fireEvent.click(copyCommandButton);
+
+    expect(await screen.findByText("Command copied")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Cairn could not write to the system clipboard."),
+    ).not.toBeInTheDocument();
+  });
+
   it("reports scheduled-command write failures without an unhandled rejection", async () => {
     terminalServiceMock.ListTerminalSessions.mockResolvedValue([
       terminalSession({ id: "alpha", title: "Alpha" }),
@@ -371,15 +450,17 @@ function terminalPage(
   patch: Partial<React.ComponentProps<typeof TerminalPage>> = {},
 ) {
   return (
-    <TerminalPage
-      containers={[]}
-      initialSession={null}
-      onCommandConsumed={vi.fn()}
-      onInitialSessionConsumed={vi.fn()}
-      projects={[]}
-      queuedCommand={null}
-      {...patch}
-    />
+    <ClipboardProvider copyText={terminalTestCopyText}>
+      <TerminalPage
+        containers={[]}
+        initialSession={null}
+        onCommandConsumed={vi.fn()}
+        onInitialSessionConsumed={vi.fn()}
+        projects={[]}
+        queuedCommand={null}
+        {...patch}
+      />
+    </ClipboardProvider>
   );
 }
 

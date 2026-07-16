@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { getAppVersion } from "../api/app";
+import { useAppStore } from "../state/appStore";
 import {
   PARTICLE_LINK_DISTANCE_SQUARED,
   visitParticleLinks,
@@ -17,10 +17,10 @@ import {
  * fades out, and calls onDone. A dedicated button lets users skip the intro.
  * ------------------------------------------------------------------------- */
 
-// The bar ramps to CAP, then holds there until Cairn's Go backend actually
-// responds (so the loader genuinely covers startup, not a blind timer); once
+// The bar ramps to CAP, then holds until the shared app-version bootstrap
+// settles (so the loader covers real startup work, not a blind timer); once
 // ready — and a minimum on-screen time — it finishes to 100% and fades. A hard
-// max-wait dismisses anyway if the backend never answers, so it can't trap the
+// max-wait dismisses anyway if that shared request hangs, so it cannot trap the
 // user (the app then shows its own provider/setup state).
 const RAMP_MS = 2600; // ease up to CAP
 const MIN_MS = 1700; // minimum on-screen time before finishing
@@ -136,11 +136,12 @@ function usePrefersReducedMotion() {
 export default function CairnLoader({ onDone }: { onDone: () => void }) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const reducedMotion = usePrefersReducedMotion();
+  const versionReady = useAppStore((state) => state.version !== null);
   const [prog, setProg] = useState(0.01);
   const [leaving, setLeaving] = useState(false);
   const leavingRef = useRef(false);
   const doneRef = useRef(false);
-  const readyRef = useRef(false); // backend responded (or we gave up waiting)
+  const readyRef = useRef(versionReady); // shared bootstrap responded (or we gave up waiting)
   const finishFallbackTimerRef = useRef<number | null>(null);
   const onDoneRef = useRef(onDone);
 
@@ -174,28 +175,21 @@ export default function CairnLoader({ onDone }: { onDone: () => void }) {
     [],
   );
 
-  // ---- readiness: hold the bar at CAP until Cairn's Go backend answers ----
+  // App owns the version bootstrap request. The loader is presentation only:
+  // it observes the shared result and never starts/retries a second Wails RPC.
   useEffect(() => {
-    let alive = true;
-    const t0 = performance.now();
-    void (async () => {
-      while (alive) {
-        try {
-          await getAppVersion(); // resolves once the backend is reachable
-          break;
-        } catch {
-          if (performance.now() - t0 > MAX_WAIT_MS) break;
-          await new Promise((r) => setTimeout(r, 350));
-        }
-      }
-      if (alive) readyRef.current = true;
-    })();
-    // Hard backstop so even a hung call can't keep the loader up forever.
+    if (versionReady) {
+      readyRef.current = true;
+    }
+  }, [versionReady]);
+
+  // ---- readiness: hold the bar at CAP until shared bootstrap completes ----
+  useEffect(() => {
+    // Hard backstop so a hung shared request cannot keep the presentation up.
     const hard = window.setTimeout(() => {
       readyRef.current = true;
     }, MAX_WAIT_MS);
     return () => {
-      alive = false;
       window.clearTimeout(hard);
     };
   }, []);

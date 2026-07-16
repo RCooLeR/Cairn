@@ -60,9 +60,10 @@ import {
   decodeBase64Bytes,
   encodeTerminalInput,
 } from "./components/terminal/terminalEncoding";
-import { useAppStore } from "./state/appStore";
+import { resetAppVersionBootstrapForTest } from "./state/appStore";
 import { useInventoryStore } from "./state/inventoryStore";
 import { resetAgentSessionForTest } from "./agent/AgentPage";
+import { allowConsoleErrorOnce } from "./test/setup";
 
 const inventoryMock = vi.hoisted(() => ({
   getInventorySnapshot: vi.fn<() => Promise<InventorySnapshot>>(),
@@ -641,11 +642,7 @@ describe("App inventory shell", () => {
     runtimeMock.openFile.mockResolvedValue("");
     runtimeMock.saveFile.mockResolvedValue("/tmp/cairn-logs.jsonl");
     runtimeMock.setClipboardText.mockResolvedValue(undefined);
-    useAppStore.setState({
-      version: null,
-      versionLoading: false,
-      versionError: null,
-    });
+    resetAppVersionBootstrapForTest();
     useInventoryStore.setState({
       status: "idle",
       connection: "connecting",
@@ -734,6 +731,30 @@ describe("App inventory shell", () => {
     const searchInput = screen.getByLabelText("Search inventory");
     fireEvent.keyDown(window, { key: "/" });
     expect(searchInput).toHaveFocus();
+  });
+
+  it("retries a failed app-version bootstrap and replaces its fallback", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    appApiMock.getAppVersion
+      .mockRejectedValueOnce(new Error("version bridge starting"))
+      .mockResolvedValueOnce({
+        version: "1.2.3",
+        goVersion: "go1.26.4",
+      });
+
+    render(<App />);
+
+    const retry = await screen.findByRole("button", {
+      name: "Retry app version",
+    });
+    expect(retry).toHaveAttribute("title", "version bridge starting");
+    fireEvent.click(retry);
+
+    expect(await screen.findByText("v1.2.3")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Retry app version" }),
+    ).not.toBeInTheDocument();
+    expect(appApiMock.getAppVersion).toHaveBeenCalledTimes(2);
   });
 
   it("renders agent markdown, plan items, and Enter chat shortcuts", async () => {
@@ -977,9 +998,13 @@ describe("App inventory shell", () => {
     const projectA = seededProject();
     const projectB = alternateProject();
     const planRequest = deferred<CommandPlan>();
+    const projectBAnalysis = deferred<AgentProjectAnalysis>();
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
     projectServiceMock.RefreshProjects.mockResolvedValue([projectA, projectB]);
     agentServiceMock.PlanFileEdit.mockReturnValueOnce(planRequest.promise);
+    agentServiceMock.AnalyzeProject.mockResolvedValueOnce(
+      projectAnalysisFor(projectA, "Project A stack"),
+    ).mockReturnValueOnce(projectBAnalysis.promise);
 
     render(<App />);
 
@@ -1020,6 +1045,11 @@ describe("App inventory shell", () => {
     expect(projectSelect).not.toBeDisabled();
 
     fireEvent.change(projectSelect, { target: { value: projectB.id } });
+    await act(async () => {
+      projectBAnalysis.resolve(projectAnalysisFor(projectB, "Project B stack"));
+      await projectBAnalysis.promise;
+    });
+    expect(await screen.findByText("Project B stack")).toBeInTheDocument();
     expect(
       screen.queryByText(/Preview ready for app-db \/ \.env:/),
     ).not.toBeInTheDocument();
@@ -2178,8 +2208,28 @@ describe("App inventory shell", () => {
         "docker system prune",
       ),
     );
+    expect(await screen.findByText("Command copied")).toBeInTheDocument();
     expect(terminalServiceMock.OpenBackendTerminal).not.toHaveBeenCalled();
     expect(terminalServiceMock.WriteTerminal).not.toHaveBeenCalled();
+  });
+
+  it("reports command palette clipboard rejection without claiming success", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    runtimeMock.setClipboardText.mockRejectedValueOnce(new Error("denied"));
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+    fireEvent.click(await screen.findByText("docker system prune"));
+
+    expect(await screen.findByText("Copy failed")).toBeInTheDocument();
+    expect(
+      screen.getByText("Cairn could not write to the system clipboard."),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Command copied")).not.toBeInTheDocument();
+    expect(terminalServiceMock.OpenBackendTerminal).not.toHaveBeenCalled();
   });
 
   it("requires typed confirmation when cleanup includes volumes", async () => {
@@ -2703,12 +2753,16 @@ describe("App inventory shell", () => {
       ),
     ).toBeInTheDocument();
 
-    fireEvent.click(screen.getAllByRole("button", { name: "Update" })[0]);
+    await act(async () => {
+      fireEvent.click(screen.getAllByRole("button", { name: "Update" })[0]);
+    });
     expect(
       await screen.findByText("$ docker compose pull app"),
     ).toBeInTheDocument();
     fireEvent.click(screen.getByLabelText(/Back up named volumes first/));
-    fireEvent.click(screen.getByRole("button", { name: "Update service" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Update service" }));
+    });
 
     await waitFor(() =>
       expect(updateServiceMock.ApplyUpdate).toHaveBeenCalledWith({
@@ -2721,11 +2775,15 @@ describe("App inventory shell", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     fireEvent.click(screen.getByRole("button", { name: "History" }));
-    fireEvent.click(await screen.findByRole("button", { name: "Rollback" }));
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "Rollback" }));
+    });
     await waitFor(() =>
       expect(updateServiceMock.PlanRollback).toHaveBeenCalledWith(301),
     );
-    fireEvent.click(screen.getByRole("button", { name: "Roll back" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Roll back" }));
+    });
     await waitFor(() =>
       expect(updateServiceMock.ApplyRollback).toHaveBeenCalledWith(
         "rollback-plan-app",
@@ -2737,7 +2795,9 @@ describe("App inventory shell", () => {
     expect(
       await screen.findByText("Waiting for maintenance window"),
     ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Unignore" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Unignore" }));
+    });
     expect(updateServiceMock.UnignoreUpdate).toHaveBeenCalledWith(201);
   });
 
@@ -2817,7 +2877,9 @@ describe("App inventory shell", () => {
       ),
     ).toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Update project" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Update project" }));
+    });
     expect(updateServiceMock.PlanProjectUpdate).toHaveBeenCalledWith(
       "linux_native/app-db",
     );
@@ -3014,9 +3076,13 @@ describe("App inventory shell", () => {
   it("handles a stop failure when a metrics stream resolves after cleanup", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
     const stopError = new Error("metrics stream already stopped");
-    const consoleError = vi
-      .spyOn(console, "error")
-      .mockImplementation(() => undefined);
+    allowConsoleErrorOnce(
+      "the late metrics stream cleanup failure",
+      (arguments_) =>
+        arguments_[0] === "Unable to stop metrics stream" &&
+        arguments_[1] === "late-stats-stream" &&
+        arguments_[2] === stopError,
+    );
     metricsServiceMock.StopStream.mockRejectedValueOnce(stopError);
     let resolveStatsStream: (streamID: string) => void = () => undefined;
     metricsServiceMock.StartStatsStream.mockImplementationOnce(
@@ -3040,14 +3106,6 @@ describe("App inventory shell", () => {
     expect(metricsServiceMock.StopStream).toHaveBeenCalledWith(
       "late-stats-stream",
     );
-    await waitFor(() =>
-      expect(consoleError).toHaveBeenCalledWith(
-        "Unable to stop metrics stream",
-        "late-stats-stream",
-        stopError,
-      ),
-    );
-    consoleError.mockRestore();
   });
 
   it("ignores a metrics start failure after its runtime became obsolete", async () => {
@@ -3082,9 +3140,13 @@ describe("App inventory shell", () => {
   it("handles a stop failure when a log stream resolves after cleanup", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
     const stopError = new Error("stream already stopped");
-    const consoleError = vi
-      .spyOn(console, "error")
-      .mockImplementation(() => undefined);
+    allowConsoleErrorOnce(
+      "the late log stream cleanup failure",
+      (arguments_) =>
+        arguments_[0] === "Unable to stop log stream" &&
+        arguments_[1] === "late-log-stream" &&
+        arguments_[2] === stopError,
+    );
     let resolveLogStream: (streamID: string) => void = () => undefined;
     logsServiceMock.StartLogStream.mockImplementationOnce(
       () =>
@@ -3118,14 +3180,6 @@ describe("App inventory shell", () => {
     });
 
     expect(logsServiceMock.StopStream).toHaveBeenCalledWith("late-log-stream");
-    await waitFor(() =>
-      expect(consoleError).toHaveBeenCalledWith(
-        "Unable to stop log stream",
-        "late-log-stream",
-        stopError,
-      ),
-    );
-    consoleError.mockRestore();
   });
 
   it("uses checkboxes for container log scope selection", async () => {
@@ -3237,10 +3291,13 @@ describe("App inventory shell", () => {
       }),
     );
     expect(await screen.findByText("Logs exported")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "Open folder" }));
-    expect(runtimeMock.setClipboardText).toHaveBeenCalledWith(
-      "/tmp/cairn-logs.jsonl",
+    fireEvent.click(screen.getByRole("button", { name: "Copy path" }));
+    await waitFor(() =>
+      expect(runtimeMock.setClipboardText).toHaveBeenCalledWith(
+        "/tmp/cairn-logs.jsonl",
+      ),
     );
+    expect(await screen.findByText("Log path copied")).toBeInTheDocument();
   });
 
   it("confirms dangerous project plans through the project apply endpoint", async () => {
