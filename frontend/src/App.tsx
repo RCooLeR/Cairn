@@ -190,8 +190,10 @@ import {
   auditMetadataString,
   type AuditFilterState,
   type AuditRangeID,
+  type SettingsReadStatus,
   type SettingsSectionID,
 } from "./settings/SettingsPage";
+import { SerializedSettingsSaver } from "./settings/serializedSettingsSaver";
 import {
   normalizeRegistryHostForUI,
   registryStorageLabel,
@@ -1404,11 +1406,30 @@ function App() {
   const [wslDistrosLoading, setWSLDistrosLoading] = useState(false);
   const [wslDistrosError, setWSLDistrosError] = useState<string | null>(null);
   const [providerAutostart, setProviderAutostart] = useState(true);
-  const [settingsSaving, setSettingsSaving] = useState(false);
+  const settingsLifecycleMountedRef = useRef(true);
+  const [settingsSavePendingCount, setSettingsSavePendingCount] = useState(0);
+  const [settingsAuxPendingCount, setSettingsAuxPendingCount] = useState(0);
+  const [settingsSaver] = useState(() => new SerializedSettingsSaver());
+  const settingsSaving =
+    settingsSavePendingCount > 0 || settingsAuxPendingCount > 0;
   const [settingsMessage, setSettingsMessage] = useState<string | null>(null);
   const [settingsError, setSettingsError] = useState<string | null>(null);
   const { pushToast, toasts } = useToastQueue();
-  const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const [settingsStatus, setSettingsStatus] =
+    useState<SettingsReadStatus>("loading");
+  const [settingsLoadError, setSettingsLoadError] = useState<string | null>(
+    null,
+  );
+  const settingsStatusRef = useRef<SettingsReadStatus>("loading");
+  const settingsLoadGenerationRef = useRef(0);
+  const settingsFeedbackIntentRef = useRef(0);
+  const appSettingsRef = useRef(appSettings);
+  appSettingsRef.current = appSettings;
+  settingsStatusRef.current = settingsStatus;
+  const settingsLoaded =
+    settingsStatus === "ready" ||
+    settingsStatus === "refreshing" ||
+    settingsStatus === "stale";
   const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([]);
   const [auditLoading, setAuditLoading] = useState(false);
   const [auditError, setAuditError] = useState<string | null>(null);
@@ -1802,58 +1823,84 @@ function App() {
   }, [setVersion, setVersionError, setVersionLoading]);
 
   useEffect(() => {
-    let active = true;
-    SettingsService.GetSettings()
-      .then((settings) => {
-        if (!active) {
-          return;
-        }
-        const nextSettings = settings ?? {};
-        setAppSettings(nextSettings);
-        setPermissionMode(
-          normalizePermissionMode(nextSettings["linux.sudo_mode"]),
-        );
-        setWSLDistro(
-          normalizeStringSetting(nextSettings["windows.wsl_distro"], "Ubuntu"),
-        );
-        setColimaProfile(
-          normalizeStringSetting(
-            nextSettings["macos.colima_profile"],
-            "default",
-          ),
-        );
-        setColimaCPU(normalizeIntSetting(nextSettings["macos.colima_cpu"], 2));
-        setColimaMemoryGB(
-          normalizeIntSetting(nextSettings["macos.colima_memory_gb"], 4),
-        );
-        setColimaDiskGB(
-          normalizeIntSetting(nextSettings["macos.colima_disk_gb"], 60),
-        );
-        setProviderAutostart(
-          normalizeBoolSetting(
-            nextSettings["provider.autostart_backend"],
-            true,
-          ),
-        );
-        setSettingsLoaded(true);
-      })
-      .catch(() => {
-        if (active) {
-          setAppSettings({});
-          setPermissionMode("ask");
-          setWSLDistro("Ubuntu");
-          setColimaProfile("default");
-          setColimaCPU(2);
-          setColimaMemoryGB(4);
-          setColimaDiskGB(60);
-          setProviderAutostart(true);
-          setSettingsLoaded(true);
-        }
-      });
+    settingsLifecycleMountedRef.current = true;
+    const unsubscribePendingCount = settingsSaver.subscribePendingCount(
+      setSettingsSavePendingCount,
+    );
     return () => {
-      active = false;
+      unsubscribePendingCount();
+      settingsLifecycleMountedRef.current = false;
+      settingsLoadGenerationRef.current += 1;
     };
+  }, [settingsSaver]);
+
+  const refreshSettings = useCallback(async () => {
+    const generation = settingsLoadGenerationRef.current + 1;
+    settingsLoadGenerationRef.current = generation;
+    const hasLastKnownGood =
+      settingsStatusRef.current === "ready" ||
+      settingsStatusRef.current === "refreshing" ||
+      settingsStatusRef.current === "stale";
+    const loadingStatus: SettingsReadStatus = hasLastKnownGood
+      ? "refreshing"
+      : "loading";
+    settingsStatusRef.current = loadingStatus;
+    setSettingsStatus(loadingStatus);
+    setSettingsLoadError(null);
+    setSettingsError(null);
+    setSettingsMessage(null);
+    try {
+      const nextSettings = (await SettingsService.GetSettings()) ?? {};
+      if (
+        !settingsLifecycleMountedRef.current ||
+        settingsLoadGenerationRef.current !== generation
+      ) {
+        return;
+      }
+      appSettingsRef.current = nextSettings;
+      setAppSettings(nextSettings);
+      setPermissionMode(
+        normalizePermissionMode(nextSettings["linux.sudo_mode"]),
+      );
+      setWSLDistro(
+        normalizeStringSetting(nextSettings["windows.wsl_distro"], "Ubuntu"),
+      );
+      setColimaProfile(
+        normalizeStringSetting(nextSettings["macos.colima_profile"], "default"),
+      );
+      setColimaCPU(normalizeIntSetting(nextSettings["macos.colima_cpu"], 2));
+      setColimaMemoryGB(
+        normalizeIntSetting(nextSettings["macos.colima_memory_gb"], 4),
+      );
+      setColimaDiskGB(
+        normalizeIntSetting(nextSettings["macos.colima_disk_gb"], 60),
+      );
+      setProviderAutostart(
+        normalizeBoolSetting(nextSettings["provider.autostart_backend"], true),
+      );
+      settingsStatusRef.current = "ready";
+      setSettingsStatus("ready");
+    } catch (error: unknown) {
+      if (
+        !settingsLifecycleMountedRef.current ||
+        settingsLoadGenerationRef.current !== generation
+      ) {
+        return;
+      }
+      const message =
+        error instanceof Error ? error.message : "Unable to load settings";
+      const failedStatus: SettingsReadStatus = hasLastKnownGood
+        ? "stale"
+        : "error";
+      settingsStatusRef.current = failedStatus;
+      setSettingsStatus(failedStatus);
+      setSettingsLoadError(message);
+    }
   }, []);
+
+  useEffect(() => {
+    void refreshSettings();
+  }, [refreshSettings]);
 
   useEffect(() => {
     const off = Events.On("provider:install:progress", (event) => {
@@ -2856,11 +2903,150 @@ function App() {
     }
   }, [activeProvider?.id, activeProvider?.name]);
 
+  const saveSetting = useCallback(
+    async (key: string, value: unknown) => {
+      if (settingsStatusRef.current !== "ready") {
+        setSettingsError(
+          "Settings must load successfully before changes can be saved.",
+        );
+        return false;
+      }
+      const feedbackIntent = settingsFeedbackIntentRef.current + 1;
+      settingsFeedbackIntentRef.current = feedbackIntent;
+      setSettingsError(null);
+      setSettingsMessage(null);
+      return settingsSaver.enqueue(key, value, async (context) => {
+        try {
+          await SettingsService.SetSetting(key, value);
+        } catch (error: unknown) {
+          const message =
+            error instanceof Error ? error.message : "Unable to save setting";
+          if (context.isLatestForKey()) {
+            await refreshSettings();
+          }
+          if (settingsFeedbackIntentRef.current === feedbackIntent) {
+            setSettingsError(message);
+            setSettingsMessage(null);
+          }
+          if (context.isLatestForKey()) {
+            pushToast({
+              body: message,
+              level: "error",
+              title: "Setting failed",
+            });
+          }
+          return false;
+        }
+
+        if (context.isLatestForKey()) {
+          const nextSettings = { ...appSettingsRef.current, [key]: value };
+          appSettingsRef.current = nextSettings;
+          setAppSettings(nextSettings);
+          if (key === "linux.sudo_mode") {
+            setPermissionMode(normalizePermissionMode(value));
+          } else if (key === "windows.wsl_distro") {
+            setWSLDistro(normalizeStringSetting(value, "Ubuntu"));
+          } else if (key === "macos.colima_profile") {
+            setColimaProfile(normalizeStringSetting(value, "default"));
+          } else if (key === "macos.colima_cpu") {
+            setColimaCPU(normalizeIntSetting(value, 2));
+          } else if (key === "macos.colima_memory_gb") {
+            setColimaMemoryGB(normalizeIntSetting(value, 4));
+          } else if (key === "macos.colima_disk_gb") {
+            setColimaDiskGB(normalizeIntSetting(value, 60));
+          } else if (key === "provider.autostart_backend") {
+            setProviderAutostart(normalizeBoolSetting(value, true));
+          }
+        }
+
+        try {
+          if (context.isLatestForKey() && key === "windows.wsl_distro") {
+            await ProviderService.SetActiveProvider(windowsWSLProviderID);
+            await refreshInventory();
+            await refreshProjects();
+            await refreshUpdateSurfaces();
+          }
+          if (
+            context.isLatestForKey() &&
+            (key === "linux.sudo_mode" || key === "linux.socket_path")
+          ) {
+            if (activeProvider?.id === linuxNativeProviderID) {
+              await ProviderService.SetActiveProvider(linuxNativeProviderID);
+            } else {
+              await ProviderService.Detect(linuxNativeProviderID).catch(
+                () => null,
+              );
+            }
+            await refreshInventory();
+            await refreshProjects();
+            await refreshUpdateSurfaces();
+          }
+          if (
+            context.isLatestForKey() &&
+            String(key).startsWith("macos.colima_")
+          ) {
+            if (activeProvider?.id === macOSColimaProviderID) {
+              await ProviderService.SetActiveProvider(macOSColimaProviderID);
+            } else {
+              await ProviderService.Detect(macOSColimaProviderID).catch(
+                () => null,
+              );
+            }
+            await refreshInventory();
+            await refreshProjects();
+            await refreshUpdateSurfaces();
+          }
+        } catch (error: unknown) {
+          const message =
+            error instanceof Error
+              ? `Setting saved, but refresh failed: ${error.message}`
+              : "Setting saved, but dependent data could not be refreshed";
+          if (settingsFeedbackIntentRef.current === feedbackIntent) {
+            setSettingsError(message);
+            setSettingsMessage(null);
+          }
+          if (context.isLatestForKey()) {
+            pushToast({
+              body: message,
+              level: "warn",
+              title: "Setting saved",
+            });
+          }
+          return true;
+        }
+
+        if (settingsFeedbackIntentRef.current === feedbackIntent) {
+          setSettingsMessage("Setting saved");
+          setSettingsError(null);
+          pushToast({
+            body: "Your preference was saved.",
+            level: "ok",
+            title: "Setting saved",
+          });
+        }
+        return true;
+      });
+    },
+    [
+      activeProvider?.id,
+      pushToast,
+      refreshInventory,
+      refreshProjects,
+      refreshSettings,
+      refreshUpdateSurfaces,
+      settingsSaver,
+    ],
+  );
+
   const savePermissionMode = useCallback(async () => {
     setRepairSaving(true);
     setRepairError(null);
     try {
-      await SettingsService.SetSetting("linux.sudo_mode", permissionMode);
+      const saved = await saveSetting("linux.sudo_mode", permissionMode);
+      if (!saved) {
+        setRepairError("Unable to save permission mode");
+        return;
+      }
       setRepairOpen(false);
       await retryProviderDetection();
     } catch (error: unknown) {
@@ -2872,76 +3058,7 @@ function App() {
     } finally {
       setRepairSaving(false);
     }
-  }, [permissionMode, retryProviderDetection]);
-
-  const saveSetting = useCallback(
-    async (key: string, value: unknown) => {
-      setSettingsSaving(true);
-      setSettingsError(null);
-      setSettingsMessage(null);
-      try {
-        await SettingsService.SetSetting(key, value);
-        setAppSettings((current) => ({ ...current, [key]: value }));
-        if (key === "linux.sudo_mode") {
-          setPermissionMode(normalizePermissionMode(value));
-        }
-        setSettingsMessage("Setting saved");
-        pushToast({
-          body: "Your preference was saved.",
-          level: "ok",
-          title: "Setting saved",
-        });
-        if (key === "windows.wsl_distro") {
-          await ProviderService.SetActiveProvider(windowsWSLProviderID);
-          await refreshInventory();
-          await refreshProjects();
-          await refreshUpdateSurfaces();
-        }
-        if (key === "linux.sudo_mode" || key === "linux.socket_path") {
-          if (activeProvider?.id === linuxNativeProviderID) {
-            await ProviderService.SetActiveProvider(linuxNativeProviderID);
-          } else {
-            await ProviderService.Detect(linuxNativeProviderID).catch(
-              () => null,
-            );
-          }
-          await refreshInventory();
-          await refreshProjects();
-          await refreshUpdateSurfaces();
-        }
-        if (String(key).startsWith("macos.colima_")) {
-          if (activeProvider?.id === macOSColimaProviderID) {
-            await ProviderService.SetActiveProvider(macOSColimaProviderID);
-          } else {
-            await ProviderService.Detect(macOSColimaProviderID).catch(
-              () => null,
-            );
-          }
-          await refreshInventory();
-          await refreshProjects();
-          await refreshUpdateSurfaces();
-        }
-      } catch (error: unknown) {
-        const message =
-          error instanceof Error ? error.message : "Unable to save setting";
-        setSettingsError(message);
-        pushToast({
-          body: message,
-          level: "error",
-          title: "Setting failed",
-        });
-      } finally {
-        setSettingsSaving(false);
-      }
-    },
-    [
-      activeProvider?.id,
-      pushToast,
-      refreshInventory,
-      refreshProjects,
-      refreshUpdateSurfaces,
-    ],
-  );
+  }, [permissionMode, retryProviderDetection, saveSetting]);
 
   const saveWSLDistro = useCallback(async () => {
     const nextDistro = wslDistro.trim() || "Ubuntu";
@@ -3128,17 +3245,21 @@ function App() {
 
   const activateDockerContext = useCallback(
     async (name: string) => {
-      setSettingsSaving(true);
+      const feedbackIntent = settingsFeedbackIntentRef.current + 1;
+      settingsFeedbackIntentRef.current = feedbackIntent;
+      setSettingsAuxPendingCount((current) => current + 1);
       setSettingsError(null);
       setSettingsMessage(null);
       try {
         await ProviderService.SetDockerContext(name);
-        setSettingsMessage(`Using Docker context ${name}`);
-        pushToast({
-          body: `Using Docker context ${name}.`,
-          level: "ok",
-          title: "Docker context saved",
-        });
+        if (settingsFeedbackIntentRef.current === feedbackIntent) {
+          setSettingsMessage(`Using Docker context ${name}`);
+          pushToast({
+            body: `Using Docker context ${name}.`,
+            level: "ok",
+            title: "Docker context saved",
+          });
+        }
         await refreshDockerContexts();
         await refreshInventory();
         await refreshProjects();
@@ -3147,14 +3268,18 @@ function App() {
           error instanceof Error
             ? error.message
             : "Unable to use Docker context";
-        setSettingsError(message);
-        pushToast({
-          body: message,
-          level: "error",
-          title: "Docker context failed",
-        });
+        if (settingsFeedbackIntentRef.current === feedbackIntent) {
+          setSettingsError(message);
+          pushToast({
+            body: message,
+            level: "error",
+            title: "Docker context failed",
+          });
+        }
       } finally {
-        setSettingsSaving(false);
+        if (settingsLifecycleMountedRef.current) {
+          setSettingsAuxPendingCount((current) => Math.max(0, current - 1));
+        }
       }
     },
     [pushToast, refreshDockerContexts, refreshInventory, refreshProjects],
@@ -3494,6 +3619,11 @@ function App() {
     const persistSetupSetting = async (key: string, value: string | number) => {
       if (!providerSetupSessionMatches(sessionID, backend)) {
         return false;
+      }
+      if (settingsStatusRef.current !== "ready") {
+        throw new Error(
+          "Settings must load successfully before provider choices can be saved.",
+        );
       }
       await SettingsService.SetSetting(key, value);
       return providerSetupSessionMatches(sessionID, backend);
@@ -5788,9 +5918,7 @@ function App() {
             onRefreshAudit={() => {
               void refreshAuditLog();
             }}
-            onSettingChange={(key, value) => {
-              void saveSetting(key, value);
-            }}
+            onSettingChange={saveSetting}
             onSaveColimaCPU={() => {
               void saveColimaNumberSetting(
                 "macos.colima_cpu",
@@ -5834,10 +5962,16 @@ function App() {
             registryAccountsLoading={registryAccountsStatus === "loading"}
             registryBusyKeys={registryBusyKeys}
             registryStatuses={registryStatuses}
-            saving={settingsSaving}
+            saving={settingsSaving || settingsStatus !== "ready"}
             section={settingsSection}
             settings={appSettings}
+            settingsLoadError={settingsLoadError}
+            settingsStatus={settingsStatus}
             onSectionChange={setSettingsSection}
+            onRetrySettings={() => {
+              settingsFeedbackIntentRef.current += 1;
+              void refreshSettings();
+            }}
             version={version}
             wslDistro={wslDistro}
             wslDistros={wslDistros}

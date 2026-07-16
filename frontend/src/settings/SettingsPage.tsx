@@ -1,4 +1,10 @@
-import { type ReactNode, useCallback, useEffect, useState } from "react";
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import {
   Bot,
   Download,
@@ -65,6 +71,13 @@ export type SettingsSectionID =
   | "advanced"
   | "help"
   | "about";
+
+export type SettingsReadStatus =
+  | "error"
+  | "loading"
+  | "ready"
+  | "refreshing"
+  | "stale";
 export type AuditRangeID = "24h" | "7d" | "30d" | "90d" | "all";
 export type AuditFilterState = {
   range: AuditRangeID;
@@ -148,7 +161,10 @@ export function SettingsPage({
   saving,
   section,
   settings,
+  settingsLoadError,
+  settingsStatus,
   onSectionChange,
+  onRetrySettings,
   version,
   wslDistro,
   wslDistros,
@@ -185,7 +201,7 @@ export function SettingsPage({
   onRegistryLogout: (registry: string) => void;
   onRegistryTest: (registry: string) => void;
   onAuditFilterChange: (patch: Partial<AuditFilterState>) => void;
-  onSettingChange: (key: string, value: unknown) => void;
+  onSettingChange: (key: string, value: unknown) => Promise<boolean>;
   onSaveColimaCPU: () => void;
   onSaveColimaDiskGB: () => void;
   onSaveColimaMemoryGB: () => void;
@@ -203,7 +219,10 @@ export function SettingsPage({
   saving: boolean;
   section: SettingsSectionID;
   settings: AppSettings;
+  settingsLoadError: string | null;
+  settingsStatus: SettingsReadStatus;
   onSectionChange: (section: SettingsSectionID) => void;
+  onRetrySettings: () => void;
   version: VersionInfo | null;
   wslDistro: string;
   wslDistros: WSLDistroInfo[];
@@ -317,6 +336,46 @@ export function SettingsPage({
     }
     return undefined;
   }, [refreshRuntimeDiagnostics, section]);
+
+  if (settingsStatus === "loading" || settingsStatus === "error") {
+    const loadFailed = settingsStatus === "error";
+    return (
+      <Card>
+        <CardHeader title="Settings" />
+        <CardBody>
+          <div
+            className={[
+              "rounded-card border px-4 py-3 text-sm",
+              loadFailed
+                ? "border-error/30 bg-error/10 text-error"
+                : "border-info/30 bg-info/10 text-info",
+            ].join(" ")}
+            role={loadFailed ? "alert" : "status"}
+          >
+            <div className="font-medium">
+              {loadFailed ? "Settings could not be loaded" : "Loading settings"}
+            </div>
+            <p className="mt-1">
+              {loadFailed
+                ? settingsLoadError ||
+                  "Cairn did not receive your saved settings. Defaults are not shown and saving is disabled."
+                : "Reading your saved settings before enabling changes."}
+            </p>
+            {loadFailed ? (
+              <Button
+                className="mt-3"
+                onClick={onRetrySettings}
+                variant="secondary"
+              >
+                Retry settings load
+              </Button>
+            ) : null}
+          </div>
+        </CardBody>
+      </Card>
+    );
+  }
+
   return (
     <div className="grid gap-4 xl:grid-cols-[220px_minmax(0,1fr)]">
       <div className="xl:hidden">
@@ -358,6 +417,45 @@ export function SettingsPage({
       </div>
 
       <div className="space-y-4">
+        {settingsStatus === "ready" ? (
+          <div className="flex justify-end">
+            <Button
+              disabled={saving}
+              onClick={onRetrySettings}
+              variant="secondary"
+            >
+              Refresh settings
+            </Button>
+          </div>
+        ) : null}
+        {settingsStatus === "refreshing" ? (
+          <div
+            className="rounded-card border border-info/30 bg-info/10 px-3 py-2 text-sm text-info"
+            role="status"
+          >
+            Refreshing saved settings. Changes are disabled until the refresh
+            completes.
+          </div>
+        ) : null}
+        {settingsStatus === "stale" ? (
+          <div
+            className="rounded-card border border-warn/30 bg-warn/10 px-3 py-2 text-sm text-warn"
+            role="alert"
+          >
+            <div>
+              {settingsLoadError || "Unable to refresh saved settings."} Showing
+              the last successfully loaded values; saving is disabled until they
+              are refreshed.
+            </div>
+            <Button
+              className="mt-2"
+              onClick={onRetrySettings}
+              variant="secondary"
+            >
+              Retry settings load
+            </Button>
+          </div>
+        ) : null}
         {message ? (
           <div className="rounded-card border border-ok/30 bg-ok/10 px-3 py-2 text-sm text-ok">
             {message}
@@ -1678,11 +1776,33 @@ function SettingsTextSetting({
 }: {
   disabled?: boolean;
   label: string;
-  onSave: (value: string) => void;
+  onSave: (value: string) => Promise<boolean>;
   placeholder?: string;
   value: string;
 }) {
-  const save = (input: HTMLInputElement) => onSave(input.value);
+  const committedValueRef = useRef(value);
+  useEffect(() => {
+    committedValueRef.current = value;
+  }, [value]);
+  const save = async (input: HTMLInputElement) => {
+    const nextValue = input.value;
+    if (Object.is(committedValueRef.current, nextValue)) {
+      return;
+    }
+    const previousValue = committedValueRef.current;
+    committedValueRef.current = nextValue;
+    let saved = false;
+    try {
+      saved = await onSave(nextValue);
+    } finally {
+      if (!saved && Object.is(committedValueRef.current, nextValue)) {
+        committedValueRef.current = previousValue;
+        if (input.value === nextValue) {
+          input.value = previousValue;
+        }
+      }
+    }
+  };
   return (
     <label className="block">
       <span className="text-xs font-medium uppercase text-text-muted">
@@ -1693,10 +1813,14 @@ function SettingsTextSetting({
         defaultValue={value}
         disabled={disabled}
         key={value}
-        onBlur={(event) => save(event.currentTarget)}
+        onBlur={(event) => {
+          void save(event.currentTarget);
+        }}
         onKeyDown={(event) => {
           if (event.key === "Enter") {
-            save(event.currentTarget);
+            event.preventDefault();
+            void save(event.currentTarget);
+            event.currentTarget.blur();
           }
         }}
         placeholder={placeholder}
@@ -1717,10 +1841,14 @@ function SettingsNumberSetting({
   label: string;
   max?: number;
   min?: number;
-  onSave: (value: number) => void;
+  onSave: (value: number) => Promise<boolean>;
   value: number;
 }) {
-  const save = (input: HTMLInputElement) => {
+  const committedValueRef = useRef(value);
+  useEffect(() => {
+    committedValueRef.current = value;
+  }, [value]);
+  const save = async (input: HTMLInputElement) => {
     const parsed = Number(input.value);
     if (!Number.isFinite(parsed)) {
       input.value = String(value);
@@ -1730,7 +1858,22 @@ function SettingsNumberSetting({
     const nextValue =
       max === undefined ? lowerBounded : Math.min(max, lowerBounded);
     input.value = String(nextValue);
-    onSave(nextValue);
+    if (Object.is(committedValueRef.current, nextValue)) {
+      return;
+    }
+    const previousValue = committedValueRef.current;
+    committedValueRef.current = nextValue;
+    let saved = false;
+    try {
+      saved = await onSave(nextValue);
+    } finally {
+      if (!saved && Object.is(committedValueRef.current, nextValue)) {
+        committedValueRef.current = previousValue;
+        if (Number(input.value) === nextValue) {
+          input.value = String(previousValue);
+        }
+      }
+    }
   };
   return (
     <label className="block">
@@ -1744,10 +1887,14 @@ function SettingsNumberSetting({
         key={value}
         max={max}
         min={min}
-        onBlur={(event) => save(event.currentTarget)}
+        onBlur={(event) => {
+          void save(event.currentTarget);
+        }}
         onKeyDown={(event) => {
           if (event.key === "Enter") {
-            save(event.currentTarget);
+            event.preventDefault();
+            void save(event.currentTarget);
+            event.currentTarget.blur();
           }
         }}
         type="number"

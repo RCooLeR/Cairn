@@ -4491,6 +4491,302 @@ describe("App inventory shell", () => {
     expect(screen.getByText("go1.26.4")).toBeInTheDocument();
   });
 
+  it("does not present defaults or allow writes until settings load succeeds", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    settingsServiceMock.GetSettings.mockRejectedValueOnce(
+      new Error("settings database unavailable"),
+    ).mockResolvedValueOnce({
+      "general.theme": "light",
+      "linux.sudo_mode": "group",
+      "provider.autostart_backend": false,
+      "updates.notify": true,
+    });
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Settings/ }),
+    );
+
+    expect(
+      await screen.findByText("Settings could not be loaded"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("settings database unavailable"),
+    ).toBeInTheDocument();
+    expect(screen.queryByLabelText("Theme")).not.toBeInTheDocument();
+    expect(settingsServiceMock.SetSetting).not.toHaveBeenCalled();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Retry settings load" }),
+    );
+    await screen.findByRole("button", { name: "Refresh settings" });
+    clickSettingsSection("General");
+    expect(await screen.findByLabelText("Theme")).toHaveValue("light");
+    expect(screen.getByLabelText("Theme")).not.toBeDisabled();
+  });
+
+  it("retains last-known settings as disabled stale data after refresh failure", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    settingsServiceMock.GetSettings.mockResolvedValueOnce({
+      "general.theme": "light",
+      "provider.autostart_backend": true,
+      "updates.notify": true,
+    })
+      .mockRejectedValueOnce(new Error("settings refresh timed out"))
+      .mockResolvedValueOnce({
+        "general.theme": "dark",
+        "provider.autostart_backend": true,
+        "updates.notify": true,
+      });
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Settings/ }),
+    );
+    await screen.findByRole("button", { name: "Refresh settings" });
+    clickSettingsSection("General");
+    expect(await screen.findByLabelText("Theme")).toHaveValue("light");
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh settings" }));
+    expect(
+      await screen.findByText(/settings refresh timed out/),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText("Theme")).toHaveValue("light");
+    expect(screen.getByLabelText("Theme")).toBeDisabled();
+    expect(settingsServiceMock.SetSetting).not.toHaveBeenCalled();
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Retry settings load" }),
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText("Theme")).toHaveValue("dark"),
+    );
+    expect(screen.getByLabelText("Theme")).not.toBeDisabled();
+  });
+
+  it("coalesces Enter and blur into one text or number settings write", async () => {
+    const pendingTextSave = deferred<void>();
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    settingsServiceMock.SetSetting.mockReturnValueOnce(pendingTextSave.promise);
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Settings/ }),
+    );
+    await screen.findByRole("button", { name: "Refresh settings" });
+    clickSettingsSection("Terminal");
+    const shellInput = await screen.findByLabelText("Default shell");
+    fireEvent.change(shellInput, { target: { value: "/bin/zsh" } });
+    fireEvent.keyDown(shellInput, { key: "Enter" });
+    fireEvent.blur(shellInput);
+
+    await waitFor(() =>
+      expect(settingsServiceMock.SetSetting).toHaveBeenCalledWith(
+        "terminal.default_shell",
+        "/bin/zsh",
+      ),
+    );
+    expect(settingsServiceMock.SetSetting).toHaveBeenCalledTimes(1);
+    expect(shellInput).toBeDisabled();
+
+    await act(async () => {
+      pendingTextSave.resolve();
+      await pendingTextSave.promise;
+    });
+    await waitFor(() =>
+      expect(screen.getByLabelText("Default shell")).not.toBeDisabled(),
+    );
+    expect(screen.getByLabelText("Default shell")).toHaveValue("/bin/zsh");
+    expect(settingsServiceMock.SetSetting).toHaveBeenCalledTimes(1);
+
+    const pendingNumberSave = deferred<void>();
+    settingsServiceMock.SetSetting.mockClear();
+    settingsServiceMock.SetSetting.mockReturnValueOnce(
+      pendingNumberSave.promise,
+    );
+    clickSettingsSection("Metrics");
+    const sampleInterval = await screen.findByLabelText(
+      "Sample interval seconds",
+    );
+    fireEvent.change(sampleInterval, { target: { value: "5" } });
+    fireEvent.keyDown(sampleInterval, { key: "Enter" });
+    fireEvent.blur(sampleInterval);
+
+    await waitFor(() =>
+      expect(settingsServiceMock.SetSetting).toHaveBeenCalledWith(
+        "metrics.sample_interval_seconds",
+        5,
+      ),
+    );
+    expect(settingsServiceMock.SetSetting).toHaveBeenCalledTimes(1);
+    expect(sampleInterval).toBeDisabled();
+
+    await act(async () => {
+      pendingNumberSave.resolve();
+      await pendingNumberSave.promise;
+    });
+    await waitFor(() =>
+      expect(
+        screen.getByLabelText("Sample interval seconds"),
+      ).not.toBeDisabled(),
+    );
+    expect(settingsServiceMock.SetSetting).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps later writes queued and reports an earlier keyed failure", async () => {
+    const firstSave = deferred<void>();
+    const secondSave = deferred<void>();
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    settingsServiceMock.SetSetting.mockReturnValueOnce(
+      firstSave.promise,
+    ).mockReturnValueOnce(secondSave.promise);
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Settings/ }),
+    );
+    await screen.findByRole("button", { name: "Refresh settings" });
+    clickSettingsSection("General");
+    const theme = await screen.findByLabelText("Theme");
+    const autostart = screen.getByRole("checkbox", {
+      name: "Launch Cairn at login",
+    });
+
+    act(() => {
+      fireEvent.change(theme, { target: { value: "light" } });
+      fireEvent.click(autostart);
+    });
+    await waitFor(() =>
+      expect(settingsServiceMock.SetSetting).toHaveBeenCalledWith(
+        "general.theme",
+        "light",
+      ),
+    );
+    expect(settingsServiceMock.SetSetting).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      firstSave.reject(new Error("theme save failed"));
+      await expect(firstSave.promise).rejects.toThrow("theme save failed");
+    });
+    expect(await screen.findByText("theme save failed")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(settingsServiceMock.SetSetting).toHaveBeenCalledWith(
+        "general.autostart_app",
+        true,
+      ),
+    );
+    expect(settingsServiceMock.SetSetting).toHaveBeenCalledTimes(2);
+    expect(screen.getByLabelText("Theme")).toBeDisabled();
+    expect(
+      screen.getByRole("checkbox", { name: "Launch Cairn at login" }),
+    ).toBeDisabled();
+
+    await act(async () => {
+      secondSave.resolve();
+      await secondSave.promise;
+    });
+    await waitFor(() =>
+      expect(screen.getByLabelText("Theme")).not.toBeDisabled(),
+    );
+    expect(
+      screen.getByRole("checkbox", { name: "Launch Cairn at login" }),
+    ).toBeChecked();
+  });
+
+  it("restores the authoritative text value after a settings write fails", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    settingsServiceMock.SetSetting.mockRejectedValueOnce(
+      new Error("settings write rejected"),
+    );
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Settings/ }),
+    );
+    await screen.findByRole("button", { name: "Refresh settings" });
+    clickSettingsSection("Terminal");
+    const shellInput = await screen.findByLabelText("Default shell");
+    fireEvent.change(shellInput, { target: { value: "/bin/fish" } });
+    fireEvent.blur(shellInput);
+
+    expect(
+      await screen.findAllByText("settings write rejected"),
+    ).not.toHaveLength(0);
+    expect(screen.getByLabelText("Default shell")).toHaveValue("");
+    expect(settingsServiceMock.GetSettings).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not double-save the Agent endpoint when Enter causes blur", async () => {
+    const pendingSave = deferred<void>();
+    const initialAgentStatus = {
+      enabled: true,
+      provider: "ollama",
+      endpoint: "http://127.0.0.1:11434",
+      model: "gemma4:12b-it-q8_0",
+      reachable: true,
+      availableModels: ["gemma4:12b-it-q8_0"],
+      candidateModels: ["gemma4:12b-it-q8_0"],
+    };
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    agentServiceMock.Status.mockResolvedValueOnce(
+      initialAgentStatus,
+    ).mockResolvedValue({
+      ...initialAgentStatus,
+      endpoint: "http://127.0.0.1:11435",
+    });
+    settingsServiceMock.SetSetting.mockReturnValueOnce(pendingSave.promise);
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Agent/ }),
+    );
+    const endpointInput = await screen.findByLabelText("Endpoint");
+    fireEvent.change(endpointInput, {
+      target: { value: "http://127.0.0.1:11435" },
+    });
+    fireEvent.keyDown(endpointInput, { key: "Enter" });
+    fireEvent.blur(endpointInput);
+
+    await waitFor(() =>
+      expect(settingsServiceMock.SetSetting).toHaveBeenCalledWith(
+        "agent.endpoint",
+        "http://127.0.0.1:11435",
+      ),
+    );
+    expect(settingsServiceMock.SetSetting).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      pendingSave.resolve();
+      await pendingSave.promise;
+    });
+    await waitFor(() => expect(endpointInput).not.toBeDisabled());
+    expect(settingsServiceMock.SetSetting).toHaveBeenCalledTimes(1);
+  });
+
   it("uses the stamped frontend version if backend version loading fails", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
     appApiMock.getAppVersion.mockRejectedValue(new Error("backend offline"));

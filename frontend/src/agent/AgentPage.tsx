@@ -39,6 +39,7 @@ import {
   EmptyState,
   Modal,
 } from "../components/ui";
+import { SerializedSettingsSaver } from "../settings/serializedSettingsSaver";
 
 type AgentPageProps = {
   projects: ProjectSummary[];
@@ -197,7 +198,7 @@ export function AgentPage({ projects }: AgentPageProps) {
   const [analysis, setAnalysis] = useState<AgentProjectAnalysis | null>(null);
   const [loadingStatus, setLoadingStatus] = useState(true);
   const [analysisLoading, setAnalysisLoading] = useState(false);
-  const [savingKey, setSavingKey] = useState<string | null>(null);
+  const [settingsSavePendingCount, setSettingsSavePendingCount] = useState(0);
   const [error, setError] = useState<string | null>(null);
   const [editPath, setEditPath] = useState(".env");
   const [editInstruction, setEditInstruction] = useState(
@@ -211,11 +212,13 @@ export function AgentPage({ projects }: AgentPageProps) {
   const [editBusy, setEditBusy] = useState(false);
   const [editError, setEditError] = useState<string | null>(null);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
+  const mountedRef = useRef(true);
+  const [settingsSaver] = useState(() => new SerializedSettingsSaver());
+  const endpointCommittedRef = useRef(defaultEndpoint);
   const autoLoadedAnalysisProjectRef = useRef<string | null>(null);
   const analysisGenerationRef = useRef(0);
   const editOperationGenerationRef = useRef(0);
   const editPathRef = useRef(editPath);
-  const mountedRef = useRef(true);
   const {
     attachRequest,
     beginRequest,
@@ -269,10 +272,14 @@ export function AgentPage({ projects }: AgentPageProps) {
 
   useEffect(() => {
     mountedRef.current = true;
+    const unsubscribePendingCount = settingsSaver.subscribePendingCount(
+      setSettingsSavePendingCount,
+    );
     return () => {
+      unsubscribePendingCount();
       mountedRef.current = false;
     };
-  }, []);
+  }, [settingsSaver]);
 
   useEffect(() => {
     const transcript = transcriptRef.current;
@@ -295,7 +302,9 @@ export function AgentPage({ projects }: AgentPageProps) {
       setStatus(nextStatus);
       setToolCatalog(nextTools ?? []);
       setProvider(nextStatus?.provider || "ollama");
-      setEndpoint(nextStatus?.endpoint || defaultEndpoint);
+      const nextEndpoint = nextStatus?.endpoint || defaultEndpoint;
+      endpointCommittedRef.current = nextEndpoint;
+      setEndpoint(nextEndpoint);
       setModel(nextStatus?.model || "");
     } catch (nextError) {
       setError(errorMessage(nextError, "Unable to load local agent"));
@@ -314,7 +323,9 @@ export function AgentPage({ projects }: AgentPageProps) {
         setStatus(nextStatus);
         setToolCatalog(nextTools ?? []);
         setProvider(nextStatus?.provider || "ollama");
-        setEndpoint(nextStatus?.endpoint || defaultEndpoint);
+        const nextEndpoint = nextStatus?.endpoint || defaultEndpoint;
+        endpointCommittedRef.current = nextEndpoint;
+        setEndpoint(nextEndpoint);
         setModel(nextStatus?.model || "");
       })
       .catch((nextError) => {
@@ -333,23 +344,42 @@ export function AgentPage({ projects }: AgentPageProps) {
   }, []);
 
   const saveAgentSetting = async (key: string, value: string) => {
-    setSavingKey(key);
     setError(null);
-    try {
-      await SettingsService.SetSetting(key, value);
-      await refreshAgent(false);
-    } catch (nextError) {
-      setError(errorMessage(nextError, "Unable to save local agent setting"));
-    } finally {
-      setSavingKey(null);
-    }
+    return settingsSaver.enqueue(key, value, async (context) => {
+      try {
+        await SettingsService.SetSetting(key, value);
+      } catch (nextError) {
+        const message = errorMessage(
+          nextError,
+          "Unable to save local agent setting",
+        );
+        if (context.isLatestForKey()) {
+          await refreshAgent(false);
+        }
+        if (context.isLatest()) {
+          setError(message);
+        }
+        return false;
+      }
+      if (context.isLatest()) {
+        await refreshAgent(false);
+      }
+      return true;
+    });
   };
 
   const saveEndpoint = () => {
     const nextEndpoint = endpoint.trim() || defaultEndpoint;
     setEndpoint(nextEndpoint);
-    if (nextEndpoint !== status?.endpoint) {
-      void saveAgentSetting("agent.endpoint", nextEndpoint);
+    if (nextEndpoint !== endpointCommittedRef.current) {
+      const previousEndpoint = endpointCommittedRef.current;
+      endpointCommittedRef.current = nextEndpoint;
+      void saveAgentSetting("agent.endpoint", nextEndpoint).then((saved) => {
+        if (!saved && endpointCommittedRef.current === nextEndpoint) {
+          endpointCommittedRef.current = previousEndpoint;
+          setEndpoint(previousEndpoint);
+        }
+      });
     }
   };
 
@@ -787,7 +817,7 @@ export function AgentPage({ projects }: AgentPageProps) {
         <CardBody className="space-y-3">
           <div className="grid gap-3 lg:grid-cols-2 xl:grid-cols-[180px_minmax(220px,1fr)_240px_260px]">
             <AgentSelect
-              disabled={savingKey === "agent.provider"}
+              disabled={settingsSavePendingCount > 0}
               label="Provider"
               onChange={(value) => {
                 setProvider(value);
@@ -805,7 +835,7 @@ export function AgentPage({ projects }: AgentPageProps) {
               </span>
               <input
                 className="mt-1 h-10 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none focus:border-accent"
-                disabled={savingKey === "agent.endpoint"}
+                disabled={settingsSavePendingCount > 0}
                 onBlur={saveEndpoint}
                 onChange={(event) => setEndpoint(event.target.value)}
                 onKeyDown={(event) => {
@@ -819,7 +849,7 @@ export function AgentPage({ projects }: AgentPageProps) {
             </label>
             <AgentSelect
               disabled={
-                savingKey === "agent.model" || availableModels.length === 0
+                settingsSavePendingCount > 0 || availableModels.length === 0
               }
               label="Model"
               onChange={(value) => {
