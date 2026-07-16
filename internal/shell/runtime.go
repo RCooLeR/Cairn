@@ -2,7 +2,9 @@ package shell
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -48,20 +50,30 @@ type appRuntime struct {
 	backupService      *services.BackupService
 	portForwardService *services.PortForwardService
 
-	opMu        sync.Mutex
-	mu          sync.Mutex
-	state       appRuntimeState
-	cancel      context.CancelFunc
-	provider    providers.PlatformProvider
-	docker      *dockercore.Client
-	logs        *logsvc.Manager
-	metrics     *metrics.Manager
-	terminal    *terminal.Manager
-	backups     *backupcore.Manager
-	updates     *updatescore.Manager
-	bridge      *dockerbridge.Manager
-	portforward *portforward.Manager
+	opMu            sync.Mutex
+	mu              sync.Mutex
+	state           appRuntimeState
+	cancel          context.CancelFunc
+	provider        providers.PlatformProvider
+	docker          *dockercore.Client
+	logs            *logsvc.Manager
+	metrics         *metrics.Manager
+	terminal        *terminal.Manager
+	backups         *backupcore.Manager
+	updates         *updatescore.Manager
+	bridge          runtimeDockerBridge
+	portforward     *portforward.Manager
+	bridgeFactory   dockerBridgeFactory
+	bridgeFailureMu sync.Mutex
+	bridgeFailures  map[string]string
 }
+
+type runtimeDockerBridge interface {
+	Start(context.Context) error
+	Stop()
+}
+
+type dockerBridgeFactory func(dockerbridge.Provider, dockerbridge.Options) runtimeDockerBridge
 
 type appRuntimeState string
 
@@ -92,6 +104,7 @@ type appRuntimeConfig struct {
 	LineageService     *services.ImageLineageService
 	BackupService      *services.BackupService
 	PortForwardService *services.PortForwardService
+	BridgeFactory      dockerBridgeFactory
 }
 
 type runtimeHandles struct {
@@ -103,11 +116,17 @@ type runtimeHandles struct {
 	terminal    *terminal.Manager
 	backups     *backupcore.Manager
 	updates     *updatescore.Manager
-	bridge      *dockerbridge.Manager
+	bridge      runtimeDockerBridge
 	portforward *portforward.Manager
 }
 
 func newAppRuntime(cfg appRuntimeConfig) *appRuntime {
+	bridgeFactory := cfg.BridgeFactory
+	if bridgeFactory == nil {
+		bridgeFactory = func(provider dockerbridge.Provider, options dockerbridge.Options) runtimeDockerBridge {
+			return dockerbridge.New(provider, options)
+		}
+	}
 	return &appRuntime{
 		rootCtx:            cfg.RootCtx,
 		db:                 cfg.DB,
@@ -127,6 +146,7 @@ func newAppRuntime(cfg appRuntimeConfig) *appRuntime {
 		lineageService:     cfg.LineageService,
 		backupService:      cfg.BackupService,
 		portForwardService: cfg.PortForwardService,
+		bridgeFactory:      bridgeFactory,
 		state:              runtimeStateStopped,
 	}
 }
@@ -146,6 +166,16 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 	if r.serviceMu != nil {
 		r.serviceMu.Unlock()
 	}
+	carriedBridgeState := previous.provider != nil && provider != nil && previous.provider.ID() == provider.ID()
+	bridgeOutcomeKnown := false
+	if !carriedBridgeState {
+		r.clearDockerBridgeState(previous.provider)
+	}
+	defer func() {
+		if carriedBridgeState && !bridgeOutcomeKnown {
+			r.clearDockerBridgeState(previous.provider)
+		}
+	}()
 	previous.stop()
 	if provider == nil {
 		r.mu.Lock()
@@ -195,10 +225,8 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 	dockerClient.StartHealthLoop(runtimeCtx)
 	dockerClient.StartObjectEventLoop(runtimeCtx)
 	dockerClient.StartReconcileLoop(runtimeCtx)
-	dockerBridge := dockerbridge.New(provider, dockerbridge.Options{})
-	if err := dockerBridge.Start(runtimeCtx); err != nil {
-		slog.Debug("Docker CLI bridge unavailable", "provider", provider.ID(), "error", err)
-	}
+	dockerBridge, bridgeWarning := r.startDockerBridge(runtimeCtx, provider)
+	bridgeOutcomeKnown = true
 
 	// Host port forwarding mirrors published container ports onto the Windows
 	// host (Docker Desktop parity). Only the WSL backend needs it; native and
@@ -250,6 +278,7 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 			bridge:      dockerBridge,
 			portforward: portForwardManager,
 		}.stop()
+		r.clearDockerBridgeState(provider)
 		r.mu.Lock()
 		r.state = runtimeStateStopped
 		r.mu.Unlock()
@@ -309,6 +338,9 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 		summary = detail.Summary
 		summary.Active = true
 	}
+	if bridgeWarning != nil {
+		summary.Status.Warnings = mergeRuntimeProviderWarning(summary.Status.Warnings, *bridgeWarning)
+	}
 	if r.events != nil {
 		r.events.Publish(bus.Event{Topic: bus.TopicProviderChanged, Payload: summary})
 	}
@@ -340,6 +372,7 @@ func (r *appRuntime) StopAll() {
 	if r.serviceMu != nil {
 		r.serviceMu.Unlock()
 	}
+	r.clearDockerBridgeState(previous.provider)
 	previous.stop()
 	r.mu.Lock()
 	r.state = runtimeStateStopped
@@ -421,6 +454,136 @@ func statsConcurrency(provider providers.PlatformProvider) int {
 		return 1
 	}
 	return 0
+}
+
+func (r *appRuntime) startDockerBridge(ctx context.Context, provider dockerbridge.Provider) (runtimeDockerBridge, *models.ProviderWarning) {
+	bridge := r.bridgeFactory(provider, dockerbridge.Options{})
+	var err error
+	if bridge == nil {
+		err = errors.New("bridge manager was not created")
+	} else {
+		err = bridge.Start(ctx)
+	}
+	if err == nil {
+		r.clearDockerBridgeState(provider)
+		return bridge, nil
+	}
+
+	detail := compactBridgeError(err)
+	message := "Windows Docker CLI compatibility is unavailable because Cairn could not start its private named-pipe bridge"
+	if detail != "" {
+		message += ": " + strings.TrimRight(detail, ".") + "."
+	} else {
+		message += "."
+	}
+	message += " Close conflicting Cairn or Docker processes, or repair named-pipe permissions, then reconnect the provider or restart Cairn."
+	warning := models.ProviderWarning{
+		Code:    providers.WarningDockerBridgeUnavailable,
+		Message: message,
+	}
+	providerID := ""
+	if provider != nil {
+		providerID = provider.ID()
+	}
+	if r.providerManager != nil {
+		r.providerManager.SetRuntimeWarning(providerID, warning)
+	}
+	slog.Warn("Docker CLI bridge unavailable", "provider", providerID, "error", err)
+	r.publishDockerBridgeFailureTransition(ctx, providerID, warning)
+	return bridge, &warning
+}
+
+func (r *appRuntime) clearDockerBridgeWarning(provider interface{ ID() string }) {
+	if provider == nil || r.providerManager == nil {
+		return
+	}
+	r.providerManager.ClearRuntimeWarning(provider.ID(), providers.WarningDockerBridgeUnavailable)
+}
+
+func (r *appRuntime) clearDockerBridgeState(provider interface{ ID() string }) {
+	if provider == nil {
+		return
+	}
+	r.clearDockerBridgeWarning(provider)
+	r.bridgeFailureMu.Lock()
+	delete(r.bridgeFailures, provider.ID())
+	r.bridgeFailureMu.Unlock()
+}
+
+func (r *appRuntime) publishDockerBridgeFailureTransition(ctx context.Context, providerID string, warning models.ProviderWarning) {
+	providerID = strings.TrimSpace(providerID)
+	message := strings.TrimSpace(warning.Message)
+	if providerID == "" || message == "" {
+		return
+	}
+	r.bridgeFailureMu.Lock()
+	defer r.bridgeFailureMu.Unlock()
+	if r.bridgeFailures[providerID] == message {
+		return
+	}
+	// Do not suppress a later retry unless the warning was durably recorded.
+	// Holding the transition lock through insertion also prevents concurrent
+	// identical failures from creating duplicate notifications.
+	if !r.publishDockerBridgeNotification(ctx, warning) {
+		return
+	}
+	if r.bridgeFailures == nil {
+		r.bridgeFailures = map[string]string{}
+	}
+	r.bridgeFailures[providerID] = message
+}
+
+func (r *appRuntime) publishDockerBridgeNotification(ctx context.Context, warning models.ProviderWarning) bool {
+	if r == nil || r.db == nil {
+		return false
+	}
+	createdAt := time.Now().UTC()
+	id, err := r.db.Notifications().Insert(ctx, store.NotificationRecord{
+		Level:     "warn",
+		Title:     "Docker CLI bridge unavailable",
+		Body:      warning.Message,
+		Topic:     "provider",
+		CreatedAt: createdAt,
+	})
+	if err != nil {
+		slog.Warn("Record Docker CLI bridge notification failed", "error", err)
+		return false
+	}
+	if r.events != nil {
+		r.events.Publish(bus.Event{Topic: bus.TopicNotification, Payload: models.Notification{
+			ID:        id,
+			Level:     "warn",
+			Title:     "Docker CLI bridge unavailable",
+			Body:      warning.Message,
+			Topic:     "provider",
+			CreatedAt: createdAt,
+		}})
+	}
+	return true
+}
+
+func compactBridgeError(err error) string {
+	if err == nil {
+		return ""
+	}
+	detail := strings.Join(strings.Fields(err.Error()), " ")
+	const maximumRunes = 240
+	runes := []rune(detail)
+	if len(runes) > maximumRunes {
+		detail = string(runes[:maximumRunes]) + "..."
+	}
+	return detail
+}
+
+func mergeRuntimeProviderWarning(warnings []models.ProviderWarning, runtimeWarning models.ProviderWarning) []models.ProviderWarning {
+	merged := make([]models.ProviderWarning, 0, len(warnings)+1)
+	merged = append(merged, runtimeWarning)
+	for _, warning := range warnings {
+		if warning.Code != runtimeWarning.Code {
+			merged = append(merged, warning)
+		}
+	}
+	return merged
 }
 
 func (r *appRuntime) portForwardEnabled(ctx context.Context) bool {

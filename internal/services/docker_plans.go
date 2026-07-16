@@ -60,7 +60,7 @@ func (s *DockerService) PlanPushImage(ctx context.Context, imageRef string) (*mo
 	if s.Client == nil {
 		return nil, notReady()
 	}
-	plan, err := security.NewPushImagePlan(imageRef, time.Now().UTC())
+	plan, err := security.NewPushImagePlan(imageRef, time.Now().UTC(), s.IDs)
 	if err != nil {
 		return nil, err
 	}
@@ -95,7 +95,7 @@ func (s *DockerService) PlanRunImage(ctx context.Context, req models.RunImageReq
 	command := dockerRunCommand(req)
 	risk := runImageRisk(req)
 	targetID := runImageTarget(req)
-	plan, err := security.NewRunImagePlan(req, risk, command, targetID, time.Now().UTC())
+	plan, err := security.NewRunImagePlan(req, risk, command, targetID, time.Now().UTC(), s.IDs)
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +133,7 @@ func (s *DockerService) planContainerAction(ctx context.Context, action string, 
 		}
 		containers = append(containers, detail.Summary)
 	}
-	plan, err := security.NewContainerActionPlan(action, containers, timeoutSeconds, opts, time.Now().UTC())
+	plan, err := security.NewContainerActionPlan(action, containers, timeoutSeconds, opts, time.Now().UTC(), s.IDs)
 	if err != nil {
 		return nil, err
 	}
@@ -151,7 +151,7 @@ func (s *DockerService) planRemoveImage(ctx context.Context, imageID string, for
 	if err != nil {
 		return nil, err
 	}
-	plan, err := security.NewRemoveImagePlan(detail.Summary, force, time.Now().UTC())
+	plan, err := security.NewRemoveImagePlan(detail.Summary, force, time.Now().UTC(), s.IDs)
 	if err != nil {
 		return nil, err
 	}
@@ -170,7 +170,7 @@ func (s *DockerService) planRemoveVolume(ctx context.Context, name string, force
 	if err != nil {
 		return nil, err
 	}
-	plan, err := security.NewRemoveVolumePlan(detail.Summary, force, time.Now().UTC())
+	plan, err := security.NewRemoveVolumePlan(detail.Summary, force, time.Now().UTC(), s.IDs)
 	if err != nil {
 		return nil, err
 	}
@@ -188,7 +188,7 @@ func (s *DockerService) planRemoveNetwork(ctx context.Context, id string) (*mode
 	if err != nil {
 		return nil, err
 	}
-	plan, err := security.NewRemoveNetworkPlan(detail.Summary, time.Now().UTC())
+	plan, err := security.NewRemoveNetworkPlan(detail.Summary, time.Now().UTC(), s.IDs)
 	if err != nil {
 		return nil, err
 	}
@@ -205,7 +205,7 @@ func (s *DockerService) PlanPrune(_ context.Context, kind string) (*models.Comma
 	if s.Client == nil {
 		return nil, notReady()
 	}
-	plan, err := security.NewPrunePlan(kind, time.Now().UTC())
+	plan, err := security.NewPrunePlan(kind, time.Now().UTC(), s.IDs)
 	if err != nil {
 		return nil, err
 	}

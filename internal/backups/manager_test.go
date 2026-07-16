@@ -17,8 +17,48 @@ import (
 	"github.com/RCooLeR/Cairn/internal/bus"
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
+	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/store"
 )
+
+type failingBackupEntropyReader struct{}
+
+func (failingBackupEntropyReader) Read([]byte) (int, error) {
+	return 0, errors.New("entropy unavailable")
+}
+
+func TestPlanBackupEntropyFailureLeavesNoPlanOrFilesystemMutation(t *testing.T) {
+	ctx := context.Background()
+	mgr, _, provider := newTestManager(t)
+	mgr.IDs = security.NewIDSource(failingBackupEntropyReader{})
+	mgr.Docker.(*fakeBackupDocker).volumes["app-db"] = &models.VolumeDetail{
+		Summary: models.VolumeSummary{Name: "app-db", SizeBytes: 1024},
+	}
+	dest := filepath.Join(t.TempDir(), "not-created")
+
+	plan, err := mgr.PlanBackupVolume(ctx, models.BackupVolumeRequest{VolumeName: "app-db", DestPath: dest})
+	if plan != nil {
+		t.Fatalf("PlanBackupVolume() plan = %#v, want nil", plan)
+	}
+	if !apperror.IsCode(err, apperror.Internal) {
+		t.Fatalf("PlanBackupVolume() error = %v, want %s", err, apperror.Internal)
+	}
+	mgr.mu.Lock()
+	planCount := len(mgr.plans)
+	mgr.mu.Unlock()
+	if planCount != 0 {
+		t.Fatalf("saved plans = %d, want 0", planCount)
+	}
+	if _, statErr := os.Stat(dest); !os.IsNotExist(statErr) {
+		t.Fatalf("backup directory was created despite ID failure: %v", statErr)
+	}
+	provider.mu.Lock()
+	providerCalls := len(provider.calls)
+	provider.mu.Unlock()
+	if providerCalls != 0 {
+		t.Fatalf("provider commands = %d, want 0", providerCalls)
+	}
+}
 
 func TestPlanBackupVolumeWarnsForRunningContainers(t *testing.T) {
 	t.Parallel()

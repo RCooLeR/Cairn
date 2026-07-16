@@ -34,6 +34,7 @@ type MacOSColimaOptions struct {
 	DiskGB   int
 	Runner   CommandRunner
 	HomeDir  string
+	IDs      *security.IDSource
 }
 
 type MacOSColimaProvider struct {
@@ -43,6 +44,7 @@ type MacOSColimaProvider struct {
 	diskGB   int
 	runner   CommandRunner
 	homeDir  string
+	ids      *security.IDSource
 	// runtimeSocket is populated only on a frozen runtime snapshot.
 	runtimeSocket string
 
@@ -87,6 +89,7 @@ func NewMacOSColima(opts MacOSColimaOptions) *MacOSColimaProvider {
 		diskGB:       opts.DiskGB,
 		runner:       runner,
 		homeDir:      strings.TrimSpace(opts.HomeDir),
+		ids:          opts.IDs,
 		installPlans: map[string]colimaInstallPlan{},
 	}
 }
@@ -240,7 +243,10 @@ func (p *MacOSColimaProvider) PlanInstall(_ context.Context, opts models.Install
 	memoryGB := optionInt(opts.Extra, "memoryGB", p.configuredMemoryGB())
 	diskGB := optionInt(opts.Extra, "diskGB", p.configuredDiskGB())
 	steps := buildColimaInstallSteps(profile, cpu, memoryGB, diskGB, defaultColimaSocket(p.homeDir, profile))
-	planID := security.NewPlanID()
+	planID, err := p.ids.NewPlanID()
+	if err != nil {
+		return nil, err
+	}
 	commands := make([]models.PlannedCommand, 0, len(steps))
 	for index, step := range steps {
 		commands = append(commands, models.PlannedCommand{

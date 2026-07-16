@@ -45,12 +45,14 @@ type WindowsWSLOptions struct {
 	Distro      string
 	Runner      CommandRunner
 	StdioDialer WSLStdioDialer
+	IDs         *security.IDSource
 }
 
 type WindowsWSLProvider struct {
 	distro       string
 	runner       CommandRunner
 	stdioDialer  WSLStdioDialer
+	ids          *security.IDSource
 	configMu     sync.RWMutex
 	ipCacheMu    sync.Mutex
 	ipCache      cachedBackendIP
@@ -97,6 +99,7 @@ func NewWindowsWSL(opts WindowsWSLOptions) *WindowsWSLProvider {
 		distro:       strings.TrimSpace(opts.Distro),
 		runner:       runner,
 		stdioDialer:  stdioDialer,
+		ids:          opts.IDs,
 		installPlans: map[string]wslInstallPlan{},
 	}
 }
@@ -335,7 +338,10 @@ func (p *WindowsWSLProvider) PlanInstall(_ context.Context, opts models.InstallO
 		distribution = defaultWSLDistro
 	}
 	steps := buildWSLInstallStepsFor(distro, distribution)
-	planID := security.NewPlanID()
+	planID, err := p.ids.NewPlanID()
+	if err != nil {
+		return nil, err
+	}
 	commands := make([]models.PlannedCommand, 0, len(steps))
 	for index, step := range steps {
 		commands = append(commands, models.PlannedCommand{

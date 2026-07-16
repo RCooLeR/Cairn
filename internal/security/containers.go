@@ -1,8 +1,6 @@
 package security
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"slices"
 	"strings"
@@ -64,7 +62,7 @@ func RequireConfirmation(plan models.CommandPlan, typedName string) error {
 	return nil
 }
 
-func NewContainerActionPlan(action string, containers []models.ContainerSummary, timeoutSeconds int, opts models.RemoveContainerOptions, now time.Time) (ContainerPlan, error) {
+func NewContainerActionPlan(action string, containers []models.ContainerSummary, timeoutSeconds int, opts models.RemoveContainerOptions, now time.Time, sources ...*IDSource) (ContainerPlan, error) {
 	action = strings.TrimSpace(strings.ToLower(action))
 	if !slices.Contains([]string{
 		ContainerActionStart,
@@ -80,6 +78,10 @@ func NewContainerActionPlan(action string, containers []models.ContainerSummary,
 	}
 	if now.IsZero() {
 		now = time.Now().UTC()
+	}
+	planID, err := idSource(sources).NewTypedPlanID("container")
+	if err != nil {
+		return ContainerPlan{}, err
 	}
 
 	ids := make([]string, 0, len(containers))
@@ -100,7 +102,7 @@ func NewContainerActionPlan(action string, containers []models.ContainerSummary,
 		requiresTypedName = containerConfirmationName(containers)
 	}
 	plan := models.CommandPlan{
-		PlanID:            NewTypedPlanID("container"),
+		PlanID:            planID,
 		Title:             containerPlanTitle(action, containers),
 		Risk:              risk,
 		Commands:          []models.PlannedCommand{{Order: 1, Command: command, Risk: risk, Explanation: containerActionExplanation(action, opts)}},
@@ -242,41 +244,11 @@ func titleWord(value string) string {
 	return strings.ToUpper(string(first)) + value[size:]
 }
 
-func NewPlanID() string {
-	var buf [16]byte
-	if _, err := rand.Read(buf[:]); err != nil {
-		panic(fmt.Sprintf("generate plan id: %v", err))
+func idSource(sources []*IDSource) *IDSource {
+	if len(sources) == 0 {
+		return nil
 	}
-	return "plan-" + hex.EncodeToString(buf[:])
-}
-
-func NewTypedPlanID(kind string) string {
-	kind = strings.ToLower(strings.TrimSpace(kind))
-	kind = strings.Map(func(r rune) rune {
-		switch {
-		case r >= 'a' && r <= 'z':
-			return r
-		case r >= '0' && r <= '9':
-			return r
-		case r == '-' || r == '_':
-			return '-'
-		default:
-			return -1
-		}
-	}, kind)
-	kind = strings.Trim(kind, "-")
-	if kind == "" {
-		return NewPlanID()
-	}
-	return "plan-" + kind + "-" + strings.TrimPrefix(NewPlanID(), "plan-")
-}
-
-func NewJobID(prefix string) string {
-	prefix = strings.TrimSpace(strings.TrimSuffix(prefix, "-"))
-	if prefix == "" {
-		prefix = "job"
-	}
-	return prefix + "-" + strings.TrimPrefix(NewPlanID(), "plan-")
+	return sources[0]
 }
 
 func containerConfirmationName(containers []models.ContainerSummary) string {

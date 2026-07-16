@@ -38,6 +38,7 @@ type LinuxNativeOptions struct {
 	SocketPath string
 	Runner     CommandRunner
 	Probe      LinuxProbe
+	IDs        *security.IDSource
 }
 
 type LinuxProbe interface {
@@ -75,6 +76,7 @@ type LinuxNativeProvider struct {
 	socketPath string
 	runner     CommandRunner
 	probe      LinuxProbe
+	ids        *security.IDSource
 	installMu  sync.Mutex
 	plans      map[string]linuxInstallPlan
 }
@@ -104,6 +106,7 @@ func NewLinuxNative(opts LinuxNativeOptions) *LinuxNativeProvider {
 		socketPath: opts.SocketPath,
 		runner:     runner,
 		probe:      probe,
+		ids:        opts.IDs,
 		plans:      map[string]linuxInstallPlan{},
 	}
 }
@@ -235,7 +238,10 @@ func (p *LinuxNativeProvider) Detect(ctx context.Context) (*models.ProviderStatu
 
 func (p *LinuxNativeProvider) PlanInstall(context.Context, models.InstallOptions) (*models.CommandPlan, error) {
 	steps := buildLinuxInstallSteps("unix://" + p.detectSocketPath())
-	planID := security.NewPlanID()
+	planID, err := p.ids.NewPlanID()
+	if err != nil {
+		return nil, err
+	}
 	commands := make([]models.PlannedCommand, 0, len(steps))
 	for index, step := range steps {
 		commands = append(commands, models.PlannedCommand{

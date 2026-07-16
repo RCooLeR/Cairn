@@ -40,11 +40,12 @@ const (
 	ProblemContextMissing             = "CONTEXT_MISSING"
 	ProblemContextNotSelected         = "CONTEXT_NOT_SELECTED"
 
-	WarningSystemdMissing         = "SYSTEMD_MISSING"
-	WarningBrewMissing            = "BREW_MISSING"
-	WarningUnencryptedTCP         = "UNENCRYPTED_TCP_CONTEXT"
-	WarningDockerPackagesOutdated = "DOCKER_PACKAGES_OUTDATED"
-	WarningNVIDIARuntimeMissing   = "NVIDIA_RUNTIME_MISSING"
+	WarningSystemdMissing          = "SYSTEMD_MISSING"
+	WarningBrewMissing             = "BREW_MISSING"
+	WarningUnencryptedTCP          = "UNENCRYPTED_TCP_CONTEXT"
+	WarningDockerPackagesOutdated  = "DOCKER_PACKAGES_OUTDATED"
+	WarningNVIDIARuntimeMissing    = "NVIDIA_RUNTIME_MISSING"
+	WarningDockerBridgeUnavailable = "DOCKER_BRIDGE_UNAVAILABLE"
 )
 
 type CommandResult struct {
@@ -156,6 +157,7 @@ func SnapshotRuntimeProvider(ctx context.Context, provider PlatformProvider) (Pl
 			Distro:      typed.configuredDistro(),
 			Runner:      typed.runner,
 			StdioDialer: typed.stdioDialer,
+			IDs:         typed.ids,
 		}), nil
 	case *MacOSColimaProvider:
 		typed.configMu.RLock()
@@ -175,6 +177,7 @@ func SnapshotRuntimeProvider(ctx context.Context, provider PlatformProvider) (Pl
 			DiskGB:   diskGB,
 			Runner:   typed.runner,
 			HomeDir:  typed.homeDir,
+			IDs:      typed.ids,
 		})
 		frozen.runtimeSocket = host
 		return frozen, nil
@@ -183,6 +186,7 @@ func SnapshotRuntimeProvider(ctx context.Context, provider PlatformProvider) (Pl
 			SocketPath: typed.detectSocketPath(),
 			Runner:     typed.runner,
 			Probe:      typed.probe,
+			IDs:        typed.ids,
 		}), nil
 	case *ExistingContextProvider:
 		frozen := NewExistingContext(ExistingContextOptions{

@@ -155,7 +155,11 @@ func (s *ProjectService) ImportProject(ctx context.Context, req models.ImportPro
 	}
 	jobID := strings.TrimSpace(req.JobID)
 	if jobID == "" {
-		jobID = security.NewJobID("import")
+		var err error
+		jobID, err = s.IDs.NewJobID("import")
+		if err != nil {
+			return nil, err
+		}
 	}
 	projectID := ""
 	fail := func(err error) (*models.ProjectDetail, error) {
@@ -288,25 +292,25 @@ func (s *ProjectService) RefreshProjects(ctx context.Context) ([]models.ProjectS
 func (s *ProjectService) StartProject(ctx context.Context, projectID string) error {
 	unlock := s.lockRuntime()
 	defer unlock()
-	return s.runProjectAction(ctx, security.ProjectActionStart, projectID, false, nil)
+	return s.runProjectAction(ctx, security.ProjectActionStart, projectID, false, nil, "")
 }
 
 func (s *ProjectService) StopProject(ctx context.Context, projectID string) error {
 	unlock := s.lockRuntime()
 	defer unlock()
-	return s.runProjectAction(ctx, security.ProjectActionStop, projectID, false, nil)
+	return s.runProjectAction(ctx, security.ProjectActionStop, projectID, false, nil, "")
 }
 
 func (s *ProjectService) RestartProject(ctx context.Context, projectID string) error {
 	unlock := s.lockRuntime()
 	defer unlock()
-	return s.runProjectAction(ctx, security.ProjectActionRestart, projectID, false, nil)
+	return s.runProjectAction(ctx, security.ProjectActionRestart, projectID, false, nil, "")
 }
 
 func (s *ProjectService) PullProject(ctx context.Context, projectID string) error {
 	unlock := s.lockRuntime()
 	defer unlock()
-	return s.runProjectAction(ctx, security.ProjectActionPull, projectID, false, nil)
+	return s.runProjectAction(ctx, security.ProjectActionPull, projectID, false, nil, "")
 }
 
 func (s *ProjectService) PlanRedeployProject(ctx context.Context, projectID string) (*models.CommandPlan, error) {
@@ -324,6 +328,10 @@ func (s *ProjectService) PlanDownProject(ctx context.Context, projectID string, 
 func (s *ProjectService) ApplyProjectPlan(ctx context.Context, planID string, typedName string) error {
 	unlock := s.lockRuntime()
 	defer unlock()
+	jobID, err := s.IDs.NewJobID("job")
+	if err != nil {
+		return err
+	}
 	plan, err := s.projectPlanStore().Take(ctx, planID, typedName)
 	if err != nil {
 		return err
@@ -334,7 +342,7 @@ func (s *ProjectService) ApplyProjectPlan(ctx context.Context, planID string, ty
 	if _, err := s.projectRecordForCurrentContext(ctx, plan.ProjectID); err != nil {
 		return err
 	}
-	return s.runProjectAction(ctx, plan.Action, plan.ProjectID, plan.RemoveVolumes, &plan.Plan)
+	return s.runProjectAction(ctx, plan.Action, plan.ProjectID, plan.RemoveVolumes, &plan.Plan, jobID)
 }
 
 func (s *ComposeService) Config(ctx context.Context, projectID string) (*models.ComposeConfigResult, error) {
@@ -425,7 +433,10 @@ func (s *ComposeService) ScaleService(ctx context.Context, projectID string, ser
 }
 
 func (s *ComposeService) runComposeServiceAction(ctx context.Context, project store.ProjectRecord, action string, command string, run func() (*providers.CommandResult, error)) error {
-	jobID := security.NewJobID("job")
+	jobID, err := s.IDs.NewJobID("job")
+	if err != nil {
+		return err
+	}
 	started := time.Now().UTC()
 	if err := s.recordComposeServiceAudit(ctx, project, action, command, "started", 0, nil); err != nil {
 		return err
@@ -707,7 +718,10 @@ func (s *ProjectService) planProjectAction(ctx context.Context, action string, p
 		if len(containers) == 0 {
 			return nil, apperror.New(apperror.NotFound, "No project containers were found", apperror.WithDetail(project.ID))
 		}
-		plan := newStaleProjectDownPlan(project, containers, removeVolumes, s.now())
+		plan, err := newStaleProjectDownPlan(project, containers, removeVolumes, s.now(), s.IDs)
+		if err != nil {
+			return nil, err
+		}
 		projectPlan, err := security.NewProjectActionPlan(plan, action, project.ID, removeVolumes, s.Scope)
 		if err != nil {
 			return nil, err
@@ -717,7 +731,10 @@ func (s *ProjectService) planProjectAction(ctx context.Context, action string, p
 		}
 		return &plan, nil
 	}
-	plan := newProjectCommandPlan(project, action, removeVolumes, s.now())
+	plan, err := newProjectCommandPlan(project, action, removeVolumes, s.now(), s.IDs)
+	if err != nil {
+		return nil, err
+	}
 	projectPlan, err := security.NewProjectActionPlan(plan, action, project.ID, removeVolumes, s.Scope)
 	if err != nil {
 		return nil, err
@@ -728,7 +745,7 @@ func (s *ProjectService) planProjectAction(ctx context.Context, action string, p
 	return &plan, nil
 }
 
-func (s *ProjectService) runProjectAction(ctx context.Context, action string, projectID string, removeVolumes bool, planned *models.CommandPlan) error {
+func (s *ProjectService) runProjectAction(ctx context.Context, action string, projectID string, removeVolumes bool, planned *models.CommandPlan, jobID string) error {
 	project, err := s.projectForAction(ctx, projectID)
 	if err != nil {
 		if !apperror.IsCode(err, apperror.WorkdirMissing) || (action != security.ProjectActionStop && action != security.ProjectActionDown) {
@@ -738,18 +755,26 @@ func (s *ProjectService) runProjectAction(ctx context.Context, action string, pr
 		if err != nil {
 			return err
 		}
-		return s.runStaleProjectContainerAction(ctx, action, project, removeVolumes, planned)
+		return s.runStaleProjectContainerAction(ctx, action, project, removeVolumes, planned, jobID)
 	}
 	plan := planned
 	if plan == nil {
-		nextPlan := newProjectCommandPlan(project, action, removeVolumes, s.now())
+		nextPlan, err := newProjectCommandPlan(project, action, removeVolumes, s.now(), s.IDs)
+		if err != nil {
+			return err
+		}
 		plan = &nextPlan
 	}
 	command := ""
 	if len(plan.Commands) > 0 {
 		command = plan.Commands[0].Command
 	}
-	jobID := security.NewJobID("job")
+	if jobID == "" {
+		jobID, err = s.IDs.NewJobID("job")
+		if err != nil {
+			return err
+		}
+	}
 	started := time.Now().UTC()
 	if err := s.recordProjectAudit(ctx, project, action, command, plan.Risk, "started", 0, nil); err != nil {
 		return err
@@ -778,7 +803,7 @@ func (s *ProjectService) runProjectAction(ctx context.Context, action string, pr
 	return nil
 }
 
-func (s *ProjectService) runStaleProjectContainerAction(ctx context.Context, action string, project store.ProjectRecord, removeVolumes bool, planned *models.CommandPlan) error {
+func (s *ProjectService) runStaleProjectContainerAction(ctx context.Context, action string, project store.ProjectRecord, removeVolumes bool, planned *models.CommandPlan, jobID string) error {
 	if s.Docker == nil {
 		return notReady()
 	}
@@ -792,10 +817,16 @@ func (s *ProjectService) runStaleProjectContainerAction(ctx context.Context, act
 	plan := planned
 	if plan == nil {
 		if action == security.ProjectActionDown {
-			nextPlan := newStaleProjectDownPlan(project, containers, removeVolumes, s.now())
+			nextPlan, err := newStaleProjectDownPlan(project, containers, removeVolumes, s.now(), s.IDs)
+			if err != nil {
+				return err
+			}
 			plan = &nextPlan
 		} else {
-			nextPlan := newStaleProjectStopPlan(project, containers, s.now())
+			nextPlan, err := newStaleProjectStopPlan(project, containers, s.now(), s.IDs)
+			if err != nil {
+				return err
+			}
 			plan = &nextPlan
 		}
 	}
@@ -803,7 +834,12 @@ func (s *ProjectService) runStaleProjectContainerAction(ctx context.Context, act
 	if len(plan.Commands) > 0 {
 		command = plan.Commands[0].Command
 	}
-	jobID := security.NewJobID("job")
+	if jobID == "" {
+		jobID, err = s.IDs.NewJobID("job")
+		if err != nil {
+			return err
+		}
+	}
 	started := time.Now().UTC()
 	if err := s.recordProjectAudit(ctx, project, action, command, plan.Risk, "started", 0, nil); err != nil {
 		return err
@@ -1017,7 +1053,7 @@ func appendCommandOutput(current string, next string) string {
 	}
 }
 
-func newProjectCommandPlan(project store.ProjectRecord, action string, removeVolumes bool, now time.Time) models.CommandPlan {
+func newProjectCommandPlan(project store.ProjectRecord, action string, removeVolumes bool, now time.Time, source *security.IDSource) (models.CommandPlan, error) {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
@@ -1028,8 +1064,12 @@ func newProjectCommandPlan(project store.ProjectRecord, action string, removeVol
 	if risk == models.RiskDangerous || risk == models.RiskDestructive {
 		requiresTypedName = project.Name
 	}
+	planID, err := source.NewTypedPlanID("project")
+	if err != nil {
+		return models.CommandPlan{}, err
+	}
 	return models.CommandPlan{
-		PlanID: security.NewTypedPlanID("project"),
+		PlanID: planID,
 		Title:  title,
 		Risk:   risk,
 		Commands: []models.PlannedCommand{{
@@ -1042,15 +1082,19 @@ func newProjectCommandPlan(project store.ProjectRecord, action string, removeVol
 		Effects:           []string{project.Name + ": " + explanation},
 		RequiresTypedName: requiresTypedName,
 		ExpiresAt:         now.Add(security.DefaultPlanTTL),
-	}
+	}, nil
 }
 
-func newStaleProjectStopPlan(project store.ProjectRecord, containers []models.ContainerSummary, now time.Time) models.CommandPlan {
+func newStaleProjectStopPlan(project store.ProjectRecord, containers []models.ContainerSummary, now time.Time, source *security.IDSource) (models.CommandPlan, error) {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
+	planID, err := source.NewTypedPlanID("project")
+	if err != nil {
+		return models.CommandPlan{}, err
+	}
 	return models.CommandPlan{
-		PlanID: security.NewTypedPlanID("project"),
+		PlanID: planID,
 		Title:  "Stop " + project.Name,
 		Risk:   models.RiskSafe,
 		Commands: []models.PlannedCommand{{
@@ -1061,10 +1105,10 @@ func newStaleProjectStopPlan(project store.ProjectRecord, containers []models.Co
 		}},
 		Effects:   []string{project.Name + ": Stops known project containers without needing the missing Compose folder."},
 		ExpiresAt: now.Add(security.DefaultPlanTTL),
-	}
+	}, nil
 }
 
-func newStaleProjectDownPlan(project store.ProjectRecord, containers []models.ContainerSummary, removeVolumes bool, now time.Time) models.CommandPlan {
+func newStaleProjectDownPlan(project store.ProjectRecord, containers []models.ContainerSummary, removeVolumes bool, now time.Time, source *security.IDSource) (models.CommandPlan, error) {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
@@ -1076,8 +1120,12 @@ func newStaleProjectDownPlan(project store.ProjectRecord, containers []models.Co
 	if removeVolumes {
 		effects = append(effects, "Anonymous volumes attached to removed containers will also be removed.")
 	}
+	planID, err := source.NewTypedPlanID("project")
+	if err != nil {
+		return models.CommandPlan{}, err
+	}
 	return models.CommandPlan{
-		PlanID: security.NewTypedPlanID("project"),
+		PlanID: planID,
 		Title:  projectActionTitle(security.ProjectActionDown, project.Name, removeVolumes),
 		Risk:   risk,
 		Commands: []models.PlannedCommand{{
@@ -1089,7 +1137,7 @@ func newStaleProjectDownPlan(project store.ProjectRecord, containers []models.Co
 		Effects:           effects,
 		RequiresTypedName: project.Name,
 		ExpiresAt:         now.Add(security.DefaultPlanTTL),
-	}
+	}, nil
 }
 
 func staleProjectContainerCommand(action string, containers []models.ContainerSummary, removeVolumes bool) string {

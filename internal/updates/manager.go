@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"log/slog"
 	"math/big"
 	"runtime"
 	"strings"
@@ -15,8 +16,8 @@ import (
 	"github.com/RCooLeR/Cairn/internal/models"
 	registrycore "github.com/RCooLeR/Cairn/internal/registry"
 	"github.com/RCooLeR/Cairn/internal/runtimescope"
+	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/store"
-	"github.com/google/uuid"
 )
 
 type RegistryResolver interface {
@@ -42,21 +43,23 @@ type LineageDiscoverer interface {
 const updateSchedulerDisabledPollInterval = time.Minute
 
 type Manager struct {
-	Projects           *store.ProjectRepository
-	Lineage            *store.LineageRepository
-	Updates            *store.UpdateRepository
-	Objects            *store.ObjectCacheRepository
-	Images             ImageInspector
-	Docker             DockerRuntime
-	Compose            ComposeRunner
-	Backups            BackupRunner
-	Audit              *store.AuditRepository
-	Notify             *store.NotificationRepository
-	Registry           RegistryResolver
-	Settings           *store.SettingsRepository
-	Events             bus.Bus
-	Discover           LineageDiscoverer
-	Now                func() time.Time
+	Projects *store.ProjectRepository
+	Lineage  *store.LineageRepository
+	Updates  *store.UpdateRepository
+	Objects  *store.ObjectCacheRepository
+	Images   ImageInspector
+	Docker   DockerRuntime
+	Compose  ComposeRunner
+	Backups  BackupRunner
+	Audit    *store.AuditRepository
+	Notify   *store.NotificationRepository
+	Registry RegistryResolver
+	Settings *store.SettingsRepository
+	Events   bus.Bus
+	Discover LineageDiscoverer
+	Now      func() time.Time
+	IDs      *security.IDSource
+	// NewID is retained as a deterministic test seam. Production uses IDs.
 	NewID              func() string
 	JitterFor          func(time.Duration) time.Duration
 	HealthWindow       time.Duration
@@ -91,7 +94,6 @@ func NewManager(projects *store.ProjectRepository, lineage *store.LineageReposit
 		Events:   events,
 		Discover: discover,
 		Now:      func() time.Time { return time.Now().UTC() },
-		NewID:    uuid.NewString,
 		plans:    map[string]updatePlanRecord{},
 		jobs:     map[string]context.CancelFunc{},
 	}
@@ -137,7 +139,10 @@ func (m *Manager) CheckAllUpdates(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", apperror.Wrap(apperror.Internal, "List projects for update check failed", err)
 	}
-	jobID := "updates-" + m.newID()
+	jobID, err := m.newID("updates")
+	if err != nil {
+		return "", err
+	}
 	m.startJob(jobID, func(jobCtx context.Context) {
 		m.runAllChecks(jobCtx, jobID, projects)
 	})
@@ -552,13 +557,24 @@ func (m *Manager) runScheduler(ctx context.Context) {
 			if m.offline(ctx) {
 				continue
 			}
-			projects, err := m.currentProviderProjects(ctx)
-			if err != nil {
-				continue
+			if err := m.runScheduledCheck(ctx); err != nil {
+				slog.Warn("scheduled update check skipped", "error", err)
 			}
-			m.runAllChecks(ctx, "updates-"+m.newID(), projects)
 		}
 	}
+}
+
+func (m *Manager) runScheduledCheck(ctx context.Context) error {
+	projects, err := m.currentProviderProjects(ctx)
+	if err != nil {
+		return err
+	}
+	jobID, err := m.newID("updates")
+	if err != nil {
+		return err
+	}
+	m.runAllChecks(ctx, jobID, projects)
+	return nil
 }
 
 func (m *Manager) projectWithServices(ctx context.Context, projectID string) (store.ProjectRecord, []store.ServiceRecord, error) {
@@ -827,11 +843,23 @@ func (m *Manager) now() time.Time {
 	return time.Now().UTC()
 }
 
-func (m *Manager) newID() string {
+func (m *Manager) newID(prefix string) (string, error) {
 	if m != nil && m.NewID != nil {
-		return m.NewID()
+		suffix := strings.TrimSpace(m.NewID())
+		if suffix == "" {
+			return "", apperror.New(
+				apperror.Internal,
+				"Generate operation identifier failed",
+				apperror.WithDetail("The configured identifier source returned an empty value."),
+			)
+		}
+		return strings.TrimSuffix(prefix, "-") + "-" + suffix, nil
 	}
-	return uuid.NewString()
+	var source *security.IDSource
+	if m != nil {
+		source = m.IDs
+	}
+	return source.NewJobID(prefix)
 }
 
 func baseCheckRecord(project store.ProjectRecord, service store.ServiceRecord, containerID string, kind models.UpdateKind, imageRef string, baseImageRef string, checkedAt time.Time) store.UpdateCheckRecord {

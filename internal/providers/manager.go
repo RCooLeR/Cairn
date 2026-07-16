@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -27,11 +28,13 @@ type Manager struct {
 	order     []string
 	now       func() time.Time
 	runner    CommandRunner
+	IDs       *security.IDSource
 
 	mu               sync.RWMutex
 	providerConfigMu sync.Mutex
 	activeID         string
 	installPlans     map[string]installPlanRecord
+	runtimeWarnings  map[string]map[string]models.ProviderWarning
 }
 
 type installPlanRecord struct {
@@ -64,13 +67,14 @@ func NewManager(repo *store.ProviderRepository, settings *store.SettingsReposito
 		order = append(order, provider.ID())
 	}
 	return &Manager{
-		repo:         repo,
-		settings:     settings,
-		providers:    providersByID,
-		order:        order,
-		now:          func() time.Time { return time.Now().UTC() },
-		runner:       ExecRunner{},
-		installPlans: map[string]installPlanRecord{},
+		repo:            repo,
+		settings:        settings,
+		providers:       providersByID,
+		order:           order,
+		now:             func() time.Time { return time.Now().UTC() },
+		runner:          ExecRunner{},
+		installPlans:    map[string]installPlanRecord{},
+		runtimeWarnings: map[string]map[string]models.ProviderWarning{},
 	}
 }
 
@@ -165,6 +169,7 @@ func (m *Manager) ListProviders(ctx context.Context) ([]models.ProviderSummary, 
 		return nil, err
 	}
 	activeID := m.ActiveProviderID(ctx)
+	runtimeWarnings := m.runtimeWarningsSnapshot()
 	summaries := make([]models.ProviderSummary, 0, len(records))
 	for _, record := range records {
 		status := models.ProviderStatus{}
@@ -173,6 +178,7 @@ func (m *Manager) ListProviders(ctx context.Context) ([]models.ProviderSummary, 
 				return nil, err
 			}
 		}
+		status.Warnings = mergeProviderWarnings(runtimeWarnings[record.ID], status.Warnings)
 		summaries = append(summaries, models.ProviderSummary{
 			ID:      record.ID,
 			Name:    record.DisplayName,
@@ -183,6 +189,85 @@ func (m *Manager) ListProviders(ctx context.Context) ([]models.ProviderSummary, 
 		})
 	}
 	return summaries, nil
+}
+
+// SetRuntimeWarning overlays a warning produced by the currently bound
+// runtime. Runtime warnings are deliberately not persisted with provider
+// detection: they describe process-local facilities and must disappear after
+// a successful restart or process exit.
+func (m *Manager) SetRuntimeWarning(providerID string, warning models.ProviderWarning) {
+	if m == nil {
+		return
+	}
+	providerID = strings.TrimSpace(providerID)
+	warning.Code = strings.TrimSpace(warning.Code)
+	warning.Message = strings.TrimSpace(warning.Message)
+	if providerID == "" || warning.Code == "" || warning.Message == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.runtimeWarnings == nil {
+		m.runtimeWarnings = map[string]map[string]models.ProviderWarning{}
+	}
+	if m.runtimeWarnings[providerID] == nil {
+		m.runtimeWarnings[providerID] = map[string]models.ProviderWarning{}
+	}
+	m.runtimeWarnings[providerID][warning.Code] = warning
+}
+
+func (m *Manager) ClearRuntimeWarning(providerID string, warningCode string) {
+	if m == nil {
+		return
+	}
+	providerID = strings.TrimSpace(providerID)
+	warningCode = strings.TrimSpace(warningCode)
+	if providerID == "" || warningCode == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	warnings := m.runtimeWarnings[providerID]
+	delete(warnings, warningCode)
+	if len(warnings) == 0 {
+		delete(m.runtimeWarnings, providerID)
+	}
+}
+
+func (m *Manager) runtimeWarningsSnapshot() map[string][]models.ProviderWarning {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	snapshot := make(map[string][]models.ProviderWarning, len(m.runtimeWarnings))
+	for providerID, warningsByCode := range m.runtimeWarnings {
+		warnings := make([]models.ProviderWarning, 0, len(warningsByCode))
+		for _, warning := range warningsByCode {
+			warnings = append(warnings, warning)
+		}
+		sort.Slice(warnings, func(i, j int) bool {
+			return warnings[i].Code < warnings[j].Code
+		})
+		snapshot[providerID] = warnings
+	}
+	return snapshot
+}
+
+func mergeProviderWarnings(runtimeWarnings []models.ProviderWarning, detectedWarnings []models.ProviderWarning) []models.ProviderWarning {
+	if len(runtimeWarnings) == 0 {
+		return detectedWarnings
+	}
+	merged := make([]models.ProviderWarning, 0, len(runtimeWarnings)+len(detectedWarnings))
+	seen := make(map[string]struct{}, len(runtimeWarnings)+len(detectedWarnings))
+	for _, warning := range append(append([]models.ProviderWarning(nil), runtimeWarnings...), detectedWarnings...) {
+		if _, ok := seen[warning.Code]; ok {
+			continue
+		}
+		seen[warning.Code] = struct{}{}
+		merged = append(merged, warning)
+	}
+	return merged
 }
 
 func (m *Manager) GetProvider(ctx context.Context, providerID string) (*models.ProviderDetail, error) {
@@ -369,7 +454,7 @@ func (m *Manager) PlanLifecycle(ctx context.Context, action string, providerID s
 	if err != nil {
 		return security.ProviderPlan{}, err
 	}
-	return security.NewProviderLifecyclePlan(action, providerID, provider.DisplayName(), command, models.RiskNeedsConfirmation, runtimeScope, m.now())
+	return security.NewProviderLifecyclePlan(action, providerID, provider.DisplayName(), command, models.RiskNeedsConfirmation, runtimeScope, m.now(), m.IDs)
 }
 
 // ApplyLifecyclePlan revalidates the active provider and exact backend scope

@@ -24,7 +24,7 @@ func NewProviderPlanStore(now func() time.Time) *ProviderPlanStore {
 	return &ProviderPlanStore{commandPlanStore: newCommandPlanStore(now, func(plan ProviderPlan) models.CommandPlan { return plan.Plan })}
 }
 
-func NewProviderLifecyclePlan(action string, providerID string, providerName string, command string, risk models.Risk, scope runtimescope.Scope, now time.Time) (ProviderPlan, error) {
+func NewProviderLifecyclePlan(action string, providerID string, providerName string, command string, risk models.Risk, scope runtimescope.Scope, now time.Time, sources ...*IDSource) (ProviderPlan, error) {
 	action = strings.ToLower(strings.TrimSpace(action))
 	providerID = strings.TrimSpace(providerID)
 	if providerID == "" {
@@ -41,6 +41,10 @@ func NewProviderLifecyclePlan(action string, providerID string, providerName str
 	}
 	if risk == "" {
 		risk = models.RiskNeedsConfirmation
+	}
+	planID, err := idSource(sources).NewTypedPlanID("provider")
+	if err != nil {
+		return ProviderPlan{}, err
 	}
 	displayName := providerName
 	typedName := providerName
@@ -66,7 +70,7 @@ func NewProviderLifecyclePlan(action string, providerID string, providerName str
 		command = strings.ToLower(verb) + " Docker backend for " + displayName
 	}
 	plan := models.CommandPlan{
-		PlanID:    NewTypedPlanID("provider"),
+		PlanID:    planID,
 		Title:     verb + " Docker backend",
 		Risk:      risk,
 		Commands:  []models.PlannedCommand{{Order: 1, Command: command, Risk: risk, Explanation: explanation}},

@@ -57,6 +57,7 @@ type Manager struct {
 	Events    bus.Bus
 	Now       func() time.Time
 	NewID     func() string
+	IDs       *security.IDSource
 	Version   string
 
 	AvailableBytes func(string) (uint64, bool)
@@ -187,6 +188,10 @@ func (m *Manager) PlanBackupVolume(ctx context.Context, req models.BackupVolumeR
 	if err != nil {
 		return nil, err
 	}
+	planID, err := m.IDs.NewPlanID()
+	if err != nil {
+		return nil, err
+	}
 	if err := os.MkdirAll(backupDirHost, 0o755); err != nil {
 		return nil, apperror.Wrap(apperror.Internal, "Create backup directory failed", err)
 	}
@@ -201,7 +206,7 @@ func (m *Manager) PlanBackupVolume(ctx context.Context, req models.BackupVolumeR
 	}
 	containers := runningContainerNames(detail.Containers)
 	plan := models.CommandPlan{
-		PlanID:    security.NewPlanID(),
+		PlanID:    planID,
 		Title:     "Back up " + volumeName,
 		Risk:      models.RiskSafe,
 		Commands:  []models.PlannedCommand{backupCommand(1, volumeName, backupDirBackend, archiveName, models.RiskSafe)},
@@ -317,8 +322,12 @@ func (m *Manager) PlanRestoreVolume(ctx context.Context, req models.RestoreVolum
 		containers = runningContainerNames(target.Containers)
 	}
 	now := m.now()
+	planID, err := m.IDs.NewPlanID()
+	if err != nil {
+		return nil, err
+	}
 	plan := models.CommandPlan{
-		PlanID:            security.NewPlanID(),
+		PlanID:            planID,
 		Title:             restoreTitle(targetName, req.Overwrite),
 		Risk:              risk,
 		Commands:          commands,
@@ -372,8 +381,12 @@ func (m *Manager) PlanDeleteBackup(ctx context.Context, backupID string) (*model
 		return nil, apperror.Wrap(apperror.NotFound, "Backup was not found", err)
 	}
 	now := m.now()
+	planID, err := m.IDs.NewPlanID()
+	if err != nil {
+		return nil, err
+	}
 	plan := models.CommandPlan{
-		PlanID:    security.NewPlanID(),
+		PlanID:    planID,
 		Title:     "Delete backup " + record.ID,
 		Risk:      models.RiskNeedsConfirmation,
 		ExpiresAt: now.Add(security.DefaultPlanTTL),

@@ -35,7 +35,7 @@ func NewDockerObjectPlanStore(now func() time.Time) *DockerObjectPlanStore {
 	return &DockerObjectPlanStore{commandPlanStore: newCommandPlanStore(now, func(plan DockerObjectPlan) models.CommandPlan { return plan.Plan })}
 }
 
-func NewRemoveImagePlan(image models.ImageSummary, force bool, now time.Time) (DockerObjectPlan, error) {
+func NewRemoveImagePlan(image models.ImageSummary, force bool, now time.Time, sources ...*IDSource) (DockerObjectPlan, error) {
 	target := imageTarget(image)
 	if strings.TrimSpace(target) == "" {
 		return DockerObjectPlan{}, apperror.New(apperror.Conflict, "Image ID is required")
@@ -48,7 +48,10 @@ func NewRemoveImagePlan(image models.ImageSummary, force bool, now time.Time) (D
 	if force {
 		command = "docker image rm --force " + quotePlanArg(target)
 	}
-	plan := commandPlan(now, "Remove image "+target, risk, command, "Removes the selected image from the Docker backend.")
+	plan, err := commandPlan(now, "object", "Remove image "+target, risk, command, "Removes the selected image from the Docker backend.", idSource(sources))
+	if err != nil {
+		return DockerObjectPlan{}, err
+	}
 	plan.Effects = []string{
 		"Image " + target + " will be removed from the active Docker backend.",
 	}
@@ -67,13 +70,15 @@ func NewRemoveImagePlan(image models.ImageSummary, force bool, now time.Time) (D
 	}, nil
 }
 
-func NewPushImagePlan(imageRef string, now time.Time) (DockerObjectPlan, error) {
+func NewPushImagePlan(imageRef string, now time.Time, sources ...*IDSource) (DockerObjectPlan, error) {
 	imageRef = strings.TrimSpace(imageRef)
 	if imageRef == "" {
 		return DockerObjectPlan{}, apperror.New(apperror.Conflict, "Image reference is required")
 	}
-	plan := commandPlan(now, "Push image "+imageRef, models.RiskNeedsConfirmation, "docker push "+quotePlanArg(imageRef), "Publishes the selected image reference to its registry.")
-	plan.PlanID = NewTypedPlanID("push")
+	plan, err := commandPlan(now, "push", "Push image "+imageRef, models.RiskNeedsConfirmation, "docker push "+quotePlanArg(imageRef), "Publishes the selected image reference to its registry.", idSource(sources))
+	if err != nil {
+		return DockerObjectPlan{}, err
+	}
 	plan.Effects = []string{
 		"Image " + imageRef + " will be pushed to its registry.",
 		"Registry credentials configured for this Docker backend may be used by Docker.",
@@ -86,7 +91,7 @@ func NewPushImagePlan(imageRef string, now time.Time) (DockerObjectPlan, error) 
 	}, nil
 }
 
-func NewRunImagePlan(req models.RunImageRequest, risk models.Risk, command string, target string, now time.Time) (DockerObjectPlan, error) {
+func NewRunImagePlan(req models.RunImageRequest, risk models.Risk, command string, target string, now time.Time, sources ...*IDSource) (DockerObjectPlan, error) {
 	req.ImageRef = strings.TrimSpace(req.ImageRef)
 	req.Name = strings.TrimSpace(req.Name)
 	target = strings.TrimSpace(target)
@@ -103,8 +108,10 @@ func NewRunImagePlan(req models.RunImageRequest, risk models.Risk, command strin
 	if strings.TrimSpace(command) == "" {
 		command = "docker run " + quotePlanArg(req.ImageRef)
 	}
-	plan := commandPlan(now, "Run image "+req.ImageRef, risk, command, "Creates a container from the selected image.")
-	plan.PlanID = NewTypedPlanID("run-image")
+	plan, err := commandPlan(now, "run-image", "Run image "+req.ImageRef, risk, command, "Creates a container from the selected image.", idSource(sources))
+	if err != nil {
+		return DockerObjectPlan{}, err
+	}
 	plan.Effects = []string{
 		"A new container will be created from " + req.ImageRef + ".",
 	}
@@ -133,7 +140,7 @@ func NewRunImagePlan(req models.RunImageRequest, risk models.Risk, command strin
 	}, nil
 }
 
-func NewRemoveVolumePlan(volume models.VolumeSummary, force bool, now time.Time) (DockerObjectPlan, error) {
+func NewRemoveVolumePlan(volume models.VolumeSummary, force bool, now time.Time, sources ...*IDSource) (DockerObjectPlan, error) {
 	name := strings.TrimSpace(volume.Name)
 	if name == "" {
 		return DockerObjectPlan{}, apperror.New(apperror.Conflict, "Volume name is required")
@@ -142,7 +149,10 @@ func NewRemoveVolumePlan(volume models.VolumeSummary, force bool, now time.Time)
 	if force {
 		command = "docker volume rm --force " + quotePlanArg(name)
 	}
-	plan := commandPlan(now, "Delete volume "+name, models.RiskDangerous, command, "Deletes the selected Docker volume.")
+	plan, err := commandPlan(now, "object", "Delete volume "+name, models.RiskDangerous, command, "Deletes the selected Docker volume.", idSource(sources))
+	if err != nil {
+		return DockerObjectPlan{}, err
+	}
 	plan.RequiresTypedName = name
 	plan.Effects = []string{
 		"Volume " + name + " and its data will be deleted from the active Docker backend.",
@@ -159,7 +169,7 @@ func NewRemoveVolumePlan(volume models.VolumeSummary, force bool, now time.Time)
 	}, nil
 }
 
-func NewRemoveNetworkPlan(network models.NetworkSummary, now time.Time) (DockerObjectPlan, error) {
+func NewRemoveNetworkPlan(network models.NetworkSummary, now time.Time, sources ...*IDSource) (DockerObjectPlan, error) {
 	id := strings.TrimSpace(network.ID)
 	if id == "" {
 		return DockerObjectPlan{}, apperror.New(apperror.Conflict, "Network ID is required")
@@ -168,7 +178,10 @@ func NewRemoveNetworkPlan(network models.NetworkSummary, now time.Time) (DockerO
 	if label == "" {
 		label = id
 	}
-	plan := commandPlan(now, "Remove network "+label, models.RiskNeedsConfirmation, "docker network rm "+quotePlanArg(label), "Removes the selected Docker network.")
+	plan, err := commandPlan(now, "object", "Remove network "+label, models.RiskNeedsConfirmation, "docker network rm "+quotePlanArg(label), "Removes the selected Docker network.", idSource(sources))
+	if err != nil {
+		return DockerObjectPlan{}, err
+	}
 	plan.Effects = []string{
 		"Network " + label + " will be removed from the active Docker backend.",
 	}
@@ -180,7 +193,7 @@ func NewRemoveNetworkPlan(network models.NetworkSummary, now time.Time) (DockerO
 	}, nil
 }
 
-func NewPrunePlan(kind string, now time.Time) (DockerObjectPlan, error) {
+func NewPrunePlan(kind string, now time.Time, sources ...*IDSource) (DockerObjectPlan, error) {
 	kind = normalizePruneKind(kind)
 	if kind == "" {
 		return DockerObjectPlan{}, apperror.New(apperror.Conflict, "Prune kind is required")
@@ -190,7 +203,10 @@ func NewPrunePlan(kind string, now time.Time) (DockerObjectPlan, error) {
 	if command == "" {
 		return DockerObjectPlan{}, apperror.New(apperror.Conflict, "Unsupported prune kind", apperror.WithDetail(kind))
 	}
-	plan := commandPlan(now, "Prune "+pruneTitle(kind), risk, command, "Removes unused Docker data for the selected category.")
+	plan, err := commandPlan(now, "object", "Prune "+pruneTitle(kind), risk, command, "Removes unused Docker data for the selected category.", idSource(sources))
+	if err != nil {
+		return DockerObjectPlan{}, err
+	}
 	plan.RequiresTypedName = typedName
 	if plan.RequiresTypedName == "" && requiresTypedConfirmation(risk) {
 		plan.RequiresTypedName = "prune"
@@ -204,18 +220,22 @@ func NewPrunePlan(kind string, now time.Time) (DockerObjectPlan, error) {
 	}, nil
 }
 
-func commandPlan(now time.Time, title string, risk models.Risk, command string, explanation string) models.CommandPlan {
+func commandPlan(now time.Time, kind string, title string, risk models.Risk, command string, explanation string, source *IDSource) (models.CommandPlan, error) {
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
+	planID, err := source.NewTypedPlanID(kind)
+	if err != nil {
+		return models.CommandPlan{}, err
+	}
 	return models.CommandPlan{
-		PlanID:    NewTypedPlanID("object"),
+		PlanID:    planID,
 		Title:     title,
 		Risk:      risk,
 		Commands:  []models.PlannedCommand{{Order: 1, Command: command, Risk: risk, Explanation: explanation}},
 		Effects:   []string{explanation},
 		ExpiresAt: now.Add(DefaultPlanTTL),
-	}
+	}, nil
 }
 
 func imageTarget(image models.ImageSummary) string {

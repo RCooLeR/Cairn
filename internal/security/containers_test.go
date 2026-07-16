@@ -245,13 +245,25 @@ func TestNewContainerActionPlanValidationAndFallbackLabels(t *testing.T) {
 	if len(plan.Plan.Effects) != 1 || !strings.HasPrefix(plan.Plan.Effects[0], "1234567890ab:") {
 		t.Fatalf("fallback effects = %#v", plan.Plan.Effects)
 	}
-	if got := NewPlanID(); !strings.HasPrefix(got, "plan-") {
+	got, err := NewPlanID()
+	if err != nil {
+		t.Fatalf("NewPlanID() error = %v", err)
+	}
+	if !strings.HasPrefix(got, "plan-") {
 		t.Fatalf("NewPlanID() = %q, want plan-*", got)
 	}
-	if got := NewTypedPlanID("object"); !strings.HasPrefix(got, "plan-object-") {
+	got, err = NewTypedPlanID("object")
+	if err != nil {
+		t.Fatalf("NewTypedPlanID() error = %v", err)
+	}
+	if !strings.HasPrefix(got, "plan-object-") {
 		t.Fatalf("NewTypedPlanID() = %q, want plan-object-*", got)
 	}
-	if got := NewJobID("project"); !strings.HasPrefix(got, "project-") || strings.Contains(got, "plan-") {
+	got, err = NewJobID("project")
+	if err != nil {
+		t.Fatalf("NewJobID() error = %v", err)
+	}
+	if !strings.HasPrefix(got, "project-") || strings.Contains(got, "plan-") {
 		t.Fatalf("NewJobID() = %q, want project-* without plan prefix", got)
 	}
 }

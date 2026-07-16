@@ -140,7 +140,11 @@ func (m *Manager) ApplyUpdate(ctx context.Context, req models.ApplyUpdateRequest
 		m.saveUpdatePlan(record)
 		return "", notReady()
 	}
-	jobID := "updates-" + m.newID()
+	jobID, err := m.newID("updates")
+	if err != nil {
+		m.saveUpdatePlan(record)
+		return "", err
+	}
 	m.startJob(jobID, func(jobCtx context.Context) {
 		m.runUpdate(jobCtx, jobID, record, req)
 	})
@@ -193,9 +197,13 @@ func (m *Manager) PlanRollback(ctx context.Context, historyID int64) (*models.Up
 			Explanation: "Recreates the service with the restored image reference.",
 		},
 	}
+	planID, err := m.newID("rollback")
+	if err != nil {
+		return nil, err
+	}
 	record := updatePlanRecord{
 		Plan: models.UpdatePlan{
-			PlanID:    "rollback-" + m.newID(),
+			PlanID:    planID,
 			ProjectID: project.ID,
 			Items: []models.UpdatePlanItem{
 				{
@@ -240,7 +248,11 @@ func (m *Manager) ApplyRollback(ctx context.Context, planID string) (string, err
 		return "", apperror.New(apperror.NotFound, "Update history item was not found")
 	}
 	record.Project = project
-	jobID := "updates-" + m.newID()
+	jobID, err := m.newID("updates")
+	if err != nil {
+		m.saveUpdatePlan(record)
+		return "", err
+	}
 	m.startJob(jobID, func(jobCtx context.Context) {
 		m.runManualRollback(jobCtx, jobID, record.Project, record.RollbackHistory)
 	})
@@ -346,7 +358,11 @@ func (m *Manager) planUpdate(ctx context.Context, projectID string, serviceName 
 		record.Up = appendUnique(record.Up, service)
 	}
 	record.CommandSet = updateCommands(project, record.Pull, record.Build, record.Up)
-	record.Plan.PlanID = "update-" + m.newID()
+	planID, err := m.newID("update")
+	if err != nil {
+		return nil, err
+	}
+	record.Plan.PlanID = planID
 	record.Plan.ProjectID = project.ID
 	record.Plan.Commands = record.CommandSet
 	record.Plan.Warnings = uniqueStrings(warnings)

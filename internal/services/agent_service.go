@@ -39,6 +39,7 @@ type AgentService struct {
 	Logs     *LogsService
 	Update   *UpdateService
 	Plans    *security.AgentFileEditPlanStore
+	IDs      *security.IDSource
 	Client   *http.Client
 }
 
@@ -579,8 +580,12 @@ func (s *AgentService) PlanFileEdit(ctx context.Context, req models.AgentFileEdi
 	} else {
 		return nil, err
 	}
+	planID, err := s.IDs.NewTypedPlanID("agent-file")
+	if err != nil {
+		return nil, err
+	}
 	plan := models.CommandPlan{
-		PlanID: security.NewTypedPlanID("agent-file"),
+		PlanID: planID,
 		Title:  agentFileEditTitle(createFile, relPath),
 		Risk:   models.RiskNeedsConfirmation,
 		Commands: []models.PlannedCommand{

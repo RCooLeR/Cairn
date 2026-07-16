@@ -90,6 +90,7 @@ type DockerService struct {
 	Audit       *store.AuditRepository
 	Plans       *security.PlanStore
 	ObjectPlans *security.DockerObjectPlanStore
+	IDs         *security.IDSource
 	RuntimeMu   *sync.RWMutex
 }
 type ProjectDetector interface {
@@ -109,6 +110,7 @@ type ProjectService struct {
 	Events     bus.Bus
 	Scope      runtimescope.Scope
 	Now        func() time.Time
+	IDs        *security.IDSource
 	RuntimeMu  *sync.RWMutex
 	RuntimeCtx context.Context
 }
@@ -121,6 +123,7 @@ type ComposeService struct {
 	Detector   ProjectDetector
 	Events     bus.Bus
 	Scope      runtimescope.Scope
+	IDs        *security.IDSource
 	RuntimeMu  *sync.RWMutex
 }
 type MetricsService struct {
@@ -375,7 +378,7 @@ func (s *DockerService) runContainerAction(ctx context.Context, action string, i
 	if err != nil {
 		return err
 	}
-	plan, err := security.NewContainerActionPlan(action, []models.ContainerSummary{detail.Summary}, timeoutSeconds, opts, time.Now().UTC())
+	plan, err := security.NewContainerActionPlan(action, []models.ContainerSummary{detail.Summary}, timeoutSeconds, opts, time.Now().UTC(), s.IDs)
 	if err != nil {
 		return err
 	}

@@ -2,7 +2,9 @@ package providers
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/RCooLeR/Cairn/internal/models"
@@ -46,6 +48,87 @@ func TestManagerDetectAllPersistsAndSelectsSavedHealthyProvider(t *testing.T) {
 	}
 	if record.LastStatusJSON == "" || record.LastCheckedAt.IsZero() {
 		t.Fatalf("record not updated: %#v", record)
+	}
+}
+
+func TestManagerRuntimeWarningOverlaysDetectionUntilCleared(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openProviderTestStore(t, ctx)
+	provider := &fakeProvider{id: "linux_native", kind: TypeLinuxNative, platform: PlatformLinux, healthy: true}
+	manager := NewManager(db.Providers(), db.Settings(), []PlatformProvider{provider})
+	if _, err := manager.Detect(ctx, provider.ID()); err != nil {
+		t.Fatalf("Detect() error = %v", err)
+	}
+
+	manager.SetRuntimeWarning(provider.ID(), models.ProviderWarning{
+		Code:    WarningDockerBridgeUnavailable,
+		Message: "  Docker CLI bridge unavailable  ",
+	})
+	// A later detection result must not erase a live process-local warning.
+	if _, err := manager.Detect(ctx, provider.ID()); err != nil {
+		t.Fatalf("Detect(second) error = %v", err)
+	}
+	summaries, err := manager.ListProviders(ctx)
+	if err != nil {
+		t.Fatalf("ListProviders() error = %v", err)
+	}
+	if len(summaries) != 1 || len(summaries[0].Status.Warnings) != 1 {
+		t.Fatalf("summaries with runtime warning = %#v", summaries)
+	}
+	warning := summaries[0].Status.Warnings[0]
+	if warning.Code != WarningDockerBridgeUnavailable || warning.Message != "Docker CLI bridge unavailable" {
+		t.Fatalf("runtime warning = %#v", warning)
+	}
+
+	record, err := db.Providers().Get(ctx, provider.ID())
+	if err != nil {
+		t.Fatalf("Get provider record: %v", err)
+	}
+	var persisted models.ProviderStatus
+	if err := json.Unmarshal([]byte(record.LastStatusJSON), &persisted); err != nil {
+		t.Fatalf("Unmarshal persisted status: %v", err)
+	}
+	if len(persisted.Warnings) != 0 {
+		t.Fatalf("process-local warning was persisted: %#v", persisted.Warnings)
+	}
+
+	manager.ClearRuntimeWarning(provider.ID(), WarningDockerBridgeUnavailable)
+	summaries, err = manager.ListProviders(ctx)
+	if err != nil {
+		t.Fatalf("ListProviders(after clear) error = %v", err)
+	}
+	if len(summaries[0].Status.Warnings) != 0 {
+		t.Fatalf("runtime warnings after clear = %#v", summaries[0].Status.Warnings)
+	}
+}
+
+func TestManagerRuntimeWarningOverlayIsConcurrentSafe(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openProviderTestStore(t, ctx)
+	provider := &fakeProvider{id: "linux_native", kind: TypeLinuxNative, platform: PlatformLinux, healthy: true}
+	manager := NewManager(db.Providers(), db.Settings(), []PlatformProvider{provider})
+	if _, err := manager.Detect(ctx, provider.ID()); err != nil {
+		t.Fatalf("Detect() error = %v", err)
+	}
+
+	var workers sync.WaitGroup
+	for i := 0; i < 24; i++ {
+		workers.Add(1)
+		go func(index int) {
+			defer workers.Done()
+			code := WarningDockerBridgeUnavailable
+			manager.SetRuntimeWarning(provider.ID(), models.ProviderWarning{Code: code, Message: "degraded"})
+			_, _ = manager.ListProviders(ctx)
+			if index%2 == 0 {
+				manager.ClearRuntimeWarning(provider.ID(), code)
+			}
+		}(i)
+	}
+	workers.Wait()
+	if _, err := manager.ListProviders(ctx); err != nil {
+		t.Fatalf("ListProviders() after concurrent overlays error = %v", err)
 	}
 }
 
