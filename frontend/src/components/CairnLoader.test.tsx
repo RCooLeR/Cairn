@@ -126,6 +126,23 @@ describe("CairnLoader", () => {
       motionPreference.mediaQuery.removeEventListener,
     ).toHaveBeenCalledWith("change", expect.any(Function));
   });
+
+  it("uses neutral presentation copy while backend readiness is unknown", async () => {
+    vi.mocked(getAppVersion).mockReturnValue(new Promise(() => undefined));
+
+    render(<CairnLoader onDone={vi.fn()} />);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3_000);
+    });
+
+    expect(screen.getByText("Preparing runtime integration")).toBeVisible();
+    expect(screen.getByText("Loading security preferences")).toBeVisible();
+    expect(
+      screen.queryByText(/detected|verified|online|system ready/i),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("Runtime Integration")).toBeVisible();
+    expect(screen.getByText("Assistant Interface")).toBeVisible();
+  });
 });
 
 function createMotionPreferenceController(): MotionPreferenceController {

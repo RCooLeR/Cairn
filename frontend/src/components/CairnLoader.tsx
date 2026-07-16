@@ -33,16 +33,16 @@ const PROGRESS_TICK_MS = 50;
 const REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
 
 const LOG_LINES = [
-  "[10:24:31] Boot sequence initiated",
-  "[10:24:31] Checking backend provider",
-  "[10:24:32] Docker engine detected",
-  "[10:24:32] Validating environment",
-  "[10:24:33] Loading core modules",
-  "[10:24:34] Compose service online",
-  "[10:24:34] Network layer initializing",
-  "[10:24:35] Security policies verified",
-  "[10:24:36] Preparing UI environment",
-  "[10:24:36] System ready",
+  "Startup presentation beginning",
+  "Preparing application services",
+  "Preparing runtime integration",
+  "Loading environment settings",
+  "Loading core modules",
+  "Preparing workspace services",
+  "Preparing network tools",
+  "Loading security preferences",
+  "Preparing user interface",
+  "Finishing startup presentation",
 ];
 
 // label, icon, and per-service fill curve (staggered) from the original app.js.
@@ -54,31 +54,31 @@ const SERVICES: {
 }[] = [
   {
     key: "core",
-    label: "Core Services",
+    label: "Application Shell",
     icon: "▣",
     fill: (p) => Math.min(100, p * 155),
   },
   {
     key: "engine",
-    label: "Docker Engine",
+    label: "Runtime Integration",
     icon: "⬡",
     fill: (p) => Math.min(100, Math.max(0, (p - 0.1) * 130)),
   },
   {
     key: "compose",
-    label: "Compose Module",
+    label: "Workspace Services",
     icon: "◇",
     fill: (p) => Math.min(100, Math.max(0, (p - 0.24) * 118)),
   },
   {
     key: "network",
-    label: "Network Layer",
+    label: "Network Tools",
     icon: "◌",
     fill: (p) => Math.min(100, Math.max(0, (p - 0.42) * 110)),
   },
   {
     key: "agent",
-    label: "Local Agent",
+    label: "Assistant Interface",
     icon: "⌂",
     fill: (p) => Math.min(100, Math.max(0, (p - 0.58) * 110)),
   },
