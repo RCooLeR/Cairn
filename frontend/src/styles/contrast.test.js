@@ -22,6 +22,7 @@ const themeTokensPattern = new RegExp(
     "[\\s\\S]*?--bg-inset:\\s*(\\d+)\\s+(\\d+)\\s+(\\d+);",
     "[\\s\\S]*?--text-secondary:\\s*(\\d+)\\s+(\\d+)\\s+(\\d+);",
     "[\\s\\S]*?--text-muted:\\s*(\\d+)\\s+(\\d+)\\s+(\\d+);",
+    "[\\s\\S]*?--focus-ring:\\s*(\\d+)\\s+(\\d+)\\s+(\\d+);",
   ].join(""),
   "g",
 );
@@ -70,6 +71,7 @@ describe("semantic text contrast", () => {
         rgb(match.slice(10, 13)),
       ];
       const textColors = [rgb(match.slice(13, 16)), rgb(match.slice(16, 19))];
+      const focusRing = rgb(match.slice(19, 22));
 
       for (const foreground of textColors) {
         for (const background of surfaces) {
@@ -78,6 +80,12 @@ describe("semantic text contrast", () => {
             `theme ${themeIndex} foreground ${foreground.join(" ")} on ${background.join(" ")}`,
           ).toBeGreaterThanOrEqual(4.5);
         }
+      }
+      for (const background of surfaces) {
+        expect(
+          contrastRatio(focusRing, background),
+          `theme ${themeIndex} focus ring ${focusRing.join(" ")} on ${background.join(" ")}`,
+        ).toBeGreaterThanOrEqual(3);
       }
     }
   });

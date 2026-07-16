@@ -12,6 +12,7 @@
   --text-primary: 240 246 252;
   --text-secondary: 177 186 196;
   --text-muted: 139 148 158;
+  --focus-ring: 45 212 167;
   --accent: 45 212 167;
   --ok: 45 212 167;
   --warn: 245 184 61;
@@ -62,6 +63,7 @@
   --text-primary: 15 23 42;
   --text-secondary: 30 41 59;
   --text-muted: 71 85 105;
+  --focus-ring: 13 148 136;
   --accent: 13 148 136;
   --ok: 13 148 136;
   --warn: 180 83 9;
@@ -100,6 +102,7 @@
     --text-primary: 240 246 252;
     --text-secondary: 177 186 196;
     --text-muted: 139 148 158;
+    --focus-ring: 45 212 167;
     --accent: 45 212 167;
     --ok: 45 212 167;
     --warn: 245 184 61;
@@ -157,11 +160,31 @@ button {
   cursor: pointer;
 }
 
-button:focus-visible,
-a:focus-visible,
-input:focus-visible {
-  outline: 2px solid #2dd4a7;
+:where(
+  button,
+  a,
+  input,
+  select,
+  textarea,
+  [contenteditable="true"],
+  [tabindex]:not([tabindex="-1"])
+):focus-visible {
+  outline: 2px solid rgb(var(--focus-ring));
   outline-offset: 2px;
+}
+
+@media (forced-colors: active) {
+  :where(
+    button,
+    a,
+    input,
+    select,
+    textarea,
+    [contenteditable="true"],
+    [tabindex]:not([tabindex="-1"])
+  ):focus-visible {
+    outline-color: CanvasText;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
