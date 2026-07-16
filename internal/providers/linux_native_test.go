@@ -19,9 +19,9 @@ func TestLinuxNativeDetectHealthy(t *testing.T) {
 	runner := newFakeRunner()
 	runner.paths["docker"] = "/usr/bin/docker"
 	runner.outputs["docker context show"] = "default\n"
-	runner.outputs["docker compose version --short"] = "v2.29.1\n"
-	runner.outputs["docker buildx version"] = "github.com/docker/buildx v0.16.2 123456\n"
-	runner.outputs["docker info --format {{.ServerVersion}}"] = "27.1.2\n"
+	runner.outputs["docker --host unix:///run/user/1000/docker.sock compose version --short"] = "v2.29.1\n"
+	runner.outputs["docker --host unix:///run/user/1000/docker.sock buildx version"] = "github.com/docker/buildx v0.16.2 123456\n"
+	runner.outputs["docker --host unix:///run/user/1000/docker.sock info --format {{.ServerVersion}}"] = "27.1.2\n"
 	probe := &fakeLinuxProbe{
 		env: map[string]string{"XDG_RUNTIME_DIR": "/run/user/1000"},
 		paths: map[string]fakeFileInfo{
@@ -67,8 +67,8 @@ func TestLinuxNativeDetectSocketPermission(t *testing.T) {
 	runner := newFakeRunner()
 	runner.paths["docker"] = "/usr/bin/docker"
 	runner.outputs["docker context show"] = "default\n"
-	runner.outputs["docker compose version --short"] = "v2.29.1\n"
-	runner.outputs["docker buildx version"] = "github.com/docker/buildx v0.16.2 123456\n"
+	runner.outputs["docker --host unix:///var/run/docker.sock compose version --short"] = "v2.29.1\n"
+	runner.outputs["docker --host unix:///var/run/docker.sock buildx version"] = "github.com/docker/buildx v0.16.2 123456\n"
 	probe := &fakeLinuxProbe{
 		paths: map[string]fakeFileInfo{
 			defaultDockerSocket: {},
@@ -166,7 +166,9 @@ func TestLinuxNativePlanInstallBuildsUbuntuDockerAptSteps(t *testing.T) {
 	if strings.Contains(plan.Commands[2].Command, `\$codename`) || strings.Contains(plan.Commands[2].Command, `\$(dpkg --print-architecture)`) {
 		t.Fatalf("Linux native repository command should not escape shell dollars: %q", plan.Commands[2].Command)
 	}
-	if !strings.Contains(plan.Commands[6].Command, "docker run --rm hello-world") {
+	if !strings.Contains(plan.Commands[6].Command, "--host") ||
+		!strings.Contains(plan.Commands[6].Command, "unix:///var/run/docker.sock") ||
+		!strings.Contains(plan.Commands[6].Command, "run --rm hello-world") {
 		t.Fatalf("verify command missing hello-world: %q", plan.Commands[6].Command)
 	}
 	if len(plan.Effects) != 5 {
@@ -182,9 +184,9 @@ func TestLinuxNativeDetectWarnsWhenDockerPackagesAreOutdated(t *testing.T) {
 	runner := newFakeRunner()
 	runner.paths["docker"] = "/usr/bin/docker"
 	runner.outputs["docker context show"] = "default\n"
-	runner.outputs["docker compose version --short"] = "v2.29.1\n"
-	runner.outputs["docker buildx version"] = "github.com/docker/buildx v0.16.2 123456\n"
-	runner.outputs["docker info --format {{.ServerVersion}}"] = "27.1.2\n"
+	runner.outputs["docker --host unix:///var/run/docker.sock compose version --short"] = "v2.29.1\n"
+	runner.outputs["docker --host unix:///var/run/docker.sock buildx version"] = "github.com/docker/buildx v0.16.2 123456\n"
+	runner.outputs["docker --host unix:///var/run/docker.sock info --format {{.ServerVersion}}"] = "27.1.2\n"
 	runner.outputs["apt-cache policy docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"] = `docker-ce:
   Installed: 5:27.1.2-1~ubuntu.24.04~noble
   Candidate: 5:29.0.3-1~ubuntu.24.04~noble
@@ -281,7 +283,7 @@ func TestLinuxNativeRunComposeUsesWorkdirEnvAndArgv(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunComposeEnv() error = %v", err)
 	}
-	if got, want := result.Command, []string{"docker", "compose", "-f", "compose.yaml", "config"}; !reflect.DeepEqual(got, want) {
+	if got, want := result.Command, []string{"docker", "--host", "unix:///var/run/docker.sock", "compose", "-f", "compose.yaml", "config"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("command = %#v, want %#v", got, want)
 	}
 	if runner.opts.Workdir != "/workspace/app" {
@@ -311,7 +313,7 @@ func TestLinuxNativeRunDockerWithInputUsesOptionsRunner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunDockerWithInput() error = %v", err)
 	}
-	if got, want := result.Command, []string{"docker", "login", "docker.io", "-u", "ada", "--password-stdin"}; !reflect.DeepEqual(got, want) {
+	if got, want := result.Command, []string{"docker", "--host", "unix:///var/run/docker.sock", "login", "docker.io", "-u", "ada", "--password-stdin"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("command = %#v, want %#v", got, want)
 	}
 	if runner.opts.Stdin != "secret\n" {
@@ -319,6 +321,41 @@ func TestLinuxNativeRunDockerWithInputUsesOptionsRunner(t *testing.T) {
 	}
 	if runner.opts.Timeout != dockerOperationTimeout {
 		t.Fatalf("timeout = %s, want %s", runner.opts.Timeout, dockerOperationTimeout)
+	}
+}
+
+func TestLinuxNativeBackendIdentityAndCLIUseBoundSocket(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		socketPath string
+		env        map[string]string
+		paths      map[string]fakeFileInfo
+		wantHost   string
+	}{
+		{name: "repair default", wantHost: "unix:///var/run/docker.sock"},
+		{name: "explicit", socketPath: "/custom/docker.sock", wantHost: "unix:///custom/docker.sock"},
+		{name: "rootless", env: map[string]string{"XDG_RUNTIME_DIR": "/run/user/1000"}, paths: map[string]fakeFileInfo{"/run/user/1000/docker.sock": {}}, wantHost: "unix:///run/user/1000/docker.sock"},
+		{name: "missing rootless uses existing system", env: map[string]string{"XDG_RUNTIME_DIR": "/run/user/1000"}, paths: map[string]fakeFileInfo{defaultDockerSocket: {}}, wantHost: "unix:///var/run/docker.sock"},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			runner := &composeOptionsRunner{}
+			provider := NewLinuxNative(LinuxNativeOptions{SocketPath: test.socketPath, Runner: runner, Probe: &fakeLinuxProbe{env: test.env, paths: test.paths}})
+			identity, err := provider.BackendIdentity(context.Background())
+			if err != nil || identity != test.wantHost {
+				t.Fatalf("BackendIdentity() = %q, %v; want %q", identity, err, test.wantHost)
+			}
+			result, err := provider.RunDockerWithInput(context.Background(), "", "info")
+			if err != nil {
+				t.Fatalf("RunDockerWithInput() error = %v", err)
+			}
+			if got := strings.Join(result.Command, " "); got != "docker --host "+test.wantHost+" info" {
+				t.Fatalf("command = %q", got)
+			}
+		})
 	}
 }
 

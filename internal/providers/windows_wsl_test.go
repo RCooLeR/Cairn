@@ -87,9 +87,9 @@ func TestWindowsWSLDetectHealthyCustomDistro(t *testing.T) {
 	runner.outputs[wslCommandName+" -d cairn-dev -- sh -lc readlink -f /usr/bin/docker 2>/dev/null || true"] = "/usr/bin/docker\n"
 	runner.outputs[wslCommandName+" -d cairn-dev -- sh -lc command -v docker >/dev/null 2>&1"] = "/usr/bin/docker\n"
 	runner.outputs[wslCommandName+" -d cairn-dev -- docker context show"] = "default\n"
-	runner.outputs[wslCommandName+" -d cairn-dev -- docker compose version --short"] = "v2.29.1\n"
-	runner.outputs[wslCommandName+" -d cairn-dev -- docker buildx version"] = "github.com/docker/buildx v0.16.2 123456\n"
-	runner.outputs[wslCommandName+" -d cairn-dev -- docker info --format {{.ServerVersion}}"] = "27.1.2\n"
+	runner.outputs[wslCommandName+" -d cairn-dev -- docker --host "+wslDockerSocketHost+" compose version --short"] = "v2.29.1\n"
+	runner.outputs[wslCommandName+" -d cairn-dev -- docker --host "+wslDockerSocketHost+" buildx version"] = "github.com/docker/buildx v0.16.2 123456\n"
+	runner.outputs[wslCommandName+" -d cairn-dev -- docker --host "+wslDockerSocketHost+" info --format {{.ServerVersion}}"] = "27.1.2\n"
 
 	status, err := NewWindowsWSL(WindowsWSLOptions{Distro: "cairn-dev", Runner: runner}).Detect(context.Background())
 	if err != nil {
@@ -243,17 +243,17 @@ func TestWindowsWSLRunDockerComposeAndShellCommands(t *testing.T) {
 	t.Parallel()
 	runner := newFakeRunner()
 	runner.paths["pwsh"] = `C:\Program Files\PowerShell\7\pwsh.exe`
-	runner.outputs[wslCommandName+" -d cairn-dev -- docker ps -a"] = "CONTAINER ID\n"
-	runner.outputs[wslCommandName+" -d cairn-dev -- docker run alpine sh -c echo \\$HOME"] = "/home/ada\n"
-	runner.outputs[wslCommandName+" -d cairn-dev -- sh -lc cd '/mnt/c/Users/Ada/Project One' && exec docker 'compose' '-f' 'compose.yaml' 'config'"] = "services: {}\n"
-	runner.outputs[wslCommandName+" -d cairn-dev -- sh -lc export COMPOSE_PROJECT_NAME='demo'; cd '/mnt/c/Users/Ada/Project One' && exec docker 'compose' '-f' 'compose.yaml' 'ps'"] = "[]\n"
+	runner.outputs[wslCommandName+" -d cairn-dev -- docker --host "+wslDockerSocketHost+" ps -a"] = "CONTAINER ID\n"
+	runner.outputs[wslCommandName+" -d cairn-dev -- docker --host "+wslDockerSocketHost+" run alpine sh -c echo \\$HOME"] = "/home/ada\n"
+	runner.outputs[wslCommandName+" -d cairn-dev -- sh -lc cd '/mnt/c/Users/Ada/Project One' && exec docker '--host' '"+wslDockerSocketHost+"' 'compose' '-f' 'compose.yaml' 'config'"] = "services: {}\n"
+	runner.outputs[wslCommandName+" -d cairn-dev -- sh -lc export COMPOSE_PROJECT_NAME='demo'; cd '/mnt/c/Users/Ada/Project One' && exec docker '--host' '"+wslDockerSocketHost+"' 'compose' '-f' 'compose.yaml' 'ps'"] = "[]\n"
 	provider := NewWindowsWSL(WindowsWSLOptions{Distro: "cairn-dev", Runner: runner})
 
 	result, err := provider.RunDocker(context.Background(), "ps", "-a")
 	if err != nil {
 		t.Fatalf("RunDocker() error = %v", err)
 	}
-	if got, want := result.Command, []string{wslCommandName, "-d", "cairn-dev", "--", "docker", "ps", "-a"}; !reflect.DeepEqual(got, want) {
+	if got, want := result.Command, []string{wslCommandName, "-d", "cairn-dev", "--", "docker", "--host", wslDockerSocketHost, "ps", "-a"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("RunDocker command = %#v, want %#v", got, want)
 	}
 
@@ -261,7 +261,7 @@ func TestWindowsWSLRunDockerComposeAndShellCommands(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunDocker($) error = %v", err)
 	}
-	if got, want := result.Command, []string{wslCommandName, "-d", "cairn-dev", "--", "docker", "run", "alpine", "sh", "-c", "echo \\$HOME"}; !reflect.DeepEqual(got, want) {
+	if got, want := result.Command, []string{wslCommandName, "-d", "cairn-dev", "--", "docker", "--host", wslDockerSocketHost, "run", "alpine", "sh", "-c", "echo \\$HOME"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("RunDocker($) command = %#v, want %#v", got, want)
 	}
 
@@ -347,7 +347,7 @@ func TestWindowsWSLRunComposeUsesOperationTimeout(t *testing.T) {
 func TestWindowsWSLDockerDialerUsesDockerDialStdio(t *testing.T) {
 	t.Parallel()
 	runner := newFakeRunner()
-	runner.outputs[wslCommandName+" -d cairn-dev -- docker system dial-stdio --help"] = "Usage: docker system dial-stdio\n"
+	runner.outputs[wslCommandName+" -d cairn-dev -- docker --host "+wslDockerSocketHost+" system dial-stdio --help"] = "Usage: docker system dial-stdio\n"
 	var captured []string
 	provider := NewWindowsWSL(WindowsWSLOptions{
 		Distro: "cairn-dev",
@@ -376,7 +376,7 @@ func TestWindowsWSLDockerDialerUsesDockerDialStdio(t *testing.T) {
 		t.Fatalf("dialContext() error = %v", err)
 	}
 	_ = conn.Close()
-	if got, want := captured, []string{wslCommandName, "-d", "cairn-dev", "--", "docker", "system", "dial-stdio"}; !reflect.DeepEqual(got, want) {
+	if got, want := captured, []string{wslCommandName, "-d", "cairn-dev", "--", "docker", "--host", wslDockerSocketHost, "system", "dial-stdio"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("stdio command = %#v, want %#v", got, want)
 	}
 }
@@ -559,9 +559,9 @@ func TestWindowsWSLDetectWarnsWhenNVIDIARuntimeMissing(t *testing.T) {
 	seedWSLDetectThroughDockerProbe(runner)
 	runner.outputs[wslCommandName+" -d Ubuntu -- sh -lc command -v docker >/dev/null 2>&1"] = "/usr/bin/docker\n"
 	runner.outputs[wslCommandName+" -d Ubuntu -- docker context show"] = "default\n"
-	runner.outputs[wslCommandName+" -d Ubuntu -- docker compose version --short"] = "v2.29.1\n"
-	runner.outputs[wslCommandName+" -d Ubuntu -- docker buildx version"] = "github.com/docker/buildx v0.16.2 123456\n"
-	runner.outputs[wslCommandName+" -d Ubuntu -- docker info --format {{.ServerVersion}}"] = "27.1.2\n"
+	runner.outputs[wslCommandName+" -d Ubuntu -- docker --host "+wslDockerSocketHost+" compose version --short"] = "v2.29.1\n"
+	runner.outputs[wslCommandName+" -d Ubuntu -- docker --host "+wslDockerSocketHost+" buildx version"] = "github.com/docker/buildx v0.16.2 123456\n"
+	runner.outputs[wslCommandName+" -d Ubuntu -- docker --host "+wslDockerSocketHost+" info --format {{.ServerVersion}}"] = "27.1.2\n"
 	runner.outputs[wslCommandName+" -d Ubuntu -- sh -lc "+wslNVIDIAGPUCheckCommand] = "GPU 0: NVIDIA RTX\n"
 	runner.errors[wslCommandName+" -d Ubuntu -- sh -lc "+wslNVIDIARuntimeCheckCommand] = errors.New("runtime missing")
 
@@ -584,9 +584,9 @@ func TestWindowsWSLDetectMarksNVIDIARuntimeReady(t *testing.T) {
 	seedWSLDetectThroughDockerProbe(runner)
 	runner.outputs[wslCommandName+" -d Ubuntu -- sh -lc command -v docker >/dev/null 2>&1"] = "/usr/bin/docker\n"
 	runner.outputs[wslCommandName+" -d Ubuntu -- docker context show"] = "default\n"
-	runner.outputs[wslCommandName+" -d Ubuntu -- docker compose version --short"] = "v2.29.1\n"
-	runner.outputs[wslCommandName+" -d Ubuntu -- docker buildx version"] = "github.com/docker/buildx v0.16.2 123456\n"
-	runner.outputs[wslCommandName+" -d Ubuntu -- docker info --format {{.ServerVersion}}"] = "27.1.2\n"
+	runner.outputs[wslCommandName+" -d Ubuntu -- docker --host "+wslDockerSocketHost+" compose version --short"] = "v2.29.1\n"
+	runner.outputs[wslCommandName+" -d Ubuntu -- docker --host "+wslDockerSocketHost+" buildx version"] = "github.com/docker/buildx v0.16.2 123456\n"
+	runner.outputs[wslCommandName+" -d Ubuntu -- docker --host "+wslDockerSocketHost+" info --format {{.ServerVersion}}"] = "27.1.2\n"
 	runner.outputs[wslCommandName+" -d Ubuntu -- sh -lc "+wslNVIDIAGPUCheckCommand] = "GPU 0: NVIDIA RTX\n"
 	runner.outputs[wslCommandName+" -d Ubuntu -- sh -lc "+wslNVIDIARuntimeCheckCommand] = "nvidia\n"
 
@@ -606,8 +606,8 @@ func TestWindowsWSLDetectWarnsWhenDockerPackagesAreOutdated(t *testing.T) {
 	seedWSLDetectThroughDockerProbe(runner)
 	runner.outputs[wslCommandName+" -d Ubuntu -- sh -lc command -v docker >/dev/null 2>&1"] = "/usr/bin/docker\n"
 	runner.outputs[wslCommandName+" -d Ubuntu -- docker context show"] = "default\n"
-	runner.outputs[wslCommandName+" -d Ubuntu -- docker compose version --short"] = "v2.29.1\n"
-	runner.outputs[wslCommandName+" -d Ubuntu -- docker buildx version"] = "github.com/docker/buildx v0.16.2 123456\n"
+	runner.outputs[wslCommandName+" -d Ubuntu -- docker --host "+wslDockerSocketHost+" compose version --short"] = "v2.29.1\n"
+	runner.outputs[wslCommandName+" -d Ubuntu -- docker --host "+wslDockerSocketHost+" buildx version"] = "github.com/docker/buildx v0.16.2 123456\n"
 	runner.outputs[wslCommandName+" -d Ubuntu -- sh -lc apt-cache policy docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"] = `docker-ce:
   Installed: 5:27.1.2-1~ubuntu.24.04~noble
   Candidate: 5:29.0.3-1~ubuntu.24.04~noble
@@ -615,7 +615,7 @@ docker-compose-plugin:
   Installed: 2.29.1-1~ubuntu.24.04~noble
   Candidate: 2.40.3-1~ubuntu.24.04~noble
 `
-	runner.outputs[wslCommandName+" -d Ubuntu -- docker info --format {{.ServerVersion}}"] = "27.1.2\n"
+	runner.outputs[wslCommandName+" -d Ubuntu -- docker --host "+wslDockerSocketHost+" info --format {{.ServerVersion}}"] = "27.1.2\n"
 
 	status, err := NewWindowsWSL(WindowsWSLOptions{Runner: runner}).Detect(context.Background())
 	if err != nil {

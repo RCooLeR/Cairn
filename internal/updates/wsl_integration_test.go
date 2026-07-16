@@ -19,6 +19,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
 	registrycore "github.com/RCooLeR/Cairn/internal/registry"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/store"
 )
 
@@ -173,6 +174,7 @@ func TestManagerRealWSLUpdateAndRebuildSmoke(t *testing.T) {
 	}
 
 	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), client, staticRegistry{}, db.Settings(), eventBus, nil)
+	manager.Scope = runtimescope.Must(provider.ID(), "wsl:cairn-dev")
 	manager.Compose = compose
 	manager.HealthWindow = 15 * time.Second
 	manager.HealthPollInterval = 500 * time.Millisecond
@@ -376,9 +378,10 @@ func seedWSLUpdateProject(t *testing.T, ctx context.Context, db *store.Store, pr
 			LastSeenAt:     now,
 		},
 	}
-	if err := db.Projects().SaveSnapshot(ctx, providerID, []store.ProjectRecord{{
+	if err := db.Projects().SaveSnapshot(ctx, runtimescope.Must(providerID, "wsl:cairn-dev"), []store.ProjectRecord{{
 		ID:           projectID,
 		ProviderID:   providerID,
+		ContextName:  "wsl:cairn-dev",
 		Name:         projectName,
 		WorkingDir:   workdir,
 		ComposeFiles: []string{"compose.yaml"},

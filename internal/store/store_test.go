@@ -13,9 +13,13 @@ import (
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 )
 
-const expectedMigrationCount = 6
+const (
+	expectedMigrationCount       = 9
+	releaseFixtureMigrationCount = 6
+)
 
 func TestMigrateFreshDatabaseCreatesV1Schema(t *testing.T) {
 	ctx := context.Background()
@@ -200,9 +204,24 @@ func TestReleaseDBFixtureUpgrade(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open fixture store: %v", err)
 	}
-	if err := fixture.Migrate(ctx); err != nil {
+	if err := ensureMigrationsTable(ctx, fixture.writer); err != nil {
 		_ = fixture.Close()
-		t.Fatalf("prepare fixture schema: %v", err)
+		t.Fatalf("prepare fixture migration table: %v", err)
+	}
+	migrations, err := loadMigrations()
+	if err != nil {
+		_ = fixture.Close()
+		t.Fatalf("load fixture migrations: %v", err)
+	}
+	for _, migration := range migrations[:releaseFixtureMigrationCount] {
+		if err := applyMigration(ctx, fixture.writer, migration); err != nil {
+			_ = fixture.Close()
+			t.Fatalf("prepare fixture schema through %s: %v", migration.name, err)
+		}
+	}
+	if err := fixture.Settings().EnsureDefaults(ctx); err != nil {
+		_ = fixture.Close()
+		t.Fatalf("prepare fixture settings: %v", err)
 	}
 	if _, err := fixture.writer.ExecContext(ctx, string(seedSQL)); err != nil {
 		_ = fixture.Close()
@@ -220,6 +239,27 @@ func TestReleaseDBFixtureUpgrade(t *testing.T) {
 	}
 	if got := migrationCount(t, ctx, upgraded); got != expectedMigrationCount {
 		t.Fatalf("migration count = %d, want %d", got, expectedMigrationCount)
+	}
+	for _, table := range []string{"containers_cache", "images_cache", "volumes_cache", "networks_cache"} {
+		if got := countRows(t, ctx, upgraded, table); got != 0 {
+			t.Fatalf("%s rows after scoped cache migration = %d, want ambiguous legacy cache discarded", table, got)
+		}
+	}
+	if got := queryString(t, ctx, upgraded, "SELECT context_name FROM metrics_samples LIMIT 1"); got != "" {
+		t.Fatalf("legacy metrics context_name = %q, want quarantined blank scope", got)
+	}
+	legacySeries, err := upgraded.Metrics().QuerySeries(ctx, MetricsSeriesFilter{
+		Scope:       runtimescope.Must("linux_native", "default"),
+		ContainerID: "container-web",
+		Resolution:  MetricsResolutionRaw,
+		From:        time.Date(2026, 6, 13, 0, 0, 0, 0, time.UTC),
+		To:          time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatalf("QuerySeries(scoped legacy fixture) error = %v", err)
+	}
+	if points := legacySeries.Series[0].Points; len(points) != 0 {
+		t.Fatalf("scoped query claimed legacy blank-context metrics: %#v", points)
 	}
 
 	settings := upgraded.Settings()

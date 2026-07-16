@@ -3,10 +3,12 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 )
 
 const (
@@ -22,6 +24,7 @@ type MetricsRepository struct {
 
 type MetricsSampleRecord struct {
 	ProviderID        string
+	ContextName       string
 	ProjectID         string
 	ServiceID         string
 	ContainerID       string
@@ -42,7 +45,7 @@ type MetricsSampleRecord struct {
 }
 
 type MetricsSeriesFilter struct {
-	ProviderID  string
+	Scope       runtimescope.Scope
 	ProjectID   string
 	ContainerID string
 	Resolution  string
@@ -58,6 +61,15 @@ func (r *MetricsRepository) InsertBatch(ctx context.Context, records []MetricsSa
 	if len(records) == 0 {
 		return nil
 	}
+	records = append([]MetricsSampleRecord(nil), records...)
+	for i := range records {
+		runtimeScope, ok := runtimescope.New(records[i].ProviderID, records[i].ContextName)
+		if !ok {
+			return errors.New("metrics sample runtime scope is required")
+		}
+		records[i].ProviderID = runtimeScope.ProviderID()
+		records[i].ContextName = runtimeScope.ContextName()
+	}
 	tx, err := r.writer.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -72,6 +84,9 @@ func (r *MetricsRepository) InsertBatch(ctx context.Context, records []MetricsSa
 }
 
 func (r *MetricsRepository) QuerySeries(ctx context.Context, filter MetricsSeriesFilter) (*models.SeriesBundle, error) {
+	if !filter.Scope.Valid() {
+		return nil, errors.New("metrics series runtime scope is required")
+	}
 	resolution := filter.Resolution
 	if resolution == "" {
 		resolution = ResolutionForRange(filter.From, filter.To)
@@ -98,7 +113,8 @@ func (r *MetricsRepository) QuerySeries(ctx context.Context, filter MetricsSerie
 		WHERE resolution = ?
 			AND sampled_at >= ?
 			AND sampled_at <= ?
-			AND (? = '' OR provider_id = ?)
+			AND provider_id = ?
+			AND context_name = ?
 			AND (? = '' OR project_id = ?)
 			AND (? = '' OR container_id = ?)
 		GROUP BY sampled_at
@@ -106,7 +122,7 @@ func (r *MetricsRepository) QuerySeries(ctx context.Context, filter MetricsSerie
 	`
 	rows, err := r.reader.QueryContext(ctx, query,
 		resolution, formatTime(from), formatTime(to),
-		filter.ProviderID, filter.ProviderID,
+		filter.Scope.ProviderID(), filter.Scope.ContextName(),
 		filter.ProjectID, filter.ProjectID,
 		filter.ContainerID, filter.ContainerID,
 	)
@@ -188,12 +204,12 @@ func ResolutionForRange(from time.Time, to time.Time) string {
 func insertMetricsRecords(ctx context.Context, tx *sql.Tx, records []MetricsSampleRecord) error {
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO metrics_samples (
-			provider_id, project_id, service_id, container_id,
+			provider_id, context_name, project_id, service_id, container_id,
 			cpu_percent, cpu_percent_max, memory_bytes, memory_bytes_max,
 			memory_limit_bytes, gpu_memory_bytes, network_rx_bytes, network_tx_bytes,
 			block_read_bytes, block_write_bytes, pids, resolution, sampled_at
 		)
-		VALUES (?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''),
+		VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''),
 			?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`)
 	if err != nil {
@@ -216,7 +232,7 @@ func insertMetricsRecords(ctx context.Context, tx *sql.Tx, records []MetricsSamp
 			record.SampledAt = time.Now().UTC()
 		}
 		if _, err := stmt.ExecContext(ctx,
-			record.ProviderID, record.ProjectID, record.ServiceID, record.ContainerID,
+			record.ProviderID, record.ContextName, record.ProjectID, record.ServiceID, record.ContainerID,
 			record.CPUPercent, record.CPUPercentMax, record.MemoryBytes, record.MemoryBytesMax,
 			record.MemoryLimitBytes, record.GPUMemoryBytes, record.NetworkRXBytes, record.NetworkTXBytes,
 			record.BlockReadBytes, record.BlockWriteBytes, record.PIDs, record.Resolution,
@@ -230,7 +246,7 @@ func insertMetricsRecords(ctx context.Context, tx *sql.Tx, records []MetricsSamp
 
 func downsampleMetrics(ctx context.Context, tx *sql.Tx, fromResolution string, toResolution string, cutoff time.Time, bucketSize time.Duration) error {
 	rows, err := tx.QueryContext(ctx, `
-		SELECT provider_id, COALESCE(project_id, ''), COALESCE(service_id, ''),
+		SELECT provider_id, context_name, COALESCE(project_id, ''), COALESCE(service_id, ''),
 			COALESCE(container_id, ''), COALESCE(cpu_percent, 0),
 			COALESCE(cpu_percent_max, 0), COALESCE(memory_bytes, 0),
 			COALESCE(memory_bytes_max, 0), COALESCE(memory_limit_bytes, 0),
@@ -253,6 +269,7 @@ func downsampleMetrics(ctx context.Context, tx *sql.Tx, fromResolution string, t
 		var tsText string
 		if err := rows.Scan(
 			&record.ProviderID,
+			&record.ContextName,
 			&record.ProjectID,
 			&record.ServiceID,
 			&record.ContainerID,
@@ -278,6 +295,7 @@ func downsampleMetrics(ctx context.Context, tx *sql.Tx, fromResolution string, t
 		record.SampledAt = sampledAt
 		key := metricsBucketKey{
 			providerID:  record.ProviderID,
+			contextName: record.ContextName,
 			projectID:   record.ProjectID,
 			serviceID:   record.ServiceID,
 			containerID: record.ContainerID,
@@ -303,11 +321,12 @@ func downsampleMetrics(ctx context.Context, tx *sql.Tx, fromResolution string, t
 			DELETE FROM metrics_samples
 			WHERE resolution = ?
 				AND provider_id = ?
+				AND context_name = ?
 				AND COALESCE(project_id, '') = ?
 				AND COALESCE(service_id, '') = ?
 				AND COALESCE(container_id, '') = ?
 				AND sampled_at = ?
-		`, toResolution, key.providerID, key.projectID, key.serviceID, key.containerID, formatTime(key.bucket)); err != nil {
+		`, toResolution, key.providerID, key.contextName, key.projectID, key.serviceID, key.containerID, formatTime(key.bucket)); err != nil {
 			return err
 		}
 		records = append(records, aggregate.record(key, toResolution))
@@ -324,6 +343,7 @@ func downsampleMetrics(ctx context.Context, tx *sql.Tx, fromResolution string, t
 
 type metricsBucketKey struct {
 	providerID  string
+	contextName string
 	projectID   string
 	serviceID   string
 	containerID string
@@ -369,6 +389,7 @@ func (a *metricsAggregate) record(key metricsBucketKey, resolution string) Metri
 	}
 	return MetricsSampleRecord{
 		ProviderID:        key.providerID,
+		ContextName:       key.contextName,
 		ProjectID:         key.projectID,
 		ServiceID:         key.serviceID,
 		ContainerID:       key.containerID,

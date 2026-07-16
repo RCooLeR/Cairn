@@ -88,6 +88,44 @@ func TestSubscribeAfterCloseReturnsClosedChannel(t *testing.T) {
 	}
 }
 
+func TestCloseJoinsBackgroundSubscriptionCleanup(t *testing.T) {
+	b := New()
+	_ = b.Subscribe(context.Background(), TopicObjectsChanged, 1)
+
+	b.Close()
+
+	done := make(chan struct{})
+	go func() {
+		b.cleanup.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("Close returned before subscription cleanup completed")
+	}
+}
+
+func TestConcurrentCloseWaitsForCleanup(t *testing.T) {
+	b := New()
+	_ = b.Subscribe(context.Background(), TopicObjectsChanged, 1)
+
+	closed := make(chan struct{}, 2)
+	for range 2 {
+		go func() {
+			b.Close()
+			closed <- struct{}{}
+		}()
+	}
+	for range 2 {
+		select {
+		case <-closed:
+		case <-time.After(time.Second):
+			t.Fatal("concurrent Close did not complete")
+		}
+	}
+}
+
 func TestPublishRaceWithCloseDoesNotPanic(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

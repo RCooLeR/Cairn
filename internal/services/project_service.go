@@ -25,7 +25,7 @@ import (
 func (s *ProjectService) ListProjects(ctx context.Context) ([]models.ProjectSummary, error) {
 	unlock := s.lockRuntime()
 	defer unlock()
-	if s.Projects == nil {
+	if s.Projects == nil || !s.Scope.Valid() {
 		return nil, notReady()
 	}
 	projects, err := s.listCurrentProviderProjects(ctx)
@@ -51,10 +51,10 @@ func (s *ProjectService) ListProjects(ctx context.Context) ([]models.ProjectSumm
 }
 
 func (s *ProjectService) listCurrentProviderProjects(ctx context.Context) ([]store.ProjectRecord, error) {
-	if strings.TrimSpace(s.ProviderID) == "" {
-		return s.Projects.List(ctx)
+	if !s.Scope.Valid() {
+		return nil, notReady()
 	}
-	return s.Projects.ListByProviderContext(ctx, s.ProviderID, s.ContextName)
+	return s.Projects.ListByScope(ctx, s.Scope)
 }
 
 func (s *ProjectService) GetProject(ctx context.Context, projectID string) (*models.ProjectDetail, error) {
@@ -64,15 +64,12 @@ func (s *ProjectService) GetProject(ctx context.Context, projectID string) (*mod
 }
 
 func (s *ProjectService) getProject(ctx context.Context, projectID string) (*models.ProjectDetail, error) {
-	if s.Projects == nil {
+	if s.Projects == nil || !s.Scope.Valid() {
 		return nil, notReady()
 	}
-	project, err := s.Projects.Get(ctx, projectID)
+	project, err := s.Projects.GetInScope(ctx, s.Scope, projectID)
 	if err != nil {
 		return nil, mapStoreNotFound(err, "Project was not found")
-	}
-	if !s.projectInCurrentContext(project) {
-		return nil, apperror.New(apperror.NotFound, "Project was not found")
 	}
 	project = normalizeProjectHostPaths(project, s.PathMapper)
 	services, err := s.Projects.ListServices(ctx, projectID)
@@ -103,7 +100,7 @@ func (s *ProjectService) getProject(ctx context.Context, projectID string) (*mod
 func (s *ProjectService) ReviewImportProject(ctx context.Context, req models.ImportProjectRequest) (*models.ImportProjectReview, error) {
 	unlock := s.lockRuntime()
 	defer unlock()
-	if s.Client == nil || s.Projects == nil || strings.TrimSpace(s.ProviderID) == "" {
+	if s.Client == nil || s.Projects == nil || !s.Scope.Valid() {
 		return nil, notReady()
 	}
 	workdir, files, err := resolveImportFiles(req)
@@ -114,7 +111,7 @@ func (s *ProjectService) ReviewImportProject(ctx context.Context, req models.Imp
 	if projectName == "" {
 		projectName = "project"
 	}
-	projectID := composecore.ProjectID(s.ProviderID, projectName)
+	projectID := composecore.ProjectID(s.Scope.ProviderID(), projectName)
 	importOpts := composecore.ProjectOptions{
 		Workdir:     workdir,
 		Files:       files,
@@ -153,7 +150,7 @@ func (s *ProjectService) ReviewImportProject(ctx context.Context, req models.Imp
 func (s *ProjectService) ImportProject(ctx context.Context, req models.ImportProjectRequest) (*models.ProjectDetail, error) {
 	unlock := s.lockRuntime()
 	defer unlock()
-	if s.Client == nil || s.Projects == nil || strings.TrimSpace(s.ProviderID) == "" {
+	if s.Client == nil || s.Projects == nil || !s.Scope.Valid() {
 		return nil, notReady()
 	}
 	jobID := strings.TrimSpace(req.JobID)
@@ -175,7 +172,7 @@ func (s *ProjectService) ImportProject(ctx context.Context, req models.ImportPro
 	if projectName == "" {
 		projectName = "project"
 	}
-	projectID = composecore.ProjectID(s.ProviderID, projectName)
+	projectID = composecore.ProjectID(s.Scope.ProviderID(), projectName)
 	importOpts := composecore.ProjectOptions{
 		Workdir:     workdir,
 		Files:       files,
@@ -193,13 +190,13 @@ func (s *ProjectService) ImportProject(ctx context.Context, req models.ImportPro
 	s.publishImportJobProgress(jobID, projectID, "review", "Compose YAML valid: "+strconv.Itoa(len(config.Services))+" service(s)", progressPct(55))
 
 	now := s.now()
-	if err := s.Projects.Unforget(ctx, s.ProviderID, s.ContextName, projectName, projectID); err != nil {
+	if err := s.Projects.UnforgetInScope(ctx, s.Scope, projectName, projectID); err != nil {
 		return fail(apperror.Wrap(apperror.Internal, "Import project failed", err))
 	}
 	project := store.ProjectRecord{
 		ID:           projectID,
-		ProviderID:   s.ProviderID,
-		ContextName:  s.ContextName,
+		ProviderID:   s.Scope.ProviderID(),
+		ContextName:  s.Scope.ContextName(),
 		Name:         projectName,
 		WorkingDir:   workdir,
 		ComposeFiles: files,
@@ -228,7 +225,10 @@ func (s *ProjectService) ImportProject(ctx context.Context, req models.ImportPro
 			LastSeenAt:     now,
 		})
 	}
-	if err := s.Projects.SaveSnapshot(ctx, s.ProviderID, []store.ProjectRecord{project}, services, now, time.Time{}); err != nil {
+	if err := s.Projects.SaveSnapshot(ctx, s.Scope, []store.ProjectRecord{project}, services, now, time.Time{}); err != nil {
+		if store.IsProjectScopeConflict(err) {
+			return fail(apperror.New(apperror.Conflict, "A project with this legacy ID already belongs to another runtime context", apperror.WithCause(err)))
+		}
 		return fail(apperror.Wrap(apperror.Internal, "Import project failed", err))
 	}
 	s.publishImportJobProgress(jobID, projectID, "save", "Project saved", progressPct(100))
@@ -243,22 +243,19 @@ func (s *ProjectService) ImportProject(ctx context.Context, req models.ImportPro
 func (s *ProjectService) RemoveProjectFromList(ctx context.Context, projectID string) error {
 	unlock := s.lockRuntime()
 	defer unlock()
-	if s.Projects == nil {
+	if s.Projects == nil || !s.Scope.Valid() {
 		return notReady()
 	}
-	project, err := s.Projects.Get(ctx, projectID)
+	project, err := s.Projects.GetInScope(ctx, s.Scope, projectID)
 	if err != nil {
 		return mapStoreNotFound(err, "Project was not found")
-	}
-	if !s.projectInCurrentContext(project) {
-		return apperror.New(apperror.NotFound, "Project was not found")
 	}
 	started := time.Now().UTC()
 	if err := s.Projects.Forget(ctx, project, started); err != nil {
 		_ = s.recordProjectAudit(ctx, project, "remove_from_list", "", models.RiskSafe, "failed", time.Since(started), err)
 		return apperror.Wrap(apperror.Internal, "Remove project from list failed", err)
 	}
-	if err := s.Projects.Delete(ctx, projectID); err != nil {
+	if err := s.Projects.DeleteInScope(ctx, s.Scope, projectID); err != nil {
 		_ = s.recordProjectAudit(ctx, project, "remove_from_list", "", models.RiskSafe, "failed", time.Since(started), err)
 		return mapStoreNotFound(err, "Project was not found")
 	}
@@ -331,16 +328,22 @@ func (s *ProjectService) ApplyProjectPlan(ctx context.Context, planID string, ty
 	if err != nil {
 		return err
 	}
+	if !plan.Scope.Equal(s.Scope) {
+		return apperror.New(apperror.NotFound, "Project plan was not created for the active runtime context")
+	}
+	if _, err := s.projectRecordForCurrentContext(ctx, plan.ProjectID); err != nil {
+		return err
+	}
 	return s.runProjectAction(ctx, plan.Action, plan.ProjectID, plan.RemoveVolumes, &plan.Plan)
 }
 
 func (s *ComposeService) Config(ctx context.Context, projectID string) (*models.ComposeConfigResult, error) {
 	unlock := s.lockRuntime()
 	defer unlock()
-	if s.Client == nil || s.Projects == nil {
+	if s.Client == nil || s.Projects == nil || !s.Scope.Valid() {
 		return nil, notReady()
 	}
-	project, err := s.Projects.Get(ctx, projectID)
+	project, err := s.Projects.GetInScope(ctx, s.Scope, projectID)
 	if err != nil {
 		return nil, mapStoreNotFound(err, "Project was not found")
 	}
@@ -362,10 +365,10 @@ func (s *ComposeService) Config(ctx context.Context, projectID string) (*models.
 func (s *ComposeService) Ps(ctx context.Context, projectID string) ([]models.ComposeServiceStatus, error) {
 	unlock := s.lockRuntime()
 	defer unlock()
-	if s.Client == nil || s.Projects == nil {
+	if s.Client == nil || s.Projects == nil || !s.Scope.Valid() {
 		return nil, notReady()
 	}
-	project, err := s.Projects.Get(ctx, projectID)
+	project, err := s.Projects.GetInScope(ctx, s.Scope, projectID)
 	if err != nil {
 		return nil, mapStoreNotFound(err, "Project was not found")
 	}
@@ -514,10 +517,10 @@ func (s *ComposeService) publishJobDone(jobID string, result string, actionErr e
 }
 
 func (s *ComposeService) projectForServiceAction(ctx context.Context, projectID string, requested []string) (store.ProjectRecord, []string, error) {
-	if s.Client == nil || s.Projects == nil {
+	if s.Client == nil || s.Projects == nil || !s.Scope.Valid() {
 		return store.ProjectRecord{}, nil, notReady()
 	}
-	project, err := s.Projects.Get(ctx, projectID)
+	project, err := s.Projects.GetInScope(ctx, s.Scope, projectID)
 	if err != nil {
 		return store.ProjectRecord{}, nil, mapStoreNotFound(err, "Project was not found")
 	}
@@ -596,7 +599,7 @@ func (s *ProjectService) hydrateUpdateBadges(ctx context.Context, summaries []mo
 	for _, summary := range summaries {
 		projectIDs = append(projectIDs, summary.ID)
 	}
-	badgesByProject, err := s.Updates.BadgesByProjectIDs(ctx, projectIDs)
+	badgesByProject, err := s.Updates.BadgesByProjectIDsInScope(ctx, s.Scope, projectIDs)
 	if err != nil {
 		return apperror.Wrap(apperror.Internal, "Load project update badges failed", err)
 	}
@@ -621,7 +624,7 @@ func (s *ProjectService) projectContainers(ctx context.Context, project store.Pr
 	if s.Objects == nil {
 		return nil, nil
 	}
-	records, err := s.Objects.ListContainers(ctx, project.ProviderID)
+	records, err := s.Objects.ListContainersScoped(ctx, s.Scope)
 	if err != nil {
 		return nil, apperror.Wrap(apperror.Internal, "List project containers failed", err)
 	}
@@ -705,7 +708,7 @@ func (s *ProjectService) planProjectAction(ctx context.Context, action string, p
 			return nil, apperror.New(apperror.NotFound, "No project containers were found", apperror.WithDetail(project.ID))
 		}
 		plan := newStaleProjectDownPlan(project, containers, removeVolumes, s.now())
-		projectPlan, err := security.NewProjectActionPlan(plan, action, project.ID, removeVolumes)
+		projectPlan, err := security.NewProjectActionPlan(plan, action, project.ID, removeVolumes, s.Scope)
 		if err != nil {
 			return nil, err
 		}
@@ -715,7 +718,7 @@ func (s *ProjectService) planProjectAction(ctx context.Context, action string, p
 		return &plan, nil
 	}
 	plan := newProjectCommandPlan(project, action, removeVolumes, s.now())
-	projectPlan, err := security.NewProjectActionPlan(plan, action, project.ID, removeVolumes)
+	projectPlan, err := security.NewProjectActionPlan(plan, action, project.ID, removeVolumes, s.Scope)
 	if err != nil {
 		return nil, err
 	}
@@ -879,15 +882,12 @@ func (s *ProjectService) projectForAction(ctx context.Context, projectID string)
 }
 
 func (s *ProjectService) projectRecordForCurrentContext(ctx context.Context, projectID string) (store.ProjectRecord, error) {
-	if s.Projects == nil {
+	if s.Projects == nil || !s.Scope.Valid() {
 		return store.ProjectRecord{}, notReady()
 	}
-	project, err := s.Projects.Get(ctx, projectID)
+	project, err := s.Projects.GetInScope(ctx, s.Scope, projectID)
 	if err != nil {
 		return store.ProjectRecord{}, mapStoreNotFound(err, "Project was not found")
-	}
-	if !s.projectInCurrentContext(project) {
-		return store.ProjectRecord{}, apperror.New(apperror.NotFound, "Project was not found")
 	}
 	project = normalizeProjectHostPaths(project, s.PathMapper)
 	return project, nil
@@ -1532,13 +1532,7 @@ func (s *ProjectService) now() time.Time {
 }
 
 func (s *ProjectService) projectInCurrentContext(project store.ProjectRecord) bool {
-	if providerID := strings.TrimSpace(s.ProviderID); providerID != "" && project.ProviderID != providerID {
-		return false
-	}
-	if contextName := strings.TrimSpace(s.ContextName); contextName != "" && project.ContextName != contextName {
-		return false
-	}
-	return true
+	return s.Scope.Matches(project.ProviderID, project.ContextName)
 }
 
 func mapStoreNotFound(err error, message string) error {

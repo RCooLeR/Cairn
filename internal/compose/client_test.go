@@ -8,10 +8,12 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/providers"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 )
 
 func TestClientRunsProviderWithArgvWorkdirEnv(t *testing.T) {
@@ -69,6 +71,64 @@ func TestClientMapsHostProjectPathsBeforeComposeRun(t *testing.T) {
 	if got, want := runner.calls[0].args, []string{"-f", backendFile, "config"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("args = %#v, want %#v", got, want)
 	}
+}
+
+func TestClientRuntimeScopeBindingIsOneShotAndRejectsTargetChange(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	runner := &scopeRunner{id: "provider", contextName: "context-a"}
+	client := NewClient(runner)
+	scopeA := runtimescope.Must("provider", "context-a")
+	if err := client.BindRuntimeScope(scopeA); err != nil {
+		t.Fatalf("BindRuntimeScope(A) error = %v", err)
+	}
+	if err := client.BindRuntimeScope(scopeA); err != nil {
+		t.Fatalf("BindRuntimeScope(A again) error = %v", err)
+	}
+	if err := client.BindRuntimeScope(runtimescope.Must("provider", "context-b")); !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("BindRuntimeScope(B) error = %v, want conflict", err)
+	}
+	if _, err := client.Config(ctx, ProjectOptions{}); err != nil {
+		t.Fatalf("Config(A) error = %v", err)
+	}
+	if got := runner.callCount(); got != 1 {
+		t.Fatalf("runner calls = %d, want 1", got)
+	}
+
+	runner.setContext("context-b")
+	if _, err := client.Config(ctx, ProjectOptions{}); !apperror.IsCode(err, apperror.NotFound) {
+		t.Fatalf("Config(after target change) error = %v, want not found", err)
+	}
+	if got := runner.callCount(); got != 1 {
+		t.Fatalf("runner called after scope mismatch: %d", got)
+	}
+}
+
+func TestClientRuntimeScopeBindingIsRaceSafe(t *testing.T) {
+	t.Parallel()
+	runner := &scopeRunner{id: "provider", contextName: "context-a"}
+	client := NewClient(runner)
+	scope := runtimescope.Must("provider", "context-a")
+	if err := client.BindRuntimeScope(scope); err != nil {
+		t.Fatalf("BindRuntimeScope() error = %v", err)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if err := client.BindRuntimeScope(scope); err != nil {
+				t.Errorf("concurrent BindRuntimeScope() error = %v", err)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			if _, err := client.Config(context.Background(), ProjectOptions{}); err != nil {
+				t.Errorf("concurrent Config() error = %v", err)
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 func TestClientBuildAddsCairnLabelsDeterministically(t *testing.T) {
@@ -235,6 +295,44 @@ type fakeRunner struct {
 	calls         []fakeCall
 	hostToBackend map[string]string
 	backendToHost map[string]string
+}
+
+type scopeRunner struct {
+	mu          sync.Mutex
+	id          string
+	contextName string
+	calls       int
+}
+
+func (r *scopeRunner) ID() string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.id
+}
+
+func (r *scopeRunner) DockerContext(context.Context) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.contextName, nil
+}
+
+func (r *scopeRunner) RunCompose(context.Context, string, ...string) (*providers.CommandResult, error) {
+	r.mu.Lock()
+	r.calls++
+	r.mu.Unlock()
+	return &providers.CommandResult{Stdout: "services: {}\n"}, nil
+}
+
+func (r *scopeRunner) setContext(value string) {
+	r.mu.Lock()
+	r.contextName = value
+	r.mu.Unlock()
+}
+
+func (r *scopeRunner) callCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
 }
 
 type fakeCall struct {

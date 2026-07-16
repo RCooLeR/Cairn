@@ -4,10 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"strings"
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 )
 
 type UpdateRepository struct {
@@ -21,6 +23,7 @@ type updateCheckExecutor interface {
 type UpdateCheckRecord struct {
 	ID                int64
 	ProviderID        string
+	ContextName       string
 	ProjectID         string
 	ServiceID         string
 	ContainerID       string
@@ -42,6 +45,7 @@ type UpdateCheckRecord struct {
 type IgnoredUpdateRecord struct {
 	ID           int64
 	ProviderID   string
+	ContextName  string
 	ImageRef     string
 	UpdateKind   models.UpdateKind
 	BaseImageRef string
@@ -54,6 +58,7 @@ type IgnoredUpdateRecord struct {
 type UpdateHistoryRecord struct {
 	ID             int64
 	ProviderID     string
+	ContextName    string
 	ProjectID      string
 	ServiceID      string
 	UpdateKind     models.UpdateKind
@@ -84,6 +89,16 @@ func (r *UpdateRepository) InsertCheck(ctx context.Context, record UpdateCheckRe
 	return insertCheck(ctx, r.db, record)
 }
 
+func (r *UpdateRepository) InsertCheckInScope(ctx context.Context, scope runtimescope.Scope, record UpdateCheckRecord) (int64, error) {
+	if !scope.Valid() {
+		return 0, errors.New("runtime scope is required")
+	}
+	if !scope.Matches(record.ProviderID, record.ContextName) {
+		return 0, errors.New("update check does not belong to the runtime scope")
+	}
+	return insertCheck(ctx, r.db, record)
+}
+
 func insertCheck(ctx context.Context, exec updateCheckExecutor, record UpdateCheckRecord) (int64, error) {
 	if record.CheckedAt.IsZero() {
 		record.CheckedAt = time.Now().UTC()
@@ -102,16 +117,16 @@ func insertCheck(ctx context.Context, exec updateCheckExecutor, record UpdateChe
 	}
 	result, err := exec.ExecContext(ctx, `
 		INSERT INTO image_update_checks (
-			provider_id, project_id, service_id, container_id, kind, image_ref,
+			provider_id, context_name, project_id, service_id, container_id, kind, image_ref,
 			base_image_ref, local_image_id, local_digest, remote_digest,
 			lineage_id, base_image_ref_id, confidence, recommended_action,
 			status, checked_at, error
 		)
-		VALUES (?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?, ?,
+		VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?, ?,
 			NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''),
 			NULLIF(?, 0), NULLIF(?, 0), NULLIF(?, ''), NULLIF(?, ''),
 			?, ?, NULLIF(?, ''))
-	`, record.ProviderID, record.ProjectID, record.ServiceID, record.ContainerID,
+	`, record.ProviderID, record.ContextName, record.ProjectID, record.ServiceID, record.ContainerID,
 		string(record.Kind), record.ImageRef, record.BaseImageRef, record.LocalImageID,
 		record.LocalDigest, record.RemoteDigest, record.LineageID, record.BaseImageRefID,
 		string(record.Confidence), string(record.RecommendedAction), string(record.Status),
@@ -123,6 +138,17 @@ func insertCheck(ctx context.Context, exec updateCheckExecutor, record UpdateChe
 }
 
 func (r *UpdateRepository) InsertChecks(ctx context.Context, records []UpdateCheckRecord) error {
+	return r.insertChecks(ctx, runtimescope.Scope{}, records)
+}
+
+func (r *UpdateRepository) InsertChecksInScope(ctx context.Context, scope runtimescope.Scope, records []UpdateCheckRecord) error {
+	if !scope.Valid() {
+		return errors.New("runtime scope is required")
+	}
+	return r.insertChecks(ctx, scope, records)
+}
+
+func (r *UpdateRepository) insertChecks(ctx context.Context, scope runtimescope.Scope, records []UpdateCheckRecord) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -131,6 +157,9 @@ func (r *UpdateRepository) InsertChecks(ctx context.Context, records []UpdateChe
 		_ = tx.Rollback()
 	}()
 	for _, record := range records {
+		if scope.Valid() && !scope.Matches(record.ProviderID, record.ContextName) {
+			return errors.New("update check does not belong to the runtime scope")
+		}
 		if _, err := insertCheck(ctx, tx, record); err != nil {
 			return err
 		}
@@ -143,12 +172,31 @@ func (r *UpdateRepository) GetCheck(ctx context.Context, id int64) (UpdateCheckR
 	return scanUpdateCheck(row)
 }
 
+func (r *UpdateRepository) GetCheckInScope(ctx context.Context, scope runtimescope.Scope, id int64) (UpdateCheckRecord, error) {
+	if !scope.Valid() {
+		return UpdateCheckRecord{}, errors.New("runtime scope is required")
+	}
+	row := r.db.QueryRowContext(ctx, updateCheckSelectSQL()+` WHERE id = ? AND provider_id = ? AND context_name = ?`, id, scope.ProviderID(), scope.ContextName())
+	return scanUpdateCheck(row)
+}
+
 func (r *UpdateRepository) ListCurrent(ctx context.Context, filter models.UpdateFilter) ([]UpdateCheckRecord, error) {
-	records, err := r.listLatestChecks(ctx, filter.ProjectID)
+	return r.listCurrent(ctx, runtimescope.Scope{}, filter)
+}
+
+func (r *UpdateRepository) ListCurrentInScope(ctx context.Context, scope runtimescope.Scope, filter models.UpdateFilter) ([]UpdateCheckRecord, error) {
+	if !scope.Valid() {
+		return nil, errors.New("runtime scope is required")
+	}
+	return r.listCurrent(ctx, scope, filter)
+}
+
+func (r *UpdateRepository) listCurrent(ctx context.Context, scope runtimescope.Scope, filter models.UpdateFilter) ([]UpdateCheckRecord, error) {
+	records, err := r.listLatestChecks(ctx, scope, filter.ProjectID)
 	if err != nil {
 		return nil, err
 	}
-	ignored, err := r.listIgnored(ctx)
+	ignored, err := r.listIgnored(ctx, scope)
 	if err != nil {
 		return nil, err
 	}
@@ -189,6 +237,17 @@ func (r *UpdateRepository) Badges(ctx context.Context, projectID string) (models
 }
 
 func (r *UpdateRepository) BadgesByProjectIDs(ctx context.Context, projectIDs []string) (map[string]models.UpdateBadges, error) {
+	return r.badgesByProjectIDs(ctx, runtimescope.Scope{}, projectIDs)
+}
+
+func (r *UpdateRepository) BadgesByProjectIDsInScope(ctx context.Context, scope runtimescope.Scope, projectIDs []string) (map[string]models.UpdateBadges, error) {
+	if !scope.Valid() {
+		return nil, errors.New("runtime scope is required")
+	}
+	return r.badgesByProjectIDs(ctx, scope, projectIDs)
+}
+
+func (r *UpdateRepository) badgesByProjectIDs(ctx context.Context, scope runtimescope.Scope, projectIDs []string) (map[string]models.UpdateBadges, error) {
 	badgesByProject := make(map[string]models.UpdateBadges, len(projectIDs))
 	if len(projectIDs) == 0 {
 		return badgesByProject, nil
@@ -205,16 +264,53 @@ func (r *UpdateRepository) BadgesByProjectIDs(ctx context.Context, projectIDs []
 	if len(wanted) == 0 {
 		return badgesByProject, nil
 	}
-	records, err := r.listLatestChecks(ctx, "")
+	allowed := wanted
+	if scope.Valid() {
+		allowed = make(map[string]struct{}, len(wanted))
+		args := []any{scope.ProviderID(), scope.ContextName()}
+		placeholders := make([]string, 0, len(wanted))
+		for projectID := range wanted {
+			placeholders = append(placeholders, "?")
+			args = append(args, projectID)
+		}
+		rows, err := r.db.QueryContext(ctx, `
+			SELECT id FROM projects
+			WHERE provider_id = ? AND context_name = ?
+				AND id IN (`+strings.Join(placeholders, ",")+`)
+		`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var projectID string
+			if err := rows.Scan(&projectID); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			allowed[projectID] = struct{}{}
+		}
+		rowsErr := rows.Err()
+		closeErr := rows.Close()
+		if rowsErr != nil {
+			return nil, rowsErr
+		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+	}
+	records, err := r.listLatestChecks(ctx, scope, "")
 	if err != nil {
 		return nil, err
 	}
-	ignored, err := r.listIgnored(ctx)
+	ignored, err := r.listIgnored(ctx, scope)
 	if err != nil {
 		return nil, err
 	}
 	for _, record := range records {
-		if _, ok := wanted[record.ProjectID]; !ok {
+		if scope.Valid() && !scope.Matches(record.ProviderID, record.ContextName) {
+			continue
+		}
+		if _, ok := allowed[record.ProjectID]; !ok {
 			continue
 		}
 		if _, ok := matchingIgnore(ignored, record); ok {
@@ -239,6 +335,17 @@ func (r *UpdateRepository) BadgesByProjectIDs(ctx context.Context, projectIDs []
 }
 
 func (r *UpdateRepository) IgnoreCheck(ctx context.Context, id int64, reason string, createdAt time.Time) error {
+	return r.ignoreCheck(ctx, runtimescope.Scope{}, id, reason, createdAt)
+}
+
+func (r *UpdateRepository) IgnoreCheckInScope(ctx context.Context, scope runtimescope.Scope, id int64, reason string, createdAt time.Time) error {
+	if !scope.Valid() {
+		return errors.New("runtime scope is required")
+	}
+	return r.ignoreCheck(ctx, scope, id, reason, createdAt)
+}
+
+func (r *UpdateRepository) ignoreCheck(ctx context.Context, scope runtimescope.Scope, id int64, reason string, createdAt time.Time) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -246,7 +353,13 @@ func (r *UpdateRepository) IgnoreCheck(ctx context.Context, id int64, reason str
 	defer func() {
 		_ = tx.Rollback()
 	}()
-	check, err := scanUpdateCheck(tx.QueryRowContext(ctx, updateCheckSelectSQL()+` WHERE id = ?`, id))
+	query := updateCheckSelectSQL() + ` WHERE id = ?`
+	args := []any{id}
+	if scope.Valid() {
+		query += ` AND provider_id = ? AND context_name = ?`
+		args = append(args, scope.ProviderID(), scope.ContextName())
+	}
+	check, err := scanUpdateCheck(tx.QueryRowContext(ctx, query, args...))
 	if err != nil {
 		return err
 	}
@@ -262,6 +375,7 @@ func (r *UpdateRepository) IgnoreCheck(ctx context.Context, id int64, reason str
 func upsertIgnoredUpdate(ctx context.Context, tx *sql.Tx, check UpdateCheckRecord, reason string, createdAt time.Time) error {
 	args := []any{
 		check.ProviderID,
+		check.ContextName,
 		check.ImageRef,
 		string(check.Kind),
 		check.BaseImageRef,
@@ -273,6 +387,7 @@ func upsertIgnoredUpdate(ctx context.Context, tx *sql.Tx, check UpdateCheckRecor
 			UPDATE ignored_updates
 			SET reason = NULLIF(?, ''), created_at = ?
 			WHERE provider_id = ?
+				AND context_name = ?
 				AND image_ref = ?
 				AND update_kind = ?
 				AND COALESCE(base_image_ref, '') = ?
@@ -289,10 +404,10 @@ func upsertIgnoredUpdate(ctx context.Context, tx *sql.Tx, check UpdateCheckRecor
 	}
 	_, insertErr := tx.ExecContext(ctx, `
 		INSERT INTO ignored_updates (
-			provider_id, image_ref, update_kind, base_image_ref, project_id,
+			provider_id, context_name, image_ref, update_kind, base_image_ref, project_id,
 			service_id, reason, created_at
 		)
-		VALUES (?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''),
+		VALUES (?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''),
 			NULLIF(?, ''), ?)
 	`, append(args, reason, formatTime(createdAt))...)
 	if insertErr == nil {
@@ -309,7 +424,77 @@ func (r *UpdateRepository) Unignore(ctx context.Context, id int64) error {
 	return err
 }
 
+func (r *UpdateRepository) UnignoreInScope(ctx context.Context, scope runtimescope.Scope, id int64) error {
+	if !scope.Valid() {
+		return errors.New("runtime scope is required")
+	}
+	result, err := r.db.ExecContext(ctx, `
+		DELETE FROM ignored_updates
+		WHERE id = ? AND provider_id = ? AND context_name = ?
+	`, id, scope.ProviderID(), scope.ContextName())
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+func (r *UpdateRepository) GetIgnored(ctx context.Context, id int64) (IgnoredUpdateRecord, error) {
+	var record IgnoredUpdateRecord
+	var createdAt string
+	err := r.db.QueryRowContext(ctx, `
+		SELECT id, provider_id, context_name, image_ref, update_kind, COALESCE(base_image_ref, ''),
+			COALESCE(project_id, ''), COALESCE(service_id, ''), COALESCE(reason, ''), created_at
+		FROM ignored_updates
+		WHERE id = ?
+	`, id).Scan(&record.ID, &record.ProviderID, &record.ContextName, &record.ImageRef, &record.UpdateKind, &record.BaseImageRef, &record.ProjectID, &record.ServiceID, &record.Reason, &createdAt)
+	if err != nil {
+		return IgnoredUpdateRecord{}, err
+	}
+	record.CreatedAt = parseStoreTime(createdAt)
+	return record, nil
+}
+
+func (r *UpdateRepository) GetIgnoredInScope(ctx context.Context, scope runtimescope.Scope, id int64) (IgnoredUpdateRecord, error) {
+	if !scope.Valid() {
+		return IgnoredUpdateRecord{}, errors.New("runtime scope is required")
+	}
+	var record IgnoredUpdateRecord
+	var createdAt string
+	err := r.db.QueryRowContext(ctx, `
+		SELECT id, provider_id, context_name, image_ref, update_kind, COALESCE(base_image_ref, ''),
+			COALESCE(project_id, ''), COALESCE(service_id, ''), COALESCE(reason, ''), created_at
+		FROM ignored_updates
+		WHERE id = ? AND provider_id = ? AND context_name = ?
+	`, id, scope.ProviderID(), scope.ContextName()).Scan(&record.ID, &record.ProviderID, &record.ContextName, &record.ImageRef, &record.UpdateKind, &record.BaseImageRef, &record.ProjectID, &record.ServiceID, &record.Reason, &createdAt)
+	if err != nil {
+		return IgnoredUpdateRecord{}, err
+	}
+	record.CreatedAt = parseStoreTime(createdAt)
+	return record, nil
+}
+
 func (r *UpdateRepository) InsertHistory(ctx context.Context, record UpdateHistoryRecord) (int64, error) {
+	return r.insertHistory(ctx, record)
+}
+
+func (r *UpdateRepository) InsertHistoryInScope(ctx context.Context, scope runtimescope.Scope, record UpdateHistoryRecord) (int64, error) {
+	if !scope.Valid() {
+		return 0, errors.New("runtime scope is required")
+	}
+	if !scope.Matches(record.ProviderID, record.ContextName) {
+		return 0, errors.New("update history does not belong to the runtime scope")
+	}
+	return r.insertHistory(ctx, record)
+}
+
+func (r *UpdateRepository) insertHistory(ctx context.Context, record UpdateHistoryRecord) (int64, error) {
 	if record.StartedAt.IsZero() {
 		record.StartedAt = time.Now().UTC()
 	}
@@ -326,16 +511,16 @@ func (r *UpdateRepository) InsertHistory(ctx context.Context, record UpdateHisto
 	}
 	result, err := r.db.ExecContext(ctx, `
 		INSERT INTO update_history (
-			provider_id, project_id, service_id, update_kind, image_ref, base_image_ref,
+			provider_id, context_name, project_id, service_id, update_kind, image_ref, base_image_ref,
 			old_image_id, old_digest, old_base_digest, new_image_id, new_digest,
 			new_base_digest, dockerfile_hash, build_args_json, commands_json,
 			result, health_result, rollback_status, started_at, finished_at, error
 		)
-		VALUES (?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, NULLIF(?, ''),
+		VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, NULLIF(?, ''),
 			NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''),
 			NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, '{}'), NULLIF(?, '[]'),
 			?, NULLIF(?, ''), NULLIF(?, ''), ?, NULLIF(?, ''), NULLIF(?, ''))
-	`, record.ProviderID, record.ProjectID, record.ServiceID, string(record.UpdateKind),
+	`, record.ProviderID, record.ContextName, record.ProjectID, record.ServiceID, string(record.UpdateKind),
 		record.ImageRef, record.BaseImageRef, record.OldImageID, record.OldDigest,
 		record.OldBaseDigest, record.NewImageID, record.NewDigest, record.NewBaseDigest,
 		record.DockerfileHash, buildArgs, commands, record.Result, record.HealthResult,
@@ -348,10 +533,21 @@ func (r *UpdateRepository) InsertHistory(ctx context.Context, record UpdateHisto
 }
 
 func (r *UpdateRepository) FinishHistory(ctx context.Context, id int64, record UpdateHistoryRecord) error {
+	return r.finishHistory(ctx, runtimescope.Scope{}, id, record)
+}
+
+func (r *UpdateRepository) FinishHistoryInScope(ctx context.Context, scope runtimescope.Scope, id int64, record UpdateHistoryRecord) error {
+	if !scope.Valid() {
+		return errors.New("runtime scope is required")
+	}
+	return r.finishHistory(ctx, scope, id, record)
+}
+
+func (r *UpdateRepository) finishHistory(ctx context.Context, scope runtimescope.Scope, id int64, record UpdateHistoryRecord) error {
 	if record.FinishedAt.IsZero() {
 		record.FinishedAt = time.Now().UTC()
 	}
-	_, err := r.db.ExecContext(ctx, `
+	query := `
 		UPDATE update_history
 		SET new_image_id = COALESCE(NULLIF(?, ''), new_image_id),
 			new_digest = COALESCE(NULLIF(?, ''), new_digest),
@@ -361,16 +557,44 @@ func (r *UpdateRepository) FinishHistory(ctx context.Context, id int64, record U
 			rollback_status = NULLIF(?, ''),
 			finished_at = ?,
 			error = NULLIF(?, '')
-		WHERE id = ?
-	`, record.NewImageID, record.NewDigest, record.NewBaseDigest, record.Result,
+		WHERE id = ?`
+	args := []any{record.NewImageID, record.NewDigest, record.NewBaseDigest, record.Result,
 		record.HealthResult, record.RollbackStatus, formatTime(record.FinishedAt),
-		record.Error, id)
-	return err
+		record.Error, id}
+	if scope.Valid() {
+		query += ` AND provider_id = ? AND context_name = ?`
+		args = append(args, scope.ProviderID(), scope.ContextName())
+	}
+	result, err := r.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	if scope.Valid() {
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rows == 0 {
+			return sql.ErrNoRows
+		}
+	}
+	return nil
 }
 
 func (r *UpdateRepository) GetHistory(ctx context.Context, id int64) (UpdateHistoryRecord, error) {
-	row := r.db.QueryRowContext(ctx, `
-		SELECT id, provider_id, COALESCE(project_id, ''), COALESCE(service_id, ''),
+	return r.getHistory(ctx, runtimescope.Scope{}, id)
+}
+
+func (r *UpdateRepository) GetHistoryInScope(ctx context.Context, scope runtimescope.Scope, id int64) (UpdateHistoryRecord, error) {
+	if !scope.Valid() {
+		return UpdateHistoryRecord{}, errors.New("runtime scope is required")
+	}
+	return r.getHistory(ctx, scope, id)
+}
+
+func (r *UpdateRepository) getHistory(ctx context.Context, scope runtimescope.Scope, id int64) (UpdateHistoryRecord, error) {
+	query := `
+		SELECT id, provider_id, context_name, COALESCE(project_id, ''), COALESCE(service_id, ''),
 			update_kind, image_ref, COALESCE(base_image_ref, ''),
 			COALESCE(old_image_id, ''), COALESCE(old_digest, ''),
 			COALESCE(old_base_digest, ''), COALESCE(new_image_id, ''),
@@ -380,27 +604,55 @@ func (r *UpdateRepository) GetHistory(ctx context.Context, id int64) (UpdateHist
 			started_at, COALESCE(finished_at, ''), COALESCE(rollback_status, ''),
 			COALESCE(error, '')
 		FROM update_history
-		WHERE id = ?
-	`, id)
+		WHERE id = ?`
+	args := []any{id}
+	if scope.Valid() {
+		query += ` AND provider_id = ? AND context_name = ?`
+		args = append(args, scope.ProviderID(), scope.ContextName())
+	}
+	row := r.db.QueryRowContext(ctx, query, args...)
 	return scanUpdateHistory(row)
 }
 
 func (r *UpdateRepository) ListHistory(ctx context.Context, filter models.UpdateHistoryFilter) ([]UpdateHistoryRecord, error) {
+	return r.listHistory(ctx, runtimescope.Scope{}, filter)
+}
+
+func (r *UpdateRepository) ListHistoryInScope(ctx context.Context, scope runtimescope.Scope, filter models.UpdateHistoryFilter) ([]UpdateHistoryRecord, error) {
+	if !scope.Valid() {
+		return nil, errors.New("runtime scope is required")
+	}
+	return r.listHistory(ctx, scope, filter)
+}
+
+func (r *UpdateRepository) listHistory(ctx context.Context, scope runtimescope.Scope, filter models.UpdateHistoryFilter) ([]UpdateHistoryRecord, error) {
 	limit := filter.Limit
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, provider_id, COALESCE(project_id, ''), COALESCE(service_id, ''),
+	query := `
+		SELECT id, provider_id, context_name, COALESCE(project_id, ''), COALESCE(service_id, ''),
 			update_kind, image_ref, COALESCE(base_image_ref, ''), result,
 			started_at, COALESCE(finished_at, ''), COALESCE(rollback_status, ''),
 			COALESCE(error, '')
 		FROM update_history
-		WHERE (? = '' OR project_id = ?)
+		WHERE `
+	args := make([]any, 0, 9)
+	if scope.Valid() {
+		query += `provider_id = ? AND context_name = ?
+		  AND project_id IN (
+			SELECT id FROM projects WHERE provider_id = ? AND context_name = ?
+		  )
+		  AND `
+		args = append(args, scope.ProviderID(), scope.ContextName(), scope.ProviderID(), scope.ContextName())
+	}
+	query += `(? = '' OR project_id = ?)
 		  AND (? = '' OR service_id = ?)
 		ORDER BY started_at DESC, id DESC
 		LIMIT ?
-	`, filter.ProjectID, filter.ProjectID, filter.Service, filter.Service, limit)
+	`
+	args = append(args, filter.ProjectID, filter.ProjectID, filter.Service, filter.Service, limit)
+	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -415,6 +667,7 @@ func (r *UpdateRepository) ListHistory(ctx context.Context, filter models.Update
 		if err := rows.Scan(
 			&record.ID,
 			&record.ProviderID,
+			&record.ContextName,
 			&record.ProjectID,
 			&record.ServiceID,
 			&record.UpdateKind,
@@ -444,6 +697,7 @@ func scanUpdateHistory(scanner updateHistoryScanner) (UpdateHistoryRecord, error
 	if err := scanner.Scan(
 		&record.ID,
 		&record.ProviderID,
+		&record.ContextName,
 		&record.ProjectID,
 		&record.ServiceID,
 		&record.UpdateKind,
@@ -482,19 +736,27 @@ type updateHistoryScanner interface {
 	Scan(dest ...any) error
 }
 
-func (r *UpdateRepository) listLatestChecks(ctx context.Context, projectID string) ([]UpdateCheckRecord, error) {
+func (r *UpdateRepository) listLatestChecks(ctx context.Context, scope runtimescope.Scope, projectID string) ([]UpdateCheckRecord, error) {
 	args := []any{}
 	query := updateCheckSelectSQL() + `
 		JOIN (
 			SELECT MAX(id) AS latest_id
 			FROM image_update_checks
 `
+	conditions := make([]string, 0, 2)
+	if scope.Valid() {
+		conditions = append(conditions, `provider_id = ? AND context_name = ?`)
+		args = append(args, scope.ProviderID(), scope.ContextName())
+	}
 	if projectID != "" {
-		query += `			WHERE COALESCE(project_id, '') = ?
-`
+		conditions = append(conditions, `COALESCE(project_id, '') = ?`)
 		args = append(args, projectID)
 	}
-	query += `			GROUP BY COALESCE(project_id, ''), provider_id, COALESCE(service_id, ''),
+	if len(conditions) > 0 {
+		query += `			WHERE ` + strings.Join(conditions, ` AND `) + `
+`
+	}
+	query += `			GROUP BY COALESCE(project_id, ''), provider_id, context_name, COALESCE(service_id, ''),
 				COALESCE(container_id, ''), kind, image_ref, COALESCE(base_image_ref, '')
 		) latest ON latest.latest_id = image_update_checks.id
 		ORDER BY COALESCE(project_id, ''), COALESCE(service_id, ''), kind, image_ref, COALESCE(base_image_ref, '')
@@ -517,14 +779,22 @@ func (r *UpdateRepository) listLatestChecks(ctx context.Context, projectID strin
 	return records, rows.Err()
 }
 
-func (r *UpdateRepository) listIgnored(ctx context.Context) ([]IgnoredUpdateRecord, error) {
-	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, provider_id, image_ref, update_kind, COALESCE(base_image_ref, ''),
+func (r *UpdateRepository) listIgnored(ctx context.Context, scope runtimescope.Scope) ([]IgnoredUpdateRecord, error) {
+	query := `
+		SELECT id, provider_id, context_name, image_ref, update_kind, COALESCE(base_image_ref, ''),
 			COALESCE(project_id, ''), COALESCE(service_id, ''), COALESCE(reason, ''),
 			created_at
 		FROM ignored_updates
+	`
+	args := []any{}
+	if scope.Valid() {
+		query += ` WHERE provider_id = ? AND context_name = ?`
+		args = append(args, scope.ProviderID(), scope.ContextName())
+	}
+	query += `
 		ORDER BY created_at DESC, id DESC
-	`)
+	`
+	rows, err := r.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -538,6 +808,7 @@ func (r *UpdateRepository) listIgnored(ctx context.Context) ([]IgnoredUpdateReco
 		if err := rows.Scan(
 			&record.ID,
 			&record.ProviderID,
+			&record.ContextName,
 			&record.ImageRef,
 			&record.UpdateKind,
 			&record.BaseImageRef,
@@ -556,7 +827,7 @@ func (r *UpdateRepository) listIgnored(ctx context.Context) ([]IgnoredUpdateReco
 
 func updateCheckSelectSQL() string {
 	return `
-		SELECT id, provider_id, COALESCE(project_id, ''), COALESCE(service_id, ''),
+		SELECT id, provider_id, context_name, COALESCE(project_id, ''), COALESCE(service_id, ''),
 			COALESCE(container_id, ''), kind, image_ref, COALESCE(base_image_ref, ''),
 			COALESCE(local_image_id, ''), COALESCE(local_digest, ''),
 			COALESCE(remote_digest, ''), COALESCE(lineage_id, 0),
@@ -576,6 +847,7 @@ func scanUpdateCheck(scanner updateCheckScanner) (UpdateCheckRecord, error) {
 	if err := scanner.Scan(
 		&record.ID,
 		&record.ProviderID,
+		&record.ContextName,
 		&record.ProjectID,
 		&record.ServiceID,
 		&record.ContainerID,
@@ -606,22 +878,52 @@ func scanUpdateCheck(scanner updateCheckScanner) (UpdateCheckRecord, error) {
 }
 
 func (r *LineageRepository) UpdateBaseRefCheck(ctx context.Context, id int64, localDigest string, remoteDigest string, status models.UpdateStatus, checkedAt time.Time, checkErr string) error {
+	return r.updateBaseRefCheck(ctx, runtimescope.Scope{}, id, localDigest, remoteDigest, status, checkedAt, checkErr)
+}
+
+func (r *LineageRepository) UpdateBaseRefCheckInScope(ctx context.Context, scope runtimescope.Scope, id int64, localDigest string, remoteDigest string, status models.UpdateStatus, checkedAt time.Time, checkErr string) error {
+	if !scope.Valid() {
+		return errors.New("runtime scope is required")
+	}
+	return r.updateBaseRefCheck(ctx, scope, id, localDigest, remoteDigest, status, checkedAt, checkErr)
+}
+
+func (r *LineageRepository) updateBaseRefCheck(ctx context.Context, scope runtimescope.Scope, id int64, localDigest string, remoteDigest string, status models.UpdateStatus, checkedAt time.Time, checkErr string) error {
 	if checkedAt.IsZero() {
 		checkedAt = time.Now().UTC()
 	}
 	if status == "" {
 		status = models.UpdateStatusUnknown
 	}
-	_, err := r.db.ExecContext(ctx, `
+	query := `
 		UPDATE base_image_refs
 		SET local_digest = NULLIF(?, ''),
 			remote_digest = NULLIF(?, ''),
 			status = ?,
 			last_checked_at = ?,
 			error = NULLIF(?, '')
-		WHERE id = ?
-	`, localDigest, remoteDigest, string(status), formatTime(checkedAt), checkErr, id)
-	return err
+		WHERE id = ?`
+	args := []any{localDigest, remoteDigest, string(status), formatTime(checkedAt), checkErr, id}
+	if scope.Valid() {
+		query += ` AND lineage_id IN (
+			SELECT id FROM image_lineage WHERE provider_id = ? AND context_name = ?
+		)`
+		args = append(args, scope.ProviderID(), scope.ContextName())
+	}
+	result, err := r.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	if scope.Valid() {
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rows == 0 {
+			return sql.ErrNoRows
+		}
+	}
+	return nil
 }
 
 func (r UpdateCheckRecord) ToModel() models.ImageUpdate {
@@ -694,7 +996,7 @@ func matchingIgnore(rules []IgnoredUpdateRecord, check UpdateCheckRecord) (int64
 }
 
 func ignoreRuleMatches(rule IgnoredUpdateRecord, check UpdateCheckRecord) bool {
-	if rule.ProviderID != check.ProviderID || rule.UpdateKind != check.Kind || rule.ImageRef != check.ImageRef {
+	if rule.ProviderID != check.ProviderID || rule.ContextName != check.ContextName || rule.UpdateKind != check.Kind || rule.ImageRef != check.ImageRef {
 		return false
 	}
 	if rule.BaseImageRef != check.BaseImageRef {

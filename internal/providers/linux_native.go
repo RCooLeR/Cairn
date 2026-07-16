@@ -178,11 +178,9 @@ func (p *LinuxNativeProvider) Detect(ctx context.Context) (*models.ProviderStatu
 		socketOK = true
 	}
 
-	if contextName, ok := p.runText(ctx, "docker", "context", "show"); ok {
-		status.CurrentContext = contextName
-	}
+	status.CurrentContext = status.DockerHost
 
-	if composeVersion, ok := p.runText(ctx, "docker", "compose", "version", "--short"); ok {
+	if composeVersion, ok := p.runDockerText(ctx, "compose", "version", "--short"); ok {
 		status.ComposeInstalled = true
 		status.ComposeVersion = normalizeDockerVersion(composeVersion)
 	} else {
@@ -194,7 +192,7 @@ func (p *LinuxNativeProvider) Detect(ctx context.Context) (*models.ProviderStatu
 		))
 	}
 
-	if buildxVersion, ok := p.runText(ctx, "docker", "buildx", "version"); ok {
+	if buildxVersion, ok := p.runDockerText(ctx, "buildx", "version"); ok {
 		status.BuildxInstalled = true
 		status.BackendVersion = normalizeDockerVersion(buildxVersion)
 	} else {
@@ -213,7 +211,7 @@ func (p *LinuxNativeProvider) Detect(ctx context.Context) (*models.ProviderStatu
 	}
 
 	if socketOK {
-		if dockerVersion, ok := p.runText(ctx, "docker", "info", "--format", "{{.ServerVersion}}"); ok {
+		if dockerVersion, ok := p.runDockerText(ctx, "info", "--format", "{{.ServerVersion}}"); ok {
 			status.DockerRunning = true
 			status.DockerVersion = normalizeDockerVersion(dockerVersion)
 			if status.BackendVersion == "" {
@@ -236,7 +234,7 @@ func (p *LinuxNativeProvider) Detect(ctx context.Context) (*models.ProviderStatu
 }
 
 func (p *LinuxNativeProvider) PlanInstall(context.Context, models.InstallOptions) (*models.CommandPlan, error) {
-	steps := buildLinuxInstallSteps()
+	steps := buildLinuxInstallSteps("unix://" + p.detectSocketPath())
 	planID := security.NewPlanID()
 	commands := make([]models.PlannedCommand, 0, len(steps))
 	for index, step := range steps {
@@ -326,22 +324,19 @@ func (p *LinuxNativeProvider) Restart(ctx context.Context) error {
 
 func (p *LinuxNativeProvider) DockerHost(context.Context) (string, error) {
 	socketPath := p.detectSocketPath()
-	if socketPath == "" {
-		return "", apperror.New(apperror.ProviderNotReady, "Docker socket was not found")
-	}
 	return "unix://" + socketPath, nil
 }
 
-func (p *LinuxNativeProvider) DockerContext(ctx context.Context) (string, error) {
-	contextName, ok := p.runText(ctx, "docker", "context", "show")
-	if !ok {
-		return "", apperror.New(apperror.ProviderNotReady, "Docker context is not available")
-	}
-	return contextName, nil
+func (p *LinuxNativeProvider) BackendIdentity(context.Context) (string, error) {
+	return "unix://" + p.detectSocketPath(), nil
+}
+
+func (p *LinuxNativeProvider) DockerContext(context.Context) (string, error) {
+	return "unix://" + p.detectSocketPath(), nil
 }
 
 func (p *LinuxNativeProvider) RunDocker(ctx context.Context, args ...string) (*CommandResult, error) {
-	return p.runner.Run(ctx, dockerOperationTimeout, "docker", args...)
+	return p.runner.Run(ctx, dockerOperationTimeout, "docker", p.dockerHostArgs(args...)...)
 }
 
 func (p *LinuxNativeProvider) RunDockerWithInput(ctx context.Context, input string, args ...string) (*CommandResult, error) {
@@ -349,7 +344,7 @@ func (p *LinuxNativeProvider) RunDockerWithInput(ctx context.Context, input stri
 		return runner.RunWithOptions(ctx, CommandRunOptions{
 			Timeout: dockerOperationTimeout,
 			Stdin:   input,
-		}, "docker", args...)
+		}, "docker", p.dockerHostArgs(args...)...)
 	}
 	return p.RunDocker(ctx, args...)
 }
@@ -372,7 +367,7 @@ func (p *LinuxNativeProvider) RunCompose(ctx context.Context, workdir string, ar
 }
 
 func (p *LinuxNativeProvider) RunComposeEnv(ctx context.Context, workdir string, env []string, args ...string) (*CommandResult, error) {
-	composeArgs := append([]string{"compose"}, args...)
+	composeArgs := p.dockerHostArgs(append([]string{"compose"}, args...)...)
 	timeout := composeTimeoutForArgs(args)
 	if runner, ok := p.runner.(OptionsCommandRunner); ok {
 		return runner.RunWithOptions(ctx, CommandRunOptions{
@@ -411,7 +406,7 @@ func (p *LinuxNativeProvider) MapPathToHost(backendPath string) (string, error) 
 	return backendPath, nil
 }
 
-func buildLinuxInstallSteps() []linuxInstallStep {
+func buildLinuxInstallSteps(dockerHost string) []linuxInstallStep {
 	aptRefreshCommand := strings.Join([]string{
 		"set -e",
 		dockerAptSourceCleanupCommand(),
@@ -425,11 +420,12 @@ func buildLinuxInstallSteps() []linuxInstallStep {
 		"chmod a+r /etc/apt/keyrings/docker.gpg",
 		dockerAptSourceWriteCommand(),
 	}, " && ")
+	dockerPrefix := "docker --host " + shellQuote(strings.TrimSpace(dockerHost))
 	verifyCommand := strings.Join([]string{
-		"docker info >/dev/null",
-		"docker compose version",
-		"docker buildx version",
-		"docker run --rm hello-world",
+		dockerPrefix + " info >/dev/null",
+		dockerPrefix + " compose version",
+		dockerPrefix + " buildx version",
+		dockerPrefix + " run --rm hello-world",
 	}, " && ")
 	return []linuxInstallStep{
 		{
@@ -498,25 +494,25 @@ func buildLinuxInstallSteps() []linuxInstallStep {
 }
 
 func (p *LinuxNativeProvider) detectSocketPath() string {
-	candidates := []string{}
-	if p.socketPath != "" {
-		candidates = append(candidates, p.socketPath)
-	} else {
-		if runtimeDir := p.probe.Env("XDG_RUNTIME_DIR"); runtimeDir != "" {
-			candidates = append(candidates, path.Join(runtimeDir, "docker.sock"))
-		}
-		candidates = append(candidates, defaultDockerSocket)
+	if configured := strings.TrimSpace(strings.TrimPrefix(p.socketPath, "unix://")); configured != "" {
+		return path.Clean(configured)
 	}
-
+	candidates := make([]string, 0, 2)
+	if runtimeDir := strings.TrimSpace(p.probe.Env("XDG_RUNTIME_DIR")); runtimeDir != "" {
+		candidates = append(candidates, path.Join(runtimeDir, "docker.sock"))
+	}
+	candidates = append(candidates, defaultDockerSocket)
 	for _, candidate := range candidates {
 		if info, err := p.probe.Stat(candidate); err == nil && !info.IsDir() {
 			return candidate
 		}
 	}
-	if len(candidates) > 0 && p.socketPath != "" {
-		return p.socketPath
-	}
-	return ""
+	return defaultDockerSocket
+}
+
+func (p *LinuxNativeProvider) dockerHostArgs(args ...string) []string {
+	host := "unix://" + p.detectSocketPath()
+	return append([]string{"--host", host}, args...)
 }
 
 func (p *LinuxNativeProvider) systemdAvailable() bool {
@@ -530,6 +526,10 @@ func (p *LinuxNativeProvider) runText(ctx context.Context, name string, args ...
 		return "", false
 	}
 	return strings.TrimSpace(result.Stdout), true
+}
+
+func (p *LinuxNativeProvider) runDockerText(ctx context.Context, args ...string) (string, bool) {
+	return p.runText(ctx, "docker", p.dockerHostArgs(args...)...)
 }
 
 func (p *LinuxNativeProvider) detectDockerPackageUpdates(ctx context.Context) ([]string, bool) {

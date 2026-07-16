@@ -3,6 +3,7 @@ package terminal
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
 	"io"
 	"os"
 	"os/user"
@@ -16,6 +17,8 @@ import (
 	"github.com/RCooLeR/Cairn/internal/bus"
 	dockercore "github.com/RCooLeR/Cairn/internal/docker"
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/providers"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/store"
 	"github.com/google/uuid"
 )
@@ -60,13 +63,14 @@ type DockerClient interface {
 }
 
 type ProjectStore interface {
-	Get(context.Context, string) (store.ProjectRecord, error)
+	GetInScope(context.Context, runtimescope.Scope, string) (store.ProjectRecord, error)
 }
 
 type Options struct {
 	MaxSessions int
 	Now         func() time.Time
 	PTYStarter  PTYStarter
+	Scope       runtimescope.Scope
 }
 
 type Manager struct {
@@ -77,9 +81,19 @@ type Manager struct {
 	now      func() time.Time
 	starter  PTYStarter
 	max      int
+	scope    runtimescope.Scope
 
-	mu       sync.RWMutex
-	sessions map[string]*session
+	mu           sync.RWMutex
+	sessions     map[string]*session
+	reservations int
+}
+
+// sessionReservation accounts for terminal capacity before any child process,
+// PTY, or container exec is created. Its active field is protected by
+// Manager.mu.
+type sessionReservation struct {
+	manager *Manager
+	active  bool
 }
 
 type session struct {
@@ -114,6 +128,7 @@ func NewManager(provider Provider, docker DockerClient, projects ProjectStore, e
 		now:      now,
 		starter:  starter,
 		max:      maxSessions,
+		scope:    opts.Scope,
 		sessions: map[string]*session{},
 	}
 }
@@ -131,9 +146,18 @@ func (m *Manager) OpenHostTerminal(ctx context.Context, opts models.TerminalOpti
 	if cwd == "" {
 		cwd, _ = os.UserHomeDir()
 	}
+	reservation, err := m.reserveSession()
+	if err != nil {
+		return nil, err
+	}
+	defer m.releaseReservation(reservation)
 	ptySession, err := m.starter.Start(ctx, PTYSpec{Argv: argv, Env: opts.Env, WorkingDir: cwd, Cols: opts.Cols, Rows: opts.Rows})
 	if err != nil {
+		closeAndWaitPTY(ptySession)
 		return nil, mapTerminalStartError("open host terminal", err)
+	}
+	if ptySession == nil {
+		return nil, apperror.New(apperror.Internal, "Open host terminal returned no PTY session")
 	}
 	info := models.TerminalSessionInfo{
 		ID:         uuid.NewString(),
@@ -144,12 +168,15 @@ func (m *Manager) OpenHostTerminal(ctx context.Context, opts models.TerminalOpti
 		WorkingDir: cwd,
 		CreatedAt:  m.now(),
 	}
-	return m.addPTYSession(info, ptySession)
+	return m.addPTYSession(info, ptySession, reservation)
 }
 
 func (m *Manager) OpenBackendTerminal(ctx context.Context, opts models.TerminalOptions) (*models.TerminalSessionInfo, error) {
 	if m.provider == nil {
 		return nil, providerNotReady()
+	}
+	if err := m.validateRuntimeScope(ctx); err != nil {
+		return nil, err
 	}
 	opts.Cols, opts.Rows = normalizeDimensions(opts.Cols, opts.Rows)
 	argv, err := m.provider.BackendShellCommand(opts)
@@ -170,10 +197,13 @@ func (m *Manager) OpenBackendTerminal(ctx context.Context, opts models.TerminalO
 }
 
 func (m *Manager) OpenProjectTerminal(ctx context.Context, projectID string, opts models.TerminalOptions) (*models.TerminalSessionInfo, error) {
-	if m.provider == nil || m.projects == nil {
+	if m.provider == nil || m.projects == nil || !m.scope.Valid() {
 		return nil, providerNotReady()
 	}
-	project, err := m.projects.Get(ctx, projectID)
+	if err := m.validateRuntimeScope(ctx); err != nil {
+		return nil, err
+	}
+	project, err := m.projects.GetInScope(ctx, m.scope, projectID)
 	if err != nil {
 		return nil, apperror.Wrap(apperror.NotFound, "Project not found", err)
 	}
@@ -230,17 +260,44 @@ func (m *Manager) OpenProjectTerminal(ctx context.Context, projectID string, opt
 	})
 }
 
+func (m *Manager) validateRuntimeScope(ctx context.Context) error {
+	if !m.scope.Valid() {
+		return providerNotReady()
+	}
+	provider, ok := m.provider.(providers.RuntimeScopeProvider)
+	if !ok {
+		return apperror.New(apperror.ProviderNotReady, "Terminal provider cannot verify runtime scope")
+	}
+	currentScope, err := providers.ResolveRuntimeScope(ctx, provider)
+	if err != nil {
+		return err
+	}
+	if !currentScope.Equal(m.scope) {
+		return apperror.New(apperror.NotFound, "Terminal runtime context changed; reconnect the provider")
+	}
+	return nil
+}
+
 func (m *Manager) openProviderPTYTerminal(ctx context.Context, opts models.TerminalOptions, argv []string, cwd string, info models.TerminalSessionInfo) (*models.TerminalSessionInfo, error) {
+	reservation, err := m.reserveSession()
+	if err != nil {
+		return nil, err
+	}
+	defer m.releaseReservation(reservation)
 	ptySession, err := m.starter.Start(ctx, PTYSpec{Argv: argv, Env: opts.Env, WorkingDir: cwd, Cols: opts.Cols, Rows: opts.Rows})
 	if err != nil {
+		closeAndWaitPTY(ptySession)
 		return nil, mapTerminalStartError("open backend terminal", err)
+	}
+	if ptySession == nil {
+		return nil, apperror.New(apperror.Internal, "Open backend terminal returned no PTY session")
 	}
 	info.ID = uuid.NewString()
 	info.Shell = shellTitle(argv)
 	info.User = currentUsername()
 	info.WorkingDir = cwd
 	info.CreatedAt = m.now()
-	return m.addPTYSession(info, ptySession)
+	return m.addPTYSession(info, ptySession, reservation)
 }
 
 func (m *Manager) OpenContainerTerminal(ctx context.Context, containerID string, opts models.ContainerTerminalOptions) (*models.TerminalSessionInfo, error) {
@@ -252,6 +309,11 @@ func (m *Manager) OpenContainerTerminal(ctx context.Context, containerID string,
 	if err != nil {
 		return nil, err
 	}
+	reservation, err := m.reserveSession()
+	if err != nil {
+		return nil, err
+	}
+	defer m.releaseReservation(reservation)
 	shell := strings.TrimSpace(opts.Shell)
 	if shell == "" {
 		shells, err := m.docker.DetectContainerShells(ctx, containerID)
@@ -279,7 +341,13 @@ func (m *Manager) OpenContainerTerminal(ctx context.Context, containerID string,
 		Rows:       opts.Rows,
 	})
 	if err != nil {
+		if execSession != nil {
+			_ = execSession.Close()
+		}
 		return nil, err
+	}
+	if execSession == nil {
+		return nil, apperror.New(apperror.Internal, "Open container terminal returned no exec session")
 	}
 	title := detail.Summary.Name
 	if title == "" {
@@ -313,7 +381,7 @@ func (m *Manager) OpenContainerTerminal(ctx context.Context, containerID string,
 		},
 		closeContext: closeCtx,
 	}
-	if err := m.register(active); err != nil {
+	if err := m.registerReserved(active, reservation); err != nil {
 		_ = execSession.Close()
 		return nil, err
 	}
@@ -391,7 +459,7 @@ func (m *Manager) StopAll() {
 	}
 }
 
-func (m *Manager) addPTYSession(info models.TerminalSessionInfo, ptySession PTYSession) (*models.TerminalSessionInfo, error) {
+func (m *Manager) addPTYSession(info models.TerminalSessionInfo, ptySession PTYSession, reservation *sessionReservation) (*models.TerminalSessionInfo, error) {
 	active := &session{
 		info:      info,
 		stream:    ptySession,
@@ -399,8 +467,8 @@ func (m *Manager) addPTYSession(info models.TerminalSessionInfo, ptySession PTYS
 		resize:    ptySession.Resize,
 		wait:      ptySession.Wait,
 	}
-	if err := m.register(active); err != nil {
-		_ = ptySession.Close()
+	if err := m.registerReserved(active, reservation); err != nil {
+		closeAndWaitPTY(ptySession)
 		return nil, err
 	}
 	go m.pump(active)
@@ -411,19 +479,55 @@ func (m *Manager) addPTYSession(info models.TerminalSessionInfo, ptySession PTYS
 	return &info, nil
 }
 
-func (m *Manager) register(active *session) error {
+func (m *Manager) reserveSession() (*sessionReservation, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if len(m.sessions) >= m.max {
-		return apperror.New(
+	if len(m.sessions)+m.reservations >= m.max {
+		return nil, apperror.New(
 			apperror.Conflict,
 			"Terminal session limit reached",
-			apperror.WithDetail("Cairn allows up to 16 active terminal sessions."),
+			apperror.WithDetail(fmt.Sprintf("Cairn allows up to %d active terminal sessions.", m.max)),
 			apperror.WithRepairHints("Close an existing terminal tab and try again."),
 		)
 	}
+	m.reservations++
+	return &sessionReservation{manager: m, active: true}, nil
+}
+
+func (m *Manager) releaseReservation(reservation *sessionReservation) {
+	if reservation == nil || reservation.manager != m {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !reservation.active {
+		return
+	}
+	reservation.active = false
+	m.reservations--
+}
+
+func (m *Manager) registerReserved(active *session, reservation *sessionReservation) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if reservation == nil || reservation.manager != m || !reservation.active {
+		return apperror.New(apperror.Internal, "Terminal capacity reservation is invalid")
+	}
+	reservation.active = false
+	m.reservations--
+	if _, exists := m.sessions[active.info.ID]; exists {
+		return apperror.New(apperror.Conflict, "Terminal session already exists")
+	}
 	m.sessions[active.info.ID] = active
 	return nil
+}
+
+func closeAndWaitPTY(ptySession PTYSession) {
+	if ptySession == nil {
+		return
+	}
+	_ = ptySession.Close()
+	ptySession.Wait()
 }
 
 func (m *Manager) lookup(sessionID string) (*session, error) {

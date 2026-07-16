@@ -17,6 +17,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
 	registrycore "github.com/RCooLeR/Cairn/internal/registry"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/store"
 )
 
@@ -90,6 +91,7 @@ func TestManagerServiceImageStatusMachine(t *testing.T) {
 		},
 	}
 	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), images, registry, db.Settings(), nil, nil)
+	manager.Scope = runtimescope.Must("linux_native", "default")
 
 	got, err := manager.CheckProjectUpdates(ctx, projectID)
 	if err != nil {
@@ -125,6 +127,7 @@ func TestManagerServiceImageAcceptsRemoteIndexDigestMatch(t *testing.T) {
 		digests:      map[string]string{"nginx:1.25": digestB},
 		indexDigests: map[string]string{"nginx:1.25": digestA},
 	}, db.Settings(), nil, nil)
+	manager.Scope = runtimescope.Must("linux_native", "default")
 
 	got, err := manager.CheckProjectUpdates(ctx, projectID)
 	if err != nil {
@@ -155,6 +158,7 @@ func TestManagerServiceImageUsesDockerEnginePlatform(t *testing.T) {
 	}
 	registry := &fakeRegistry{digests: map[string]string{"nginx:1.25": digestB}}
 	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), images, registry, db.Settings(), nil, nil)
+	manager.Scope = runtimescope.Must("linux_native", "default")
 
 	if _, err := manager.CheckProjectUpdates(ctx, projectID); err != nil {
 		t.Fatalf("CheckProjectUpdates() error = %v", err)
@@ -176,6 +180,7 @@ func TestManagerBaseImageStatusMachine(t *testing.T) {
 	})
 	if err := db.Lineage().ReplaceProject(ctx, projectID, []store.LineageRecord{{
 		ProviderID:      "linux_native",
+		ContextName:     "default",
 		ProjectID:       projectID,
 		ServiceID:       projectID + "/api",
 		ServiceName:     "api",
@@ -195,6 +200,7 @@ func TestManagerBaseImageStatusMachine(t *testing.T) {
 		"alpine:3.20": digestD,
 	}}
 	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), fakeImages{}, registry, db.Settings(), nil, nil)
+	manager.Scope = runtimescope.Must("linux_native", "default")
 
 	got, err := manager.CheckProjectUpdates(ctx, projectID)
 	if err != nil {
@@ -231,6 +237,7 @@ func TestManagerIgnoreRoundTripExcludesBadges(t *testing.T) {
 	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), fakeImages{details: map[string]*models.ImageDetail{
 		"nginx:1.25": imageDetail("sha256:web", "docker.io/library/nginx@"+digestA),
 	}}, &fakeRegistry{digests: map[string]string{"nginx:1.25": digestB}}, db.Settings(), nil, nil)
+	manager.Scope = runtimescope.Must("linux_native", "default")
 
 	current, err := manager.CheckProjectUpdates(ctx, projectID)
 	if err != nil {
@@ -275,6 +282,43 @@ func TestManagerIgnoreRoundTripExcludesBadges(t *testing.T) {
 	}
 }
 
+func TestManagerIgnoreAndUnignoreRejectForeignRuntimeScope(t *testing.T) {
+	ctx := context.Background()
+	db := openUpdatesStore(t)
+	now := time.Date(2026, 6, 13, 12, 15, 0, 0, time.UTC)
+	foreignScope := runtimescope.Must("linux_native", "socket:foreign")
+	foreignProjectID := "linux_native/foreign"
+	if err := db.Projects().SaveSnapshot(ctx, foreignScope, []store.ProjectRecord{{
+		ID: foreignProjectID, ProviderID: "linux_native", ContextName: foreignScope.ContextName(), Name: "foreign", WorkingDir: t.TempDir(), LastSeenAt: now,
+	}}, nil, now, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot(foreign) error = %v", err)
+	}
+	checkID := insertCheck(t, ctx, db, store.UpdateCheckRecord{
+		ProviderID: "linux_native", ProjectID: foreignProjectID, ServiceID: foreignProjectID + "/web",
+		Kind: models.UpdateKindServiceImage, ImageRef: "nginx:1.25", Status: models.UpdateStatusServiceImageUpdateAvailable, CheckedAt: now,
+	})
+	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), fakeImages{}, &fakeRegistry{}, db.Settings(), nil, nil)
+	manager.Scope = runtimescope.Must("linux_native", "default")
+
+	if err := manager.IgnoreUpdate(ctx, models.IgnoreUpdateRequest{ID: checkID, Reason: "foreign"}); !apperror.IsCode(err, apperror.NotFound) {
+		t.Fatalf("IgnoreUpdate(foreign) error = %v, want not found", err)
+	}
+	if err := db.Updates().IgnoreCheck(ctx, checkID, "seed ignored", now); err != nil {
+		t.Fatalf("IgnoreCheck(seed) error = %v", err)
+	}
+	ignored, err := db.Updates().ListCurrent(ctx, models.UpdateFilter{ProjectID: foreignProjectID, Status: []models.UpdateStatus{models.UpdateStatusIgnored}})
+	if err != nil || len(ignored) != 1 {
+		t.Fatalf("ListCurrent(foreign ignored) = %#v, %v", ignored, err)
+	}
+	ignoreID := ignored[0].ID
+	if err := manager.UnignoreUpdate(ctx, ignoreID); !apperror.IsCode(err, apperror.NotFound) {
+		t.Fatalf("UnignoreUpdate(foreign) error = %v, want not found", err)
+	}
+	if _, err := db.Updates().GetIgnored(ctx, ignoreID); err != nil {
+		t.Fatalf("foreign ignore rule was deleted: %v", err)
+	}
+}
+
 func TestManagerListCurrentUpdatesScopesToActiveBackendContext(t *testing.T) {
 	ctx := context.Background()
 	db := openUpdatesStore(t)
@@ -291,7 +335,7 @@ func TestManagerListCurrentUpdatesScopesToActiveBackendContext(t *testing.T) {
 	now := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)
 	ubuntuProjectID := providerID + "/ubuntu-app"
 	cairnProjectID := providerID + "/cairn-app"
-	if err := db.Projects().SaveSnapshot(ctx, providerID, []store.ProjectRecord{
+	if err := db.Projects().SaveSnapshot(ctx, runtimescope.Must(providerID, "wsl:Ubuntu"), []store.ProjectRecord{
 		{
 			ID:           ubuntuProjectID,
 			ProviderID:   providerID,
@@ -302,6 +346,12 @@ func TestManagerListCurrentUpdatesScopesToActiveBackendContext(t *testing.T) {
 			Source:       store.ProjectSourceImported,
 			LastSeenAt:   now,
 		},
+	}, []store.ServiceRecord{
+		serviceRecord(ubuntuProjectID, "web", "nginx:1.25", ""),
+	}, now, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot(Ubuntu) error = %v", err)
+	}
+	if err := db.Projects().SaveSnapshot(ctx, runtimescope.Must(providerID, "wsl:cairn-dev"), []store.ProjectRecord{
 		{
 			ID:           cairnProjectID,
 			ProviderID:   providerID,
@@ -313,7 +363,6 @@ func TestManagerListCurrentUpdatesScopesToActiveBackendContext(t *testing.T) {
 			LastSeenAt:   now,
 		},
 	}, []store.ServiceRecord{
-		serviceRecord(ubuntuProjectID, "web", "nginx:1.25", ""),
 		serviceRecord(cairnProjectID, "api", "redis:7", ""),
 	}, now, time.Time{}); err != nil {
 		t.Fatalf("SaveSnapshot() error = %v", err)
@@ -346,6 +395,7 @@ func TestManagerListCurrentUpdatesScopesToActiveBackendContext(t *testing.T) {
 	})
 	if _, err := db.Updates().InsertHistory(ctx, store.UpdateHistoryRecord{
 		ProviderID:   providerID,
+		ContextName:  "wsl:Ubuntu",
 		ProjectID:    ubuntuProjectID,
 		ServiceID:    ubuntuProjectID + "/web",
 		UpdateKind:   models.UpdateKindServiceImage,
@@ -363,6 +413,7 @@ func TestManagerListCurrentUpdatesScopesToActiveBackendContext(t *testing.T) {
 	}
 	if _, err := db.Updates().InsertHistory(ctx, store.UpdateHistoryRecord{
 		ProviderID:   providerID,
+		ContextName:  "wsl:cairn-dev",
 		ProjectID:    cairnProjectID,
 		ServiceID:    cairnProjectID + "/api",
 		UpdateKind:   models.UpdateKindServiceImage,
@@ -378,12 +429,28 @@ func TestManagerListCurrentUpdatesScopesToActiveBackendContext(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("InsertHistory(cairn-dev) error = %v", err)
 	}
+	// A newer foreign-context row must not consume the SQL LIMIT before scope
+	// filtering; otherwise the active context incorrectly appears empty.
+	if _, err := db.Updates().InsertHistory(ctx, store.UpdateHistoryRecord{
+		ProviderID:   providerID,
+		ContextName:  "wsl:Ubuntu",
+		ProjectID:    ubuntuProjectID,
+		ServiceID:    ubuntuProjectID + "/newer",
+		UpdateKind:   models.UpdateKindServiceImage,
+		ImageRef:     "busybox:latest",
+		Result:       "success",
+		StartedAt:    now.Add(2 * time.Hour),
+		FinishedAt:   now.Add(2*time.Hour + time.Minute),
+		HealthResult: "healthy",
+	}); err != nil {
+		t.Fatalf("InsertHistory(newer ubuntu) error = %v", err)
+	}
 	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), &fakeUpdateDocker{
 		providerID: providerID,
 		images:     map[string]*models.ImageDetail{},
 		details:    map[string]*models.ContainerDetail{},
 	}, &fakeRegistry{}, db.Settings(), nil, nil)
-	manager.ContextName = "wsl:cairn-dev"
+	manager.Scope = runtimescope.Must(providerID, "wsl:cairn-dev")
 
 	current, err := manager.ListCurrentUpdates(ctx, models.UpdateFilter{})
 	if err != nil {
@@ -393,13 +460,10 @@ func TestManagerListCurrentUpdatesScopesToActiveBackendContext(t *testing.T) {
 		t.Fatalf("current = %#v, want only %s", current, cairnProjectID)
 	}
 	stale, err := manager.ListCurrentUpdates(ctx, models.UpdateFilter{ProjectID: ubuntuProjectID})
-	if err != nil {
-		t.Fatalf("ListCurrentUpdates(stale project) error = %v", err)
+	if !apperror.IsCode(err, apperror.NotFound) || stale != nil {
+		t.Fatalf("ListCurrentUpdates(stale project) = %#v, %v; want not found", stale, err)
 	}
-	if len(stale) != 0 {
-		t.Fatalf("stale context updates = %#v, want none", stale)
-	}
-	history, err := manager.ListUpdateHistory(ctx, models.UpdateHistoryFilter{Limit: 20})
+	history, err := manager.ListUpdateHistory(ctx, models.UpdateHistoryFilter{Limit: 1})
 	if err != nil {
 		t.Fatalf("ListUpdateHistory() error = %v", err)
 	}
@@ -489,6 +553,7 @@ func TestManagerMixedProjectPlanOrdering(t *testing.T) {
 		Status:     models.UpdateStatusUnknownBaseImage,
 	})
 	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), fakeImages{}, &fakeRegistry{}, db.Settings(), nil, nil)
+	manager.Scope = runtimescope.Must("linux_native", "default")
 
 	plan, err := manager.PlanProjectUpdate(ctx, projectID)
 	if err != nil {
@@ -508,6 +573,33 @@ func TestManagerMixedProjectPlanOrdering(t *testing.T) {
 	}
 	if !warningsContain(plan.Warnings, "pinned") || !warningsContain(plan.Warnings, "base image is unknown") {
 		t.Fatalf("warnings = %#v", plan.Warnings)
+	}
+}
+
+func TestManagerApplyUpdateRevalidatesPlanRuntimeScope(t *testing.T) {
+	ctx := context.Background()
+	db := openUpdatesStore(t)
+	projectID := "linux_native/revalidate"
+	seedUpdateProject(t, ctx, db, projectID, []store.ServiceRecord{serviceRecord(projectID, "web", "nginx:1.25", "")})
+	insertCheck(t, ctx, db, store.UpdateCheckRecord{
+		ProviderID: "linux_native", ProjectID: projectID, ServiceID: projectID + "/web",
+		Kind: models.UpdateKindServiceImage, ImageRef: "nginx:1.25", LocalDigest: digestA, RemoteDigest: digestB,
+		RecommendedAction: models.RecommendedActionPullRecreate, Status: models.UpdateStatusServiceImageUpdateAvailable,
+	})
+	compose := &fakeUpdateCompose{}
+	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), fakeImages{}, &fakeRegistry{}, db.Settings(), nil, nil)
+	manager.Scope = runtimescope.Must("linux_native", "default")
+	manager.Compose = compose
+	plan, err := manager.PlanProjectUpdate(ctx, projectID)
+	if err != nil {
+		t.Fatalf("PlanProjectUpdate() error = %v", err)
+	}
+	manager.Scope = runtimescope.Must("linux_native", "socket:other")
+	if _, err := manager.ApplyUpdate(ctx, models.ApplyUpdateRequest{PlanID: plan.PlanID}); !apperror.IsCode(err, apperror.NotFound) {
+		t.Fatalf("ApplyUpdate(after scope change) error = %v, want not found", err)
+	}
+	if len(compose.calls) != 0 {
+		t.Fatalf("Compose ran after scope change: %#v", compose.calls)
 	}
 }
 
@@ -553,6 +645,7 @@ func TestManagerApplyUpdateHealthFailureRollsBack(t *testing.T) {
 		logs: map[string]string{"container-web": "panic: update failed\n"},
 	}
 	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), docker, &fakeRegistry{}, db.Settings(), eventBus, nil)
+	manager.Scope = runtimescope.Must("linux_native", "default")
 	manager.Compose = compose
 	manager.HealthWindow = 20 * time.Millisecond
 	manager.HealthPollInterval = time.Millisecond
@@ -624,6 +717,7 @@ func TestManagerApplyUpdateManualNeededWhenOldImagePruned(t *testing.T) {
 		logs: map[string]string{"container-web": "Fatal: no database\n"},
 	}
 	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), docker, &fakeRegistry{}, db.Settings(), eventBus, nil)
+	manager.Scope = runtimescope.Must("linux_native", "default")
 	manager.Compose = &fakeUpdateCompose{}
 	manager.HealthWindow = 20 * time.Millisecond
 	manager.HealthPollInterval = time.Millisecond
@@ -693,6 +787,7 @@ func TestManagerApplyUpdateBackupFirstSuccessWarn(t *testing.T) {
 		logs: map[string]string{"container-web": "server started\n"},
 	}
 	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), docker, &fakeRegistry{}, db.Settings(), eventBus, nil)
+	manager.Scope = runtimescope.Must("linux_native", "default")
 	manager.Compose = &fakeUpdateCompose{}
 	manager.Backups = backups
 
@@ -728,6 +823,7 @@ func TestManagerRollbackHistory(t *testing.T) {
 	seedUpdateProject(t, ctx, db, projectID, []store.ServiceRecord{serviceRecord(projectID, "web", "rollback-web:local", ".")})
 	historyID, err := db.Updates().InsertHistory(ctx, store.UpdateHistoryRecord{
 		ProviderID:     "linux_native",
+		ContextName:    "default",
 		ProjectID:      projectID,
 		ServiceID:      projectID + "/web",
 		UpdateKind:     models.UpdateKindBaseImage,
@@ -757,6 +853,7 @@ func TestManagerRollbackHistory(t *testing.T) {
 		"sha256:web-old": imageDetail("sha256:web-old", "docker.io/library/rollback-web@"+digestA),
 	}}
 	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), docker, &fakeRegistry{}, db.Settings(), eventBus, nil)
+	manager.Scope = runtimescope.Must("linux_native", "default")
 	manager.Compose = compose
 
 	if _, err := manager.Rollback(ctx, historyID); !apperror.IsCode(err, apperror.ConfirmationRequired) {
@@ -793,6 +890,87 @@ func TestManagerRollbackHistory(t *testing.T) {
 	}
 }
 
+func TestManagerPlanRollbackRejectsForeignScopeBeforeDockerLookup(t *testing.T) {
+	ctx := context.Background()
+	db := openUpdatesStore(t)
+	now := time.Now().UTC()
+	foreignScope := runtimescope.Must("linux_native", "socket:foreign")
+	foreignProjectID := "linux_native/foreign-rollback"
+	if err := db.Projects().SaveSnapshot(ctx, foreignScope, []store.ProjectRecord{{
+		ID: foreignProjectID, ProviderID: "linux_native", ContextName: foreignScope.ContextName(), Name: "foreign-rollback", WorkingDir: t.TempDir(), LastSeenAt: now,
+	}}, nil, now, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot(foreign) error = %v", err)
+	}
+	historyID, err := db.Updates().InsertHistory(ctx, store.UpdateHistoryRecord{
+		ProviderID: "linux_native", ContextName: foreignScope.ContextName(), ProjectID: foreignProjectID, ServiceID: foreignProjectID + "/web",
+		UpdateKind: models.UpdateKindServiceImage, ImageRef: "nginx:1.25", OldImageID: "sha256:old",
+		Result: updateResultSuccess, RollbackStatus: rollbackStatusAvailable, StartedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("InsertHistory() error = %v", err)
+	}
+	docker := &fakeUpdateDocker{images: map[string]*models.ImageDetail{"sha256:old": imageDetail("sha256:old", "nginx@"+digestA)}}
+	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), docker, &fakeRegistry{}, db.Settings(), nil, nil)
+	manager.Scope = runtimescope.Must("linux_native", "default")
+	manager.Compose = &fakeUpdateCompose{}
+	if _, err := manager.PlanRollback(ctx, historyID); !apperror.IsCode(err, apperror.NotFound) {
+		t.Fatalf("PlanRollback(foreign) error = %v, want not found", err)
+	}
+	if docker.getImageCalls != 0 {
+		t.Fatalf("Docker GetImage called before scope authorization: %d", docker.getImageCalls)
+	}
+}
+
+func TestManagerPlanRollbackRejectsHistoryFromPreviousContextAfterProjectIDReuse(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openUpdatesStore(t)
+	now := time.Date(2026, 7, 16, 17, 0, 0, 0, time.UTC)
+	projectID := "linux_native/reused-rollback"
+	scopeA := runtimescope.Must("linux_native", "socket:a")
+	scopeB := runtimescope.Must("linux_native", "socket:b")
+	project := store.ProjectRecord{
+		ID: projectID, ProviderID: scopeA.ProviderID(), ContextName: scopeA.ContextName(),
+		Name: "reused-rollback", WorkingDir: t.TempDir(), ComposeFiles: []string{"compose.yaml"},
+		Source: store.ProjectSourceImported, LastSeenAt: now,
+	}
+	service := serviceRecord(projectID, "web", "nginx:latest", "")
+	if err := db.Projects().SaveSnapshot(ctx, scopeA, []store.ProjectRecord{project}, []store.ServiceRecord{service}, now, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot(A): %v", err)
+	}
+	historyID, err := db.Updates().InsertHistoryInScope(ctx, scopeA, store.UpdateHistoryRecord{
+		ProviderID: scopeA.ProviderID(), ContextName: scopeA.ContextName(), ProjectID: projectID,
+		ServiceID: projectID + "/web", UpdateKind: models.UpdateKindServiceImage,
+		ImageRef: "nginx:latest", OldImageID: "sha256:scope-a-old", Result: updateResultSuccess,
+		RollbackStatus: rollbackStatusAvailable, StartedAt: now,
+	})
+	if err != nil {
+		t.Fatalf("InsertHistoryInScope(A): %v", err)
+	}
+	if err := db.Projects().DeleteInScope(ctx, scopeA, projectID); err != nil {
+		t.Fatalf("DeleteInScope(A): %v", err)
+	}
+	project.ContextName = scopeB.ContextName()
+	project.LastSeenAt = now.Add(time.Hour)
+	service.LastSeenAt = project.LastSeenAt
+	if err := db.Projects().SaveSnapshot(ctx, scopeB, []store.ProjectRecord{project}, []store.ServiceRecord{service}, project.LastSeenAt, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot(B): %v", err)
+	}
+
+	docker := &fakeUpdateDocker{images: map[string]*models.ImageDetail{
+		"sha256:scope-a-old": imageDetail("sha256:scope-a-old", "nginx@"+digestA),
+	}}
+	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), docker, &fakeRegistry{}, db.Settings(), nil, nil)
+	manager.Scope = scopeB
+	manager.Compose = &fakeUpdateCompose{}
+	if _, err := manager.PlanRollback(ctx, historyID); !apperror.IsCode(err, apperror.NotFound) {
+		t.Fatalf("PlanRollback(previous context) error = %v, want not found", err)
+	}
+	if docker.getImageCalls != 0 {
+		t.Fatalf("Docker GetImage called before exact-context history authorization: %d", docker.getImageCalls)
+	}
+}
+
 func TestManagerPlanServiceWarningsAndExpiry(t *testing.T) {
 	ctx := context.Background()
 	db := openUpdatesStore(t)
@@ -810,6 +988,7 @@ func TestManagerPlanServiceWarningsAndExpiry(t *testing.T) {
 		Status:     models.UpdateStatusUnknownBaseImage,
 	})
 	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), fakeImages{}, &fakeRegistry{}, db.Settings(), nil, nil)
+	manager.Scope = runtimescope.Must("linux_native", "default")
 
 	plan, err := manager.PlanServiceUpdate(ctx, projectID, "api")
 	if err != nil {
@@ -836,6 +1015,7 @@ func TestManagerAuditNotificationAndErrorHelpers(t *testing.T) {
 	ctx := context.Background()
 	db := openUpdatesStore(t)
 	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), fakeImages{}, &fakeRegistry{}, db.Settings(), nil, nil)
+	manager.Scope = runtimescope.Must("linux_native", "default")
 	manager.Audit = db.Audit()
 	manager.Notify = db.Notifications()
 	now := time.Date(2026, 6, 13, 14, 0, 0, 0, time.UTC)
@@ -935,6 +1115,7 @@ func TestManagerCheckAllPublishesProgress(t *testing.T) {
 	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), fakeImages{details: map[string]*models.ImageDetail{
 		"nginx:1.25": imageDetail("sha256:web", "docker.io/library/nginx@"+digestA),
 	}}, &fakeRegistry{digests: map[string]string{"nginx:1.25": digestA}}, db.Settings(), eventBus, nil)
+	manager.Scope = runtimescope.Must("linux_native", "default")
 	manager.NewID = func() string { return "job" }
 
 	jobID, err := manager.CheckAllUpdates(ctx)
@@ -967,6 +1148,7 @@ func TestManagerCheckServiceUpdatePrimaryAndFilters(t *testing.T) {
 	seedUpdateProject(t, ctx, db, projectID, []store.ServiceRecord{serviceRecord(projectID, "api", "builds-api:local", ".")})
 	if err := db.Lineage().ReplaceProject(ctx, projectID, []store.LineageRecord{{
 		ProviderID:      "linux_native",
+		ContextName:     "default",
 		ProjectID:       projectID,
 		ServiceID:       projectID + "/api",
 		ServiceName:     "api",
@@ -984,6 +1166,7 @@ func TestManagerCheckServiceUpdatePrimaryAndFilters(t *testing.T) {
 		"golang:1.22": digestB,
 		"alpine:3.20": digestD,
 	}}, db.Settings(), nil, nil)
+	manager.Scope = runtimescope.Must("linux_native", "default")
 
 	primary, err := manager.CheckServiceUpdate(ctx, projectID, "api")
 	if err != nil {
@@ -1018,6 +1201,7 @@ func TestManagerValidationSchedulerAndHelperPaths(t *testing.T) {
 	}
 	db := openUpdatesStore(t)
 	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), fakeImages{pingErr: errors.New("offline")}, &fakeRegistry{}, db.Settings(), nil, nil)
+	manager.Scope = runtimescope.Must("linux_native", "default")
 	if err := manager.IgnoreUpdate(ctx, models.IgnoreUpdateRequest{}); !apperror.IsCode(err, apperror.Conflict) {
 		t.Fatalf("ignore validation error = %v", err)
 	}
@@ -1139,6 +1323,7 @@ func TestManagerBaseImageLocalDigestAndErrorPaths(t *testing.T) {
 		},
 	}
 	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), images, registry, db.Settings(), nil, nil)
+	manager.Scope = runtimescope.Must("linux_native", "default")
 
 	got, err := manager.CheckProjectUpdates(ctx, projectID)
 	if err != nil {
@@ -1170,6 +1355,7 @@ func TestManagerAdditionalBranchPaths(t *testing.T) {
 		digests:     map[string]string{"httpd:2": digestA},
 		emptyResult: map[string]bool{"empty.local/team/app:1": true},
 	}, db.Settings(), nil, nil)
+	manager.Scope = runtimescope.Must("linux_native", "default")
 	got, err := manager.CheckProjectUpdates(ctx, projectID)
 	if err != nil {
 		t.Fatalf("CheckProjectUpdates() error = %v", err)
@@ -1189,6 +1375,7 @@ func TestManagerAdditionalBranchPaths(t *testing.T) {
 	offlineBus := bus.New()
 	t.Cleanup(offlineBus.Close)
 	offlineManager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), fakeImages{pingErr: errors.New("offline")}, &fakeRegistry{}, db.Settings(), offlineBus, nil)
+	offlineManager.Scope = runtimescope.Must("linux_native", "default")
 	projects, err := db.Projects().List(ctx)
 	if err != nil {
 		t.Fatalf("List projects error = %v", err)
@@ -1210,6 +1397,7 @@ func TestManagerRemainingErrorAndDefaultBranches(t *testing.T) {
 			"partial.local/app:1": {digest: digestB, err: apperror.New(apperror.RegistryRateLimit, "retry later")},
 		},
 	}, nil, nil, nil)
+	manager.Scope = runtimescope.Must("linux_native", "default")
 	if err := manager.IgnoreUpdate(ctx, models.IgnoreUpdateRequest{ID: 404}); !apperror.IsCode(err, apperror.NotFound) {
 		t.Fatalf("ignore missing error = %v, want not found", err)
 	}
@@ -1265,9 +1453,10 @@ func openUpdatesStore(t *testing.T) *store.Store {
 func seedUpdateProject(t *testing.T, ctx context.Context, db *store.Store, projectID string, services []store.ServiceRecord) {
 	t.Helper()
 	now := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)
-	if err := db.Projects().SaveSnapshot(ctx, "linux_native", []store.ProjectRecord{{
+	if err := db.Projects().SaveSnapshot(ctx, runtimescope.Must("linux_native", "default"), []store.ProjectRecord{{
 		ID:           projectID,
 		ProviderID:   "linux_native",
+		ContextName:  "default",
 		Name:         strings.TrimPrefix(projectID, "linux_native/"),
 		WorkingDir:   t.TempDir(),
 		ComposeFiles: []string{"compose.yaml"},
@@ -1293,6 +1482,7 @@ func serviceRecord(projectID string, name string, image string, buildContext str
 func lineageRecord(projectID string, service string, image string, base store.BaseImageRefRecord) store.LineageRecord {
 	return store.LineageRecord{
 		ProviderID:      "linux_native",
+		ContextName:     "default",
 		ProjectID:       projectID,
 		ServiceID:       projectID + "/" + service,
 		ServiceName:     service,
@@ -1427,12 +1617,13 @@ func (f *fakeUpdateCompose) Config(context.Context, composecore.ProjectOptions) 
 }
 
 type fakeUpdateDocker struct {
-	providerID string
-	images     map[string]*models.ImageDetail
-	containers []models.ContainerSummary
-	details    map[string]*models.ContainerDetail
-	logs       map[string]string
-	tags       []string
+	providerID    string
+	images        map[string]*models.ImageDetail
+	containers    []models.ContainerSummary
+	details       map[string]*models.ContainerDetail
+	logs          map[string]string
+	tags          []string
+	getImageCalls int
 }
 
 func (f *fakeUpdateDocker) ProviderID() string {
@@ -1443,6 +1634,7 @@ func (f *fakeUpdateDocker) ProviderID() string {
 }
 
 func (f *fakeUpdateDocker) GetImage(_ context.Context, id string) (*models.ImageDetail, error) {
+	f.getImageCalls++
 	if detail := f.images[id]; detail != nil {
 		return detail, nil
 	}
@@ -1505,6 +1697,13 @@ func (failingDiscoverer) DiscoverProjectLineage(context.Context, string) ([]mode
 
 func insertCheck(t *testing.T, ctx context.Context, db *store.Store, record store.UpdateCheckRecord) int64 {
 	t.Helper()
+	if strings.TrimSpace(record.ContextName) == "" && strings.TrimSpace(record.ProjectID) != "" {
+		project, err := db.Projects().Get(ctx, record.ProjectID)
+		if err != nil {
+			t.Fatalf("Get project scope for update check: %v", err)
+		}
+		record.ContextName = project.ContextName
+	}
 	id, err := db.Updates().InsertCheck(ctx, record)
 	if err != nil {
 		t.Fatalf("InsertCheck() error = %v", err)

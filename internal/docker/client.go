@@ -15,6 +15,8 @@ import (
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/bus"
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/providers"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/store"
 	cerrdefs "github.com/containerd/errdefs"
 	dockertypes "github.com/docker/docker/api/types"
@@ -139,6 +141,8 @@ type Client struct {
 	api              APIClient
 	host             string
 	contextName      string
+	expectedScope    runtimescope.Scope
+	runtimeScope     runtimescope.Scope
 	processBacked    bool
 	unaryTimeout     time.Duration
 	pingInterval     time.Duration
@@ -174,10 +178,42 @@ func (c *Client) SetObjectCache(cache *store.ObjectCacheRepository) {
 	c.cache = cache
 }
 
+func (c *Client) BindRuntimeScope(scope runtimescope.Scope) error {
+	if c == nil || !scope.Valid() {
+		return apperror.New(apperror.ProviderNotReady, "Docker runtime scope is required")
+	}
+	c.reconnectMu.Lock()
+	defer c.reconnectMu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.expectedScope.Valid() && !c.expectedScope.Equal(scope) {
+		return apperror.New(apperror.Conflict, "Docker client is already bound to another runtime context")
+	}
+	if c.runtimeScope.Valid() && !c.runtimeScope.Equal(scope) {
+		return apperror.New(apperror.Conflict, "Connected Docker client belongs to another runtime context")
+	}
+	c.expectedScope = scope
+	return nil
+}
+
 func (c *Client) Connect(ctx context.Context) error {
 	c.reconnectMu.Lock()
 	defer c.reconnectMu.Unlock()
 
+	runtimeScope, err := providers.ResolveRuntimeScope(ctx, c.provider)
+	if err != nil {
+		return err
+	}
+	c.mu.RLock()
+	expectedScope := c.expectedScope
+	c.mu.RUnlock()
+	if expectedScope.Valid() {
+		if !runtimeScope.Equal(expectedScope) {
+			return apperror.New(apperror.NotFound, "Docker provider target changed; reconnect the runtime")
+		}
+	} else {
+		expectedScope = runtimeScope
+	}
 	host, err := c.provider.DockerHost(ctx)
 	if err != nil {
 		return mapDockerError("resolve Docker host", err)
@@ -189,8 +225,6 @@ func (c *Client) Connect(ctx context.Context) error {
 			return mapDockerError("resolve Docker dialer", err)
 		}
 	}
-	contextName, _ := c.provider.DockerContext(ctx)
-
 	api, err := c.newAPIClient(host, dialContext)
 	if err != nil {
 		return mapDockerError("create Docker client", err)
@@ -211,12 +245,28 @@ func (c *Client) Connect(ctx context.Context) error {
 			apperror.WithDetail(fmt.Sprintf("daemon API %s, minimum %s", ping.APIVersion, minimumAPIVersion)),
 		)
 	}
+	finalScope, err := providers.ResolveRuntimeScope(ctx, c.provider)
+	if err != nil {
+		_ = api.Close()
+		return err
+	}
+	if !finalScope.Equal(expectedScope) {
+		_ = api.Close()
+		return apperror.New(apperror.NotFound, "Docker provider target changed while connecting")
+	}
 
 	c.mu.Lock()
+	if c.expectedScope.Valid() && !c.expectedScope.Equal(expectedScope) {
+		c.mu.Unlock()
+		_ = api.Close()
+		return apperror.New(apperror.NotFound, "Docker runtime context changed while connecting")
+	}
 	old := c.api
 	c.api = api
 	c.host = host
-	c.contextName = contextName
+	c.contextName = expectedScope.ContextName()
+	c.expectedScope = expectedScope
+	c.runtimeScope = expectedScope
 	c.processBacked = dialContext != nil
 	c.connectedOnce = true
 	c.mu.Unlock()
@@ -224,7 +274,7 @@ func (c *Client) Connect(ctx context.Context) error {
 		_ = old.Close()
 	}
 
-	c.publish(bus.TopicDockerConnected, ConnectedPayload{Host: host, Context: contextName})
+	c.publish(bus.TopicDockerConnected, ConnectedPayload{Host: host, Context: expectedScope.ContextName()})
 	return nil
 }
 

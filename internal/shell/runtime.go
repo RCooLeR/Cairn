@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/RCooLeR/Cairn/internal/apperror"
 	backupcore "github.com/RCooLeR/Cairn/internal/backups"
 	"github.com/RCooLeR/Cairn/internal/bus"
 	composecore "github.com/RCooLeR/Cairn/internal/compose"
@@ -18,6 +19,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/portforward"
 	"github.com/RCooLeR/Cairn/internal/providers"
 	registrycore "github.com/RCooLeR/Cairn/internal/registry"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/services"
 	"github.com/RCooLeR/Cairn/internal/store"
 	"github.com/RCooLeR/Cairn/internal/terminal"
@@ -50,6 +52,7 @@ type appRuntime struct {
 	mu          sync.Mutex
 	state       appRuntimeState
 	cancel      context.CancelFunc
+	provider    providers.PlatformProvider
 	docker      *dockercore.Client
 	logs        *logsvc.Manager
 	metrics     *metrics.Manager
@@ -93,6 +96,7 @@ type appRuntimeConfig struct {
 
 type runtimeHandles struct {
 	cancel      context.CancelFunc
+	provider    providers.PlatformProvider
 	docker      *dockercore.Client
 	logs        *logsvc.Manager
 	metrics     *metrics.Manager
@@ -149,10 +153,44 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 		r.mu.Unlock()
 		return nil, nil
 	}
+	frozenProvider, err := providers.SnapshotRuntimeProvider(ctx, provider)
+	if err != nil {
+		r.mu.Lock()
+		r.state = runtimeStateStopped
+		r.mu.Unlock()
+		return nil, err
+	}
+	provider = frozenProvider
+	providerInstalled := false
+	defer func() {
+		if !providerInstalled {
+			_ = providers.CloseRuntimeProvider(provider)
+		}
+	}()
+	runtimeScope, err := providers.ResolveRuntimeScope(ctx, provider)
+	if err != nil {
+		r.mu.Lock()
+		r.state = runtimeStateStopped
+		r.mu.Unlock()
+		return nil, err
+	}
+	composeClient := composecore.NewClient(provider)
+	if err := composeClient.BindRuntimeScope(runtimeScope); err != nil {
+		r.mu.Lock()
+		r.state = runtimeStateStopped
+		r.mu.Unlock()
+		return nil, err
+	}
 
 	runtimeCtx, cancel := context.WithCancel(r.rootCtx)
-	contextName := backendContextName(ctx, provider)
 	dockerClient := dockercore.New(provider, r.events)
+	if err := dockerClient.BindRuntimeScope(runtimeScope); err != nil {
+		cancel()
+		r.mu.Lock()
+		r.state = runtimeStateStopped
+		r.mu.Unlock()
+		return nil, err
+	}
 	dockerClient.SetObjectCache(r.db.Objects())
 	dockerClient.StartHealthLoop(runtimeCtx)
 	dockerClient.StartObjectEventLoop(runtimeCtx)
@@ -171,10 +209,8 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 		portForwardManager.Start(runtimeCtx)
 	}
 
-	composeClient := composecore.NewClient(provider)
 	projectDetector := &composecore.ProjectDetector{
-		ProviderID:        provider.ID(),
-		ContextName:       contextName,
+		Scope:             runtimeScope,
 		Docker:            dockerClient,
 		Compose:           composeClient,
 		PathMapper:        provider,
@@ -184,31 +220,58 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 	}
 	logsManager := logsvc.NewManager(dockerClient, r.events, logsvc.Options{})
 	metricsManager := metrics.NewManager(dockerClient, r.db.Metrics(), r.projects, r.audit, r.events, metrics.Options{
+		Scope:                 runtimeScope,
 		GPUProbe:              metrics.NewProviderGPUProbe(provider),
 		VisibleInterval:       metricsVisibleInterval(provider),
 		BackgroundInterval:    metricsBackgroundInterval(provider),
 		DisableStreamingStats: disableStreamingStats(provider),
 		StatsConcurrency:      statsConcurrency(provider),
 	})
-	metricsManager.ContextName = contextName
 	metricsManager.Start(runtimeCtx)
-	terminalManager := terminal.NewManager(provider, dockerClient, r.projects, r.events, terminal.Options{})
-	backupManager := backupcore.NewManager(r.providerManager, dockerClient, r.db.Settings(), r.db.Backups(), r.audit, r.events, services.Version)
+	terminalManager := terminal.NewManager(provider, dockerClient, r.projects, r.events, terminal.Options{Scope: runtimeScope})
+	backupManager := backupcore.NewManager(boundProviderResolver{provider: provider}, dockerClient, r.db.Settings(), r.db.Backups(), r.audit, r.events, services.Version)
 	backupManager.Start(runtimeCtx)
 	lineageManager := lineagecore.NewManager(r.projects, r.db.Lineage(), r.db.Objects(), dockerClient)
-	updateManager := updatescore.NewManager(r.projects, r.db.Lineage(), r.db.Updates(), r.db.Objects(), dockerClient, r.registryManager, r.db.Settings(), r.events, lineageManager)
+	lineageManager.Scope = runtimeScope
+	var boundRegistry *registrycore.Manager
+	if r.registryManager != nil {
+		boundRegistry = r.registryManager.CloneBoundTo(boundProviderResolver{provider: provider})
+	}
+	updateManager := updatescore.NewManager(r.projects, r.db.Lineage(), r.db.Updates(), r.db.Objects(), dockerClient, boundRegistry, r.db.Settings(), r.events, lineageManager)
 	updateManager.Compose = composeClient
 	updateManager.Backups = backupManager
 	updateManager.Audit = r.audit
 	updateManager.Notify = r.db.Notifications()
-	updateManager.ContextName = contextName
+	updateManager.Scope = runtimeScope
 	updateManager.Start(runtimeCtx)
+	currentScope, err := providers.ResolveRuntimeScope(ctx, provider)
+	if err != nil || !currentScope.Equal(runtimeScope) {
+		runtimeHandles{
+			cancel:      cancel,
+			docker:      dockerClient,
+			logs:        logsManager,
+			metrics:     metricsManager,
+			terminal:    terminalManager,
+			backups:     backupManager,
+			updates:     updateManager,
+			bridge:      dockerBridge,
+			portforward: portForwardManager,
+		}.stop()
+		r.mu.Lock()
+		r.state = runtimeStateStopped
+		r.mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		return nil, apperror.New(apperror.ProviderNotReady, "Provider runtime context changed while binding")
+	}
 
 	if r.serviceMu != nil {
 		r.serviceMu.Lock()
 	}
 	r.mu.Lock()
 	r.cancel = cancel
+	r.provider = provider
 	r.docker = dockerClient
 	r.logs = logsManager
 	r.metrics = metricsManager
@@ -224,12 +287,12 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 	r.projectService.Docker = dockerClient
 	r.projectService.Client = composeClient
 	r.projectService.PathMapper = provider
-	r.projectService.ProviderID = provider.ID()
-	r.projectService.ContextName = contextName
+	r.projectService.Scope = runtimeScope
 	r.projectService.RuntimeCtx = runtimeCtx
 	r.composeService.Client = composeClient
 	r.composeService.PathMapper = provider
 	r.composeService.Detector = projectDetector
+	r.composeService.Scope = runtimeScope
 	r.metricsService.Manager = metricsManager
 	r.logsService.Manager = logsManager
 	r.terminalService.Manager = terminalManager
@@ -237,6 +300,7 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 	r.lineageService.Manager = lineageManager
 	r.backupService.Manager = backupManager
 	r.portForwardService.Manager = portForwardManager
+	providerInstalled = true
 	r.mu.Unlock()
 	if r.serviceMu != nil {
 		r.serviceMu.Unlock()
@@ -256,6 +320,17 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 		r.events.Publish(bus.Event{Topic: bus.TopicProviderChanged, Payload: summary})
 	}
 	return &summary, nil
+}
+
+type boundProviderResolver struct {
+	provider providers.PlatformProvider
+}
+
+func (r boundProviderResolver) ActiveProvider(context.Context) (providers.PlatformProvider, error) {
+	if r.provider == nil {
+		return nil, apperror.New(apperror.ProviderNotReady, "Provider is not ready")
+	}
+	return r.provider, nil
 }
 
 func (r *appRuntime) StopAll() {
@@ -281,6 +356,7 @@ func (r *appRuntime) StopAll() {
 func (r *appRuntime) detachLocked() runtimeHandles {
 	handles := runtimeHandles{
 		cancel:      r.cancel,
+		provider:    r.provider,
 		docker:      r.docker,
 		logs:        r.logs,
 		metrics:     r.metrics,
@@ -291,6 +367,7 @@ func (r *appRuntime) detachLocked() runtimeHandles {
 		portforward: r.portforward,
 	}
 	r.cancel = nil
+	r.provider = nil
 	r.docker = nil
 	r.logs = nil
 	r.metrics = nil
@@ -329,6 +406,9 @@ func (h runtimeHandles) stop() {
 	}
 	if h.docker != nil {
 		_ = h.docker.Close()
+	}
+	if h.provider != nil {
+		_ = providers.CloseRuntimeProvider(h.provider)
 	}
 }
 
@@ -381,12 +461,12 @@ func (r *appRuntime) clearServicesLocked() {
 	r.projectService.Docker = nil
 	r.projectService.Client = nil
 	r.projectService.PathMapper = nil
-	r.projectService.ProviderID = ""
-	r.projectService.ContextName = ""
+	r.projectService.Scope = runtimescope.Scope{}
 	r.projectService.RuntimeCtx = nil
 	r.composeService.Client = nil
 	r.composeService.PathMapper = nil
 	r.composeService.Detector = nil
+	r.composeService.Scope = runtimescope.Scope{}
 	r.metricsService.Manager = nil
 	r.logsService.Manager = nil
 	r.terminalService.Manager = nil

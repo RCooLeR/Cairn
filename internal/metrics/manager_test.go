@@ -11,12 +11,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/bus"
 	dockercore "github.com/RCooLeR/Cairn/internal/docker"
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/store"
 	"github.com/docker/docker/api/types/container"
 )
+
+var testRuntimeScope = runtimescope.Must("linux_native", "default")
 
 func TestManagerStreamsPersistsAndRanksSamples(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -55,6 +59,7 @@ func TestManagerStreamsPersistsAndRanksSamples(t *testing.T) {
 	defer events.Close()
 	samples := events.Subscribe(ctx, bus.TopicStatsSample, 8)
 	manager := NewManager(docker, db.Metrics(), db.Projects(), db.Audit(), events, Options{
+		Scope:              testRuntimeScope,
 		VisibleInterval:    time.Millisecond,
 		BackgroundInterval: 10 * time.Millisecond,
 		PublishInterval:    5 * time.Millisecond,
@@ -129,6 +134,7 @@ func TestManagerStreamsPersistsAndRanksSamples(t *testing.T) {
 
 	manager.StopAll()
 	series, err := db.Metrics().QuerySeries(ctx, store.MetricsSeriesFilter{
+		Scope:       testRuntimeScope,
 		ContainerID: "c1",
 		Resolution:  store.MetricsResolutionRaw,
 		From:        now.Add(-time.Minute),
@@ -156,9 +162,10 @@ func TestManagerFlushRetainsPendingOnCanceledContext(t *testing.T) {
 	}
 
 	now := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)
-	manager := NewManager(nil, db.Metrics(), nil, nil, nil, Options{})
+	manager := NewManager(nil, db.Metrics(), nil, nil, nil, Options{Scope: testRuntimeScope})
 	manager.pending = []store.MetricsSampleRecord{{
 		ProviderID:  "linux_native",
+		ContextName: "default",
 		ProjectID:   "linux_native/demo",
 		ServiceID:   "linux_native/demo::web",
 		ContainerID: "c1",
@@ -175,6 +182,7 @@ func TestManagerFlushRetainsPendingOnCanceledContext(t *testing.T) {
 	}
 
 	series, err := db.Metrics().QuerySeries(ctx, store.MetricsSeriesFilter{
+		Scope:       testRuntimeScope,
 		ContainerID: "c1",
 		Resolution:  store.MetricsResolutionRaw,
 		From:        now.Add(-time.Minute),
@@ -209,7 +217,7 @@ func TestTrimPendingMetricsKeepsNewestSamples(t *testing.T) {
 
 func TestManagerBuildSampleUsesStartedAtForUptime(t *testing.T) {
 	now := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)
-	manager := NewManager(&fakeMetricsDocker{}, nil, nil, nil, nil, Options{Now: func() time.Time { return now }})
+	manager := NewManager(&fakeMetricsDocker{}, nil, nil, nil, nil, Options{Scope: testRuntimeScope, Now: func() time.Time { return now }})
 	manager.mu.Lock()
 	manager.containers["c1"] = models.ContainerSummary{
 		ID:        "c1",
@@ -229,7 +237,7 @@ func TestManagerBuildSampleUsesStartedAtForUptime(t *testing.T) {
 }
 
 func TestManagerStatsConcurrencyDisablesStreaming(t *testing.T) {
-	manager := NewManager(&fakeMetricsDocker{}, nil, nil, nil, nil, Options{StatsConcurrency: 1})
+	manager := NewManager(&fakeMetricsDocker{}, nil, nil, nil, nil, Options{Scope: testRuntimeScope, StatsConcurrency: 1})
 	if !manager.disableStreamingStats {
 		t.Fatal("StatsConcurrency did not force one-shot stats mode")
 	}
@@ -284,7 +292,7 @@ func TestWatchContainerRetriesStreamAfterFallbackFailures(t *testing.T) {
 			}
 		},
 	}
-	manager := NewManager(docker, nil, nil, nil, nil, Options{BackgroundInterval: time.Millisecond})
+	manager := NewManager(docker, nil, nil, nil, nil, Options{Scope: testRuntimeScope, BackgroundInterval: time.Millisecond})
 	manager.mu.Lock()
 	manager.containers["c1"] = models.ContainerSummary{ID: "c1", Name: "web"}
 	manager.mu.Unlock()
@@ -329,6 +337,7 @@ func TestWatchContainerCanDisableStreamingStats(t *testing.T) {
 		},
 	}
 	manager := NewManager(docker, nil, nil, nil, nil, Options{
+		Scope:                 testRuntimeScope,
 		BackgroundInterval:    time.Millisecond,
 		DisableStreamingStats: true,
 		StatsConcurrency:      1,
@@ -374,6 +383,7 @@ func TestStopAllClosesBlockingStatsReader(t *testing.T) {
 		statsReaders: map[string]io.ReadCloser{"c1": reader},
 	}
 	manager := NewManager(docker, nil, nil, nil, nil, Options{
+		Scope:              testRuntimeScope,
 		BackgroundInterval: time.Hour,
 	})
 
@@ -411,8 +421,19 @@ func TestManagerQueriesStopsFallbackAndScopes(t *testing.T) {
 	if err := db.Migrate(ctx); err != nil {
 		t.Fatalf("Migrate: %v", err)
 	}
+	seedMetricsProvider(t, ctx, db, testRuntimeScope.ProviderID())
+	if err := db.Projects().SaveSnapshot(ctx, testRuntimeScope, []store.ProjectRecord{{
+		ID:          "project",
+		ProviderID:  testRuntimeScope.ProviderID(),
+		ContextName: testRuntimeScope.ContextName(),
+		Name:        "project",
+		Source:      store.ProjectSourceLabels,
+		LastSeenAt:  now,
+	}}, nil, now, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot() error = %v", err)
+	}
 	if err := db.Metrics().InsertBatch(ctx, []store.MetricsSampleRecord{{
-		ProviderID: "linux_native", ProjectID: "project", ServiceID: "project::api", ContainerID: "c1",
+		ProviderID: "linux_native", ContextName: "default", ProjectID: "project", ServiceID: "project::api", ContainerID: "c1",
 		CPUPercent: 12, MemoryBytes: 34, SampledAt: now,
 	}}); err != nil {
 		t.Fatalf("InsertBatch() error = %v", err)
@@ -424,7 +445,7 @@ func TestManagerQueriesStopsFallbackAndScopes(t *testing.T) {
 			statsResponse(now, 100, 1000, 100, 10, 10),
 		}},
 	}
-	manager := NewManager(docker, db.Metrics(), nil, nil, nil, Options{Now: func() time.Time { return now }})
+	manager := NewManager(docker, db.Metrics(), db.Projects(), nil, nil, Options{Scope: testRuntimeScope, Now: func() time.Time { return now }})
 	if _, err := manager.GetProjectMetrics(ctx, "project", models.TimeRange{From: now.Add(-time.Minute), To: now.Add(time.Minute)}); err != nil {
 		t.Fatalf("GetProjectMetrics() error = %v", err)
 	}
@@ -474,6 +495,78 @@ func TestManagerQueriesStopsFallbackAndScopes(t *testing.T) {
 	}
 }
 
+func TestManagerSeriesQueriesAuthorizeExactRuntimeScope(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+	db, err := store.Open(ctx, t.TempDir()+"/cairn.db")
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	seedMetricsProvider(t, ctx, db, testRuntimeScope.ProviderID())
+
+	foreignScope := runtimescope.Must(testRuntimeScope.ProviderID(), "other-context")
+	if err := db.Projects().SaveSnapshot(ctx, foreignScope, []store.ProjectRecord{{
+		ID:          "foreign-project",
+		ProviderID:  foreignScope.ProviderID(),
+		ContextName: foreignScope.ContextName(),
+		Name:        "foreign-project",
+		Source:      store.ProjectSourceLabels,
+		LastSeenAt:  now,
+	}}, nil, now, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot(foreign) error = %v", err)
+	}
+	if err := db.Metrics().InsertBatch(ctx, []store.MetricsSampleRecord{
+		{
+			ProviderID: testRuntimeScope.ProviderID(), ContextName: testRuntimeScope.ContextName(),
+			ProjectID: "foreign-project", ContainerID: "project-sample", CPUPercent: 33, SampledAt: now,
+		},
+		{
+			ProviderID: foreignScope.ProviderID(), ContextName: foreignScope.ContextName(),
+			ContainerID: "shared-container-id", CPUPercent: 99, SampledAt: now,
+		},
+	}); err != nil {
+		t.Fatalf("InsertBatch() error = %v", err)
+	}
+
+	manager := NewManager(&fakeMetricsDocker{}, db.Metrics(), db.Projects(), nil, nil, Options{Scope: testRuntimeScope})
+	window := models.TimeRange{From: now.Add(-time.Minute), To: now.Add(time.Minute)}
+	if _, err := manager.GetProjectMetrics(ctx, "foreign-project", window); !apperror.IsCode(err, apperror.NotFound) {
+		t.Fatalf("GetProjectMetrics(foreign scope) error = %v, want not found", err)
+	}
+	series, err := manager.GetContainerMetrics(ctx, "shared-container-id", window)
+	if err != nil {
+		t.Fatalf("GetContainerMetrics() error = %v", err)
+	}
+	if points := series.Series[0].Points; len(points) != 0 {
+		t.Fatalf("GetContainerMetrics() leaked foreign-context points: %#v", points)
+	}
+
+	unbound := NewManager(&fakeMetricsDocker{}, db.Metrics(), db.Projects(), nil, nil, Options{})
+	if _, err := unbound.GetContainerMetrics(ctx, "shared-container-id", window); err == nil {
+		t.Fatal("GetContainerMetrics(unbound) error = nil, want fail closed")
+	}
+	if _, err := unbound.GetDashboardMetrics(ctx); err == nil {
+		t.Fatal("GetDashboardMetrics(unbound) error = nil, want fail closed")
+	}
+}
+
+func seedMetricsProvider(t *testing.T, ctx context.Context, db *store.Store, providerID string) {
+	t.Helper()
+	if err := db.Providers().Upsert(ctx, store.ProviderRecord{
+		ID:          providerID,
+		Type:        providerID,
+		Platform:    "test",
+		DisplayName: providerID,
+		Enabled:     true,
+	}); err != nil {
+		t.Fatalf("seed metrics provider: %v", err)
+	}
+}
+
 func TestManagerAttributesGPUProcessesToContainers(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -488,7 +581,7 @@ func TestManagerAttributesGPUProcessesToContainers(t *testing.T) {
 		}},
 		processPIDs: map[string][]int{"c1": {4242}},
 	}
-	manager := NewManager(docker, nil, nil, nil, nil, Options{Now: func() time.Time { return now }})
+	manager := NewManager(docker, nil, nil, nil, nil, Options{Scope: testRuntimeScope, Now: func() time.Time { return now }})
 	manager.ensureReady()
 	manager.containers["c1"] = docker.containers[0]
 
@@ -540,7 +633,7 @@ func TestManagerAttributesGPUProcessesByContainerID(t *testing.T) {
 			Service:   "ollama",
 		}},
 	}
-	manager := NewManager(docker, nil, nil, nil, nil, Options{Now: func() time.Time { return now }})
+	manager := NewManager(docker, nil, nil, nil, nil, Options{Scope: testRuntimeScope, Now: func() time.Time { return now }})
 	manager.ensureReady()
 	manager.containers[containerID] = docker.containers[0]
 
@@ -591,7 +684,7 @@ func TestManagerAttributesSyntheticOllamaGPUProcess(t *testing.T) {
 			Ports:     []models.PortBinding{{HostPort: "11434", ContainerPort: "11434", Protocol: "tcp"}},
 		}},
 	}
-	manager := NewManager(docker, nil, nil, nil, nil, Options{Now: func() time.Time { return now }})
+	manager := NewManager(docker, nil, nil, nil, nil, Options{Scope: testRuntimeScope, Now: func() time.Time { return now }})
 	manager.ensureReady()
 	manager.containers["ollama1"] = docker.containers[0]
 

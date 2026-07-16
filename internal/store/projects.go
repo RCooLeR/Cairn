@@ -4,10 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 )
 
 const (
@@ -57,11 +61,54 @@ type forgottenProjectKey struct {
 	projectID   string
 }
 
+var errProjectScopeConflict = errors.New("project ID belongs to another runtime scope")
+
+func IsProjectScopeConflict(err error) bool {
+	return errors.Is(err, errProjectScopeConflict)
+}
+
 func (s *Store) Projects() *ProjectRepository {
 	return &ProjectRepository{db: s.writer}
 }
 
-func (r *ProjectRepository) SaveSnapshot(ctx context.Context, providerID string, projects []ProjectRecord, services []ServiceRecord, seenAt time.Time, staleCutoff time.Time) error {
+// SaveSnapshot atomically updates only one exact runtime scope. It also
+// fails closed when a legacy global project ID is already owned by another
+// scope; canonical scoped IDs are introduced by the separate BE-005 migration.
+func (r *ProjectRepository) SaveSnapshot(ctx context.Context, runtimeScope runtimescope.Scope, projects []ProjectRecord, services []ServiceRecord, seenAt time.Time, staleCutoff time.Time) error {
+	if err := validateSnapshotScope(runtimeScope, projects); err != nil {
+		return err
+	}
+	return r.saveSnapshot(ctx, runtimeScope.ProviderID(), runtimeScope.ContextName(), projects, services, seenAt, staleCutoff, false, nil)
+}
+
+// SaveDetectedSnapshot preserves availability for detector snapshots while
+// keeping legacy global-ID collisions quarantined. Conflicting project IDs and
+// their services are skipped inside the same transaction as the remaining
+// snapshot writes and stale cleanup.
+func (r *ProjectRepository) SaveDetectedSnapshot(ctx context.Context, runtimeScope runtimescope.Scope, projects []ProjectRecord, services []ServiceRecord, seenAt time.Time, staleCutoff time.Time) ([]string, error) {
+	if err := validateSnapshotScope(runtimeScope, projects); err != nil {
+		return nil, err
+	}
+	skipped := []string{}
+	if err := r.saveSnapshot(ctx, runtimeScope.ProviderID(), runtimeScope.ContextName(), projects, services, seenAt, staleCutoff, true, &skipped); err != nil {
+		return nil, err
+	}
+	return skipped, nil
+}
+
+func validateSnapshotScope(runtimeScope runtimescope.Scope, projects []ProjectRecord) error {
+	if !runtimeScope.Valid() {
+		return errors.New("runtime scope is required")
+	}
+	for _, project := range projects {
+		if !runtimeScope.Matches(project.ProviderID, project.ContextName) {
+			return fmt.Errorf("project %q does not belong to the snapshot runtime scope", project.ID)
+		}
+	}
+	return nil
+}
+
+func (r *ProjectRepository) saveSnapshot(ctx context.Context, providerID string, contextName string, projects []ProjectRecord, services []ServiceRecord, seenAt time.Time, staleCutoff time.Time, skipScopeConflicts bool, skippedResult *[]string) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -70,14 +117,37 @@ func (r *ProjectRepository) SaveSnapshot(ctx context.Context, providerID string,
 		_ = tx.Rollback()
 	}()
 
-	forgotten, err := r.forgottenProjectKeys(ctx, tx, providerID)
+	forgotten, err := r.forgottenProjectKeys(ctx, tx, providerID, contextName)
 	if err != nil {
 		return err
 	}
+	skippedProjectIDs := map[string]struct{}{}
 	if len(forgotten) > 0 {
 		var skipped map[string]struct{}
 		projects, skipped = filterForgottenProjects(projects, forgotten)
 		services = filterForgottenServices(services, skipped)
+		for projectID := range skipped {
+			skippedProjectIDs[projectID] = struct{}{}
+		}
+	}
+
+	conflictingProjectIDs, err := r.snapshotScopeConflicts(ctx, tx, providerID, contextName, projects, services)
+	if err != nil {
+		return err
+	}
+	if len(conflictingProjectIDs) > 0 {
+		skipped := sortedProjectIDs(conflictingProjectIDs)
+		if !skipScopeConflicts {
+			return fmt.Errorf("%w: %s", errProjectScopeConflict, skipped[0])
+		}
+		projects = filterProjectsByID(projects, conflictingProjectIDs)
+		services = filterServicesByProjectID(services, conflictingProjectIDs)
+		for projectID := range conflictingProjectIDs {
+			skippedProjectIDs[projectID] = struct{}{}
+		}
+	}
+	if skippedResult != nil {
+		*skippedResult = sortedProjectIDs(skippedProjectIDs)
 	}
 
 	replaceServices := services != nil
@@ -132,12 +202,15 @@ func (r *ProjectRepository) SaveSnapshot(ctx context.Context, providerID string,
 
 	if !replaceServices {
 		if !staleCutoff.IsZero() {
-			if _, err := tx.ExecContext(ctx, `
+			query := `
 				DELETE FROM projects
 				WHERE provider_id = ?
 					AND source <> ?
-					AND last_seen_at < ?
-			`, providerID, ProjectSourceImported, formatTime(staleCutoff)); err != nil {
+					AND last_seen_at < ?`
+			args := []any{providerID, ProjectSourceImported, formatTime(staleCutoff)}
+			query += " AND context_name = ?"
+			args = append(args, contextName)
+			if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 				return err
 			}
 		}
@@ -171,12 +244,15 @@ func (r *ProjectRepository) SaveSnapshot(ctx context.Context, providerID string,
 	}
 
 	if !staleCutoff.IsZero() {
-		if _, err := tx.ExecContext(ctx, `
+		query := `
 			DELETE FROM projects
 			WHERE provider_id = ?
 				AND source <> ?
-				AND last_seen_at < ?
-		`, providerID, ProjectSourceImported, formatTime(staleCutoff)); err != nil {
+				AND last_seen_at < ?`
+		args := []any{providerID, ProjectSourceImported, formatTime(staleCutoff)}
+		query += " AND context_name = ?"
+		args = append(args, contextName)
+		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
 			return err
 		}
 	}
@@ -184,12 +260,15 @@ func (r *ProjectRepository) SaveSnapshot(ctx context.Context, providerID string,
 	return tx.Commit()
 }
 
-func (r *ProjectRepository) forgottenProjectKeys(ctx context.Context, tx *sql.Tx, providerID string) (map[forgottenProjectKey]struct{}, error) {
-	rows, err := tx.QueryContext(ctx, `
+func (r *ProjectRepository) forgottenProjectKeys(ctx context.Context, tx *sql.Tx, providerID string, contextName string) (map[forgottenProjectKey]struct{}, error) {
+	query := `
 		SELECT context_name, name, project_id
 		FROM forgotten_projects
-		WHERE provider_id = ?
-	`, providerID)
+		WHERE provider_id = ?`
+	args := []any{providerID}
+	query += " AND context_name = ?"
+	args = append(args, contextName)
+	rows, err := tx.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -208,6 +287,111 @@ func (r *ProjectRepository) forgottenProjectKeys(ctx context.Context, tx *sql.Tx
 		keys[key] = struct{}{}
 	}
 	return keys, rows.Err()
+}
+
+func runtimeScopeMatches(providerID string, contextName string, expectedProviderID string, expectedContextName string) bool {
+	return strings.TrimSpace(providerID) == strings.TrimSpace(expectedProviderID) && strings.TrimSpace(contextName) == strings.TrimSpace(expectedContextName)
+}
+
+func (r *ProjectRepository) snapshotScopeConflicts(ctx context.Context, tx *sql.Tx, providerID string, contextName string, projects []ProjectRecord, services []ServiceRecord) (map[string]struct{}, error) {
+	conflicts := map[string]struct{}{}
+	inputProjectIDs := make(map[string]struct{}, len(projects))
+	for _, project := range projects {
+		projectID := strings.TrimSpace(project.ID)
+		inputProjectIDs[projectID] = struct{}{}
+
+		var existingProviderID string
+		var existingContextName string
+		err := tx.QueryRowContext(ctx, "SELECT provider_id, context_name FROM projects WHERE id = ?", projectID).Scan(&existingProviderID, &existingContextName)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+		if err == nil && !runtimeScopeMatches(existingProviderID, existingContextName, providerID, contextName) {
+			conflicts[projectID] = struct{}{}
+		}
+	}
+
+	validatedProjectIDs := map[string]struct{}{}
+	for _, service := range services {
+		projectID := strings.TrimSpace(service.ProjectID)
+		if projectID == "" {
+			return nil, errors.New("service project ID is required")
+		}
+		if _, incoming := inputProjectIDs[projectID]; !incoming {
+			if _, validated := validatedProjectIDs[projectID]; !validated {
+				var existingProviderID string
+				var existingContextName string
+				err := tx.QueryRowContext(ctx, "SELECT provider_id, context_name FROM projects WHERE id = ?", projectID).Scan(&existingProviderID, &existingContextName)
+				if errors.Is(err, sql.ErrNoRows) {
+					return nil, fmt.Errorf("%w: %s", errProjectScopeConflict, projectID)
+				}
+				if err != nil {
+					return nil, err
+				}
+				if !runtimeScopeMatches(existingProviderID, existingContextName, providerID, contextName) {
+					conflicts[projectID] = struct{}{}
+				}
+				validatedProjectIDs[projectID] = struct{}{}
+			}
+		}
+		if _, conflicting := conflicts[projectID]; conflicting {
+			continue
+		}
+
+		var existingProjectID string
+		var existingProviderID string
+		var existingContextName string
+		err := tx.QueryRowContext(ctx, `
+			SELECT services.project_id, projects.provider_id, projects.context_name
+			FROM services
+			JOIN projects ON projects.id = services.project_id
+			WHERE services.id = ?
+		`, strings.TrimSpace(service.ID)).Scan(&existingProjectID, &existingProviderID, &existingContextName)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+		if err == nil && (strings.TrimSpace(existingProjectID) != projectID || !runtimeScopeMatches(existingProviderID, existingContextName, providerID, contextName)) {
+			conflicts[projectID] = struct{}{}
+		}
+	}
+	return conflicts, nil
+}
+
+func sortedProjectIDs(projectIDs map[string]struct{}) []string {
+	ids := make([]string, 0, len(projectIDs))
+	for projectID := range projectIDs {
+		ids = append(ids, projectID)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+func filterProjectsByID(projects []ProjectRecord, skipped map[string]struct{}) []ProjectRecord {
+	if len(projects) == 0 || len(skipped) == 0 {
+		return projects
+	}
+	filtered := make([]ProjectRecord, 0, len(projects))
+	for _, project := range projects {
+		if _, ok := skipped[strings.TrimSpace(project.ID)]; ok {
+			continue
+		}
+		filtered = append(filtered, project)
+	}
+	return filtered
+}
+
+func filterServicesByProjectID(services []ServiceRecord, skipped map[string]struct{}) []ServiceRecord {
+	if len(services) == 0 || len(skipped) == 0 {
+		return services
+	}
+	filtered := make([]ServiceRecord, 0, len(services))
+	for _, service := range services {
+		if _, ok := skipped[strings.TrimSpace(service.ProjectID)]; ok {
+			continue
+		}
+		filtered = append(filtered, service)
+	}
+	return filtered
 }
 
 func filterForgottenProjects(projects []ProjectRecord, forgotten map[forgottenProjectKey]struct{}) ([]ProjectRecord, map[string]struct{}) {
@@ -295,7 +479,11 @@ func (r *ProjectRepository) UpsertImported(ctx context.Context, record ProjectRe
 	if record.Source == "" {
 		record.Source = ProjectSourceImported
 	}
-	return r.SaveSnapshot(ctx, record.ProviderID, []ProjectRecord{record}, nil, record.LastSeenAt, time.Time{})
+	runtimeScope, ok := runtimescope.New(record.ProviderID, record.ContextName)
+	if !ok {
+		return errors.New("imported project runtime scope is required")
+	}
+	return r.SaveSnapshot(ctx, runtimeScope, []ProjectRecord{record}, nil, record.LastSeenAt, time.Time{})
 }
 
 func (r *ProjectRepository) Forget(ctx context.Context, project ProjectRecord, forgottenAt time.Time) error {
@@ -340,6 +528,20 @@ func (r *ProjectRepository) Unforget(ctx context.Context, providerID string, con
 	return err
 }
 
+func (r *ProjectRepository) UnforgetInScope(ctx context.Context, runtimeScope runtimescope.Scope, name string, projectID string) error {
+	if !runtimeScope.Valid() {
+		return errors.New("runtime scope is required")
+	}
+	name = strings.TrimSpace(name)
+	projectID = strings.TrimSpace(projectID)
+	_, err := r.db.ExecContext(ctx, `
+		DELETE FROM forgotten_projects
+		WHERE provider_id = ? AND context_name = ?
+			AND (name = ? OR (? <> '' AND project_id = ?))
+	`, runtimeScope.ProviderID(), runtimeScope.ContextName(), name, projectID, projectID)
+	return err
+}
+
 func (r *ProjectRepository) Delete(ctx context.Context, projectID string) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -361,6 +563,32 @@ func (r *ProjectRepository) Delete(ctx context.Context, projectID string) error 
 	}
 	if rows == 0 {
 		return sql.ErrNoRows
+	}
+	return tx.Commit()
+}
+
+func (r *ProjectRepository) DeleteInScope(ctx context.Context, runtimeScope runtimescope.Scope, projectID string) error {
+	if !runtimeScope.Valid() {
+		return errors.New("runtime scope is required")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var providerID string
+	var contextName string
+	if err := tx.QueryRowContext(ctx, "SELECT provider_id, context_name FROM projects WHERE id = ?", projectID).Scan(&providerID, &contextName); err != nil {
+		return err
+	}
+	if !runtimeScope.Matches(providerID, contextName) {
+		return sql.ErrNoRows
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM services WHERE project_id = ?", projectID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM projects WHERE id = ? AND provider_id = ? AND context_name = ?", projectID, runtimeScope.ProviderID(), runtimeScope.ContextName()); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
@@ -419,6 +647,13 @@ func (r *ProjectRepository) ListByProviderContext(ctx context.Context, providerI
 	return scanProjectRows(rows)
 }
 
+func (r *ProjectRepository) ListByScope(ctx context.Context, runtimeScope runtimescope.Scope) ([]ProjectRecord, error) {
+	if !runtimeScope.Valid() {
+		return nil, errors.New("runtime scope is required")
+	}
+	return r.ListByProviderContext(ctx, runtimeScope.ProviderID(), runtimeScope.ContextName())
+}
+
 func (r *ProjectRepository) Get(ctx context.Context, projectID string) (ProjectRecord, error) {
 	row := r.db.QueryRowContext(ctx, `
 		SELECT id, provider_id, context_name, name, working_dir, compose_files_json,
@@ -426,6 +661,19 @@ func (r *ProjectRepository) Get(ctx context.Context, projectID string) (ProjectR
 		FROM projects
 		WHERE id = ?
 	`, projectID)
+	return scanProject(row)
+}
+
+func (r *ProjectRepository) GetInScope(ctx context.Context, runtimeScope runtimescope.Scope, projectID string) (ProjectRecord, error) {
+	if !runtimeScope.Valid() {
+		return ProjectRecord{}, errors.New("runtime scope is required")
+	}
+	row := r.db.QueryRowContext(ctx, `
+		SELECT id, provider_id, context_name, name, working_dir, compose_files_json,
+			status, health, source, pinned, last_seen_at, metadata_json
+		FROM projects
+		WHERE id = ? AND provider_id = ? AND context_name = ?
+	`, projectID, runtimeScope.ProviderID(), runtimeScope.ContextName())
 	return scanProject(row)
 }
 
@@ -465,6 +713,13 @@ func (r *ProjectRepository) ListImportedByProviderContext(ctx context.Context, p
 		_ = rows.Close()
 	}()
 	return scanProjectRows(rows)
+}
+
+func (r *ProjectRepository) ListImportedByScope(ctx context.Context, runtimeScope runtimescope.Scope) ([]ProjectRecord, error) {
+	if !runtimeScope.Valid() {
+		return nil, errors.New("runtime scope is required")
+	}
+	return r.ListImportedByProviderContext(ctx, runtimeScope.ProviderID(), runtimeScope.ContextName())
 }
 
 func (r *ProjectRepository) ListServices(ctx context.Context, projectID string) ([]ServiceRecord, error) {

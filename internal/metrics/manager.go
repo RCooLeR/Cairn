@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -26,6 +27,7 @@ func NewManager(docker DockerClient, repo *store.MetricsRepository, projects *st
 		Projects:   projects,
 		Audit:      audit,
 		Events:     events,
+		Scope:      opts.Scope,
 	}
 	manager.applyOptions(opts)
 	return manager
@@ -33,7 +35,7 @@ func NewManager(docker DockerClient, repo *store.MetricsRepository, projects *st
 
 func (m *Manager) Start(ctx context.Context) {
 	m.ensureReady()
-	if m.Docker == nil {
+	if m.requireDocker() != nil {
 		return
 	}
 	m.mu.Lock()
@@ -180,12 +182,19 @@ func (m *Manager) GetDashboardMetrics(ctx context.Context) (*models.DashboardMet
 }
 
 func (m *Manager) GetProjectMetrics(ctx context.Context, projectID string, r models.TimeRange) (*models.SeriesBundle, error) {
-	if m.Repository == nil {
+	if m.Repository == nil || m.Projects == nil || !m.Scope.Valid() {
 		return nil, notReady()
 	}
+	projectID = strings.TrimSpace(projectID)
+	if _, err := m.Projects.GetInScope(ctx, m.Scope, projectID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, apperror.New(apperror.NotFound, "Project was not found")
+		}
+		return nil, err
+	}
 	return m.Repository.QuerySeries(ctx, store.MetricsSeriesFilter{
-		ProviderID: m.providerID(),
-		ProjectID:  strings.TrimSpace(projectID),
+		Scope:      m.Scope,
+		ProjectID:  projectID,
 		Resolution: store.ResolutionForRange(r.From, r.To),
 		From:       r.From,
 		To:         r.To,
@@ -193,11 +202,11 @@ func (m *Manager) GetProjectMetrics(ctx context.Context, projectID string, r mod
 }
 
 func (m *Manager) GetContainerMetrics(ctx context.Context, containerID string, r models.TimeRange) (*models.SeriesBundle, error) {
-	if m.Repository == nil {
+	if m.Repository == nil || !m.Scope.Valid() {
 		return nil, notReady()
 	}
 	return m.Repository.QuerySeries(ctx, store.MetricsSeriesFilter{
-		ProviderID:  m.providerID(),
+		Scope:       m.Scope,
 		ContainerID: strings.TrimSpace(containerID),
 		Resolution:  store.ResolutionForRange(r.From, r.To),
 		From:        r.From,
@@ -402,6 +411,9 @@ func (m *Manager) ingest(containerID string, raw container.StatsResponse) {
 }
 
 func (m *Manager) buildSample(containerID string, raw container.StatsResponse) (Sample, bool) {
+	if m.requireDocker() != nil {
+		return Sample{}, false
+	}
 	if raw.Read.IsZero() {
 		raw.Read = m.now()
 	}
@@ -462,7 +474,8 @@ func (m *Manager) buildSample(containerID string, raw container.StatsResponse) (
 	}
 
 	return Sample{
-		ProviderID:       m.providerID(),
+		ProviderID:       m.Scope.ProviderID(),
+		ContextName:      m.Scope.ContextName(),
 		ProjectID:        summary.ProjectID,
 		ServiceID:        serviceID,
 		ContainerID:      containerID,
@@ -1071,25 +1084,17 @@ func (m *Manager) acquireStatsSlot(ctx context.Context) (func(), error) {
 }
 
 func (m *Manager) requireDocker() error {
-	if m.Docker == nil {
+	if m.Docker == nil || !m.Scope.Valid() || strings.TrimSpace(m.Docker.ProviderID()) != m.Scope.ProviderID() {
 		return notReady()
 	}
 	return nil
 }
 
-func (m *Manager) providerID() string {
-	if m.Docker == nil {
-		return ""
-	}
-	return m.Docker.ProviderID()
-}
-
 func (m *Manager) currentProviderProjects(ctx context.Context) ([]store.ProjectRecord, error) {
-	providerID := m.providerID()
-	if strings.TrimSpace(providerID) == "" {
-		return m.Projects.List(ctx)
+	if !m.Scope.Valid() {
+		return nil, notReady()
 	}
-	return m.Projects.ListByProviderContext(ctx, providerID, m.ContextName)
+	return m.Projects.ListByScope(ctx, m.Scope)
 }
 
 func notReady() error {
@@ -1099,6 +1104,7 @@ func notReady() error {
 func recordFromSample(sample Sample) store.MetricsSampleRecord {
 	return store.MetricsSampleRecord{
 		ProviderID:       sample.ProviderID,
+		ContextName:      sample.ContextName,
 		ProjectID:        sample.ProjectID,
 		ServiceID:        sample.ServiceID,
 		ContainerID:      sample.ContainerID,

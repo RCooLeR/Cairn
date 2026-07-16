@@ -46,10 +46,13 @@ type Bus interface {
 }
 
 type MemoryBus struct {
-	mu     sync.Mutex
-	now    func() time.Time
-	subs   map[Topic]map[*subscription]struct{}
-	closed bool
+	mu            sync.Mutex
+	now           func() time.Time
+	subs          map[Topic]map[*subscription]struct{}
+	done          chan struct{}
+	closeComplete chan struct{}
+	cleanup       sync.WaitGroup
+	closed        bool
 }
 
 type subscription struct {
@@ -58,8 +61,10 @@ type subscription struct {
 
 func New() *MemoryBus {
 	return &MemoryBus{
-		now:  func() time.Time { return time.Now().UTC() },
-		subs: make(map[Topic]map[*subscription]struct{}),
+		now:           func() time.Time { return time.Now().UTC() },
+		subs:          make(map[Topic]map[*subscription]struct{}),
+		done:          make(chan struct{}),
+		closeComplete: make(chan struct{}),
 	}
 }
 
@@ -100,10 +105,15 @@ func (b *MemoryBus) Subscribe(ctx context.Context, topic Topic, buf int) <-chan 
 		b.subs[topic] = make(map[*subscription]struct{})
 	}
 	b.subs[topic][sub] = struct{}{}
+	b.cleanup.Add(1)
 	b.mu.Unlock()
 
 	go func() {
-		<-ctx.Done()
+		defer b.cleanup.Done()
+		select {
+		case <-ctx.Done():
+		case <-b.done:
+		}
 		b.unsubscribe(topic, sub)
 	}()
 
@@ -112,12 +122,14 @@ func (b *MemoryBus) Subscribe(ctx context.Context, topic Topic, buf int) <-chan 
 
 func (b *MemoryBus) Close() {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-
 	if b.closed {
+		closeComplete := b.closeComplete
+		b.mu.Unlock()
+		<-closeComplete
 		return
 	}
 	b.closed = true
+	close(b.done)
 	for topic, subs := range b.subs {
 		for sub := range subs {
 			delete(subs, sub)
@@ -125,6 +137,10 @@ func (b *MemoryBus) Close() {
 		}
 		delete(b.subs, topic)
 	}
+	b.mu.Unlock()
+
+	b.cleanup.Wait()
+	close(b.closeComplete)
 }
 
 func (b *MemoryBus) unsubscribe(topic Topic, sub *subscription) {

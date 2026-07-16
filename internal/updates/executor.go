@@ -18,6 +18,7 @@ import (
 	dockercore "github.com/RCooLeR/Cairn/internal/docker"
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/store"
 )
@@ -79,6 +80,7 @@ type updatePlanRecord struct {
 	Build           []string
 	Up              []string
 	CommandSet      []models.PlannedCommand
+	Scope           runtimescope.Scope
 }
 
 type updateSnapshot struct {
@@ -122,6 +124,14 @@ func (m *Manager) ApplyUpdate(ctx context.Context, req models.ApplyUpdateRequest
 		m.saveUpdatePlan(record)
 		return "", apperror.New(apperror.Conflict, "Update plan is a rollback plan")
 	}
+	if !record.Scope.Equal(m.Scope) {
+		return "", apperror.New(apperror.NotFound, "Update plan was not created for the active runtime context")
+	}
+	project, err := m.projectForCompose(ctx, record.Project.ID)
+	if err != nil {
+		return "", err
+	}
+	record.Project = project
 	if len(record.CommandSet) == 0 {
 		m.saveUpdatePlan(record)
 		return "", apperror.New(apperror.Conflict, "Update plan has no actionable commands")
@@ -138,12 +148,16 @@ func (m *Manager) ApplyUpdate(ctx context.Context, req models.ApplyUpdateRequest
 }
 
 func (m *Manager) PlanRollback(ctx context.Context, historyID int64) (*models.UpdatePlan, error) {
-	if m == nil || m.Updates == nil || m.Compose == nil || m.Docker == nil {
+	if m == nil || m.Updates == nil || m.Compose == nil || m.Docker == nil || !m.Scope.Valid() {
 		return nil, notReady()
 	}
-	history, err := m.Updates.GetHistory(ctx, historyID)
+	history, err := m.Updates.GetHistoryInScope(ctx, m.Scope, historyID)
 	if err != nil {
 		return nil, mapStoreError(err, "Update history item was not found")
+	}
+	project, err := m.projectForCompose(ctx, history.ProjectID)
+	if err != nil || !m.Scope.Matches(history.ProviderID, history.ContextName) {
+		return nil, apperror.New(apperror.NotFound, "Update history item was not found")
 	}
 	if history.RollbackStatus != rollbackStatusAvailable {
 		return nil, apperror.New(
@@ -157,10 +171,6 @@ func (m *Manager) PlanRollback(ctx context.Context, historyID int64) (*models.Up
 	}
 	if _, err := m.Docker.GetImage(ctx, history.OldImageID); err != nil {
 		return nil, apperror.New(apperror.NotFound, "Previous image is no longer present locally", apperror.WithCause(err), apperror.WithRepairHints("Pull the previous versioned tag manually, then redeploy this service."))
-	}
-	project, err := m.projectForCompose(ctx, history.ProjectID)
-	if err != nil {
-		return nil, err
 	}
 	service := serviceNameFromID(history.ServiceID, history.ProjectID)
 	composeArgs := []string{"up", "-d"}
@@ -206,6 +216,7 @@ func (m *Manager) PlanRollback(ctx context.Context, historyID int64) (*models.Up
 		Project:         project,
 		RollbackHistory: history,
 		CommandSet:      commands,
+		Scope:           m.Scope,
 	}
 	m.saveUpdatePlan(record)
 	plan := record.Plan
@@ -221,6 +232,14 @@ func (m *Manager) ApplyRollback(ctx context.Context, planID string) (string, err
 		m.saveUpdatePlan(record)
 		return "", apperror.New(apperror.Conflict, "Update plan is not a rollback plan")
 	}
+	if !record.Scope.Equal(m.Scope) {
+		return "", apperror.New(apperror.NotFound, "Rollback plan was not created for the active runtime context")
+	}
+	project, err := m.projectForCompose(ctx, record.Project.ID)
+	if err != nil || record.RollbackHistory.ProjectID != record.Project.ID || !m.Scope.Matches(record.RollbackHistory.ProviderID, record.RollbackHistory.ContextName) {
+		return "", apperror.New(apperror.NotFound, "Update history item was not found")
+	}
+	record.Project = project
 	jobID := "updates-" + m.newID()
 	m.startJob(jobID, func(jobCtx context.Context) {
 		m.runManualRollback(jobCtx, jobID, record.Project, record.RollbackHistory)
@@ -258,11 +277,11 @@ func (m *Manager) planUpdate(ctx context.Context, projectID string, serviceName 
 		}
 	}
 
-	current, err := m.Updates.ListCurrent(ctx, models.UpdateFilter{ProjectID: projectID})
+	current, err := m.Updates.ListCurrentInScope(ctx, m.Scope, models.UpdateFilter{ProjectID: projectID})
 	if err != nil {
 		return nil, apperror.Wrap(apperror.Internal, "List updates for planning failed", err)
 	}
-	ignored, err := m.Updates.ListCurrent(ctx, models.UpdateFilter{
+	ignored, err := m.Updates.ListCurrentInScope(ctx, m.Scope, models.UpdateFilter{
 		ProjectID: projectID,
 		Status:    []models.UpdateStatus{models.UpdateStatusIgnored},
 	})
@@ -280,6 +299,7 @@ func (m *Manager) planUpdate(ctx context.Context, projectID string, serviceName 
 		ExpiresAt: now.Add(security.DefaultPlanTTL),
 		Project:   project,
 		Services:  serviceByName,
+		Scope:     m.Scope,
 	}
 	warnings := make([]string, 0)
 	for _, check := range current {
@@ -402,6 +422,7 @@ func (m *Manager) insertHistoryRows(ctx context.Context, record updatePlanRecord
 	for _, snapshot := range record.Snapshots {
 		history := store.UpdateHistoryRecord{
 			ProviderID:     record.Project.ProviderID,
+			ContextName:    record.Project.ContextName,
 			ProjectID:      record.Project.ID,
 			ServiceID:      snapshot.Service.ID,
 			UpdateKind:     snapshot.Check.Kind,
@@ -417,7 +438,7 @@ func (m *Manager) insertHistoryRows(ctx context.Context, record updatePlanRecord
 			RollbackStatus: rollbackStatusForImage(snapshot.OldImageID),
 			StartedAt:      m.now(),
 		}
-		id, err := m.Updates.InsertHistory(ctx, history)
+		id, err := m.Updates.InsertHistoryInScope(ctx, m.Scope, history)
 		if err != nil {
 			return histories, apperror.Wrap(apperror.Internal, "Record update history failed", err)
 		}
@@ -684,7 +705,7 @@ func (m *Manager) runManualRollback(ctx context.Context, jobID string, project s
 	}
 	finishCtx, cancel := m.finishContext(ctx)
 	defer cancel()
-	_ = m.Updates.FinishHistory(finishCtx, history.ID, finish)
+	_ = m.Updates.FinishHistoryInScope(finishCtx, m.Scope, history.ID, finish)
 	_ = m.recordAudit(finishCtx, "update.rollback", "project", project.ID, project.ProviderID, project.ID, command, models.RiskNeedsConfirmation, auditStatus(err), time.Since(started), err)
 	history.Result = result
 	history.RollbackStatus = status
@@ -731,7 +752,7 @@ func (m *Manager) finishUpdateJob(ctx context.Context, jobID string, record upda
 		if history.UpdateKind == models.UpdateKindBaseImage {
 			finish.NewBaseDigest = history.NewBaseDigest
 		}
-		_ = m.Updates.FinishHistory(finishCtx, history.ID, finish)
+		_ = m.Updates.FinishHistoryInScope(finishCtx, m.Scope, history.ID, finish)
 		history.Result = finish.Result
 		history.HealthResult = finish.HealthResult
 		history.RollbackStatus = finish.RollbackStatus
@@ -775,9 +796,9 @@ func (m *Manager) currentServiceImage(ctx context.Context, projectID string, ser
 }
 
 func (m *Manager) projectForCompose(ctx context.Context, projectID string) (store.ProjectRecord, error) {
-	project, err := m.Projects.Get(ctx, projectID)
+	project, err := m.projectInScope(ctx, projectID)
 	if err != nil {
-		return store.ProjectRecord{}, mapStoreError(err, "Project was not found")
+		return store.ProjectRecord{}, err
 	}
 	if strings.TrimSpace(project.WorkingDir) == "" {
 		return store.ProjectRecord{}, apperror.New(apperror.WorkdirMissing, "Project working directory is missing")

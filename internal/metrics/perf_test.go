@@ -35,6 +35,7 @@ func TestManagerSeedScaleDashboardPerformanceAndGoroutines(t *testing.T) {
 	events := bus.New()
 	defer events.Close()
 	manager := NewManager(docker, db.Metrics(), db.Projects(), db.Audit(), events, Options{
+		Scope:              testRuntimeScope,
 		VisibleInterval:    time.Millisecond,
 		BackgroundInterval: 5 * time.Millisecond,
 		PublishInterval:    time.Millisecond,

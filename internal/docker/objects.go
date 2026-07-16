@@ -10,9 +10,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/bus"
 	composecore "github.com/RCooLeR/Cairn/internal/compose"
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/store"
 	dockertypes "github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
@@ -290,6 +292,9 @@ func (c *Client) GetNetwork(ctx context.Context, id string) (*models.NetworkDeta
 }
 
 func (c *Client) Reconcile(ctx context.Context) error {
+	if _, err := c.ensureConnected(ctx); err != nil {
+		return err
+	}
 	var joined error
 	cache := c.objectCache()
 	before, compareSnapshots, snapshotErr := c.objectSnapshot(ctx, cache)
@@ -302,10 +307,6 @@ func (c *Client) Reconcile(ctx context.Context) error {
 	joined = errors.Join(joined, err)
 	_, err = c.ListNetworks(ctx)
 	joined = errors.Join(joined, err)
-	if cache != nil {
-		err = cache.DeleteStale(ctx, c.providerID(), c.now().Add(-24*time.Hour))
-		joined = errors.Join(joined, err)
-	}
 	if compareSnapshots && joined == nil {
 		after, _, err := c.objectSnapshot(ctx, cache)
 		if err != nil {
@@ -453,7 +454,11 @@ func (c *Client) objectSnapshot(ctx context.Context, cache *store.ObjectCacheRep
 	if cache == nil {
 		return store.ObjectCacheSnapshot{}, false, nil
 	}
-	snapshot, err := cache.SnapshotKeys(ctx, c.providerID())
+	scope, err := c.objectCacheScope()
+	if err != nil {
+		return store.ObjectCacheSnapshot{}, false, err
+	}
+	snapshot, err := cache.SnapshotKeysScoped(ctx, scope)
 	if err != nil {
 		return store.ObjectCacheSnapshot{}, false, err
 	}
@@ -815,13 +820,17 @@ func (c *Client) saveContainers(ctx context.Context, records []store.ContainerCa
 	if cache == nil {
 		return nil
 	}
+	scope, err := c.objectCacheScope()
+	if err != nil {
+		return err
+	}
 	if replace {
-		return cache.SaveContainersSnapshot(ctx, c.providerID(), records, c.now())
+		return cache.SaveContainersSnapshotScoped(ctx, scope, records, c.now())
 	}
 	if len(records) == 0 {
 		return nil
 	}
-	return cache.SaveContainers(ctx, c.providerID(), records, c.now())
+	return cache.SaveContainersScoped(ctx, scope, records, c.now())
 }
 
 func isContainerInventorySnapshot(opts models.ContainerListOptions) bool {
@@ -833,13 +842,17 @@ func (c *Client) saveImages(ctx context.Context, records []store.ImageCacheRecor
 	if cache == nil {
 		return nil
 	}
+	scope, err := c.objectCacheScope()
+	if err != nil {
+		return err
+	}
 	if replace {
-		return cache.SaveImagesSnapshot(ctx, c.providerID(), records, c.now())
+		return cache.SaveImagesSnapshotScoped(ctx, scope, records, c.now())
 	}
 	if len(records) == 0 {
 		return nil
 	}
-	return cache.SaveImages(ctx, c.providerID(), records, c.now())
+	return cache.SaveImagesScoped(ctx, scope, records, c.now())
 }
 
 func (c *Client) saveVolumes(ctx context.Context, records []store.VolumeCacheRecord, replace bool) error {
@@ -847,13 +860,17 @@ func (c *Client) saveVolumes(ctx context.Context, records []store.VolumeCacheRec
 	if cache == nil {
 		return nil
 	}
+	scope, err := c.objectCacheScope()
+	if err != nil {
+		return err
+	}
 	if replace {
-		return cache.SaveVolumesSnapshot(ctx, c.providerID(), records, c.now())
+		return cache.SaveVolumesSnapshotScoped(ctx, scope, records, c.now())
 	}
 	if len(records) == 0 {
 		return nil
 	}
-	return cache.SaveVolumes(ctx, c.providerID(), records, c.now())
+	return cache.SaveVolumesScoped(ctx, scope, records, c.now())
 }
 
 func (c *Client) saveNetworks(ctx context.Context, records []store.NetworkCacheRecord, replace bool) error {
@@ -861,19 +878,33 @@ func (c *Client) saveNetworks(ctx context.Context, records []store.NetworkCacheR
 	if cache == nil {
 		return nil
 	}
+	scope, err := c.objectCacheScope()
+	if err != nil {
+		return err
+	}
 	if replace {
-		return cache.SaveNetworksSnapshot(ctx, c.providerID(), records, c.now())
+		return cache.SaveNetworksSnapshotScoped(ctx, scope, records, c.now())
 	}
 	if len(records) == 0 {
 		return nil
 	}
-	return cache.SaveNetworks(ctx, c.providerID(), records, c.now())
+	return cache.SaveNetworksScoped(ctx, scope, records, c.now())
 }
 
 func (c *Client) objectCache() *store.ObjectCacheRepository {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.cache
+}
+
+func (c *Client) objectCacheScope() (runtimescope.Scope, error) {
+	c.mu.RLock()
+	runtimeScope := c.runtimeScope
+	c.mu.RUnlock()
+	if !runtimeScope.Valid() {
+		return runtimescope.Scope{}, apperror.New(apperror.ProviderNotReady, "Docker object cache scope is not available")
+	}
+	return runtimeScope, nil
 }
 
 func sleepContext(ctx context.Context, d time.Duration) bool {

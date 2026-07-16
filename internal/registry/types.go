@@ -157,6 +157,61 @@ func NewManager(providers ProviderResolver, audit *store.AuditRepository) *Manag
 	}
 }
 
+// CloneBoundTo returns an independent registry manager that resolves
+// credentials through one runtime-bound provider resolver. Static policy is
+// copied from the receiver, while all provider-sensitive runtime state (digest
+// cache, circuit breakers, limiters, and operation locks) starts empty.
+//
+// The returned manager may safely outlive or run concurrently with the source
+// manager. In particular, it does not reuse a digest that was authorized under
+// another provider's Docker configuration.
+func (m *Manager) CloneBoundTo(providers ProviderResolver) *Manager {
+	bound := NewManager(providers, nil)
+	if m == nil {
+		return bound
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	bound.Audit = m.Audit
+	bound.Settings = m.Settings
+	bound.HTTPClient = m.HTTPClient
+	bound.Now = m.Now
+	bound.CacheTTL = m.CacheTTL
+	bound.PlainHTTPRegistries = cloneRegistryBoolMap(m.PlainHTTPRegistries)
+	bound.TrustedAuthRealms = cloneRegistryStringSliceMap(m.TrustedAuthRealms)
+	bound.perRegistryLimit = m.perRegistryLimit
+	bound.cacheEntryLimit = m.cacheEntryLimit
+	bound.circuitEntryLimit = m.circuitEntryLimit
+	if globalLimit := cap(m.globalLimit); globalLimit > 0 {
+		bound.globalLimit = make(chan struct{}, globalLimit)
+	}
+	return bound
+}
+
+func cloneRegistryBoolMap(source map[string]bool) map[string]bool {
+	if source == nil {
+		return nil
+	}
+	cloned := make(map[string]bool, len(source))
+	for key, value := range source {
+		cloned[key] = value
+	}
+	return cloned
+}
+
+func cloneRegistryStringSliceMap(source map[string][]string) map[string][]string {
+	if source == nil {
+		return nil
+	}
+	cloned := make(map[string][]string, len(source))
+	for key, values := range source {
+		cloned[key] = append([]string(nil), values...)
+	}
+	return cloned
+}
+
 func (m *Manager) now() time.Time {
 	if m != nil && m.Now != nil {
 		return m.Now().UTC()

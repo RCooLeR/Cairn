@@ -2,6 +2,7 @@ package compose
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/store"
 )
 
@@ -27,23 +29,21 @@ type DockerInventory interface {
 }
 
 type ProjectDetector struct {
-	ProviderID  string
-	ContextName string
-	Docker      DockerInventory
-	Compose     *Client
-	PathMapper  PathMapper
-	Projects    *store.ProjectRepository
-	Objects     *store.ObjectCacheRepository
-	Now         func() time.Time
+	Scope      runtimescope.Scope
+	Docker     DockerInventory
+	Compose    *Client
+	PathMapper PathMapper
+	Projects   *store.ProjectRepository
+	Objects    *store.ObjectCacheRepository
+	Now        func() time.Time
 
 	ConfigTimeout     time.Duration
 	ConfigConcurrency int
 }
 
 func (d *ProjectDetector) Reconcile(ctx context.Context) ([]models.ProjectSummary, error) {
-	providerID := strings.TrimSpace(d.ProviderID)
-	if providerID == "" {
-		return nil, apperror.New(apperror.ProviderNotReady, "Project detector provider is not configured")
+	if !d.Scope.Valid() {
+		return nil, apperror.New(apperror.ProviderNotReady, "Project detector runtime scope is not configured")
 	}
 	now := d.now()
 	detected := map[string]*detectedProject{}
@@ -67,7 +67,7 @@ func (d *ProjectDetector) Reconcile(ctx context.Context) ([]models.ProjectSummar
 	}
 
 	if d.Projects != nil {
-		imported, err := d.Projects.ListImportedByProviderContext(ctx, providerID, d.ContextName)
+		imported, err := d.Projects.ListImportedByScope(ctx, d.Scope)
 		if err != nil {
 			return nil, err
 		}
@@ -83,8 +83,17 @@ func (d *ProjectDetector) Reconcile(ctx context.Context) ([]models.ProjectSummar
 
 	projectRecords, serviceRecords := projectStoreRecords(detected)
 	if d.Projects != nil {
-		if err := d.Projects.SaveSnapshot(ctx, providerID, projectRecords, serviceRecords, now, now.Add(-staleProjectTTL)); err != nil {
+		skippedProjectIDs, err := d.Projects.SaveDetectedSnapshot(ctx, d.Scope, projectRecords, serviceRecords, now, now.Add(-staleProjectTTL))
+		if err != nil {
 			return nil, err
+		}
+		if len(skippedProjectIDs) > 0 {
+			slog.WarnContext(ctx, "skipped detected projects excluded from the active snapshot",
+				"provider", d.Scope.ProviderID(),
+				"context", d.Scope.ContextName(),
+				"project_ids", skippedProjectIDs,
+			)
+			omitDetectedProjects(detected, skippedProjectIDs)
 		}
 	}
 	return projectSummaries(detected), nil
@@ -100,7 +109,7 @@ func (d *ProjectDetector) refreshContainers(ctx context.Context) ([]store.Contai
 		}
 	}
 	if d.Objects != nil && d.Docker == nil {
-		records, err := d.Objects.ListContainers(ctx, d.ProviderID)
+		records, err := d.Objects.ListContainersScoped(ctx, d.Scope)
 		if err != nil {
 			return nil, err
 		}
@@ -118,7 +127,7 @@ func (d *ProjectDetector) refreshContainers(ctx context.Context) ([]store.Contai
 func (d *ProjectDetector) mergeContainer(record store.ContainerCacheRecord, detected map[string]*detectedProject, now time.Time) {
 	projectName := NormalizeProjectName(record.Labels[LabelProject])
 	if projectName == "" {
-		projectName = NormalizeProjectName(ProjectNameFromID(d.ProviderID, record.Summary.ProjectID))
+		projectName = NormalizeProjectName(ProjectNameFromID(d.Scope.ProviderID(), record.Summary.ProjectID))
 	}
 	if projectName == "" {
 		return
@@ -180,7 +189,7 @@ func (d *ProjectDetector) mergeComposeLS(project Project, detected map[string]*d
 func (d *ProjectDetector) mergeImported(project store.ProjectRecord, detected map[string]*detectedProject, now time.Time) {
 	name := NormalizeProjectName(project.Name)
 	if name == "" {
-		name = NormalizeProjectName(ProjectNameFromID(d.ProviderID, project.ID))
+		name = NormalizeProjectName(ProjectNameFromID(d.Scope.ProviderID(), project.ID))
 	}
 	if name == "" {
 		return
@@ -323,12 +332,12 @@ func (d *ProjectDetector) ensureProject(detected map[string]*detectedProject, na
 	if project != nil {
 		return project
 	}
-	projectID := ProjectID(d.ProviderID, name)
+	projectID := ProjectID(d.Scope.ProviderID(), name)
 	project = &detectedProject{
 		record: store.ProjectRecord{
 			ID:          projectID,
-			ProviderID:  d.ProviderID,
-			ContextName: d.ContextName,
+			ProviderID:  d.Scope.ProviderID(),
+			ContextName: d.Scope.ContextName(),
 			Name:        name,
 			Status:      models.ProjectStatusUnknown,
 			Health:      models.HealthStatusUnknown,
@@ -461,6 +470,21 @@ func projectSummaries(detected map[string]*detectedProject) []models.ProjectSumm
 		})
 	}
 	return summaries
+}
+
+func omitDetectedProjects(detected map[string]*detectedProject, projectIDs []string) {
+	if len(detected) == 0 || len(projectIDs) == 0 {
+		return
+	}
+	skipped := make(map[string]struct{}, len(projectIDs))
+	for _, projectID := range projectIDs {
+		skipped[strings.TrimSpace(projectID)] = struct{}{}
+	}
+	for name, project := range detected {
+		if _, ok := skipped[strings.TrimSpace(project.record.ID)]; ok {
+			delete(detected, name)
+		}
+	}
 }
 
 func serviceConfigMetadata(config ServiceConfig) map[string]any {

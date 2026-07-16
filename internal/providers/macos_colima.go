@@ -43,6 +43,8 @@ type MacOSColimaProvider struct {
 	diskGB   int
 	runner   CommandRunner
 	homeDir  string
+	// runtimeSocket is populated only on a frozen runtime snapshot.
+	runtimeSocket string
 
 	configMu     sync.RWMutex
 	installMu    sync.Mutex
@@ -152,7 +154,7 @@ func (p *MacOSColimaProvider) Detect(ctx context.Context) (*models.ProviderStatu
 		))
 	}
 
-	if buildxVersion, ok := p.runText(ctx, "docker", "buildx", "version"); ok {
+	if buildxVersion, ok := p.runDockerHostText(ctx, "buildx", "version"); ok {
 		status.BuildxInstalled = true
 		status.BackendVersion = normalizeDockerVersion(buildxVersion)
 	} else {
@@ -185,7 +187,7 @@ func (p *MacOSColimaProvider) Detect(ctx context.Context) (*models.ProviderStatu
 		status.BackendVersion = "Colima " + normalizeDockerVersion(colimaVersion)
 	}
 
-	colimaStatus, colimaRunning := p.colimaStatus(ctx)
+	_, colimaRunning := p.colimaStatus(ctx)
 	if !colimaRunning {
 		status.Problems = append(status.Problems, providerProblem(
 			ProblemColimaStopped,
@@ -195,57 +197,24 @@ func (p *MacOSColimaProvider) Detect(ctx context.Context) (*models.ProviderStatu
 		))
 	}
 
-	contextName := p.contextName()
-	contexts, contextsOK := p.listDockerContexts(ctx)
-	contextFound := false
-	contextSelected := false
-	for _, dockerContext := range contexts {
-		if dockerContext.Name != contextName {
-			continue
-		}
-		contextFound = true
-		contextSelected = dockerContext.Current
-		status.CurrentContext = dockerContext.Name
-		status.DockerHost = dockerContext.DockerHost
-		break
-	}
-	if status.DockerHost == "" && colimaStatus.Socket != "" {
-		status.DockerHost = colimaStatus.Socket
-	}
-	if status.DockerHost == "" {
-		status.DockerHost = defaultColimaSocket(p.homeDir, p.configuredProfile())
-	}
-	if !contextsOK || !contextFound {
-		status.Problems = append(status.Problems, providerProblem(
-			ProblemContextMissing,
-			fmt.Sprintf("Docker context %q was not found.", contextName),
-			"Start Colima and allow it to create the Docker context.",
-			true,
-		))
-	} else if !contextSelected {
-		status.Problems = append(status.Problems, providerProblem(
-			ProblemContextNotSelected,
-			fmt.Sprintf("Docker context %q is not selected.", contextName),
-			fmt.Sprintf("Run `docker context use %s` or start the Colima provider from Cairn.", contextName),
-			true,
-		))
-	}
+	status.CurrentContext = "colima:" + p.configuredProfile()
+	status.DockerHost = p.profileDockerHost(ctx)
 
-	if colimaRunning && contextFound {
-		if dockerVersion, ok := p.runDockerContextText(ctx, contextName, "info", "--format", "{{.ServerVersion}}"); ok {
+	if colimaRunning {
+		if dockerVersion, ok := p.runDockerHostText(ctx, "info", "--format", "{{.ServerVersion}}"); ok {
 			status.DockerRunning = true
 			status.DockerVersion = normalizeDockerVersion(dockerVersion)
 		} else {
 			status.Problems = append(status.Problems, providerProblem(
 				ProblemDockerDown,
-				"Docker daemon ping through the Colima context failed.",
-				"Restart Colima and verify `docker --context "+contextName+" info`.",
+				"Docker daemon ping through the Colima profile socket failed.",
+				"Restart Colima and verify its profile Docker socket.",
 				true,
 			))
 		}
 	}
 
-	status.Installed = status.DockerInstalled && status.ComposeInstalled && status.BuildxInstalled && contextFound
+	status.Installed = status.DockerInstalled && status.ComposeInstalled && status.BuildxInstalled
 	status.Running = colimaRunning && status.DockerRunning
 	status.Healthy = status.Installed && status.Running && !hasBlockingProblem(status.Problems)
 	return status, nil
@@ -270,7 +239,7 @@ func (p *MacOSColimaProvider) PlanInstall(_ context.Context, opts models.Install
 	cpu := optionInt(opts.Extra, "cpu", p.configuredCPU())
 	memoryGB := optionInt(opts.Extra, "memoryGB", p.configuredMemoryGB())
 	diskGB := optionInt(opts.Extra, "diskGB", p.configuredDiskGB())
-	steps := buildColimaInstallSteps(profile, cpu, memoryGB, diskGB)
+	steps := buildColimaInstallSteps(profile, cpu, memoryGB, diskGB, defaultColimaSocket(p.homeDir, profile))
 	planID := security.NewPlanID()
 	commands := make([]models.PlannedCommand, 0, len(steps))
 	for index, step := range steps {
@@ -289,7 +258,7 @@ func (p *MacOSColimaProvider) PlanInstall(_ context.Context, opts models.Install
 		Effects: []string{
 			"Install or upgrade Docker CLI, Docker Compose, Docker Buildx, and Colima with Homebrew.",
 			"Start the selected Colima profile with the configured CPU, memory, and disk limits.",
-			"Select the Colima Docker context and verify Docker, Compose, Buildx, and hello-world.",
+			"Verify Docker, Compose, Buildx, and hello-world through the selected profile socket.",
 		},
 		ExpiresAt: time.Now().UTC().Add(security.DefaultPlanTTL),
 	}
@@ -343,10 +312,6 @@ func (p *MacOSColimaProvider) pruneExpiredInstallPlansLocked(now time.Time) {
 
 func (p *MacOSColimaProvider) Start(ctx context.Context) error {
 	_, err := p.runner.Run(ctx, colimaInstallTimeout, colimaCommandName, p.colimaStartArgs()...)
-	if err != nil {
-		return err
-	}
-	_, err = p.runner.Run(ctx, commandTimeout, "docker", "context", "use", p.contextName())
 	return err
 }
 
@@ -357,38 +322,54 @@ func (p *MacOSColimaProvider) Stop(ctx context.Context) error {
 
 func (p *MacOSColimaProvider) Restart(ctx context.Context) error {
 	_, err := p.runner.Run(ctx, colimaInstallTimeout, colimaCommandName, "restart", "-p", p.configuredProfile())
-	if err != nil {
-		return err
-	}
-	_, err = p.runner.Run(ctx, commandTimeout, "docker", "context", "use", p.contextName())
 	return err
 }
 
 func (p *MacOSColimaProvider) DockerHost(ctx context.Context) (string, error) {
-	if host, ok := p.contextDockerHost(ctx, p.contextName()); ok {
-		return host, nil
+	current := p.profileDockerHost(ctx)
+	if current == "" {
+		return "", apperror.New(apperror.ProviderNotReady, "Colima profile Docker socket is not available")
 	}
-	if status, ok := p.colimaStatus(ctx); ok && status.Socket != "" {
-		return status.Socket, nil
+	if p.runtimeSocket != "" && current != p.runtimeSocket {
+		return "", apperror.New(
+			apperror.ProviderNotReady,
+			"Colima profile Docker socket changed; reconnect the provider",
+			apperror.WithDetail(current),
+		)
 	}
-	return "", apperror.New(apperror.ProviderNotReady, "Colima Docker context host is not available")
+	if p.runtimeSocket != "" {
+		return p.runtimeSocket, nil
+	}
+	return current, nil
 }
 
-func (p *MacOSColimaProvider) DockerContext(context.Context) (string, error) {
-	return p.contextName(), nil
+func (p *MacOSColimaProvider) DockerContext(ctx context.Context) (string, error) {
+	return p.BackendIdentity(ctx)
 }
 
-func (p *MacOSColimaProvider) BackendIdentity(context.Context) (string, error) {
-	return "colima:" + p.configuredProfile(), nil
+func (p *MacOSColimaProvider) BackendIdentity(ctx context.Context) (string, error) {
+	host, err := p.DockerHost(ctx)
+	if err != nil {
+		return "", err
+	}
+	return "colima:" + p.configuredProfile() + "@" + host, nil
 }
 
 func (p *MacOSColimaProvider) RunDocker(ctx context.Context, args ...string) (*CommandResult, error) {
-	dockerArgs := append([]string{"--context", p.contextName()}, args...)
+	host, err := p.DockerHost(ctx)
+	if err != nil {
+		return nil, err
+	}
+	dockerArgs := append([]string{"--host", host}, args...)
 	return p.runner.Run(ctx, dockerOperationTimeout, "docker", dockerArgs...)
 }
 
 func (p *MacOSColimaProvider) RunDockerWithInput(ctx context.Context, input string, args ...string) (*CommandResult, error) {
-	dockerArgs := append([]string{"--context", p.contextName()}, args...)
+	host, err := p.DockerHost(ctx)
+	if err != nil {
+		return nil, err
+	}
+	dockerArgs := append([]string{"--host", host}, args...)
 	if runner, ok := p.runner.(OptionsCommandRunner); ok {
 		return runner.RunWithOptions(ctx, CommandRunOptions{
 			Timeout: dockerOperationTimeout,
@@ -416,7 +397,11 @@ func (p *MacOSColimaProvider) RunCompose(ctx context.Context, workdir string, ar
 }
 
 func (p *MacOSColimaProvider) RunComposeEnv(ctx context.Context, workdir string, env []string, args ...string) (*CommandResult, error) {
-	name, prefix := p.composeCommand(ctx)
+	host, err := p.DockerHost(ctx)
+	if err != nil {
+		return nil, err
+	}
+	name, prefix := p.composeCommand(ctx, host)
 	composeArgs := append(prefix, args...)
 	timeout := composeTimeoutForArgs(args)
 	if runner, ok := p.runner.(OptionsCommandRunner); ok {
@@ -466,7 +451,7 @@ func (p *MacOSColimaProvider) MapPathToHost(backendPath string) (string, error) 
 }
 
 func (p *MacOSColimaProvider) detectComposeVersion(ctx context.Context) (string, bool) {
-	if version, ok := p.runText(ctx, "docker", "compose", "version", "--short"); ok {
+	if version, ok := p.runDockerHostText(ctx, "compose", "version", "--short"); ok {
 		return version, true
 	}
 	if _, err := p.runner.LookPath("docker-compose"); err == nil {
@@ -475,17 +460,33 @@ func (p *MacOSColimaProvider) detectComposeVersion(ctx context.Context) (string,
 	return "", false
 }
 
-func (p *MacOSColimaProvider) composeCommand(ctx context.Context) (string, []string) {
-	contextName := p.contextName()
-	if _, ok := p.runText(ctx, "docker", "--context", contextName, "compose", "version", "--short"); ok {
-		return "docker", []string{"--context", contextName, "compose"}
+func (p *MacOSColimaProvider) composeCommand(ctx context.Context, host string) (string, []string) {
+	if _, ok := p.runText(ctx, "docker", "--host", host, "compose", "version", "--short"); ok {
+		return "docker", []string{"--host", host, "compose"}
 	}
-	return "docker-compose", []string{"--context", contextName}
+	return "docker-compose", []string{"--host", host}
 }
 
 func (p *MacOSColimaProvider) runDockerContextText(ctx context.Context, contextName string, args ...string) (string, bool) {
 	dockerArgs := append([]string{"--context", contextName}, args...)
 	return p.runText(ctx, "docker", dockerArgs...)
+}
+
+func (p *MacOSColimaProvider) runDockerHostText(ctx context.Context, args ...string) (string, bool) {
+	host := p.profileDockerHost(ctx)
+	if host == "" {
+		return "", false
+	}
+	dockerArgs := append([]string{"--host", host}, args...)
+	return p.runText(ctx, "docker", dockerArgs...)
+}
+
+func (p *MacOSColimaProvider) profileDockerHost(ctx context.Context) string {
+	status, _ := p.colimaStatus(ctx)
+	if socket := strings.TrimSpace(status.Socket); socket != "" {
+		return socket
+	}
+	return defaultColimaSocket(p.homeDir, p.configuredProfile())
 }
 
 func (p *MacOSColimaProvider) runText(ctx context.Context, name string, args ...string) (string, bool) {
@@ -596,8 +597,7 @@ func (p *MacOSColimaProvider) colimaStartArgs() []string {
 	}
 }
 
-func buildColimaInstallSteps(profile string, cpu, memoryGB, diskGB int) []colimaInstallStep {
-	contextName := colimaContextName(profile)
+func buildColimaInstallSteps(profile string, cpu, memoryGB, diskGB int, dockerHost string) []colimaInstallStep {
 	return []colimaInstallStep{
 		{
 			Message:     "Install or upgrade Docker CLI with Homebrew",
@@ -637,27 +637,21 @@ func buildColimaInstallSteps(profile string, cpu, memoryGB, diskGB int) []colima
 			RepairHints: []string{"Inspect `colima status` and free disk/memory resources before retrying."},
 		},
 		{
-			Message:     "Select the Colima Docker context",
-			Timeout:     commandTimeout,
-			Command:     []string{"docker", "context", "use", contextName},
-			RepairHints: []string{"Start Colima again if the context was not created."},
-		},
-		{
 			Message:     "Verify Docker, Compose, and Buildx",
 			Timeout:     commandTimeout,
-			Command:     []string{"docker", "--context", contextName, "compose", "version", "--short"},
+			Command:     []string{"docker", "--host", dockerHost, "compose", "version", "--short"},
 			RepairHints: []string{"Install Docker Compose v2 and retry setup."},
 		},
 		{
 			Message:     "Verify Buildx",
 			Timeout:     commandTimeout,
-			Command:     []string{"docker", "--context", contextName, "buildx", "version"},
+			Command:     []string{"docker", "--host", dockerHost, "buildx", "version"},
 			RepairHints: []string{"Install or update Docker Buildx and retry setup."},
 		},
 		{
 			Message:     "Run hello-world through Colima",
 			Timeout:     colimaInstallTimeout,
-			Command:     []string{"docker", "--context", contextName, "run", "--rm", "hello-world"},
+			Command:     []string{"docker", "--host", dockerHost, "run", "--rm", "hello-world"},
 			RepairHints: []string{"Verify the Colima daemon can pull images from Docker Hub."},
 		},
 	}

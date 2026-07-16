@@ -2,6 +2,7 @@ package compose
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/store"
 )
 
@@ -35,7 +37,7 @@ func TestProjectDetectorLabelsWinOverImported(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("UpsertImported() error = %v", err)
 	}
-	if err := db.Objects().SaveContainers(ctx, "linux_native", []store.ContainerCacheRecord{{
+	if err := db.Objects().SaveContainersScoped(ctx, runtimescope.Must("linux_native", "default"), []store.ContainerCacheRecord{{
 		Summary: models.ContainerSummary{
 			ID:        "abc",
 			Name:      "demo-web-1",
@@ -60,13 +62,12 @@ func TestProjectDetectorLabelsWinOverImported(t *testing.T) {
 	runner.outputs["|ls --format json --all"] = commandResult(lsOutput(t, "demo", "running(1)", composeFile))
 	runner.outputs[workdir+"|-f "+composeFile+" config"] = commandResult("services:\n  web:\n    image: nginx:alpine\n")
 	detector := &ProjectDetector{
-		ProviderID:  "linux_native",
-		ContextName: "default",
-		Docker:      nil,
-		Compose:     NewClient(runner),
-		Projects:    db.Projects(),
-		Objects:     db.Objects(),
-		Now:         func() time.Time { return now },
+		Scope:    runtimescope.Must("linux_native", "default"),
+		Docker:   nil,
+		Compose:  NewClient(runner),
+		Projects: db.Projects(),
+		Objects:  db.Objects(),
+		Now:      func() time.Time { return now },
 	}
 
 	summaries, err := detector.Reconcile(ctx)
@@ -104,7 +105,7 @@ func TestProjectDetectorIgnoresObjectCacheWhenLiveDockerIsEmpty(t *testing.T) {
 	ctx := context.Background()
 	db := openProjectTestStore(t)
 	now := time.Date(2026, 6, 13, 1, 30, 0, 0, time.UTC)
-	if err := db.Objects().SaveContainers(ctx, "linux_native", []store.ContainerCacheRecord{{
+	if err := db.Objects().SaveContainersScoped(ctx, runtimescope.Must("linux_native", "default"), []store.ContainerCacheRecord{{
 		Summary: models.ContainerSummary{
 			ID:        "stale",
 			Name:      "stale-web-1",
@@ -125,13 +126,12 @@ func TestProjectDetectorIgnoresObjectCacheWhenLiveDockerIsEmpty(t *testing.T) {
 	runner := newFakeRunner()
 	runner.outputs["|ls --format json --all"] = commandResult(`[]`)
 	detector := &ProjectDetector{
-		ProviderID:  "linux_native",
-		ContextName: "default",
-		Docker:      fakeDockerInventory{},
-		Compose:     NewClient(runner),
-		Projects:    db.Projects(),
-		Objects:     db.Objects(),
-		Now:         func() time.Time { return now },
+		Scope:    runtimescope.Must("linux_native", "default"),
+		Docker:   fakeDockerInventory{},
+		Compose:  NewClient(runner),
+		Projects: db.Projects(),
+		Objects:  db.Objects(),
+		Now:      func() time.Time { return now },
 	}
 
 	summaries, err := detector.Reconcile(ctx)
@@ -140,6 +140,48 @@ func TestProjectDetectorIgnoresObjectCacheWhenLiveDockerIsEmpty(t *testing.T) {
 	}
 	if len(summaries) != 0 {
 		t.Fatalf("summaries = %#v", summaries)
+	}
+}
+
+func TestProjectDetectorOmitsForgottenProjectFromImmediateResult(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openProjectTestStore(t)
+	workdir := t.TempDir()
+	composeFile := filepath.Join(workdir, "compose.yaml")
+	writeProjectFile(t, composeFile, "services:\n  web:\n    image: nginx:alpine\n")
+	now := time.Date(2026, 6, 13, 1, 40, 0, 0, time.UTC)
+	projectID := ProjectID("linux_native", "forgotten")
+	if err := db.Projects().Forget(ctx, store.ProjectRecord{
+		ID:          projectID,
+		ProviderID:  "linux_native",
+		ContextName: "default",
+		Name:        "forgotten",
+		Source:      store.ProjectSourceLabels,
+	}, now.Add(-time.Minute)); err != nil {
+		t.Fatalf("Forget() error = %v", err)
+	}
+
+	runner := newFakeRunner()
+	runner.outputs["|ls --format json --all"] = commandResult(lsOutput(t, "forgotten", "running(1)", composeFile))
+	runner.outputs[workdir+"|-f "+composeFile+" config"] = commandResult("services:\n  web:\n    image: nginx:alpine\n")
+	detector := &ProjectDetector{
+		Scope:    runtimescope.Must("linux_native", "default"),
+		Compose:  NewClient(runner),
+		Projects: db.Projects(),
+		Objects:  db.Objects(),
+		Now:      func() time.Time { return now },
+	}
+
+	summaries, err := detector.Reconcile(ctx)
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if len(summaries) != 0 {
+		t.Fatalf("forgotten summaries = %#v, want none", summaries)
+	}
+	if _, err := db.Projects().Get(ctx, projectID); !store.IsStoreNotFound(err) {
+		t.Fatalf("forgotten project persistence error = %v, want not found", err)
 	}
 }
 
@@ -163,7 +205,7 @@ func TestProjectDetectorMapsBackendLabelPathsToHost(t *testing.T) {
 	backendFile := "/mnt/e/Development/project/compose.yaml"
 	now := time.Date(2026, 6, 13, 1, 45, 0, 0, time.UTC)
 
-	if err := db.Objects().SaveContainers(ctx, "windows_wsl_ubuntu", []store.ContainerCacheRecord{{
+	if err := db.Objects().SaveContainersScoped(ctx, runtimescope.Must("windows_wsl_ubuntu", "default"), []store.ContainerCacheRecord{{
 		Summary: models.ContainerSummary{
 			ID:        "abc",
 			Name:      "demo-web-1",
@@ -191,13 +233,12 @@ func TestProjectDetectorMapsBackendLabelPathsToHost(t *testing.T) {
 	runner.outputs["|ls --format json --all"] = commandResult(`[]`)
 	runner.outputs[backendWorkdir+"|-f "+backendFile+" config"] = commandResult("services:\n  web:\n    image: nginx:alpine\n")
 	detector := &ProjectDetector{
-		ProviderID:  "windows_wsl_ubuntu",
-		ContextName: "default",
-		Compose:     NewClient(runner),
-		PathMapper:  runner,
-		Projects:    db.Projects(),
-		Objects:     db.Objects(),
-		Now:         func() time.Time { return now },
+		Scope:      runtimescope.Must("windows_wsl_ubuntu", "default"),
+		Compose:    NewClient(runner),
+		PathMapper: runner,
+		Projects:   db.Projects(),
+		Objects:    db.Objects(),
+		Now:        func() time.Time { return now },
 	}
 
 	summaries, err := detector.Reconcile(ctx)
@@ -238,13 +279,12 @@ func TestProjectDetectorComposeLSAddsZeroContainerProject(t *testing.T) {
 	runner.outputs["|ls --format json --all"] = commandResult(lsOutput(t, "empty", "exited(0)", composeFile))
 	runner.outputs[workdir+"|-f "+composeFile+" config"] = commandResult("services:\n  worker:\n    image: busybox:1.36\n")
 	detector := &ProjectDetector{
-		ProviderID:  "linux_native",
-		ContextName: "default",
-		Docker:      fakeDockerInventory{},
-		Compose:     NewClient(runner),
-		Projects:    db.Projects(),
-		Objects:     db.Objects(),
-		Now:         func() time.Time { return now },
+		Scope:    runtimescope.Must("linux_native", "default"),
+		Docker:   fakeDockerInventory{},
+		Compose:  NewClient(runner),
+		Projects: db.Projects(),
+		Objects:  db.Objects(),
+		Now:      func() time.Time { return now },
 	}
 
 	summaries, err := detector.Reconcile(ctx)
@@ -283,13 +323,12 @@ func TestProjectDetectorFlagsImportedMissingWorkdir(t *testing.T) {
 	runner := newFakeRunner()
 	runner.outputs["|ls --format json --all"] = commandResult(`[]`)
 	detector := &ProjectDetector{
-		ProviderID:  "linux_native",
-		ContextName: "default",
-		Docker:      fakeDockerInventory{},
-		Compose:     NewClient(runner),
-		Projects:    db.Projects(),
-		Objects:     db.Objects(),
-		Now:         func() time.Time { return now },
+		Scope:    runtimescope.Must("linux_native", "default"),
+		Docker:   fakeDockerInventory{},
+		Compose:  NewClient(runner),
+		Projects: db.Projects(),
+		Objects:  db.Objects(),
+		Now:      func() time.Time { return now },
 	}
 
 	summaries, err := detector.Reconcile(ctx)
@@ -308,6 +347,79 @@ func TestProjectDetectorFlagsImportedMissingWorkdir(t *testing.T) {
 	}
 }
 
+func TestProjectDetectorSkipsLegacyBlankContextCollisionAndReturnsUnrelatedProject(t *testing.T) {
+	ctx := context.Background()
+	db, dbPath := openProjectTestStoreAt(t)
+	now := time.Date(2026, 6, 16, 6, 0, 0, 0, time.UTC)
+	scope := runtimescope.Must("linux_native", "unix:///var/run/docker.sock")
+	legacyID := "linux_native/legacy"
+	unrelatedID := "linux_native/unrelated"
+
+	raw, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw test database: %v", err)
+	}
+	t.Cleanup(func() { _ = raw.Close() })
+	if _, err := raw.ExecContext(ctx, `
+		INSERT INTO projects (id, provider_id, context_name, name, status, health, source, pinned, last_seen_at, compose_files_json, metadata_json)
+		VALUES (?, ?, '', ?, ?, ?, ?, 0, ?, '[]', '{}')
+	`, legacyID, scope.ProviderID(), "legacy", string(models.ProjectStatusStopped), string(models.HealthStatusUnknown), store.ProjectSourceLabels, now.Add(-time.Hour).Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("seed legacy blank-context project: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `
+		INSERT INTO services (id, project_id, name, image_ref, status, health, replicas_running, replicas_total, metadata_json, last_seen_at)
+		VALUES (?, ?, ?, ?, ?, ?, 0, 1, '{}', ?)
+	`, legacyID+"/web", legacyID, "web", "nginx:legacy", string(models.ProjectStatusStopped), string(models.HealthStatusUnknown), now.Add(-time.Hour).Format(time.RFC3339Nano)); err != nil {
+		t.Fatalf("seed legacy service: %v", err)
+	}
+
+	detector := &ProjectDetector{
+		Scope: scope,
+		Docker: fakeDockerInventory{containers: []models.ContainerSummary{
+			{ID: "legacy-container", ProjectID: legacyID, Service: "web", Image: "nginx:detected", State: "running", Status: "running", Health: models.HealthStatusHealthy, CreatedAt: now},
+			{ID: "unrelated-container", ProjectID: unrelatedID, Service: "api", Image: "cairn/api:latest", State: "running", Status: "running", Health: models.HealthStatusHealthy, CreatedAt: now},
+		}},
+		Projects: db.Projects(),
+		Now:      func() time.Time { return now },
+	}
+
+	summaries, err := detector.Reconcile(ctx)
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if len(summaries) != 1 || summaries[0].ID != unrelatedID {
+		t.Fatalf("summaries = %#v, want only %q", summaries, unrelatedID)
+	}
+	legacy, err := db.Projects().Get(ctx, legacyID)
+	if err != nil {
+		t.Fatalf("Get(legacy) error = %v", err)
+	}
+	if legacy.ContextName != "" {
+		t.Fatalf("legacy project was auto-claimed: %#v", legacy)
+	}
+	legacyServices, err := db.Projects().ListServices(ctx, legacyID)
+	if err != nil {
+		t.Fatalf("ListServices(legacy) error = %v", err)
+	}
+	if len(legacyServices) != 1 || legacyServices[0].ImageRef != "nginx:legacy" {
+		t.Fatalf("legacy services were overwritten: %#v", legacyServices)
+	}
+	unrelated, err := db.Projects().GetInScope(ctx, scope, unrelatedID)
+	if err != nil {
+		t.Fatalf("GetInScope(unrelated) error = %v", err)
+	}
+	if unrelated.Name != "unrelated" {
+		t.Fatalf("unrelated project = %#v", unrelated)
+	}
+	unrelatedServices, err := db.Projects().ListServices(ctx, unrelatedID)
+	if err != nil {
+		t.Fatalf("ListServices(unrelated) error = %v", err)
+	}
+	if len(unrelatedServices) != 1 || unrelatedServices[0].ImageRef != "cairn/api:latest" {
+		t.Fatalf("unrelated services = %#v", unrelatedServices)
+	}
+}
+
 func TestSamePathHonorsPlatformCaseSensitivity(t *testing.T) {
 	t.Parallel()
 	if !samePathForOS(`/tmp/App`, `/tmp/app`, "windows") {
@@ -318,10 +430,12 @@ func TestSamePathHonorsPlatformCaseSensitivity(t *testing.T) {
 	}
 }
 
-type fakeDockerInventory struct{}
+type fakeDockerInventory struct {
+	containers []models.ContainerSummary
+}
 
-func (fakeDockerInventory) ListContainers(context.Context, models.ContainerListOptions) ([]models.ContainerSummary, error) {
-	return []models.ContainerSummary{}, nil
+func (f fakeDockerInventory) ListContainers(context.Context, models.ContainerListOptions) ([]models.ContainerSummary, error) {
+	return append([]models.ContainerSummary(nil), f.containers...), nil
 }
 
 func commandResult(stdout string) providers.CommandResult {
@@ -330,8 +444,15 @@ func commandResult(stdout string) providers.CommandResult {
 
 func openProjectTestStore(t *testing.T) *store.Store {
 	t.Helper()
+	db, _ := openProjectTestStoreAt(t)
+	return db
+}
+
+func openProjectTestStoreAt(t *testing.T) (*store.Store, string) {
+	t.Helper()
 	ctx := context.Background()
-	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "cairn.db"))
+	dbPath := filepath.Join(t.TempDir(), "cairn.db")
+	db, err := store.Open(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("Open() error = %v", err)
 	}
@@ -342,7 +463,7 @@ func openProjectTestStore(t *testing.T) *store.Store {
 		t.Fatalf("Migrate() error = %v", err)
 	}
 	seedProvider(t, ctx, db)
-	return db
+	return db, dbPath
 }
 
 func seedProvider(t *testing.T, ctx context.Context, db *store.Store) {

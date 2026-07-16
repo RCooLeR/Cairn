@@ -1123,6 +1123,148 @@ func TestRegistryStateMapsRemainBoundedAndLimitersAreReleased(t *testing.T) {
 	}
 }
 
+func TestManagerCloneBoundToCopiesPolicyAndResetsProviderSensitiveState(t *testing.T) {
+	t.Parallel()
+	fixedNow := time.Date(2026, time.July, 16, 12, 0, 0, 0, time.UTC)
+	sourceProvider := &fakeRegistryProvider{}
+	boundProvider := &fakeRegistryProvider{}
+	source := NewManager(fakeResolver{provider: sourceProvider}, nil)
+	source.Audit = &store.AuditRepository{}
+	source.Settings = &store.SettingsRepository{}
+	source.HTTPClient = &http.Client{Timeout: 17 * time.Second}
+	source.Now = func() time.Time { return fixedNow }
+	source.CacheTTL = 23 * time.Minute
+	source.PlainHTTPRegistries = map[string]bool{"registry.internal": true}
+	source.TrustedAuthRealms = map[string][]string{"registry.internal": {"https://auth.internal", "https://backup-auth.internal"}}
+	source.globalLimit = make(chan struct{}, 7)
+	source.globalLimit <- struct{}{}
+	source.perRegistryLimit = 2
+	source.cacheEntryLimit = 3
+	source.circuitEntryLimit = 4
+	source.cache["source-cache"] = cacheEntry{ExpiresAt: fixedNow.Add(time.Hour)}
+	source.circuit["registry.internal"] = circuitState{Failures: 2, LastTouched: fixedNow}
+	source.registryGate["registry.internal"] = &registryGateState{gate: make(chan struct{}, 1), refs: 1}
+
+	bound := source.CloneBoundTo(fakeResolver{provider: boundProvider})
+	if bound == source {
+		t.Fatal("CloneBoundTo() returned the source manager")
+	}
+	resolvedProvider, err := bound.provider(context.Background())
+	if err != nil || resolvedProvider != boundProvider {
+		t.Fatalf("bound provider = %#v, %v; want supplied provider", resolvedProvider, err)
+	}
+	if bound.Audit != source.Audit || bound.Settings != source.Settings || bound.HTTPClient != source.HTTPClient {
+		t.Fatal("CloneBoundTo() did not preserve shared repositories/HTTP client")
+	}
+	if got := bound.now(); !got.Equal(fixedNow) {
+		t.Fatalf("bound Now() = %s, want %s", got, fixedNow)
+	}
+	if bound.CacheTTL != source.CacheTTL || bound.perRegistryLimit != 2 || bound.cacheEntryLimit != 3 || bound.circuitEntryLimit != 4 {
+		t.Fatalf("bound policy limits = ttl:%s per:%d cache:%d circuit:%d", bound.CacheTTL, bound.perRegistryLimit, bound.cacheEntryLimit, bound.circuitEntryLimit)
+	}
+	if bound.globalLimit == source.globalLimit || cap(bound.globalLimit) != 7 || len(bound.globalLimit) != 0 {
+		t.Fatalf("bound global limiter = same:%t cap:%d len:%d", bound.globalLimit == source.globalLimit, cap(bound.globalLimit), len(bound.globalLimit))
+	}
+	if len(bound.cache) != 0 || len(bound.circuit) != 0 || len(bound.registryGate) != 0 {
+		t.Fatalf("provider-sensitive state was copied: cache=%d circuit=%d gates=%d", len(bound.cache), len(bound.circuit), len(bound.registryGate))
+	}
+
+	source.PlainHTTPRegistries["registry.internal"] = false
+	source.TrustedAuthRealms["registry.internal"][0] = "https://changed.invalid"
+	if !bound.PlainHTTPRegistries["registry.internal"] {
+		t.Fatal("bound plain-HTTP policy aliases the source map")
+	}
+	if got := bound.TrustedAuthRealms["registry.internal"][0]; got != "https://auth.internal" {
+		t.Fatalf("bound trusted realm = %q; nested slice aliases source", got)
+	}
+	bound.cache["bound-cache"] = cacheEntry{ExpiresAt: fixedNow.Add(time.Hour)}
+	if _, exists := source.cache["bound-cache"]; exists {
+		t.Fatal("bound digest cache aliases source cache")
+	}
+	<-source.globalLimit
+}
+
+func TestManagerCloneBoundToIsolatesAuthSensitiveDigestCaches(t *testing.T) {
+	t.Parallel()
+	digestByUser := map[string]string{
+		"alice": "sha256:" + strings.Repeat("a", 64),
+		"bob":   "sha256:" + strings.Repeat("b", 64),
+	}
+	var authMu sync.Mutex
+	authenticatedUsers := []string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead || r.URL.Path != "/v2/team/app/manifests/1" {
+			http.NotFound(w, r)
+			return
+		}
+		username, password, ok := r.BasicAuth()
+		if !ok {
+			w.Header().Set("WWW-Authenticate", `Basic realm="registry.test"`)
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		digest, exists := digestByUser[username]
+		if !exists || password != username+"-secret" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		authMu.Lock()
+		authenticatedUsers = append(authenticatedUsers, username)
+		authMu.Unlock()
+		w.Header().Set("Docker-Content-Digest", digest)
+		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	registryHost := strings.TrimPrefix(server.URL, "http://")
+
+	providerFor := func(username string) *fakeRegistryProvider {
+		config, err := json.Marshal(dockerConfig{Auths: map[string]dockerAuth{
+			registryHost: {Auth: base64.StdEncoding.EncodeToString([]byte(username + ":" + username + "-secret"))},
+		}})
+		if err != nil {
+			t.Fatalf("marshal Docker config: %v", err)
+		}
+		return &fakeRegistryProvider{backendConfig: string(config)}
+	}
+
+	template := NewManager(fakeResolver{provider: providerFor("alice")}, nil)
+	managerA := template.CloneBoundTo(fakeResolver{provider: providerFor("alice")})
+	managerB := template.CloneBoundTo(fakeResolver{provider: providerFor("bob")})
+	image := registryHost + "/team/app:1"
+	platform := Platform{OS: "linux", Architecture: "amd64"}
+
+	resultA, err := managerA.ResolveDigest(context.Background(), image, ResolveOptions{Platform: platform})
+	if err != nil {
+		t.Fatalf("ResolveDigest(A) error = %v", err)
+	}
+	resultB, err := managerB.ResolveDigest(context.Background(), image, ResolveOptions{Platform: platform})
+	if err != nil {
+		t.Fatalf("ResolveDigest(B) error = %v", err)
+	}
+	if resultA.ManifestDigest != digestByUser["alice"] || resultB.ManifestDigest != digestByUser["bob"] {
+		t.Fatalf("auth-sensitive digests crossed providers: A=%q B=%q", resultA.ManifestDigest, resultB.ManifestDigest)
+	}
+	if resultA.FromCache || resultB.FromCache {
+		t.Fatalf("first bound resolutions unexpectedly used cache: A=%t B=%t", resultA.FromCache, resultB.FromCache)
+	}
+
+	cachedA, err := managerA.ResolveDigest(context.Background(), image, ResolveOptions{Platform: platform})
+	if err != nil || !cachedA.FromCache || cachedA.ManifestDigest != digestByUser["alice"] {
+		t.Fatalf("cached A = %#v, %v", cachedA, err)
+	}
+	cachedB, err := managerB.ResolveDigest(context.Background(), image, ResolveOptions{Platform: platform})
+	if err != nil || !cachedB.FromCache || cachedB.ManifestDigest != digestByUser["bob"] {
+		t.Fatalf("cached B = %#v, %v", cachedB, err)
+	}
+	authMu.Lock()
+	users := append([]string(nil), authenticatedUsers...)
+	authMu.Unlock()
+	if !reflect.DeepEqual(users, []string{"alice", "bob"}) {
+		t.Fatalf("authenticated registry requests = %#v, want one per bound provider", users)
+	}
+}
+
 func TestResolveDigestHandlesBearerAuthAndIndexSelection(t *testing.T) {
 	var serverURL string
 	tokenRequested := false

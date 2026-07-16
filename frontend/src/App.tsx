@@ -4188,10 +4188,18 @@ function App() {
         await refreshAfterAction();
       }
     } catch (error: unknown) {
+      const message =
+        error instanceof Error ? error.message : "Unable to apply plan";
+      if (
+        confirm.planKind === "run-image" &&
+        parseAppErrorText(message).partial?.type === "container"
+      ) {
+        await refreshAfterAction();
+      }
       setConfirm((current) => ({
         ...current,
         busy: false,
-        error: error instanceof Error ? error.message : "Unable to apply plan",
+        error: message,
       }));
     }
   }, [
@@ -4357,10 +4365,15 @@ function App() {
         busy: false,
       });
     } catch (error: unknown) {
+      const message =
+        error instanceof Error ? error.message : "Unable to run image";
+      if (parseAppErrorText(message).partial?.type === "container") {
+        await refreshAfterAction();
+      }
       setRunImage((current) => ({
         ...current,
         busy: false,
-        error: error instanceof Error ? error.message : "Unable to run image",
+        error: message,
       }));
     }
   }, [ensureDockerReady, refreshAfterAction, runImage]);

@@ -9,6 +9,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/bus"
 	dockercore "github.com/RCooLeR/Cairn/internal/docker"
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/store"
 	"github.com/docker/docker/api/types/container"
 )
@@ -43,6 +44,7 @@ type DockerClient interface {
 }
 
 type Options struct {
+	Scope                 runtimescope.Scope
 	VisibleInterval       time.Duration
 	BackgroundInterval    time.Duration
 	PublishInterval       time.Duration
@@ -67,12 +69,12 @@ func (f GPUProbeFunc) ProbeGPUs(ctx context.Context) models.GPUMetrics {
 }
 
 type Manager struct {
-	Docker      DockerClient
-	Repository  *store.MetricsRepository
-	Projects    *store.ProjectRepository
-	Audit       *store.AuditRepository
-	Events      bus.Bus
-	ContextName string
+	Docker     DockerClient
+	Repository *store.MetricsRepository
+	Projects   *store.ProjectRepository
+	Audit      *store.AuditRepository
+	Events     bus.Bus
+	Scope      runtimescope.Scope
 
 	visibleInterval       time.Duration
 	backgroundInterval    time.Duration
@@ -114,6 +116,7 @@ type containerGPUUsage struct {
 
 type Sample struct {
 	ProviderID       string              `json:"providerID"`
+	ContextName      string              `json:"contextName"`
 	ProjectID        string              `json:"projectID,omitempty"`
 	ServiceID        string              `json:"serviceID,omitempty"`
 	ContainerID      string              `json:"containerID"`

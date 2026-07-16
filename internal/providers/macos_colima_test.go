@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/models"
 )
 
@@ -73,11 +74,62 @@ func TestMacOSColimaDetectHealthy(t *testing.T) {
 	if !status.DockerInstalled || !status.ComposeInstalled || !status.BuildxInstalled || !status.DockerRunning {
 		t.Fatalf("status flags = %#v", status)
 	}
-	if status.CurrentContext != "colima" || status.DockerHost != "unix:///Users/ada/.colima/default/docker.sock" {
+	if status.CurrentContext != "colima:default" || status.DockerHost != "unix:///Users/ada/.colima/default/docker.sock" {
 		t.Fatalf("context/host = %q/%q", status.CurrentContext, status.DockerHost)
 	}
 	if status.DockerVersion != "29.0.1" || status.ComposeVersion != "2.40.3" {
 		t.Fatalf("versions = docker %q compose %q", status.DockerVersion, status.ComposeVersion)
+	}
+}
+
+func TestMacOSColimaIgnoresRetargetedDockerContext(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	runner := healthyColimaRunner()
+	runner.outputs["docker context ls --format json"] = `{"Name":"colima","Description":"retargeted","DockerEndpoint":"tcp://192.0.2.40:2375","Current":true}` + "\n"
+	runner.outputs["docker --host unix:///Users/ada/.colima/default/docker.sock ps"] = "CONTAINER ID\n"
+	provider := NewMacOSColima(MacOSColimaOptions{Runner: runner, HomeDir: "/Users/ada"})
+
+	status, err := provider.Detect(ctx)
+	if err != nil {
+		t.Fatalf("Detect() error = %v", err)
+	}
+	if !status.Healthy || status.DockerHost != "unix:///Users/ada/.colima/default/docker.sock" {
+		t.Fatalf("status followed retargeted context = %#v", status)
+	}
+	result, err := provider.RunDocker(ctx, "ps")
+	if err != nil {
+		t.Fatalf("RunDocker() error = %v", err)
+	}
+	want := []string{"docker", "--host", "unix:///Users/ada/.colima/default/docker.sock", "ps"}
+	if !reflect.DeepEqual(result.Command, want) {
+		t.Fatalf("RunDocker command = %#v, want %#v", result.Command, want)
+	}
+}
+
+func TestFrozenMacOSColimaRejectsProfileSocketRetarget(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	runner := healthyColimaRunner()
+	original := NewMacOSColima(MacOSColimaOptions{Runner: runner, HomeDir: "/Users/ada"})
+	frozen, err := SnapshotRuntimeProvider(ctx, original)
+	if err != nil {
+		t.Fatalf("SnapshotRuntimeProvider() error = %v", err)
+	}
+	initial, err := ResolveRuntimeScope(ctx, frozen)
+	if err != nil {
+		t.Fatalf("ResolveRuntimeScope() error = %v", err)
+	}
+	if !strings.Contains(initial.ContextName(), "unix:///Users/ada/.colima/default/docker.sock") {
+		t.Fatalf("scope does not identify frozen socket: %q", initial.ContextName())
+	}
+
+	runner.outputs[colimaCommandName+" status -p default --json"] = `{"status":"Running","socket":"unix:///tmp/retargeted-colima.sock"}`
+	if _, err := frozen.DockerHost(ctx); !apperror.IsCode(err, apperror.ProviderNotReady) {
+		t.Fatalf("DockerHost() error = %v, want provider not ready", err)
+	}
+	if _, err := frozen.RunDocker(ctx, "ps"); !apperror.IsCode(err, apperror.ProviderNotReady) {
+		t.Fatalf("RunDocker() error = %v, want provider not ready", err)
 	}
 }
 
@@ -126,22 +178,6 @@ func TestMacOSColimaDetectProblemCases(t *testing.T) {
 			},
 			want: ProblemColimaStopped,
 		},
-		{
-			name: "context missing",
-			configure: func(r *fakeRunner) {
-				seedColimaCommon(r)
-				r.outputs["docker context ls --format json"] = `{"Name":"default","DockerEndpoint":"unix:///var/run/docker.sock","Current":true}`
-			},
-			want: ProblemContextMissing,
-		},
-		{
-			name: "context not selected",
-			configure: func(r *fakeRunner) {
-				seedColimaCommon(r)
-				r.outputs["docker context ls --format json"] = `{"Name":"colima","DockerEndpoint":"unix:///Users/ada/.colima/default/docker.sock","Current":false}`
-			},
-			want: ProblemContextNotSelected,
-		},
 	}
 
 	for _, tt := range tests {
@@ -178,7 +214,7 @@ func TestMacOSColimaPlanInstallAndExecute(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PlanInstall() error = %v", err)
 	}
-	if plan.Risk != models.RiskNeedsConfirmation || len(plan.Commands) != 9 {
+	if plan.Risk != models.RiskNeedsConfirmation || len(plan.Commands) != 8 {
 		t.Fatalf("plan = %#v", plan)
 	}
 	if plan.Title != "Install or update Colima backend" {
@@ -224,13 +260,13 @@ func TestMacOSColimaPlanInstallRequiresHomebrew(t *testing.T) {
 func TestMacOSColimaRunComposeUsesContextWorkdirAndEnv(t *testing.T) {
 	t.Parallel()
 	runner := &colimaOptionsRunner{versionOK: true}
-	provider := NewMacOSColima(MacOSColimaOptions{Profile: "dev", Runner: runner})
+	provider := NewMacOSColima(MacOSColimaOptions{Profile: "dev", Runner: runner, HomeDir: "/Users/ada"})
 
 	result, err := provider.RunComposeEnv(context.Background(), "/Users/ada/app", []string{"COMPOSE_PROJECT_NAME=demo"}, "-f", "compose.yaml", "config")
 	if err != nil {
 		t.Fatalf("RunComposeEnv() error = %v", err)
 	}
-	wantCommand := []string{"docker", "--context", "colima-dev", "compose", "-f", "compose.yaml", "config"}
+	wantCommand := []string{"docker", "--host", "unix:///Users/ada/.colima/dev/docker.sock", "compose", "-f", "compose.yaml", "config"}
 	if !reflect.DeepEqual(result.Command, wantCommand) {
 		t.Fatalf("command = %#v, want %#v", result.Command, wantCommand)
 	}
@@ -290,12 +326,12 @@ func seedColimaCommon(runner *fakeRunner) {
 	runner.paths[brewCommandName] = "/opt/homebrew/bin/brew"
 	runner.paths["docker"] = "/opt/homebrew/bin/docker"
 	runner.paths[colimaCommandName] = "/opt/homebrew/bin/colima"
-	runner.outputs["docker compose version --short"] = "v2.40.3\n"
-	runner.outputs["docker buildx version"] = "github.com/docker/buildx v0.34.1 123456\n"
+	runner.outputs["docker --host unix:///Users/ada/.colima/default/docker.sock compose version --short"] = "v2.40.3\n"
+	runner.outputs["docker --host unix:///Users/ada/.colima/default/docker.sock buildx version"] = "github.com/docker/buildx v0.34.1 123456\n"
 	runner.outputs[colimaCommandName+" version"] = "colima version 0.9.1\n"
 	runner.outputs[colimaCommandName+" status -p default --json"] = `{"status":"Running","runtime":"docker","socket":"unix:///Users/ada/.colima/default/docker.sock","cpus":4,"memory":8,"disk":80}` + "\n"
 	runner.outputs["docker context ls --format json"] = `{"Name":"colima","Description":"Colima","DockerEndpoint":"unix:///Users/ada/.colima/default/docker.sock","Current":true}` + "\n"
-	runner.outputs["docker --context colima info --format {{.ServerVersion}}"] = "29.0.1\n"
+	runner.outputs["docker --host unix:///Users/ada/.colima/default/docker.sock info --format {{.ServerVersion}}"] = "29.0.1\n"
 }
 
 type colimaOptionsRunner struct {
@@ -309,7 +345,7 @@ func (r *colimaOptionsRunner) LookPath(file string) (string, error) {
 
 func (r *colimaOptionsRunner) Run(_ context.Context, _ time.Duration, name string, args ...string) (*CommandResult, error) {
 	command := append([]string{name}, args...)
-	if r.versionOK && strings.Join(command, " ") == "docker --context colima-dev compose version --short" {
+	if r.versionOK && strings.Join(command, " ") == "docker --host unix:///Users/ada/.colima/dev/docker.sock compose version --short" {
 		return &CommandResult{Command: command, Stdout: "v2.40.3\n"}, nil
 	}
 	return &CommandResult{Command: command, ExitCode: 1, Stderr: "not configured"}, errors.New("not configured")

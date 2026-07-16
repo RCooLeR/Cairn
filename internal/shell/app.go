@@ -130,10 +130,10 @@ func Run(assets fs.FS) error {
 		}
 		maybeAutoInstallWindowsDockerCLIShim(ctx, db.Settings(), runtimeProvider)
 		if _, err := runtimeController.RebindProvider(ctx, runtimeProvider); err != nil {
-			cancel()
-			eventBus.Close()
-			_ = db.Close()
-			return err
+			// A saved provider can be temporarily unavailable or have been
+			// removed outside Cairn. Keep the runtime stopped and let the app
+			// open so the user can select, configure, or repair a provider.
+			slog.Warn("initial provider runtime is unavailable; starting in setup-only mode", "provider", runtimeProvider.ID(), "error", err)
 		}
 	}
 

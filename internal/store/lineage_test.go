@@ -2,11 +2,14 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 )
 
 func TestLineageRepositoryReplaceAndLookup(t *testing.T) {
@@ -77,6 +80,62 @@ func TestLineageRepositoryReplaceAndLookup(t *testing.T) {
 	}
 	if len(list) != 1 || len(list[0].BaseRefs) != 1 || list[0].BaseRefs[0].ImageRef != "busybox:1.36" {
 		t.Fatalf("replacement list = %#v", list)
+	}
+}
+
+func TestLineageRepositoryScopedReplacePreservesForeignRows(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openStoreForProjectTest(t)
+	repo := db.Lineage()
+	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+	scope := runtimescope.Must("linux_native", "unix:///var/run/docker.sock")
+	project := ProjectRecord{
+		ID:          "linux_native/demo",
+		ProviderID:  scope.ProviderID(),
+		ContextName: scope.ContextName(),
+		Name:        "demo",
+		LastSeenAt:  now,
+	}
+	if err := db.Projects().SaveSnapshot(ctx, scope, []ProjectRecord{project}, nil, now, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot() error = %v", err)
+	}
+	foreign := LineageRecord{
+		ProviderID:   "existing_context:foreign",
+		ProjectID:    project.ID,
+		ServiceName:  "foreign",
+		Source:       models.LineageSourceUnknown,
+		Confidence:   models.ConfidenceUnknown,
+		DiscoveredAt: now,
+		UpdatedAt:    now,
+	}
+	if err := repo.ReplaceProject(ctx, project.ID, []LineageRecord{foreign}); err != nil {
+		t.Fatalf("seed foreign ReplaceProject() error = %v", err)
+	}
+	local := foreign
+	local.ProviderID = scope.ProviderID()
+	local.ContextName = scope.ContextName()
+	local.ServiceName = "local"
+	if err := repo.ReplaceProjectInScope(ctx, scope, project.ID, []LineageRecord{local}); err != nil {
+		t.Fatalf("ReplaceProjectInScope() error = %v", err)
+	}
+	all, err := repo.ListProject(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("ListProject() error = %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("ListProject() = %#v, want local and preserved foreign rows", all)
+	}
+	scoped, err := repo.ListProjectInScope(ctx, scope, project.ID)
+	if err != nil {
+		t.Fatalf("ListProjectInScope() error = %v", err)
+	}
+	if len(scoped) != 1 || scoped[0].ProviderID != scope.ProviderID() || scoped[0].ServiceName != "local" {
+		t.Fatalf("ListProjectInScope() = %#v", scoped)
+	}
+	wrongScope := runtimescope.Must(scope.ProviderID(), "unix:///run/user/1000/docker.sock")
+	if err := repo.ReplaceProjectInScope(ctx, wrongScope, project.ID, []LineageRecord{local}); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("ReplaceProjectInScope(wrong scope) error = %v, want sql.ErrNoRows", err)
 	}
 }
 

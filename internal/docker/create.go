@@ -165,10 +165,77 @@ func (c *Client) RunImage(ctx context.Context, req models.RunImageRequest) (stri
 		return "", mapDockerError("create container", err)
 	}
 	if err := api.ContainerStart(ctx, created.ID, container.StartOptions{}); err != nil {
-		return "", mapDockerError("start container", err)
+		return c.handleContainerStartFailure(ctx, api, created.ID, err)
 	}
 	c.publishContainerChanged(created.ID)
 	return created.ID, nil
+}
+
+func (c *Client) handleContainerStartFailure(ctx context.Context, api APIClient, containerID string, cause error) (string, error) {
+	startErr := mapDockerError("start container", cause)
+	cleanupCtx, cancel := c.withTimeout(context.WithoutCancel(ctx))
+	defer cancel()
+
+	inspect, _, inspectErr := api.ContainerInspectWithRaw(cleanupCtx, containerID, false)
+	if cerrdefs.IsNotFound(inspectErr) {
+		// Another actor already removed the just-created container. The desired
+		// rollback state is satisfied even though the original start still failed.
+		c.publishContainerChanged(containerID)
+		return "", startErr
+	}
+	state := inspectedContainerState(inspect)
+	if inspectErr == nil && state == "created" {
+		cleanupErr := api.ContainerRemove(cleanupCtx, containerID, container.RemoveOptions{RemoveVolumes: true})
+		c.publishContainerChanged(containerID)
+		if cleanupErr == nil || cerrdefs.IsNotFound(cleanupErr) {
+			return "", startErr
+		}
+		return containerID, partialContainerStartError(
+			startErr,
+			containerID,
+			state,
+			fmt.Sprintf("automatic cleanup failed: %v", cleanupErr),
+		)
+	}
+
+	// A transport/cancellation error can lose a successful start response. If
+	// inspect cannot prove the object is still in Docker's never-started
+	// "created" state, preserve it for reconciliation rather than deleting a
+	// workload that may have run.
+	c.publishContainerChanged(containerID)
+	detail := "Docker could not confirm the created container state"
+	if inspectErr != nil {
+		detail = "inspect after start failure failed: " + inspectErr.Error()
+	} else if state != "" {
+		detail = "container state after start failure: " + state
+	}
+	return containerID, partialContainerStartError(startErr, containerID, state, detail)
+}
+
+func inspectedContainerState(inspect container.InspectResponse) string {
+	if inspect.ContainerJSONBase == nil || inspect.State == nil {
+		return "unknown"
+	}
+	state := strings.ToLower(strings.TrimSpace(string(inspect.State.Status)))
+	if state == "" {
+		return "unknown"
+	}
+	return state
+}
+
+func partialContainerStartError(startErr error, containerID string, state string, detail string) error {
+	code, ok := apperror.CodeOf(startErr)
+	if !ok {
+		code = apperror.DockerUnreachable
+	}
+	return apperror.Wrap(
+		code,
+		"Container start outcome requires reconciliation",
+		startErr,
+		apperror.WithDetail(fmt.Sprintf("container %s: %s", containerID, detail)),
+		apperror.WithRepairHints("Inspect the created container's state, then stop or remove it if appropriate before retrying."),
+		apperror.WithPartialResource("container", containerID, state, true),
+	)
 }
 
 func (c *Client) RenameContainer(ctx context.Context, id string, newName string) error {

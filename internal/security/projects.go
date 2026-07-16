@@ -6,6 +6,7 @@ import (
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 )
 
 const (
@@ -23,6 +24,7 @@ type ProjectPlan struct {
 	Action        string
 	ProjectID     string
 	RemoveVolumes bool
+	Scope         runtimescope.Scope
 }
 
 type ProjectPlanStore struct {
@@ -33,7 +35,14 @@ func NewProjectPlanStore(now func() time.Time) *ProjectPlanStore {
 	return &ProjectPlanStore{commandPlanStore: newCommandPlanStore(now, func(plan ProjectPlan) models.CommandPlan { return plan.Plan })}
 }
 
-func NewProjectActionPlan(plan models.CommandPlan, action string, projectID string, removeVolumes bool) (ProjectPlan, error) {
+func NewProjectActionPlan(plan models.CommandPlan, action string, projectID string, removeVolumes bool, runtimeScope runtimescope.Scope) (ProjectPlan, error) {
+	if !runtimeScope.Valid() {
+		return ProjectPlan{}, apperror.New(apperror.ProviderNotReady, "Project plan runtime scope is required")
+	}
+	return newProjectActionPlan(plan, action, projectID, removeVolumes, runtimeScope)
+}
+
+func newProjectActionPlan(plan models.CommandPlan, action string, projectID string, removeVolumes bool, runtimeScope runtimescope.Scope) (ProjectPlan, error) {
 	action = strings.ToLower(strings.TrimSpace(action))
 	switch action {
 	case ProjectActionStart, ProjectActionStop, ProjectActionRestart, ProjectActionPull, ProjectActionDeploy, ProjectActionRedeploy, ProjectActionDown:
@@ -52,5 +61,6 @@ func NewProjectActionPlan(plan models.CommandPlan, action string, projectID stri
 		Action:        action,
 		ProjectID:     projectID,
 		RemoveVolumes: removeVolumes,
+		Scope:         runtimeScope,
 	}, nil
 }

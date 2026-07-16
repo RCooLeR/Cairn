@@ -2,9 +2,12 @@ package compose
 
 import (
 	"context"
+	"sync"
 
+	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 )
 
 const MinimumVersion = "2.20.0"
@@ -23,11 +26,32 @@ type PathMapper interface {
 }
 
 type Client struct {
-	runner Runner
+	mu            sync.RWMutex
+	runner        Runner
+	scope         runtimescope.Scope
+	scopeProvider providers.RuntimeScopeProvider
 }
 
 func NewClient(runner Runner) *Client {
 	return &Client{runner: runner}
+}
+
+func (c *Client) BindRuntimeScope(scope runtimescope.Scope) error {
+	if c == nil || !scope.Valid() {
+		return apperror.New(apperror.ProviderNotReady, "Compose runtime scope is required")
+	}
+	provider, ok := c.runner.(providers.RuntimeScopeProvider)
+	if !ok {
+		return apperror.New(apperror.ProviderNotReady, "Compose runner cannot verify runtime scope")
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.scope.Valid() && !c.scope.Equal(scope) {
+		return apperror.New(apperror.Conflict, "Compose client is already bound to another runtime context")
+	}
+	c.scope = scope
+	c.scopeProvider = provider
+	return nil
 }
 
 type ProjectOptions struct {

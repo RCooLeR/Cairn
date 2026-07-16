@@ -38,7 +38,12 @@ func TestCodeHelpersIgnorePlainErrors(t *testing.T) {
 }
 
 func TestMarshalProducesContractJSON(t *testing.T) {
-	err := New(PermissionDenied, "permission denied", WithRepairHints("Fix permissions"))
+	err := New(
+		PermissionDenied,
+		"permission denied",
+		WithRepairHints("Fix permissions"),
+		WithPartialResource("container", "container-123", "unknown", true),
+	)
 
 	var payload map[string]any
 	if marshalErr := json.Unmarshal(Marshal(err), &payload); marshalErr != nil {
@@ -50,6 +55,10 @@ func TestMarshalProducesContractJSON(t *testing.T) {
 	}
 	if payload["message"] != "permission denied" {
 		t.Fatalf("message = %#v, want permission denied", payload["message"])
+	}
+	partial, ok := payload["partial"].(map[string]any)
+	if !ok || partial["type"] != "container" || partial["id"] != "container-123" || partial["cleanupRequired"] != true {
+		t.Fatalf("partial = %#v, want structured partial resource", payload["partial"])
 	}
 }
 

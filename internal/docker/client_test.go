@@ -25,6 +25,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/bus"
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/store"
 	cerrdefs "github.com/containerd/errdefs"
 	dockertypes "github.com/docker/docker/api/types"
@@ -874,6 +875,207 @@ func TestClientObjectsDTOsRawInspectAndCacheReconcile(t *testing.T) {
 	}
 	if got := queryString(t, ctx, sqlDB, "SELECT subnet FROM networks_cache WHERE id = ?", "net1"); got != "172.22.0.0/16" {
 		t.Fatalf("cached network subnet = %q, want subnet", got)
+	}
+}
+
+func TestClientObjectCacheUsesStableManagedBackendScope(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "cairn.db")
+	db, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	sqlDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw sql: %v", err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+
+	for _, identity := range []string{"wsl:Ubuntu", "wsl:Work"} {
+		api := newFakeAPI()
+		seedFakeObjects(api)
+		provider := &fakeManagedDockerProvider{
+			providerID:      "windows_wsl_ubuntu",
+			dockerContext:   "default",
+			backendIdentity: identity,
+		}
+		client := New(provider, nil)
+		client.SetObjectCache(db.Objects())
+		client.factory = func(string) (APIClient, error) { return api, nil }
+		if err := client.Connect(ctx); err != nil {
+			t.Fatalf("Connect(%s) error = %v", identity, err)
+		}
+		// The binding is immutable for this client even if a mutable provider is
+		// reconfigured before an inventory operation completes.
+		provider.backendIdentity = "wsl:changed-after-connect"
+		if err := client.Reconcile(ctx); err != nil {
+			t.Fatalf("Reconcile(%s) error = %v", identity, err)
+		}
+	}
+
+	for _, table := range []string{"containers_cache", "images_cache", "volumes_cache", "networks_cache"} {
+		if got := queryCount(t, ctx, sqlDB, table); got != 2 {
+			t.Fatalf("%s rows = %d, want colliding native keys in both backend scopes", table, got)
+		}
+		if got := queryString(t, ctx, sqlDB, "SELECT group_concat(context_name, ',') FROM (SELECT context_name FROM "+table+" ORDER BY context_name)"); got != "wsl:Ubuntu,wsl:Work" {
+			t.Fatalf("%s contexts = %q, want stable managed backend scopes", table, got)
+		}
+	}
+}
+
+func TestClientConnectRejectsIncompleteCacheScope(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	provider := &fakeManagedDockerProvider{providerID: "linux_native"}
+	client := New(provider, nil)
+	factoryCalled := false
+	client.factory = func(string) (APIClient, error) {
+		factoryCalled = true
+		return newFakeAPI(), nil
+	}
+
+	if err := client.Connect(ctx); !apperror.IsCode(err, apperror.ProviderNotReady) {
+		t.Fatalf("Connect() error = %v, want provider-not-ready runtime scope error", err)
+	}
+	if factoryCalled {
+		t.Fatal("Docker API factory called before runtime scope validation")
+	}
+}
+
+func TestClientReconnectRejectsManagedIdentityMutation(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	provider := &fakeManagedDockerProvider{providerID: "windows_wsl_ubuntu", backendIdentity: "wsl:one"}
+	client := New(provider, nil)
+	scope := runtimescope.Must(provider.providerID, provider.backendIdentity)
+	if err := client.BindRuntimeScope(scope); err != nil {
+		t.Fatalf("BindRuntimeScope() error = %v", err)
+	}
+	factoryCalls := 0
+	client.factory = func(string) (APIClient, error) {
+		factoryCalls++
+		return newFakeAPI(), nil
+	}
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("initial Connect() error = %v", err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	provider.backendIdentity = "wsl:two"
+	if err := client.Connect(ctx); !apperror.IsCode(err, apperror.NotFound) {
+		t.Fatalf("reconnect error = %v, want not found", err)
+	}
+	if factoryCalls != 1 {
+		t.Fatalf("factory calls = %d, want no new API after identity mismatch", factoryCalls)
+	}
+	client.mu.RLock()
+	api := client.api
+	runtimeScope := client.runtimeScope
+	client.mu.RUnlock()
+	if api != nil || !runtimeScope.Equal(scope) {
+		t.Fatalf("reconnect changed bound client: api=%T scope=%q", api, runtimeScope.ContextName())
+	}
+}
+
+func TestClientConnectRejectsIdentityMutationDuringSetup(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	provider := &fakeManagedDockerProvider{providerID: "windows_wsl_ubuntu", backendIdentity: "wsl:one"}
+	client := New(provider, nil)
+	scope := runtimescope.Must(provider.providerID, provider.backendIdentity)
+	if err := client.BindRuntimeScope(scope); err != nil {
+		t.Fatalf("BindRuntimeScope() error = %v", err)
+	}
+	created := newFakeAPI()
+	client.factory = func(string) (APIClient, error) {
+		provider.backendIdentity = "wsl:two"
+		return created, nil
+	}
+	if err := client.Connect(ctx); !apperror.IsCode(err, apperror.NotFound) {
+		t.Fatalf("Connect() error = %v, want not found", err)
+	}
+	created.mu.Lock()
+	closed := created.closed
+	created.mu.Unlock()
+	client.mu.RLock()
+	installed := client.api
+	client.mu.RUnlock()
+	if !closed || installed != nil {
+		t.Fatalf("changed-target API accepted: closed=%t installed=%T", closed, installed)
+	}
+}
+
+func TestClientFreshReconcileConnectsBeforeReadingScopedCache(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "cairn.db"))
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	provider := &fakeManagedDockerProvider{providerID: "windows_wsl_ubuntu", backendIdentity: "wsl:one"}
+	client := New(provider, nil)
+	client.SetObjectCache(db.Objects())
+	api := newFakeAPI()
+	client.factory = func(string) (APIClient, error) { return api, nil }
+
+	if err := client.Reconcile(ctx); err != nil {
+		t.Fatalf("fresh Reconcile() error = %v", err)
+	}
+	client.mu.RLock()
+	installed := client.api
+	scope := client.runtimeScope
+	client.mu.RUnlock()
+	if installed != api || !scope.Matches(provider.providerID, provider.backendIdentity) {
+		t.Fatalf("fresh Reconcile did not bind API/scope: api=%T scope=%q", installed, scope.ContextName())
+	}
+}
+
+func TestClientReconcilePreservesFailedInventoryKind(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "cairn.db"))
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	scope := runtimescope.Must("windows_wsl_ubuntu", "wsl:one")
+	if err := db.Objects().SaveImagesScoped(ctx, scope, []store.ImageCacheRecord{{
+		Summary: models.ImageSummary{ID: "sha256:preserve", RepoTags: []string{"example/preserve:latest"}},
+	}}, time.Now().UTC().Add(-48*time.Hour)); err != nil {
+		t.Fatalf("SaveImagesScoped() error = %v", err)
+	}
+	provider := &fakeManagedDockerProvider{providerID: scope.ProviderID(), backendIdentity: scope.ContextName()}
+	client := New(provider, nil)
+	client.SetObjectCache(db.Objects())
+	api := newFakeAPI()
+	api.imageListErr = errors.New("image inventory unavailable")
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.BindRuntimeScope(scope); err != nil {
+		t.Fatalf("BindRuntimeScope() error = %v", err)
+	}
+
+	if err := client.Reconcile(ctx); err == nil {
+		t.Fatal("Reconcile() error = nil, want image inventory error")
+	}
+	snapshot, err := db.Objects().SnapshotKeysScoped(ctx, scope)
+	if err != nil {
+		t.Fatalf("SnapshotKeysScoped() error = %v", err)
+	}
+	if len(snapshot.Images) != 1 || snapshot.Images["sha256:preserve"] == "" {
+		t.Fatalf("failed image inventory was erased = %#v", snapshot.Images)
 	}
 }
 
@@ -2305,6 +2507,26 @@ func (fakeDockerProvider) DockerContext(context.Context) (string, error) {
 	return "default", nil
 }
 
+type fakeManagedDockerProvider struct {
+	providerID      string
+	dockerContext   string
+	backendIdentity string
+}
+
+func (p *fakeManagedDockerProvider) ID() string { return p.providerID }
+
+func (*fakeManagedDockerProvider) DockerHost(context.Context) (string, error) {
+	return "unix:///var/run/docker.sock", nil
+}
+
+func (p *fakeManagedDockerProvider) DockerContext(context.Context) (string, error) {
+	return p.dockerContext, nil
+}
+
+func (p *fakeManagedDockerProvider) BackendIdentity(context.Context) (string, error) {
+	return p.backendIdentity, nil
+}
+
 type fakeDialerProvider struct {
 	host   string
 	dialer func(context.Context, string, string) (net.Conn, error)
@@ -2337,6 +2559,7 @@ type fakeAPI struct {
 	containerInspects map[string]container.InspectResponse
 	containerRaw      map[string][]byte
 	images            []image.Summary
+	imageListErr      error
 	imageListDeadline time.Duration
 	imageInspects     map[string]image.InspectResponse
 	imageRaw          map[string][]byte
@@ -2700,7 +2923,7 @@ func (a *fakeAPI) ImageList(ctx context.Context, _ image.ListOptions) ([]image.S
 		a.imageListDeadline = time.Until(deadline)
 		a.mu.Unlock()
 	}
-	return append([]image.Summary(nil), a.images...), nil
+	return append([]image.Summary(nil), a.images...), a.imageListErr
 }
 
 func (a *fakeAPI) ImageInspectWithRaw(_ context.Context, id string) (image.InspectResponse, []byte, error) {

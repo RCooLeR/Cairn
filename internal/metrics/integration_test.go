@@ -77,7 +77,7 @@ func TestManagerRealDockerStatsIntegration(t *testing.T) {
 	if err := decoder.Decode(&raw); err != nil {
 		t.Fatalf("decode stats: %v", err)
 	}
-	manager := NewManager(client, nil, nil, nil, nil, Options{})
+	manager := NewManager(client, nil, nil, nil, nil, Options{Scope: testRuntimeScope})
 	manager.ensureReady()
 	manager.containers[summary.ID] = summary
 	manager.refreshDockerInfo(ctx)

@@ -13,6 +13,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	composecore "github.com/RCooLeR/Cairn/internal/compose"
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/store"
 )
 
@@ -43,6 +44,7 @@ func TestManagerDiscoversGoldenProjectLineage(t *testing.T) {
 			expected := readExpectedProject(t, projectDir)
 			projectID := seedProjectFromCompose(t, ctx, db, projectDir, expected.Project)
 			manager := NewManager(db.Projects(), db.Lineage(), db.Objects(), nil)
+			manager.Scope = runtimescope.Must("linux_native", "default")
 			got, err := manager.DiscoverProjectLineage(ctx, projectID)
 			if err != nil {
 				t.Fatalf("DiscoverProjectLineage() error = %v", err)
@@ -120,13 +122,14 @@ func TestManagerConfidenceAssignments(t *testing.T) {
 	writeFile(t, filepath.Join(root, "unresolved", "Dockerfile"), "ARG BASE\nFROM ${BASE}:latest\n")
 	projectID := "linux_native/confidence"
 	now := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)
-	if err := db.Projects().SaveSnapshot(ctx, "linux_native", []store.ProjectRecord{{
-		ID:         projectID,
-		ProviderID: "linux_native",
-		Name:       "confidence",
-		WorkingDir: root,
-		Source:     store.ProjectSourceImported,
-		LastSeenAt: now,
+	if err := db.Projects().SaveSnapshot(ctx, runtimescope.Must("linux_native", "default"), []store.ProjectRecord{{
+		ID:          projectID,
+		ProviderID:  "linux_native",
+		ContextName: "default",
+		Name:        "confidence",
+		WorkingDir:  root,
+		Source:      store.ProjectSourceImported,
+		LastSeenAt:  now,
 	}}, []store.ServiceRecord{
 		{ID: projectID + "/high", ProjectID: projectID, Name: "high", ImageRef: "local/high:latest", BuildContext: "high", LastSeenAt: now},
 		{ID: projectID + "/medium", ProjectID: projectID, Name: "medium", ImageRef: "local/medium:latest", BuildContext: "medium", LastSeenAt: now},
@@ -149,6 +152,7 @@ func TestManagerConfidenceAssignments(t *testing.T) {
 		}},
 	}
 	manager := NewManager(db.Projects(), db.Lineage(), nil, images)
+	manager.Scope = runtimescope.Must("linux_native", "default")
 	got, err := manager.DiscoverProjectLineage(ctx, projectID)
 	if err != nil {
 		t.Fatalf("DiscoverProjectLineage() error = %v", err)
@@ -172,13 +176,14 @@ func TestManagerGetAndRefreshLineage(t *testing.T) {
 	writeFile(t, filepath.Join(root, "Dockerfile"), "FROM nginx:alpine\n")
 	projectID := "linux_native/refresh"
 	now := time.Date(2026, 6, 13, 12, 30, 0, 0, time.UTC)
-	if err := db.Projects().SaveSnapshot(ctx, "linux_native", []store.ProjectRecord{{
-		ID:         projectID,
-		ProviderID: "linux_native",
-		Name:       "refresh",
-		WorkingDir: root,
-		Source:     store.ProjectSourceImported,
-		LastSeenAt: now,
+	if err := db.Projects().SaveSnapshot(ctx, runtimescope.Must("linux_native", "default"), []store.ProjectRecord{{
+		ID:          projectID,
+		ProviderID:  "linux_native",
+		ContextName: "default",
+		Name:        "refresh",
+		WorkingDir:  root,
+		Source:      store.ProjectSourceImported,
+		LastSeenAt:  now,
 	}}, []store.ServiceRecord{{
 		ID:           projectID + "/web",
 		ProjectID:    projectID,
@@ -190,6 +195,7 @@ func TestManagerGetAndRefreshLineage(t *testing.T) {
 		t.Fatalf("SaveSnapshot() error = %v", err)
 	}
 	manager := NewManager(db.Projects(), db.Lineage(), db.Objects(), nil)
+	manager.Scope = runtimescope.Must("linux_native", "default")
 	refreshed, err := manager.RefreshServiceLineage(ctx, projectID, "web")
 	if err != nil {
 		t.Fatalf("RefreshServiceLineage() error = %v", err)
@@ -210,6 +216,93 @@ func TestManagerGetAndRefreshLineage(t *testing.T) {
 	}
 	if missing != nil {
 		t.Fatalf("missing lineage = %#v", missing)
+	}
+}
+
+func TestManagerContainerLineageScopesBeforeSelectingNewestCollision(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openLineageStore(t)
+	now := time.Date(2026, 6, 13, 13, 0, 0, 0, time.UTC)
+	scopeA := runtimescope.Must("linux_native", "socket:a")
+	scopeB := runtimescope.Must("linux_native", "socket:b")
+	projectA := store.ProjectRecord{ID: "linux_native/a", ProviderID: "linux_native", ContextName: "socket:a", Name: "a", LastSeenAt: now}
+	projectB := store.ProjectRecord{ID: "linux_native/b", ProviderID: "linux_native", ContextName: "socket:b", Name: "b", LastSeenAt: now}
+	if err := db.Projects().SaveSnapshot(ctx, scopeA, []store.ProjectRecord{projectA}, nil, now, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot(A) error = %v", err)
+	}
+	if err := db.Projects().SaveSnapshot(ctx, scopeB, []store.ProjectRecord{projectB}, nil, now, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot(B) error = %v", err)
+	}
+	if err := db.Lineage().ReplaceProject(ctx, projectA.ID, []store.LineageRecord{{
+		ProviderID: "linux_native", ContextName: scopeA.ContextName(), ProjectID: projectA.ID, ServiceName: "local", ContainerID: "shared-container", ServiceImageRef: "local:latest",
+	}}); err != nil {
+		t.Fatalf("ReplaceProject(A) error = %v", err)
+	}
+	// Insert the colliding foreign row second so a global ORDER BY id DESC
+	// would choose it before applying scope authorization.
+	if err := db.Lineage().ReplaceProject(ctx, projectB.ID, []store.LineageRecord{{
+		ProviderID: "linux_native", ContextName: scopeB.ContextName(), ProjectID: projectB.ID, ServiceName: "foreign", ContainerID: "shared-container", ServiceImageRef: "foreign:latest",
+	}}); err != nil {
+		t.Fatalf("ReplaceProject(B) error = %v", err)
+	}
+
+	manager := NewManager(db.Projects(), db.Lineage(), nil, nil)
+	manager.Scope = scopeA
+	got, err := manager.GetContainerLineage(ctx, "shared-container")
+	if err != nil {
+		t.Fatalf("GetContainerLineage() error = %v", err)
+	}
+	if got == nil || got.ProjectID != projectA.ID || got.Service != "local" {
+		t.Fatalf("GetContainerLineage() = %#v, want active-scope row", got)
+	}
+
+	foreignOnly, err := manager.GetContainerLineage(ctx, "foreign-only")
+	if err != nil {
+		t.Fatalf("foreign-only GetContainerLineage() error = %v", err)
+	}
+	if foreignOnly != nil {
+		t.Fatalf("foreign-only lineage leaked = %#v", foreignOnly)
+	}
+}
+
+func TestManagerScopedLineageRejectsMismatchedRedundantProvider(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openLineageStore(t)
+	now := time.Date(2026, 6, 13, 13, 30, 0, 0, time.UTC)
+	scope := runtimescope.Must("linux_native", "default")
+	project := store.ProjectRecord{ID: "linux_native/corrupt", ProviderID: "linux_native", ContextName: "default", Name: "corrupt", LastSeenAt: now}
+	if err := db.Projects().SaveSnapshot(ctx, scope, []store.ProjectRecord{project}, nil, now, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot() error = %v", err)
+	}
+	if err := db.Lineage().ReplaceProject(ctx, project.ID, []store.LineageRecord{{
+		ProviderID: "other-provider", ProjectID: project.ID, ServiceName: "web", ContainerID: "corrupt-container",
+	}}); err != nil {
+		t.Fatalf("ReplaceProject() error = %v", err)
+	}
+	manager := NewManager(db.Projects(), db.Lineage(), nil, nil)
+	manager.Scope = scope
+	projectRows, err := manager.GetProjectLineage(ctx, project.ID)
+	if err != nil {
+		t.Fatalf("GetProjectLineage() error = %v", err)
+	}
+	if len(projectRows) != 0 {
+		t.Fatalf("mismatched-provider project lineage leaked = %#v", projectRows)
+	}
+	serviceRow, err := manager.GetServiceLineage(ctx, project.ID, "web")
+	if err != nil {
+		t.Fatalf("GetServiceLineage() error = %v", err)
+	}
+	if serviceRow != nil {
+		t.Fatalf("mismatched-provider service lineage leaked = %#v", serviceRow)
+	}
+	containerRow, err := manager.GetContainerLineage(ctx, "corrupt-container")
+	if err != nil {
+		t.Fatalf("GetContainerLineage() error = %v", err)
+	}
+	if containerRow != nil {
+		t.Fatalf("mismatched-provider container lineage leaked = %#v", containerRow)
 	}
 }
 
@@ -277,9 +370,10 @@ func seedProjectFromCompose(t *testing.T, ctx context.Context, db *store.Store, 
 			LastSeenAt:     now,
 		})
 	}
-	if err := db.Projects().SaveSnapshot(ctx, "linux_native", []store.ProjectRecord{{
+	if err := db.Projects().SaveSnapshot(ctx, runtimescope.Must("linux_native", "default"), []store.ProjectRecord{{
 		ID:           projectID,
 		ProviderID:   "linux_native",
+		ContextName:  "default",
 		Name:         projectName,
 		WorkingDir:   projectDir,
 		ComposeFiles: []string{filepath.Join(projectDir, "compose.yaml")},
@@ -350,6 +444,7 @@ func TestManagerMissingProject(t *testing.T) {
 	ctx := context.Background()
 	db := openLineageStore(t)
 	manager := NewManager(db.Projects(), db.Lineage(), nil, nil)
+	manager.Scope = runtimescope.Must("linux_native", "default")
 	_, err := manager.DiscoverProjectLineage(ctx, "missing")
 	if err == nil {
 		t.Fatal("DiscoverProjectLineage() error = nil, want not found")

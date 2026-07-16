@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 )
 
 type LineageRepository struct {
@@ -18,6 +19,7 @@ type LineageRepository struct {
 type LineageRecord struct {
 	ID              int64
 	ProviderID      string
+	ContextName     string
 	ProjectID       string
 	ServiceID       string
 	ServiceName     string
@@ -79,6 +81,37 @@ func (r *LineageRepository) ReplaceProject(ctx context.Context, projectID string
 	return tx.Commit()
 }
 
+// ReplaceProjectInScope atomically revalidates project ownership and replaces
+// only lineage owned by the exact active runtime scope.
+func (r *LineageRepository) ReplaceProjectInScope(ctx context.Context, scope runtimescope.Scope, projectID string, records []LineageRecord) error {
+	if !scope.Valid() {
+		return errors.New("runtime scope is required")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := requireLineageProjectScope(ctx, tx, scope, projectID); err != nil {
+		return err
+	}
+	for _, record := range records {
+		if !scope.Matches(record.ProviderID, record.ContextName) {
+			return fmt.Errorf("lineage record for project %q does not belong to the runtime scope", projectID)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM image_lineage WHERE project_id = ? AND provider_id = ? AND context_name = ?`, projectID, scope.ProviderID(), scope.ContextName()); err != nil {
+		return err
+	}
+	for _, record := range records {
+		record.ProjectID = projectID
+		if err := insertLineageRecord(ctx, tx, record); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func (r *LineageRepository) ReplaceService(ctx context.Context, projectID string, service string, record LineageRecord) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -101,11 +134,89 @@ func (r *LineageRepository) ReplaceService(ctx context.Context, projectID string
 	return tx.Commit()
 }
 
+// ReplaceServiceInScope is the scoped equivalent of ReplaceService. It closes
+// the authorization/write race by checking the project row in the same
+// transaction that performs the replacement.
+func (r *LineageRepository) ReplaceServiceInScope(ctx context.Context, scope runtimescope.Scope, projectID string, service string, record LineageRecord) error {
+	if !scope.Valid() {
+		return errors.New("runtime scope is required")
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := requireLineageProjectScope(ctx, tx, scope, projectID); err != nil {
+		return err
+	}
+	if !scope.Matches(record.ProviderID, record.ContextName) {
+		return fmt.Errorf("lineage record for project %q does not belong to the runtime scope", projectID)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM image_lineage
+		WHERE project_id = ? AND service_name = ? AND provider_id = ? AND context_name = ?
+	`, projectID, service, scope.ProviderID(), scope.ContextName()); err != nil {
+		return err
+	}
+	record.ProjectID = projectID
+	record.ServiceName = service
+	if err := insertLineageRecord(ctx, tx, record); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func requireLineageProjectScope(ctx context.Context, tx *sql.Tx, scope runtimescope.Scope, projectID string) error {
+	var providerID string
+	var contextName string
+	if err := tx.QueryRowContext(ctx, `SELECT provider_id, context_name FROM projects WHERE id = ?`, projectID).Scan(&providerID, &contextName); err != nil {
+		return err
+	}
+	if !scope.Matches(providerID, contextName) {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 func (r *LineageRepository) ListProject(ctx context.Context, projectID string) ([]LineageRecord, error) {
 	rows, err := r.db.QueryContext(ctx, lineageSelectSQL()+`
 		WHERE project_id = ?
 		ORDER BY service_name ASC, id ASC
 	`, projectID)
+	if err != nil {
+		return nil, err
+	}
+	records, err := scanLineageRows(rows)
+	closeErr := rows.Close()
+	if err != nil {
+		return nil, err
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	for i := range records {
+		records[i].BaseRefs, err = r.listBaseRefs(ctx, records[i].ID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return records, nil
+}
+
+// ListProjectInScope returns lineage only when both the owning project and the
+// lineage row belong to the exact active runtime scope. The redundant lineage
+// scope check keeps corrupt or stale rows outside the authorization boundary.
+func (r *LineageRepository) ListProjectInScope(ctx context.Context, scope runtimescope.Scope, projectID string) ([]LineageRecord, error) {
+	if !scope.Valid() {
+		return nil, errors.New("runtime scope is required")
+	}
+	rows, err := r.db.QueryContext(ctx, lineageSelectSQL()+`
+		WHERE provider_id = ? AND context_name = ? AND project_id = ?
+			AND project_id IN (
+				SELECT id FROM projects WHERE provider_id = ? AND context_name = ?
+			)
+		ORDER BY service_name ASC, id ASC
+	`, scope.ProviderID(), scope.ContextName(), projectID, scope.ProviderID(), scope.ContextName())
 	if err != nil {
 		return nil, err
 	}
@@ -143,12 +254,58 @@ func (r *LineageRepository) GetService(ctx context.Context, projectID string, se
 	return record, nil
 }
 
+func (r *LineageRepository) GetServiceInScope(ctx context.Context, scope runtimescope.Scope, projectID string, service string) (LineageRecord, error) {
+	if !scope.Valid() {
+		return LineageRecord{}, errors.New("runtime scope is required")
+	}
+	row := r.db.QueryRowContext(ctx, lineageSelectSQL()+`
+		WHERE provider_id = ? AND context_name = ? AND project_id = ? AND service_name = ?
+			AND project_id IN (
+				SELECT id FROM projects WHERE provider_id = ? AND context_name = ?
+			)
+		ORDER BY id DESC
+		LIMIT 1
+	`, scope.ProviderID(), scope.ContextName(), projectID, service, scope.ProviderID(), scope.ContextName())
+	record, err := scanLineageRecord(row)
+	if err != nil {
+		return LineageRecord{}, err
+	}
+	record.BaseRefs, err = r.listBaseRefs(ctx, record.ID)
+	if err != nil {
+		return LineageRecord{}, err
+	}
+	return record, nil
+}
+
 func (r *LineageRepository) GetContainer(ctx context.Context, containerID string) (LineageRecord, error) {
 	row := r.db.QueryRowContext(ctx, lineageSelectSQL()+`
 		WHERE container_id = ?
 		ORDER BY id DESC
 		LIMIT 1
 	`, containerID)
+	record, err := scanLineageRecord(row)
+	if err != nil {
+		return LineageRecord{}, err
+	}
+	record.BaseRefs, err = r.listBaseRefs(ctx, record.ID)
+	if err != nil {
+		return LineageRecord{}, err
+	}
+	return record, nil
+}
+
+func (r *LineageRepository) GetContainerInScope(ctx context.Context, scope runtimescope.Scope, containerID string) (LineageRecord, error) {
+	if !scope.Valid() {
+		return LineageRecord{}, errors.New("runtime scope is required")
+	}
+	row := r.db.QueryRowContext(ctx, lineageSelectSQL()+`
+		WHERE provider_id = ? AND context_name = ? AND container_id = ?
+			AND project_id IN (
+				SELECT id FROM projects WHERE provider_id = ? AND context_name = ?
+			)
+		ORDER BY id DESC
+		LIMIT 1
+	`, scope.ProviderID(), scope.ContextName(), containerID, scope.ProviderID(), scope.ContextName())
 	record, err := scanLineageRecord(row)
 	if err != nil {
 		return LineageRecord{}, err
@@ -187,15 +344,15 @@ func insertLineageRecord(ctx context.Context, tx *sql.Tx, record LineageRecord) 
 	}
 	result, err := tx.ExecContext(ctx, `
 		INSERT INTO image_lineage (
-			provider_id, project_id, service_id, service_name, container_id,
+			provider_id, context_name, project_id, service_id, service_name, container_id,
 			service_image_ref, service_image_id, service_digest, build_context,
 			dockerfile_path, build_target, dockerfile_hash, build_args_json,
 			source, confidence, discovered_at, updated_at
 		)
-		VALUES (?, ?, NULLIF(?, ''), ?, NULLIF(?, ''), NULLIF(?, ''),
+		VALUES (?, ?, ?, NULLIF(?, ''), ?, NULLIF(?, ''), NULLIF(?, ''),
 			NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''),
 			NULLIF(?, ''), NULLIF(?, ''), ?, ?, ?, ?, ?)
-	`, record.ProviderID, record.ProjectID, record.ServiceID, record.ServiceName,
+	`, record.ProviderID, record.ContextName, record.ProjectID, record.ServiceID, record.ServiceName,
 		record.ContainerID, record.ServiceImageRef, record.ServiceImageID, record.ServiceDigest,
 		record.BuildContext, record.DockerfilePath, record.BuildTarget, record.DockerfileHash,
 		jsonText(record.BuildArgs, "{}"), string(record.Source), string(record.Confidence),
@@ -284,7 +441,7 @@ func (r *LineageRepository) listBaseRefs(ctx context.Context, lineageID int64) (
 
 func lineageSelectSQL() string {
 	return `
-		SELECT id, provider_id, project_id, COALESCE(service_id, ''), service_name,
+		SELECT id, provider_id, context_name, project_id, COALESCE(service_id, ''), service_name,
 			COALESCE(container_id, ''), COALESCE(service_image_ref, ''),
 			COALESCE(service_image_id, ''), COALESCE(service_digest, ''),
 			COALESCE(build_context, ''), COALESCE(dockerfile_path, ''),
@@ -308,6 +465,7 @@ func scanLineageRecord(scanner lineageScanner) (LineageRecord, error) {
 	if err := scanner.Scan(
 		&record.ID,
 		&record.ProviderID,
+		&record.ContextName,
 		&record.ProjectID,
 		&record.ServiceID,
 		&record.ServiceName,

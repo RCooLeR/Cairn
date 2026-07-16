@@ -16,6 +16,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/portforward"
 	registrycore "github.com/RCooLeR/Cairn/internal/registry"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/store"
 	"github.com/RCooLeR/Cairn/internal/terminal"
@@ -96,21 +97,20 @@ type ProjectDetector interface {
 }
 
 type ProjectService struct {
-	Detector    ProjectDetector
-	Projects    *store.ProjectRepository
-	Objects     *store.ObjectCacheRepository
-	Updates     *store.UpdateRepository
-	Docker      DockerClient
-	Client      *composecore.Client
-	PathMapper  composecore.PathMapper
-	Audit       *store.AuditRepository
-	Plans       *security.ProjectPlanStore
-	Events      bus.Bus
-	ProviderID  string
-	ContextName string
-	Now         func() time.Time
-	RuntimeMu   *sync.RWMutex
-	RuntimeCtx  context.Context
+	Detector   ProjectDetector
+	Projects   *store.ProjectRepository
+	Objects    *store.ObjectCacheRepository
+	Updates    *store.UpdateRepository
+	Docker     DockerClient
+	Client     *composecore.Client
+	PathMapper composecore.PathMapper
+	Audit      *store.AuditRepository
+	Plans      *security.ProjectPlanStore
+	Events     bus.Bus
+	Scope      runtimescope.Scope
+	Now        func() time.Time
+	RuntimeMu  *sync.RWMutex
+	RuntimeCtx context.Context
 }
 
 type ComposeService struct {
@@ -120,6 +120,7 @@ type ComposeService struct {
 	Audit      *store.AuditRepository
 	Detector   ProjectDetector
 	Events     bus.Bus
+	Scope      runtimescope.Scope
 	RuntimeMu  *sync.RWMutex
 }
 type MetricsService struct {
@@ -532,8 +533,11 @@ func (s *DockerService) runRunImagePlan(ctx context.Context, plan security.Docke
 	id, err := s.Client.RunImage(ctx, req)
 	duration := time.Since(started)
 	if err != nil {
+		if strings.TrimSpace(id) != "" {
+			targetID = id
+		}
 		_ = s.recordAudit(ctx, "container.run", "container", targetID, "", command, plan.Plan.Risk, "failed", duration, err)
-		return "", err
+		return id, err
 	}
 	return id, s.recordAudit(ctx, "container.run", "container", id, "", command, plan.Plan.Risk, "success", duration, nil)
 }

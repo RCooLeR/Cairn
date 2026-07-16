@@ -27,11 +27,12 @@ const (
 	wslCommandTimeout     = 10 * commandTimeout
 	wslServiceTimeout     = 2 * time.Minute
 	wslInstallTimeout     = 15 * time.Minute
+	wslDockerSocketHost   = "unix:///var/run/docker.sock"
 )
 
 const (
 	wslNVIDIAGPUCheckCommand     = "command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1"
-	wslNVIDIARuntimeCheckCommand = "docker info 2>/dev/null | sed -n 's/^ Runtimes: //p' | grep -Eq '(^|[[:space:]])nvidia([[:space:]]|$)'"
+	wslNVIDIARuntimeCheckCommand = "docker --host " + wslDockerSocketHost + " info 2>/dev/null | sed -n 's/^ Runtimes: //p' | grep -Eq '(^|[[:space:]])nvidia([[:space:]]|$)'"
 	wslSystemdEnabledCommand     = `awk 'BEGIN{inboot=0;found=0} /^\[boot\][[:space:]]*$/{inboot=1;next} /^\[.*\][[:space:]]*$/{inboot=0;next} inboot&&/^[[:space:]]*systemd[[:space:]]*=[[:space:]]*true[[:space:]]*$/{found=1} END{exit found?0:1}' /etc/wsl.conf`
 	wslBackendIPCacheTTL         = 30 * time.Second
 	wslDefaultRouteIPCommand     = "ip -o -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \\([0-9.]*\\).*/\\1/p' | head -n1"
@@ -244,10 +245,8 @@ func (p *WindowsWSLProvider) Detect(ctx context.Context) (*models.ProviderStatus
 	}
 	status.DockerInstalled = true
 
-	if contextName, ok := p.runWSLText(ctx, selected.Name, "docker", "context", "show"); ok {
-		status.CurrentContext = contextName
-	}
-	if composeVersion, ok := p.runWSLText(ctx, selected.Name, "docker", "compose", "version", "--short"); ok {
+	status.CurrentContext = p.backendIdentity()
+	if composeVersion, ok := p.runWSLText(ctx, selected.Name, "docker", "--host", wslDockerSocketHost, "compose", "version", "--short"); ok {
 		status.ComposeInstalled = true
 		status.ComposeVersion = normalizeDockerVersion(composeVersion)
 	} else {
@@ -258,7 +257,7 @@ func (p *WindowsWSLProvider) Detect(ctx context.Context) (*models.ProviderStatus
 			true,
 		))
 	}
-	if buildxVersion, ok := p.runWSLText(ctx, selected.Name, "docker", "buildx", "version"); ok {
+	if buildxVersion, ok := p.runWSLText(ctx, selected.Name, "docker", "--host", wslDockerSocketHost, "buildx", "version"); ok {
 		status.BuildxInstalled = true
 		status.BackendVersion = normalizeDockerVersion(buildxVersion)
 	} else {
@@ -274,7 +273,7 @@ func (p *WindowsWSLProvider) Detect(ctx context.Context) (*models.ProviderStatus
 			status.Warnings = append(status.Warnings, dockerPackagesOutdatedWarning(outdated))
 		}
 	}
-	if dockerVersion, ok := p.runWSLText(ctx, selected.Name, "docker", "info", "--format", "{{.ServerVersion}}"); ok {
+	if dockerVersion, ok := p.runWSLText(ctx, selected.Name, "docker", "--host", wslDockerSocketHost, "info", "--format", "{{.ServerVersion}}"); ok {
 		status.DockerRunning = true
 		status.DockerVersion = normalizeDockerVersion(dockerVersion)
 		status.DockerHost = "wsl+stdio://" + selected.Name
@@ -425,7 +424,7 @@ func (p *WindowsWSLProvider) Restart(ctx context.Context) error {
 }
 
 func (p *WindowsWSLProvider) DockerHost(context.Context) (string, error) {
-	return "unix:///var/run/docker.sock", nil
+	return wslDockerSocketHost, nil
 }
 
 func (p *WindowsWSLProvider) DockerDialContext(ctx context.Context) (func(context.Context, string, string) (net.Conn, error), error) {
@@ -519,24 +518,26 @@ func (p *WindowsWSLProvider) clearBackendIPCache() {
 	p.ipCacheMu.Unlock()
 }
 
-func (p *WindowsWSLProvider) DockerContext(ctx context.Context) (string, error) {
-	contextName, ok := p.runWSLText(ctx, p.configuredDistro(), "docker", "context", "show")
-	if !ok {
-		return "", apperror.New(apperror.ProviderNotReady, "WSL Docker context is not available")
-	}
-	return contextName, nil
+func (p *WindowsWSLProvider) DockerContext(context.Context) (string, error) {
+	return p.backendIdentity(), nil
 }
 
 func (p *WindowsWSLProvider) BackendIdentity(context.Context) (string, error) {
-	return "wsl:" + p.configuredDistro(), nil
+	return p.backendIdentity(), nil
+}
+
+func (p *WindowsWSLProvider) backendIdentity() string {
+	return "wsl:" + strings.ToLower(strings.TrimSpace(p.configuredDistro()))
 }
 
 func (p *WindowsWSLProvider) RunDocker(ctx context.Context, args ...string) (*CommandResult, error) {
-	return p.runWSLWithTimeout(ctx, dockerOperationTimeout, p.configuredDistro(), append([]string{"docker"}, escapeWSLArgs(args)...)...)
+	command := []string{"docker", "--host", wslDockerSocketHost}
+	return p.runWSLWithTimeout(ctx, dockerOperationTimeout, p.configuredDistro(), append(command, escapeWSLArgs(args)...)...)
 }
 
 func (p *WindowsWSLProvider) RunDockerWithInput(ctx context.Context, input string, args ...string) (*CommandResult, error) {
-	return p.runWSLWithOptions(ctx, dockerOperationTimeout, input, p.configuredDistro(), append([]string{"docker"}, escapeWSLArgs(args)...)...)
+	command := []string{"docker", "--host", wslDockerSocketHost}
+	return p.runWSLWithOptions(ctx, dockerOperationTimeout, input, p.configuredDistro(), append(command, escapeWSLArgs(args)...)...)
 }
 
 func (p *WindowsWSLProvider) RunBackendCommand(ctx context.Context, input string, args ...string) (*CommandResult, error) {
@@ -551,7 +552,7 @@ func (p *WindowsWSLProvider) RunCompose(ctx context.Context, workdir string, arg
 }
 
 func (p *WindowsWSLProvider) RunComposeEnv(ctx context.Context, workdir string, env []string, args ...string) (*CommandResult, error) {
-	composeArgs := append([]string{"compose"}, args...)
+	composeArgs := append([]string{"--host", wslDockerSocketHost, "compose"}, args...)
 	timeout := composeTimeoutForArgs(args)
 	if strings.TrimSpace(workdir) == "" {
 		if len(env) == 0 {
@@ -776,8 +777,8 @@ func isWSLInvocationFailure(result *CommandResult, err error) bool {
 
 func (p *WindowsWSLProvider) dockerDialCommand(ctx context.Context) ([]string, error) {
 	distro := p.configuredDistro()
-	if p.runWSLOK(ctx, distro, "docker", "system", "dial-stdio", "--help") {
-		return []string{wslCommandName, "-d", distro, "--", "docker", "system", "dial-stdio"}, nil
+	if p.runWSLOK(ctx, distro, "docker", "--host", wslDockerSocketHost, "system", "dial-stdio", "--help") {
+		return []string{wslCommandName, "-d", distro, "--", "docker", "--host", wslDockerSocketHost, "system", "dial-stdio"}, nil
 	}
 	if p.runWSLOK(ctx, distro, "sh", "-lc", "command -v socat >/dev/null 2>&1") {
 		return []string{wslCommandName, "-d", distro, "--", "socat", "UNIX-CONNECT:/var/run/docker.sock", "-"}, nil
@@ -1070,10 +1071,10 @@ func buildWSLInstallStepsFor(distro string, distribution string) []wslInstallSte
 	}, " && ")
 	groupCommand := `user="$(getent passwd 1000 | cut -d: -f1)"; if [ -z "$user" ]; then echo "No non-root WSL user was found for docker group membership." >&2; exit 1; fi; usermod -aG docker "$user"`
 	verifyCommand := strings.Join([]string{
-		"docker info >/dev/null",
-		"docker compose version",
-		"docker buildx version",
-		"docker run --rm hello-world",
+		"docker --host " + wslDockerSocketHost + " info >/dev/null",
+		"docker --host " + wslDockerSocketHost + " compose version",
+		"docker --host " + wslDockerSocketHost + " buildx version",
+		"docker --host " + wslDockerSocketHost + " run --rm hello-world",
 	}, " && ")
 	return []wslInstallStep{
 		{

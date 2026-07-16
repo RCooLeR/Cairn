@@ -176,7 +176,8 @@ func TestManagerDashboardIncludesCachedGPUMetrics(t *testing.T) {
 	calls := 0
 	docker := &fakeMetricsDocker{}
 	manager := NewManager(docker, nil, nil, nil, nil, Options{
-		Now: func() time.Time { return now },
+		Scope: testRuntimeScope,
+		Now:   func() time.Time { return now },
 		GPUProbe: GPUProbeFunc(func(context.Context) models.GPUMetrics {
 			calls++
 			return models.GPUMetrics{

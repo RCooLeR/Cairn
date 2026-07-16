@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 )
 
 func TestUpdateRepositoryIgnoreOverlayAndBadges(t *testing.T) {
@@ -180,6 +181,54 @@ func TestUpdateRepositoryBadgesByProjectIDs(t *testing.T) {
 	}
 	if _, ok := badgesByProject["linux_native/empty"]; !ok {
 		t.Fatal("empty project should be present with zero badges")
+	}
+}
+
+func TestUpdateRepositoryBadgesByProjectIDsInScopeRejectsForeignRecords(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openStoreForProjectTest(t)
+	repo := db.Updates()
+	now := time.Date(2026, 7, 16, 13, 0, 0, 0, time.UTC)
+	scope := runtimescope.Must("linux_native", "unix:///var/run/docker.sock")
+	projectID := "linux_native/app"
+	if err := db.Projects().SaveSnapshot(ctx, scope, []ProjectRecord{{
+		ID:          projectID,
+		ProviderID:  scope.ProviderID(),
+		ContextName: scope.ContextName(),
+		Name:        "app",
+		LastSeenAt:  now,
+	}}, nil, now, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot() error = %v", err)
+	}
+	if err := repo.InsertChecks(ctx, []UpdateCheckRecord{
+		{
+			ProviderID: scope.ProviderID(), ContextName: scope.ContextName(), ProjectID: projectID, ServiceID: projectID + "/web",
+			Kind: models.UpdateKindServiceImage, ImageRef: "nginx:1.25",
+			Status: models.UpdateStatusServiceImageUpdateAvailable, CheckedAt: now,
+		},
+		{
+			ProviderID: "existing_context:foreign", ContextName: "foreign", ProjectID: projectID, ServiceID: projectID + "/api",
+			Kind: models.UpdateKindBaseImage, ImageRef: "app:foreign", BaseImageRef: "alpine:3.20",
+			Status: models.UpdateStatusRebuildRequired, CheckedAt: now.Add(time.Minute),
+		},
+	}); err != nil {
+		t.Fatalf("InsertChecks() error = %v", err)
+	}
+	badges, err := repo.BadgesByProjectIDsInScope(ctx, scope, []string{projectID})
+	if err != nil {
+		t.Fatalf("BadgesByProjectIDsInScope() error = %v", err)
+	}
+	if got := badges[projectID]; got.ImageUpdates != 1 || got.RebuildNeeded != 0 {
+		t.Fatalf("scoped badges = %#v", got)
+	}
+	wrongScope := runtimescope.Must(scope.ProviderID(), "unix:///run/user/1000/docker.sock")
+	badges, err = repo.BadgesByProjectIDsInScope(ctx, wrongScope, []string{projectID})
+	if err != nil {
+		t.Fatalf("BadgesByProjectIDsInScope(wrong scope) error = %v", err)
+	}
+	if got := badges[projectID]; got != (models.UpdateBadges{}) {
+		t.Fatalf("wrong-scope badges = %#v", got)
 	}
 }
 

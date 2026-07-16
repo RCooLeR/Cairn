@@ -29,11 +29,22 @@ const (
 )
 
 type AppError struct {
-	Code        Code     `json:"code"`
-	Message     string   `json:"message"`
-	Detail      string   `json:"detail,omitempty"`
-	RepairHints []string `json:"repairHints,omitempty"`
-	Cause       error    `json:"-"`
+	Code        Code             `json:"code"`
+	Message     string           `json:"message"`
+	Detail      string           `json:"detail,omitempty"`
+	RepairHints []string         `json:"repairHints,omitempty"`
+	Partial     *PartialResource `json:"partial,omitempty"`
+	Cause       error            `json:"-"`
+}
+
+// PartialResource describes an external resource that may remain after an
+// operation failed locally. Callers can reconcile it without scraping an error
+// message or blindly retrying a non-idempotent mutation.
+type PartialResource struct {
+	Type            string `json:"type"`
+	ID              string `json:"id"`
+	State           string `json:"state,omitempty"`
+	CleanupRequired bool   `json:"cleanupRequired"`
 }
 
 type Option func(*AppError)
@@ -69,6 +80,17 @@ func WithRepairHints(hints ...string) Option {
 func WithCause(cause error) Option {
 	return func(err *AppError) {
 		err.Cause = cause
+	}
+}
+
+func WithPartialResource(resourceType string, id string, state string, cleanupRequired bool) Option {
+	return func(err *AppError) {
+		err.Partial = &PartialResource{
+			Type:            resourceType,
+			ID:              id,
+			State:           state,
+			CleanupRequired: cleanupRequired,
+		}
 	}
 }
 

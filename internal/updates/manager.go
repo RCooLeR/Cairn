@@ -14,6 +14,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/bus"
 	"github.com/RCooLeR/Cairn/internal/models"
 	registrycore "github.com/RCooLeR/Cairn/internal/registry"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/store"
 	"github.com/google/uuid"
 )
@@ -60,7 +61,7 @@ type Manager struct {
 	JitterFor          func(time.Duration) time.Duration
 	HealthWindow       time.Duration
 	HealthPollInterval time.Duration
-	ContextName        string
+	Scope              runtimescope.Scope
 
 	startOnce sync.Once
 	planMu    sync.Mutex
@@ -165,7 +166,7 @@ func (m *Manager) CheckProjectUpdates(ctx context.Context, projectID string) ([]
 	for _, service := range services {
 		checks := m.checkService(ctx, project, service, lineageByService[service.Name], containers[service.Name], now)
 		for _, check := range checks {
-			if _, err := m.Updates.InsertCheck(ctx, check); err != nil {
+			if _, err := m.Updates.InsertCheckInScope(ctx, m.Scope, check); err != nil {
 				return nil, apperror.Wrap(apperror.Internal, "Persist update check failed", err)
 			}
 		}
@@ -197,7 +198,7 @@ func (m *Manager) CheckServiceUpdate(ctx context.Context, projectID string, serv
 		}
 		checks := m.checkService(ctx, project, service, lineageByService[service.Name], containers[service.Name], m.now())
 		for i := range checks {
-			id, err := m.Updates.InsertCheck(ctx, checks[i])
+			id, err := m.Updates.InsertCheckInScope(ctx, m.Scope, checks[i])
 			if err != nil {
 				return nil, apperror.Wrap(apperror.Internal, "Persist service update check failed", err)
 			}
@@ -236,19 +237,27 @@ func (m *Manager) forgetJob(jobID string) {
 }
 
 func (m *Manager) ListCurrentUpdates(ctx context.Context, filter models.UpdateFilter) ([]models.ImageUpdate, error) {
-	if m == nil || m.Updates == nil {
+	if m == nil || m.Updates == nil || m.Projects == nil || !m.Scope.Valid() {
 		return nil, notReady()
+	}
+	if strings.TrimSpace(filter.ProjectID) != "" {
+		if _, err := m.projectInScope(ctx, filter.ProjectID); err != nil {
+			return nil, err
+		}
 	}
 	currentProjectIDs, scoped, err := m.currentProviderProjectIDs(ctx)
 	if err != nil {
 		return nil, apperror.Wrap(apperror.Internal, "List current update projects failed", err)
 	}
-	records, err := m.Updates.ListCurrent(ctx, filter)
+	records, err := m.Updates.ListCurrentInScope(ctx, m.Scope, filter)
 	if err != nil {
 		return nil, apperror.Wrap(apperror.Internal, "List current updates failed", err)
 	}
 	result := make([]models.ImageUpdate, 0, len(records))
 	for _, record := range records {
+		if !m.Scope.Matches(record.ProviderID, record.ContextName) {
+			continue
+		}
 		if scoped {
 			if _, ok := currentProjectIDs[record.ProjectID]; !ok {
 				continue
@@ -260,13 +269,23 @@ func (m *Manager) ListCurrentUpdates(ctx context.Context, filter models.UpdateFi
 }
 
 func (m *Manager) IgnoreUpdate(ctx context.Context, req models.IgnoreUpdateRequest) error {
-	if m == nil || m.Updates == nil {
+	if m == nil || m.Updates == nil || m.Projects == nil || !m.Scope.Valid() {
 		return notReady()
 	}
 	if req.ID <= 0 {
 		return apperror.New(apperror.Conflict, "Update ID is required")
 	}
-	if err := m.Updates.IgnoreCheck(ctx, req.ID, req.Reason, m.now()); err != nil {
+	check, err := m.Updates.GetCheckInScope(ctx, m.Scope, req.ID)
+	if err != nil {
+		return mapStoreError(err, "Update check was not found")
+	}
+	if !m.Scope.Matches(check.ProviderID, check.ContextName) {
+		return apperror.New(apperror.NotFound, "Update check was not found")
+	}
+	if _, err := m.projectInScope(ctx, check.ProjectID); err != nil {
+		return apperror.New(apperror.NotFound, "Update check was not found")
+	}
+	if err := m.Updates.IgnoreCheckInScope(ctx, m.Scope, req.ID, req.Reason, m.now()); err != nil {
 		if store.IsStoreNotFound(err) {
 			return apperror.New(apperror.NotFound, "Update check was not found")
 		}
@@ -276,32 +295,53 @@ func (m *Manager) IgnoreUpdate(ctx context.Context, req models.IgnoreUpdateReque
 }
 
 func (m *Manager) UnignoreUpdate(ctx context.Context, id int64) error {
-	if m == nil || m.Updates == nil {
+	if m == nil || m.Updates == nil || m.Projects == nil || !m.Scope.Valid() {
 		return notReady()
 	}
 	if id <= 0 {
 		return apperror.New(apperror.Conflict, "Ignored update ID is required")
 	}
-	if err := m.Updates.Unignore(ctx, id); err != nil {
+	rule, err := m.Updates.GetIgnoredInScope(ctx, m.Scope, id)
+	if err != nil {
+		return mapStoreError(err, "Ignored update was not found")
+	}
+	if !m.Scope.Matches(rule.ProviderID, rule.ContextName) {
+		return apperror.New(apperror.NotFound, "Ignored update was not found")
+	}
+	if strings.TrimSpace(rule.ProjectID) == "" {
+		return apperror.New(apperror.NotFound, "Ignored update was not found")
+	}
+	if _, err := m.projectInScope(ctx, rule.ProjectID); err != nil {
+		return apperror.New(apperror.NotFound, "Ignored update was not found")
+	}
+	if err := m.Updates.UnignoreInScope(ctx, m.Scope, id); err != nil {
 		return apperror.Wrap(apperror.Internal, "Unignore update failed", err)
 	}
 	return nil
 }
 
 func (m *Manager) ListUpdateHistory(ctx context.Context, filter models.UpdateHistoryFilter) ([]models.UpdateHistoryItem, error) {
-	if m == nil || m.Updates == nil {
+	if m == nil || m.Updates == nil || m.Projects == nil || !m.Scope.Valid() {
 		return nil, notReady()
+	}
+	if strings.TrimSpace(filter.ProjectID) != "" {
+		if _, err := m.projectInScope(ctx, filter.ProjectID); err != nil {
+			return nil, err
+		}
 	}
 	currentProjectIDs, scoped, err := m.currentProviderProjectIDs(ctx)
 	if err != nil {
 		return nil, apperror.Wrap(apperror.Internal, "List update history projects failed", err)
 	}
-	records, err := m.Updates.ListHistory(ctx, filter)
+	records, err := m.Updates.ListHistoryInScope(ctx, m.Scope, filter)
 	if err != nil {
 		return nil, apperror.Wrap(apperror.Internal, "List update history failed", err)
 	}
 	result := make([]models.UpdateHistoryItem, 0, len(records))
 	for _, record := range records {
+		if !m.Scope.Matches(record.ProviderID, record.ContextName) {
+			continue
+		}
 		if scoped {
 			if _, ok := currentProjectIDs[record.ProjectID]; !ok {
 				continue
@@ -522,9 +562,9 @@ func (m *Manager) runScheduler(ctx context.Context) {
 }
 
 func (m *Manager) projectWithServices(ctx context.Context, projectID string) (store.ProjectRecord, []store.ServiceRecord, error) {
-	project, err := m.Projects.Get(ctx, projectID)
+	project, err := m.projectInScope(ctx, projectID)
 	if err != nil {
-		return store.ProjectRecord{}, nil, mapStoreError(err, "Project was not found")
+		return store.ProjectRecord{}, nil, err
 	}
 	services, err := m.Projects.ListServices(ctx, projectID)
 	if err != nil {
@@ -534,18 +574,14 @@ func (m *Manager) projectWithServices(ctx context.Context, projectID string) (st
 }
 
 func (m *Manager) currentProviderProjects(ctx context.Context) ([]store.ProjectRecord, error) {
-	providerID := m.providerID()
-	if strings.TrimSpace(providerID) == "" {
-		return m.Projects.List(ctx)
+	if m == nil || m.Projects == nil || !m.Scope.Valid() {
+		return nil, notReady()
 	}
-	return m.Projects.ListByProviderContext(ctx, providerID, m.ContextName)
+	return m.Projects.ListByScope(ctx, m.Scope)
 }
 
 func (m *Manager) currentProviderProjectIDs(ctx context.Context) (map[string]struct{}, bool, error) {
-	if strings.TrimSpace(m.providerID()) == "" {
-		return nil, false, nil
-	}
-	if m == nil || m.Projects == nil {
+	if m == nil || m.Projects == nil || !m.Scope.Valid() {
 		return nil, true, notReady()
 	}
 	projects, err := m.currentProviderProjects(ctx)
@@ -560,10 +596,21 @@ func (m *Manager) currentProviderProjectIDs(ctx context.Context) (map[string]str
 }
 
 func (m *Manager) providerID() string {
-	if m == nil || m.Docker == nil {
+	if m == nil || !m.Scope.Valid() {
 		return ""
 	}
-	return m.Docker.ProviderID()
+	return m.Scope.ProviderID()
+}
+
+func (m *Manager) projectInScope(ctx context.Context, projectID string) (store.ProjectRecord, error) {
+	if m == nil || m.Projects == nil || !m.Scope.Valid() {
+		return store.ProjectRecord{}, notReady()
+	}
+	project, err := m.Projects.GetInScope(ctx, m.Scope, projectID)
+	if err != nil {
+		return store.ProjectRecord{}, mapStoreError(err, "Project was not found")
+	}
+	return project, nil
 }
 
 func (m *Manager) lineageByService(ctx context.Context, projectID string) (map[string]store.LineageRecord, error) {
@@ -571,7 +618,7 @@ func (m *Manager) lineageByService(ctx context.Context, projectID string) (map[s
 	if m.Lineage == nil {
 		return result, nil
 	}
-	records, err := m.Lineage.ListProject(ctx, projectID)
+	records, err := m.Lineage.ListProjectInScope(ctx, m.Scope, projectID)
 	if err != nil {
 		return nil, apperror.Wrap(apperror.Internal, "Load project lineage for update check failed", err)
 	}
@@ -586,7 +633,7 @@ func (m *Manager) containersByService(ctx context.Context, project store.Project
 	if m.Objects == nil || project.ProviderID == "" {
 		return result
 	}
-	records, err := m.Objects.ListContainers(ctx, project.ProviderID)
+	records, err := m.Objects.ListContainersScoped(ctx, m.Scope)
 	if err != nil {
 		return result
 	}
@@ -704,7 +751,7 @@ func (m *Manager) updateBaseRef(ctx context.Context, id int64, localDigest strin
 	if id <= 0 || m.Lineage == nil {
 		return nil
 	}
-	return m.Lineage.UpdateBaseRefCheck(ctx, id, localDigest, remoteDigest, status, checkedAt, checkErr)
+	return m.Lineage.UpdateBaseRefCheckInScope(ctx, m.Scope, id, localDigest, remoteDigest, status, checkedAt, checkErr)
 }
 
 func (m *Manager) schedulerInterval(ctx context.Context) (time.Duration, bool) {
@@ -764,7 +811,10 @@ func (m *Manager) publishCheckProgress(jobID string, done int, total int, curren
 }
 
 func (m *Manager) ready() error {
-	if m == nil || m.Projects == nil || m.Updates == nil || m.Registry == nil {
+	if m == nil || m.Projects == nil || m.Updates == nil || m.Registry == nil || !m.Scope.Valid() {
+		return notReady()
+	}
+	if m.Docker != nil && strings.TrimSpace(m.Docker.ProviderID()) != m.Scope.ProviderID() {
 		return notReady()
 	}
 	return nil
@@ -787,6 +837,7 @@ func (m *Manager) newID() string {
 func baseCheckRecord(project store.ProjectRecord, service store.ServiceRecord, containerID string, kind models.UpdateKind, imageRef string, baseImageRef string, checkedAt time.Time) store.UpdateCheckRecord {
 	return store.UpdateCheckRecord{
 		ProviderID:        project.ProviderID,
+		ContextName:       project.ContextName,
 		ProjectID:         project.ID,
 		ServiceID:         service.ID,
 		ContainerID:       containerID,

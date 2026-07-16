@@ -10,6 +10,7 @@ import (
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 )
 
 func TestContainerRiskMapping(t *testing.T) {
@@ -399,11 +400,12 @@ func TestNewProjectActionPlanRequiresTypedConfirmationForHighRisk(t *testing.T) 
 		Risk:      models.RiskDestructive,
 		ExpiresAt: time.Now().Add(time.Minute),
 	}
-	if _, err := NewProjectActionPlan(plan, ProjectActionDown, "provider/app", false); !apperror.IsCode(err, apperror.ConfirmationRequired) {
+	scope := runtimescope.Must("provider", "context")
+	if _, err := NewProjectActionPlan(plan, ProjectActionDown, "provider/app", false, scope); !apperror.IsCode(err, apperror.ConfirmationRequired) {
 		t.Fatalf("project constructor error = %v, want confirmation required", err)
 	}
 	plan.RequiresTypedName = "app"
-	projectPlan, err := NewProjectActionPlan(plan, ProjectActionDown, "provider/app", false)
+	projectPlan, err := NewProjectActionPlan(plan, ProjectActionDown, "provider/app", false, scope)
 	if err != nil {
 		t.Fatalf("NewProjectActionPlan() error = %v", err)
 	}

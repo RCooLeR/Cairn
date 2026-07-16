@@ -384,6 +384,12 @@ describe("UI kit", () => {
           code: "E_COMPOSE_INVALID",
           message: "Compose project action failed",
           detail: "docker compose pull failed",
+          partial: {
+            type: "container",
+            id: "container-123",
+            state: "running",
+            cleanupRequired: true,
+          },
         },
       }),
     );
@@ -391,6 +397,26 @@ describe("UI kit", () => {
     expect(parsed.title).toBe("Compose file is invalid");
     expect(parsed.body).toBe("Compose project action failed");
     expect(parsed.detail).toBe("docker compose pull failed");
+    expect(parsed.partial).toEqual({
+      type: "container",
+      id: "container-123",
+      state: "running",
+      cleanupRequired: true,
+    });
+  });
+
+  it("parses a directly marshalled app error", () => {
+    const parsed = parseAppErrorText(
+      JSON.stringify({
+        code: "E_TIMEOUT",
+        message: "Container start outcome requires reconciliation",
+        detail: "container container-123: state unknown",
+      }),
+    );
+
+    expect(parsed.code).toBe("E_TIMEOUT");
+    expect(parsed.title).toBe("Operation timed out");
+    expect(parsed.detail).toBe("container container-123: state unknown");
   });
 
   it("windows large table row sets for seed-scale inventory pages", () => {

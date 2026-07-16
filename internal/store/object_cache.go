@@ -4,16 +4,20 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 )
 
 type ObjectCacheRepository struct {
 	db *sql.DB
 }
+
+var errInvalidObjectCacheScope = errors.New("object cache: complete runtime scope is required")
 
 type ContainerCacheRecord struct {
 	Summary   models.ContainerSummary
@@ -51,15 +55,19 @@ func (s *Store) Objects() *ObjectCacheRepository {
 	return &ObjectCacheRepository{db: s.writer}
 }
 
-func (r *ObjectCacheRepository) SaveContainers(ctx context.Context, providerID string, records []ContainerCacheRecord, seenAt time.Time) error {
-	return r.saveContainers(ctx, providerID, records, seenAt, false)
+func (r *ObjectCacheRepository) SaveContainersScoped(ctx context.Context, scope runtimescope.Scope, records []ContainerCacheRecord, seenAt time.Time) error {
+	return r.saveContainers(ctx, scope, records, seenAt, false)
 }
 
-func (r *ObjectCacheRepository) SaveContainersSnapshot(ctx context.Context, providerID string, records []ContainerCacheRecord, seenAt time.Time) error {
-	return r.saveContainers(ctx, providerID, records, seenAt, true)
+func (r *ObjectCacheRepository) SaveContainersSnapshotScoped(ctx context.Context, scope runtimescope.Scope, records []ContainerCacheRecord, seenAt time.Time) error {
+	return r.saveContainers(ctx, scope, records, seenAt, true)
 }
 
-func (r *ObjectCacheRepository) saveContainers(ctx context.Context, providerID string, records []ContainerCacheRecord, seenAt time.Time, replace bool) error {
+func (r *ObjectCacheRepository) saveContainers(ctx context.Context, scope runtimescope.Scope, records []ContainerCacheRecord, seenAt time.Time, replace bool) error {
+	if !scope.Valid() {
+		return errInvalidObjectCacheScope
+	}
+	providerID, contextName := scope.ProviderID(), scope.ContextName()
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -69,7 +77,7 @@ func (r *ObjectCacheRepository) saveContainers(ctx context.Context, providerID s
 	}()
 
 	if replace {
-		if _, err := tx.ExecContext(ctx, "DELETE FROM containers_cache WHERE provider_id = ?", providerID); err != nil {
+		if _, err := tx.ExecContext(ctx, "DELETE FROM containers_cache WHERE provider_id = ? AND context_name = ?", providerID, contextName); err != nil {
 			return err
 		}
 	}
@@ -79,14 +87,13 @@ func (r *ObjectCacheRepository) saveContainers(ctx context.Context, providerID s
 		state := cacheContainerState(summary)
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO containers_cache (
-				id, provider_id, project_id, service_id, name, image_ref, image_id,
+				provider_id, context_name, id, project_id, service_id, name, image_ref, image_id,
 				status, state, health, restart_count, ports_json, labels_json, created_at,
 				started_at, last_seen_at
 			)
-			VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, NULLIF(?, ''), NULLIF(?, ''),
+			VALUES (?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, NULLIF(?, ''), NULLIF(?, ''),
 				NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?)
-			ON CONFLICT(id) DO UPDATE SET
-				provider_id = excluded.provider_id,
+			ON CONFLICT(provider_id, context_name, id) DO UPDATE SET
 				project_id = excluded.project_id,
 				service_id = excluded.service_id,
 				name = excluded.name,
@@ -101,7 +108,7 @@ func (r *ObjectCacheRepository) saveContainers(ctx context.Context, providerID s
 				created_at = excluded.created_at,
 				started_at = COALESCE(excluded.started_at, containers_cache.started_at),
 				last_seen_at = excluded.last_seen_at
-		`, summary.ID, providerID, summary.ProjectID, summary.Service, summary.Name, summary.Image,
+		`, providerID, contextName, summary.ID, summary.ProjectID, summary.Service, summary.Name, summary.Image,
 			summary.ImageID, summary.Status, state, string(summary.Health), summary.Restarts,
 			jsonText(summary.Ports, "[]"), jsonText(record.Labels, "{}"), formatTime(summary.CreatedAt),
 			formatTime(record.StartedAt), formatTime(seenAt)); err != nil {
@@ -112,14 +119,17 @@ func (r *ObjectCacheRepository) saveContainers(ctx context.Context, providerID s
 	return tx.Commit()
 }
 
-func (r *ObjectCacheRepository) ListContainers(ctx context.Context, providerID string) ([]ContainerCacheRecord, error) {
+func (r *ObjectCacheRepository) ListContainersScoped(ctx context.Context, scope runtimescope.Scope) ([]ContainerCacheRecord, error) {
+	if !scope.Valid() {
+		return nil, errInvalidObjectCacheScope
+	}
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, name, image_ref, image_id, status, state, health, restart_count,
 			project_id, service_id, ports_json, labels_json, created_at, started_at
 		FROM containers_cache
-		WHERE provider_id = ?
+		WHERE provider_id = ? AND context_name = ?
 		ORDER BY name
-	`, providerID)
+	`, scope.ProviderID(), scope.ContextName())
 	if err != nil {
 		return nil, err
 	}
@@ -216,15 +226,19 @@ func normalizeCachedContainerState(status string) string {
 	}
 }
 
-func (r *ObjectCacheRepository) SaveImages(ctx context.Context, providerID string, records []ImageCacheRecord, seenAt time.Time) error {
-	return r.saveImages(ctx, providerID, records, seenAt, false)
+func (r *ObjectCacheRepository) SaveImagesScoped(ctx context.Context, scope runtimescope.Scope, records []ImageCacheRecord, seenAt time.Time) error {
+	return r.saveImages(ctx, scope, records, seenAt, false)
 }
 
-func (r *ObjectCacheRepository) SaveImagesSnapshot(ctx context.Context, providerID string, records []ImageCacheRecord, seenAt time.Time) error {
-	return r.saveImages(ctx, providerID, records, seenAt, true)
+func (r *ObjectCacheRepository) SaveImagesSnapshotScoped(ctx context.Context, scope runtimescope.Scope, records []ImageCacheRecord, seenAt time.Time) error {
+	return r.saveImages(ctx, scope, records, seenAt, true)
 }
 
-func (r *ObjectCacheRepository) saveImages(ctx context.Context, providerID string, records []ImageCacheRecord, seenAt time.Time, replace bool) error {
+func (r *ObjectCacheRepository) saveImages(ctx context.Context, scope runtimescope.Scope, records []ImageCacheRecord, seenAt time.Time, replace bool) error {
+	if !scope.Valid() {
+		return errInvalidObjectCacheScope
+	}
+	providerID, contextName := scope.ProviderID(), scope.ContextName()
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -234,7 +248,7 @@ func (r *ObjectCacheRepository) saveImages(ctx context.Context, providerID strin
 	}()
 
 	if replace {
-		if _, err := tx.ExecContext(ctx, "DELETE FROM images_cache WHERE provider_id = ?", providerID); err != nil {
+		if _, err := tx.ExecContext(ctx, "DELETE FROM images_cache WHERE provider_id = ? AND context_name = ?", providerID, contextName); err != nil {
 			return err
 		}
 	}
@@ -247,12 +261,11 @@ func (r *ObjectCacheRepository) saveImages(ctx context.Context, providerID strin
 		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO images_cache (
-				id, provider_id, repo_tags_json, repo_digests_json, size_bytes,
+				provider_id, context_name, id, repo_tags_json, repo_digests_json, size_bytes,
 				created_at, used_by_json, dangling, last_seen_at
 			)
-			VALUES (?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?)
-			ON CONFLICT(id) DO UPDATE SET
-				provider_id = excluded.provider_id,
+			VALUES (?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?)
+			ON CONFLICT(provider_id, context_name, id) DO UPDATE SET
 				repo_tags_json = excluded.repo_tags_json,
 				repo_digests_json = excluded.repo_digests_json,
 				size_bytes = excluded.size_bytes,
@@ -260,7 +273,7 @@ func (r *ObjectCacheRepository) saveImages(ctx context.Context, providerID strin
 				used_by_json = excluded.used_by_json,
 				dangling = excluded.dangling,
 				last_seen_at = excluded.last_seen_at
-		`, summary.ID, providerID, jsonText(summary.RepoTags, "[]"), jsonText(summary.RepoDigests, "[]"),
+		`, providerID, contextName, summary.ID, jsonText(summary.RepoTags, "[]"), jsonText(summary.RepoDigests, "[]"),
 			summary.SizeBytes, formatTime(summary.CreatedAt), jsonText(record.UsedBy, "[]"), dangling,
 			formatTime(seenAt)); err != nil {
 			return err
@@ -270,15 +283,19 @@ func (r *ObjectCacheRepository) saveImages(ctx context.Context, providerID strin
 	return tx.Commit()
 }
 
-func (r *ObjectCacheRepository) SaveVolumes(ctx context.Context, providerID string, records []VolumeCacheRecord, seenAt time.Time) error {
-	return r.saveVolumes(ctx, providerID, records, seenAt, false)
+func (r *ObjectCacheRepository) SaveVolumesScoped(ctx context.Context, scope runtimescope.Scope, records []VolumeCacheRecord, seenAt time.Time) error {
+	return r.saveVolumes(ctx, scope, records, seenAt, false)
 }
 
-func (r *ObjectCacheRepository) SaveVolumesSnapshot(ctx context.Context, providerID string, records []VolumeCacheRecord, seenAt time.Time) error {
-	return r.saveVolumes(ctx, providerID, records, seenAt, true)
+func (r *ObjectCacheRepository) SaveVolumesSnapshotScoped(ctx context.Context, scope runtimescope.Scope, records []VolumeCacheRecord, seenAt time.Time) error {
+	return r.saveVolumes(ctx, scope, records, seenAt, true)
 }
 
-func (r *ObjectCacheRepository) saveVolumes(ctx context.Context, providerID string, records []VolumeCacheRecord, seenAt time.Time, replace bool) error {
+func (r *ObjectCacheRepository) saveVolumes(ctx context.Context, scope runtimescope.Scope, records []VolumeCacheRecord, seenAt time.Time, replace bool) error {
+	if !scope.Valid() {
+		return errInvalidObjectCacheScope
+	}
+	providerID, contextName := scope.ProviderID(), scope.ContextName()
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -288,7 +305,7 @@ func (r *ObjectCacheRepository) saveVolumes(ctx context.Context, providerID stri
 	}()
 
 	if replace {
-		if _, err := tx.ExecContext(ctx, "DELETE FROM volumes_cache WHERE provider_id = ?", providerID); err != nil {
+		if _, err := tx.ExecContext(ctx, "DELETE FROM volumes_cache WHERE provider_id = ? AND context_name = ?", providerID, contextName); err != nil {
 			return err
 		}
 	}
@@ -297,11 +314,11 @@ func (r *ObjectCacheRepository) saveVolumes(ctx context.Context, providerID stri
 		summary := record.Summary
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO volumes_cache (
-				name, provider_id, driver, mountpoint, labels_json, used_by_json,
+				provider_id, context_name, name, driver, mountpoint, labels_json, used_by_json,
 				estimated_size_bytes, created_at, last_seen_at
 			)
-			VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, ?, NULLIF(?, ''), ?)
-			ON CONFLICT(provider_id, name) DO UPDATE SET
+			VALUES (?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, ?, NULLIF(?, ''), ?)
+			ON CONFLICT(provider_id, context_name, name) DO UPDATE SET
 				driver = excluded.driver,
 				mountpoint = excluded.mountpoint,
 				labels_json = excluded.labels_json,
@@ -309,7 +326,7 @@ func (r *ObjectCacheRepository) saveVolumes(ctx context.Context, providerID stri
 				estimated_size_bytes = excluded.estimated_size_bytes,
 				created_at = excluded.created_at,
 				last_seen_at = excluded.last_seen_at
-		`, summary.Name, providerID, summary.Driver, summary.Mountpoint, jsonText(summary.Labels, "{}"),
+		`, providerID, contextName, summary.Name, summary.Driver, summary.Mountpoint, jsonText(summary.Labels, "{}"),
 			jsonText(record.UsedBy, "[]"), summary.SizeBytes, formatTime(record.CreatedAt), formatTime(seenAt)); err != nil {
 			return err
 		}
@@ -318,15 +335,19 @@ func (r *ObjectCacheRepository) saveVolumes(ctx context.Context, providerID stri
 	return tx.Commit()
 }
 
-func (r *ObjectCacheRepository) SaveNetworks(ctx context.Context, providerID string, records []NetworkCacheRecord, seenAt time.Time) error {
-	return r.saveNetworks(ctx, providerID, records, seenAt, false)
+func (r *ObjectCacheRepository) SaveNetworksScoped(ctx context.Context, scope runtimescope.Scope, records []NetworkCacheRecord, seenAt time.Time) error {
+	return r.saveNetworks(ctx, scope, records, seenAt, false)
 }
 
-func (r *ObjectCacheRepository) SaveNetworksSnapshot(ctx context.Context, providerID string, records []NetworkCacheRecord, seenAt time.Time) error {
-	return r.saveNetworks(ctx, providerID, records, seenAt, true)
+func (r *ObjectCacheRepository) SaveNetworksSnapshotScoped(ctx context.Context, scope runtimescope.Scope, records []NetworkCacheRecord, seenAt time.Time) error {
+	return r.saveNetworks(ctx, scope, records, seenAt, true)
 }
 
-func (r *ObjectCacheRepository) saveNetworks(ctx context.Context, providerID string, records []NetworkCacheRecord, seenAt time.Time, replace bool) error {
+func (r *ObjectCacheRepository) saveNetworks(ctx context.Context, scope runtimescope.Scope, records []NetworkCacheRecord, seenAt time.Time, replace bool) error {
+	if !scope.Valid() {
+		return errInvalidObjectCacheScope
+	}
+	providerID, contextName := scope.ProviderID(), scope.ContextName()
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -336,7 +357,7 @@ func (r *ObjectCacheRepository) saveNetworks(ctx context.Context, providerID str
 	}()
 
 	if replace {
-		if _, err := tx.ExecContext(ctx, "DELETE FROM networks_cache WHERE provider_id = ?", providerID); err != nil {
+		if _, err := tx.ExecContext(ctx, "DELETE FROM networks_cache WHERE provider_id = ? AND context_name = ?", providerID, contextName); err != nil {
 			return err
 		}
 	}
@@ -349,13 +370,12 @@ func (r *ObjectCacheRepository) saveNetworks(ctx context.Context, providerID str
 		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT INTO networks_cache (
-				id, provider_id, name, driver, scope, subnet, gateway, internal,
+				provider_id, context_name, id, name, driver, scope, subnet, gateway, internal,
 				containers_json, labels_json, last_seen_at
 			)
-			VALUES (?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''),
+			VALUES (?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''),
 				?, ?, ?, ?)
-			ON CONFLICT(id) DO UPDATE SET
-				provider_id = excluded.provider_id,
+			ON CONFLICT(provider_id, context_name, id) DO UPDATE SET
 				name = excluded.name,
 				driver = excluded.driver,
 				scope = excluded.scope,
@@ -365,7 +385,7 @@ func (r *ObjectCacheRepository) saveNetworks(ctx context.Context, providerID str
 				containers_json = excluded.containers_json,
 				labels_json = excluded.labels_json,
 				last_seen_at = excluded.last_seen_at
-		`, summary.ID, providerID, summary.Name, summary.Driver, summary.Scope, record.Subnet,
+		`, providerID, contextName, summary.ID, summary.Name, summary.Driver, summary.Scope, record.Subnet,
 			record.Gateway, internal, jsonText(record.Containers, "[]"), jsonText(summary.Labels, "{}"),
 			formatTime(seenAt)); err != nil {
 			return err
@@ -375,7 +395,11 @@ func (r *ObjectCacheRepository) saveNetworks(ctx context.Context, providerID str
 	return tx.Commit()
 }
 
-func (r *ObjectCacheRepository) DeleteStale(ctx context.Context, providerID string, cutoff time.Time) error {
+func (r *ObjectCacheRepository) DeleteStaleScoped(ctx context.Context, scope runtimescope.Scope, cutoff time.Time) error {
+	if !scope.Valid() {
+		return errInvalidObjectCacheScope
+	}
+	providerID, contextName := scope.ProviderID(), scope.ContextName()
 	cutoffText := formatTime(cutoff)
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -385,19 +409,23 @@ func (r *ObjectCacheRepository) DeleteStale(ctx context.Context, providerID stri
 		_ = tx.Rollback()
 	}()
 	for _, stmt := range []string{
-		"DELETE FROM containers_cache WHERE provider_id = ? AND last_seen_at < ?",
-		"DELETE FROM images_cache WHERE provider_id = ? AND last_seen_at < ?",
-		"DELETE FROM volumes_cache WHERE provider_id = ? AND last_seen_at < ?",
-		"DELETE FROM networks_cache WHERE provider_id = ? AND last_seen_at < ?",
+		"DELETE FROM containers_cache WHERE provider_id = ? AND context_name = ? AND last_seen_at < ?",
+		"DELETE FROM images_cache WHERE provider_id = ? AND context_name = ? AND last_seen_at < ?",
+		"DELETE FROM volumes_cache WHERE provider_id = ? AND context_name = ? AND last_seen_at < ?",
+		"DELETE FROM networks_cache WHERE provider_id = ? AND context_name = ? AND last_seen_at < ?",
 	} {
-		if _, err := tx.ExecContext(ctx, stmt, providerID, cutoffText); err != nil {
+		if _, err := tx.ExecContext(ctx, stmt, providerID, contextName, cutoffText); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
 }
 
-func (r *ObjectCacheRepository) SnapshotKeys(ctx context.Context, providerID string) (ObjectCacheSnapshot, error) {
+func (r *ObjectCacheRepository) SnapshotKeysScoped(ctx context.Context, scope runtimescope.Scope) (ObjectCacheSnapshot, error) {
+	if !scope.Valid() {
+		return ObjectCacheSnapshot{}, errInvalidObjectCacheScope
+	}
+	providerID, contextName := scope.ProviderID(), scope.ContextName()
 	snapshot := ObjectCacheSnapshot{
 		Containers: map[string]string{},
 		Images:     map[string]string{},
@@ -407,29 +435,29 @@ func (r *ObjectCacheRepository) SnapshotKeys(ctx context.Context, providerID str
 	if err := scanObjectSnapshot(ctx, r.db, snapshot.Containers, `
 		SELECT id, COALESCE(state, ''), COALESCE(status, ''), COALESCE(image_id, ''), COALESCE(ports_json, '')
 		FROM containers_cache
-		WHERE provider_id = ?
-	`, providerID); err != nil {
+		WHERE provider_id = ? AND context_name = ?
+	`, providerID, contextName); err != nil {
 		return ObjectCacheSnapshot{}, err
 	}
 	if err := scanObjectSnapshot(ctx, r.db, snapshot.Images, `
 		SELECT id, COALESCE(repo_tags_json, ''), COALESCE(repo_digests_json, '')
 		FROM images_cache
-		WHERE provider_id = ?
-	`, providerID); err != nil {
+		WHERE provider_id = ? AND context_name = ?
+	`, providerID, contextName); err != nil {
 		return ObjectCacheSnapshot{}, err
 	}
 	if err := scanObjectSnapshot(ctx, r.db, snapshot.Volumes, `
 		SELECT name, COALESCE(driver, ''), COALESCE(labels_json, ''), COALESCE(used_by_json, '')
 		FROM volumes_cache
-		WHERE provider_id = ?
-	`, providerID); err != nil {
+		WHERE provider_id = ? AND context_name = ?
+	`, providerID, contextName); err != nil {
 		return ObjectCacheSnapshot{}, err
 	}
 	if err := scanObjectSnapshot(ctx, r.db, snapshot.Networks, `
 		SELECT id, COALESCE(name, ''), COALESCE(driver, ''), COALESCE(subnet, ''), COALESCE(containers_json, '')
 		FROM networks_cache
-		WHERE provider_id = ?
-	`, providerID); err != nil {
+		WHERE provider_id = ? AND context_name = ?
+	`, providerID, contextName); err != nil {
 		return ObjectCacheSnapshot{}, err
 	}
 	return snapshot, nil

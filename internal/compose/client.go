@@ -68,6 +68,11 @@ func (c *Client) Config(ctx context.Context, opts ProjectOptions) (*ConfigResult
 	args := append(projectArgs(opts), "config")
 	result, err := c.run(ctx, opts.Workdir, projectEnv(opts), args...)
 	if commandFailed(result, err) {
+		if result == nil {
+			if _, ok := apperror.CodeOf(err); ok {
+				return nil, err
+			}
+		}
 		detail := commandDetail(result, err)
 		config := &ConfigResult{
 			Raw:    stdout(result),
@@ -202,6 +207,19 @@ func (c *Client) run(ctx context.Context, workdir string, env []string, args ...
 	if c == nil || c.runner == nil {
 		return nil, apperror.New(apperror.ProviderNotReady, "Compose runner is not ready")
 	}
+	c.mu.RLock()
+	runtimeScope := c.scope
+	scopeProvider := c.scopeProvider
+	c.mu.RUnlock()
+	if runtimeScope.Valid() {
+		currentScope, err := providers.ResolveRuntimeScope(ctx, scopeProvider)
+		if err != nil {
+			return nil, err
+		}
+		if !currentScope.Equal(runtimeScope) {
+			return nil, apperror.New(apperror.NotFound, "Compose runtime context changed; reconnect the provider")
+		}
+	}
 	if len(env) > 0 {
 		if runner, ok := c.runner.(EnvRunner); ok {
 			return runner.RunComposeEnv(ctx, workdir, env, args...)
@@ -289,6 +307,13 @@ func commandFailed(result *providers.CommandResult, err error) bool {
 }
 
 func composeCommandError(code apperror.Code, message string, result *providers.CommandResult, err error) error {
+	// Scope/provider failures happen before a Compose process is started and
+	// must retain their authorization/readiness taxonomy.
+	if result == nil {
+		if _, ok := apperror.CodeOf(err); ok {
+			return err
+		}
+	}
 	detail := commandDetail(result, err)
 	hints := []string{}
 	if code == apperror.ComposeNotFound {

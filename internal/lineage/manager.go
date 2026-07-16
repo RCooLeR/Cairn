@@ -12,6 +12,7 @@ import (
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/store"
 )
 
@@ -39,6 +40,7 @@ type Manager struct {
 	Objects    *store.ObjectCacheRepository
 	Images     ImageInspector
 	Now        func() time.Time
+	Scope      runtimescope.Scope
 }
 
 func NewManager(projects *store.ProjectRepository, repository *store.LineageRepository, objects *store.ObjectCacheRepository, images ImageInspector) *Manager {
@@ -54,9 +56,9 @@ func (m *Manager) DiscoverProjectLineage(ctx context.Context, projectID string) 
 	if m == nil || m.Projects == nil || m.Repository == nil {
 		return nil, apperror.New(apperror.ProviderNotReady, "Image lineage manager is not ready")
 	}
-	project, err := m.Projects.Get(ctx, projectID)
+	project, err := m.projectInScope(ctx, projectID)
 	if err != nil {
-		return nil, mapLineageStoreError(err, "Project was not found")
+		return nil, err
 	}
 	services, err := m.Projects.ListServices(ctx, projectID)
 	if err != nil {
@@ -67,10 +69,10 @@ func (m *Manager) DiscoverProjectLineage(ctx context.Context, projectID string) 
 	for _, service := range services {
 		records = append(records, m.discoverService(ctx, project, service, containers[service.Name]))
 	}
-	if err := m.Repository.ReplaceProject(ctx, projectID, records); err != nil {
+	if err := m.Repository.ReplaceProjectInScope(ctx, m.Scope, projectID, records); err != nil {
 		return nil, apperror.Wrap(apperror.Internal, "Persist project lineage failed", err)
 	}
-	persisted, err := m.Repository.ListProject(ctx, projectID)
+	persisted, err := m.Repository.ListProjectInScope(ctx, m.Scope, projectID)
 	if err != nil {
 		return nil, apperror.Wrap(apperror.Internal, "Load project lineage failed", err)
 	}
@@ -78,10 +80,13 @@ func (m *Manager) DiscoverProjectLineage(ctx context.Context, projectID string) 
 }
 
 func (m *Manager) GetProjectLineage(ctx context.Context, projectID string) ([]models.ImageLineage, error) {
-	if m == nil || m.Repository == nil {
+	if m == nil || m.Repository == nil || m.Projects == nil || !m.Scope.Valid() {
 		return nil, apperror.New(apperror.ProviderNotReady, "Image lineage manager is not ready")
 	}
-	records, err := m.Repository.ListProject(ctx, projectID)
+	if _, err := m.projectInScope(ctx, projectID); err != nil {
+		return nil, err
+	}
+	records, err := m.Repository.ListProjectInScope(ctx, m.Scope, projectID)
 	if err != nil {
 		return nil, apperror.Wrap(apperror.Internal, "Load project lineage failed", err)
 	}
@@ -89,10 +94,13 @@ func (m *Manager) GetProjectLineage(ctx context.Context, projectID string) ([]mo
 }
 
 func (m *Manager) GetServiceLineage(ctx context.Context, projectID string, service string) (*models.ImageLineage, error) {
-	if m == nil || m.Repository == nil {
+	if m == nil || m.Repository == nil || m.Projects == nil || !m.Scope.Valid() {
 		return nil, apperror.New(apperror.ProviderNotReady, "Image lineage manager is not ready")
 	}
-	record, err := m.Repository.GetService(ctx, projectID, service)
+	if _, err := m.projectInScope(ctx, projectID); err != nil {
+		return nil, err
+	}
+	record, err := m.Repository.GetServiceInScope(ctx, m.Scope, projectID, service)
 	if err != nil {
 		if store.IsStoreNotFound(err) {
 			return nil, nil
@@ -104,15 +112,18 @@ func (m *Manager) GetServiceLineage(ctx context.Context, projectID string, servi
 }
 
 func (m *Manager) GetContainerLineage(ctx context.Context, containerID string) (*models.ImageLineage, error) {
-	if m == nil || m.Repository == nil {
+	if m == nil || m.Repository == nil || m.Projects == nil || !m.Scope.Valid() {
 		return nil, apperror.New(apperror.ProviderNotReady, "Image lineage manager is not ready")
 	}
-	record, err := m.Repository.GetContainer(ctx, containerID)
+	record, err := m.Repository.GetContainerInScope(ctx, m.Scope, containerID)
 	if err != nil {
 		if store.IsStoreNotFound(err) {
 			return nil, nil
 		}
 		return nil, apperror.Wrap(apperror.Internal, "Load container lineage failed", err)
+	}
+	if _, err := m.projectInScope(ctx, record.ProjectID); err != nil {
+		return nil, err
 	}
 	model := record.ToModel()
 	return &model, nil
@@ -122,9 +133,9 @@ func (m *Manager) RefreshServiceLineage(ctx context.Context, projectID string, s
 	if m == nil || m.Projects == nil || m.Repository == nil {
 		return nil, apperror.New(apperror.ProviderNotReady, "Image lineage manager is not ready")
 	}
-	project, err := m.Projects.Get(ctx, projectID)
+	project, err := m.projectInScope(ctx, projectID)
 	if err != nil {
-		return nil, mapLineageStoreError(err, "Project was not found")
+		return nil, err
 	}
 	services, err := m.Projects.ListServices(ctx, projectID)
 	if err != nil {
@@ -135,10 +146,10 @@ func (m *Manager) RefreshServiceLineage(ctx context.Context, projectID string, s
 			continue
 		}
 		record := m.discoverService(ctx, project, service, m.containersByService(ctx, project)[service.Name])
-		if err := m.Repository.ReplaceService(ctx, projectID, serviceName, record); err != nil {
+		if err := m.Repository.ReplaceServiceInScope(ctx, m.Scope, projectID, serviceName, record); err != nil {
 			return nil, apperror.Wrap(apperror.Internal, "Persist service lineage failed", err)
 		}
-		persisted, err := m.Repository.GetService(ctx, projectID, serviceName)
+		persisted, err := m.Repository.GetServiceInScope(ctx, m.Scope, projectID, serviceName)
 		if err != nil {
 			return nil, apperror.Wrap(apperror.Internal, "Load service lineage failed", err)
 		}
@@ -148,10 +159,22 @@ func (m *Manager) RefreshServiceLineage(ctx context.Context, projectID string, s
 	return nil, apperror.New(apperror.NotFound, "Service was not found", apperror.WithDetail(serviceName))
 }
 
+func (m *Manager) projectInScope(ctx context.Context, projectID string) (store.ProjectRecord, error) {
+	if m == nil || m.Projects == nil || !m.Scope.Valid() {
+		return store.ProjectRecord{}, apperror.New(apperror.ProviderNotReady, "Image lineage manager is not ready")
+	}
+	project, err := m.Projects.GetInScope(ctx, m.Scope, projectID)
+	if err != nil {
+		return store.ProjectRecord{}, mapLineageStoreError(err, "Project was not found")
+	}
+	return project, nil
+}
+
 func (m *Manager) discoverService(ctx context.Context, project store.ProjectRecord, service store.ServiceRecord, container *store.ContainerCacheRecord) store.LineageRecord {
 	now := m.now()
 	record := store.LineageRecord{
 		ProviderID:      project.ProviderID,
+		ContextName:     project.ContextName,
 		ProjectID:       project.ID,
 		ServiceID:       service.ID,
 		ServiceName:     service.Name,
@@ -346,7 +369,7 @@ func (m *Manager) containersByService(ctx context.Context, project store.Project
 	if m.Objects == nil || project.ProviderID == "" {
 		return result
 	}
-	records, err := m.Objects.ListContainers(ctx, project.ProviderID)
+	records, err := m.Objects.ListContainersScoped(ctx, m.Scope)
 	if err != nil {
 		return result
 	}

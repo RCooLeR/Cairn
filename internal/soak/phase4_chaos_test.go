@@ -23,6 +23,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/metrics"
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/store"
 )
 
@@ -89,6 +90,7 @@ func TestPhase4ProviderChaos(t *testing.T) {
 	})
 	defer logManager.StopAll()
 	metricsManager := metrics.NewManager(client, db.Metrics(), db.Projects(), db.Audit(), eventBus, metrics.Options{
+		Scope:              runtimescope.Must("linux_native", "default"),
 		VisibleInterval:    time.Second,
 		BackgroundInterval: 2 * time.Second,
 		PublishInterval:    time.Second,

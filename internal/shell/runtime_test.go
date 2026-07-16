@@ -5,8 +5,20 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/RCooLeR/Cairn/internal/providers"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/services"
 )
+
+type runtimeCleanupProvider struct {
+	providers.PlatformProvider
+	closed int
+}
+
+func (p *runtimeCleanupProvider) CloseRuntime() error {
+	p.closed++
+	return nil
+}
 
 func TestNewAppRuntimeUsesNamedConfigAndStoppedState(t *testing.T) {
 	runtimeMu := &sync.RWMutex{}
@@ -36,9 +48,8 @@ func TestNewAppRuntimeUsesNamedConfigAndStoppedState(t *testing.T) {
 func TestAppRuntimeNilProviderClearsServicesAndReturnsStopped(t *testing.T) {
 	runtimeMu := &sync.RWMutex{}
 	projectService := &services.ProjectService{
-		RuntimeMu:   runtimeMu,
-		ProviderID:  "old-provider",
-		ContextName: "old-context",
+		RuntimeMu: runtimeMu,
+		Scope:     runtimescope.Must("old-provider", "old-context"),
 	}
 	runtimeController := newAppRuntime(appRuntimeConfig{
 		RootCtx:            context.Background(),
@@ -65,7 +76,15 @@ func TestAppRuntimeNilProviderClearsServicesAndReturnsStopped(t *testing.T) {
 	if runtimeController.state != runtimeStateStopped {
 		t.Fatalf("runtime state = %q, want %q", runtimeController.state, runtimeStateStopped)
 	}
-	if projectService.ProviderID != "" || projectService.ContextName != "" {
-		t.Fatalf("project service not cleared: provider=%q context=%q", projectService.ProviderID, projectService.ContextName)
+	if projectService.Scope.Valid() {
+		t.Fatalf("project service scope was not cleared: %q/%q", projectService.Scope.ProviderID(), projectService.Scope.ContextName())
+	}
+}
+
+func TestRuntimeHandlesStopClosesRuntimeProviderSnapshot(t *testing.T) {
+	provider := &runtimeCleanupProvider{}
+	runtimeHandles{provider: provider}.stop()
+	if provider.closed != 1 {
+		t.Fatalf("CloseRuntime() calls = %d, want 1", provider.closed)
 	}
 }

@@ -22,6 +22,7 @@ import (
 	composecore "github.com/RCooLeR/Cairn/internal/compose"
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/store"
 )
@@ -1215,6 +1216,33 @@ func TestDockerServiceObjectCreationAudits(t *testing.T) {
 	}
 }
 
+func TestDockerServicePreservesRunImagePartialResourceID(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	client := newFakeDockerClient()
+	service := &DockerService{Client: client}
+	req := models.RunImageRequest{ImageRef: "alpine:latest", Name: "partial"}
+	plan, err := service.PlanRunImage(ctx, req)
+	if err != nil {
+		t.Fatalf("PlanRunImage() error = %v", err)
+	}
+	client.runImageID = "container-partial"
+	client.runImageErr = apperror.New(
+		apperror.Timeout,
+		"Container start outcome requires reconciliation",
+		apperror.WithPartialResource("container", client.runImageID, "unknown", true),
+	)
+
+	id, err := service.ApplyRunImagePlan(ctx, plan.PlanID, "")
+	if id != client.runImageID || !apperror.IsCode(err, apperror.Timeout) {
+		t.Fatalf("ApplyRunImagePlan() = id %q, error %v", id, err)
+	}
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) || appErr.Partial == nil || appErr.Partial.ID != client.runImageID {
+		t.Fatalf("ApplyRunImagePlan() error = %#v, want structured partial resource", appErr)
+	}
+}
+
 func TestDockerServiceRunImageRequiresPlan(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -1450,10 +1478,10 @@ func TestProjectServiceImportProject(t *testing.T) {
 		Stdout: "services:\n  app:\n    image: nginx:alpine\n  db:\n    image: postgres:16-alpine\n",
 	}
 	service := &ProjectService{
-		Client:     composecore.NewClient(runner),
-		Projects:   db.Projects(),
-		ProviderID: "linux_native",
-		Now:        func() time.Time { return time.Date(2026, 6, 13, 6, 0, 0, 0, time.UTC) },
+		Client:   composecore.NewClient(runner),
+		Projects: db.Projects(),
+		Scope:    runtimescope.Must("linux_native", "default"),
+		Now:      func() time.Time { return time.Date(2026, 6, 13, 6, 0, 0, 0, time.UTC) },
 	}
 
 	detail, err := service.ImportProject(ctx, models.ImportProjectRequest{FolderPath: root})
@@ -1487,9 +1515,9 @@ func TestProjectServiceReviewImportProjectIsSaveOnly(t *testing.T) {
 		Stdout: "services:\n  app:\n    image: nginx:alpine\n",
 	}
 	service := &ProjectService{
-		Client:     composecore.NewClient(runner),
-		Projects:   db.Projects(),
-		ProviderID: "linux_native",
+		Client:   composecore.NewClient(runner),
+		Projects: db.Projects(),
+		Scope:    runtimescope.Must("linux_native", "default"),
 	}
 
 	review, err := service.ReviewImportProject(ctx, models.ImportProjectRequest{FolderPath: root})
@@ -1514,9 +1542,9 @@ func TestProjectServiceImportProjectDoesNotInvokeComposeUp(t *testing.T) {
 	}
 	runner.errors[root+"|-f "+composeFile+" up -d"] = errors.New("nvidia runtime is not available")
 	service := &ProjectService{
-		Client:     composecore.NewClient(runner),
-		Projects:   db.Projects(),
-		ProviderID: "linux_native",
+		Client:   composecore.NewClient(runner),
+		Projects: db.Projects(),
+		Scope:    runtimescope.Must("linux_native", "default"),
 	}
 
 	detail, err := service.ImportProject(ctx, models.ImportProjectRequest{FolderPath: root})
@@ -1544,13 +1572,16 @@ func TestProjectServiceListProjectsScopesToActiveBackendContext(t *testing.T) {
 	now := time.Date(2026, 6, 15, 10, 0, 0, 0, time.UTC)
 	projects := db.Projects()
 
-	if err := projects.SaveSnapshot(ctx, "windows_wsl_ubuntu", []store.ProjectRecord{{
+	if err := projects.SaveSnapshot(ctx, runtimescope.Must("windows_wsl_ubuntu", "wsl:Ubuntu"), []store.ProjectRecord{{
 		ID:          "windows_wsl_ubuntu/ubuntu-app",
 		ProviderID:  "windows_wsl_ubuntu",
 		ContextName: "wsl:Ubuntu",
 		Name:        "ubuntu-app",
 		LastSeenAt:  now,
-	}, {
+	}}, nil, now, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot Ubuntu error = %v", err)
+	}
+	if err := projects.SaveSnapshot(ctx, runtimescope.Must("windows_wsl_ubuntu", "wsl:cairn-dev"), []store.ProjectRecord{{
 		ID:          "windows_wsl_ubuntu/cairn-app",
 		ProviderID:  "windows_wsl_ubuntu",
 		ContextName: "wsl:cairn-dev",
@@ -1559,19 +1590,19 @@ func TestProjectServiceListProjectsScopesToActiveBackendContext(t *testing.T) {
 	}}, nil, now, time.Time{}); err != nil {
 		t.Fatalf("SaveSnapshot windows error = %v", err)
 	}
-	if err := projects.SaveSnapshot(ctx, "linux_native", []store.ProjectRecord{{
-		ID:         "linux_native/linux-app",
-		ProviderID: "linux_native",
-		Name:       "linux-app",
-		LastSeenAt: now,
+	if err := projects.SaveSnapshot(ctx, runtimescope.Must("linux_native", "default"), []store.ProjectRecord{{
+		ID:          "linux_native/linux-app",
+		ProviderID:  "linux_native",
+		ContextName: "default",
+		Name:        "linux-app",
+		LastSeenAt:  now,
 	}}, nil, now, time.Time{}); err != nil {
 		t.Fatalf("SaveSnapshot linux error = %v", err)
 	}
 
 	service := &ProjectService{
-		Projects:    projects,
-		ProviderID:  "windows_wsl_ubuntu",
-		ContextName: "wsl:cairn-dev",
+		Projects: projects,
+		Scope:    runtimescope.Must("windows_wsl_ubuntu", "wsl:cairn-dev"),
 	}
 	summaries, err := service.ListProjects(ctx)
 	if err != nil {
@@ -1585,12 +1616,88 @@ func TestProjectServiceListProjectsScopesToActiveBackendContext(t *testing.T) {
 	}
 }
 
+func TestProjectServiceGetProjectRejectsMissingRuntimeScope(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	service := &ProjectService{Projects: db.Projects()}
+
+	if _, err := service.GetProject(ctx, "linux_native/app"); !apperror.IsCode(err, apperror.ProviderNotReady) {
+		t.Fatalf("GetProject() error = %v, want %s", err, apperror.ProviderNotReady)
+	}
+}
+
+func TestComposeServiceRejectsForeignRuntimeScopeBeforeRunner(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	root, composeFile := writeServiceComposeProject(t, "foreign")
+	now := time.Date(2026, 6, 15, 10, 30, 0, 0, time.UTC)
+	foreignScope := runtimescope.Must("linux_native", "socket:foreign")
+	projectID := "linux_native/foreign"
+	if err := db.Projects().SaveSnapshot(ctx, foreignScope, []store.ProjectRecord{{
+		ID: projectID, ProviderID: "linux_native", ContextName: foreignScope.ContextName(), Name: "foreign",
+		WorkingDir: root, ComposeFiles: []string{composeFile}, LastSeenAt: now,
+	}}, []store.ServiceRecord{{ID: projectID + "/app", ProjectID: projectID, Name: "app", ImageRef: "nginx", LastSeenAt: now}}, now, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot(foreign) error = %v", err)
+	}
+	runner := newFakeComposeRunner()
+	service := &ComposeService{
+		Client:   composecore.NewClient(runner),
+		Projects: db.Projects(),
+		Scope:    runtimescope.Must("linux_native", "default"),
+	}
+	if _, err := service.Config(ctx, projectID); !apperror.IsCode(err, apperror.NotFound) {
+		t.Fatalf("Config(foreign) error = %v, want not found", err)
+	}
+	if _, err := service.Ps(ctx, projectID); !apperror.IsCode(err, apperror.NotFound) {
+		t.Fatalf("Ps(foreign) error = %v, want not found", err)
+	}
+	if err := service.StartServices(ctx, projectID, []string{"app"}); !apperror.IsCode(err, apperror.NotFound) {
+		t.Fatalf("StartServices(foreign) error = %v, want not found", err)
+	}
+	if calls := runner.callsSnapshot(); len(calls) != 0 {
+		t.Fatalf("Compose runner called for foreign project: %#v", calls)
+	}
+}
+
+func TestProjectServiceApplyPlanRevalidatesRuntimeScope(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	root, composeFile := writeServiceComposeProject(t, "revalidate")
+	now := time.Date(2026, 6, 15, 10, 45, 0, 0, time.UTC)
+	scope := runtimescope.Must("linux_native", "default")
+	projectID := "linux_native/revalidate"
+	if err := db.Projects().SaveSnapshot(ctx, scope, []store.ProjectRecord{{
+		ID: projectID, ProviderID: "linux_native", ContextName: scope.ContextName(), Name: "revalidate",
+		WorkingDir: root, ComposeFiles: []string{composeFile}, LastSeenAt: now,
+	}}, nil, now, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot() error = %v", err)
+	}
+	runner := newFakeComposeRunner()
+	service := &ProjectService{
+		Client:   composecore.NewClient(runner),
+		Projects: db.Projects(),
+		Plans:    security.NewProjectPlanStore(nil),
+		Scope:    scope,
+	}
+	plan, err := service.PlanDownProject(ctx, projectID, false)
+	if err != nil {
+		t.Fatalf("PlanDownProject() error = %v", err)
+	}
+	service.Scope = runtimescope.Must("linux_native", "socket:other")
+	if err := service.ApplyProjectPlan(ctx, plan.PlanID, "revalidate"); !apperror.IsCode(err, apperror.NotFound) {
+		t.Fatalf("ApplyProjectPlan(after scope change) error = %v, want not found", err)
+	}
+	if calls := runner.callsSnapshot(); len(calls) != 0 {
+		t.Fatalf("Compose runner called after scope change: %#v", calls)
+	}
+}
+
 func TestProjectServiceRemoveProjectFromListUsesStoreOnly(t *testing.T) {
 	ctx := context.Background()
 	db := openServiceTestStore(t)
 	now := time.Date(2026, 6, 15, 11, 30, 0, 0, time.UTC)
 	projects := db.Projects()
-	if err := projects.SaveSnapshot(ctx, "windows_wsl_ubuntu", []store.ProjectRecord{{
+	if err := projects.SaveSnapshot(ctx, runtimescope.Must("windows_wsl_ubuntu", "wsl:cairn-dev"), []store.ProjectRecord{{
 		ID:          "windows_wsl_ubuntu/cairn-app",
 		ProviderID:  "windows_wsl_ubuntu",
 		ContextName: "wsl:cairn-dev",
@@ -1611,11 +1718,10 @@ func TestProjectServiceRemoveProjectFromListUsesStoreOnly(t *testing.T) {
 	defer cancelEvents()
 	events := eventBus.Subscribe(eventCtx, bus.TopicProjectChanged, 1)
 	service := &ProjectService{
-		Projects:    projects,
-		Audit:       db.Audit(),
-		Events:      eventBus,
-		ProviderID:  "windows_wsl_ubuntu",
-		ContextName: "wsl:cairn-dev",
+		Projects: projects,
+		Audit:    db.Audit(),
+		Events:   eventBus,
+		Scope:    runtimescope.Must("windows_wsl_ubuntu", "wsl:cairn-dev"),
 	}
 
 	if err := service.RemoveProjectFromList(ctx, "windows_wsl_ubuntu/cairn-app"); err != nil {
@@ -1652,7 +1758,7 @@ func TestProjectServiceMissingWorkdirStopAndDownUseProjectContainers(t *testing.
 		Source:      store.ProjectSourceLabels,
 		LastSeenAt:  now,
 	}
-	if err := db.Projects().SaveSnapshot(ctx, "linux_native", []store.ProjectRecord{project}, []store.ServiceRecord{{
+	if err := db.Projects().SaveSnapshot(ctx, runtimescope.Must("linux_native", "default"), []store.ProjectRecord{project}, []store.ServiceRecord{{
 		ID:         "linux_native/stale/web",
 		ProjectID:  project.ID,
 		Name:       "web",
@@ -1667,12 +1773,12 @@ func TestProjectServiceMissingWorkdirStopAndDownUseProjectContainers(t *testing.
 	docker.container.ProjectID = project.ID
 	docker.container.State = "running"
 	service := &ProjectService{
-		Client:     composecore.NewClient(newFakeComposeRunner()),
-		Docker:     docker,
-		Projects:   db.Projects(),
-		Audit:      db.Audit(),
-		Plans:      security.NewProjectPlanStore(nil),
-		ProviderID: "linux_native",
+		Client:   composecore.NewClient(newFakeComposeRunner()),
+		Docker:   docker,
+		Projects: db.Projects(),
+		Audit:    db.Audit(),
+		Plans:    security.NewProjectPlanStore(nil),
+		Scope:    runtimescope.Must("linux_native", "default"),
 	}
 
 	if err := service.StopProject(ctx, project.ID); err != nil {
@@ -1707,18 +1813,18 @@ func TestProjectServiceGetProjectIncludesDetailPayload(t *testing.T) {
 		Stdout: resolvedConfig,
 	}
 	service := &ProjectService{
-		Client:     composecore.NewClient(runner),
-		Projects:   db.Projects(),
-		Objects:    db.Objects(),
-		ProviderID: "linux_native",
-		Now:        func() time.Time { return time.Date(2026, 6, 13, 6, 0, 0, 0, time.UTC) },
+		Client:   composecore.NewClient(runner),
+		Projects: db.Projects(),
+		Objects:  db.Objects(),
+		Scope:    runtimescope.Must("linux_native", "default"),
+		Now:      func() time.Time { return time.Date(2026, 6, 13, 6, 0, 0, 0, time.UTC) },
 	}
 
 	imported, err := service.ImportProject(ctx, models.ImportProjectRequest{FolderPath: root})
 	if err != nil {
 		t.Fatalf("ImportProject() error = %v", err)
 	}
-	if err := db.Objects().SaveContainers(ctx, "linux_native", []store.ContainerCacheRecord{
+	if err := db.Objects().SaveContainersScoped(ctx, runtimescope.Must("linux_native", "default"), []store.ContainerCacheRecord{
 		{
 			Summary: models.ContainerSummary{
 				ID:        "container-app",
@@ -1792,9 +1898,9 @@ func TestProjectServiceGetProjectIncludesDetailPayload(t *testing.T) {
 func TestProjectServiceImportProjectInvalidFolder(t *testing.T) {
 	db := openServiceTestStore(t)
 	service := &ProjectService{
-		Client:     composecore.NewClient(newFakeComposeRunner()),
-		Projects:   db.Projects(),
-		ProviderID: "linux_native",
+		Client:   composecore.NewClient(newFakeComposeRunner()),
+		Projects: db.Projects(),
+		Scope:    runtimescope.Must("linux_native", "default"),
 	}
 
 	_, err := service.ImportProject(context.Background(), models.ImportProjectRequest{FolderPath: t.TempDir()})
@@ -1815,12 +1921,12 @@ func TestProjectServiceStartProjectAuditsAndPublishesProgress(t *testing.T) {
 	eventBus := bus.New()
 	defer eventBus.Close()
 	service := &ProjectService{
-		Client:     composecore.NewClient(runner),
-		Projects:   db.Projects(),
-		Audit:      db.Audit(),
-		Events:     eventBus,
-		ProviderID: "linux_native",
-		Now:        func() time.Time { return time.Date(2026, 6, 13, 6, 0, 0, 0, time.UTC) },
+		Client:   composecore.NewClient(runner),
+		Projects: db.Projects(),
+		Audit:    db.Audit(),
+		Events:   eventBus,
+		Scope:    runtimescope.Must("linux_native", "default"),
+		Now:      func() time.Time { return time.Date(2026, 6, 13, 6, 0, 0, 0, time.UTC) },
 	}
 	detail, err := service.ImportProject(ctx, models.ImportProjectRequest{FolderPath: root})
 	if err != nil {
@@ -1866,6 +1972,7 @@ func TestProjectServicePullBuildsLocalBuildServices(t *testing.T) {
 	project := store.ProjectRecord{
 		ID:           "linux_native/mixed-build",
 		ProviderID:   "linux_native",
+		ContextName:  "default",
 		Name:         "mixed-build",
 		WorkingDir:   root,
 		ComposeFiles: []string{composeFile},
@@ -1904,16 +2011,16 @@ func TestProjectServicePullBuildsLocalBuildServices(t *testing.T) {
 			LastSeenAt: now,
 		},
 	}
-	if err := db.Projects().SaveSnapshot(ctx, "linux_native", []store.ProjectRecord{project}, services, now, time.Time{}); err != nil {
+	if err := db.Projects().SaveSnapshot(ctx, runtimescope.Must("linux_native", "default"), []store.ProjectRecord{project}, services, now, time.Time{}); err != nil {
 		t.Fatalf("SaveSnapshot() error = %v", err)
 	}
 	runner := newFakeComposeRunner()
 	runner.outputs[root+"|-f "+composeFile+" pull db web"] = providers.CommandResult{Stdout: "registry images pulled\n"}
 	runner.outputs[root+"|-f "+composeFile+" build --pull build-a build-b"] = providers.CommandResult{Stdout: "local images built\n"}
 	service := &ProjectService{
-		Client:     composecore.NewClient(runner),
-		Projects:   db.Projects(),
-		ProviderID: "linux_native",
+		Client:   composecore.NewClient(runner),
+		Projects: db.Projects(),
+		Scope:    runtimescope.Must("linux_native", "default"),
 	}
 
 	if err := service.PullProject(ctx, project.ID); err != nil {
@@ -1940,11 +2047,11 @@ func TestProjectServicePlanDownWithVolumesRequiresTypedName(t *testing.T) {
 	}
 	runner.outputs[root+"|-f "+composeFile+" down --volumes"] = providers.CommandResult{Stdout: "removed\n"}
 	service := &ProjectService{
-		Client:     composecore.NewClient(runner),
-		Projects:   db.Projects(),
-		Audit:      db.Audit(),
-		ProviderID: "linux_native",
-		Now:        func() time.Time { return time.Date(2026, 6, 13, 6, 0, 0, 0, time.UTC) },
+		Client:   composecore.NewClient(runner),
+		Projects: db.Projects(),
+		Audit:    db.Audit(),
+		Scope:    runtimescope.Must("linux_native", "default"),
+		Now:      func() time.Time { return time.Date(2026, 6, 13, 6, 0, 0, 0, time.UTC) },
 	}
 	detail, err := service.ImportProject(ctx, models.ImportProjectRequest{FolderPath: root})
 	if err != nil {
@@ -1982,9 +2089,9 @@ func TestProjectServiceLifecycleWorkdirMissing(t *testing.T) {
 		Stdout: "services:\n  app:\n    image: nginx:alpine\n",
 	}
 	service := &ProjectService{
-		Client:     composecore.NewClient(runner),
-		Projects:   db.Projects(),
-		ProviderID: "linux_native",
+		Client:   composecore.NewClient(runner),
+		Projects: db.Projects(),
+		Scope:    runtimescope.Must("linux_native", "default"),
 	}
 	detail, err := service.ImportProject(ctx, models.ImportProjectRequest{FolderPath: root})
 	if err != nil {
@@ -2011,7 +2118,7 @@ func TestProjectServiceLifecycleMapsBackendPaths(t *testing.T) {
 	backendWorkdir := "/mnt/e/Development/project"
 	backendFile := "/mnt/e/Development/project/compose.yaml"
 	now := time.Date(2026, 6, 13, 6, 30, 0, 0, time.UTC)
-	if err := db.Projects().SaveSnapshot(ctx, "windows_wsl_ubuntu", []store.ProjectRecord{{
+	if err := db.Projects().SaveSnapshot(ctx, runtimescope.Must("windows_wsl_ubuntu", "wsl:cairn-dev"), []store.ProjectRecord{{
 		ID:           "windows_wsl_ubuntu/demo",
 		ProviderID:   "windows_wsl_ubuntu",
 		ContextName:  "wsl:cairn-dev",
@@ -2030,11 +2137,10 @@ func TestProjectServiceLifecycleMapsBackendPaths(t *testing.T) {
 	runner.hostToBackend[hostWorkdir] = backendWorkdir
 	runner.hostToBackend[hostFile] = backendFile
 	service := &ProjectService{
-		Client:      composecore.NewClient(runner),
-		PathMapper:  runner,
-		Projects:    db.Projects(),
-		ProviderID:  "windows_wsl_ubuntu",
-		ContextName: "wsl:cairn-dev",
+		Client:     composecore.NewClient(runner),
+		PathMapper: runner,
+		Projects:   db.Projects(),
+		Scope:      runtimescope.Must("windows_wsl_ubuntu", "wsl:cairn-dev"),
 	}
 
 	if err := service.StartProject(ctx, "windows_wsl_ubuntu/demo"); err != nil {
@@ -2057,6 +2163,8 @@ type fakeDockerClient struct {
 	removed         []string
 	renamed         []string
 	runImages       []models.RunImageRequest
+	runImageID      string
+	runImageErr     error
 	pulled          []string
 	tagged          []string
 	pushed          []string
@@ -2177,6 +2285,9 @@ func (f *fakeDockerClient) RenameContainer(_ context.Context, id string, name st
 
 func (f *fakeDockerClient) RunImage(_ context.Context, req models.RunImageRequest) (string, error) {
 	f.runImages = append(f.runImages, req)
+	if f.runImageID != "" || f.runImageErr != nil {
+		return f.runImageID, f.runImageErr
+	}
 	return "container-created", nil
 }
 
@@ -2504,10 +2615,10 @@ func importAgentTestProject(t *testing.T, ctx context.Context, db *store.Store) 
 		Stdout: "services:\n  app:\n    image: nginx:alpine\n    ports:\n      - \"8080:80\"\n",
 	}
 	service := &ProjectService{
-		Client:     composecore.NewClient(runner),
-		Projects:   db.Projects(),
-		ProviderID: "linux_native",
-		Now:        func() time.Time { return time.Date(2026, 6, 13, 6, 0, 0, 0, time.UTC) },
+		Client:   composecore.NewClient(runner),
+		Projects: db.Projects(),
+		Scope:    runtimescope.Must("linux_native", "default"),
+		Now:      func() time.Time { return time.Date(2026, 6, 13, 6, 0, 0, 0, time.UTC) },
 	}
 	detail, err := service.ImportProject(ctx, models.ImportProjectRequest{FolderPath: root})
 	if err != nil {

@@ -167,6 +167,14 @@ export type ParsedAppError = {
   title: string;
   body: string;
   detail?: string;
+  partial?: PartialResourceError;
+};
+
+export type PartialResourceError = {
+  type: string;
+  id: string;
+  state?: string;
+  cleanupRequired: boolean;
 };
 
 export function appErrorPresentation(code: AppErrorCode): AppErrorPresentation {
@@ -188,12 +196,14 @@ export function parseAppErrorText(text: string): ParsedAppError {
       title: presentation.title,
       body: cleanAppErrorMessage(structured.message ?? raw, code),
       detail: structured.detail,
+      partial: structured.partial,
     };
   }
   return {
     title: "Action failed",
     body: structured.message ?? raw,
     detail: structured.detail,
+    partial: structured.partial,
   };
 }
 
@@ -201,33 +211,61 @@ function parseStructuredAppError(text: string): {
   code?: AppErrorCode;
   message?: string;
   detail?: string;
+  partial?: PartialResourceError;
 } {
   if (!text.startsWith("{")) {
     return {};
   }
   try {
-    const parsed = JSON.parse(text) as {
-      message?: unknown;
-      cause?: { code?: unknown; message?: unknown; detail?: unknown };
-    };
-    const causeCode =
-      typeof parsed.cause?.code === "string" ? parsed.cause.code : "";
+    const parsed = JSON.parse(text) as Record<string, unknown>;
+    const cause = isRecord(parsed.cause) ? parsed.cause : undefined;
+    const payload = cause ?? parsed;
+    const causeCode = typeof payload.code === "string" ? payload.code : "";
     const message =
-      typeof parsed.cause?.message === "string"
-        ? parsed.cause.message
+      typeof payload.message === "string"
+        ? payload.message
         : typeof parsed.message === "string"
           ? parsed.message
           : undefined;
     const detail =
-      typeof parsed.cause?.detail === "string" ? parsed.cause.detail : "";
+      typeof payload.detail === "string"
+        ? payload.detail
+        : typeof parsed.detail === "string"
+          ? parsed.detail
+          : "";
     return {
       code: isAppErrorCode(causeCode) ? causeCode : undefined,
       message,
       detail: detail.trim() || undefined,
+      partial: parsePartialResource(payload.partial ?? parsed.partial),
     };
   } catch {
     return {};
   }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parsePartialResource(
+  value: unknown,
+): PartialResourceError | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+  const type = typeof value.type === "string" ? value.type.trim() : "";
+  const id = typeof value.id === "string" ? value.id.trim() : "";
+  if (!type || !id) {
+    return undefined;
+  }
+  const state = typeof value.state === "string" ? value.state.trim() : "";
+  return {
+    type,
+    id,
+    state: state || undefined,
+    cleanupRequired: value.cleanupRequired === true,
+  };
 }
 
 function codeFromMessage(message: string): AppErrorCode | undefined {
