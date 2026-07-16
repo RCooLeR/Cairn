@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -27,6 +28,18 @@ type commandStdioConn struct {
 	readMu sync.Mutex
 	peeked bool
 	err    error
+
+	deadlineMu              sync.Mutex
+	readDeadline            time.Time
+	writeDeadline           time.Time
+	readDeadlineTimer       *time.Timer
+	writeDeadlineTimer      *time.Timer
+	readDeadlineGeneration  uint64
+	writeDeadlineGeneration uint64
+	readTimedOut            bool
+	writeTimedOut           bool
+	closed                  bool
+	forceClose              bool
 }
 
 type commandAddr string
@@ -81,6 +94,9 @@ func dialCommandStdio(ctx context.Context, command []string) (net.Conn, error) {
 }
 
 func (c *commandStdioConn) Read(b []byte) (int, error) {
+	if c.operationTimedOut(true) {
+		return 0, os.ErrDeadlineExceeded
+	}
 	n, err := c.stdout.Read(b)
 	if n > 0 && c.shouldValidateFirstRead() {
 		if failure := stdioStartupFailure(b[:n]); failure != nil {
@@ -88,52 +104,63 @@ func (c *commandStdioConn) Read(b []byte) (int, error) {
 			return 0, failure
 		}
 	}
+	if err != nil && c.operationTimedOut(true) {
+		return n, os.ErrDeadlineExceeded
+	}
 	return n, err
 }
 
 func (c *commandStdioConn) abortStartupFailure() error {
-	c.once.Do(func() {
-		_ = c.stdin.Close()
-		_ = c.stdout.Close()
-		if c.cmd != nil && c.cmd.Process != nil {
-			trackStdioForcedKill()
-			_ = c.cmd.Process.Kill()
-		}
-		select {
-		case c.err = <-c.done:
-		case <-time.After(stdioForceCloseTimeout):
-			trackStdioCloseTimeout()
-			c.err = fmt.Errorf("stdio command did not exit after startup failure")
-		}
-	})
-	return c.err
+	return c.close(true, "stdio command did not exit after startup failure")
 }
 
 func (c *commandStdioConn) Write(b []byte) (int, error) {
-	return c.stdin.Write(b)
+	if c.operationTimedOut(false) {
+		return 0, os.ErrDeadlineExceeded
+	}
+	n, err := c.stdin.Write(b)
+	if err != nil && c.operationTimedOut(false) {
+		return n, os.ErrDeadlineExceeded
+	}
+	return n, err
 }
 
 func (c *commandStdioConn) Close() error {
+	return c.close(false, "stdio command did not exit after close")
+}
+
+func (c *commandStdioConn) close(force bool, timeoutMessage string) error {
+	c.requestClose(force)
 	c.once.Do(func() {
+		force := c.forceCloseRequested()
+		if force {
+			c.killProcess()
+		}
 		_ = c.stdin.Close()
 		_ = c.stdout.Close()
-		select {
-		case c.err = <-c.done:
-			return
-		case <-time.After(stdioGracefulCloseTimeout):
-		}
-		if c.cmd != nil && c.cmd.Process != nil {
-			trackStdioForcedKill()
-			_ = c.cmd.Process.Kill()
+		if !force {
+			select {
+			case c.err = <-c.done:
+				return
+			case <-time.After(stdioGracefulCloseTimeout):
+			}
+			c.killProcess()
 		}
 		select {
 		case c.err = <-c.done:
 		case <-time.After(stdioForceCloseTimeout):
 			trackStdioCloseTimeout()
-			c.err = fmt.Errorf("stdio command did not exit after close")
+			c.err = fmt.Errorf("%s", timeoutMessage)
 		}
 	})
 	return c.err
+}
+
+func (c *commandStdioConn) killProcess() {
+	if c.cmd != nil && c.cmd.Process != nil {
+		trackStdioForcedKill()
+		_ = c.cmd.Process.Kill()
+	}
 }
 
 func (c *commandStdioConn) LocalAddr() net.Addr {
@@ -144,16 +171,153 @@ func (c *commandStdioConn) RemoteAddr() net.Addr {
 	return commandAddr("remote")
 }
 
-func (c *commandStdioConn) SetDeadline(time.Time) error {
+// The anonymous pipes owned by a commandStdioConn cannot carry recoverable
+// socket deadlines. Expiration is therefore terminal: it closes both pipes,
+// kills and reaps the child, and reports a timeout from the affected I/O.
+func (c *commandStdioConn) SetDeadline(deadline time.Time) error {
+	return c.setDeadline(deadline, true, true)
+}
+
+func (c *commandStdioConn) SetReadDeadline(deadline time.Time) error {
+	return c.setDeadline(deadline, true, false)
+}
+
+func (c *commandStdioConn) SetWriteDeadline(deadline time.Time) error {
+	return c.setDeadline(deadline, false, true)
+}
+
+func (c *commandStdioConn) setDeadline(deadline time.Time, read, write bool) error {
+	expired := false
+
+	c.deadlineMu.Lock()
+	if c.closed {
+		c.deadlineMu.Unlock()
+		return net.ErrClosed
+	}
+	now := time.Now()
+	if read {
+		c.readDeadlineGeneration++
+		generation := c.readDeadlineGeneration
+		stopTimer(&c.readDeadlineTimer)
+		c.readDeadline = deadline
+		c.readTimedOut = false
+		if !deadline.IsZero() {
+			if !deadline.After(now) {
+				c.readTimedOut = true
+				expired = true
+			} else {
+				c.readDeadlineTimer = time.AfterFunc(deadline.Sub(now), func() {
+					c.expireDeadline(true, generation)
+				})
+			}
+		}
+	}
+	if write {
+		c.writeDeadlineGeneration++
+		generation := c.writeDeadlineGeneration
+		stopTimer(&c.writeDeadlineTimer)
+		c.writeDeadline = deadline
+		c.writeTimedOut = false
+		if !deadline.IsZero() {
+			if !deadline.After(now) {
+				c.writeTimedOut = true
+				expired = true
+			} else {
+				c.writeDeadlineTimer = time.AfterFunc(deadline.Sub(now), func() {
+					c.expireDeadline(false, generation)
+				})
+			}
+		}
+	}
+	expired = expired || deadlineReached(c.readDeadline, now) || deadlineReached(c.writeDeadline, now)
+	if expired {
+		c.readTimedOut = deadlineReached(c.readDeadline, now)
+		c.writeTimedOut = deadlineReached(c.writeDeadline, now)
+		c.closed = true
+		c.forceClose = true
+		c.stopDeadlineTimersLocked()
+	}
+	c.deadlineMu.Unlock()
+
+	if expired {
+		go c.close(true, "stdio command did not exit after deadline")
+	}
 	return nil
 }
 
-func (c *commandStdioConn) SetReadDeadline(time.Time) error {
-	return nil
+func (c *commandStdioConn) expireDeadline(read bool, generation uint64) {
+	now := time.Now()
+	c.deadlineMu.Lock()
+	if c.closed || (read && generation != c.readDeadlineGeneration) || (!read && generation != c.writeDeadlineGeneration) {
+		c.deadlineMu.Unlock()
+		return
+	}
+	readExpired := deadlineReached(c.readDeadline, now)
+	writeExpired := deadlineReached(c.writeDeadline, now)
+	if !readExpired && !writeExpired {
+		// A deadline without a monotonic component can move into the future when
+		// the wall clock changes. Re-arm instead of silently losing the deadline.
+		if read && !c.readDeadline.IsZero() {
+			c.readDeadlineTimer = time.AfterFunc(time.Until(c.readDeadline), func() {
+				c.expireDeadline(true, generation)
+			})
+		} else if !read && !c.writeDeadline.IsZero() {
+			c.writeDeadlineTimer = time.AfterFunc(time.Until(c.writeDeadline), func() {
+				c.expireDeadline(false, generation)
+			})
+		}
+		c.deadlineMu.Unlock()
+		return
+	}
+	c.readTimedOut = readExpired
+	c.writeTimedOut = writeExpired
+	c.closed = true
+	c.forceClose = true
+	c.stopDeadlineTimersLocked()
+	c.deadlineMu.Unlock()
+
+	_ = c.close(true, "stdio command did not exit after deadline")
 }
 
-func (c *commandStdioConn) SetWriteDeadline(time.Time) error {
-	return nil
+func deadlineReached(deadline, now time.Time) bool {
+	return !deadline.IsZero() && !deadline.After(now)
+}
+
+func (c *commandStdioConn) operationTimedOut(read bool) bool {
+	c.deadlineMu.Lock()
+	defer c.deadlineMu.Unlock()
+	if read {
+		return c.readTimedOut
+	}
+	return c.writeTimedOut
+}
+
+func (c *commandStdioConn) requestClose(force bool) {
+	c.deadlineMu.Lock()
+	c.closed = true
+	c.forceClose = c.forceClose || force
+	c.stopDeadlineTimersLocked()
+	c.deadlineMu.Unlock()
+}
+
+func (c *commandStdioConn) forceCloseRequested() bool {
+	c.deadlineMu.Lock()
+	defer c.deadlineMu.Unlock()
+	return c.forceClose
+}
+
+func (c *commandStdioConn) stopDeadlineTimersLocked() {
+	c.readDeadlineGeneration++
+	c.writeDeadlineGeneration++
+	stopTimer(&c.readDeadlineTimer)
+	stopTimer(&c.writeDeadlineTimer)
+}
+
+func stopTimer(timer **time.Timer) {
+	if *timer != nil {
+		(*timer).Stop()
+		*timer = nil
+	}
 }
 
 func (a commandAddr) Network() string {
