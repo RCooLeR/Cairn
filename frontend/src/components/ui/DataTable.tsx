@@ -337,7 +337,7 @@ export function DataTable<T>({
         <table
           aria-label={ariaLabel}
           aria-colcount={columnCount}
-          aria-rowcount={visibleRows.length}
+          aria-rowcount={visibleRows.length + 1}
           className="min-w-full table-fixed text-left text-sm"
           style={{ minWidth: "100%", width: tableWidth }}
         >
@@ -357,7 +357,7 @@ export function DataTable<T>({
             className="sticky top-0 z-10 bg-bg-inset text-xs text-text-muted"
             onContextMenu={openColumnMenu}
           >
-            <tr>
+            <tr aria-rowindex={1}>
               {onToggleRow ? (
                 <th
                   aria-label="Selection"
@@ -466,12 +466,13 @@ export function DataTable<T>({
                 />
               </tr>
             ) : null}
-            {virtualRows.map((row) => {
+            {virtualRows.map((row, rowIndex) => {
               const id = getRowID(row);
               const selected = selectedIDs.has(id);
               const label = rowLabel?.(row) || id;
               return (
                 <tr
+                  aria-rowindex={virtualStart + rowIndex + 2}
                   className={cx(
                     "hover:bg-bg-inset",
                     selected && "bg-accent/10",

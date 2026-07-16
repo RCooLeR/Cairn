@@ -167,7 +167,7 @@ describe("UI kit", () => {
 
     expect(screen.getByRole("table", { name: "Workers" })).toHaveAttribute(
       "aria-rowcount",
-      "2",
+      "3",
     );
     fireEvent.click(
       screen.getByRole("button", { name: "Sort by Name, not sorted" }),
@@ -441,6 +441,48 @@ describe("UI kit", () => {
 
     expect(screen.getByText("Row 0")).toBeInTheDocument();
     expect(screen.queryByText("Row 199")).not.toBeInTheDocument();
+  });
+
+  it("reports absolute row positions inside a virtual window", () => {
+    const rows = Array.from({ length: 200 }, (_, index) => ({
+      id: `row-${index}`,
+      label: `Row ${index}`,
+    }));
+    render(
+      <DataTable
+        ariaLabel="Virtual workers"
+        columns={[
+          {
+            id: "label",
+            header: "Label",
+            render: (row) => row.label,
+          },
+        ]}
+        getRowID={(row) => row.id}
+        rows={rows}
+      />,
+    );
+
+    const table = screen.getByRole("table", { name: "Virtual workers" });
+    expect(table).toHaveAttribute("aria-rowcount", "201");
+    expect(screen.getByRole("columnheader").parentElement).toHaveAttribute(
+      "aria-rowindex",
+      "1",
+    );
+    expect(screen.getByText("Row 0").parentElement).toHaveAttribute(
+      "aria-rowindex",
+      "2",
+    );
+
+    fireEvent.scroll(table.parentElement as HTMLElement, {
+      target: { scrollTop: 4400 },
+    });
+    const visibleCell = screen.getAllByRole("cell")[0];
+    const absoluteIndex = Number(visibleCell.textContent?.replace("Row ", ""));
+    expect(visibleCell.parentElement).toHaveAttribute(
+      "aria-rowindex",
+      String(absoluteIndex + 2),
+    );
   });
 
   it("resets the virtual table window when row sets change", () => {
