@@ -1,13 +1,45 @@
 package providers
 
 import (
-	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
+	"sync"
 	"time"
+)
+
+const (
+	// stdout and stderr are bounded independently. The reserve keeps the
+	// explicit truncation marker inside the advertised per-stream limit.
+	commandOutputLimitBytes       = 64 << 10
+	commandOutputMarkerReserve    = 96
+	commandFailureCauseLimitBytes = 4 << 10
+	commandFailureStreamLimit     = 8 << 10
+	commandFailureDetailLimit     = 24 << 10
+)
+
+var (
+	commandPrivateKeyPattern   = regexp.MustCompile(`(?is)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)`)
+	commandPrivateKeyTail      = regexp.MustCompile(`(?is)^.*?-----END [A-Z0-9 ]*PRIVATE KEY-----`)
+	commandURLSecretPattern    = regexp.MustCompile(`(?i)([a-z][a-z0-9+.-]*://[^/\s:@]+:)[^@\s/]+@`)
+	commandQuotedSecretPattern = regexp.MustCompile(
+		`(?im)((?:^|[^A-Za-z0-9_])["']?(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|auth(?:orization)?|credentials?|private[_-]?key|client[_-]?secret|refresh[_-]?token)["']?\s*[:=]\s*)["'][^\r\n]*`,
+	)
+	commandSecretFlagPattern = regexp.MustCompile(
+		`(?i)(--?(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|auth(?:orization)?|credentials?|private[_-]?key|client[_-]?secret|refresh[_-]?token)(?:=|\s+))(?:["'][^"'\r\n]*["']|[^\s]+)`,
+	)
+	commandAuthorizationPattern  = regexp.MustCompile(`(?i)(\b(?:bearer|basic)\s+)[A-Za-z0-9._~+/=-]+`)
+	commandUnquotedSecretPattern = regexp.MustCompile(
+		`(?im)(\b(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|auth(?:orization)?|credentials?|private[_-]?key|client[_-]?secret|refresh[_-]?token)\b\s*[:=]\s*)[^\r\n]+`,
+	)
+	commandKnownTokenPattern = regexp.MustCompile(
+		`(?i)\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16})\b`,
+	)
+	commandJWTTokenPattern = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`)
 )
 
 type CommandRunner interface {
@@ -54,14 +86,14 @@ func (ExecRunner) RunWithOptions(ctx context.Context, opts CommandRunOptions, na
 	if opts.Stdin != "" {
 		cmd.Stdin = strings.NewReader(opts.Stdin)
 	}
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	stdout := newCommandOutputBuffer(commandOutputLimitBytes)
+	stderr := newCommandOutputBuffer(commandOutputLimitBytes)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 
 	err := cmd.Run()
 	result := &CommandResult{
-		Command:  append([]string{name}, args...),
+		Command:  safeCommandResultCommand(name, args),
 		Workdir:  opts.Workdir,
 		Stdout:   stdout.String(),
 		Stderr:   stderr.String(),
@@ -78,6 +110,77 @@ func (ExecRunner) RunWithOptions(ctx context.Context, opts CommandRunOptions, na
 		result.ExitCode = -1
 	}
 	return result, err
+}
+
+// commandOutputBuffer retains a bounded prefix and suffix while always
+// accepting the full write. This lets the child continue draining both pipes
+// without allowing either stream to grow memory without limit.
+type commandOutputBuffer struct {
+	mu        sync.Mutex
+	head      []byte
+	tail      []byte
+	headLimit int
+	tailLimit int
+	dropped   int64
+}
+
+func newCommandOutputBuffer(limit int) *commandOutputBuffer {
+	payloadLimit := limit - commandOutputMarkerReserve
+	if payloadLimit < 0 {
+		payloadLimit = 0
+	}
+	headLimit := payloadLimit / 2
+	return &commandOutputBuffer{
+		headLimit: headLimit,
+		tailLimit: payloadLimit - headLimit,
+	}
+}
+
+func (b *commandOutputBuffer) Write(p []byte) (int, error) {
+	written := len(p)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	if remaining := b.headLimit - len(b.head); remaining > 0 {
+		if remaining > len(p) {
+			remaining = len(p)
+		}
+		b.head = append(b.head, p[:remaining]...)
+		p = p[remaining:]
+	}
+	if len(p) == 0 {
+		return written, nil
+	}
+	if b.tailLimit == 0 {
+		b.dropped += int64(len(p))
+		return written, nil
+	}
+	if len(p) >= b.tailLimit {
+		b.dropped += int64(len(b.tail) + len(p) - b.tailLimit)
+		b.tail = append(b.tail[:0], p[len(p)-b.tailLimit:]...)
+		return written, nil
+	}
+	overflow := len(b.tail) + len(p) - b.tailLimit
+	if overflow > 0 {
+		b.dropped += int64(overflow)
+		copy(b.tail, b.tail[overflow:])
+		b.tail = b.tail[:len(b.tail)-overflow]
+	}
+	b.tail = append(b.tail, p...)
+	return written, nil
+}
+
+func (b *commandOutputBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.dropped == 0 {
+		return string(b.head) + string(b.tail)
+	}
+	return string(b.head) + commandOutputTruncationMarker(b.dropped) + string(b.tail)
+}
+
+func commandOutputTruncationMarker(dropped int64) string {
+	return fmt.Sprintf("...[Cairn truncated %d bytes]...", dropped)
 }
 
 func mergeEnv(base []string, overrides []string) []string {
@@ -110,15 +213,85 @@ func mergeEnv(base []string, overrides []string) []string {
 func commandFailureDetail(result *CommandResult, err error) string {
 	parts := []string{}
 	if err != nil {
-		parts = append(parts, err.Error())
+		if cause := safeCommandFailureText(err.Error(), commandFailureCauseLimitBytes); cause != "" {
+			parts = append(parts, cause)
+		}
 	}
 	if result != nil {
-		if stdout := strings.TrimSpace(result.Stdout); stdout != "" {
+		if stdout := safeCommandFailureText(result.Stdout, commandFailureStreamLimit); stdout != "" {
 			parts = append(parts, "stdout:\n"+stdout)
 		}
-		if stderr := strings.TrimSpace(result.Stderr); stderr != "" {
+		if stderr := safeCommandFailureText(result.Stderr, commandFailureStreamLimit); stderr != "" {
 			parts = append(parts, "stderr:\n"+stderr)
 		}
 	}
-	return strings.Join(parts, "\n")
+	return boundedHeadTailString(strings.Join(parts, "\n"), commandFailureDetailLimit)
+}
+
+func safeCommandFailureText(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return ""
+	}
+	value = redactCommandDiagnostic(value)
+	return boundedHeadTailString(value, limit)
+}
+
+func boundedHeadTailString(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(value) <= limit {
+		return value
+	}
+	payloadLimit := limit - commandOutputMarkerReserve
+	if payloadLimit < 0 {
+		payloadLimit = 0
+	}
+	headLimit := payloadLimit / 2
+	tailLimit := payloadLimit - headLimit
+	dropped := len(value) - headLimit - tailLimit
+	return value[:headLimit] + commandOutputTruncationMarker(int64(dropped)) + value[len(value)-tailLimit:]
+}
+
+func redactCommandDiagnostic(value string) string {
+	value = commandPrivateKeyPattern.ReplaceAllString(value, "[REDACTED PRIVATE KEY]")
+	value = commandPrivateKeyTail.ReplaceAllString(value, "[REDACTED PRIVATE KEY]")
+	value = commandURLSecretPattern.ReplaceAllString(value, "$1[REDACTED]@")
+	value = commandQuotedSecretPattern.ReplaceAllString(value, "$1[REDACTED]")
+	value = commandSecretFlagPattern.ReplaceAllString(value, "$1[REDACTED]")
+	value = commandAuthorizationPattern.ReplaceAllString(value, "$1[REDACTED]")
+	value = commandUnquotedSecretPattern.ReplaceAllString(value, "$1[REDACTED]")
+	value = commandKnownTokenPattern.ReplaceAllString(value, "[REDACTED TOKEN]")
+	return commandJWTTokenPattern.ReplaceAllString(value, "[REDACTED TOKEN]")
+}
+
+func safeCommandResultCommand(name string, args []string) []string {
+	command := make([]string, 0, len(args)+1)
+	command = append(command, redactCommandDiagnostic(name))
+	redactNext := false
+	for _, arg := range args {
+		if redactNext {
+			command = append(command, "[REDACTED]")
+			redactNext = false
+			continue
+		}
+		command = append(command, redactCommandDiagnostic(arg))
+		redactNext = commandArgumentExpectsSecret(arg)
+	}
+	return command
+}
+
+func commandArgumentExpectsSecret(arg string) bool {
+	arg = strings.ToLower(strings.TrimSpace(arg))
+	if !strings.HasPrefix(arg, "-") || strings.Contains(arg, "=") {
+		return false
+	}
+	arg = strings.TrimLeft(arg, "-")
+	switch arg {
+	case "password", "passwd", "secret", "token", "api-key", "api_key", "access-key", "access_key", "auth", "authorization", "credential", "credentials", "private-key", "private_key", "client-secret", "client_secret", "refresh-token", "refresh_token":
+		return true
+	default:
+		return false
+	}
 }
