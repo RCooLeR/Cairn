@@ -15,6 +15,8 @@ const (
 	MetricsResolutionRaw = "raw"
 	MetricsResolution1m  = "1m"
 	MetricsResolution15m = "15m"
+
+	DefaultMetricsRawRetention = time.Hour
 )
 
 type MetricsRepository struct {
@@ -158,8 +160,15 @@ func (r *MetricsRepository) QuerySeries(ctx context.Context, filter MetricsSerie
 }
 
 func (r *MetricsRepository) RetainAndDownsample(ctx context.Context, now time.Time) error {
+	return r.RetainAndDownsampleWithRawRetention(ctx, now, DefaultMetricsRawRetention)
+}
+
+func (r *MetricsRepository) RetainAndDownsampleWithRawRetention(ctx context.Context, now time.Time, rawRetention time.Duration) error {
 	if now.IsZero() {
 		now = time.Now().UTC()
+	}
+	if rawRetention <= 0 {
+		rawRetention = DefaultMetricsRawRetention
 	}
 	tx, err := r.writer.BeginTx(ctx, nil)
 	if err != nil {
@@ -169,7 +178,7 @@ func (r *MetricsRepository) RetainAndDownsample(ctx context.Context, now time.Ti
 		_ = tx.Rollback()
 	}()
 
-	if err := downsampleMetrics(ctx, tx, MetricsResolutionRaw, MetricsResolution1m, now.Add(-time.Hour), time.Minute); err != nil {
+	if err := downsampleMetrics(ctx, tx, MetricsResolutionRaw, MetricsResolution1m, now.Add(-rawRetention), time.Minute); err != nil {
 		return err
 	}
 	if err := downsampleMetrics(ctx, tx, MetricsResolution1m, MetricsResolution15m, now.Add(-24*time.Hour), 15*time.Minute); err != nil {
@@ -185,14 +194,21 @@ func (r *MetricsRepository) RetainAndDownsample(ctx context.Context, now time.Ti
 }
 
 func ResolutionForRange(from time.Time, to time.Time) string {
+	return ResolutionForRangeWithRawRetention(from, to, DefaultMetricsRawRetention)
+}
+
+func ResolutionForRangeWithRawRetention(from time.Time, to time.Time, rawRetention time.Duration) string {
 	if to.IsZero() {
 		to = time.Now().UTC()
 	}
 	if from.IsZero() {
-		from = to.Add(-time.Hour)
+		from = to.Add(-DefaultMetricsRawRetention)
+	}
+	if rawRetention <= 0 {
+		rawRetention = DefaultMetricsRawRetention
 	}
 	duration := to.Sub(from)
-	if duration <= time.Hour {
+	if duration <= rawRetention {
 		return MetricsResolutionRaw
 	}
 	if duration <= 24*time.Hour {

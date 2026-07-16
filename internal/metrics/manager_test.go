@@ -84,6 +84,7 @@ func TestManagerStreamsPersistsAndRanksSamples(t *testing.T) {
 		}),
 	})
 	t.Cleanup(manager.StopAll)
+	manager.Start(ctx)
 
 	streamID, err := manager.StartStatsStream(ctx, models.StatsScope{Kind: ScopeAll})
 	if err != nil {
@@ -145,6 +146,158 @@ func TestManagerStreamsPersistsAndRanksSamples(t *testing.T) {
 	}
 	if len(series.Series[0].Points) == 0 {
 		t.Fatalf("expected persisted metric samples, got %#v", series)
+	}
+}
+
+func TestManagerStatsStreamsRequireRuntimeOwnershipAndRespectCapacity(t *testing.T) {
+	manager := NewManager(&fakeMetricsDocker{}, nil, nil, nil, nil, Options{
+		Scope:              testRuntimeScope,
+		MaxStreams:         3,
+		PublishInterval:    time.Hour,
+		BackgroundInterval: time.Hour,
+	})
+	if _, err := manager.StartStatsStream(context.Background(), models.StatsScope{Kind: ScopeAll}); !apperror.IsCode(err, apperror.ProviderNotReady) {
+		t.Fatalf("StartStatsStream(before Start) error = %v, want provider not ready", err)
+	}
+
+	rootCtx, cancelRoot := context.WithCancel(context.Background())
+	manager.Start(rootCtx)
+	t.Cleanup(manager.StopAll)
+
+	canceledCtx, cancelBeforeStart := context.WithCancel(context.Background())
+	cancelBeforeStart()
+	if _, err := manager.StartStatsStream(canceledCtx, models.StatsScope{Kind: ScopeAll}); !apperror.IsCode(err, apperror.Cancelled) {
+		t.Fatalf("StartStatsStream(canceled admission) error = %v, want canceled", err)
+	}
+
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	firstID, err := manager.StartStatsStream(requestCtx, models.StatsScope{Kind: ScopeAll})
+	if err != nil {
+		t.Fatalf("StartStatsStream() error = %v", err)
+	}
+	cancelRequest()
+	manager.mu.Lock()
+	first := manager.sessions[firstID]
+	manager.mu.Unlock()
+	if first == nil {
+		t.Fatal("admitted stream was not registered")
+	}
+	select {
+	case <-first.done:
+		t.Fatal("request cancellation stopped a runtime-owned stream")
+	default:
+	}
+
+	for i := 1; i < 3; i++ {
+		if _, err := manager.StartStatsStream(context.Background(), models.StatsScope{Kind: ScopeAll}); err != nil {
+			t.Fatalf("StartStatsStream(%d) error = %v", i+1, err)
+		}
+	}
+	if _, err := manager.StartStatsStream(context.Background(), models.StatsScope{Kind: ScopeAll}); !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("StartStatsStream(over capacity) error = %v, want conflict", err)
+	}
+	if got := manager.Diagnostics().ActiveStreams; got != 3 {
+		t.Fatalf("active streams = %d, want 3", got)
+	}
+
+	cancelRoot()
+	select {
+	case <-first.done:
+	case <-time.After(time.Second):
+		t.Fatal("runtime cancellation did not stop the metrics stream")
+	}
+	deadline := time.Now().Add(time.Second)
+	for manager.Diagnostics().ActiveStreams != 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := manager.Diagnostics().ActiveStreams; got != 0 {
+		t.Fatalf("active streams after runtime cancellation = %d, want 0", got)
+	}
+}
+
+func TestManagerStatsStreamAdmissionIsAtomicAtCapacity(t *testing.T) {
+	const (
+		maxStreams = 3
+		attempts   = 24
+	)
+	rootCtx, cancelRoot := context.WithCancel(context.Background())
+	defer cancelRoot()
+	manager := NewManager(&fakeMetricsDocker{}, nil, nil, nil, nil, Options{
+		Scope:              testRuntimeScope,
+		MaxStreams:         maxStreams,
+		PublishInterval:    time.Hour,
+		BackgroundInterval: time.Hour,
+	})
+	manager.Start(rootCtx)
+	t.Cleanup(manager.StopAll)
+
+	begin := make(chan struct{})
+	results := make(chan error, attempts)
+	for i := 0; i < attempts; i++ {
+		go func() {
+			<-begin
+			_, err := manager.StartStatsStream(context.Background(), models.StatsScope{Kind: ScopeAll})
+			results <- err
+		}()
+	}
+	close(begin)
+
+	admitted := 0
+	for i := 0; i < attempts; i++ {
+		err := <-results
+		switch {
+		case err == nil:
+			admitted++
+		case apperror.IsCode(err, apperror.Conflict):
+		default:
+			t.Fatalf("StartStatsStream() error = %v, want success or capacity conflict", err)
+		}
+	}
+	if admitted != maxStreams {
+		t.Fatalf("admitted streams = %d, want exactly %d", admitted, maxStreams)
+	}
+	if got := manager.Diagnostics().ActiveStreams; got != maxStreams {
+		t.Fatalf("active streams = %d, want %d", got, maxStreams)
+	}
+}
+
+func TestManagerConcurrentStatsStreamAdmissionCannotOutliveStopAll(t *testing.T) {
+	const iterations = 40
+	for iteration := 0; iteration < iterations; iteration++ {
+		rootCtx, cancelRoot := context.WithCancel(context.Background())
+		manager := NewManager(&fakeMetricsDocker{}, nil, nil, nil, nil, Options{
+			Scope:              testRuntimeScope,
+			MaxStreams:         4,
+			PublishInterval:    time.Hour,
+			BackgroundInterval: time.Hour,
+		})
+		manager.Start(rootCtx)
+
+		begin := make(chan struct{})
+		var callers sync.WaitGroup
+		for i := 0; i < 16; i++ {
+			callers.Add(1)
+			go func() {
+				defer callers.Done()
+				<-begin
+				_, _ = manager.StartStatsStream(context.Background(), models.StatsScope{Kind: ScopeAll})
+			}()
+		}
+		stopped := make(chan struct{})
+		go func() {
+			<-begin
+			manager.StopAll()
+			close(stopped)
+		}()
+		close(begin)
+		callers.Wait()
+		<-stopped
+		cancelRoot()
+
+		diagnostics := manager.Diagnostics()
+		if diagnostics.Started || diagnostics.ActiveStreams != 0 {
+			t.Fatalf("iteration %d diagnostics after StopAll = %#v", iteration, diagnostics)
+		}
 	}
 }
 

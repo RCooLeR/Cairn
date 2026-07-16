@@ -30,10 +30,13 @@ func NewManager(docker DockerClient, repo *store.MetricsRepository, projects *st
 		Events:     events,
 		Scope:      opts.Scope,
 	}
-	if repo != nil {
-		manager.retentionFunc = repo.RetainAndDownsample
-	}
 	manager.applyOptions(opts)
+	if manager.retentionFunc == nil && repo != nil {
+		rawRetention := manager.rawRetention
+		manager.retentionFunc = func(ctx context.Context, now time.Time) error {
+			return repo.RetainAndDownsampleWithRawRetention(ctx, now, rawRetention)
+		}
+	}
 	return manager
 }
 
@@ -104,18 +107,37 @@ func (m *Manager) StartStatsStream(ctx context.Context, scope models.StatsScope)
 	if err := validateScope(scope); err != nil {
 		return "", err
 	}
-	m.Start(context.Background())
-	streamID := uuid.NewString()
-	session := newStreamSession(m, streamID, scope)
-
+	if err := ctx.Err(); err != nil {
+		return "", apperror.Wrap(apperror.Cancelled, "Start metrics stream canceled", err)
+	}
 	m.mu.Lock()
+	if !m.started || m.ctx == nil || m.ctx.Err() != nil {
+		m.mu.Unlock()
+		return "", apperror.New(
+			apperror.ProviderNotReady,
+			"Metrics runtime is not running",
+			apperror.WithRepairHints("Reconnect the active Docker provider and try again."),
+		)
+	}
+	if len(m.sessions) >= m.maxStreams {
+		m.mu.Unlock()
+		return "", apperror.New(
+			apperror.Conflict,
+			"Metrics stream capacity has been reached",
+			apperror.WithDetail("Stop an existing metrics stream before starting another."),
+		)
+	}
+	streamID := uuid.NewString()
+	session := newStreamSession(m, m.ctx, streamID, scope)
 	m.sessions[streamID] = session
+	m.wg.Add(1)
 	m.mu.Unlock()
 
-	go session.run()
 	go func() {
-		_ = m.reconcileOnce(ctx)
+		defer m.wg.Done()
+		session.run()
 	}()
+	m.requestReconcile()
 	return streamID, nil
 }
 
@@ -199,7 +221,7 @@ func (m *Manager) GetProjectMetrics(ctx context.Context, projectID string, r mod
 	return m.Repository.QuerySeries(ctx, store.MetricsSeriesFilter{
 		Scope:      m.Scope,
 		ProjectID:  projectID,
-		Resolution: store.ResolutionForRange(r.From, r.To),
+		Resolution: store.ResolutionForRangeWithRawRetention(r.From, r.To, m.rawRetention),
 		From:       r.From,
 		To:         r.To,
 	})
@@ -212,7 +234,7 @@ func (m *Manager) GetContainerMetrics(ctx context.Context, containerID string, r
 	return m.Repository.QuerySeries(ctx, store.MetricsSeriesFilter{
 		Scope:       m.Scope,
 		ContainerID: strings.TrimSpace(containerID),
-		Resolution:  store.ResolutionForRange(r.From, r.To),
+		Resolution:  store.ResolutionForRangeWithRawRetention(r.From, r.To, m.rawRetention),
 		From:        r.From,
 		To:          r.To,
 	})
@@ -226,6 +248,8 @@ func (m *Manager) reconcileLoop() {
 		select {
 		case <-m.ctx.Done():
 			return
+		case <-m.reconcileRequests:
+			_ = m.reconcileOnce(m.ctx)
 		case <-ticker.C:
 			_ = m.reconcileOnce(m.ctx)
 		}
@@ -862,8 +886,8 @@ func (m *Manager) setGPUUsage(usage map[string]containerGPUUsage) {
 	}
 }
 
-func newStreamSession(manager *Manager, streamID string, scope models.StatsScope) *streamSession {
-	ctx, cancel := context.WithCancel(context.Background())
+func newStreamSession(manager *Manager, rootCtx context.Context, streamID string, scope models.StatsScope) *streamSession {
+	ctx, cancel := context.WithCancel(rootCtx)
 	return &streamSession{
 		id:      streamID,
 		scope:   scope,
@@ -875,7 +899,10 @@ func newStreamSession(manager *Manager, streamID string, scope models.StatsScope
 }
 
 func (s *streamSession) run() {
-	defer close(s.done)
+	defer func() {
+		s.manager.removeSession(s.id, s)
+		close(s.done)
+	}()
 	ticker := time.NewTicker(s.manager.publishInterval)
 	defer ticker.Stop()
 	for {
@@ -894,6 +921,21 @@ func (s *streamSession) run() {
 				GPU:      gpu,
 			})
 		}
+	}
+}
+
+func (m *Manager) removeSession(streamID string, session *streamSession) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.sessions[streamID] == session {
+		delete(m.sessions, streamID)
+	}
+}
+
+func (m *Manager) requestReconcile() {
+	select {
+	case m.reconcileRequests <- struct{}{}:
+	default:
 	}
 }
 
@@ -1027,6 +1069,9 @@ func (m *Manager) ensureReady() {
 	if m.sessions == nil {
 		m.sessions = map[string]*streamSession{}
 	}
+	if m.reconcileRequests == nil {
+		m.reconcileRequests = make(chan struct{}, 1)
+	}
 	if m.containers == nil {
 		m.containers = map[string]models.ContainerSummary{}
 	}
@@ -1063,11 +1108,17 @@ func (m *Manager) ensureReady() {
 	if m.retainRetryInterval < minimumRetainRetryInterval {
 		m.retainRetryInterval = minimumRetainRetryInterval
 	}
+	if m.rawRetention <= 0 {
+		m.rawRetention = store.DefaultMetricsRawRetention
+	}
 	if m.gpuCacheTTL <= 0 {
 		m.gpuCacheTTL = defaultGPUCacheTTL
 	}
 	if m.topN <= 0 {
 		m.topN = defaultTopN
+	}
+	if m.maxStreams <= 0 {
+		m.maxStreams = defaultMaxStreams
 	}
 	if m.now == nil {
 		m.now = func() time.Time { return time.Now().UTC() }
@@ -1084,8 +1135,10 @@ func (m *Manager) applyOptions(opts Options) {
 	m.persistInterval = opts.PersistInterval
 	m.retainInterval = opts.RetainInterval
 	m.retainRetryInterval = opts.RetainRetryInterval
+	m.rawRetention = opts.RawRetention
 	m.gpuCacheTTL = opts.GPUCacheTTL
 	m.topN = opts.TopN
+	m.maxStreams = opts.MaxStreams
 	m.disableStreamingStats = opts.DisableStreamingStats
 	if opts.StatsConcurrency > 0 {
 		m.statsSemaphore = make(chan struct{}, opts.StatsConcurrency)

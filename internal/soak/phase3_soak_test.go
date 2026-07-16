@@ -97,6 +97,7 @@ func TestPhase3StreamsTerminalDashboardSoak(t *testing.T) {
 		PersistInterval:    5 * time.Second,
 	})
 	defer metricsManager.StopAll()
+	metricsManager.Start(ctx)
 	terminalManager := terminal.NewManager(provider, client, db.Projects(), eventBus, terminal.Options{})
 	defer terminalManager.StopAll()
 

@@ -219,14 +219,7 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 		ConfigConcurrency: composeConfigConcurrency(provider),
 	}
 	logsManager := logsvc.NewManager(dockerClient, r.events, logsvc.Options{})
-	metricsManager := metrics.NewManager(dockerClient, r.db.Metrics(), r.projects, r.audit, r.events, metrics.Options{
-		Scope:                 runtimeScope,
-		GPUProbe:              metrics.NewProviderGPUProbe(provider),
-		VisibleInterval:       metricsVisibleInterval(provider),
-		BackgroundInterval:    metricsBackgroundInterval(provider),
-		DisableStreamingStats: disableStreamingStats(provider),
-		StatsConcurrency:      statsConcurrency(provider),
-	})
+	metricsManager := metrics.NewManager(dockerClient, r.db.Metrics(), r.projects, r.audit, r.events, r.metricsManagerOptions(ctx, provider, runtimeScope))
 	metricsManager.Start(runtimeCtx)
 	terminalManager := terminal.NewManager(provider, dockerClient, r.projects, r.events, terminal.Options{Scope: runtimeScope})
 	backupManager := backupcore.NewManager(boundProviderResolver{provider: provider}, dockerClient, r.db.Settings(), r.db.Backups(), r.audit, r.events, services.Version)
@@ -441,18 +434,39 @@ func (r *appRuntime) portForwardEnabled(ctx context.Context) bool {
 	return enabled
 }
 
-func metricsVisibleInterval(provider providers.PlatformProvider) time.Duration {
-	if provider != nil && provider.Type() == providers.TypeWindowsWSL {
-		return 5 * time.Second
+func (r *appRuntime) metricsSampleInterval(ctx context.Context) time.Duration {
+	const defaultIntervalSeconds = 2
+	seconds := defaultIntervalSeconds
+	if r.db != nil {
+		if configured, err := r.db.Settings().GetInt(ctx, "metrics.sample_interval_seconds"); err == nil && configured >= 1 && configured <= 10 {
+			seconds = configured
+		}
 	}
-	return 0
+	return time.Duration(seconds) * time.Second
 }
 
-func metricsBackgroundInterval(provider providers.PlatformProvider) time.Duration {
-	if provider != nil && provider.Type() == providers.TypeWindowsWSL {
-		return 30 * time.Second
+func (r *appRuntime) metricsRawRetention(ctx context.Context) time.Duration {
+	const defaultRetentionMinutes = 60
+	minutes := defaultRetentionMinutes
+	if r.db != nil {
+		if configured, err := r.db.Settings().GetInt(ctx, "metrics.retention_raw_minutes"); err == nil && configured >= 1 && configured <= 24*60 {
+			minutes = configured
+		}
 	}
-	return 0
+	return time.Duration(minutes) * time.Minute
+}
+
+func (r *appRuntime) metricsManagerOptions(ctx context.Context, provider providers.PlatformProvider, runtimeScope runtimescope.Scope) metrics.Options {
+	sampleInterval := r.metricsSampleInterval(ctx)
+	return metrics.Options{
+		Scope:                 runtimeScope,
+		GPUProbe:              metrics.NewProviderGPUProbe(provider),
+		VisibleInterval:       sampleInterval,
+		BackgroundInterval:    sampleInterval,
+		RawRetention:          r.metricsRawRetention(ctx),
+		DisableStreamingStats: disableStreamingStats(provider),
+		StatsConcurrency:      statsConcurrency(provider),
+	}
 }
 
 func (r *appRuntime) clearServicesLocked() {

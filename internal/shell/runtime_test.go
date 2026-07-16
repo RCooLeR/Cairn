@@ -4,10 +4,12 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/RCooLeR/Cairn/internal/providers"
 	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/services"
+	"github.com/RCooLeR/Cairn/internal/store"
 )
 
 type runtimeCleanupProvider struct {
@@ -86,5 +88,32 @@ func TestRuntimeHandlesStopClosesRuntimeProviderSnapshot(t *testing.T) {
 	runtimeHandles{provider: provider}.stop()
 	if provider.closed != 1 {
 		t.Fatalf("CloseRuntime() calls = %d, want 1", provider.closed)
+	}
+}
+
+func TestAppRuntimeLoadsMetricsSettingsForProviderBinding(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, t.TempDir()+"/cairn.db")
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate store: %v", err)
+	}
+	if err := db.Settings().SetInt(ctx, "metrics.sample_interval_seconds", 7); err != nil {
+		t.Fatalf("Set sample interval: %v", err)
+	}
+	if err := db.Settings().SetInt(ctx, "metrics.retention_raw_minutes", 45); err != nil {
+		t.Fatalf("Set raw retention: %v", err)
+	}
+
+	runtimeController := newAppRuntime(appRuntimeConfig{RootCtx: ctx, DB: db})
+	options := runtimeController.metricsManagerOptions(ctx, nil, runtimescope.Must("linux_native", "default"))
+	if options.VisibleInterval != 7*time.Second || options.BackgroundInterval != 7*time.Second {
+		t.Fatalf("metrics sampling intervals = visible %v, background %v; want 7s for both", options.VisibleInterval, options.BackgroundInterval)
+	}
+	if options.RawRetention != 45*time.Minute {
+		t.Fatalf("metrics raw retention = %v, want 45m", options.RawRetention)
 	}
 }

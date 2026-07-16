@@ -44,6 +44,7 @@ func TestManagerSeedScaleDashboardPerformanceAndGoroutines(t *testing.T) {
 		Now:                func() time.Time { return now },
 	})
 	baselineGoroutines := runtime.NumGoroutine()
+	manager.Start(ctx)
 
 	streamID, err := manager.StartStatsStream(ctx, models.StatsScope{Kind: ScopeAll})
 	if err != nil {

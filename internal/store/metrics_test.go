@@ -20,6 +20,12 @@ func TestMetricsResolutionForRange(t *testing.T) {
 	if got := ResolutionForRange(now.Add(-48*time.Hour), now); got != MetricsResolution15m {
 		t.Fatalf("48h resolution = %q, want 15m", got)
 	}
+	if got := ResolutionForRangeWithRawRetention(now.Add(-45*time.Minute), now, 30*time.Minute); got != MetricsResolution1m {
+		t.Fatalf("45m resolution with 30m raw retention = %q, want 1m", got)
+	}
+	if got := ResolutionForRangeWithRawRetention(now.Add(-20*time.Minute), now, 30*time.Minute); got != MetricsResolutionRaw {
+		t.Fatalf("20m resolution with 30m raw retention = %q, want raw", got)
+	}
 }
 
 func TestMetricsRepositoryQueryAndRetentionDownsample(t *testing.T) {
@@ -93,6 +99,62 @@ func TestMetricsRepositoryQueryAndRetentionDownsample(t *testing.T) {
 	}
 	if points := downsampled.Series[2].Points; len(points) != 1 || points[0].Value != 4096 {
 		t.Fatalf("1m GPU points = %#v, want max 4096", points)
+	}
+}
+
+func TestMetricsRepositoryAppliesConfiguredRawRetention(t *testing.T) {
+	ctx := context.Background()
+	db := openMigratedStore(t, ctx)
+	defer closeStore(t, db)
+
+	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+	repo := db.Metrics()
+	runtimeScope := runtimescope.Must("linux_native", "default")
+	if err := repo.InsertBatch(ctx, []MetricsSampleRecord{
+		{
+			ProviderID: "linux_native", ContextName: "default", ContainerID: "old",
+			CPUPercent: 10, SampledAt: now.Add(-45 * time.Minute),
+		},
+		{
+			ProviderID: "linux_native", ContextName: "default", ContainerID: "new",
+			CPUPercent: 20, SampledAt: now.Add(-20 * time.Minute),
+		},
+	}); err != nil {
+		t.Fatalf("InsertBatch() error = %v", err)
+	}
+
+	if err := repo.RetainAndDownsampleWithRawRetention(ctx, now, 30*time.Minute); err != nil {
+		t.Fatalf("RetainAndDownsampleWithRawRetention() error = %v", err)
+	}
+	oldRaw, err := repo.QuerySeries(ctx, MetricsSeriesFilter{
+		Scope: runtimeScope, ContainerID: "old", Resolution: MetricsResolutionRaw,
+		From: now.Add(-time.Hour), To: now,
+	})
+	if err != nil {
+		t.Fatalf("QuerySeries(old raw) error = %v", err)
+	}
+	if points := oldRaw.Series[0].Points; len(points) != 0 {
+		t.Fatalf("old raw points = %#v, want compacted", points)
+	}
+	oldDownsampled, err := repo.QuerySeries(ctx, MetricsSeriesFilter{
+		Scope: runtimeScope, ContainerID: "old", Resolution: MetricsResolution1m,
+		From: now.Add(-time.Hour), To: now,
+	})
+	if err != nil {
+		t.Fatalf("QuerySeries(old 1m) error = %v", err)
+	}
+	if points := oldDownsampled.Series[0].Points; len(points) != 1 || points[0].Value != 10 {
+		t.Fatalf("old 1m points = %#v, want compacted sample", points)
+	}
+	newRaw, err := repo.QuerySeries(ctx, MetricsSeriesFilter{
+		Scope: runtimeScope, ContainerID: "new", Resolution: MetricsResolutionRaw,
+		From: now.Add(-time.Hour), To: now,
+	})
+	if err != nil {
+		t.Fatalf("QuerySeries(new raw) error = %v", err)
+	}
+	if points := newRaw.Series[0].Points; len(points) != 1 || points[0].Value != 20 {
+		t.Fatalf("new raw points = %#v, want retained sample", points)
 	}
 }
 

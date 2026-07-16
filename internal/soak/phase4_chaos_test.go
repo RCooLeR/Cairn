@@ -97,6 +97,7 @@ func TestPhase4ProviderChaos(t *testing.T) {
 		PersistInterval:    5 * time.Second,
 	})
 	defer metricsManager.StopAll()
+	metricsManager.Start(ctx)
 
 	logStreamID, err := logManager.StartLogStream(ctx, models.LogStreamRequest{
 		Scope:      logsvc.ScopeAll,

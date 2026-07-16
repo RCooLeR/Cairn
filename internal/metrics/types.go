@@ -29,6 +29,7 @@ const (
 	minimumRetainRetryInterval = time.Second
 	defaultGPUCacheTTL         = 5 * time.Second
 	defaultTopN                = 8
+	defaultMaxStreams          = 16
 	watcherStopTimeout         = 5 * time.Second
 	maxPendingPersistSamples   = 10000
 	streamRetryFallbackSamples = 5
@@ -53,8 +54,10 @@ type Options struct {
 	PersistInterval       time.Duration
 	RetainInterval        time.Duration
 	RetainRetryInterval   time.Duration
+	RawRetention          time.Duration
 	GPUCacheTTL           time.Duration
 	TopN                  int
+	MaxStreams            int
 	DisableStreamingStats bool
 	StatsConcurrency      int
 	Now                   func() time.Time
@@ -88,8 +91,10 @@ type Manager struct {
 	persistInterval       time.Duration
 	retainInterval        time.Duration
 	retainRetryInterval   time.Duration
+	rawRetention          time.Duration
 	gpuCacheTTL           time.Duration
 	topN                  int
+	maxStreams            int
 	disableStreamingStats bool
 	statsSemaphore        chan struct{}
 	now                   func() time.Time
@@ -102,6 +107,7 @@ type Manager struct {
 	started           bool
 	watchers          map[string]*containerWatcher
 	sessions          map[string]*streamSession
+	reconcileRequests chan struct{}
 	containers        map[string]models.ContainerSummary
 	latest            map[string]Sample
 	previous          map[string]container.StatsResponse
