@@ -569,6 +569,16 @@ func TestAgentServiceFileEditPlanWritesProjectConfig(t *testing.T) {
 	if string(raw) != "APP_PORT=8080\nNODE_ENV=development\n" {
 		t.Fatalf(".env = %q", raw)
 	}
+	entries, err := db.Audit().List(ctx, models.AuditFilter{Topic: "agent.file_edit", Limit: 10})
+	if err != nil {
+		t.Fatalf("List(agent.file_edit) error = %v", err)
+	}
+	if len(entries) != 1 || entries[0].Result != "success" || entries[0].Error != "" {
+		t.Fatalf("agent file edit audit entries = %#v, want one finalized success record", entries)
+	}
+	if command := fmt.Sprint(entries[0].Metadata["command"]); strings.Contains(command, "NODE_ENV=development") || !strings.Contains(command, "plan ") {
+		t.Fatalf("agent file edit audit command = %q, want safe plan fingerprint without content", command)
+	}
 }
 
 func TestAgentServiceCreateFilePlanRejectsFileCreatedBeforeApply(t *testing.T) {

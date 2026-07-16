@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"strings"
 	"time"
 
@@ -26,6 +27,15 @@ type AuditRecord struct {
 	Duration   time.Duration
 	Error      string
 	CreatedAt  time.Time
+}
+
+// AuditOutcome is the terminal state of an audit attempt that was durably
+// inserted before its side effect began.
+type AuditOutcome struct {
+	Status   string
+	ExitCode *int
+	Duration time.Duration
+	Error    string
 }
 
 func (s *Store) Audit() *AuditRepository {
@@ -54,6 +64,35 @@ func (r *AuditRepository) Insert(ctx context.Context, record AuditRecord) (int64
 		return 0, err
 	}
 	return result.LastInsertId()
+}
+
+// UpdateOutcome finalizes an existing audit attempt in place. Keeping the
+// started row and its terminal outcome under one stable ID lets callers insert
+// intent before an external side effect without creating two independent audit
+// records for one operation.
+func (r *AuditRepository) UpdateOutcome(ctx context.Context, id int64, outcome AuditOutcome) error {
+	if id <= 0 {
+		return fmt.Errorf("store: invalid audit record id %d", id)
+	}
+	if outcome.Status != "success" && outcome.Status != "failed" {
+		return fmt.Errorf("store: invalid terminal audit status %q", outcome.Status)
+	}
+	result, err := r.db.ExecContext(ctx, `
+		UPDATE audit_log
+		SET status = ?, exit_code = ?, duration_ms = ?, error = NULLIF(?, '')
+		WHERE id = ? AND status = 'started'
+	`, outcome.Status, outcome.ExitCode, outcome.Duration.Milliseconds(), outcome.Error, id)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows != 1 {
+		return fmt.Errorf("store: audit record %d was not found or was already finalized", id)
+	}
+	return nil
 }
 
 func (r *AuditRepository) List(ctx context.Context, filter models.AuditFilter) ([]models.AuditEntry, error) {

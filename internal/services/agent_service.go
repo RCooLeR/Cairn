@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -29,11 +30,19 @@ const (
 	agentDefaultEndpoint          = "http://127.0.0.1:11434"
 	agentDefaultModel             = "gemma4:12b-it-q8_0"
 	maxAgentFileEditBytes         = 256 * 1024
+	agentFileEditAuditTimeout     = 5 * time.Second
 )
+
+type agentAuditStore interface {
+	Insert(context.Context, store.AuditRecord) (int64, error)
+	UpdateOutcome(context.Context, int64, store.AuditOutcome) error
+}
+
+type agentFileWriter func(security.AgentFileEditPlan, fs.FileMode) error
 
 type AgentService struct {
 	Settings *store.SettingsRepository
-	Audit    *store.AuditRepository
+	Audit    agentAuditStore
 	Docker   *DockerService
 	Project  *ProjectService
 	Logs     *LogsService
@@ -41,6 +50,8 @@ type AgentService struct {
 	Plans    *security.AgentFileEditPlanStore
 	IDs      *security.IDSource
 	Client   *http.Client
+
+	writeFile agentFileWriter
 }
 
 type agentConfig struct {
@@ -628,54 +639,105 @@ func (s *AgentService) PlanFileEdit(ctx context.Context, req models.AgentFileEdi
 }
 
 func (s *AgentService) ApplyFileEdit(ctx context.Context, planID string, typedName string) (*models.AgentFileEditResult, error) {
+	if s.Audit == nil {
+		return nil, apperror.New(
+			apperror.Internal,
+			"Agent file edit audit store is not configured",
+			apperror.WithDetail("The file was not changed."),
+		)
+	}
 	if s.Plans == nil {
-		return nil, apperror.New(apperror.Internal, "Agent file edit plan store is not configured")
+		actionErr := apperror.New(apperror.Internal, "Agent file edit plan store is not configured")
+		if auditErr := s.recordRejectedFileEditAudit(ctx, planID, actionErr); auditErr != nil {
+			return nil, agentFileEditFailedAuditError(actionErr, auditErr)
+		}
+		return nil, actionErr
 	}
 	plan, err := s.Plans.Take(ctx, planID, typedName)
 	if err != nil {
+		if auditErr := s.recordRejectedFileEditAudit(ctx, planID, err); auditErr != nil {
+			return nil, agentFileEditFailedAuditError(err, auditErr)
+		}
 		return nil, err
 	}
-	_, absPath, err := resolveAgentProjectPath(plan.WorkingDir, plan.RelativePath)
+	startedAt := time.Now().UTC()
+	auditID, err := s.beginFileEditAudit(ctx, plan, startedAt)
 	if err != nil {
-		return nil, err
+		return nil, apperror.Wrap(
+			apperror.Internal,
+			"Agent file edit was not applied because its audit intent could not be recorded",
+			err,
+			apperror.WithDetail("The file was not changed. Create a new preview after the audit store is healthy."),
+			apperror.WithRepairHints("Check Cairn's audit database health, then create and approve a new file edit preview."),
+		)
 	}
+	fail := func(actionErr error) (*models.AgentFileEditResult, error) {
+		if auditErr := s.finishFileEditAudit(ctx, auditID, "failed", startedAt, actionErr); auditErr != nil {
+			return nil, agentFileEditFailedAuditError(actionErr, auditErr)
+		}
+		return nil, actionErr
+	}
+	if err := ctx.Err(); err != nil {
+		return fail(err)
+	}
+
+	relPath, absPath, err := resolveAgentProjectPath(plan.WorkingDir, plan.RelativePath)
+	if err != nil {
+		return fail(err)
+	}
+	plan.RelativePath = relPath
 	plan.AbsolutePath = absPath
+	perm, err := agentFileEditPermission(plan)
+	if err != nil {
+		return fail(err)
+	}
 	if plan.OriginalHash != "" {
 		raw, err := os.ReadFile(plan.AbsolutePath)
 		if err != nil {
-			return nil, err
+			return fail(err)
 		}
 		if hashAgentFile(raw) != plan.OriginalHash {
-			return nil, apperror.New(
+			return fail(apperror.New(
 				apperror.Conflict,
 				"File changed after preview",
 				apperror.WithDetail("Refresh the draft and preview again before applying."),
-			)
+			))
 		}
 	}
 	if err := os.MkdirAll(filepath.Dir(plan.AbsolutePath), 0o755); err != nil {
-		return nil, err
+		return fail(err)
 	}
-	_, absPath, err = resolveAgentProjectPath(plan.WorkingDir, plan.RelativePath)
+	relPath, absPath, err = resolveAgentProjectPath(plan.WorkingDir, plan.RelativePath)
 	if err != nil {
-		return nil, err
+		return fail(err)
 	}
+	plan.RelativePath = relPath
 	plan.AbsolutePath = absPath
-	perm := fs.FileMode(0o644)
-	if strings.HasPrefix(filepath.Base(plan.RelativePath), ".env") {
-		perm = 0o600
+	writer := s.writeFile
+	if writer == nil {
+		writer = writeAgentPlanFile
 	}
-	if err := writeAgentPlanFile(plan, perm); err != nil {
-		return nil, err
+	if err := writer(plan, perm); err != nil {
+		return fail(err)
 	}
 	appliedAt := time.Now().UTC()
-	_ = s.recordFileEditAudit(ctx, plan, "success", len([]byte(plan.Content)), nil)
-	return &models.AgentFileEditResult{
+	result := &models.AgentFileEditResult{
 		ProjectID:    plan.ProjectID,
 		Path:         plan.RelativePath,
 		BytesWritten: len([]byte(plan.Content)),
 		AppliedAt:    appliedAt,
-	}, nil
+	}
+	if auditErr := s.finishFileEditAudit(ctx, auditID, "success", startedAt, nil); auditErr != nil {
+		return result, apperror.Wrap(
+			apperror.Internal,
+			"Agent file edit was applied, but its audit outcome could not be finalized",
+			auditErr,
+			apperror.WithDetail("The file was changed. Do not retry this edit blindly; verify the target before taking further action."),
+			apperror.WithRepairHints("Verify the edited file, restore audit database health, and reconcile the started agent.file_edit audit entry."),
+			apperror.WithPartialResource("file", plan.RelativePath, "updated_audit_incomplete", false),
+		)
+	}
+	return result, nil
 }
 
 func agentToolCatalog() []models.AgentToolSpec {
@@ -1920,12 +1982,78 @@ func readAgentDraftCurrent(absPath string) (string, error) {
 	return redactText(string(raw)), nil
 }
 
+func agentFileEditPermission(plan security.AgentFileEditPlan) (fs.FileMode, error) {
+	info, err := os.Lstat(plan.AbsolutePath)
+	if err == nil {
+		if plan.CreateFile {
+			return 0, apperror.New(
+				apperror.Conflict,
+				"File changed after preview",
+				apperror.WithDetail("Refresh the draft and preview again before applying."),
+			)
+		}
+		if info.IsDir() {
+			return 0, apperror.New(apperror.Conflict, "File edit target is a directory")
+		}
+		if !info.Mode().IsRegular() {
+			return 0, apperror.New(apperror.Conflict, "File edit target is not a regular file")
+		}
+		return info.Mode().Perm(), nil
+	}
+	if !os.IsNotExist(err) {
+		return 0, err
+	}
+	if !plan.CreateFile {
+		return 0, apperror.New(
+			apperror.Conflict,
+			"File changed after preview",
+			apperror.WithDetail("Refresh the draft and preview again before applying."),
+		)
+	}
+	perm := fs.FileMode(0o644)
+	if strings.HasPrefix(filepath.Base(plan.RelativePath), ".env") {
+		perm = 0o600
+	}
+	return perm, nil
+}
+
 func writeAgentPlanFile(plan security.AgentFileEditPlan, perm fs.FileMode) error {
 	if !plan.CreateFile {
-		return os.WriteFile(plan.AbsolutePath, []byte(plan.Content), perm)
+		return replaceAgentPlanFile(plan, perm)
 	}
-	file, err := os.OpenFile(plan.AbsolutePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+	return writeNewAgentPlanFile(plan, perm)
+}
+
+func replaceAgentPlanFile(plan security.AgentFileEditPlan, perm fs.FileMode) error {
+	info, err := os.Lstat(plan.AbsolutePath)
 	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return apperror.New(apperror.Conflict, "File edit target is not a regular file")
+	}
+	tmpPath, err := writeAgentPlanTempFile(plan, perm)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = os.Remove(tmpPath)
+	}()
+	return os.Rename(tmpPath, plan.AbsolutePath)
+}
+
+// writeNewAgentPlanFile publishes a fully written temporary file with a
+// no-clobber hard link. The destination either remains absent or becomes the
+// complete file; a concurrent creator can never be overwritten.
+func writeNewAgentPlanFile(plan security.AgentFileEditPlan, perm fs.FileMode) error {
+	tmpPath, err := writeAgentPlanTempFile(plan, perm)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = os.Remove(tmpPath)
+	}()
+	if err := os.Link(tmpPath, plan.AbsolutePath); err != nil {
 		if os.IsExist(err) {
 			return apperror.New(
 				apperror.Conflict,
@@ -1935,11 +2063,41 @@ func writeAgentPlanFile(plan security.AgentFileEditPlan, perm fs.FileMode) error
 		}
 		return err
 	}
-	if _, err := file.Write([]byte(plan.Content)); err != nil {
-		_ = file.Close()
-		return err
+	return nil
+}
+
+func writeAgentPlanTempFile(plan security.AgentFileEditPlan, perm fs.FileMode) (string, error) {
+	tmp, err := os.CreateTemp(filepath.Dir(plan.AbsolutePath), ".cairn-agent-edit-*")
+	if err != nil {
+		return "", err
 	}
-	return file.Close()
+	tmpPath := tmp.Name()
+	keep := false
+	defer func() {
+		_ = tmp.Close()
+		if !keep {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if err := tmp.Chmod(perm); err != nil {
+		return "", err
+	}
+	raw := []byte(plan.Content)
+	written, err := tmp.Write(raw)
+	if err != nil {
+		return "", err
+	}
+	if written != len(raw) {
+		return "", io.ErrShortWrite
+	}
+	if err := tmp.Sync(); err != nil {
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		return "", err
+	}
+	keep = true
+	return tmpPath, nil
 }
 
 func hashAgentFile(raw []byte) string {
@@ -1961,29 +2119,124 @@ func agentFileEditEffect(create bool, relPath string) string {
 	return "Replace project file " + relPath
 }
 
-func (s *AgentService) recordFileEditAudit(ctx context.Context, plan security.AgentFileEditPlan, status string, bytesWritten int, actionErr error) error {
-	if s.Audit == nil {
-		return nil
-	}
-	message := ""
-	if actionErr != nil {
-		message = actionErr.Error()
-	}
-	_, err := s.Audit.Insert(ctx, store.AuditRecord{
+func (s *AgentService) beginFileEditAudit(ctx context.Context, plan security.AgentFileEditPlan, startedAt time.Time) (int64, error) {
+	auditCtx, cancel := agentFileEditAuditContext(ctx)
+	defer cancel()
+	id, err := s.Audit.Insert(auditCtx, store.AuditRecord{
 		Action:     "agent.file_edit",
 		TargetType: "file",
 		TargetID:   plan.RelativePath,
 		ProjectID:  plan.ProjectID,
-		Command:    fmt.Sprintf("write %s (%d bytes)", plan.RelativePath, bytesWritten),
+		Command:    agentFileEditAuditCommand(plan),
 		Risk:       models.RiskNeedsConfirmation,
-		Status:     status,
-		Error:      message,
+		Status:     "started",
+		CreatedAt:  startedAt,
+	})
+	if err != nil {
+		return 0, apperror.Wrap(apperror.Internal, "Record agent file edit audit intent failed", err)
+	}
+	return id, nil
+}
+
+func (s *AgentService) recordRejectedFileEditAudit(ctx context.Context, planID string, actionErr error) error {
+	auditCtx, cancel := agentFileEditAuditContext(ctx)
+	defer cancel()
+	_, err := s.Audit.Insert(auditCtx, store.AuditRecord{
+		Action:     "agent.file_edit",
+		TargetType: "file",
+		TargetID:   "unresolved",
+		Command:    "apply agent file edit plan " + agentFileEditAttemptFingerprint(planID),
+		Risk:       models.RiskNeedsConfirmation,
+		Status:     "failed",
+		Error:      safeAgentFileEditAuditError(actionErr),
 		CreatedAt:  time.Now().UTC(),
 	})
 	if err != nil {
-		return apperror.Wrap(apperror.Internal, "Record agent file edit audit entry failed", err)
+		return apperror.Wrap(apperror.Internal, "Record rejected agent file edit audit outcome failed", err)
 	}
 	return nil
+}
+
+func (s *AgentService) finishFileEditAudit(ctx context.Context, auditID int64, status string, startedAt time.Time, actionErr error) error {
+	var exitCode *int
+	if status == "success" {
+		code := 0
+		exitCode = &code
+	}
+	auditCtx, cancel := agentFileEditAuditContext(ctx)
+	defer cancel()
+	err := s.Audit.UpdateOutcome(auditCtx, auditID, store.AuditOutcome{
+		Status:   status,
+		ExitCode: exitCode,
+		Duration: time.Since(startedAt),
+		Error:    safeAgentFileEditAuditError(actionErr),
+	})
+	if err != nil {
+		return apperror.Wrap(apperror.Internal, "Finalize agent file edit audit outcome failed", err)
+	}
+	return nil
+}
+
+func agentFileEditAuditContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), agentFileEditAuditTimeout)
+}
+
+func agentFileEditAuditCommand(plan security.AgentFileEditPlan) string {
+	return fmt.Sprintf(
+		"write %s (%d bytes; plan %s)",
+		plan.RelativePath,
+		len([]byte(plan.Content)),
+		agentFileEditPlanFingerprint(plan),
+	)
+}
+
+func agentFileEditPlanFingerprint(plan security.AgentFileEditPlan) string {
+	value := strings.Join([]string{
+		plan.Plan.PlanID,
+		plan.ProjectID,
+		plan.RelativePath,
+		plan.OriginalHash,
+		fmt.Sprintf("%t", plan.CreateFile),
+		fmt.Sprintf("%d", len([]byte(plan.Content))),
+	}, "\x00")
+	sum := sha256.Sum256([]byte(value))
+	return fmt.Sprintf("%x", sum[:6])
+}
+
+func agentFileEditAttemptFingerprint(planID string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(planID)))
+	return fmt.Sprintf("%x", sum[:6])
+}
+
+func safeAgentFileEditAuditError(err error) string {
+	if err == nil {
+		return ""
+	}
+	if code, ok := apperror.CodeOf(err); ok {
+		return string(code)
+	}
+	switch {
+	case errors.Is(err, context.Canceled):
+		return string(apperror.Cancelled)
+	case errors.Is(err, context.DeadlineExceeded):
+		return string(apperror.Timeout)
+	case errors.Is(err, fs.ErrPermission):
+		return string(apperror.PermissionDenied)
+	case errors.Is(err, fs.ErrNotExist):
+		return string(apperror.NotFound)
+	default:
+		return string(apperror.Internal)
+	}
+}
+
+func agentFileEditFailedAuditError(actionErr error, auditErr error) error {
+	return apperror.Wrap(
+		apperror.Internal,
+		"Agent file edit failed and its audit outcome could not be finalized",
+		errors.Join(actionErr, auditErr),
+		apperror.WithDetail("The target file was not published, but the durable audit attempt may still appear as started."),
+		apperror.WithRepairHints("Check Cairn's audit database health before creating another file edit preview."),
+	)
 }
 
 func marshalAgentData(value any) string {

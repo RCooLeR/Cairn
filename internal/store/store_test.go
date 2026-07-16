@@ -571,6 +571,56 @@ func TestAuditListRejectsMalformedCreatedAt(t *testing.T) {
 	}
 }
 
+func TestAuditUpdateOutcomeFinalizesStartedRecordInPlace(t *testing.T) {
+	ctx := context.Background()
+	s := openMigratedStore(t, ctx)
+	defer closeStore(t, s)
+
+	id, err := s.Audit().Insert(ctx, AuditRecord{
+		Action:   "agent.file_edit",
+		TargetID: ".env",
+		Status:   "started",
+	})
+	if err != nil {
+		t.Fatalf("Insert started audit: %v", err)
+	}
+	exitCode := 0
+	if err := s.Audit().UpdateOutcome(ctx, id, AuditOutcome{
+		Status:   "success",
+		ExitCode: &exitCode,
+		Duration: 3 * time.Millisecond,
+	}); err != nil {
+		t.Fatalf("UpdateOutcome: %v", err)
+	}
+
+	entries, err := s.Audit().List(ctx, models.AuditFilter{Topic: "agent.file_edit", Limit: 10})
+	if err != nil {
+		t.Fatalf("List finalized audit: %v", err)
+	}
+	if len(entries) != 1 || entries[0].ID != id || entries[0].Result != "success" || entries[0].Error != "" {
+		t.Fatalf("finalized audit entries = %#v", entries)
+	}
+	if entries[0].Metadata["durationMS"] != int64(3) {
+		t.Fatalf("finalized audit duration = %#v, want 3", entries[0].Metadata["durationMS"])
+	}
+	if err := s.Audit().UpdateOutcome(ctx, id, AuditOutcome{Status: "cancelled", Error: "must-not-persist"}); err == nil {
+		t.Fatal("UpdateOutcome invalid terminal status succeeded, want error")
+	}
+	if err := s.Audit().UpdateOutcome(ctx, id, AuditOutcome{Status: "failed", Error: "must-not-persist"}); err == nil {
+		t.Fatal("UpdateOutcome second finalization succeeded, want error")
+	}
+	entries, err = s.Audit().List(ctx, models.AuditFilter{Topic: "agent.file_edit", Limit: 10})
+	if err != nil {
+		t.Fatalf("List audit after rejected finalizations: %v", err)
+	}
+	if len(entries) != 1 || entries[0].Result != "success" || entries[0].Error != "" || entries[0].Metadata["durationMS"] != int64(3) {
+		t.Fatalf("audit outcome changed after rejected finalizations: %#v", entries)
+	}
+	if err := s.Audit().UpdateOutcome(ctx, id+1, AuditOutcome{Status: "failed"}); err == nil {
+		t.Fatal("UpdateOutcome missing record succeeded, want error")
+	}
+}
+
 func TestAuditListEscapesTopicAndPreservesZeroDuration(t *testing.T) {
 	ctx := context.Background()
 	s := openMigratedStore(t, ctx)
