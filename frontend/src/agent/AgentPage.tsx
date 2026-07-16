@@ -71,16 +71,37 @@ type AgentToolCall = {
   toolID: string;
 };
 
+type AgentChatRequest = ReturnType<typeof AgentService.Chat>;
+
+type AgentEditTarget = {
+  operationID: number;
+  projectID: string;
+  projectName: string;
+  path: string;
+};
+
+type AgentEditPlan = {
+  plan: CommandPlan;
+  target: AgentEditTarget;
+};
+
 const defaultEndpoint = "http://127.0.0.1:11434";
 
 type AgentSessionState = {
+  activeRequest: AgentChatRequest | null;
+  activeRequestID: string | null;
+  chatError: string | null;
   lastToolResults: AgentToolResult[];
   messages: ChatMessage[];
   mode: AgentMode;
   pendingToolCall: AgentToolCall | null;
   projectID: string;
   prompt: string;
+  sending: boolean;
+  attachRequest: (requestID: string, request: AgentChatRequest) => void;
+  beginRequest: (requestID: string) => boolean;
   clearConversation: () => void;
+  finishRequest: (requestID: string) => void;
   setLastToolResults: (
     next:
       | AgentToolResult[]
@@ -93,25 +114,53 @@ type AgentSessionState = {
   setPendingToolCall: (call: AgentToolCall | null) => void;
   setProjectID: (projectID: string) => void;
   setPrompt: (prompt: string) => void;
+  setChatError: (error: string | null) => void;
 };
 
 const initialAgentSession = {
+  activeRequest: null as AgentChatRequest | null,
+  activeRequestID: null as string | null,
+  chatError: null as string | null,
   lastToolResults: [] as AgentToolResult[],
   messages: [] as ChatMessage[],
   mode: "ask" as AgentMode,
   pendingToolCall: null as AgentToolCall | null,
   projectID: "",
   prompt: "",
+  sending: false,
 };
 
-const useAgentSessionStore = create<AgentSessionState>((set) => ({
+const useAgentSessionStore = create<AgentSessionState>((set, get) => ({
   ...initialAgentSession,
+  attachRequest: (requestID, activeRequest) => {
+    if (get().activeRequestID === requestID) {
+      set({ activeRequest });
+    }
+  },
+  beginRequest: (activeRequestID) => {
+    if (get().activeRequestID) {
+      return false;
+    }
+    set({
+      activeRequest: null,
+      activeRequestID,
+      chatError: null,
+      sending: true,
+    });
+    return true;
+  },
   clearConversation: () =>
     set({
+      chatError: null,
       lastToolResults: [],
       messages: [],
       pendingToolCall: null,
     }),
+  finishRequest: (requestID) => {
+    if (get().activeRequestID === requestID) {
+      set({ activeRequest: null, activeRequestID: null, sending: false });
+    }
+  },
   setLastToolResults: (next) =>
     set((state) => ({
       lastToolResults:
@@ -125,9 +174,13 @@ const useAgentSessionStore = create<AgentSessionState>((set) => ({
   setPendingToolCall: (pendingToolCall) => set({ pendingToolCall }),
   setProjectID: (projectID) => set({ projectID }),
   setPrompt: (prompt) => set({ prompt }),
+  setChatError: (chatError) => set({ chatError }),
 }));
 
 export function resetAgentSessionForTest() {
+  void useAgentSessionStore
+    .getState()
+    .activeRequest?.cancel?.("Agent test session reset");
   useAgentSessionStore.setState({
     ...initialAgentSession,
   });
@@ -144,7 +197,6 @@ export function AgentPage({ projects }: AgentPageProps) {
   const [analysis, setAnalysis] = useState<AgentProjectAnalysis | null>(null);
   const [loadingStatus, setLoadingStatus] = useState(true);
   const [analysisLoading, setAnalysisLoading] = useState(false);
-  const [sending, setSending] = useState(false);
   const [savingKey, setSavingKey] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [editPath, setEditPath] = useState(".env");
@@ -152,30 +204,38 @@ export function AgentPage({ projects }: AgentPageProps) {
     "Create/update placeholders for detected app environment variables.",
   );
   const [editContent, setEditContent] = useState("");
-  const [editPlan, setEditPlan] = useState<CommandPlan | null>(null);
+  const [editPlan, setEditPlan] = useState<AgentEditPlan | null>(null);
   const [editResult, setEditResult] = useState<AgentFileEditResult | null>(
     null,
   );
   const [editBusy, setEditBusy] = useState(false);
   const [editError, setEditError] = useState<string | null>(null);
-  const requestRef = useRef<ReturnType<typeof AgentService.Chat> | null>(null);
-  const stoppedRef = useRef(false);
   const transcriptRef = useRef<HTMLDivElement | null>(null);
   const autoLoadedAnalysisProjectRef = useRef<string | null>(null);
+  const analysisGenerationRef = useRef(0);
+  const editOperationGenerationRef = useRef(0);
+  const editPathRef = useRef(editPath);
+  const mountedRef = useRef(true);
   const {
+    attachRequest,
+    beginRequest,
+    chatError,
     clearConversation,
+    finishRequest,
     lastToolResults,
     messages,
     mode,
     pendingToolCall,
     projectID,
     prompt,
+    sending,
     setLastToolResults,
     setMessages,
     setMode,
     setPendingToolCall,
     setProjectID,
     setPrompt,
+    setChatError,
   } = useAgentSessionStore();
 
   const selectedProject = projects.find((project) => project.id === projectID);
@@ -206,6 +266,13 @@ export function AgentPage({ projects }: AgentPageProps) {
         : undefined,
     [pendingToolCall, toolCatalog],
   );
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     const transcript = transcriptRef.current;
@@ -291,24 +358,48 @@ export function AgentPage({ projects }: AgentPageProps) {
       if (!targetProjectID) {
         return;
       }
+      const generation = analysisGenerationRef.current + 1;
+      analysisGenerationRef.current = generation;
       autoLoadedAnalysisProjectRef.current = targetProjectID;
       setAnalysisLoading(true);
       setEditError(null);
       try {
         const nextAnalysis = await AgentService.AnalyzeProject(targetProjectID);
-        setAnalysis(nextAnalysis);
+        if (nextAnalysis && nextAnalysis.projectID !== targetProjectID) {
+          throw new Error("Project analysis returned for a different project");
+        }
+        if (
+          analysisGenerationRef.current === generation &&
+          useAgentSessionStore.getState().projectID === targetProjectID
+        ) {
+          setAnalysis(nextAnalysis);
+        }
       } catch (nextError) {
-        setEditError(errorMessage(nextError, "Unable to analyze project"));
+        if (
+          analysisGenerationRef.current === generation &&
+          useAgentSessionStore.getState().projectID === targetProjectID
+        ) {
+          setEditError(errorMessage(nextError, "Unable to analyze project"));
+        }
       } finally {
-        setAnalysisLoading(false);
+        if (
+          analysisGenerationRef.current === generation &&
+          useAgentSessionStore.getState().projectID === targetProjectID
+        ) {
+          setAnalysisLoading(false);
+        }
       }
     },
     [projectID],
   );
 
   const changeProject = (nextProjectID: string) => {
+    analysisGenerationRef.current += 1;
+    editOperationGenerationRef.current += 1;
     setProjectID(nextProjectID);
     setAnalysis(null);
+    setAnalysisLoading(false);
+    setEditBusy(false);
     setEditPlan(null);
     setEditResult(null);
     setEditError(null);
@@ -330,8 +421,37 @@ export function AgentPage({ projects }: AgentPageProps) {
     void loadProjectAnalysis(projectID);
   }, [analysis, analysisLoading, loadProjectAnalysis, projectID]);
 
+  const nextEditTarget = (): AgentEditTarget | null => {
+    const path = editPath.trim();
+    const project = projects.find((item) => item.id === projectID);
+    if (!projectID || !path || !project) {
+      return null;
+    }
+    const operationID = editOperationGenerationRef.current + 1;
+    editOperationGenerationRef.current = operationID;
+    return {
+      operationID,
+      projectID,
+      projectName: project.name,
+      path,
+    };
+  };
+
+  const isCurrentEditTarget = (target: AgentEditTarget, requirePath = true) =>
+    editOperationGenerationRef.current === target.operationID &&
+    useAgentSessionStore.getState().projectID === target.projectID &&
+    (!requirePath || editPathRef.current.trim() === target.path);
+
+  const invalidateEditOperation = () => {
+    editOperationGenerationRef.current += 1;
+    setEditBusy(false);
+    setEditPlan(null);
+    setEditResult(null);
+  };
+
   const draftProjectFile = async () => {
-    if (!projectID || !editPath.trim() || !editInstruction.trim()) {
+    const target = nextEditTarget();
+    if (!target || !editInstruction.trim()) {
       return;
     }
     setEditBusy(true);
@@ -340,30 +460,45 @@ export function AgentPage({ projects }: AgentPageProps) {
     setEditResult(null);
     try {
       const draft = await AgentService.DraftProjectFile({
-        projectID,
-        path: editPath.trim(),
+        projectID: target.projectID,
+        path: target.path,
         instruction: editInstruction.trim(),
       });
+      if (
+        draft &&
+        (draft.projectID !== target.projectID || draft.path !== target.path)
+      ) {
+        throw new Error("Draft returned for a different project or file");
+      }
+      if (!isCurrentEditTarget(target)) {
+        return;
+      }
       setEditContent(draft?.content ?? "");
       if (draft?.path) {
         setEditPath(draft.path);
+        editPathRef.current = draft.path;
       }
       setLastToolResults([
         {
           toolID: "agent.draft_file",
           title: "Draft file",
-          summary: draft?.path ?? editPath.trim(),
+          summary: draft?.path ?? target.path,
         },
       ]);
     } catch (nextError) {
-      setEditError(errorMessage(nextError, "Unable to draft file"));
+      if (isCurrentEditTarget(target)) {
+        setEditError(errorMessage(nextError, "Unable to draft file"));
+      }
     } finally {
-      setEditBusy(false);
+      if (isCurrentEditTarget(target, false)) {
+        setEditBusy(false);
+      }
     }
   };
 
   const previewFileEdit = async () => {
-    if (!projectID || !editPath.trim() || !editContent.trim()) {
+    const target = nextEditTarget();
+    if (!target || !editContent.trim()) {
       return;
     }
     setEditBusy(true);
@@ -371,16 +506,22 @@ export function AgentPage({ projects }: AgentPageProps) {
     setEditResult(null);
     try {
       const plan = await AgentService.PlanFileEdit({
-        projectID,
-        path: editPath.trim(),
+        projectID: target.projectID,
+        path: target.path,
         content: editContent,
         reason: editInstruction.trim(),
       });
-      setEditPlan(plan);
+      if (plan && isCurrentEditTarget(target)) {
+        setEditPlan({ plan, target });
+      }
     } catch (nextError) {
-      setEditError(errorMessage(nextError, "Unable to preview file edit"));
+      if (isCurrentEditTarget(target)) {
+        setEditError(errorMessage(nextError, "Unable to preview file edit"));
+      }
     } finally {
-      setEditBusy(false);
+      if (isCurrentEditTarget(target)) {
+        setEditBusy(false);
+      }
     }
   };
 
@@ -388,10 +529,31 @@ export function AgentPage({ projects }: AgentPageProps) {
     if (!editPlan) {
       return;
     }
+    if (
+      useAgentSessionStore.getState().projectID !== editPlan.target.projectID ||
+      editPathRef.current.trim() !== editPlan.target.path
+    ) {
+      setEditPlan(null);
+      setEditError("The edit target changed. Preview the file again.");
+      return;
+    }
+    const operationID = editOperationGenerationRef.current + 1;
+    editOperationGenerationRef.current = operationID;
+    const target = { ...editPlan.target, operationID };
+    const plan = editPlan.plan;
     setEditBusy(true);
     setEditError(null);
     try {
-      const result = await AgentService.ApplyFileEdit(editPlan.planID, "");
+      const result = await AgentService.ApplyFileEdit(plan.planID, "");
+      if (
+        result &&
+        (result.projectID !== target.projectID || result.path !== target.path)
+      ) {
+        throw new Error("Edit result returned for a different project or file");
+      }
+      if (!isCurrentEditTarget(target)) {
+        return;
+      }
       setEditResult(result);
       setEditPlan(null);
       setLastToolResults([
@@ -403,13 +565,15 @@ export function AgentPage({ projects }: AgentPageProps) {
             : "",
         },
       ]);
-      if (projectID) {
-        void loadProjectAnalysis(projectID);
-      }
+      void loadProjectAnalysis(target.projectID);
     } catch (nextError) {
-      setEditError(errorMessage(nextError, "Unable to apply file edit"));
+      if (isCurrentEditTarget(target)) {
+        setEditError(errorMessage(nextError, "Unable to apply file edit"));
+      }
     } finally {
-      setEditBusy(false);
+      if (isCurrentEditTarget(target)) {
+        setEditBusy(false);
+      }
     }
   };
 
@@ -418,7 +582,10 @@ export function AgentPage({ projects }: AgentPageProps) {
     if (!canSend || !text) {
       return;
     }
-    stoppedRef.current = false;
+    const requestID = crypto.randomUUID();
+    if (!beginRequest(requestID)) {
+      return;
+    }
     setPendingToolCall(null);
     setToolError(null);
     const userMessage: ChatMessage = {
@@ -428,18 +595,18 @@ export function AgentPage({ projects }: AgentPageProps) {
     };
     setMessages((current) => [...current, userMessage]);
     setPrompt("");
-    setSending(true);
     setError(null);
+    setChatError(null);
 
-    const request = AgentService.Chat({
-      prompt: buildAgentPrompt(mode, messages, text, toolCatalog),
-      scope: { projectID: projectID || undefined },
-      toolIDs: shouldUseAgentToolContext(text) ? undefined : [],
-    });
-    requestRef.current = request;
     try {
+      const request = AgentService.Chat({
+        prompt: buildAgentPrompt(mode, messages, text, toolCatalog),
+        scope: { projectID: projectID || undefined },
+        toolIDs: shouldUseAgentToolContext(text) ? undefined : [],
+      });
+      attachRequest(requestID, request);
       const response = await request;
-      if (stoppedRef.current) {
+      if (useAgentSessionStore.getState().activeRequestID !== requestID) {
         return;
       }
       setLastToolResults(response?.toolResults ?? []);
@@ -448,7 +615,7 @@ export function AgentPage({ projects }: AgentPageProps) {
       if (parsed.call) {
         setPendingToolCall(parsed.call);
       }
-      if (response?.model) {
+      if (response?.model && mountedRef.current) {
         setModel(response.model);
         setStatus((current) =>
           current
@@ -457,23 +624,23 @@ export function AgentPage({ projects }: AgentPageProps) {
         );
       }
     } catch (nextError) {
-      if (!stoppedRef.current) {
-        setError(errorMessage(nextError, "Local agent request failed"));
+      if (useAgentSessionStore.getState().activeRequestID === requestID) {
+        setChatError(errorMessage(nextError, "Local agent request failed"));
       }
     } finally {
-      if (!stoppedRef.current) {
-        setSending(false);
-      }
-      requestRef.current = null;
+      finishRequest(requestID);
     }
   };
 
   const stopPrompt = () => {
-    stoppedRef.current = true;
-    void requestRef.current?.cancel?.("Stopped by user");
-    requestRef.current = null;
-    setSending(false);
-    setMessages((current) => [
+    const session = useAgentSessionStore.getState();
+    if (!session.activeRequestID) {
+      return;
+    }
+    const requestID = session.activeRequestID;
+    void session.activeRequest?.cancel?.("Stopped by user");
+    session.finishRequest(requestID);
+    session.setMessages((current) => [
       ...current,
       {
         id: crypto.randomUUID(),
@@ -507,6 +674,7 @@ export function AgentPage({ projects }: AgentPageProps) {
       return;
     }
     const call = pendingToolCall;
+    let followupRequestID: string | null = null;
     setToolBusy(true);
     setToolError(null);
     try {
@@ -530,7 +698,10 @@ export function AgentPage({ projects }: AgentPageProps) {
       const nextMessages = [...messages, toolMessage];
       setMessages(nextMessages);
       setPendingToolCall(null);
-      setSending(true);
+      followupRequestID = crypto.randomUUID();
+      if (!beginRequest(followupRequestID)) {
+        throw new Error("Another Agent request is already running");
+      }
       const request = AgentService.Chat({
         prompt: buildAgentPrompt(
           mode,
@@ -541,9 +712,11 @@ export function AgentPage({ projects }: AgentPageProps) {
         scope: { projectID: projectID || undefined },
         toolIDs: [],
       });
-      requestRef.current = request;
+      attachRequest(followupRequestID, request);
       const response = await request;
-      if (stoppedRef.current) {
+      if (
+        useAgentSessionStore.getState().activeRequestID !== followupRequestID
+      ) {
         return;
       }
       const parsed = parseAgentToolRequest(response?.message ?? "");
@@ -551,17 +724,23 @@ export function AgentPage({ projects }: AgentPageProps) {
       if (parsed.call) {
         setPendingToolCall(parsed.call);
       }
-      if (response?.model) {
+      if (response?.model && mountedRef.current) {
         setModel(response.model);
       }
     } catch (nextError) {
-      setToolError(errorMessage(nextError, "Agent tool failed"));
-    } finally {
-      if (!stoppedRef.current) {
-        setSending(false);
+      if (
+        !followupRequestID ||
+        useAgentSessionStore.getState().activeRequestID === followupRequestID
+      ) {
+        setToolError(errorMessage(nextError, "Agent tool failed"));
       }
-      setToolBusy(false);
-      requestRef.current = null;
+    } finally {
+      if (followupRequestID) {
+        finishRequest(followupRequestID);
+      }
+      if (mountedRef.current) {
+        setToolBusy(false);
+      }
     }
   };
 
@@ -651,6 +830,7 @@ export function AgentPage({ projects }: AgentPageProps) {
               value={model}
             />
             <AgentSelect
+              disabled={editBusy}
               label="Project"
               onChange={changeProject}
               options={[
@@ -667,9 +847,9 @@ export function AgentPage({ projects }: AgentPageProps) {
               {status.error}
             </div>
           ) : null}
-          {error ? (
+          {error || chatError ? (
             <div className="rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
-              {error}
+              {error ?? chatError}
             </div>
           ) : null}
         </CardBody>
@@ -797,12 +977,18 @@ export function AgentPage({ projects }: AgentPageProps) {
             onPreview={() => {
               void previewFileEdit();
             }}
-            onSetContent={setEditContent}
-            onSetInstruction={setEditInstruction}
+            onSetContent={(content) => {
+              invalidateEditOperation();
+              setEditContent(content);
+            }}
+            onSetInstruction={(instruction) => {
+              invalidateEditOperation();
+              setEditInstruction(instruction);
+            }}
             onSetPath={(path) => {
+              invalidateEditOperation();
               setEditPath(path);
-              setEditPlan(null);
-              setEditResult(null);
+              editPathRef.current = path;
             }}
             project={selectedProject}
           />
@@ -849,7 +1035,7 @@ function ProjectConfigPanel({
   editError: string | null;
   editInstruction: string;
   editPath: string;
-  editPlan: CommandPlan | null;
+  editPlan: AgentEditPlan | null;
   editResult: AgentFileEditResult | null;
   onAnalyze: () => void;
   onApply: () => void;
@@ -943,6 +1129,7 @@ function ProjectConfigPanel({
           </span>
           <input
             className="mt-1 h-9 w-full rounded-control border border-border bg-bg-card px-3 text-sm text-text-primary outline-none focus:border-accent"
+            disabled={editBusy}
             onChange={(event) => onSetPath(event.target.value)}
             placeholder=".env"
             value={editPath}
@@ -954,6 +1141,7 @@ function ProjectConfigPanel({
           </span>
           <input
             className="mt-1 h-9 w-full rounded-control border border-border bg-bg-card px-3 text-sm text-text-primary outline-none focus:border-accent"
+            disabled={editBusy}
             onChange={(event) => onSetInstruction(event.target.value)}
             placeholder="Draft Compose env settings with safe placeholders"
             value={editInstruction}
@@ -963,6 +1151,7 @@ function ProjectConfigPanel({
 
       <textarea
         className="mt-3 min-h-36 w-full resize-y rounded-control border border-border bg-bg-card px-3 py-2 font-mono text-xs text-text-primary outline-none focus:border-accent"
+        disabled={editBusy}
         onChange={(event) => onSetContent(event.target.value)}
         placeholder="Drafted or manually edited file content appears here."
         value={editContent}
@@ -980,7 +1169,9 @@ function ProjectConfigPanel({
       ) : null}
       {editPlan ? (
         <div className="mt-2 rounded-card border border-warn/30 bg-warn/10 px-3 py-2 text-sm text-warn">
-          Preview ready: {editPlan.title}. {editPlan.effects?.join(" ")}
+          Preview ready for {editPlan.target.projectName} /{" "}
+          {editPlan.target.path}: {editPlan.plan.title}.{" "}
+          {editPlan.plan.effects?.join(" ")}
         </div>
       ) : null}
 

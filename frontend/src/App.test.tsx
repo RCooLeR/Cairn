@@ -10,6 +10,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { InventorySnapshot } from "./api/inventory";
 import type {
+  AgentChatResponse,
+  AgentProjectAnalysis,
   BackupSummary,
   ContainerSummary,
   CommandPlan,
@@ -237,6 +239,16 @@ const imageLineageServiceMock = vi.hoisted(() => ({
 const appApiMock = vi.hoisted(() => ({
   getAppVersion: vi.fn(),
 }));
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, reject, resolve };
+}
 
 vi.mock("./api/app", () => ({
   getAppVersion: appApiMock.getAppVersion,
@@ -858,6 +870,161 @@ describe("App inventory shell", () => {
       within(transcript).getByText("Persistent agent answer."),
     ).toBeInTheDocument();
     expect(agentServiceMock.Chat).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps Agent request ownership and Stop control across navigation", async () => {
+    const firstResponse = deferred<AgentChatResponse>();
+    const secondResponse = deferred<AgentChatResponse>();
+    const cancelFirst = vi.fn();
+    const firstRequest = Object.assign(firstResponse.promise, {
+      cancel: cancelFirst,
+    });
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    agentServiceMock.Chat.mockReturnValueOnce(firstRequest).mockReturnValueOnce(
+      secondResponse.promise,
+    );
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    const nav = screen.getByRole("navigation", { name: "Main navigation" });
+    fireEvent.click(within(nav).getByRole("button", { name: /Agent/ }));
+    let input = await screen.findByPlaceholderText("Ask a Docker question...");
+    fireEvent.change(input, { target: { value: "First request" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(agentServiceMock.Chat).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(within(nav).getByRole("button", { name: /Projects/ }));
+    await screen.findByRole("heading", { name: "Projects" });
+    fireEvent.click(within(nav).getByRole("button", { name: /Agent/ }));
+    const stop = await screen.findByRole("button", { name: "Stop" });
+    fireEvent.click(stop);
+    expect(cancelFirst).toHaveBeenCalledWith("Stopped by user");
+
+    input = await screen.findByPlaceholderText("Ask a Docker question...");
+    fireEvent.change(input, { target: { value: "Second request" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(agentServiceMock.Chat).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      secondResponse.resolve({
+        message: "Current second response.",
+        toolResults: [],
+        model: "gemma4:12b-it-q8_0",
+      });
+      await secondResponse.promise;
+    });
+    expect(
+      await screen.findByText("Current second response."),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      firstResponse.resolve({
+        message: "Obsolete first response.",
+        toolResults: [],
+        model: "gemma4:12b-it-q8_0",
+      });
+      await firstResponse.promise;
+    });
+    expect(
+      screen.queryByText("Obsolete first response."),
+    ).not.toBeInTheDocument();
+  });
+
+  it("ignores Agent analysis that resolves for an obsolete project", async () => {
+    const projectA = seededProject();
+    const projectB = alternateProject();
+    const analysisA = deferred<AgentProjectAnalysis>();
+    const analysisB = deferred<AgentProjectAnalysis>();
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValue([projectA, projectB]);
+    agentServiceMock.AnalyzeProject.mockImplementation((projectID: string) =>
+      projectID === projectA.id ? analysisA.promise : analysisB.promise,
+    );
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Agent/ }),
+    );
+    const projectSelect = await screen.findByLabelText("Project");
+    fireEvent.change(projectSelect, { target: { value: projectA.id } });
+    await waitFor(() =>
+      expect(agentServiceMock.AnalyzeProject).toHaveBeenCalledWith(projectA.id),
+    );
+    fireEvent.change(projectSelect, { target: { value: projectB.id } });
+    await waitFor(() =>
+      expect(agentServiceMock.AnalyzeProject).toHaveBeenCalledWith(projectB.id),
+    );
+
+    await act(async () => {
+      analysisA.resolve(projectAnalysisFor(projectA, "Stale A stack"));
+      await analysisA.promise;
+    });
+    expect(screen.queryByText("Stale A stack")).not.toBeInTheDocument();
+
+    await act(async () => {
+      analysisB.resolve(projectAnalysisFor(projectB, "Current B stack"));
+      await analysisB.promise;
+    });
+    expect(await screen.findByText("Current B stack")).toBeInTheDocument();
+  });
+
+  it("locks Agent edit targets in flight and invalidates plans on target changes", async () => {
+    const projectA = seededProject();
+    const projectB = alternateProject();
+    const planRequest = deferred<CommandPlan>();
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValue([projectA, projectB]);
+    agentServiceMock.PlanFileEdit.mockReturnValueOnce(planRequest.promise);
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Agent/ }),
+    );
+    const projectSelect = await screen.findByLabelText("Project");
+    fireEvent.change(projectSelect, { target: { value: projectA.id } });
+    fireEvent.click(await screen.findByText("Project config tools"));
+    const content = screen.getByPlaceholderText(
+      "Drafted or manually edited file content appears here.",
+    );
+    fireEvent.change(content, { target: { value: "APP_PORT=8080\n" } });
+    fireEvent.click(screen.getByRole("button", { name: "Preview edit" }));
+    await waitFor(() =>
+      expect(agentServiceMock.PlanFileEdit).toHaveBeenCalledWith({
+        projectID: projectA.id,
+        path: ".env",
+        content: "APP_PORT=8080\n",
+        reason:
+          "Create/update placeholders for detected app environment variables.",
+      }),
+    );
+    expect(projectSelect).toBeDisabled();
+    expect(screen.getByLabelText("File")).toBeDisabled();
+    expect(content).toBeDisabled();
+
+    await act(async () => {
+      planRequest.resolve(agentFileEditPlan());
+      await planRequest.promise;
+    });
+    expect(
+      await screen.findByText(/Preview ready for app-db \/ \.env:/),
+    ).toBeInTheDocument();
+    expect(projectSelect).not.toBeDisabled();
+
+    fireEvent.change(projectSelect, { target: { value: projectB.id } });
+    expect(
+      screen.queryByText(/Preview ready for app-db \/ \.env:/),
+    ).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Apply edit" })).toBeDisabled();
+    expect(agentServiceMock.ApplyFileEdit).not.toHaveBeenCalled();
   });
 
   it("does not convert ordinary agent bullets into plan items", async () => {
@@ -1709,6 +1876,68 @@ describe("App inventory shell", () => {
     expect(screen.getByText("Project Volumes")).toBeInTheDocument();
     expect(screen.getByText("cairn_data")).toBeInTheDocument();
     expect(screen.getByText("success")).toBeInTheDocument();
+  });
+
+  it("keeps project detail and actions bound to the latest requested project", async () => {
+    const projectA = seededProject();
+    const projectB = alternateProject();
+    const detailA = deferred<ProjectDetail>();
+    const detailB = deferred<ProjectDetail>();
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValue([projectA, projectB]);
+    projectServiceMock.GetProject.mockImplementation((projectID: string) => {
+      if (projectID === projectA.id) {
+        return detailA.promise;
+      }
+      if (projectID === projectB.id) {
+        return detailB.promise;
+      }
+      return Promise.resolve(null);
+    });
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    const nav = screen.getByRole("navigation", { name: "Main navigation" });
+    fireEvent.click(
+      (await screen.findAllByRole("button", { name: /app-db/ }))[0],
+    );
+    fireEvent.click(within(nav).getByRole("button", { name: /Projects/ }));
+    await waitFor(() =>
+      expect(projectServiceMock.GetProject).toHaveBeenCalledWith(projectA.id),
+    );
+
+    fireEvent.click(within(nav).getByRole("button", { name: /Overview/ }));
+    fireEvent.click(
+      (await screen.findAllByRole("button", { name: /api-worker/ }))[0],
+    );
+    fireEvent.click(within(nav).getByRole("button", { name: /Projects/ }));
+    await waitFor(() =>
+      expect(projectServiceMock.GetProject).toHaveBeenCalledWith(projectB.id),
+    );
+
+    await act(async () => {
+      detailB.resolve(projectDetailFor(projectB));
+      await detailB.promise;
+    });
+    expect(
+      await screen.findByRole("heading", { name: projectB.name }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Stop" }));
+    await waitFor(() =>
+      expect(projectServiceMock.StopProject).toHaveBeenCalledWith(projectB.id),
+    );
+
+    await act(async () => {
+      detailA.resolve(projectDetailFor(projectA));
+      await detailA.promise;
+    });
+    expect(
+      screen.getByRole("heading", { name: projectB.name }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: projectA.name }),
+    ).not.toBeInTheDocument();
   });
 
   it("drills into project containers with logs, files, inspect, and terminal actions", async () => {
@@ -2776,6 +3005,82 @@ describe("App inventory shell", () => {
     );
   });
 
+  it("does not merge a closed restore request into a newly opened volume", async () => {
+    const snapshot = seededSnapshot();
+    const volumeA = snapshot.volumes[0]!;
+    const volumeB: VolumeSummary = {
+      ...volumeA,
+      name: "api_worker_data",
+      mountpoint: "/var/lib/docker/volumes/api_worker_data/_data",
+    };
+    const backupsA = deferred<BackupSummary[]>();
+    const backupsB = deferred<BackupSummary[]>();
+    const backupA = seededBackup();
+    const backupB: BackupSummary = {
+      ...seededBackup(),
+      id: "backup-api-worker",
+      volumeName: volumeB.name,
+      path: "/tmp/cairn-backups/api_worker_data.tar.gz",
+      metadataPath: "/tmp/cairn-backups/api_worker_data.json",
+    };
+    inventoryMock.getInventorySnapshot.mockResolvedValue({
+      ...snapshot,
+      volumes: [volumeA, volumeB],
+    });
+    backupServiceMock.ListBackups.mockImplementation(
+      (request?: { volumeName?: string }) => {
+        if (request?.volumeName === volumeA.name) {
+          return backupsA.promise;
+        }
+        if (request?.volumeName === volumeB.name) {
+          return backupsB.promise;
+        }
+        return Promise.resolve([]);
+      },
+    );
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Volumes/ }),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: `Restore ${volumeA.name}` }),
+    );
+    const dialogA = await screen.findByRole("dialog", {
+      name: "Restore Volume",
+    });
+    fireEvent.click(within(dialogA).getByRole("button", { name: "Close" }));
+    fireEvent.click(
+      screen.getByRole("button", { name: `Restore ${volumeB.name}` }),
+    );
+    const dialogB = await screen.findByRole("dialog", {
+      name: "Restore Volume",
+    });
+
+    await act(async () => {
+      backupsA.resolve([backupA]);
+      await backupsA.promise;
+    });
+    expect(
+      within(dialogB).queryByRole("option", { name: /cairn_data/ }),
+    ).not.toBeInTheDocument();
+    expect(within(dialogB).getByLabelText("Backup")).toHaveDisplayValue(
+      "Loading backups...",
+    );
+
+    await act(async () => {
+      backupsB.resolve([backupB]);
+      await backupsB.promise;
+    });
+    expect(
+      await within(dialogB).findByRole("option", { name: /api_worker_data/ }),
+    ).toBeInTheDocument();
+  });
+
   it("renders empty states when the daemon has no objects", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(emptySnapshot());
 
@@ -2938,6 +3243,11 @@ describe("App inventory shell", () => {
         "plan-wsl-install",
       ),
     );
+    expect(
+      within(dialog).getByRole("button", { name: "Close" }),
+    ).toBeDisabled();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(dialog).toBeInTheDocument();
     const welcomeStep = within(dialog).getByRole("button", { name: /Welcome/ });
     expect(welcomeStep).toHaveAttribute("aria-disabled", "true");
     expect(welcomeStep).not.toBeDisabled();
@@ -2953,6 +3263,210 @@ describe("App inventory shell", () => {
     expect(
       await within(dialog).findByText("Windows WSL backend is ready"),
     ).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: "Close" }),
+    ).not.toBeDisabled();
+  });
+
+  it("locks provider setup navigation while install planning is pending", async () => {
+    const planRequest = deferred<CommandPlan>();
+    inventoryMock.getInventorySnapshot.mockResolvedValue(noProviderSnapshot());
+    providerServiceMock.Detect.mockResolvedValueOnce({
+      ...healthyProviderStatus(),
+      installed: false,
+      running: false,
+      healthy: false,
+      dockerInstalled: false,
+      dockerRunning: false,
+      composeInstalled: false,
+      buildxInstalled: false,
+      problems: [
+        {
+          code: "WSL_MISSING",
+          message: "WSL is not installed.",
+          repairHint: "Install WSL 2 with an Ubuntu distribution.",
+          recoverable: true,
+        },
+      ],
+    });
+    providerServiceMock.PlanInstall.mockReturnValueOnce(planRequest.promise);
+
+    render(<App />);
+
+    expect(
+      await screen.findByText("No Docker provider configured"),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole("button", { name: "Set up" })[0]);
+    const firstDialog = await screen.findByRole("dialog", {
+      name: "Set Up Docker Backend",
+    });
+    fireEvent.click(
+      within(firstDialog).getByRole("button", { name: "Get started" }),
+    );
+    fireEvent.click(
+      within(firstDialog).getByRole("button", { name: /Ubuntu on WSL2/ }),
+    );
+    fireEvent.click(
+      within(firstDialog).getByRole("button", { name: "Run checks" }),
+    );
+    expect(
+      await within(firstDialog).findByText(
+        "Install WSL 2 with an Ubuntu distribution.",
+      ),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      within(firstDialog).getByRole("button", { name: "Review auto repair" }),
+    );
+    await waitFor(() =>
+      expect(providerServiceMock.PlanInstall).toHaveBeenCalledTimes(1),
+    );
+    expect(
+      within(firstDialog).getByRole("button", { name: "Close" }),
+    ).toBeDisabled();
+    expect(
+      within(firstDialog).getByRole("button", { name: /Backend/ }),
+    ).toHaveAttribute("aria-disabled", "true");
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(firstDialog).toBeInTheDocument();
+
+    await act(async () => {
+      planRequest.resolve(wslInstallPlan());
+      await planRequest.promise;
+    });
+    expect(
+      await within(firstDialog).findByText(
+        "wsl.exe --install Ubuntu --name cairn-dev",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(firstDialog).getByRole("button", { name: "Close" }),
+    ).not.toBeDisabled();
+  });
+
+  it("locks setup and commits project detection only for the active session", async () => {
+    const currentProject = seededProject();
+    const detectedProject = alternateProject();
+    const detection = deferred<ProjectSummary[]>();
+    inventoryMock.getInventorySnapshot.mockResolvedValue(noProviderSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValueOnce([
+      currentProject,
+    ]).mockReturnValueOnce(detection.promise);
+
+    render(<App />);
+
+    expect(
+      await screen.findByText("No Docker provider configured"),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole("button", { name: "Set up" })[0]);
+    const dialog = await screen.findByRole("dialog", {
+      name: "Set Up Docker Backend",
+    });
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Get started" }),
+    );
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: /Ubuntu on WSL2/ }),
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: "Run checks" }));
+    expect(
+      await within(dialog).findByText("Windows WSL backend is ready"),
+    ).toBeInTheDocument();
+
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Detect projects" }),
+    );
+    await waitFor(() =>
+      expect(projectServiceMock.RefreshProjects).toHaveBeenCalledTimes(2),
+    );
+    expect(
+      within(dialog).getByRole("button", { name: "Close" }),
+    ).toBeDisabled();
+    expect(
+      within(dialog).getByRole("button", { name: /Backend/ }),
+    ).toHaveAttribute("aria-disabled", "true");
+    expect(
+      within(dialog).getByRole("button", { name: "Add folder..." }),
+    ).toBeDisabled();
+    expect(screen.queryByText(detectedProject.name)).not.toBeInTheDocument();
+
+    await act(async () => {
+      detection.resolve([detectedProject]);
+      await detection.promise;
+    });
+    expect(
+      await within(dialog).findByText("Found 1 Compose project"),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByText(detectedProject.name)).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: "Close" }),
+    ).not.toBeDisabled();
+  });
+
+  it("locks setup settings while Colima checks persist sequentially", async () => {
+    const firstSetting = deferred<void>();
+    Object.defineProperty(window.navigator, "platform", {
+      configurable: true,
+      value: "MacIntel",
+    });
+    inventoryMock.getInventorySnapshot.mockResolvedValue(noProviderSnapshot());
+    settingsServiceMock.SetSetting.mockImplementation((key: string) =>
+      key === "macos.colima_profile"
+        ? firstSetting.promise
+        : Promise.resolve(undefined),
+    );
+
+    render(<App />);
+
+    expect(
+      await screen.findByText("No Docker provider configured"),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole("button", { name: "Set up" })[0]);
+    const dialog = await screen.findByRole("dialog", {
+      name: "Set Up Docker Backend",
+    });
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Get started" }),
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: /Colima/ }));
+    fireEvent.click(within(dialog).getByRole("button", { name: "Run checks" }));
+    await waitFor(() =>
+      expect(settingsServiceMock.SetSetting).toHaveBeenCalledWith(
+        "macos.colima_profile",
+        "default",
+      ),
+    );
+
+    expect(
+      within(dialog).getByRole("button", { name: "Close" }),
+    ).toBeDisabled();
+    expect(within(dialog).getByLabelText("Profile")).toBeDisabled();
+    expect(within(dialog).getByLabelText("CPU")).toBeDisabled();
+    expect(
+      within(dialog).getByRole("button", { name: /Backend/ }),
+    ).toHaveAttribute("aria-disabled", "true");
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(dialog).toBeInTheDocument();
+
+    await act(async () => {
+      firstSetting.resolve();
+      await firstSetting.promise;
+    });
+    await waitFor(() =>
+      expect(providerServiceMock.Detect).toHaveBeenCalledWith("macos_colima"),
+    );
+    expect(
+      settingsServiceMock.SetSetting.mock.calls
+        .filter(([key]) => String(key).startsWith("macos.colima_"))
+        .map(([key]) => key),
+    ).toEqual([
+      "macos.colima_profile",
+      "macos.colima_cpu",
+      "macos.colima_memory_gb",
+      "macos.colima_disk_gb",
+    ]);
+    expect(
+      within(dialog).getByRole("button", { name: "Close" }),
+    ).not.toBeDisabled();
   });
 
   it("opens existing Docker context setup from the onboarding shortcut", async () => {
@@ -4363,6 +4877,16 @@ function seededProject(): ProjectSummary {
   };
 }
 
+function alternateProject(): ProjectSummary {
+  return {
+    ...seededProject(),
+    id: "linux_native/api-worker",
+    name: "api-worker",
+    workingDir:
+      "E:\\Development\\projects\\apps\\rcooler\\Cairn\\testdata\\projects\\api-worker",
+  };
+}
+
 function seededBrokenProject(): ProjectSummary {
   return {
     ...seededProject(),
@@ -4451,6 +4975,35 @@ function seededProjectDetail(): ProjectDetail {
       valid: true,
       errors: [],
     },
+  };
+}
+
+function projectDetailFor(project: ProjectSummary): ProjectDetail {
+  const detail = seededProjectDetail();
+  return {
+    ...detail,
+    summary: project,
+    containers: detail.containers?.map((container) => ({
+      ...container,
+      projectID: project.id,
+    })),
+  };
+}
+
+function projectAnalysisFor(
+  project: ProjectSummary,
+  stack: string,
+): AgentProjectAnalysis {
+  return {
+    projectID: project.id,
+    projectName: project.name,
+    workingDir: project.workingDir,
+    stacks: [stack],
+    runtimeHints: [],
+    configFiles: ["package.json"],
+    envVars: [],
+    ports: [],
+    recommendations: [],
   };
 }
 

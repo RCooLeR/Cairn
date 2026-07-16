@@ -225,6 +225,14 @@ type ObjectsChangedEventPayload = {
 type FilterID = string;
 type StatusToneID = "ok" | "warn" | "error" | "info" | "neutral";
 type LoadStatus = "idle" | "loading" | "ready" | "error";
+
+type ProjectDetailState = {
+  requestedID: string | null;
+  generation: number;
+  status: LoadStatus;
+  data: ProjectDetail | null;
+  error: string | null;
+};
 type ProjectViewMode = "grid" | "list";
 type ProjectSortID = "name" | "activity" | "cpu";
 type ProjectTabID =
@@ -492,6 +500,7 @@ type BackupVolumeState = {
 
 type RestoreVolumeState = {
   open: boolean;
+  requestID: number;
   volume: VolumeSummary | null;
   backups: BackupSummary[];
   backupID: string;
@@ -563,6 +572,7 @@ type ProviderInstallProgressPayload = {
 
 type ProviderSetupState = {
   open: boolean;
+  sessionID: string;
   step: SetupStepID;
   platform: SetupPlatformID;
   backend: SetupBackendID;
@@ -587,10 +597,20 @@ type ProviderSetupState = {
 };
 
 type ProviderInstallSession = {
+  sessionID: string;
   planID: string;
   streamID?: string;
   backend: SetupBackendID;
 };
+
+function providerSetupOperationBusy(setup: ProviderSetupState) {
+  return (
+    setup.detecting ||
+    setup.planning ||
+    setup.installing ||
+    setup.detectingProjects
+  );
+}
 
 type ExportLogsState = {
   open: boolean;
@@ -818,6 +838,7 @@ const emptyBackupVolume: BackupVolumeState = {
 
 const emptyRestoreVolume: RestoreVolumeState = {
   open: false,
+  requestID: 0,
   volume: null,
   backups: [],
   backupID: "",
@@ -860,6 +881,7 @@ const providerSetupStorageKey = "cairn.providerSetup.v1";
 
 const emptyProviderSetup: ProviderSetupState = {
   open: false,
+  sessionID: "",
   step: "welcome",
   platform: "windows",
   backend: "windows_wsl_ubuntu",
@@ -1068,9 +1090,14 @@ function restoreProviderSetupState(): ProviderSetupState {
       return emptyProviderSetup;
     }
     const platform = normalizedSetupPlatform(parsed.platform);
+    const sessionID =
+      typeof parsed.sessionID === "string" && parsed.sessionID
+        ? parsed.sessionID
+        : crypto.randomUUID();
     return {
       ...emptyProviderSetup,
       open: Boolean(parsed.open),
+      sessionID,
       step: normalizedSetupStep(parsed.step),
       platform,
       backend: normalizedSetupBackend(parsed.backend),
@@ -1176,14 +1203,15 @@ function App() {
   const [projectsStatus, setProjectsStatus] = useState<LoadStatus>("idle");
   const [projectsError, setProjectsError] = useState<string | null>(null);
   const [activeProjectID, setActiveProjectID] = useState<string | null>(null);
-  const [projectDetail, setProjectDetail] = useState<ProjectDetail | null>(
-    null,
-  );
-  const [projectDetailStatus, setProjectDetailStatus] =
-    useState<LoadStatus>("idle");
-  const [projectDetailError, setProjectDetailError] = useState<string | null>(
-    null,
-  );
+  const [projectDetailState, setProjectDetailState] =
+    useState<ProjectDetailState>({
+      requestedID: null,
+      generation: 0,
+      status: "idle",
+      data: null,
+      error: null,
+    });
+  const projectDetailGenerationRef = useRef(0);
   const [projectCommandOutputs, setProjectCommandOutputs] = useState<
     Record<string, ProjectCommandOutputState>
   >({});
@@ -1240,6 +1268,7 @@ function App() {
     useState<BackupVolumeState>(emptyBackupVolume);
   const [restoreVolume, setRestoreVolume] =
     useState<RestoreVolumeState>(emptyRestoreVolume);
+  const restoreVolumeRequestRef = useRef(0);
   const [backups, setBackups] = useState<BackupSummary[]>([]);
   const [backupsStatus, setBackupsStatus] = useState<LoadStatus>("idle");
   const [backupsError, setBackupsError] = useState<string | null>(null);
@@ -1345,6 +1374,18 @@ function App() {
   const [setup, setSetup] = useState<ProviderSetupState>(
     restoreProviderSetupState,
   );
+  const providerSetupIdentityRef = useRef({
+    open: setup.open,
+    sessionID: setup.sessionID,
+    backend: setup.backend,
+    busy: providerSetupOperationBusy(setup),
+  });
+  providerSetupIdentityRef.current = {
+    open: setup.open,
+    sessionID: setup.sessionID,
+    backend: setup.backend,
+    busy: providerSetupOperationBusy(setup),
+  };
   const providerInstallSessionRef = useRef<ProviderInstallSession | null>(null);
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
@@ -1492,26 +1533,49 @@ function App() {
   }, []);
 
   const refreshProjectDetail = useCallback(async (projectID: string) => {
-    setProjectDetailStatus("loading");
-    setProjectDetailError(null);
+    const generation = projectDetailGenerationRef.current + 1;
+    projectDetailGenerationRef.current = generation;
+    setProjectDetailState({
+      requestedID: projectID,
+      generation,
+      status: "loading",
+      data: null,
+      error: null,
+    });
     try {
       const detail = await ProjectService.GetProject(projectID);
       if (!detail) {
         throw new Error("Project was not found");
       }
-      setProjectDetail(
-        applyStatsSamplesToProjectDetail(
-          detail,
-          Object.values(latestSamplesRef.current),
-        ),
+      if (detail.summary.id !== projectID) {
+        throw new Error("Project detail did not match the requested project");
+      }
+      setProjectDetailState((current) =>
+        current.generation === generation && current.requestedID === projectID
+          ? {
+              ...current,
+              status: "ready",
+              data: applyStatsSamplesToProjectDetail(
+                detail,
+                Object.values(latestSamplesRef.current),
+              ),
+            }
+          : current,
       );
-      setProjectDetailStatus("ready");
     } catch (error: unknown) {
-      setProjectDetail(null);
-      setProjectDetailError(
-        error instanceof Error ? error.message : "Unable to load project",
+      setProjectDetailState((current) =>
+        current.generation === generation && current.requestedID === projectID
+          ? {
+              ...current,
+              status: "error",
+              data: null,
+              error:
+                error instanceof Error
+                  ? error.message
+                  : "Unable to load project",
+            }
+          : current,
       );
-      setProjectDetailStatus("error");
     }
   }, []);
 
@@ -1633,10 +1697,16 @@ function App() {
   );
 
   const closeProjectDetail = useCallback(() => {
+    const generation = projectDetailGenerationRef.current + 1;
+    projectDetailGenerationRef.current = generation;
     setActiveProjectID(null);
-    setProjectDetail(null);
-    setProjectDetailStatus("idle");
-    setProjectDetailError(null);
+    setProjectDetailState({
+      requestedID: null,
+      generation,
+      status: "idle",
+      data: null,
+      error: null,
+    });
   }, []);
 
   useEffect(() => {
@@ -1734,6 +1804,14 @@ function App() {
       if (!payload || !session) {
         return;
       }
+      const setupIdentity = providerSetupIdentityRef.current;
+      if (
+        !setupIdentity.open ||
+        setupIdentity.sessionID !== session.sessionID ||
+        setupIdentity.backend !== session.backend
+      ) {
+        return;
+      }
       const matchesPlan = payload.planID === session.planID;
       const matchesStream = Boolean(
         session.streamID && payload.streamID === session.streamID,
@@ -1748,8 +1826,11 @@ function App() {
       };
       setSetup((current) => {
         if (
-          current.plan?.planID !== payload.planID &&
-          current.installStreamID !== payload.streamID
+          !current.open ||
+          current.sessionID !== session.sessionID ||
+          current.backend !== session.backend ||
+          (current.plan?.planID !== payload.planID &&
+            current.installStreamID !== payload.streamID)
         ) {
           return current;
         }
@@ -1774,31 +1855,55 @@ function App() {
       });
 
       if (payload.done) {
-        providerInstallSessionRef.current = null;
+        const currentSession = providerInstallSessionRef.current;
+        if (
+          currentSession?.sessionID === session.sessionID &&
+          currentSession.planID === session.planID
+        ) {
+          providerInstallSessionRef.current = null;
+        }
       }
       if (payload.done && !payload.error) {
         const providerID = providerIDForSetupBackend(session.backend);
         if (providerID) {
           void ProviderService.Detect(providerID)
             .then((status) => {
-              setSetup((current) => ({
-                ...current,
-                detection: status ?? current.detection,
-                detectError: undefined,
-              }));
+              setSetup((current) =>
+                current.open &&
+                current.sessionID === session.sessionID &&
+                current.backend === session.backend
+                  ? {
+                      ...current,
+                      detection: status ?? current.detection,
+                      detectError: undefined,
+                    }
+                  : current,
+              );
             })
             .catch((error: unknown) => {
-              setSetup((current) => ({
-                ...current,
-                detectError:
-                  error instanceof Error
-                    ? error.message
-                    : "Provider verification failed",
-              }));
+              setSetup((current) =>
+                current.open &&
+                current.sessionID === session.sessionID &&
+                current.backend === session.backend
+                  ? {
+                      ...current,
+                      detectError:
+                        error instanceof Error
+                          ? error.message
+                          : "Provider verification failed",
+                    }
+                  : current,
+              );
             });
         }
-        void refreshInventory();
-        void refreshProjects();
+        if (
+          providerSetupIdentityRef.current.open &&
+          providerSetupIdentityRef.current.sessionID === session.sessionID &&
+          providerSetupIdentityRef.current.backend === session.backend
+        ) {
+          void refreshInventory();
+          void refreshProjects();
+        }
       }
     });
     return () => off();
@@ -2436,9 +2541,15 @@ function App() {
         setProjects((current) =>
           applyStatsSamplesToProjects(current, allSamples),
         );
-        setProjectDetail((current) =>
-          current
-            ? applyStatsSamplesToProjectDetail(current, allSamples)
+        setProjectDetailState((current) =>
+          current.data
+            ? {
+                ...current,
+                data: applyStatsSamplesToProjectDetail(
+                  current.data,
+                  allSamples,
+                ),
+              }
             : current,
         );
         setProjectSparks((current) =>
@@ -2967,13 +3078,38 @@ function App() {
     persistProviderSetupState(setup);
   }, [setup]);
 
+  const beginProviderSetupSession = useCallback((backend: SetupBackendID) => {
+    const sessionID = crypto.randomUUID();
+    providerSetupIdentityRef.current = {
+      open: true,
+      sessionID,
+      backend,
+      busy: false,
+    };
+    return sessionID;
+  }, []);
+
+  const providerSetupSessionMatches = useCallback(
+    (sessionID: string, backend: SetupBackendID) => {
+      const current = providerSetupIdentityRef.current;
+      return (
+        current.open &&
+        current.sessionID === sessionID &&
+        current.backend === backend
+      );
+    },
+    [],
+  );
+
   const openProviderSetup = useCallback(() => {
     const platform =
       setupPlatformFromProvider(activeProvider) ?? detectClientSetupPlatform();
     const backend = recommendedSetupBackend(platform);
+    const sessionID = beginProviderSetupSession(backend);
     setSetup({
       ...emptyProviderSetup,
       open: true,
+      sessionID,
       platform,
       backend,
       distro: wslDistro.trim() || "Ubuntu",
@@ -2984,6 +3120,7 @@ function App() {
     });
   }, [
     activeProvider,
+    beginProviderSetupSession,
     colimaCPU,
     colimaDiskGB,
     colimaMemoryGB,
@@ -3000,10 +3137,12 @@ function App() {
       activeProvider?.kind === "windows_wsl_ubuntu"
         ? activeProvider.kind
         : recommendedSetupBackend(platform);
+    const sessionID = beginProviderSetupSession(backend);
     setRepairOpen(false);
     setSetup({
       ...emptyProviderSetup,
       open: true,
+      sessionID,
       step: "checks",
       platform: setupPlatformForBackend(backend, platform),
       backend,
@@ -3015,6 +3154,7 @@ function App() {
     });
   }, [
     activeProvider,
+    beginProviderSetupSession,
     colimaCPU,
     colimaDiskGB,
     colimaMemoryGB,
@@ -3034,10 +3174,12 @@ function App() {
     const providerID = providerIDForSetupBackend(backend);
     const distro = wslDistro.trim() || "Ubuntu";
     const profile = colimaProfile.trim() || "default";
+    const sessionID = beginProviderSetupSession(backend);
     setRepairOpen(false);
     setSetup({
       ...emptyProviderSetup,
       open: true,
+      sessionID,
       step: "install",
       platform: setupPlatformForBackend(backend, platform),
       backend,
@@ -3080,26 +3222,39 @@ function App() {
       if (!plan) {
         throw new Error("Install plan was empty");
       }
-      setSetup((current) => ({
-        ...current,
-        step: "install",
-        plan,
-        planning: false,
-      }));
+      setSetup((current) =>
+        current.open &&
+        current.sessionID === sessionID &&
+        current.backend === backend
+          ? {
+              ...current,
+              step: "install",
+              plan,
+              planning: false,
+            }
+          : current,
+      );
     } catch (error: unknown) {
-      setSetup((current) => ({
-        ...current,
-        step: "install",
-        planning: false,
-        error:
-          error instanceof Error
-            ? error.message
-            : "Unable to create update plan",
-      }));
+      setSetup((current) =>
+        current.open &&
+        current.sessionID === sessionID &&
+        current.backend === backend
+          ? {
+              ...current,
+              step: "install",
+              planning: false,
+              error:
+                error instanceof Error
+                  ? error.message
+                  : "Unable to create update plan",
+            }
+          : current,
+      );
     }
   }, [
     activeProvider,
     appSettings,
+    beginProviderSetupSession,
     colimaCPU,
     colimaDiskGB,
     colimaMemoryGB,
@@ -3108,34 +3263,75 @@ function App() {
   ]);
 
   const closeProviderSetup = useCallback(() => {
-    providerInstallSessionRef.current = null;
+    if (
+      providerInstallSessionRef.current ||
+      providerSetupIdentityRef.current.busy
+    ) {
+      return;
+    }
+    providerSetupIdentityRef.current = {
+      open: false,
+      sessionID: "",
+      backend: emptyProviderSetup.backend,
+      busy: false,
+    };
     window.localStorage.removeItem(providerSetupStorageKey);
     setSetup(emptyProviderSetup);
   }, []);
 
   const finishProviderSetup = useCallback(() => {
+    if (
+      providerInstallSessionRef.current ||
+      providerSetupIdentityRef.current.busy
+    ) {
+      return;
+    }
+    providerSetupIdentityRef.current = {
+      open: false,
+      sessionID: "",
+      backend: emptyProviderSetup.backend,
+      busy: false,
+    };
     providerInstallSessionRef.current = null;
     window.localStorage.removeItem(providerSetupStorageKey);
     setSetup(emptyProviderSetup);
     navigate("overview");
   }, [navigate]);
 
-  const changeSetupBackend = useCallback((backend: SetupBackendID) => {
-    setSetup((current) => ({
-      ...current,
-      backend,
-      platform: setupPlatformForBackend(backend, current.platform),
-      step: "checks",
-      detection: null,
-      detectError: undefined,
-      plan: null,
-      progress: [],
-      detectedProjects: [],
-      selectedProjectIDs: [],
-      projectDetectError: undefined,
-      error: undefined,
-    }));
-  }, []);
+  const changeSetupBackend = useCallback(
+    (backend: SetupBackendID) => {
+      if (
+        providerInstallSessionRef.current ||
+        providerSetupIdentityRef.current.busy
+      ) {
+        return;
+      }
+      const sessionID = beginProviderSetupSession(backend);
+      setSetup((current) => {
+        return {
+          ...current,
+          sessionID,
+          backend,
+          platform: setupPlatformForBackend(backend, current.platform),
+          step: "checks",
+          detecting: false,
+          detection: null,
+          detectError: undefined,
+          plan: null,
+          planning: false,
+          installing: false,
+          installStreamID: undefined,
+          progress: [],
+          detectedProjects: [],
+          selectedProjectIDs: [],
+          detectingProjects: false,
+          projectDetectError: undefined,
+          error: undefined,
+        };
+      });
+    },
+    [beginProviderSetupSession],
+  );
 
   const useExistingDockerContext = useCallback(() => {
     changeSetupBackend("existing_context");
@@ -3149,106 +3345,171 @@ function App() {
   }, [closeProviderSetup, navigate, refreshDockerContexts]);
 
   const runProviderSetupChecks = useCallback(async () => {
-    const providerID = providerIDForSetupBackend(setup.backend);
+    const sessionID = setup.sessionID;
+    const backend = setup.backend;
+    const providerID = providerIDForSetupBackend(backend);
     if (!providerID) {
-      setSetup((current) => ({ ...current, step: "checks" }));
+      setSetup((current) =>
+        current.open &&
+        current.sessionID === sessionID &&
+        current.backend === backend
+          ? { ...current, step: "checks" }
+          : current,
+      );
       return;
     }
     const distro = setup.distro.trim() || "Ubuntu";
     const profile = setup.colimaProfile.trim() || "default";
-    setSetup((current) => ({
-      ...current,
-      distro,
-      colimaProfile: profile,
-      step: "checks",
-      detecting: true,
-      detectError: undefined,
-      detection: null,
-      plan: null,
-      progress: [],
-      error: undefined,
-    }));
+    setSetup((current) =>
+      current.open &&
+      current.sessionID === sessionID &&
+      current.backend === backend
+        ? {
+            ...current,
+            distro,
+            colimaProfile: profile,
+            step: "checks",
+            detecting: true,
+            detectError: undefined,
+            detection: null,
+            plan: null,
+            progress: [],
+            error: undefined,
+          }
+        : current,
+    );
+    const persistSetupSetting = async (key: string, value: string | number) => {
+      if (!providerSetupSessionMatches(sessionID, backend)) {
+        return false;
+      }
+      await SettingsService.SetSetting(key, value);
+      return providerSetupSessionMatches(sessionID, backend);
+    };
     try {
-      if (setup.backend === "macos_colima") {
-        await SettingsService.SetSetting("macos.colima_profile", profile);
-        await SettingsService.SetSetting("macos.colima_cpu", setup.colimaCPU);
-        await SettingsService.SetSetting(
-          "macos.colima_memory_gb",
-          setup.colimaMemoryGB,
-        );
-        await SettingsService.SetSetting(
-          "macos.colima_disk_gb",
-          setup.colimaDiskGB,
-        );
+      if (backend === "macos_colima") {
+        if (
+          !(await persistSetupSetting("macos.colima_profile", profile)) ||
+          !(await persistSetupSetting("macos.colima_cpu", setup.colimaCPU)) ||
+          !(await persistSetupSetting(
+            "macos.colima_memory_gb",
+            setup.colimaMemoryGB,
+          )) ||
+          !(await persistSetupSetting(
+            "macos.colima_disk_gb",
+            setup.colimaDiskGB,
+          ))
+        ) {
+          return;
+        }
         setColimaProfile(profile);
         setColimaCPU(setup.colimaCPU);
         setColimaMemoryGB(setup.colimaMemoryGB);
         setColimaDiskGB(setup.colimaDiskGB);
-        setAppSettings((current) => ({
-          ...current,
-          "macos.colima_profile": profile,
-          "macos.colima_cpu": setup.colimaCPU,
-          "macos.colima_memory_gb": setup.colimaMemoryGB,
-          "macos.colima_disk_gb": setup.colimaDiskGB,
-        }));
-      } else if (setup.backend === "windows_wsl_ubuntu") {
-        await SettingsService.SetSetting("windows.wsl_distro", distro);
+        setAppSettings((current) =>
+          providerSetupSessionMatches(sessionID, backend)
+            ? {
+                ...current,
+                "macos.colima_profile": profile,
+                "macos.colima_cpu": setup.colimaCPU,
+                "macos.colima_memory_gb": setup.colimaMemoryGB,
+                "macos.colima_disk_gb": setup.colimaDiskGB,
+              }
+            : current,
+        );
+      } else if (backend === "windows_wsl_ubuntu") {
+        if (!(await persistSetupSetting("windows.wsl_distro", distro))) {
+          return;
+        }
         setWSLDistro(distro);
-        setAppSettings((current) => ({
-          ...current,
-          "windows.wsl_distro": distro,
-        }));
+        setAppSettings((current) =>
+          providerSetupSessionMatches(sessionID, backend)
+            ? { ...current, "windows.wsl_distro": distro }
+            : current,
+        );
+      }
+      if (!providerSetupSessionMatches(sessionID, backend)) {
+        return;
       }
       const status = await ProviderService.Detect(providerID);
-      setSetup((current) => ({
-        ...current,
-        detection: status ?? null,
-        detecting: false,
-        step: status?.healthy ? "verify" : "checks",
-      }));
+      if (!providerSetupSessionMatches(sessionID, backend)) {
+        return;
+      }
+      setSetup((current) =>
+        current.open &&
+        current.sessionID === sessionID &&
+        current.backend === backend
+          ? {
+              ...current,
+              detection: status ?? null,
+              detecting: false,
+              step: status?.healthy ? "verify" : "checks",
+            }
+          : current,
+      );
       await refreshInventory();
     } catch (error: unknown) {
-      setSetup((current) => ({
-        ...current,
-        detecting: false,
-        detectError:
-          error instanceof Error ? error.message : "Provider checks failed",
-      }));
+      if (!providerSetupSessionMatches(sessionID, backend)) {
+        return;
+      }
+      setSetup((current) =>
+        current.open &&
+        current.sessionID === sessionID &&
+        current.backend === backend
+          ? {
+              ...current,
+              detecting: false,
+              detectError:
+                error instanceof Error
+                  ? error.message
+                  : "Provider checks failed",
+            }
+          : current,
+      );
     }
   }, [
     refreshInventory,
+    providerSetupSessionMatches,
     setup.backend,
     setup.colimaCPU,
     setup.colimaDiskGB,
     setup.colimaMemoryGB,
     setup.colimaProfile,
     setup.distro,
+    setup.sessionID,
   ]);
 
   const planProviderInstall = useCallback(async () => {
-    const providerID = providerIDForSetupBackend(setup.backend);
+    const sessionID = setup.sessionID;
+    const backend = setup.backend;
+    const providerID = providerIDForSetupBackend(backend);
     if (!providerID) {
       return;
     }
     const distro = setup.distro.trim() || "Ubuntu";
     const profile = setup.colimaProfile.trim() || "default";
-    setSetup((current) => ({
-      ...current,
-      distro,
-      colimaProfile: profile,
-      planning: true,
-      error: undefined,
-    }));
+    setSetup((current) =>
+      current.open &&
+      current.sessionID === sessionID &&
+      current.backend === backend
+        ? {
+            ...current,
+            distro,
+            colimaProfile: profile,
+            planning: true,
+            error: undefined,
+          }
+        : current,
+    );
     try {
       const extra =
-        setup.backend === "macos_colima"
+        backend === "macos_colima"
           ? {
               profile,
               cpu: String(setup.colimaCPU),
               memoryGB: String(setup.colimaMemoryGB),
               diskGB: String(setup.colimaDiskGB),
             }
-          : setup.backend === "linux_native"
+          : backend === "linux_native"
             ? {
                 socketPath: settingString(
                   appSettings,
@@ -3264,21 +3525,33 @@ function App() {
       if (!plan) {
         throw new Error("Install plan was empty");
       }
-      setSetup((current) => ({
-        ...current,
-        step: "install",
-        plan,
-        planning: false,
-      }));
+      setSetup((current) =>
+        current.open &&
+        current.sessionID === sessionID &&
+        current.backend === backend
+          ? {
+              ...current,
+              step: "install",
+              plan,
+              planning: false,
+            }
+          : current,
+      );
     } catch (error: unknown) {
-      setSetup((current) => ({
-        ...current,
-        planning: false,
-        error:
-          error instanceof Error
-            ? error.message
-            : "Unable to create install plan",
-      }));
+      setSetup((current) =>
+        current.open &&
+        current.sessionID === sessionID &&
+        current.backend === backend
+          ? {
+              ...current,
+              planning: false,
+              error:
+                error instanceof Error
+                  ? error.message
+                  : "Unable to create install plan",
+            }
+          : current,
+      );
     }
   }, [
     appSettings,
@@ -3288,64 +3561,103 @@ function App() {
     setup.colimaMemoryGB,
     setup.colimaProfile,
     setup.distro,
+    setup.sessionID,
   ]);
 
   const applyProviderInstall = useCallback(async () => {
-    if (!setup.plan?.planID) {
+    if (!setup.plan?.planID || !setup.sessionID) {
       return;
     }
+    const sessionID = setup.sessionID;
     const planID = setup.plan.planID;
     const backend = setup.backend;
-    providerInstallSessionRef.current = { planID, backend };
-    setSetup((current) => ({
-      ...current,
-      installing: true,
-      installStreamID: undefined,
-      progress: [
-        {
-          planID,
-          streamID: "pending",
-          step: 0,
-          totalSteps: setup.plan?.commands.length ?? 0,
-          message: "Starting auto repair",
-          done: false,
-        },
-      ],
-      error: undefined,
-    }));
+    providerInstallSessionRef.current = { sessionID, planID, backend };
+    setSetup((current) =>
+      current.open &&
+      current.sessionID === sessionID &&
+      current.backend === backend &&
+      current.plan?.planID === planID
+        ? {
+            ...current,
+            installing: true,
+            installStreamID: undefined,
+            progress: [
+              {
+                planID,
+                streamID: "pending",
+                step: 0,
+                totalSteps: setup.plan?.commands.length ?? 0,
+                message: "Starting auto repair",
+                done: false,
+              },
+            ],
+            error: undefined,
+          }
+        : current,
+    );
     try {
       const handle = await ProviderService.ApplyInstall(planID);
       const currentSession = providerInstallSessionRef.current;
-      if (currentSession?.planID === planID) {
+      if (
+        currentSession?.sessionID === sessionID &&
+        currentSession.planID === planID
+      ) {
         providerInstallSessionRef.current = {
           ...currentSession,
           streamID: handle?.streamID,
         };
       }
-      setSetup((current) => ({
-        ...current,
-        installStreamID: handle?.streamID,
-      }));
+      setSetup((current) =>
+        current.open &&
+        current.sessionID === sessionID &&
+        current.backend === backend &&
+        current.plan?.planID === planID
+          ? {
+              ...current,
+              installStreamID: handle?.streamID,
+            }
+          : current,
+      );
     } catch (error: unknown) {
-      providerInstallSessionRef.current = null;
-      setSetup((current) => ({
-        ...current,
-        installing: false,
-        error:
-          error instanceof Error ? error.message : "Unable to start install",
-      }));
+      if (
+        providerInstallSessionRef.current?.sessionID === sessionID &&
+        providerInstallSessionRef.current.planID === planID
+      ) {
+        providerInstallSessionRef.current = null;
+      }
+      setSetup((current) =>
+        current.open &&
+        current.sessionID === sessionID &&
+        current.backend === backend &&
+        current.plan?.planID === planID
+          ? {
+              ...current,
+              installing: false,
+              error:
+                error instanceof Error
+                  ? error.message
+                  : "Unable to start install",
+            }
+          : current,
+      );
     }
-  }, [setup.backend, setup.plan]);
+  }, [setup.backend, setup.plan, setup.sessionID]);
 
   const detectSetupProjects = useCallback(async () => {
-    setSetup((current) => ({
-      ...current,
-      step: "projects",
-      detectingProjects: true,
-      projectDetectError: undefined,
-    }));
-    setProjectsStatus("loading");
-    setProjectsError(null);
+    const sessionID = setup.sessionID;
+    const backend = setup.backend;
+    setSetup((current) =>
+      current.open &&
+      current.sessionID === sessionID &&
+      current.backend === backend
+        ? {
+            ...current,
+            step: "projects",
+            detectingProjects: true,
+            projectDetectError: undefined,
+          }
+        : current,
+    );
     try {
       const nextProjects = await ProjectService.RefreshProjects();
       const detected = nextProjects ?? [];
@@ -3353,29 +3665,60 @@ function App() {
         detected,
         Object.values(latestSamplesRef.current),
       );
+      if (!providerSetupSessionMatches(sessionID, backend)) {
+        return;
+      }
       setProjects(liveDetected);
+      if (!providerSetupSessionMatches(sessionID, backend)) {
+        return;
+      }
+      setProjectsError(null);
+      if (!providerSetupSessionMatches(sessionID, backend)) {
+        return;
+      }
       setProjectsStatus("ready");
-      setSetup((current) => ({
-        ...current,
-        detectedProjects: liveDetected,
-        selectedProjectIDs: liveDetected.map((project) => project.id),
-        detectingProjects: false,
-      }));
+      setSetup((current) =>
+        current.open &&
+        current.sessionID === sessionID &&
+        current.backend === backend
+          ? {
+              ...current,
+              detectedProjects: liveDetected,
+              selectedProjectIDs: liveDetected.map((project) => project.id),
+              detectingProjects: false,
+            }
+          : current,
+      );
     } catch (error: unknown) {
+      if (!providerSetupSessionMatches(sessionID, backend)) {
+        return;
+      }
       const message =
         error instanceof Error ? error.message : "Unable to detect projects";
       setProjectsError(message);
+      if (!providerSetupSessionMatches(sessionID, backend)) {
+        return;
+      }
       setProjectsStatus("error");
-      setSetup((current) => ({
-        ...current,
-        detectingProjects: false,
-        projectDetectError: message,
-      }));
+      setSetup((current) =>
+        current.open &&
+        current.sessionID === sessionID &&
+        current.backend === backend
+          ? {
+              ...current,
+              detectingProjects: false,
+              projectDetectError: message,
+            }
+          : current,
+      );
     }
-  }, []);
+  }, [providerSetupSessionMatches, setup.backend, setup.sessionID]);
 
   const toggleSetupProjectSelection = useCallback((projectID: string) => {
     setSetup((current) => {
+      if (providerSetupOperationBusy(current)) {
+        return current;
+      }
       const selected = new Set(current.selectedProjectIDs);
       if (selected.has(projectID)) {
         selected.delete(projectID);
@@ -4280,9 +4623,12 @@ function App() {
 
   const openRestoreVolume = useCallback(
     async (volume: VolumeSummary, selectedBackup?: BackupSummary) => {
+      const requestID = restoreVolumeRequestRef.current + 1;
+      restoreVolumeRequestRef.current = requestID;
       setRestoreVolume({
         ...emptyRestoreVolume,
         open: true,
+        requestID,
         volume,
         backupID: selectedBackup?.id ?? "",
         sourcePath: selectedBackup?.path ?? "",
@@ -4295,20 +4641,34 @@ function App() {
           volumeName: volume.name,
           limit: 100,
         });
-        setRestoreVolume((current) => ({
-          ...current,
-          backups: volumeBackups ?? [],
-          loading: false,
-          backupID: selectedBackup?.id ?? current.backupID,
-          sourcePath: selectedBackup?.path ?? current.sourcePath,
-        }));
+        setRestoreVolume((current) =>
+          current.open &&
+          current.requestID === requestID &&
+          current.volume?.name === volume.name
+            ? {
+                ...current,
+                backups: volumeBackups ?? [],
+                loading: false,
+                backupID: selectedBackup?.id ?? current.backupID,
+                sourcePath: selectedBackup?.path ?? current.sourcePath,
+              }
+            : current,
+        );
       } catch (error: unknown) {
-        setRestoreVolume((current) => ({
-          ...current,
-          loading: false,
-          error:
-            error instanceof Error ? error.message : "Unable to load backups",
-        }));
+        setRestoreVolume((current) =>
+          current.open &&
+          current.requestID === requestID &&
+          current.volume?.name === volume.name
+            ? {
+                ...current,
+                loading: false,
+                error:
+                  error instanceof Error
+                    ? error.message
+                    : "Unable to load backups",
+              }
+            : current,
+        );
       }
     },
     [],
@@ -4350,6 +4710,7 @@ function App() {
       if (!plan) {
         throw new Error("Restore plan was empty");
       }
+      restoreVolumeRequestRef.current += 1;
       setRestoreVolume(emptyRestoreVolume);
       setConfirm({
         ...emptyConfirm,
@@ -4367,6 +4728,11 @@ function App() {
       }));
     }
   }, [ensureDockerReady, restoreVolume]);
+
+  const closeRestoreVolume = useCallback(() => {
+    restoreVolumeRequestRef.current += 1;
+    setRestoreVolume(emptyRestoreVolume);
+  }, []);
 
   const openDeleteBackupPlan = useCallback(
     async (backup: BackupSummary) => {
@@ -4992,8 +5358,13 @@ function App() {
     switch (activePage) {
       case "projects":
         if (activeProjectID) {
+          const projectDetail =
+            projectDetailState.requestedID === activeProjectID &&
+            projectDetailState.data?.summary.id === activeProjectID
+              ? projectDetailState.data
+              : null;
           const detailProject = projectDetail?.summary;
-          const projectID = detailProject?.id ?? activeProjectID;
+          const projectID = activeProjectID;
           const projectName =
             detailProject?.name ?? projectNameForID(projects, projectID);
           return (
@@ -5004,8 +5375,15 @@ function App() {
               backupsLoading={backupsStatus === "loading"}
               commandOutput={projectCommandOutputs[projectID] ?? null}
               detail={projectDetail}
-              error={projectDetailError}
-              loading={projectDetailStatus === "loading"}
+              error={
+                projectDetailState.requestedID === activeProjectID
+                  ? projectDetailState.error
+                  : null
+              }
+              loading={
+                projectDetailState.requestedID === activeProjectID &&
+                projectDetailState.status === "loading"
+              }
               lineage={projectLineage[projectID] ?? []}
               lineageLoading={projectLineageStatus[projectID] === "loading"}
               mutationsDisabled={mutationsDisabled}
@@ -5916,21 +6294,45 @@ function App() {
         onAddProjectFolder={openSetupProjectImport}
         onChangeBackend={changeSetupBackend}
         onChangeColimaCPU={(colimaCPU) =>
-          setSetup((current) => ({ ...current, colimaCPU }))
+          setSetup((current) =>
+            providerSetupOperationBusy(current)
+              ? current
+              : { ...current, colimaCPU },
+          )
         }
         onChangeColimaDiskGB={(colimaDiskGB) =>
-          setSetup((current) => ({ ...current, colimaDiskGB }))
+          setSetup((current) =>
+            providerSetupOperationBusy(current)
+              ? current
+              : { ...current, colimaDiskGB },
+          )
         }
         onChangeColimaMemoryGB={(colimaMemoryGB) =>
-          setSetup((current) => ({ ...current, colimaMemoryGB }))
+          setSetup((current) =>
+            providerSetupOperationBusy(current)
+              ? current
+              : { ...current, colimaMemoryGB },
+          )
         }
         onChangeColimaProfile={(colimaProfile) =>
-          setSetup((current) => ({ ...current, colimaProfile }))
+          setSetup((current) =>
+            providerSetupOperationBusy(current)
+              ? current
+              : { ...current, colimaProfile },
+          )
         }
         onChangeDistro={(distro) =>
-          setSetup((current) => ({ ...current, distro }))
+          setSetup((current) =>
+            providerSetupOperationBusy(current)
+              ? current
+              : { ...current, distro },
+          )
         }
-        onChangePermissionMode={setPermissionMode}
+        onChangePermissionMode={(mode) => {
+          if (!providerSetupOperationBusy(setup)) {
+            setPermissionMode(mode);
+          }
+        }}
         onClose={closeProviderSetup}
         onDetectProjects={() => {
           void detectSetupProjects();
@@ -5946,7 +6348,13 @@ function App() {
         onSavePermission={() => {
           void saveSetting("linux.sudo_mode", permissionMode);
         }}
-        onStep={(step) => setSetup((current) => ({ ...current, step }))}
+        onStep={(step) =>
+          setSetup((current) =>
+            providerSetupOperationBusy(current)
+              ? current
+              : { ...current, step },
+          )
+        }
         onToggleProject={toggleSetupProjectSelection}
         onUseExistingContext={useExistingDockerContext}
         open={setup.open}
@@ -6104,7 +6512,7 @@ function App() {
         onChange={(patch) =>
           setRestoreVolume((current) => ({ ...current, ...patch }))
         }
-        onClose={() => setRestoreVolume(emptyRestoreVolume)}
+        onClose={closeRestoreVolume}
         onSubmit={() => {
           void submitRestoreVolume();
         }}
@@ -6604,6 +7012,7 @@ function ProviderSetupModal({
   const selectedProjects = setup.detectedProjects.filter((project) =>
     setup.selectedProjectIDs.includes(project.id),
   );
+  const setupBusy = providerSetupOperationBusy(setup);
   const setupSteps: SetupStepID[] = [
     "welcome",
     "backend",
@@ -6616,6 +7025,7 @@ function ProviderSetupModal({
 
   return (
     <Modal
+      busy={setupBusy}
       onClose={onClose}
       open={open}
       size="lg"
@@ -6625,17 +7035,17 @@ function ProviderSetupModal({
         <div className="flex flex-wrap gap-2">
           {setupSteps.map((step, index) => (
             <button
-              aria-disabled={setup.installing}
+              aria-disabled={setupBusy}
               className={[
                 "flex h-8 items-center gap-2 rounded-control border px-3 text-xs font-medium",
                 setup.step === step
                   ? "border-accent/40 bg-accent/10 text-accent"
                   : "border-border bg-bg-inset text-text-muted",
-                setup.installing ? "cursor-not-allowed opacity-70" : "",
+                setupBusy ? "cursor-not-allowed opacity-70" : "",
               ].join(" ")}
               key={step}
               onClick={() => {
-                if (!setup.installing) {
+                if (!setupBusy) {
                   onStep(step);
                 }
               }}
@@ -6687,6 +7097,7 @@ function ProviderSetupModal({
                   badge="Recommended"
                   body="Install or use Colima with Homebrew-managed Docker CLI, Compose, and Buildx."
                   details="Docker CLI, Docker Compose, Colima, selected profile resources, Docker context, and hello-world verification."
+                  disabled={setupBusy}
                   icon={<Server size={19} />}
                   onSelect={() => onChangeBackend("macos_colima")}
                   title="Colima"
@@ -6694,6 +7105,7 @@ function ProviderSetupModal({
                 <BackendChoiceCard
                   body="Use a Docker Desktop, OrbStack, Rancher Desktop, or remote Docker context without changing your global context."
                   details="No packages are installed. Cairn lists contexts, pings the selected one, and runs Docker with --context."
+                  disabled={setupBusy}
                   icon={<Terminal size={19} />}
                   onSelect={() => onChangeBackend("existing_context")}
                   title="Existing Docker context"
@@ -6711,6 +7123,7 @@ function ProviderSetupModal({
                   badge="Recommended"
                   body="Install or use Docker Engine directly on this Linux host with the official apt repository."
                   details="Docker CLI, Docker Engine, containerd, Compose, Buildx, systemd service wiring, socket access, and hello-world verification."
+                  disabled={setupBusy}
                   icon={<Server size={19} />}
                   onSelect={() => onChangeBackend("linux_native")}
                   title="Native Docker Engine"
@@ -6718,6 +7131,7 @@ function ProviderSetupModal({
                 <BackendChoiceCard
                   body="Use an existing Docker context without changing your global Docker context."
                   details="No packages are installed. Cairn runs Docker and Compose with --context."
+                  disabled={setupBusy}
                   icon={<Terminal size={19} />}
                   onSelect={() => onChangeBackend("existing_context")}
                   title="Existing Docker context"
@@ -6735,6 +7149,7 @@ function ProviderSetupModal({
                   badge="Recommended"
                   body="Install or use Ubuntu on WSL2 with official Docker Engine packages inside the distro."
                   details="WSL2, Ubuntu, Docker Engine, Compose, Buildx, systemd service wiring, and docker-group access."
+                  disabled={setupBusy}
                   icon={<Server size={19} />}
                   onSelect={() => onChangeBackend("windows_wsl_ubuntu")}
                   title="Ubuntu on WSL2"
@@ -6742,6 +7157,7 @@ function ProviderSetupModal({
                 <BackendChoiceCard
                   body="Use an existing Docker context without changing your global Docker context."
                   details="No packages are installed. Cairn runs Docker and Compose with --context."
+                  disabled={setupBusy}
                   icon={<Terminal size={19} />}
                   onSelect={() => onChangeBackend("existing_context")}
                   title="Existing Docker context"
@@ -6776,6 +7192,7 @@ function ProviderSetupModal({
                         </span>
                         <input
                           className="mt-1 h-9 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
+                          disabled={setupBusy}
                           onChange={(event) =>
                             onChangeColimaProfile(event.target.value)
                           }
@@ -6784,16 +7201,19 @@ function ProviderSetupModal({
                         />
                       </label>
                       <SetupNumberField
+                        disabled={setupBusy}
                         label="CPU"
                         onChange={onChangeColimaCPU}
                         value={setup.colimaCPU}
                       />
                       <SetupNumberField
+                        disabled={setupBusy}
                         label="RAM GB"
                         onChange={onChangeColimaMemoryGB}
                         value={setup.colimaMemoryGB}
                       />
                       <SetupNumberField
+                        disabled={setupBusy}
                         label="Disk GB"
                         onChange={onChangeColimaDiskGB}
                         value={setup.colimaDiskGB}
@@ -6806,6 +7226,7 @@ function ProviderSetupModal({
                       </span>
                       <input
                         className="mt-1 h-9 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
+                        disabled={setupBusy}
                         onChange={(event) => onChangeDistro(event.target.value)}
                         placeholder="Ubuntu"
                         value={setup.distro}
@@ -6853,6 +7274,7 @@ function ProviderSetupModal({
                       <PermissionOption
                         checked={permissionMode === "ask"}
                         description="Cairn prompts only when an action needs sudo. The sudo password is never stored."
+                        disabled={setupBusy}
                         label="Use sudo per action"
                         onChange={() => onChangePermissionMode("ask")}
                         value="ask"
@@ -6860,6 +7282,7 @@ function ProviderSetupModal({
                       <PermissionOption
                         checked={permissionMode === "group"}
                         description="Convenient, less isolated. The docker group is root-equivalent and requires signing out and back in."
+                        disabled={setupBusy}
                         label="Add user to docker group"
                         onChange={() => onChangePermissionMode("group")}
                         value="group"
@@ -6867,6 +7290,7 @@ function ProviderSetupModal({
                       <PermissionOption
                         checked={permissionMode === "rootless"}
                         description="Use the rootless Docker socket when rootless Docker is already configured."
+                        disabled={setupBusy}
                         label="Use rootless Docker socket"
                         onChange={() => onChangePermissionMode("rootless")}
                         value="rootless"
@@ -6879,6 +7303,7 @@ function ProviderSetupModal({
                     ) : null}
                     <div className="flex justify-end">
                       <Button
+                        disabled={setupBusy}
                         loading={permissionSaving}
                         onClick={onSavePermission}
                       >
@@ -6902,14 +7327,21 @@ function ProviderSetupModal({
               </div>
             ) : null}
             <div className="flex justify-end gap-2 border-t border-border pt-4">
-              <Button onClick={() => onStep("backend")} variant="secondary">
+              <Button
+                disabled={setupBusy}
+                onClick={() => onStep("backend")}
+                variant="secondary"
+              >
                 Back
               </Button>
               {setup.backend === "existing_context" ? (
-                <Button onClick={onOpenDockerContexts}>Open Settings</Button>
+                <Button disabled={setupBusy} onClick={onOpenDockerContexts}>
+                  Open Settings
+                </Button>
               ) : null}
               {setup.detection?.healthy && !hasActionableWarnings ? (
                 <Button
+                  disabled={setupBusy}
                   icon={<CheckCircle2 size={15} />}
                   onClick={() => onStep("verify")}
                 >
@@ -6917,7 +7349,7 @@ function ProviderSetupModal({
                 </Button>
               ) : setup.backend !== "existing_context" ? (
                 <Button
-                  disabled={!canPlan}
+                  disabled={!canPlan || setupBusy}
                   disabledReason="Run checks before creating a repair plan"
                   icon={<Wrench size={15} />}
                   loading={setup.planning}
@@ -7016,14 +7448,14 @@ function ProviderSetupModal({
             ) : null}
             <div className="flex justify-end gap-2 border-t border-border pt-4">
               <Button
-                disabled={setup.installing}
+                disabled={setupBusy}
                 onClick={() => onStep("checks")}
                 variant="secondary"
               >
                 Back
               </Button>
               <Button
-                disabled={!setup.plan || setup.installing}
+                disabled={!setup.plan || setupBusy}
                 disabledReason="Create an install plan first"
                 icon={<Play size={15} />}
                 loading={setup.installing}
@@ -7075,12 +7507,14 @@ function ProviderSetupModal({
             )}
             <div className="flex justify-end gap-2 border-t border-border pt-4">
               <Button
+                disabled={setupBusy}
                 onClick={() => onStep(setup.plan ? "install" : "checks")}
                 variant="secondary"
               >
                 Back
               </Button>
               <Button
+                disabled={setupBusy}
                 icon={<FolderOpen size={15} />}
                 loading={setup.detectingProjects}
                 onClick={onDetectProjects}
@@ -7113,6 +7547,7 @@ function ProviderSetupModal({
                 Refresh detection
               </Button>
               <Button
+                disabled={setupBusy}
                 icon={<FolderOpen size={15} />}
                 onClick={onAddProjectFolder}
                 variant="secondary"
@@ -7139,6 +7574,7 @@ function ProviderSetupModal({
                     <input
                       checked={setup.selectedProjectIDs.includes(project.id)}
                       className="mt-1"
+                      disabled={setupBusy}
                       onChange={() => onToggleProject(project.id)}
                       type="checkbox"
                     />
@@ -7161,13 +7597,22 @@ function ProviderSetupModal({
               />
             )}
             <div className="flex justify-end gap-2 border-t border-border pt-4">
-              <Button onClick={() => onStep("verify")} variant="secondary">
+              <Button
+                disabled={setupBusy}
+                onClick={() => onStep("verify")}
+                variant="secondary"
+              >
                 Back
               </Button>
-              <Button onClick={() => onStep("done")} variant="secondary">
+              <Button
+                disabled={setupBusy}
+                onClick={() => onStep("done")}
+                variant="secondary"
+              >
                 Skip
               </Button>
               <Button
+                disabled={setupBusy}
                 icon={<CheckCircle2 size={15} />}
                 onClick={() => onStep("done")}
               >
@@ -7324,10 +7769,12 @@ function BackendChoiceCard({
 }
 
 function SetupNumberField({
+  disabled = false,
   label,
   onChange,
   value,
 }: {
+  disabled?: boolean;
   label: string;
   onChange: (value: number) => void;
   value: number;
@@ -7339,6 +7786,7 @@ function SetupNumberField({
       </span>
       <input
         className="mt-1 h-9 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
+        disabled={disabled}
         min={1}
         onChange={(event) => onChange(Number(event.target.value))}
         type="number"
@@ -7389,21 +7837,31 @@ function SetupCheckRow({
 function PermissionOption({
   checked,
   description,
+  disabled = false,
   label,
   onChange,
   value,
 }: {
   checked: boolean;
   description: string;
+  disabled?: boolean;
   label: string;
   onChange: () => void;
   value: PermissionMode;
 }) {
   return (
-    <label className="flex cursor-pointer items-start gap-3 rounded-card border border-border bg-bg-card p-3 text-sm hover:border-border-strong">
+    <label
+      className={[
+        "flex items-start gap-3 rounded-card border border-border bg-bg-card p-3 text-sm",
+        disabled
+          ? "cursor-not-allowed opacity-70"
+          : "cursor-pointer hover:border-border-strong",
+      ].join(" ")}
+    >
       <input
         checked={checked}
         className="mt-1"
+        disabled={disabled}
         name="linux-permission-mode"
         onChange={onChange}
         type="radio"
