@@ -70,4 +70,54 @@ describe("NotificationCenter", () => {
 
     vi.useRealTimers();
   });
+
+  it("renders targetless notifications as content instead of no-op buttons", () => {
+    const targetless = {
+      ...notification(),
+      id: 2,
+      title: "Informational notice",
+      topic: "unknown-topic",
+    };
+
+    render(
+      <NotificationCenter
+        error={null}
+        loading={false}
+        notifications={[targetless]}
+        onClose={vi.fn()}
+        onMarkAllRead={vi.fn()}
+        onNavigate={vi.fn()}
+        open
+      />,
+    );
+
+    expect(screen.getByText("Informational notice")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /Informational notice/ }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("reports the activated notification and dismisses on outside interaction", () => {
+    const item = notification();
+    const onClose = vi.fn();
+    const onNavigate = vi.fn();
+
+    render(
+      <NotificationCenter
+        error={null}
+        loading={false}
+        notifications={[item]}
+        onClose={onClose}
+        onMarkAllRead={vi.fn()}
+        onNavigate={onNavigate}
+        open
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /Updates checked/ }));
+    expect(onNavigate).toHaveBeenCalledWith(item, "updates");
+
+    fireEvent.pointerDown(document.body);
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
 });

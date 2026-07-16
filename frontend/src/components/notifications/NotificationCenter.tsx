@@ -1,5 +1,5 @@
 import { Bell } from "lucide-react";
-import { useRef } from "react";
+import { useEffect, useRef } from "react";
 
 import type { Notification } from "../../../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
 import { useFocusTrap } from "../../hooks/useFocusTrap";
@@ -14,7 +14,7 @@ type NotificationCenterProps = {
   notifications: Notification[];
   onClose: () => void;
   onMarkAllRead: () => void;
-  onNavigate: (page: PageID) => void;
+  onNavigate: (notification: Notification, page: PageID) => void;
   open: boolean;
 };
 
@@ -30,6 +30,21 @@ export function NotificationCenter({
   const panelRef = useRef<HTMLDivElement | null>(null);
 
   useFocusTrap(open, panelRef, onClose);
+
+  useEffect(() => {
+    if (!open) {
+      return undefined;
+    }
+    const onPointerDown = (event: PointerEvent) => {
+      const panel = panelRef.current;
+      if (!panel || event.composedPath().includes(panel)) {
+        return;
+      }
+      onClose();
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => document.removeEventListener("pointerdown", onPointerDown);
+  }, [onClose, open]);
 
   if (!open) {
     return null;
@@ -84,23 +99,15 @@ export function NotificationCenter({
         ) : null}
         {notifications.map((notification) => {
           const target = notificationTargetPage(notification.topic);
-          return (
-            <button
-              className={[
-                "mb-2 block w-full rounded-control border p-3 text-left text-sm transition",
-                notification.read
-                  ? "border-border bg-bg-inset text-text-secondary"
-                  : "border-accent/30 bg-accent/10 text-text-primary",
-                target ? "hover:border-border-strong" : "",
-              ].join(" ")}
-              key={notification.id}
-              onClick={() => {
-                if (target) {
-                  onNavigate(target);
-                }
-              }}
-              type="button"
-            >
+          const className = [
+            "mb-2 block w-full rounded-control border p-3 text-left text-sm",
+            notification.read
+              ? "border-border bg-bg-inset text-text-secondary"
+              : "border-accent/30 bg-accent/10 text-text-primary",
+            target ? "transition hover:border-border-strong" : "",
+          ].join(" ");
+          const content = (
+            <>
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0">
                   <div className="flex items-center gap-2">
@@ -125,6 +132,23 @@ export function NotificationCenter({
                 <span>{notification.topic || "system"}</span>
                 <span>{relativeTime(dateMillis(notification.createdAt))}</span>
               </div>
+            </>
+          );
+          if (!target) {
+            return (
+              <div className={className} key={notification.id}>
+                {content}
+              </div>
+            );
+          }
+          return (
+            <button
+              className={className}
+              key={notification.id}
+              onClick={() => onNavigate(notification, target)}
+              type="button"
+            >
+              {content}
             </button>
           );
         })}

@@ -1182,7 +1182,7 @@ describe("App inventory shell", () => {
     expect(agentServiceMock.ExecuteTool).not.toHaveBeenCalled();
   });
 
-  it("opens the notification center and marks notifications read", async () => {
+  it("marks an activated notification read before navigating", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
     settingsServiceMock.GetNotifications.mockResolvedValue(
       seededNotifications(),
@@ -1200,12 +1200,17 @@ describe("App inventory shell", () => {
     });
     expect(within(dialog).getByText("Provider degraded")).toBeInTheDocument();
     fireEvent.click(within(dialog).getByText("Provider degraded"));
+    await waitFor(() =>
+      expect(settingsServiceMock.MarkNotificationsRead).toHaveBeenCalledWith([
+        1,
+      ]),
+    );
     expect(
       await screen.findByRole("heading", { name: "Overview" }),
     ).toBeInTheDocument();
 
     fireEvent.click(
-      await screen.findByRole("button", { name: "Notifications 1 unread" }),
+      await screen.findByRole("button", { name: "Notifications" }),
     );
     const updateDialog = screen.getByRole("dialog", {
       name: "Notification center",
@@ -1218,6 +1223,16 @@ describe("App inventory shell", () => {
     expect(
       await screen.findByRole("heading", { name: "Updates" }),
     ).toBeInTheDocument();
+    expect(settingsServiceMock.MarkNotificationsRead).toHaveBeenCalledTimes(1);
+  });
+
+  it("marks all notifications read from the notification center", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    settingsServiceMock.GetNotifications.mockResolvedValue(
+      seededNotifications(),
+    );
+
+    render(<App />);
 
     fireEvent.click(
       await screen.findByRole("button", { name: "Notifications 1 unread" }),
@@ -1230,6 +1245,38 @@ describe("App inventory shell", () => {
         [],
       ),
     );
+  });
+
+  it("rolls back an optimistic notification read when persistence fails", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    settingsServiceMock.GetNotifications.mockResolvedValue(
+      seededNotifications(),
+    );
+    settingsServiceMock.MarkNotificationsRead.mockRejectedValueOnce(
+      new Error("Notification write failed"),
+    );
+
+    render(<App />);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Notifications 1 unread" }),
+    );
+    const dialog = await screen.findByRole("dialog", {
+      name: "Notification center",
+    });
+    fireEvent.click(within(dialog).getByText("Provider degraded"));
+
+    await waitFor(() =>
+      expect(settingsServiceMock.MarkNotificationsRead).toHaveBeenCalledWith([
+        1,
+      ]),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Notifications 1 unread" }),
+    );
+    expect(
+      await screen.findByText("Notification write failed"),
+    ).toBeInTheDocument();
   });
 
   it("shows an in-app app-update notice from the backend app update check", async () => {

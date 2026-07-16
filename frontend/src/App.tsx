@@ -2022,6 +2022,39 @@ function App() {
     }
   }, [refreshNotifications]);
 
+  const markNotificationRead = useCallback(
+    async (notification: Notification) => {
+      if (notification.read) {
+        return;
+      }
+      setNotificationsError(null);
+      if (notification.id === -1) {
+        setAppUpdateNotificationRead(true);
+        return;
+      }
+      setNotifications((current) =>
+        current.map((item) =>
+          item.id === notification.id ? { ...item, read: true } : item,
+        ),
+      );
+      try {
+        await SettingsService.MarkNotificationsRead([notification.id]);
+      } catch (error: unknown) {
+        setNotifications((current) =>
+          current.map((item) =>
+            item.id === notification.id ? { ...item, read: false } : item,
+          ),
+        );
+        setNotificationsError(
+          error instanceof Error
+            ? error.message
+            : "Unable to mark notification read",
+        );
+      }
+    },
+    [],
+  );
+
   const refreshAuditLog = useCallback(async () => {
     setAuditLoading(true);
     setAuditError(null);
@@ -6295,7 +6328,8 @@ function App() {
                   onMarkAllRead={() => {
                     void markAllNotificationsRead();
                   }}
-                  onNavigate={(page) => {
+                  onNavigate={(notification, page) => {
+                    void markNotificationRead(notification);
                     navigate(page);
                     setNotificationsOpen(false);
                   }}
