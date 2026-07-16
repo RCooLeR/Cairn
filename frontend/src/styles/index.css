@@ -10,8 +10,8 @@
   --border: 255 255 255;
   --border-strong: 255 255 255;
   --text-primary: 240 246 252;
-  --text-secondary: 240 246 252;
-  --text-muted: 240 246 252;
+  --text-secondary: 177 186 196;
+  --text-muted: 139 148 158;
   --accent: 45 212 167;
   --ok: 45 212 167;
   --warn: 245 184 61;
@@ -98,8 +98,8 @@
     --border: 255 255 255;
     --border-strong: 255 255 255;
     --text-primary: 240 246 252;
-    --text-secondary: 240 246 252;
-    --text-muted: 240 246 252;
+    --text-secondary: 177 186 196;
+    --text-muted: 139 148 158;
     --accent: 45 212 167;
     --ok: 45 212 167;
     --warn: 245 184 61;

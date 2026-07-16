@@ -357,9 +357,7 @@ async function disableMotion(page) {
 }
 
 async function assertNoSeriousAxeViolations(page, label) {
-  const results = await new AxeBuilder({ page })
-    .disableRules(["color-contrast"])
-    .analyze();
+  const results = await new AxeBuilder({ page }).analyze();
   const violations = results.violations
     .filter((violation) => ["critical", "serious"].includes(violation.impact))
     .map((violation) => ({
