@@ -8,6 +8,7 @@ import {
 } from "react";
 import { create } from "zustand";
 import {
+  ArrowDown,
   Bot,
   CheckCircle2,
   Circle,
@@ -40,6 +41,7 @@ import {
   Modal,
 } from "../components/ui";
 import { SerializedSettingsSaver } from "../settings/serializedSettingsSaver";
+import { useTranscriptAutoFollow } from "./useTranscriptAutoFollow";
 
 type AgentPageProps = {
   projects: ProjectSummary[];
@@ -211,7 +213,6 @@ export function AgentPage({ projects }: AgentPageProps) {
   );
   const [editBusy, setEditBusy] = useState(false);
   const [editError, setEditError] = useState<string | null>(null);
-  const transcriptRef = useRef<HTMLDivElement | null>(null);
   const mountedRef = useRef(true);
   const [settingsSaver] = useState(() => new SerializedSettingsSaver());
   const endpointCommittedRef = useRef(defaultEndpoint);
@@ -269,6 +270,12 @@ export function AgentPage({ projects }: AgentPageProps) {
         : undefined,
     [pendingToolCall, toolCatalog],
   );
+  const {
+    handleScroll: handleTranscriptScroll,
+    hasUnseenContent,
+    jumpToLatest,
+    transcriptRef,
+  } = useTranscriptAutoFollow(messages, messages.length > 0 || sending);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -280,14 +287,6 @@ export function AgentPage({ projects }: AgentPageProps) {
       mountedRef.current = false;
     };
   }, [settingsSaver]);
-
-  useEffect(() => {
-    const transcript = transcriptRef.current;
-    if (!transcript) {
-      return;
-    }
-    transcript.scrollTop = transcript.scrollHeight;
-  }, [messages, sending]);
 
   const refreshAgent = useCallback(async (showSpinner = true) => {
     if (showSpinner) {
@@ -903,21 +902,35 @@ export function AgentPage({ projects }: AgentPageProps) {
             </Button>
           </div>
           <CardBody className="flex min-h-0 flex-1 flex-col gap-3">
-            <div
-              className="min-h-0 flex-1 space-y-3 overflow-auto rounded-card border border-border bg-bg-inset p-3"
-              data-testid="agent-transcript"
-              ref={transcriptRef}
-            >
-              {messages.length === 0 ? (
-                <EmptyState
-                  body="Choose a model, optionally scope to a project, then ask a Docker question."
-                  icon={<Bot size={28} />}
-                  title="Start a conversation"
-                />
+            <div className="relative min-h-0 flex-1">
+              <div
+                className="h-full space-y-3 overflow-auto rounded-card border border-border bg-bg-inset p-3"
+                data-testid="agent-transcript"
+                onScroll={handleTranscriptScroll}
+                ref={transcriptRef}
+              >
+                {messages.length === 0 ? (
+                  <EmptyState
+                    body="Choose a model, optionally scope to a project, then ask a Docker question."
+                    icon={<Bot size={28} />}
+                    title="Start a conversation"
+                  />
+                ) : null}
+                {messages.map((message) => (
+                  <ChatBubble key={message.id} message={message} />
+                ))}
+              </div>
+              {hasUnseenContent ? (
+                <Button
+                  className="absolute bottom-3 left-1/2 -translate-x-1/2 shadow-lg"
+                  icon={<ArrowDown size={14} />}
+                  onClick={jumpToLatest}
+                  size="sm"
+                  variant="secondary"
+                >
+                  New messages · Jump to latest
+                </Button>
               ) : null}
-              {messages.map((message) => (
-                <ChatBubble key={message.id} message={message} />
-              ))}
             </div>
 
             <div className="rounded-card border border-border bg-bg-card p-3">
