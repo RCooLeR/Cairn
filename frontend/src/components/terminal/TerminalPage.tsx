@@ -90,8 +90,10 @@ type TerminalClosedPayload = {
 };
 
 type PasteGuardState = {
+  busy: boolean;
   sessionID: string;
   data: string;
+  error?: string;
 };
 
 type CloseGuardState = {
@@ -105,6 +107,24 @@ type PendingRun = {
   sessionID: string;
 };
 
+type TerminalSessionsState = {
+  activeSessionID: string | null;
+  sessions: TerminalSessionInfo[];
+};
+
+type TerminalOperation = "input" | "resize";
+
+type TerminalOperationFailure = {
+  message: string;
+  recovery: string;
+};
+
+type TerminalOperationResult =
+  | { ok: true }
+  | { failure: TerminalOperationFailure; ok: false };
+
+type TerminalInputResult = "failed" | "guarded" | "sent";
+
 type PlaceholderValues = Record<string, string>;
 
 type TerminalSurfaceHandle = {
@@ -115,8 +135,16 @@ type TerminalSurfaceHandle = {
 type TerminalSurfaceProps = {
   active: boolean;
   onCopyShortcut: (session: TerminalSessionInfo) => Promise<void>;
-  onInput: (session: TerminalSessionInfo, data: string) => Promise<void>;
+  onInput: (
+    session: TerminalSessionInfo,
+    data: string,
+  ) => Promise<TerminalInputResult>;
   onPasteShortcut: (session: TerminalSessionInfo) => Promise<void>;
+  onResize: (
+    session: TerminalSessionInfo,
+    cols: number,
+    rows: number,
+  ) => Promise<TerminalOperationResult>;
   session: TerminalSessionInfo;
 };
 
@@ -133,8 +161,12 @@ export function TerminalPage({
   projects,
   queuedCommand,
 }: TerminalPageProps) {
-  const [sessions, setSessions] = useState<TerminalSessionInfo[]>([]);
-  const [activeSessionID, setActiveSessionID] = useState<string | null>(null);
+  const [terminalSessions, setTerminalSessions] =
+    useState<TerminalSessionsState>({
+      activeSessionID: null,
+      sessions: [],
+    });
+  const { activeSessionID, sessions } = terminalSessions;
   const [cheatsheet, setCheatsheet] = useState<CheatsheetEntry[]>([]);
   const [cheatsheetSearch, setCheatsheetSearch] = useState("");
   const [cheatsheetCategory, setCheatsheetCategory] = useState("all");
@@ -152,7 +184,12 @@ export function TerminalPage({
   const [closeGuard, setCloseGuard] = useState<CloseGuardState | null>(null);
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [operationError, setOperationError] = useState<{
+    message: string;
+    operation: TerminalOperation;
+  } | null>(null);
   const [busy, setBusy] = useState(false);
+  const mountedRef = useRef(true);
   const pendingTimer = useRef<number | null>(null);
   const terminalSurfaceRefs = useRef<
     Record<string, TerminalSurfaceHandle | null>
@@ -166,7 +203,11 @@ export function TerminalPage({
     (index: number) => {
       const session = sessions[index];
       if (session) {
-        setActiveSessionID(session.id);
+        setTerminalSessions((current) =>
+          current.sessions.some((item) => item.id === session.id)
+            ? { ...current, activeSessionID: session.id }
+            : current,
+        );
       }
     },
     [sessions],
@@ -235,11 +276,24 @@ export function TerminalPage({
   }, [cheatsheet, cheatsheetCategory, cheatsheetSearch]);
 
   useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
     TerminalService.ListTerminalSessions()
       .then((nextSessions) => {
         const normalized = nextSessions ?? [];
-        setSessions(normalized);
-        setActiveSessionID((current) => current ?? normalized[0]?.id ?? null);
+        setTerminalSessions((current) => ({
+          activeSessionID: normalized.some(
+            (session) => session.id === current.activeSessionID,
+          )
+            ? current.activeSessionID
+            : (normalized[0]?.id ?? null),
+          sessions: normalized,
+        }));
       })
       .catch((loadError: unknown) => {
         setError(errorMessage(loadError, "Unable to load terminal sessions"));
@@ -257,22 +311,13 @@ export function TerminalPage({
       if (!payload) {
         return;
       }
-      setSessions((current) =>
-        current.filter((session) => session.id !== payload.sessionID),
+      setTerminalSessions((current) =>
+        removeTerminalSession(current, payload.sessionID),
       );
-      setActiveSessionID((current) => {
-        if (current !== payload.sessionID) {
-          return current;
-        }
-        const next = sessions.find(
-          (session) => session.id !== payload.sessionID,
-        );
-        return next?.id ?? null;
-      });
       setStatus(`Session exited with code ${payload.exitCode}`);
     });
     return () => off();
-  }, [sessions]);
+  }, []);
 
   useEffect(() => {
     if (!selectedTerminalContainerID) {
@@ -331,13 +376,12 @@ export function TerminalPage({
     if (!session) {
       return null;
     }
-    setSessions((current) => {
-      if (current.some((item) => item.id === session.id)) {
-        return current;
-      }
-      return [...current, session];
+    setTerminalSessions((current) => {
+      const sessions = current.sessions.some((item) => item.id === session.id)
+        ? current.sessions
+        : [...current.sessions, session];
+      return { activeSessionID: session.id, sessions };
     });
-    setActiveSessionID(session.id);
     return session;
   }, []);
 
@@ -439,20 +483,12 @@ export function TerminalPage({
     selectedTerminalContainerID,
   ]);
 
-  const closeSessionNow = useCallback(
-    async (session: TerminalSessionInfo) => {
-      await TerminalService.CloseTerminal(session.id);
-      setSessions((current) =>
-        current.filter((item) => item.id !== session.id),
-      );
-      setActiveSessionID((current) =>
-        current === session.id
-          ? (sessions.find((item) => item.id !== session.id)?.id ?? null)
-          : current,
-      );
-    },
-    [sessions],
-  );
+  const closeSessionNow = useCallback(async (session: TerminalSessionInfo) => {
+    await TerminalService.CloseTerminal(session.id);
+    setTerminalSessions((current) =>
+      removeTerminalSession(current, session.id),
+    );
+  }, []);
 
   const closeSession = useCallback(
     (session: TerminalSessionInfo) => {
@@ -467,18 +503,62 @@ export function TerminalPage({
     [closeSessionNow],
   );
 
-  const sendInput = useCallback(
-    async (session: TerminalSessionInfo, data: string) => {
-      if (shouldGuardPaste(session, data)) {
-        setPasteGuard({ sessionID: session.id, data });
-        return;
+  const runTerminalOperation = useCallback(
+    async (
+      operation: TerminalOperation,
+      task: () => Promise<void>,
+    ): Promise<TerminalOperationResult> => {
+      try {
+        await task();
+        if (mountedRef.current) {
+          setOperationError((current) =>
+            current?.operation === operation ? null : current,
+          );
+        }
+        return { ok: true };
+      } catch (operationFailure: unknown) {
+        const failure = terminalOperationFailure(operation, operationFailure);
+        if (mountedRef.current) {
+          setOperationError({ message: failure.message, operation });
+          setStatus(failure.recovery);
+        }
+        return { failure, ok: false };
       }
-      await TerminalService.WriteTerminal(
-        session.id,
-        encodeTerminalInput(data),
-      );
     },
     [],
+  );
+
+  const writeTerminalInput = useCallback(
+    (sessionID: string, data: string) =>
+      runTerminalOperation("input", () =>
+        TerminalService.WriteTerminal(sessionID, encodeTerminalInput(data)),
+      ),
+    [runTerminalOperation],
+  );
+
+  const resizeTerminal = useCallback(
+    (session: TerminalSessionInfo, cols: number, rows: number) =>
+      runTerminalOperation("resize", () =>
+        TerminalService.ResizeTerminal(session.id, cols, rows),
+      ),
+    [runTerminalOperation],
+  );
+
+  const sendInput = useCallback(
+    async (
+      session: TerminalSessionInfo,
+      data: string,
+    ): Promise<TerminalInputResult> => {
+      if (shouldGuardPaste(session, data)) {
+        setPasteGuard({ busy: false, sessionID: session.id, data });
+        setStatus("Confirm paste before sending");
+        return "guarded";
+      }
+      return (await writeTerminalInput(session.id, data)).ok
+        ? "sent"
+        : "failed";
+    },
+    [writeTerminalInput],
   );
 
   const copyTerminalSelection = useCallback(
@@ -517,8 +597,10 @@ export function TerminalPage({
           setStatus("Clipboard is empty");
           return;
         }
-        await sendInput(session, text);
-        setStatus("Clipboard pasted");
+        const result = await sendInput(session, text);
+        if (result === "sent") {
+          setStatus("Clipboard pasted");
+        }
       } catch (pasteError: unknown) {
         setError(errorMessage(pasteError, "Unable to paste clipboard text"));
       } finally {
@@ -529,13 +611,9 @@ export function TerminalPage({
   );
 
   const writeCommand = useCallback(
-    async (sessionID: string, command: string) => {
-      await TerminalService.WriteTerminal(
-        sessionID,
-        encodeTerminalInput(`${command}\r`),
-      );
-    },
-    [],
+    (sessionID: string, command: string) =>
+      writeTerminalInput(sessionID, `${command}\r`),
+    [writeTerminalInput],
   );
 
   const scheduleCommand = useCallback(
@@ -559,7 +637,11 @@ export function TerminalPage({
       pendingTimer.current = window.setTimeout(() => {
         pendingTimer.current = null;
         setPendingRun(null);
-        void writeCommand(targetID, trimmed);
+        void writeCommand(targetID, trimmed).then((result) => {
+          if (result.ok && mountedRef.current) {
+            setStatus("Command sent");
+          }
+        });
       }, 1000);
     },
     [activeSessionID, openBackend, writeCommand],
@@ -577,8 +659,12 @@ export function TerminalPage({
   }, [onCommandConsumed, queuedCommand, scheduleCommand]);
 
   const copyCommand = useCallback(async (command: string) => {
-    await Clipboard.SetText(command);
-    setStatus("Command copied");
+    try {
+      await Clipboard.SetText(command);
+      setStatus("Command copied");
+    } catch (copyError: unknown) {
+      setError(errorMessage(copyError, "Unable to copy terminal command"));
+    }
   }, []);
 
   const runCheatsheetEntry = useCallback(
@@ -772,7 +858,13 @@ export function TerminalPage({
                   aria-selected={active}
                   className="flex min-w-0 flex-1 items-center gap-2 text-left outline-none focus-visible:text-text-primary"
                   id={tabID}
-                  onClick={() => setActiveSessionID(session.id)}
+                  onClick={() =>
+                    setTerminalSessions((current) =>
+                      current.sessions.some((item) => item.id === session.id)
+                        ? { ...current, activeSessionID: session.id }
+                        : current,
+                    )
+                  }
                   onKeyDown={(event) => onSessionTabKeyDown(event, index)}
                   role="tab"
                   tabIndex={active ? 0 : -1}
@@ -856,6 +948,7 @@ export function TerminalPage({
               onCopyShortcut={copyTerminalSelection}
               onInput={sendInput}
               onPasteShortcut={pasteClipboardToTerminal}
+              onResize={resizeTerminal}
               ref={(handle) => {
                 terminalSurfaceRefs.current[session.id] = handle;
               }}
@@ -879,6 +972,9 @@ export function TerminalPage({
           </span>
           <span className="ml-auto">{status}</span>
           {error ? <span className="text-error">{error}</span> : null}
+          {operationError ? (
+            <span className="text-error">{operationError.message}</span>
+          ) : null}
         </div>
       </section>
 
@@ -940,21 +1036,50 @@ export function TerminalPage({
       </aside>
 
       <Modal
+        busy={pasteGuard?.busy}
         footer={
           <>
-            <Button onClick={() => setPasteGuard(null)} variant="secondary">
+            <Button
+              disabled={pasteGuard?.busy}
+              onClick={() => setPasteGuard(null)}
+              variant="secondary"
+            >
               Cancel
             </Button>
             <Button
+              loading={pasteGuard?.busy}
               onClick={() => {
-                if (!pasteGuard) {
+                if (!pasteGuard || pasteGuard.busy) {
                   return;
                 }
                 const guard = pasteGuard;
-                setPasteGuard(null);
-                void TerminalService.WriteTerminal(
-                  guard.sessionID,
-                  encodeTerminalInput(guard.data),
+                setPasteGuard({ ...guard, busy: true, error: undefined });
+                void writeTerminalInput(guard.sessionID, guard.data).then(
+                  (result) => {
+                    if (!mountedRef.current) {
+                      return;
+                    }
+                    if (result.ok) {
+                      setPasteGuard((current) =>
+                        current?.sessionID === guard.sessionID &&
+                        current.data === guard.data
+                          ? null
+                          : current,
+                      );
+                      setStatus("Clipboard pasted");
+                      return;
+                    }
+                    setPasteGuard((current) =>
+                      current?.sessionID === guard.sessionID &&
+                      current.data === guard.data
+                        ? {
+                            ...current,
+                            busy: false,
+                            error: result.failure.message,
+                          }
+                        : current,
+                    );
+                  },
                 );
               }}
               variant="primary"
@@ -963,13 +1088,20 @@ export function TerminalPage({
             </Button>
           </>
         }
-        onClose={() => setPasteGuard(null)}
+        onClose={() => {
+          if (!pasteGuard?.busy) {
+            setPasteGuard(null);
+          }
+        }}
         open={Boolean(pasteGuard)}
         title="Confirm Paste"
       >
         <pre className="max-h-64 overflow-auto rounded-control bg-bg-inset p-3 text-xs text-text-secondary">
           {pasteGuard?.data}
         </pre>
+        {pasteGuard?.error ? (
+          <p className="mt-3 text-sm text-error">{pasteGuard.error}</p>
+        ) : null}
       </Modal>
 
       <Modal
@@ -1180,7 +1312,7 @@ export function CommandPalette<T extends string>({
 
 const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurfaceProps>(
   function TerminalSurface(
-    { active, onCopyShortcut, onInput, onPasteShortcut, session },
+    { active, onCopyShortcut, onInput, onPasteShortcut, onResize, session },
     ref,
   ) {
     const hostRef = useRef<HTMLDivElement | null>(null);
@@ -1189,6 +1321,7 @@ const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurfaceProps>(
     const onCopyShortcutRef = useRef(onCopyShortcut);
     const onInputRef = useRef(onInput);
     const onPasteShortcutRef = useRef(onPasteShortcut);
+    const onResizeRef = useRef(onResize);
     const sessionRef = useRef(session);
 
     useImperativeHandle(
@@ -1213,6 +1346,10 @@ const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurfaceProps>(
     }, [onPasteShortcut]);
 
     useEffect(() => {
+      onResizeRef.current = onResize;
+    }, [onResize]);
+
+    useEffect(() => {
       sessionRef.current = session;
     }, [session]);
 
@@ -1220,7 +1357,6 @@ const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurfaceProps>(
       if (!hostRef.current) {
         return undefined;
       }
-      const sessionID = session.id;
       const terminal = new XTerm({
         allowProposedApi: false,
         convertEol: true,
@@ -1264,7 +1400,7 @@ const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurfaceProps>(
           window.clearTimeout(resizeTimer.current);
         }
         resizeTimer.current = window.setTimeout(() => {
-          void TerminalService.ResizeTerminal(sessionID, cols, rows);
+          void onResizeRef.current(sessionRef.current, cols, rows);
         }, 100);
       };
       resize();
@@ -1513,6 +1649,83 @@ function shouldGuardPaste(session: TerminalSessionInfo, data: string) {
   const normalized = data.replace(/\r/g, "\n");
   const lines = normalized.split("\n").filter((line) => line.trim() !== "");
   return lines.length > 1;
+}
+
+function removeTerminalSession(
+  current: TerminalSessionsState,
+  sessionID: string,
+): TerminalSessionsState {
+  const removedIndex = current.sessions.findIndex(
+    (session) => session.id === sessionID,
+  );
+  if (removedIndex < 0) {
+    if (
+      current.activeSessionID === null ||
+      current.sessions.some((session) => session.id === current.activeSessionID)
+    ) {
+      return current;
+    }
+    return {
+      ...current,
+      activeSessionID: current.sessions[0]?.id ?? null,
+    };
+  }
+
+  const sessions = current.sessions.filter(
+    (session) => session.id !== sessionID,
+  );
+  const activeStillExists = sessions.some(
+    (session) => session.id === current.activeSessionID,
+  );
+  return {
+    activeSessionID: activeStillExists
+      ? current.activeSessionID
+      : (sessions[Math.min(removedIndex, sessions.length - 1)]?.id ?? null),
+    sessions,
+  };
+}
+
+function terminalOperationFailure(
+  operation: TerminalOperation,
+  error: unknown,
+): TerminalOperationFailure {
+  const summary =
+    operation === "input"
+      ? "Unable to send terminal input"
+      : "Unable to resize terminal";
+  const detail =
+    error instanceof Error
+      ? error.message.trim()
+      : typeof error === "string"
+        ? error.trim()
+        : "";
+  const message = detail ? `${summary}: ${detail}` : summary;
+  if (isStaleTerminalFailure(detail)) {
+    return {
+      message,
+      recovery:
+        "Session is no longer available; close this tab and open a new terminal",
+    };
+  }
+  return {
+    message,
+    recovery:
+      operation === "input"
+        ? "Input was not sent; retry or close and reopen the session"
+        : "Terminal resize failed; close and reopen the session if the display is incorrect",
+  };
+}
+
+function isStaleTerminalFailure(detail: string) {
+  const normalized = detail.toLowerCase();
+  return [
+    "session closed",
+    "terminal closed",
+    "session not found",
+    "terminal not found",
+    "unknown session",
+    "no terminal session",
+  ].some((marker) => normalized.includes(marker));
 }
 
 export function isTerminalCopyShortcut(event: TerminalShortcutEvent) {
