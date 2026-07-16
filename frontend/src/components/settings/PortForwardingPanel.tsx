@@ -48,9 +48,17 @@ export function PortForwardingPanel() {
     const off = Events.On("portforward:changed", () => {
       void refresh();
     });
+    const offProvider = Events.On("provider:changed", () => {
+      void refresh();
+    });
+    const offDocker = Events.On("docker:connected", () => {
+      void refresh();
+    });
     return () => {
       window.clearTimeout(timer);
       off();
+      offProvider();
+      offDocker();
     };
   }, [refresh]);
 
@@ -90,7 +98,7 @@ export function PortForwardingPanel() {
           Binds published container ports on the Windows host and proxies them
           into WSL, so <code>-p</code> behaves like Docker Desktop. Ports a
           container publishes on <code>0.0.0.0</code> are mirrored to the
-          Windows LAN interface; loopback publishes stay local.
+          Windows LAN interface; loopback-only publishes use WSL localhost.
         </p>
         <div className="flex items-center gap-3">
           <Button

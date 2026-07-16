@@ -50,7 +50,8 @@ type MacOSColimaProvider struct {
 }
 
 type colimaInstallPlan struct {
-	Steps []colimaInstallStep
+	Steps     []colimaInstallStep
+	ExpiresAt time.Time
 }
 
 type colimaInstallStep struct {
@@ -293,14 +294,21 @@ func (p *MacOSColimaProvider) PlanInstall(_ context.Context, opts models.Install
 		ExpiresAt: time.Now().UTC().Add(security.DefaultPlanTTL),
 	}
 	p.installMu.Lock()
-	p.installPlans[planID] = colimaInstallPlan{Steps: steps}
+	p.pruneExpiredInstallPlansLocked(time.Now().UTC())
+	p.installPlans[planID] = colimaInstallPlan{Steps: steps, ExpiresAt: plan.ExpiresAt}
 	p.installMu.Unlock()
 	return plan, nil
 }
 
 func (p *MacOSColimaProvider) ExecuteInstallStep(ctx context.Context, planID string, step int, progress chan<- InstallProgress) error {
+	now := time.Now().UTC()
 	p.installMu.Lock()
+	p.pruneExpiredInstallPlansLocked(now)
 	plan, ok := p.installPlans[planID]
+	if ok && !plan.ExpiresAt.IsZero() && now.After(plan.ExpiresAt) {
+		delete(p.installPlans, planID)
+		ok = false
+	}
 	p.installMu.Unlock()
 	if !ok || step < 0 || step >= len(plan.Steps) {
 		return apperror.New(apperror.PlanExpired, "Install plan expired or was not found")
@@ -323,6 +331,14 @@ func (p *MacOSColimaProvider) ExecuteInstallStep(ctx context.Context, planID str
 	}
 	sendInstallProgress(progress, step+1, len(plan.Steps), "Done: "+installStep.Message, false)
 	return nil
+}
+
+func (p *MacOSColimaProvider) pruneExpiredInstallPlansLocked(now time.Time) {
+	for id, plan := range p.installPlans {
+		if !plan.ExpiresAt.IsZero() && now.After(plan.ExpiresAt) {
+			delete(p.installPlans, id)
+		}
+	}
 }
 
 func (p *MacOSColimaProvider) Start(ctx context.Context) error {

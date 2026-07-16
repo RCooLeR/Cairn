@@ -258,6 +258,42 @@ func TestPlanDeleteBackupRequiresConfirmationAndRemovesRecord(t *testing.T) {
 	}
 }
 
+func TestApplyDeleteBackupKeepsRecordWhenArtifactRemovalFails(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	mgr, _, _ := newTestManager(t)
+	archivePath := filepath.Join(t.TempDir(), "archive-dir")
+	if err := os.MkdirAll(filepath.Join(archivePath, "child"), 0o755); err != nil {
+		t.Fatalf("mkdir archive dir: %v", err)
+	}
+	metadataPath := filepath.Join(t.TempDir(), "backup.json")
+	if err := os.WriteFile(metadataPath, []byte("{}"), 0o600); err != nil {
+		t.Fatalf("write metadata: %v", err)
+	}
+	record := store.BackupRecord{
+		ID:           "backup-fail-delete",
+		ProviderID:   "linux_native",
+		VolumeName:   "app-db",
+		BackupPath:   archivePath,
+		MetadataPath: metadataPath,
+		Result:       "success",
+	}
+	if err := mgr.Backups.Insert(ctx, record); err != nil {
+		t.Fatalf("insert backup: %v", err)
+	}
+	plan, err := mgr.PlanDeleteBackup(ctx, record.ID)
+	if err != nil {
+		t.Fatalf("PlanDeleteBackup() error = %v", err)
+	}
+
+	if err := mgr.ApplyDeleteBackup(ctx, plan.PlanID); err == nil {
+		t.Fatal("ApplyDeleteBackup() error = nil, want artifact removal failure")
+	}
+	if _, err := mgr.Backups.Get(ctx, record.ID); err != nil {
+		t.Fatalf("backup record was removed after artifact failure: %v", err)
+	}
+}
+
 func TestRestoreHelperUsesPositionalArchiveAndRollbackStash(t *testing.T) {
 	t.Parallel()
 	archiveName := "app-db.tar.gz; touch /restore/pwned #"
@@ -272,10 +308,14 @@ func TestRestoreHelperUsesPositionalArchiveAndRollbackStash(t *testing.T) {
 	if strings.Contains(script, archiveName) {
 		t.Fatalf("archive name was interpolated into shell script: %q", script)
 	}
-	for _, want := range []string{`tar xzf "$archive"`, "stash_name", "rmdir \"$stash\""} {
+	for _, want := range []string{`tar xzf "$archive"`, "stash_name", "trap cleanup EXIT HUP INT TERM", "restore_stash_dir"} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("restore script missing %q: %q", want, script)
 		}
+	}
+	backupArgs := dockerRunBackupArgs("app-db", "/tmp/backups", "app-db.tar.gz")
+	if !slices.Contains(backupArgs, "--exclude=.cairn-restore-old-*") {
+		t.Fatalf("backup args do not exclude restore stash: %#v", backupArgs)
 	}
 }
 
@@ -433,6 +473,50 @@ func TestRestoreIntoNewVolumeRequiresConfirmationOnly(t *testing.T) {
 	}
 	if plan.Risk != models.RiskNeedsConfirmation || plan.RequiresTypedName != "" {
 		t.Fatalf("plan = %#v, want confirmation without typed name", plan)
+	}
+}
+
+func TestRestoreIntoNewVolumeRechecksTargetAtApply(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	mgr, events, provider := newTestManager(t)
+	dir := t.TempDir()
+	archivePath := filepath.Join(dir, "app-db.tar.gz")
+	payload := []byte("backup-data")
+	if err := os.WriteFile(archivePath, payload, 0o600); err != nil {
+		t.Fatalf("write archive: %v", err)
+	}
+	sum := sha256.Sum256(payload)
+	if err := writeSidecar(metadataPathForArchive(archivePath), BackupSidecar{
+		FormatVersion: formatVersion,
+		Volume:        "app-db",
+		Project:       "app",
+		SHA256:        hex.EncodeToString(sum[:]),
+	}); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+
+	plan, err := mgr.PlanRestoreVolume(ctx, models.RestoreVolumeRequest{
+		SourcePath: archivePath,
+		VolumeName: "app-db-restored",
+		Overwrite:  false,
+	})
+	if err != nil {
+		t.Fatalf("PlanRestoreVolume() error = %v", err)
+	}
+	mgr.Docker.(*fakeBackupDocker).volumes["app-db-restored"] = &models.VolumeDetail{Summary: models.VolumeSummary{Name: "app-db-restored"}}
+	done := events.Subscribe(ctx, bus.TopicJobDone, 4)
+
+	jobID, err := mgr.ApplyRestore(ctx, plan.PlanID, "")
+	if err != nil {
+		t.Fatalf("ApplyRestore() error = %v", err)
+	}
+	payloadDone := waitJobDonePayload(t, done, jobID)
+	if payloadDone.Error == "" {
+		t.Fatalf("restore succeeded after target volume appeared")
+	}
+	if provider.hasRunArg("tar xzf") || provider.hasRunArg("volume create") {
+		t.Fatalf("restore touched Docker after target appeared: %#v", provider.calls)
 	}
 }
 

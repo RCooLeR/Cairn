@@ -5,7 +5,9 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -59,6 +61,41 @@ func TestDesiredForwardsKeepsBroadestBindAndSkipsUnpublished(t *testing.T) {
 	udp, ok := got[forwardKey("udp", 53)]
 	if !ok || udp.bindAddr != "0.0.0.0" || udp.protocol != "udp" {
 		t.Fatalf("udp 53 = %+v, want udp/0.0.0.0", udp)
+	}
+}
+
+func TestDesiredForwardsSkipsUnsupportedLoopbackAndIPv6Binds(t *testing.T) {
+	t.Parallel()
+	containers := []models.ContainerSummary{{
+		ID:   "a",
+		Name: "web",
+		Ports: []models.PortBinding{
+			{HostIP: "127.0.0.1", HostPort: "8080", ContainerPort: "80", Protocol: "tcp"},
+			{HostIP: "::1", HostPort: "8081", ContainerPort: "80", Protocol: "tcp"},
+			{HostIP: "fe80::1", HostPort: "8082", ContainerPort: "80", Protocol: "tcp"},
+			{HostIP: "192.168.1.50", HostPort: "8083", ContainerPort: "80", Protocol: "tcp"},
+		},
+	}}
+
+	got := desiredForwards(containers)
+	if len(got) != 1 {
+		t.Fatalf("desiredForwards size = %d, want 1 (%+v)", len(got), got)
+	}
+	if fwd, ok := got[forwardKey("tcp", 8083)]; !ok || fwd.bindAddr != "192.168.1.50" {
+		t.Fatalf("tcp 8083 = %+v, want mirrored IPv4 bind", fwd)
+	}
+}
+
+func TestIsConnResetRecognizesWrappedErrno(t *testing.T) {
+	t.Parallel()
+	if !isConnReset(syscall.ECONNRESET) {
+		t.Fatal("ECONNRESET was not recognized")
+	}
+	if !isConnReset(&net.OpError{Op: "read", Err: syscall.Errno(10054)}) {
+		t.Fatal("wrapped WSAECONNRESET was not recognized")
+	}
+	if isConnReset(errors.New("permission denied")) {
+		t.Fatal("non-reset error was misclassified")
 	}
 }
 
@@ -149,6 +186,64 @@ func TestManagerReportsBindConflict(t *testing.T) {
 	})
 	if forward.Reason == "" || forward.HostPort != 18081 {
 		t.Fatalf("conflict forward = %+v", forward)
+	}
+}
+
+func TestManagerRetriesErrorForwardOnNextReconcile(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	calls := 0
+	listenerCh := make(chan net.Listener, 1)
+	flakyListen := func(ctx context.Context, network, address string) (net.Listener, error) {
+		mu.Lock()
+		calls++
+		call := calls
+		mu.Unlock()
+		if call == 1 {
+			return nil, errors.New("address already in use")
+		}
+		return capturingListen(listenerCh)(ctx, network, address)
+	}
+	manager := newTestManager(t, fakeListerWithPort("18084", "tcp"), &echoDialer{}, Options{
+		Enabled:           true,
+		ReconcileInterval: 20 * time.Millisecond,
+		Listen:            flakyListen,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager.Start(ctx)
+	t.Cleanup(manager.StopAll)
+
+	awaitListener(t, listenerCh)
+	awaitForward(t, manager, func(forwards []models.PortForward) bool {
+		mu.Lock()
+		gotCalls := calls
+		mu.Unlock()
+		return gotCalls >= 2 && len(forwards) == 1 && forwards[0].Status == statusActive
+	})
+}
+
+func TestManagerMarksAcceptLoopFailure(t *testing.T) {
+	t.Parallel()
+	manager := newTestManager(t, fakeListerWithPort("18085", "tcp"), &echoDialer{}, Options{
+		Enabled:           true,
+		ReconcileInterval: time.Hour,
+		Listen: func(context.Context, string, string) (net.Listener, error) {
+			return errorAcceptListener{}, nil
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager.Start(ctx)
+	t.Cleanup(manager.StopAll)
+
+	forward := awaitForward(t, manager, func(forwards []models.PortForward) bool {
+		return len(forwards) == 1 && forwards[0].Status == statusError
+	})
+	if !strings.Contains(forward.Reason, "accept failed") {
+		t.Fatalf("forward reason = %q, want accept failure", forward.Reason)
 	}
 }
 
@@ -258,6 +353,17 @@ func (d *udpDialer) DialPacket(ctx context.Context, _ int) (net.Conn, error) {
 	var dialer net.Dialer
 	return dialer.DialContext(ctx, "udp", d.target)
 }
+
+type errorAcceptListener struct{}
+
+func (errorAcceptListener) Accept() (net.Conn, error) { return nil, errors.New("accept failed") }
+func (errorAcceptListener) Close() error              { return nil }
+func (errorAcceptListener) Addr() net.Addr            { return fakeAddr("127.0.0.1:0") }
+
+type fakeAddr string
+
+func (a fakeAddr) Network() string { return "tcp" }
+func (a fakeAddr) String() string  { return string(a) }
 
 func capturingListen(ch chan<- net.Listener) listenFunc {
 	return func(context.Context, string, string) (net.Listener, error) {

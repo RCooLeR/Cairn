@@ -34,6 +34,7 @@ import (
 const (
 	minimumAPIVersion       = "1.41"
 	defaultTimeout          = 10 * time.Second
+	defaultInventoryTimeout = 60 * time.Second
 	defaultPingEvery        = 10 * time.Second
 	defaultReconcileEvery   = time.Minute
 	defaultEventBatchWindow = 250 * time.Millisecond
@@ -425,6 +426,14 @@ func (c *Client) withTimeout(ctx context.Context) (context.Context, context.Canc
 	return context.WithTimeout(ctx, timeout)
 }
 
+func (c *Client) withInventoryTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
+	timeout := defaultInventoryTimeout
+	if c.unaryTimeout > timeout {
+		timeout = c.unaryTimeout
+	}
+	return context.WithTimeout(ctx, timeout)
+}
+
 func newSDKClient(host string) (APIClient, error) {
 	return newSDKClientWithDialer(host, nil)
 }
@@ -447,9 +456,9 @@ func newSDKClientWithDialer(host string, dialContext func(context.Context, strin
 func processBackedHTTPClient() *http.Client {
 	return &http.Client{
 		Transport: &http.Transport{
-			DisableKeepAlives: true,
-			MaxIdleConns:      0,
-			IdleConnTimeout:   time.Second,
+			MaxIdleConns:        4,
+			MaxIdleConnsPerHost: 2,
+			IdleConnTimeout:     10 * time.Second,
 		},
 		CheckRedirect: dockerclient.CheckRedirect,
 	}

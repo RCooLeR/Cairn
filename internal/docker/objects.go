@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
@@ -68,7 +69,7 @@ func (c *Client) ListContainers(ctx context.Context, opts models.ContainerListOp
 	}
 	sortContainerSummaries(summaries)
 	if err := c.saveContainers(ctx, records, isContainerInventorySnapshot(opts)); err != nil {
-		return nil, err
+		slog.Debug("cache containers failed", "error", err)
 	}
 	return summaries, nil
 }
@@ -81,7 +82,7 @@ func (c *Client) GetContainer(ctx context.Context, id string) (*models.Container
 	detail := mapContainerDetail(raw)
 	c.qualifyContainerSummary(&detail.Summary)
 	if err := c.saveContainers(ctx, []store.ContainerCacheRecord{containerRecordFromInspect(raw, detail)}, false); err != nil {
-		return nil, err
+		slog.Debug("cache container failed", "container", id, "error", err)
 	}
 	return detail, nil
 }
@@ -99,7 +100,7 @@ func (c *Client) ListImages(ctx context.Context) ([]models.ImageSummary, error) 
 	if err != nil {
 		return nil, err
 	}
-	callCtx, cancel := c.withTimeout(ctx)
+	callCtx, cancel := c.withInventoryTimeout(ctx)
 	defer cancel()
 
 	raw, err := api.ImageList(callCtx, image.ListOptions{})
@@ -124,7 +125,7 @@ func (c *Client) ListImages(ctx context.Context) ([]models.ImageSummary, error) 
 	}
 	sortImageSummaries(summaries)
 	if err := c.saveImages(ctx, records, true); err != nil {
-		return nil, err
+		slog.Debug("cache images failed", "error", err)
 	}
 	return summaries, nil
 }
@@ -149,7 +150,7 @@ func (c *Client) GetImage(ctx context.Context, id string) (*models.ImageDetail, 
 		UsedBy:   users,
 		Dangling: imageDangling(detail.Summary.RepoTags),
 	}}, false); err != nil {
-		return nil, err
+		slog.Debug("cache image failed", "image", id, "error", err)
 	}
 	return detail, nil
 }
@@ -194,7 +195,7 @@ func (c *Client) ListVolumes(ctx context.Context) ([]models.VolumeSummary, error
 	}
 	sortVolumeSummaries(summaries)
 	if err := c.saveVolumes(ctx, records, true); err != nil {
-		return nil, err
+		slog.Debug("cache volumes failed", "error", err)
 	}
 	return summaries, nil
 }
@@ -219,7 +220,7 @@ func (c *Client) GetVolume(ctx context.Context, name string) (*models.VolumeDeta
 		UsedBy:    usedBy,
 		CreatedAt: volumeCreatedAt(raw),
 	}}, false); err != nil {
-		return nil, err
+		slog.Debug("cache volume failed", "volume", name, "error", err)
 	}
 	return detail, nil
 }
@@ -252,7 +253,7 @@ func (c *Client) ListNetworks(ctx context.Context) ([]models.NetworkSummary, err
 	}
 	sortNetworkSummaries(summaries)
 	if err := c.saveNetworks(ctx, records, true); err != nil {
-		return nil, err
+		slog.Debug("cache networks failed", "error", err)
 	}
 	return summaries, nil
 }
@@ -283,13 +284,16 @@ func (c *Client) GetNetwork(ctx context.Context, id string) (*models.NetworkDeta
 		Gateway:    detail.Gateway,
 		Containers: containerIDs(containers),
 	}}, false); err != nil {
-		return nil, err
+		slog.Debug("cache network failed", "network", id, "error", err)
 	}
 	return detail, nil
 }
 
 func (c *Client) Reconcile(ctx context.Context) error {
 	var joined error
+	cache := c.objectCache()
+	before, compareSnapshots, snapshotErr := c.objectSnapshot(ctx, cache)
+	joined = errors.Join(joined, snapshotErr)
 	_, err := c.ListContainers(ctx, models.ContainerListOptions{All: true})
 	joined = errors.Join(joined, err)
 	_, err = c.ListImages(ctx)
@@ -298,9 +302,17 @@ func (c *Client) Reconcile(ctx context.Context) error {
 	joined = errors.Join(joined, err)
 	_, err = c.ListNetworks(ctx)
 	joined = errors.Join(joined, err)
-	if cache := c.objectCache(); cache != nil {
+	if cache != nil {
 		err = cache.DeleteStale(ctx, c.providerID(), c.now().Add(-24*time.Hour))
 		joined = errors.Join(joined, err)
+	}
+	if compareSnapshots && joined == nil {
+		after, _, err := c.objectSnapshot(ctx, cache)
+		if err != nil {
+			joined = errors.Join(joined, err)
+		} else {
+			c.publishSnapshotChanges(before, after)
+		}
 	}
 	return joined
 }
@@ -363,7 +375,7 @@ func (c *Client) objectEventLoop(ctx context.Context, changes chan<- objectChang
 		}
 		if c.usesProcessBackedTransport() {
 			c.objectPollLoop(ctx)
-			return
+			continue
 		}
 		backoff = c.backoffMin
 		if backoff <= 0 {
@@ -406,7 +418,7 @@ func (c *Client) objectEventLoop(ctx context.Context, changes chan<- objectChang
 					continue
 				}
 				if err != nil {
-					c.disconnect(mapDockerError("watch Docker events", err))
+					slog.Debug("docker event stream ended", "error", err)
 					streamOK = false
 				}
 			}
@@ -431,11 +443,55 @@ func (c *Client) objectPollLoop(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if err := c.Reconcile(ctx); err != nil {
-				c.disconnect(mapDockerError("poll Docker objects", err))
-				return
+				slog.Debug("docker object poll failed", "error", mapDockerError("poll Docker objects", err))
 			}
 		}
 	}
+}
+
+func (c *Client) objectSnapshot(ctx context.Context, cache *store.ObjectCacheRepository) (store.ObjectCacheSnapshot, bool, error) {
+	if cache == nil {
+		return store.ObjectCacheSnapshot{}, false, nil
+	}
+	snapshot, err := cache.SnapshotKeys(ctx, c.providerID())
+	if err != nil {
+		return store.ObjectCacheSnapshot{}, false, err
+	}
+	return snapshot, true, nil
+}
+
+func (c *Client) publishSnapshotChanges(before store.ObjectCacheSnapshot, after store.ObjectCacheSnapshot) {
+	for _, change := range []struct {
+		kind   string
+		before map[string]string
+		after  map[string]string
+	}{
+		{kind: objectKindContainer, before: before.Containers, after: after.Containers},
+		{kind: objectKindImage, before: before.Images, after: after.Images},
+		{kind: objectKindVolume, before: before.Volumes, after: after.Volumes},
+		{kind: objectKindNetwork, before: before.Networks, after: after.Networks},
+	} {
+		ids := changedSnapshotIDs(change.before, change.after)
+		if len(ids) == 0 {
+			continue
+		}
+		c.publish(bus.TopicObjectsChanged, ObjectsChangedPayload{Kind: change.kind, IDs: ids})
+	}
+}
+
+func changedSnapshotIDs(before map[string]string, after map[string]string) []string {
+	changed := map[string]struct{}{}
+	for id, beforeValue := range before {
+		if afterValue, ok := after[id]; !ok || afterValue != beforeValue {
+			changed[id] = struct{}{}
+		}
+	}
+	for id, afterValue := range after {
+		if beforeValue, ok := before[id]; !ok || afterValue != beforeValue {
+			changed[id] = struct{}{}
+		}
+	}
+	return sortedSet(changed)
 }
 
 func (c *Client) objectChangePublisher(ctx context.Context, changes <-chan objectChange) {
@@ -496,7 +552,17 @@ func (c *Client) objectChangePublisher(ctx context.Context, changes <-chan objec
 }
 
 func (c *Client) reconcileKind(ctx context.Context, kind string) {
-	reconcileCtx, cancel := context.WithTimeout(ctx, c.unaryTimeout)
+	timeout := c.unaryTimeout
+	if kind == objectKindImage {
+		timeout = defaultInventoryTimeout
+		if c.unaryTimeout > timeout {
+			timeout = c.unaryTimeout
+		}
+	}
+	if timeout <= 0 {
+		timeout = defaultTimeout
+	}
+	reconcileCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	var err error
 	switch kind {

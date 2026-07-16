@@ -26,10 +26,23 @@ func isLoopbackHost(hostIP string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// bindAddrFor mirrors the container's published bind interface onto the Windows
+func unsupportedForwardBind(hostIP string) bool {
+	trimmed := strings.Trim(strings.TrimSpace(hostIP), "[]")
+	if isAllInterfaces(trimmed) {
+		return false
+	}
+	ip := net.ParseIP(trimmed)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.To4() == nil
+}
+
+// bindAddrFor mirrors a supported published bind interface onto the Windows
 // host: an all-interfaces publish (0.0.0.0/::) binds 0.0.0.0 so the port is
-// LAN-reachable like Docker Desktop; a loopback publish stays on 127.0.0.1; any
-// other concrete address is mirrored verbatim.
+// LAN-reachable like Docker Desktop; a concrete IPv4 address is mirrored
+// verbatim. desiredForwards filters loopback and IPv6-specific publishes that
+// the WSL relay cannot reach through the distro eth0 address.
 func bindAddrFor(hostIP string) string {
 	if isAllInterfaces(hostIP) {
 		return "0.0.0.0"
@@ -77,6 +90,9 @@ func desiredForwards(containers []models.ContainerSummary) map[string]spec {
 	out := map[string]spec{}
 	for _, container := range containers {
 		for _, binding := range container.Ports {
+			if unsupportedForwardBind(binding.HostIP) {
+				continue
+			}
 			hostPort := strings.TrimSpace(binding.HostPort)
 			if hostPort == "" {
 				continue

@@ -122,6 +122,121 @@ func TestManagerPublishesBatchesAndEOF(t *testing.T) {
 	}
 }
 
+func TestStopStreamClosesBlockingLogReader(t *testing.T) {
+	ctx := context.Background()
+	docker := newFakeLogDocker()
+	reader := newBlockingLogReader()
+	docker.readers["container-1"] = reader
+	manager := NewManager(docker, nil, Options{BatchWindow: time.Millisecond})
+
+	streamID, err := manager.StartLogStream(ctx, models.LogStreamRequest{
+		Scope:      ScopeContainer,
+		IDs:        []string{"container-1"},
+		Follow:     true,
+		Tail:       10,
+		Timestamps: true,
+	})
+	if err != nil {
+		t.Fatalf("StartLogStream() error = %v", err)
+	}
+	select {
+	case <-reader.started:
+	case <-time.After(time.Second):
+		t.Fatal("log reader was not consumed")
+	}
+	if got := manager.Diagnostics(); got.ActiveStreams != 1 || got.ActiveProducers != 1 {
+		t.Fatalf("diagnostics while streaming = %#v", got)
+	}
+	if err := manager.StopStream(streamID); err != nil {
+		t.Fatalf("StopStream() error = %v", err)
+	}
+	select {
+	case <-reader.closed:
+	default:
+		t.Fatal("StopStream did not close active log reader")
+	}
+	if got := manager.Diagnostics(); got.ActiveStreams != 0 || got.ActiveProducers != 0 {
+		t.Fatalf("diagnostics after stop = %#v", got)
+	}
+}
+
+func TestProjectFollowIgnoresEmptyContainerSetOnObjectChange(t *testing.T) {
+	ctx := context.Background()
+	eventBus := bus.New()
+	defer eventBus.Close()
+	errorCh := eventBus.Subscribe(ctx, bus.TopicLogsError, 8)
+	docker := newFakeLogDocker()
+	reader := newBlockingLogReader()
+	docker.readers["container-1"] = reader
+	manager := NewManager(docker, eventBus, Options{BatchWindow: time.Millisecond})
+
+	streamID, err := manager.StartLogStream(ctx, models.LogStreamRequest{
+		Scope:  ScopeProject,
+		IDs:    []string{"linux_native/app"},
+		Follow: true,
+		Tail:   10,
+	})
+	if err != nil {
+		t.Fatalf("StartLogStream() error = %v", err)
+	}
+	t.Cleanup(func() { _ = manager.StopStream(streamID) })
+	select {
+	case <-reader.started:
+	case <-time.After(time.Second):
+		t.Fatal("log reader was not consumed")
+	}
+
+	docker.setContainers(nil)
+	eventBus.Publish(bus.Event{Topic: bus.TopicObjectsChanged})
+
+	select {
+	case event := <-errorCh:
+		t.Fatalf("unexpected logs:error after empty rescan: %#v", event.Payload)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestStopStreamClosesReaderReturnedAfterStop(t *testing.T) {
+	ctx := context.Background()
+	docker := newFakeLogDocker()
+	reader := newBlockingLogReader()
+	docker.readers["container-1"] = reader
+	blockLogs := make(chan struct{})
+	logsCalled := make(chan struct{})
+	docker.blockLogs = blockLogs
+	docker.logsCalled = logsCalled
+	manager := NewManager(docker, nil, Options{BatchWindow: time.Millisecond})
+
+	streamID, err := manager.StartLogStream(ctx, models.LogStreamRequest{
+		Scope:  ScopeContainer,
+		IDs:    []string{"container-1"},
+		Follow: true,
+		Tail:   10,
+	})
+	if err != nil {
+		t.Fatalf("StartLogStream() error = %v", err)
+	}
+	select {
+	case <-logsCalled:
+	case <-time.After(time.Second):
+		t.Fatal("ContainerLogs was not called")
+	}
+
+	stopped := make(chan error, 1)
+	go func() {
+		stopped <- manager.StopStream(streamID)
+	}()
+	close(blockLogs)
+	select {
+	case <-reader.closed:
+	case <-time.After(time.Second):
+		t.Fatal("reader returned after stop was not closed")
+	}
+	if err := <-stopped; err != nil {
+		t.Fatalf("StopStream() error = %v", err)
+	}
+}
+
 func TestSessionEnqueueDropsAndReportsWhenInputFull(t *testing.T) {
 	manager := NewManager(nil, nil, Options{InputBuffer: 1})
 	s := newSession(manager, "stream-1", models.LogStreamRequest{})
@@ -194,6 +309,28 @@ func TestManagerFetchPageAndExport(t *testing.T) {
 	if result.LineCount != 2 || !bytes.Contains(content, []byte(`"level":"error"`)) {
 		t.Fatalf("result = %#v content = %s", result, content)
 	}
+	docker.mu.Lock()
+	defaultExportTail := docker.requests[len(docker.requests)-1].Tail
+	docker.mu.Unlock()
+	if defaultExportTail != -1 {
+		t.Fatalf("default export tail = %d, want -1", defaultExportTail)
+	}
+
+	tailPath := filepath.Join(t.TempDir(), "tail.log")
+	if _, err := manager.ExportLogs(ctx, models.ExportLogsRequest{
+		Scope: ScopeProject,
+		IDs:   []string{"linux_native/app"},
+		Path:  tailPath,
+		Tail:  17,
+	}); err != nil {
+		t.Fatalf("ExportLogs(tail) error = %v", err)
+	}
+	docker.mu.Lock()
+	tailExportTail := docker.requests[len(docker.requests)-1].Tail
+	docker.mu.Unlock()
+	if tailExportTail != 17 {
+		t.Fatalf("tail export tail = %d, want 17", tailExportTail)
+	}
 }
 
 func TestParseRawLogLineAllowsLeadingWhitespaceBeforeTimestamp(t *testing.T) {
@@ -226,7 +363,10 @@ type fakeLogDocker struct {
 	mu         sync.Mutex
 	containers []models.ContainerSummary
 	logs       map[string]string
+	readers    map[string]io.ReadCloser
 	requests   []dockercore.LogOptions
+	blockLogs  <-chan struct{}
+	logsCalled chan struct{}
 }
 
 func newFakeLogDocker() *fakeLogDocker {
@@ -241,18 +381,38 @@ func newFakeLogDocker() *fakeLogDocker {
 			Service:   "app",
 			CreatedAt: time.Date(2026, 6, 13, 8, 0, 0, 0, time.UTC),
 		}},
-		logs: map[string]string{},
+		logs:    map[string]string{},
+		readers: map[string]io.ReadCloser{},
 	}
 }
 
 func (f *fakeLogDocker) ContainerLogs(_ context.Context, id string, opts dockercore.LogOptions) (io.ReadCloser, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.requests = append(f.requests, opts)
+	logsCalled := f.logsCalled
+	blockLogs := f.blockLogs
+	f.mu.Unlock()
+	if logsCalled != nil {
+		select {
+		case <-logsCalled:
+		default:
+			close(logsCalled)
+		}
+	}
+	if blockLogs != nil {
+		<-blockLogs
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if reader := f.readers[id]; reader != nil {
+		return reader, nil
+	}
 	return io.NopCloser(strings.NewReader(f.logs[id])), nil
 }
 
 func (f *fakeLogDocker) ListContainers(_ context.Context, opts models.ContainerListOptions) ([]models.ContainerSummary, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	containers := make([]models.ContainerSummary, 0, len(f.containers))
 	for _, container := range f.containers {
 		if opts.ProjectID != "" && container.ProjectID != opts.ProjectID {
@@ -264,6 +424,12 @@ func (f *fakeLogDocker) ListContainers(_ context.Context, opts models.ContainerL
 		containers = append(containers, container)
 	}
 	return containers, nil
+}
+
+func (f *fakeLogDocker) setContainers(containers []models.ContainerSummary) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.containers = append([]models.ContainerSummary(nil), containers...)
 }
 
 func (f *fakeLogDocker) GetContainer(_ context.Context, id string) (*models.ContainerDetail, error) {
@@ -291,4 +457,33 @@ func receiveLogEvent[T any](t *testing.T, events <-chan bus.Event, timeout time.
 		t.Fatalf("timed out waiting for event")
 		return zero
 	}
+}
+
+type blockingLogReader struct {
+	started   chan struct{}
+	closed    chan struct{}
+	startOnce sync.Once
+	closeOnce sync.Once
+}
+
+func newBlockingLogReader() *blockingLogReader {
+	return &blockingLogReader{
+		started: make(chan struct{}),
+		closed:  make(chan struct{}),
+	}
+}
+
+func (r *blockingLogReader) Read([]byte) (int, error) {
+	r.startOnce.Do(func() {
+		close(r.started)
+	})
+	<-r.closed
+	return 0, io.EOF
+}
+
+func (r *blockingLogReader) Close() error {
+	r.closeOnce.Do(func() {
+		close(r.closed)
+	})
+	return nil
 }

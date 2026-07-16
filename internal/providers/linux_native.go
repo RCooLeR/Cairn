@@ -80,7 +80,8 @@ type LinuxNativeProvider struct {
 }
 
 type linuxInstallPlan struct {
-	Steps []linuxInstallStep
+	Steps     []linuxInstallStep
+	ExpiresAt time.Time
 }
 
 type linuxInstallStep struct {
@@ -261,14 +262,21 @@ func (p *LinuxNativeProvider) PlanInstall(context.Context, models.InstallOptions
 		ExpiresAt: time.Now().UTC().Add(security.DefaultPlanTTL),
 	}
 	p.installMu.Lock()
-	p.plans[planID] = linuxInstallPlan{Steps: steps}
+	p.pruneExpiredInstallPlansLocked(time.Now().UTC())
+	p.plans[planID] = linuxInstallPlan{Steps: steps, ExpiresAt: plan.ExpiresAt}
 	p.installMu.Unlock()
 	return plan, nil
 }
 
 func (p *LinuxNativeProvider) ExecuteInstallStep(ctx context.Context, planID string, step int, progress chan<- InstallProgress) error {
+	now := time.Now().UTC()
 	p.installMu.Lock()
+	p.pruneExpiredInstallPlansLocked(now)
 	plan, ok := p.plans[planID]
+	if ok && !plan.ExpiresAt.IsZero() && now.After(plan.ExpiresAt) {
+		delete(p.plans, planID)
+		ok = false
+	}
 	p.installMu.Unlock()
 	if !ok || step < 0 || step >= len(plan.Steps) {
 		return apperror.New(apperror.PlanExpired, "Install plan expired or was not found")
@@ -291,6 +299,14 @@ func (p *LinuxNativeProvider) ExecuteInstallStep(ctx context.Context, planID str
 	}
 	sendInstallProgress(progress, step+1, len(plan.Steps), "Done: "+installStep.Message, false)
 	return nil
+}
+
+func (p *LinuxNativeProvider) pruneExpiredInstallPlansLocked(now time.Time) {
+	for id, plan := range p.plans {
+		if !plan.ExpiresAt.IsZero() && now.After(plan.ExpiresAt) {
+			delete(p.plans, id)
+		}
+	}
 }
 
 func (p *LinuxNativeProvider) Start(ctx context.Context) error {

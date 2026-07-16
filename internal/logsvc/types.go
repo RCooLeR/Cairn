@@ -22,6 +22,7 @@ const (
 	defaultBatchMaxLines = 200
 	defaultBatchWindow   = 50 * time.Millisecond
 	defaultFetchTail     = 5000
+	streamStopTimeout    = 5 * time.Second
 )
 
 type DockerClient interface {

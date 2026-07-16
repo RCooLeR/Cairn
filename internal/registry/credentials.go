@@ -23,7 +23,7 @@ func (m *Manager) prepareRegistryLoginStorage(ctx context.Context, provider prov
 	case "":
 		return nil
 	case registryCredentialModeDockerHelper:
-		return m.ensureCredentialHelper(ctx, provider, registry)
+		return m.ensureCredentialHelper(ctx, provider, registry, false)
 	case registryCredentialModeNone:
 		return apperror.New(
 			apperror.Conflict,
@@ -34,6 +34,17 @@ func (m *Manager) prepareRegistryLoginStorage(ctx context.Context, provider prov
 	default:
 		return apperror.New(apperror.Internal, "Unknown registry credential mode", apperror.WithDetail(mode))
 	}
+}
+
+func (m *Manager) finalizeRegistryLoginStorage(ctx context.Context, provider providers.PlatformProvider, registry string) error {
+	mode, err := m.registryCredentialMode(ctx)
+	if err != nil {
+		return err
+	}
+	if mode != registryCredentialModeDockerHelper {
+		return nil
+	}
+	return m.ensureCredentialHelper(ctx, provider, registry, true)
 }
 
 func (m *Manager) registryCredentialMode(ctx context.Context) (string, error) {
@@ -51,7 +62,7 @@ func (m *Manager) registryCredentialMode(ctx context.Context) (string, error) {
 	return mode, nil
 }
 
-func (m *Manager) ensureCredentialHelper(ctx context.Context, provider providers.PlatformProvider, registry string) error {
+func (m *Manager) ensureCredentialHelper(ctx context.Context, provider providers.PlatformProvider, registry string, removeInline bool) error {
 	raw, err := m.readDockerConfigRaw(ctx, provider)
 	if err != nil {
 		return err
@@ -84,11 +95,13 @@ func (m *Manager) ensureCredentialHelper(ctx context.Context, provider providers
 		changed = changed || helperChanged
 	}
 
-	authsChanged, err := removeInlineRegistryAuth(rawConfig, registry)
-	if err != nil {
-		return err
+	if removeInline {
+		authsChanged, err := removeInlineRegistryAuth(rawConfig, registry)
+		if err != nil {
+			return err
+		}
+		changed = changed || authsChanged
 	}
-	changed = changed || authsChanged
 	if !changed {
 		return nil
 	}

@@ -369,6 +369,12 @@ func (m *Manager) ListTerminalSessions() []models.TerminalSessionInfo {
 	return infos
 }
 
+func (m *Manager) Diagnostics() models.TerminalRuntimeDiagnostics {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return models.TerminalRuntimeDiagnostics{ActiveSessions: len(m.sessions)}
+}
+
 func (m *Manager) StopAll() {
 	ids := make([]string, 0)
 	m.mu.RLock()

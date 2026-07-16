@@ -85,13 +85,18 @@ func (m *Manager) StopAll() {
 	if m.cancel != nil {
 		m.cancel()
 	}
+	m.started = false
+	m.mu.Unlock()
+
+	m.reconcileMu.Lock()
+	m.mu.Lock()
 	forwards := make([]*forward, 0, len(m.forwards))
 	for key, fwd := range m.forwards {
 		delete(m.forwards, key)
 		forwards = append(forwards, fwd)
 	}
-	m.started = false
 	m.mu.Unlock()
+	m.reconcileMu.Unlock()
 
 	for _, fwd := range forwards {
 		fwd.stop()
@@ -129,14 +134,15 @@ func (m *Manager) ListForwards() []models.PortForward {
 	defer m.mu.Unlock()
 	out := make([]models.PortForward, 0, len(m.forwards))
 	for _, fwd := range m.forwards {
+		status, reason := fwd.state()
 		out = append(out, models.PortForward{
 			Protocol:      fwd.spec.protocol,
 			HostPort:      fwd.spec.hostPort,
 			BindAddr:      fwd.spec.bindAddr,
 			ContainerID:   fwd.spec.containerID,
 			ContainerName: fwd.spec.containerName,
-			Status:        fwd.status,
-			Reason:        fwd.reason,
+			Status:        status,
+			Reason:        reason,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool {
@@ -215,22 +221,28 @@ func (m *Manager) reconcileOnce(ctx context.Context) {
 
 	changed := false
 	for key, fwd := range current {
-		if want, ok := desired[key]; ok && want == fwd.spec {
+		if want, ok := desired[key]; ok && want == fwd.spec && !fwd.failed() {
 			continue
 		}
 		m.mu.Lock()
 		delete(m.forwards, key)
 		m.mu.Unlock()
 		fwd.stop()
+		delete(current, key)
 		changed = true
 	}
 
 	for key, want := range desired {
-		if existing, ok := current[key]; ok && existing.spec == want {
+		if existing, ok := current[key]; ok && existing.spec == want && !existing.failed() {
 			continue
 		}
 		fwd := m.startForward(ctx, want)
 		m.mu.Lock()
+		if !m.started || ctx.Err() != nil {
+			m.mu.Unlock()
+			fwd.stop()
+			continue
+		}
 		m.forwards[key] = fwd
 		m.mu.Unlock()
 		changed = true
@@ -285,6 +297,8 @@ func (m *Manager) serveTCP(ctx context.Context, fwd *forward, listener net.Liste
 			if errors.As(err, &netErr) && netErr.Timeout() {
 				continue
 			}
+			fwd.fail(err)
+			m.publishChanged()
 			return
 		}
 		fwd.track(conn)
@@ -350,10 +364,24 @@ func (m *Manager) publishChanged() {
 }
 
 func (f *forward) fail(err error) {
+	f.mu.Lock()
 	f.status = statusError
 	f.reason = err.Error()
+	f.mu.Unlock()
 	slog.Warn("port forward could not bind host port",
 		"protocol", f.spec.protocol, "port", f.spec.hostPort, "bind", f.spec.bindAddr, "error", err)
+}
+
+func (f *forward) failed() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.status == statusError
+}
+
+func (f *forward) state() (string, string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.status, f.reason
 }
 
 func (f *forward) track(closer interface{ Close() error }) {

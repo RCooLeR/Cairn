@@ -302,9 +302,6 @@ func (m *Manager) ApplyInstall(ctx context.Context, planID string, progress chan
 	}
 	m.mu.Lock()
 	record, ok := m.installPlans[planID]
-	if ok {
-		delete(m.installPlans, planID)
-	}
 	m.mu.Unlock()
 	if !ok {
 		return apperror.New(apperror.PlanExpired, "Install plan expired or was not found")
@@ -319,6 +316,9 @@ func (m *Manager) ApplyInstall(ctx context.Context, planID string, progress chan
 			return err
 		}
 	}
+	m.mu.Lock()
+	delete(m.installPlans, planID)
+	m.mu.Unlock()
 	return nil
 }
 
@@ -467,13 +467,13 @@ func (m *Manager) updateActiveAfterDetect(ctx context.Context, statuses map[stri
 	saved, _ := m.settings.GetString(ctx, "provider.active_id")
 	if saved != "" {
 		if status, ok := statuses[saved]; ok && status.Healthy {
-			m.setActiveBestEffort(ctx, saved)
+			m.setEffectiveActive(saved)
 			return
 		}
 	}
 	for _, id := range m.providerIDsSnapshot() {
 		if status, ok := statuses[id]; ok && status.Healthy {
-			m.setActiveBestEffort(ctx, id)
+			m.setEffectiveActive(id)
 			return
 		}
 	}
@@ -481,6 +481,10 @@ func (m *Manager) updateActiveAfterDetect(ctx context.Context, statuses map[stri
 
 func (m *Manager) setActiveBestEffort(ctx context.Context, providerID string) {
 	_ = m.settings.SetString(ctx, "provider.active_id", providerID)
+	m.setEffectiveActive(providerID)
+}
+
+func (m *Manager) setEffectiveActive(providerID string) {
 	m.mu.Lock()
 	m.activeID = providerID
 	m.mu.Unlock()

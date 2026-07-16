@@ -38,6 +38,8 @@ type LineageDiscoverer interface {
 	DiscoverProjectLineage(context.Context, string) ([]models.ImageLineage, error)
 }
 
+const updateSchedulerDisabledPollInterval = time.Minute
+
 type Manager struct {
 	Projects           *store.ProjectRepository
 	Lineage            *store.LineageRepository
@@ -351,7 +353,7 @@ func (m *Manager) checkServiceImage(ctx context.Context, project store.ProjectRe
 		return record
 	}
 	remoteDigest, resolveErr := m.remoteDigest(ctx, imageRef, "")
-	record.RemoteDigest = remoteDigest
+	record.RemoteDigest = remoteDigest.Primary()
 	if resolveErr != nil {
 		record.Status, record.RecommendedAction = statusForRegistryError(resolveErr)
 		record.Error = resolveErr.Error()
@@ -363,7 +365,7 @@ func (m *Manager) checkServiceImage(ctx context.Context, project store.ProjectRe
 		record.Error = "local image digest is unavailable"
 		return record
 	}
-	if digestsEqual(localDigest, remoteDigest) {
+	if remoteDigest.Matches(localDigest) {
 		record.Status = models.UpdateStatusUpToDate
 		return record
 	}
@@ -438,23 +440,23 @@ func (m *Manager) checkBaseRef(ctx context.Context, project store.ProjectRecord,
 	record.LocalDigest = compareDigest
 	record.LocalImageID = localImageID
 	remoteDigest, resolveErr := m.remoteDigest(ctx, base.ImageRef, base.Platform)
-	record.RemoteDigest = remoteDigest
+	record.RemoteDigest = remoteDigest.Primary()
 	if resolveErr != nil {
 		record.Status, record.RecommendedAction = statusForRegistryError(resolveErr)
 		record.Error = resolveErr.Error()
-		_ = m.updateBaseRef(ctx, base.ID, localDigest, remoteDigest, record.Status, now, record.Error)
+		_ = m.updateBaseRef(ctx, base.ID, localDigest, record.RemoteDigest, record.Status, now, record.Error)
 		return record
 	}
 	if compareDigest == "" {
 		record.Status = models.UpdateStatusUnknownBaseImage
 		record.RecommendedAction = models.RecommendedActionManual
 		record.Error = "no build-time or local base digest is available"
-		_ = m.updateBaseRef(ctx, base.ID, localDigest, remoteDigest, record.Status, now, record.Error)
+		_ = m.updateBaseRef(ctx, base.ID, localDigest, record.RemoteDigest, record.Status, now, record.Error)
 		return record
 	}
-	if digestsEqual(compareDigest, remoteDigest) {
+	if remoteDigest.Matches(compareDigest) {
 		record.Status = models.UpdateStatusUpToDate
-		_ = m.updateBaseRef(ctx, base.ID, localDigest, remoteDigest, record.Status, now, "")
+		_ = m.updateBaseRef(ctx, base.ID, localDigest, record.RemoteDigest, record.Status, now, "")
 		return record
 	}
 	if base.IsFinalStageBase {
@@ -463,7 +465,7 @@ func (m *Manager) checkBaseRef(ctx context.Context, project store.ProjectRecord,
 		record.Status = models.UpdateStatusBaseImageUpdateAvailable
 	}
 	record.RecommendedAction = models.RecommendedActionRebuildRedeploy
-	_ = m.updateBaseRef(ctx, base.ID, localDigest, remoteDigest, record.Status, now, "")
+	_ = m.updateBaseRef(ctx, base.ID, localDigest, record.RemoteDigest, record.Status, now, "")
 	return record
 }
 
@@ -485,17 +487,28 @@ func (m *Manager) runAllChecks(ctx context.Context, jobID string, projects []sto
 }
 
 func (m *Manager) runScheduler(ctx context.Context) {
+	lastInterval := 24 * time.Hour
 	for {
-		interval, enabled := m.schedulerInterval(ctx)
-		if !enabled {
-			return
+		interval, enabled, readErr := m.schedulerIntervalStatus(ctx)
+		if readErr != nil {
+			interval = lastInterval
+			enabled = true
+		} else if enabled {
+			lastInterval = interval
 		}
-		timer := time.NewTimer(interval + m.jitter(interval))
+		delay := updateSchedulerDisabledPollInterval
+		if enabled {
+			delay = interval + m.jitter(interval)
+		}
+		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
 			return
 		case <-timer.C:
+			if !enabled {
+				continue
+			}
 			if m.offline(ctx) {
 				continue
 			}
@@ -607,21 +620,34 @@ func (m *Manager) localDigest(ctx context.Context, imageRef string, imageID stri
 	return "", ""
 }
 
-func (m *Manager) remoteDigest(ctx context.Context, imageRef string, platform string) (string, error) {
+type remoteDigestSet struct {
+	Manifest string
+	Index    string
+}
+
+func (d remoteDigestSet) Primary() string {
+	return firstNonEmpty(d.Manifest, d.Index)
+}
+
+func (d remoteDigestSet) Matches(localDigest string) bool {
+	return digestsEqual(localDigest, d.Manifest) || digestsEqual(localDigest, d.Index)
+}
+
+func (m *Manager) remoteDigest(ctx context.Context, imageRef string, platform string) (remoteDigestSet, error) {
 	if m.Registry == nil {
-		return "", notReady()
+		return remoteDigestSet{}, notReady()
 	}
 	result, err := m.Registry.ResolveDigest(ctx, imageRef, registrycore.ResolveOptions{Platform: m.registryPlatform(ctx, platform)})
 	if err != nil {
-		if result != nil && result.ManifestDigest != "" {
-			return result.ManifestDigest, err
+		if result != nil && (result.ManifestDigest != "" || result.IndexDigest != "") {
+			return remoteDigestSet{Manifest: result.ManifestDigest, Index: result.IndexDigest}, err
 		}
-		return "", err
+		return remoteDigestSet{}, err
 	}
-	if result == nil || result.ManifestDigest == "" {
-		return "", apperror.New(apperror.RegistryUnreachable, "Registry digest is unavailable")
+	if result == nil || (result.ManifestDigest == "" && result.IndexDigest == "") {
+		return remoteDigestSet{}, apperror.New(apperror.RegistryUnreachable, "Registry digest is unavailable")
 	}
-	return result.ManifestDigest, nil
+	return remoteDigestSet{Manifest: result.ManifestDigest, Index: result.IndexDigest}, nil
 }
 
 func (m *Manager) registryPlatform(ctx context.Context, value string) registrycore.Platform {
@@ -682,14 +708,22 @@ func (m *Manager) updateBaseRef(ctx context.Context, id int64, localDigest strin
 }
 
 func (m *Manager) schedulerInterval(ctx context.Context) (time.Duration, bool) {
+	interval, enabled, _ := m.schedulerIntervalStatus(ctx)
+	return interval, enabled
+}
+
+func (m *Manager) schedulerIntervalStatus(ctx context.Context) (time.Duration, bool, error) {
 	if m.Settings == nil {
-		return 24 * time.Hour, true
+		return 24 * time.Hour, true, nil
 	}
 	hours, err := m.Settings.GetInt(ctx, "updates.check_interval_hours")
-	if err != nil || hours <= 0 {
-		return 0, false
+	if err != nil {
+		return 0, false, err
 	}
-	return time.Duration(hours) * time.Hour, true
+	if hours <= 0 {
+		return 0, false, nil
+	}
+	return time.Duration(hours) * time.Hour, true, nil
 }
 
 func (m *Manager) jitter(interval time.Duration) time.Duration {

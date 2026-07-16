@@ -353,9 +353,9 @@ func (r *UpdateRepository) FinishHistory(ctx context.Context, id int64, record U
 	}
 	_, err := r.db.ExecContext(ctx, `
 		UPDATE update_history
-		SET new_image_id = NULLIF(?, ''),
-			new_digest = NULLIF(?, ''),
-			new_base_digest = NULLIF(?, ''),
+		SET new_image_id = COALESCE(NULLIF(?, ''), new_image_id),
+			new_digest = COALESCE(NULLIF(?, ''), new_digest),
+			new_base_digest = COALESCE(NULLIF(?, ''), new_base_digest),
 			result = ?,
 			health_result = NULLIF(?, ''),
 			rollback_status = NULLIF(?, ''),

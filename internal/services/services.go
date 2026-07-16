@@ -110,6 +110,7 @@ type ProjectService struct {
 	ContextName string
 	Now         func() time.Time
 	RuntimeMu   *sync.RWMutex
+	RuntimeCtx  context.Context
 }
 
 type ComposeService struct {
@@ -133,6 +134,13 @@ type TerminalService struct {
 	Manager   *terminal.Manager
 	RuntimeMu *sync.RWMutex
 }
+type DiagnosticsService struct {
+	Logs        *LogsService
+	Metrics     *MetricsService
+	Terminal    *TerminalService
+	PortForward *PortForwardService
+	RuntimeMu   *sync.RWMutex
+}
 type UpdateService struct {
 	Manager   *updatescore.Manager
 	RuntimeMu *sync.RWMutex
@@ -147,6 +155,7 @@ type BackupService struct {
 }
 type PortForwardService struct {
 	Manager   *portforward.Manager
+	Settings  *store.SettingsRepository
 	RuntimeMu *sync.RWMutex
 }
 type RegistryService struct {
@@ -183,6 +192,7 @@ func (s *ComposeService) lockRuntime() func()      { return lockRuntime(s.Runtim
 func (s *MetricsService) lockRuntime() func()      { return lockRuntime(s.RuntimeMu) }
 func (s *LogsService) lockRuntime() func()         { return lockRuntime(s.RuntimeMu) }
 func (s *TerminalService) lockRuntime() func()     { return lockRuntime(s.RuntimeMu) }
+func (s *DiagnosticsService) lockRuntime() func()  { return lockRuntime(s.RuntimeMu) }
 func (s *UpdateService) lockRuntime() func()       { return lockRuntime(s.RuntimeMu) }
 func (s *ImageLineageService) lockRuntime() func() { return lockRuntime(s.RuntimeMu) }
 func (s *BackupService) lockRuntime() func()       { return lockRuntime(s.RuntimeMu) }

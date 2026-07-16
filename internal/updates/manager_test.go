@@ -112,6 +112,31 @@ func TestManagerServiceImageStatusMachine(t *testing.T) {
 	}
 }
 
+func TestManagerServiceImageAcceptsRemoteIndexDigestMatch(t *testing.T) {
+	ctx := context.Background()
+	db := openUpdatesStore(t)
+	projectID := "linux_native/app"
+	seedUpdateProject(t, ctx, db, projectID, []store.ServiceRecord{
+		serviceRecord(projectID, "web", "nginx:1.25", ""),
+	})
+	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), fakeImages{details: map[string]*models.ImageDetail{
+		"nginx:1.25": imageDetail("sha256:web", "docker.io/library/nginx@"+digestA),
+	}}, &fakeRegistry{
+		digests:      map[string]string{"nginx:1.25": digestB},
+		indexDigests: map[string]string{"nginx:1.25": digestA},
+	}, db.Settings(), nil, nil)
+
+	got, err := manager.CheckProjectUpdates(ctx, projectID)
+	if err != nil {
+		t.Fatalf("CheckProjectUpdates() error = %v", err)
+	}
+	byService := updatesByService(got)
+	assertStatus(t, byService, "web", models.UpdateKindServiceImage, "", models.UpdateStatusUpToDate)
+	if byService["web"][0].RemoteDigest != digestB {
+		t.Fatalf("remote digest = %q, want platform manifest %q", byService["web"][0].RemoteDigest, digestB)
+	}
+}
+
 func TestManagerServiceImageUsesDockerEnginePlatform(t *testing.T) {
 	ctx := context.Background()
 	db := openUpdatesStore(t)
@@ -711,6 +736,9 @@ func TestManagerRollbackHistory(t *testing.T) {
 		OldImageID:     "sha256:web-old",
 		OldDigest:      digestA,
 		OldBaseDigest:  digestA,
+		NewImageID:     "sha256:web-new",
+		NewDigest:      digestB,
+		NewBaseDigest:  digestB,
 		Commands:       []models.PlannedCommand{{Order: 1, Command: "docker compose build --pull web", Risk: models.RiskNeedsConfirmation}},
 		Result:         updateResultSuccess,
 		RollbackStatus: rollbackStatusAvailable,
@@ -723,6 +751,7 @@ func TestManagerRollbackHistory(t *testing.T) {
 	eventBus := bus.New()
 	t.Cleanup(eventBus.Close)
 	done := eventBus.Subscribe(ctx, bus.TopicJobDone, 4)
+	progress := eventBus.Subscribe(ctx, bus.TopicJobProgress, 8)
 	compose := &fakeUpdateCompose{}
 	docker := &fakeUpdateDocker{images: map[string]*models.ImageDetail{
 		"sha256:web-old": imageDetail("sha256:web-old", "docker.io/library/rollback-web@"+digestA),
@@ -745,6 +774,7 @@ func TestManagerRollbackHistory(t *testing.T) {
 		t.Fatalf("ApplyRollback() error = %v", err)
 	}
 	waitUpdateDone(t, done, updateResultRolledBack)
+	waitUpdateProgressMessage(t, progress, "stdout", "up-no-build:web")
 	if len(docker.tags) != 1 || docker.tags[0] != "sha256:web-old->rollback-web:local" {
 		t.Fatalf("tags = %#v", docker.tags)
 	}
@@ -757,6 +787,9 @@ func TestManagerRollbackHistory(t *testing.T) {
 	}
 	if history.Result != updateResultRolledBack || history.RollbackStatus != rollbackStatusRolledBack {
 		t.Fatalf("history = %#v", history)
+	}
+	if history.NewImageID != "sha256:web-new" || history.NewDigest != digestB || history.NewBaseDigest != digestB {
+		t.Fatalf("history new image evidence was not preserved: %#v", history)
 	}
 }
 
@@ -787,6 +820,9 @@ func TestManagerPlanServiceWarningsAndExpiry(t *testing.T) {
 	}
 	if _, err := manager.ApplyUpdate(ctx, models.ApplyUpdateRequest{PlanID: plan.PlanID}); !apperror.IsCode(err, apperror.Conflict) {
 		t.Fatalf("ApplyUpdate(warning-only) error = %v, want conflict", err)
+	}
+	if _, err := manager.ApplyUpdate(ctx, models.ApplyUpdateRequest{PlanID: plan.PlanID}); !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("ApplyUpdate(warning-only retry) error = %v, want conflict not expired", err)
 	}
 	if _, err := manager.PlanServiceUpdate(ctx, projectID, "missing"); !apperror.IsCode(err, apperror.NotFound) {
 		t.Fatalf("PlanServiceUpdate(missing) error = %v, want not found", err)
@@ -1182,8 +1218,8 @@ func TestManagerRemainingErrorAndDefaultBranches(t *testing.T) {
 		t.Fatalf("localDigest via imageID = %q/%q", digest, imageID)
 	}
 	remote, err := manager.remoteDigest(ctx, "partial.local/app:1", "linux/amd64")
-	if remote != digestB || !apperror.IsCode(err, apperror.RegistryRateLimit) {
-		t.Fatalf("remoteDigest partial = %q/%v", remote, err)
+	if remote.Primary() != digestB || !apperror.IsCode(err, apperror.RegistryRateLimit) {
+		t.Fatalf("remoteDigest partial = %#v/%v", remote, err)
 	}
 	if err := manager.updateBaseRef(ctx, 0, "", "", models.UpdateStatusUnknown, time.Time{}, ""); err != nil {
 		t.Fatalf("updateBaseRef zero id error = %v", err)
@@ -1299,11 +1335,12 @@ func hasNoteContaining(update models.ImageUpdate, want string) bool {
 }
 
 type fakeRegistry struct {
-	digests     map[string]string
-	errs        map[string]error
-	emptyResult map[string]bool
-	resultErrs  map[string]registryResultError
-	platforms   map[string]registrycore.Platform
+	digests      map[string]string
+	indexDigests map[string]string
+	errs         map[string]error
+	emptyResult  map[string]bool
+	resultErrs   map[string]registryResultError
+	platforms    map[string]registrycore.Platform
 }
 
 type registryResultError struct {
@@ -1326,7 +1363,7 @@ func (r *fakeRegistry) ResolveDigest(_ context.Context, image string, opts regis
 		return &registrycore.DigestResult{}, nil
 	}
 	if digest := r.digests[image]; digest != "" {
-		return &registrycore.DigestResult{ManifestDigest: digest}, nil
+		return &registrycore.DigestResult{ManifestDigest: digest, IndexDigest: r.indexDigests[image]}, nil
 	}
 	return nil, apperror.New(apperror.NotFound, "not found")
 }
@@ -1527,6 +1564,25 @@ func waitUpdateDone(t *testing.T, events <-chan bus.Event, result string) {
 			return
 		case <-deadline:
 			t.Fatalf("timed out waiting for update job result %q", result)
+		}
+	}
+}
+
+func waitUpdateProgressMessage(t *testing.T, events <-chan bus.Event, phase string, contains string) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case event := <-events:
+			payload, ok := event.Payload.(jobProgressPayload)
+			if !ok {
+				continue
+			}
+			if payload.Phase == phase && strings.Contains(payload.Message, contains) {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for update progress %s containing %q", phase, contains)
 		}
 	}
 }

@@ -1135,6 +1135,7 @@ export class ContainerSummary {
     "macAddress"?: string;
     "aliases"?: string[];
     "createdAt": time$0.Time;
+    "startedAt"?: time$0.Time;
 
     /** Creates a new ContainerSummary instance. */
     constructor($$source: Partial<ContainerSummary> = {}) {
@@ -1531,6 +1532,7 @@ export class ExportLogsRequest {
     "scope": string;
     "ids"?: string[];
     "path": string;
+    "tail"?: number;
 
     /** Creates a new ExportLogsRequest instance. */
     constructor($$source: Partial<ExportLogsRequest> = {}) {
@@ -2170,6 +2172,31 @@ export class LogPageRequest {
     }
 }
 
+export class LogRuntimeDiagnostics {
+    "activeStreams": number;
+    "activeProducers": number;
+
+    /** Creates a new LogRuntimeDiagnostics instance. */
+    constructor($$source: Partial<LogRuntimeDiagnostics> = {}) {
+        if (!("activeStreams" in $$source)) {
+            this["activeStreams"] = 0;
+        }
+        if (!("activeProducers" in $$source)) {
+            this["activeProducers"] = 0;
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new LogRuntimeDiagnostics instance from a string or object.
+     */
+    static createFrom($$source: any = {}): LogRuntimeDiagnostics {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new LogRuntimeDiagnostics($$parsedSource as Partial<LogRuntimeDiagnostics>);
+    }
+}
+
 export class LogStreamRequest {
     "scope": string;
     "ids"?: string[];
@@ -2239,6 +2266,35 @@ export class MetricRankItem {
     static createFrom($$source: any = {}): MetricRankItem {
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         return new MetricRankItem($$parsedSource as Partial<MetricRankItem>);
+    }
+}
+
+export class MetricsRuntimeDiagnostics {
+    "started": boolean;
+    "activeStreams": number;
+    "activeWatchers": number;
+
+    /** Creates a new MetricsRuntimeDiagnostics instance. */
+    constructor($$source: Partial<MetricsRuntimeDiagnostics> = {}) {
+        if (!("started" in $$source)) {
+            this["started"] = false;
+        }
+        if (!("activeStreams" in $$source)) {
+            this["activeStreams"] = 0;
+        }
+        if (!("activeWatchers" in $$source)) {
+            this["activeWatchers"] = 0;
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new MetricsRuntimeDiagnostics instance from a string or object.
+     */
+    static createFrom($$source: any = {}): MetricsRuntimeDiagnostics {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new MetricsRuntimeDiagnostics($$parsedSource as Partial<MetricsRuntimeDiagnostics>);
     }
 }
 
@@ -2558,6 +2614,31 @@ export class PortForward {
     static createFrom($$source: any = {}): PortForward {
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         return new PortForward($$parsedSource as Partial<PortForward>);
+    }
+}
+
+export class PortForwardRuntimeDiagnostics {
+    "supported": boolean;
+    "activeForwards": number;
+
+    /** Creates a new PortForwardRuntimeDiagnostics instance. */
+    constructor($$source: Partial<PortForwardRuntimeDiagnostics> = {}) {
+        if (!("supported" in $$source)) {
+            this["supported"] = false;
+        }
+        if (!("activeForwards" in $$source)) {
+            this["activeForwards"] = 0;
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new PortForwardRuntimeDiagnostics instance from a string or object.
+     */
+    static createFrom($$source: any = {}): PortForwardRuntimeDiagnostics {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new PortForwardRuntimeDiagnostics($$parsedSource as Partial<PortForwardRuntimeDiagnostics>);
     }
 }
 
@@ -3212,6 +3293,67 @@ export class RunImageRequest {
     }
 }
 
+export class RuntimeDiagnostics {
+    "stdio": StdioTransportDiagnostics;
+    "logs": LogRuntimeDiagnostics;
+    "metrics": MetricsRuntimeDiagnostics;
+    "terminals": TerminalRuntimeDiagnostics;
+    "portForwards": PortForwardRuntimeDiagnostics;
+    "checkedAt": time$0.Time;
+
+    /** Creates a new RuntimeDiagnostics instance. */
+    constructor($$source: Partial<RuntimeDiagnostics> = {}) {
+        if (!("stdio" in $$source)) {
+            this["stdio"] = (new StdioTransportDiagnostics());
+        }
+        if (!("logs" in $$source)) {
+            this["logs"] = (new LogRuntimeDiagnostics());
+        }
+        if (!("metrics" in $$source)) {
+            this["metrics"] = (new MetricsRuntimeDiagnostics());
+        }
+        if (!("terminals" in $$source)) {
+            this["terminals"] = (new TerminalRuntimeDiagnostics());
+        }
+        if (!("portForwards" in $$source)) {
+            this["portForwards"] = (new PortForwardRuntimeDiagnostics());
+        }
+        if (!("checkedAt" in $$source)) {
+            this["checkedAt"] = null;
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new RuntimeDiagnostics instance from a string or object.
+     */
+    static createFrom($$source: any = {}): RuntimeDiagnostics {
+        const $$createField0_0 = $$createType59;
+        const $$createField1_0 = $$createType60;
+        const $$createField2_0 = $$createType61;
+        const $$createField3_0 = $$createType62;
+        const $$createField4_0 = $$createType63;
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        if ("stdio" in $$parsedSource) {
+            $$parsedSource["stdio"] = $$createField0_0($$parsedSource["stdio"]);
+        }
+        if ("logs" in $$parsedSource) {
+            $$parsedSource["logs"] = $$createField1_0($$parsedSource["logs"]);
+        }
+        if ("metrics" in $$parsedSource) {
+            $$parsedSource["metrics"] = $$createField2_0($$parsedSource["metrics"]);
+        }
+        if ("terminals" in $$parsedSource) {
+            $$parsedSource["terminals"] = $$createField3_0($$parsedSource["terminals"]);
+        }
+        if ("portForwards" in $$parsedSource) {
+            $$parsedSource["portForwards"] = $$createField4_0($$parsedSource["portForwards"]);
+        }
+        return new RuntimeDiagnostics($$parsedSource as Partial<RuntimeDiagnostics>);
+    }
+}
+
 export class Series {
     "name": string;
     "unit"?: string;
@@ -3233,7 +3375,7 @@ export class Series {
      * Creates a new Series instance from a string or object.
      */
     static createFrom($$source: any = {}): Series {
-        const $$createField2_0 = $$createType60;
+        const $$createField2_0 = $$createType65;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("points" in $$parsedSource) {
             $$parsedSource["points"] = $$createField2_0($$parsedSource["points"]);
@@ -3258,7 +3400,7 @@ export class SeriesBundle {
      * Creates a new SeriesBundle instance from a string or object.
      */
     static createFrom($$source: any = {}): SeriesBundle {
-        const $$createField0_0 = $$createType62;
+        const $$createField0_0 = $$createType67;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("series" in $$parsedSource) {
             $$parsedSource["series"] = $$createField0_0($$parsedSource["series"]);
@@ -3293,6 +3435,83 @@ export class StatsScope {
     }
 }
 
+export class StdioConnectionDiagnostic {
+    "id": number;
+    "command": string;
+    "openedAt": time$0.Time;
+    "ageMs": number;
+
+    /** Creates a new StdioConnectionDiagnostic instance. */
+    constructor($$source: Partial<StdioConnectionDiagnostic> = {}) {
+        if (!("id" in $$source)) {
+            this["id"] = 0;
+        }
+        if (!("command" in $$source)) {
+            this["command"] = "";
+        }
+        if (!("openedAt" in $$source)) {
+            this["openedAt"] = null;
+        }
+        if (!("ageMs" in $$source)) {
+            this["ageMs"] = 0;
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new StdioConnectionDiagnostic instance from a string or object.
+     */
+    static createFrom($$source: any = {}): StdioConnectionDiagnostic {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new StdioConnectionDiagnostic($$parsedSource as Partial<StdioConnectionDiagnostic>);
+    }
+}
+
+export class StdioTransportDiagnostics {
+    "opened": number;
+    "closed": number;
+    "active": number;
+    "forcedKills": number;
+    "closeTimeouts": number;
+    "lastOpenedAt"?: time$0.Time;
+    "lastClosedAt"?: time$0.Time;
+    "activeConnections"?: StdioConnectionDiagnostic[];
+
+    /** Creates a new StdioTransportDiagnostics instance. */
+    constructor($$source: Partial<StdioTransportDiagnostics> = {}) {
+        if (!("opened" in $$source)) {
+            this["opened"] = 0;
+        }
+        if (!("closed" in $$source)) {
+            this["closed"] = 0;
+        }
+        if (!("active" in $$source)) {
+            this["active"] = 0;
+        }
+        if (!("forcedKills" in $$source)) {
+            this["forcedKills"] = 0;
+        }
+        if (!("closeTimeouts" in $$source)) {
+            this["closeTimeouts"] = 0;
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new StdioTransportDiagnostics instance from a string or object.
+     */
+    static createFrom($$source: any = {}): StdioTransportDiagnostics {
+        const $$createField7_0 = $$createType69;
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        if ("activeConnections" in $$parsedSource) {
+            $$parsedSource["activeConnections"] = $$createField7_0($$parsedSource["activeConnections"]);
+        }
+        return new StdioTransportDiagnostics($$parsedSource as Partial<StdioTransportDiagnostics>);
+    }
+}
+
 export class TerminalOptions {
     "shell"?: string;
     "workingDir"?: string;
@@ -3316,6 +3535,27 @@ export class TerminalOptions {
             $$parsedSource["env"] = $$createField2_0($$parsedSource["env"]);
         }
         return new TerminalOptions($$parsedSource as Partial<TerminalOptions>);
+    }
+}
+
+export class TerminalRuntimeDiagnostics {
+    "activeSessions": number;
+
+    /** Creates a new TerminalRuntimeDiagnostics instance. */
+    constructor($$source: Partial<TerminalRuntimeDiagnostics> = {}) {
+        if (!("activeSessions" in $$source)) {
+            this["activeSessions"] = 0;
+        }
+
+        Object.assign(this, $$source);
+    }
+
+    /**
+     * Creates a new TerminalRuntimeDiagnostics instance from a string or object.
+     */
+    static createFrom($$source: any = {}): TerminalRuntimeDiagnostics {
+        let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
+        return new TerminalRuntimeDiagnostics($$parsedSource as Partial<TerminalRuntimeDiagnostics>);
     }
 }
 
@@ -3442,8 +3682,8 @@ export class UpdateFilter {
      * Creates a new UpdateFilter instance from a string or object.
      */
     static createFrom($$source: any = {}): UpdateFilter {
-        const $$createField1_0 = $$createType63;
-        const $$createField2_0 = $$createType64;
+        const $$createField1_0 = $$createType70;
+        const $$createField2_0 = $$createType71;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("status" in $$parsedSource) {
             $$parsedSource["status"] = $$createField1_0($$parsedSource["status"]);
@@ -3555,7 +3795,7 @@ export class UpdatePlan {
      * Creates a new UpdatePlan instance from a string or object.
      */
     static createFrom($$source: any = {}): UpdatePlan {
-        const $$createField2_0 = $$createType66;
+        const $$createField2_0 = $$createType73;
         const $$createField3_0 = $$createType12;
         const $$createField4_0 = $$createType1;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
@@ -3679,7 +3919,7 @@ export class VolumeDetail {
      * Creates a new VolumeDetail instance from a string or object.
      */
     static createFrom($$source: any = {}): VolumeDetail {
-        const $$createField0_0 = $$createType67;
+        const $$createField0_0 = $$createType74;
         const $$createField1_0 = $$createType22;
         const $$createField2_0 = $$createType43;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
@@ -3858,12 +4098,19 @@ const $$createType55 = $Create.Array($$createType54);
 const $$createType56 = ProviderStatus.createFrom;
 const $$createType57 = PortMapping.createFrom;
 const $$createType58 = $Create.Array($$createType57);
-const $$createType59 = Point.createFrom;
-const $$createType60 = $Create.Array($$createType59);
-const $$createType61 = Series.createFrom;
-const $$createType62 = $Create.Array($$createType61);
-const $$createType63 = $Create.Array($Create.Any);
-const $$createType64 = $Create.Array($Create.Any);
-const $$createType65 = UpdatePlanItem.createFrom;
-const $$createType66 = $Create.Array($$createType65);
-const $$createType67 = VolumeSummary.createFrom;
+const $$createType59 = StdioTransportDiagnostics.createFrom;
+const $$createType60 = LogRuntimeDiagnostics.createFrom;
+const $$createType61 = MetricsRuntimeDiagnostics.createFrom;
+const $$createType62 = TerminalRuntimeDiagnostics.createFrom;
+const $$createType63 = PortForwardRuntimeDiagnostics.createFrom;
+const $$createType64 = Point.createFrom;
+const $$createType65 = $Create.Array($$createType64);
+const $$createType66 = Series.createFrom;
+const $$createType67 = $Create.Array($$createType66);
+const $$createType68 = StdioConnectionDiagnostic.createFrom;
+const $$createType69 = $Create.Array($$createType68);
+const $$createType70 = $Create.Array($Create.Any);
+const $$createType71 = $Create.Array($Create.Any);
+const $$createType72 = UpdatePlanItem.createFrom;
+const $$createType73 = $Create.Array($$createType72);
+const $$createType74 = VolumeSummary.createFrom;

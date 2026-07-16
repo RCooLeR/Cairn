@@ -119,12 +119,15 @@ func (m *Manager) ApplyUpdate(ctx context.Context, req models.ApplyUpdateRequest
 		return "", err
 	}
 	if record.Operation == "rollback" {
+		m.saveUpdatePlan(record)
 		return "", apperror.New(apperror.Conflict, "Update plan is a rollback plan")
 	}
 	if len(record.CommandSet) == 0 {
+		m.saveUpdatePlan(record)
 		return "", apperror.New(apperror.Conflict, "Update plan has no actionable commands")
 	}
 	if m.Compose == nil || m.Updates == nil {
+		m.saveUpdatePlan(record)
 		return "", notReady()
 	}
 	jobID := "updates-" + m.newID()
@@ -215,6 +218,7 @@ func (m *Manager) ApplyRollback(ctx context.Context, planID string) (string, err
 		return "", err
 	}
 	if record.Operation != "rollback" {
+		m.saveUpdatePlan(record)
 		return "", apperror.New(apperror.Conflict, "Update plan is not a rollback plan")
 	}
 	jobID := "updates-" + m.newID()
@@ -648,7 +652,7 @@ func (m *Manager) rollbackSnapshots(ctx context.Context, jobID string, record up
 			continue
 		}
 		m.publishJobProgress(jobID, "rollback", "Rolling back "+service, nil)
-		if err := m.rollbackHistory(ctx, record.Project, history); err != nil {
+		if err := m.rollbackHistory(ctx, jobID, record.Project, history); err != nil {
 			result = updateResultManualNeeded
 			status = rollbackStatusManualNeeded
 		}
@@ -662,7 +666,7 @@ func (m *Manager) runManualRollback(ctx context.Context, jobID string, project s
 	command := rollbackCommand(project, history)
 	_ = m.recordAudit(ctx, "update.rollback", "project", project.ID, project.ProviderID, project.ID, command, models.RiskNeedsConfirmation, "started", 0, nil)
 	m.publishJobProgress(jobID, "rollback", "Rolling back "+serviceNameFromID(history.ServiceID, history.ProjectID), nil)
-	err := m.rollbackHistory(ctx, project, history)
+	err := m.rollbackHistory(ctx, jobID, project, history)
 	result := updateResultRolledBack
 	status := rollbackStatusRolledBack
 	if err != nil {
@@ -674,9 +678,14 @@ func (m *Manager) runManualRollback(ctx context.Context, jobID string, project s
 		RollbackStatus: status,
 		FinishedAt:     m.now(),
 		Error:          errorString(err),
+		NewImageID:     history.NewImageID,
+		NewDigest:      history.NewDigest,
+		NewBaseDigest:  history.NewBaseDigest,
 	}
-	_ = m.Updates.FinishHistory(ctx, history.ID, finish)
-	_ = m.recordAudit(ctx, "update.rollback", "project", project.ID, project.ProviderID, project.ID, command, models.RiskNeedsConfirmation, auditStatus(err), time.Since(started), err)
+	finishCtx, cancel := m.finishContext(ctx)
+	defer cancel()
+	_ = m.Updates.FinishHistory(finishCtx, history.ID, finish)
+	_ = m.recordAudit(finishCtx, "update.rollback", "project", project.ID, project.ProviderID, project.ID, command, models.RiskNeedsConfirmation, auditStatus(err), time.Since(started), err)
 	history.Result = result
 	history.RollbackStatus = status
 	history.FinishedAt = finish.FinishedAt
@@ -685,7 +694,7 @@ func (m *Manager) runManualRollback(ctx context.Context, jobID string, project s
 	m.publishJobDone(jobID, result, err)
 }
 
-func (m *Manager) rollbackHistory(ctx context.Context, project store.ProjectRecord, history store.UpdateHistoryRecord) error {
+func (m *Manager) rollbackHistory(ctx context.Context, jobID string, project store.ProjectRecord, history store.UpdateHistoryRecord) error {
 	if strings.TrimSpace(history.OldImageID) == "" {
 		return apperror.New(apperror.NotFound, "Previous image ID is not available for rollback")
 	}
@@ -700,11 +709,13 @@ func (m *Manager) rollbackHistory(ctx context.Context, project store.ProjectReco
 		NoBuild:  noBuild,
 		Services: []string{serviceNameFromID(history.ServiceID, history.ProjectID)},
 	})
-	m.publishComposeOutput("", result)
+	m.publishComposeOutput(jobID, result)
 	return err
 }
 
 func (m *Manager) finishUpdateJob(ctx context.Context, jobID string, record updatePlanRecord, histories []store.UpdateHistoryRecord, result string, healthResult string, rollbackStatus string, started time.Time, actionErr error) {
+	finishCtx, cancel := m.finishContext(ctx)
+	defer cancel()
 	for i := range histories {
 		history := histories[i]
 		finish := store.UpdateHistoryRecord{
@@ -714,13 +725,13 @@ func (m *Manager) finishUpdateJob(ctx context.Context, jobID string, record upda
 			FinishedAt:     m.now(),
 			Error:          errorString(actionErr),
 		}
-		newImageID, newDigest := m.currentServiceImage(ctx, record.Project.ID, serviceNameFromID(history.ServiceID, history.ProjectID), history.ImageRef)
+		newImageID, newDigest := m.currentServiceImage(finishCtx, record.Project.ID, serviceNameFromID(history.ServiceID, history.ProjectID), history.ImageRef)
 		finish.NewImageID = newImageID
 		finish.NewDigest = newDigest
 		if history.UpdateKind == models.UpdateKindBaseImage {
 			finish.NewBaseDigest = history.NewBaseDigest
 		}
-		_ = m.Updates.FinishHistory(ctx, history.ID, finish)
+		_ = m.Updates.FinishHistory(finishCtx, history.ID, finish)
 		history.Result = finish.Result
 		history.HealthResult = finish.HealthResult
 		history.RollbackStatus = finish.RollbackStatus
@@ -735,12 +746,19 @@ func (m *Manager) finishUpdateJob(ctx context.Context, jobID string, record upda
 	if result == updateResultRolledBack || result == updateResultManualNeeded {
 		status = "failed"
 	}
-	_ = m.recordAudit(ctx, "update.apply", "project", record.Project.ID, record.Project.ProviderID, record.Project.ID, plannedCommandText(record.CommandSet), models.RiskNeedsConfirmation, status, time.Since(started), actionErr)
+	_ = m.recordAudit(finishCtx, "update.apply", "project", record.Project.ID, record.Project.ProviderID, record.Project.ID, plannedCommandText(record.CommandSet), models.RiskNeedsConfirmation, status, time.Since(started), actionErr)
 	if m.Events != nil {
 		m.Events.Publish(bus.Event{Topic: bus.TopicObjectsChanged, Payload: map[string]any{"kind": "project", "ids": []string{record.Project.ID}}})
 	}
-	m.insertNotification(ctx, result, record.Project.Name, actionErr)
+	m.insertNotification(finishCtx, result, record.Project.Name, actionErr)
 	m.publishJobDone(jobID, result, actionErr)
+}
+
+func (m *Manager) finishContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		return context.WithTimeout(context.Background(), 10*time.Second)
+	}
+	return context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 }
 
 func (m *Manager) currentServiceImage(ctx context.Context, projectID string, service string, imageRef string) (string, string) {

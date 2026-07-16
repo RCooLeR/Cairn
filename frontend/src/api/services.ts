@@ -2,6 +2,7 @@ export {
   AgentService,
   BackupService,
   ComposeService,
+  DiagnosticsService,
   DockerService,
   ImageLineageService,
   LogsService,

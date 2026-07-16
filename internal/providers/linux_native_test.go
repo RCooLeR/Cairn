@@ -326,6 +326,7 @@ type fakeRunner struct {
 	paths   map[string]string
 	outputs map[string]string
 	errors  map[string]error
+	counts  map[string]int
 }
 
 func newFakeRunner() *fakeRunner {
@@ -333,6 +334,7 @@ func newFakeRunner() *fakeRunner {
 		paths:   map[string]string{},
 		outputs: map[string]string{},
 		errors:  map[string]error{},
+		counts:  map[string]int{},
 	}
 }
 
@@ -345,6 +347,7 @@ func (r *fakeRunner) LookPath(file string) (string, error) {
 
 func (r *fakeRunner) Run(_ context.Context, _ time.Duration, name string, args ...string) (*CommandResult, error) {
 	key := strings.Join(append([]string{name}, args...), " ")
+	r.counts[key]++
 	result := &CommandResult{Command: append([]string{name}, args...), Stdout: r.outputs[key], ExitCode: 0}
 	if err, ok := r.errors[key]; ok {
 		result.ExitCode = 1

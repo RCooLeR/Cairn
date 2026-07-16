@@ -205,6 +205,7 @@ func mapContainerInspectSummary(raw container.InspectResponse) models.ContainerS
 		Ports:     mapInspectPorts(raw.NetworkSettings),
 		Restarts:  containerInspectRestarts(base),
 		CreatedAt: containerInspectCreatedAt(base),
+		StartedAt: containerInspectStartedAt(base),
 	}
 }
 
@@ -342,6 +343,13 @@ func containerInspectCreatedAt(base *container.ContainerJSONBase) time.Time {
 		return time.Time{}
 	}
 	return parseDockerTime(base.Created)
+}
+
+func containerInspectStartedAt(base *container.ContainerJSONBase) time.Time {
+	if base == nil || base.State == nil {
+		return time.Time{}
+	}
+	return parseDockerTime(base.State.StartedAt)
 }
 
 func normalizeContainerState(value string) string {

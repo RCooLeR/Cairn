@@ -2,6 +2,7 @@ package providers
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/RCooLeR/Cairn/internal/models"
@@ -65,6 +66,38 @@ func TestManagerSelectsBestDetectedWhenSavedProviderUnhealthy(t *testing.T) {
 	}
 	if activeID := manager.ActiveProviderID(ctx); activeID != "linux_native" {
 		t.Fatalf("ActiveProviderID() = %q, want linux_native", activeID)
+	}
+	saved, err := db.Settings().GetString(ctx, "provider.active_id")
+	if err != nil {
+		t.Fatalf("GetString(provider.active_id) error = %v", err)
+	}
+	if saved != "ctx:missing" {
+		t.Fatalf("saved provider.active_id = %q, want original user intent", saved)
+	}
+}
+
+func TestManagerApplyInstallKeepsPlanAfterStepFailure(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openProviderTestStore(t, ctx)
+	provider := &fakeProvider{id: "linux_native", kind: TypeLinuxNative, platform: PlatformLinux, installFailures: 1}
+	manager := NewManager(db.Providers(), db.Settings(), []PlatformProvider{provider})
+
+	plan, err := manager.PlanInstall(ctx, "linux_native", models.InstallOptions{})
+	if err != nil {
+		t.Fatalf("PlanInstall() error = %v", err)
+	}
+	if err := manager.ApplyInstall(ctx, plan.PlanID, nil); err == nil {
+		t.Fatal("ApplyInstall() error = nil, want first step failure")
+	}
+	if _, _, risk := manager.InstallPlanAuditContext(plan.PlanID); risk == "" {
+		t.Fatal("install plan was consumed after failed apply")
+	}
+	if err := manager.ApplyInstall(ctx, plan.PlanID, nil); err != nil {
+		t.Fatalf("ApplyInstall() retry error = %v", err)
+	}
+	if _, _, risk := manager.InstallPlanAuditContext(plan.PlanID); risk != "" {
+		t.Fatal("install plan remained after successful apply")
 	}
 }
 
@@ -162,10 +195,11 @@ type fakeProvider struct {
 	healthy  bool
 	distro   string
 
-	colimaProfile  string
-	colimaCPU      int
-	colimaMemoryGB int
-	colimaDiskGB   int
+	colimaProfile   string
+	colimaCPU       int
+	colimaMemoryGB  int
+	colimaDiskGB    int
+	installFailures int
 }
 
 func (p *fakeProvider) ID() string          { return p.id }
@@ -193,9 +227,21 @@ func (p *fakeProvider) SetColimaConfig(profile string, cpu, memoryGB, diskGB int
 	p.colimaDiskGB = diskGB
 }
 func (p *fakeProvider) PlanInstall(context.Context, models.InstallOptions) (*models.CommandPlan, error) {
-	return nil, nil
+	return &models.CommandPlan{
+		PlanID: "plan-install-test",
+		Risk:   models.RiskNeedsConfirmation,
+		Commands: []models.PlannedCommand{{
+			Order:   1,
+			Command: "install",
+			Risk:    models.RiskNeedsConfirmation,
+		}},
+	}, nil
 }
 func (p *fakeProvider) ExecuteInstallStep(context.Context, string, int, chan<- InstallProgress) error {
+	if p.installFailures > 0 {
+		p.installFailures--
+		return errors.New("install failed")
+	}
 	return nil
 }
 func (p *fakeProvider) Start(context.Context) error { return nil }

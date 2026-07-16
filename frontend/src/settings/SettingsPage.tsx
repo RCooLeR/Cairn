@@ -20,11 +20,12 @@ import type {
   ProviderSummary,
   RegistryAccount,
   RegistryAuthStatus,
+  RuntimeDiagnostics,
   VersionInfo,
   WindowsDockerCLIShimStatus,
   WSLDistroInfo,
 } from "../../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
-import { SettingsService } from "../api/services";
+import { DiagnosticsService, SettingsService } from "../api/services";
 import {
   Badge,
   Button,
@@ -215,6 +216,12 @@ export function SettingsPage({
     useState<WindowsDockerCLIShimStatus | null>(null);
   const [dockerShimLoading, setDockerShimLoading] = useState(false);
   const [dockerShimError, setDockerShimError] = useState<string | null>(null);
+  const [runtimeDiagnostics, setRuntimeDiagnostics] =
+    useState<RuntimeDiagnostics | null>(null);
+  const [runtimeDiagnosticsLoading, setRuntimeDiagnosticsLoading] =
+    useState(false);
+  const [runtimeDiagnosticsError, setRuntimeDiagnosticsError] =
+    useState<string | null>(null);
   const activeStatus = activeProvider?.status;
   const providerKind = activeProvider?.kind || "windows_wsl_ubuntu";
   const registryCredentialMode = settingString(
@@ -276,6 +283,21 @@ export function SettingsPage({
       setDockerShimLoading(false);
     }
   };
+  const refreshRuntimeDiagnostics = useCallback(async () => {
+    setRuntimeDiagnosticsLoading(true);
+    setRuntimeDiagnosticsError(null);
+    try {
+      setRuntimeDiagnostics(await DiagnosticsService.GetRuntimeDiagnostics());
+    } catch (err) {
+      setRuntimeDiagnosticsError(
+        err instanceof Error
+          ? err.message
+          : "Unable to load runtime diagnostics",
+      );
+    } finally {
+      setRuntimeDiagnosticsLoading(false);
+    }
+  }, []);
   useEffect(() => {
     if (section === "providers" && providerKind === "windows_wsl_ubuntu") {
       const timer = window.setTimeout(() => {
@@ -285,6 +307,15 @@ export function SettingsPage({
     }
     return undefined;
   }, [providerKind, refreshDockerShimStatus, section, wslDistro]);
+  useEffect(() => {
+    if (section === "advanced") {
+      const timer = window.setTimeout(() => {
+        void refreshRuntimeDiagnostics();
+      }, 0);
+      return () => window.clearTimeout(timer);
+    }
+    return undefined;
+  }, [refreshRuntimeDiagnostics, section]);
   return (
     <div className="grid gap-4 xl:grid-cols-[220px_minmax(0,1fr)]">
       <div className="xl:hidden">
@@ -698,15 +729,88 @@ export function SettingsPage({
 
         {section === "advanced" ? (
           <Card>
-            <CardHeader title="Advanced" />
+            <CardHeader
+              actions={
+                <Button
+                  icon={<RefreshCw size={14} />}
+                  loading={runtimeDiagnosticsLoading}
+                  onClick={() => void refreshRuntimeDiagnostics()}
+                  size="sm"
+                >
+                  Refresh
+                </Button>
+              }
+              title="Advanced"
+            />
             <CardBody className="space-y-3">
               <ReadOnlySetting label="Runtime cache" value="Managed by Cairn" />
-              <Button
-                disabled
-                disabledReason="No cached data is ready to reset"
-              >
-                Reset all caches
-              </Button>
+              {runtimeDiagnosticsError ? (
+                <div className="rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
+                  {runtimeDiagnosticsError}
+                </div>
+              ) : null}
+              <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                <RuntimeDiagnosticTile
+                  detail={`${runtimeDiagnostics?.stdio.opened ?? 0} opened / ${runtimeDiagnostics?.stdio.closed ?? 0} closed`}
+                  label="WSL stdio transports"
+                  value={`${runtimeDiagnostics?.stdio.active ?? 0} active`}
+                />
+                <RuntimeDiagnosticTile
+                  detail={`${runtimeDiagnostics?.stdio.forcedKills ?? 0} forced kills / ${runtimeDiagnostics?.stdio.closeTimeouts ?? 0} close timeouts`}
+                  label="Stdio close pressure"
+                  value={formatDiagnosticTime(
+                    runtimeDiagnostics?.stdio.lastClosedAt,
+                  )}
+                />
+                <RuntimeDiagnosticTile
+                  detail={`${runtimeDiagnostics?.logs.activeProducers ?? 0} active readers`}
+                  label="Log streams"
+                  value={`${runtimeDiagnostics?.logs.activeStreams ?? 0} active`}
+                />
+                <RuntimeDiagnosticTile
+                  detail={`${runtimeDiagnostics?.metrics.activeWatchers ?? 0} container watchers`}
+                  label="Metrics"
+                  value={
+                    runtimeDiagnostics?.metrics.started ? "running" : "stopped"
+                  }
+                />
+                <RuntimeDiagnosticTile
+                  detail="Host, backend, project, and container sessions"
+                  label="Terminals"
+                  value={`${runtimeDiagnostics?.terminals.activeSessions ?? 0} active`}
+                />
+                <RuntimeDiagnosticTile
+                  detail={
+                    runtimeDiagnostics?.portForwards.supported
+                      ? "Windows host relays"
+                      : "Native backend networking"
+                  }
+                  label="Port forwards"
+                  value={`${runtimeDiagnostics?.portForwards.activeForwards ?? 0} active`}
+                />
+              </div>
+              {runtimeDiagnostics?.stdio.activeConnections?.length ? (
+                <div className="overflow-hidden rounded-card border border-border">
+                  <div className="border-b border-border bg-bg-inset px-3 py-2 text-xs font-semibold uppercase text-text-muted">
+                    Active WSL stdio commands
+                  </div>
+                  <div className="divide-y divide-border">
+                    {runtimeDiagnostics.stdio.activeConnections.map((item) => (
+                      <div
+                        className="grid gap-2 px-3 py-2 text-sm md:grid-cols-[minmax(0,1fr)_120px]"
+                        key={item.id}
+                      >
+                        <code className="min-w-0 truncate text-xs text-text-primary">
+                          {item.command || "-"}
+                        </code>
+                        <span className="text-xs text-text-muted md:text-right">
+                          {formatDiagnosticDurationMS(item.ageMs)}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : null}
             </CardBody>
           </Card>
         ) : null}
@@ -1660,6 +1764,51 @@ function ReadOnlySetting({ label, value }: { label: string; value: string }) {
       <div className="mt-1 text-text-primary">{value}</div>
     </div>
   );
+}
+
+function RuntimeDiagnosticTile({
+  detail,
+  label,
+  value,
+}: {
+  detail: string;
+  label: string;
+  value: string;
+}) {
+  return (
+    <div className="rounded-card border border-border bg-bg-inset p-3 text-sm">
+      <div className="text-xs font-medium uppercase text-text-muted">
+        {label}
+      </div>
+      <div className="mt-1 text-base font-semibold text-text-primary">
+        {value}
+      </div>
+      <div className="mt-1 text-xs text-text-muted">{detail}</div>
+    </div>
+  );
+}
+
+function formatDiagnosticTime(value: unknown) {
+  const timestamp = dateMillis(value);
+  if (!timestamp) {
+    return "-";
+  }
+  return new Date(timestamp).toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function formatDiagnosticDurationMS(value: number) {
+  if (!Number.isFinite(value) || value <= 0) {
+    return "0s";
+  }
+  const seconds = Math.round(value / 1000);
+  if (seconds < 60) {
+    return `${seconds}s`;
+  }
+  return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
 }
 
 function HelpCard({

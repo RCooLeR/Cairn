@@ -1310,9 +1310,25 @@ func (s *ProjectService) publishProjectComposeOutput(jobID string, projectID str
 func (s *ProjectService) runImportedProjectDeploy(ctx context.Context, projectID string) {
 	go func() {
 		unlock := s.lockRuntime()
-		defer unlock()
-		if err := s.runProjectAction(ctx, security.ProjectActionDeploy, projectID, false, nil); err != nil && s.Detector != nil {
-			_, _ = s.Detector.Reconcile(ctx)
+		snapshot := *s
+		runtimeCtx := s.RuntimeCtx
+		unlock()
+
+		deployCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+		defer cancel()
+		if runtimeCtx != nil {
+			go func() {
+				select {
+				case <-runtimeCtx.Done():
+					cancel()
+				case <-deployCtx.Done():
+				}
+			}()
+		}
+		snapshot.RuntimeMu = nil
+		snapshot.RuntimeCtx = nil
+		if err := snapshot.runProjectAction(deployCtx, security.ProjectActionDeploy, projectID, false, nil); err != nil && snapshot.Detector != nil {
+			_, _ = snapshot.Detector.Reconcile(deployCtx)
 		}
 	}()
 }

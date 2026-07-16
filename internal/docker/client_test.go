@@ -172,15 +172,41 @@ func TestClientConnectUsesProviderDialer(t *testing.T) {
 	}
 }
 
-func TestProcessBackedHTTPClientDisablesKeepAlives(t *testing.T) {
+func TestProcessBackedHTTPClientDoesNotCapActiveStreams(t *testing.T) {
 	t.Parallel()
 	httpClient := processBackedHTTPClient()
 	transport, ok := httpClient.Transport.(*http.Transport)
 	if !ok {
 		t.Fatalf("transport = %T, want *http.Transport", httpClient.Transport)
 	}
-	if !transport.DisableKeepAlives {
-		t.Fatal("DisableKeepAlives = false, want true")
+	if transport.DisableKeepAlives {
+		t.Fatal("DisableKeepAlives = true, want bounded keep-alive reuse for process-backed WSL transport")
+	}
+	if transport.MaxConnsPerHost != 0 {
+		t.Fatalf("MaxConnsPerHost = %d, want no active stream cap", transport.MaxConnsPerHost)
+	}
+	if transport.MaxIdleConnsPerHost != 2 {
+		t.Fatalf("MaxIdleConnsPerHost = %d, want 2", transport.MaxIdleConnsPerHost)
+	}
+	if transport.IdleConnTimeout <= 0 {
+		t.Fatal("IdleConnTimeout <= 0")
+	}
+}
+
+func TestClientListImagesUsesInventoryTimeout(t *testing.T) {
+	t.Parallel()
+	api := newFakeAPI()
+	api.images = []image.Summary{{ID: "sha256:image1", RepoTags: []string{"example/app:latest"}}}
+
+	client := New(fakeDockerProvider{}, nil)
+	client.api = api
+	client.unaryTimeout = 2 * time.Second
+
+	if _, err := client.ListImages(context.Background()); err != nil {
+		t.Fatalf("ListImages() error = %v", err)
+	}
+	if api.imageListDeadline < defaultInventoryTimeout-time.Second {
+		t.Fatalf("image list deadline = %s, want inventory timeout near %s", api.imageListDeadline, defaultInventoryTimeout)
 	}
 }
 
@@ -914,6 +940,47 @@ func TestClientProcessBackedTransportDoesNotOpenDockerEventStream(t *testing.T) 
 	api.mu.Unlock()
 	if eventCalls != 0 {
 		t.Fatalf("Docker Events calls = %d, want 0 for process-backed transport", eventCalls)
+	}
+}
+
+func TestClientReconcilePublishesSnapshotChanges(t *testing.T) {
+	ctx := context.Background()
+	api := newFakeAPI()
+	seedFakeObjects(api)
+
+	dbPath := filepath.Join(t.TempDir(), "cairn.db")
+	db, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	eventBus := bus.New()
+	defer eventBus.Close()
+	client := New(fakeDockerProvider{}, eventBus)
+	client.SetObjectCache(db.Objects())
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	if err := client.Reconcile(ctx); err != nil {
+		t.Fatalf("initial Reconcile() error = %v", err)
+	}
+
+	changed := eventBus.Subscribe(ctx, bus.TopicObjectsChanged, 4)
+	api.containers[0].State = "exited"
+	api.containers[0].Status = "Exited (0) 2 seconds ago"
+	if err := client.Reconcile(ctx); err != nil {
+		t.Fatalf("changed Reconcile() error = %v", err)
+	}
+	payload := waitObjectsChangedKind(t, ctx, changed, objectKindContainer, fakeContainerID, time.Second)
+	if len(payload.IDs) != 1 || payload.IDs[0] != fakeContainerID {
+		t.Fatalf("objects:changed payload = %#v", payload)
 	}
 }
 
@@ -2133,6 +2200,7 @@ type fakeAPI struct {
 	containerInspects map[string]container.InspectResponse
 	containerRaw      map[string][]byte
 	images            []image.Summary
+	imageListDeadline time.Duration
 	imageInspects     map[string]image.InspectResponse
 	imageRaw          map[string][]byte
 	volumes           []*volume.Volume
@@ -2486,7 +2554,12 @@ func (a *fakeAPI) ContainerRename(_ context.Context, id string, name string) err
 	return nil
 }
 
-func (a *fakeAPI) ImageList(context.Context, image.ListOptions) ([]image.Summary, error) {
+func (a *fakeAPI) ImageList(ctx context.Context, _ image.ListOptions) ([]image.Summary, error) {
+	if deadline, ok := ctx.Deadline(); ok {
+		a.mu.Lock()
+		a.imageListDeadline = time.Until(deadline)
+		a.mu.Unlock()
+	}
 	return append([]image.Summary(nil), a.images...), nil
 }
 

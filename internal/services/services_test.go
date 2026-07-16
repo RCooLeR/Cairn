@@ -568,6 +568,41 @@ func TestAgentServiceFileEditPlanWritesProjectConfig(t *testing.T) {
 	}
 }
 
+func TestAgentServiceCreateFilePlanRejectsFileCreatedBeforeApply(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	projectService, projectID, root := importAgentTestProject(t, ctx, db)
+	planStore := security.NewAgentFileEditPlanStore(nil)
+	t.Cleanup(planStore.Close)
+	service := &AgentService{Project: projectService, Plans: planStore, Audit: db.Audit()}
+
+	plan, err := service.PlanFileEdit(ctx, models.AgentFileEditRequest{
+		ProjectID: projectID,
+		Path:      ".env.created",
+		Content:   "APP_PORT=9000\n",
+		Reason:    "Create a new env file",
+	})
+	if err != nil {
+		t.Fatalf("PlanFileEdit() error = %v", err)
+	}
+	target := filepath.Join(root, ".env.created")
+	if err := os.WriteFile(target, []byte("APP_PORT=8080\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile(%s) error = %v", target, err)
+	}
+
+	_, err = service.ApplyFileEdit(ctx, plan.PlanID, "")
+	if !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("ApplyFileEdit() error = %v, want conflict", err)
+	}
+	raw, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("ReadFile(%s) error = %v", target, err)
+	}
+	if string(raw) != "APP_PORT=8080\n" {
+		t.Fatalf(".env.created changed: %q", raw)
+	}
+}
+
 func TestAgentServiceFileEditRejectsSymlinkEscape(t *testing.T) {
 	ctx := context.Background()
 	db := openServiceTestStore(t)
@@ -600,6 +635,48 @@ func TestAgentServiceFileEditRejectsSymlinkEscape(t *testing.T) {
 	}
 	if string(raw) != "SECRET=outside\n" {
 		t.Fatalf("outside file changed: %q", raw)
+	}
+}
+
+func TestRedactTextKeepsSecretKeys(t *testing.T) {
+	got := redactText("DB_PASSWORD=secret\nAUTH_URL=https://example.test\nPLAIN=value\n")
+	if !strings.Contains(got, "DB_PASSWORD=[REDACTED]") {
+		t.Fatalf("redactText() = %q, want password key preserved", got)
+	}
+	if !strings.Contains(got, "AUTH_URL=[REDACTED]") {
+		t.Fatalf("redactText() = %q, want auth key preserved", got)
+	}
+	if !strings.Contains(got, "PLAIN=value") {
+		t.Fatalf("redactText() = %q, want non-secret value preserved", got)
+	}
+	if strings.Contains(got, "secret") || strings.Contains(got, "https://example.test") {
+		t.Fatalf("redactText() leaked secret value: %q", got)
+	}
+}
+
+func TestAgentContextTextSplitsDataBeforeTruncating(t *testing.T) {
+	got := agentContextText([]models.AgentToolResult{{
+		ToolID: "project.files",
+		Title:  "Files",
+		Data:   "a\nb\nc",
+	}}, 3)
+	if !strings.Contains(got, "\n... context truncated ...") {
+		t.Fatalf("agentContextText() = %q, want truncation marker", got)
+	}
+	if strings.Contains(got, "\nc") {
+		t.Fatalf("agentContextText() = %q, want third data line truncated", got)
+	}
+}
+
+func TestReadAgentDraftCurrentRejectsLargeFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".env")
+	if err := os.WriteFile(path, []byte(strings.Repeat("A", maxAgentFileEditBytes+1)), 0o600); err != nil {
+		t.Fatalf("WriteFile(%s) error = %v", path, err)
+	}
+
+	_, err := readAgentDraftCurrent(path)
+	if !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("readAgentDraftCurrent() error = %v, want conflict", err)
 	}
 }
 
@@ -849,7 +926,7 @@ func TestProviderServiceStopClearsRuntimeForActiveProvider(t *testing.T) {
 	if len(runner.commands) != 1 {
 		t.Fatalf("lifecycle commands = %#v, want one command", runner.commands)
 	}
-	if got, want := strings.Join(runner.commands[0], " "), "wsl.exe -d Ubuntu -- systemctl stop docker"; got != want {
+	if got, want := strings.Join(runner.commands[0], " "), "wsl.exe -d Ubuntu -u root -- systemctl stop docker"; got != want {
 		t.Fatalf("lifecycle command = %q, want %q", got, want)
 	}
 	if runtime.rebindCalls != 1 || runtime.lastProvider != nil {
@@ -877,7 +954,7 @@ func TestProviderServiceStopNonActiveProviderKeepsRuntime(t *testing.T) {
 	if len(runner.commands) != 1 {
 		t.Fatalf("lifecycle commands = %#v, want one command", runner.commands)
 	}
-	if got, want := strings.Join(runner.commands[0], " "), "wsl.exe -d Ubuntu -- systemctl stop docker"; got != want {
+	if got, want := strings.Join(runner.commands[0], " "), "wsl.exe -d Ubuntu -u root -- systemctl stop docker"; got != want {
 		t.Fatalf("lifecycle command = %q, want %q", got, want)
 	}
 	if runtime.rebindCalls != 0 {

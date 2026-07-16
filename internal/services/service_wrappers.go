@@ -64,11 +64,16 @@ func (s *PortForwardService) GetStatus(_ context.Context) (*models.PortForwardSt
 	}, nil
 }
 
-func (s *PortForwardService) SetEnabled(_ context.Context, enabled bool) error {
+func (s *PortForwardService) SetEnabled(ctx context.Context, enabled bool) error {
 	unlock := s.lockRuntime()
 	defer unlock()
 	if s.Manager == nil {
 		return notReady()
+	}
+	if s.Settings != nil {
+		if err := s.Settings.SetBool(ctx, "portforward.enabled", enabled); err != nil {
+			return err
+		}
 	}
 	s.Manager.SetEnabled(enabled)
 	return nil

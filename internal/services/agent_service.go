@@ -28,6 +28,7 @@ const (
 	agentProviderOpenAICompatible = "openai_compatible"
 	agentDefaultEndpoint          = "http://127.0.0.1:11434"
 	agentDefaultModel             = "gemma4:12b-it-q8_0"
+	maxAgentFileEditBytes         = 256 * 1024
 )
 
 type AgentService struct {
@@ -524,9 +525,9 @@ func (s *AgentService) DraftProjectFile(ctx context.Context, req models.AgentDra
 		return nil, apperror.New(apperror.ProviderNotReady, "No local LLM models are installed")
 	}
 
-	current := ""
-	if raw, err := os.ReadFile(absPath); err == nil {
-		current = redactText(string(raw))
+	current, err := readAgentDraftCurrent(absPath)
+	if err != nil {
+		return nil, err
 	}
 	results := []models.AgentToolResult{
 		s.toolProjectDetail(ctx, project.Summary.ID),
@@ -566,7 +567,7 @@ func (s *AgentService) PlanFileEdit(ctx context.Context, req models.AgentFileEdi
 		return nil, err
 	}
 	content := normalizeAgentFileContent(req.Content)
-	if len(content) > 256*1024 {
+	if len(content) > maxAgentFileEditBytes {
 		return nil, apperror.New(apperror.Conflict, "File edit is too large", apperror.WithDetail("Agent file edits are limited to 256 KiB."))
 	}
 	var originalHash string
@@ -659,7 +660,7 @@ func (s *AgentService) ApplyFileEdit(ctx context.Context, planID string, typedNa
 	if strings.HasPrefix(filepath.Base(plan.RelativePath), ".env") {
 		perm = 0o600
 	}
-	if err := os.WriteFile(plan.AbsolutePath, []byte(plan.Content), perm); err != nil {
+	if err := writeAgentPlanFile(plan, perm); err != nil {
 		return nil, err
 	}
 	appliedAt := time.Now().UTC()
@@ -1041,7 +1042,7 @@ func agentContextText(results []models.AgentToolResult, maxLines int) string {
 			lines = append(lines, "Error: "+result.Error)
 		}
 		if result.Data != "" {
-			lines = append(lines, result.Data)
+			lines = append(lines, strings.Split(result.Data, "\n")...)
 		}
 	}
 	if maxLines <= 0 || len(lines) <= maxLines {
@@ -1889,6 +1890,53 @@ func normalizeAgentFileContent(value string) string {
 	return value
 }
 
+func readAgentDraftCurrent(absPath string) (string, error) {
+	info, err := os.Stat(absPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	if info.IsDir() {
+		return "", apperror.New(apperror.Conflict, "Draft target is a directory")
+	}
+	if info.Size() > maxAgentFileEditBytes {
+		return "", apperror.New(
+			apperror.Conflict,
+			"File is too large to draft",
+			apperror.WithDetail("Agent file drafts are limited to 256 KiB."),
+		)
+	}
+	raw, err := os.ReadFile(absPath)
+	if err != nil {
+		return "", err
+	}
+	return redactText(string(raw)), nil
+}
+
+func writeAgentPlanFile(plan security.AgentFileEditPlan, perm fs.FileMode) error {
+	if !plan.CreateFile {
+		return os.WriteFile(plan.AbsolutePath, []byte(plan.Content), perm)
+	}
+	file, err := os.OpenFile(plan.AbsolutePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+	if err != nil {
+		if os.IsExist(err) {
+			return apperror.New(
+				apperror.Conflict,
+				"File changed after preview",
+				apperror.WithDetail("Refresh the draft and preview again before applying."),
+			)
+		}
+		return err
+	}
+	if _, err := file.Write([]byte(plan.Content)); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
+}
+
 func hashAgentFile(raw []byte) string {
 	sum := sha256.Sum256(raw)
 	return fmt.Sprintf("%x", sum[:])
@@ -2119,7 +2167,7 @@ func redactText(value string) string {
 	for i, line := range lines {
 		if secretKeyPattern.MatchString(line) {
 			if match := secretLinePattern.FindStringSubmatchIndex(line); match != nil {
-				lines[i] = line[:match[2]] + "[REDACTED]"
+				lines[i] = line[:match[3]] + "[REDACTED]"
 				continue
 			}
 			lines[i] = inlineSecretRegexp.ReplaceAllString(line, "$1$2[REDACTED]")

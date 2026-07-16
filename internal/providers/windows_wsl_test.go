@@ -43,6 +43,17 @@ func TestParseWSLListVerboseUTF16ExcludesDockerDesktop(t *testing.T) {
 	}
 }
 
+func TestParseWSLListVerboseKeepsDistroNameStartingWithName(t *testing.T) {
+	t.Parallel()
+	distros, err := parseWSLListVerbose("  NAME STATE VERSION\n  NameServer Running 2\n")
+	if err != nil {
+		t.Fatalf("parseWSLListVerbose() error = %v", err)
+	}
+	if len(distros) != 1 || distros[0].Name != "NameServer" {
+		t.Fatalf("distros = %#v, want NameServer", distros)
+	}
+}
+
 func TestSelectWSLDistroHonorsSettingsAndCustomNames(t *testing.T) {
 	t.Parallel()
 	distros := []wslDistro{
@@ -233,6 +244,7 @@ func TestWindowsWSLRunDockerComposeAndShellCommands(t *testing.T) {
 	runner := newFakeRunner()
 	runner.paths["pwsh"] = `C:\Program Files\PowerShell\7\pwsh.exe`
 	runner.outputs[wslCommandName+" -d cairn-dev -- docker ps -a"] = "CONTAINER ID\n"
+	runner.outputs[wslCommandName+" -d cairn-dev -- docker run alpine sh -c echo \\$HOME"] = "/home/ada\n"
 	runner.outputs[wslCommandName+" -d cairn-dev -- sh -lc cd '/mnt/c/Users/Ada/Project One' && exec docker 'compose' '-f' 'compose.yaml' 'config'"] = "services: {}\n"
 	runner.outputs[wslCommandName+" -d cairn-dev -- sh -lc export COMPOSE_PROJECT_NAME='demo'; cd '/mnt/c/Users/Ada/Project One' && exec docker 'compose' '-f' 'compose.yaml' 'ps'"] = "[]\n"
 	provider := NewWindowsWSL(WindowsWSLOptions{Distro: "cairn-dev", Runner: runner})
@@ -243,6 +255,14 @@ func TestWindowsWSLRunDockerComposeAndShellCommands(t *testing.T) {
 	}
 	if got, want := result.Command, []string{wslCommandName, "-d", "cairn-dev", "--", "docker", "ps", "-a"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("RunDocker command = %#v, want %#v", got, want)
+	}
+
+	result, err = provider.RunDocker(context.Background(), "run", "alpine", "sh", "-c", "echo $HOME")
+	if err != nil {
+		t.Fatalf("RunDocker($) error = %v", err)
+	}
+	if got, want := result.Command, []string{wslCommandName, "-d", "cairn-dev", "--", "docker", "run", "alpine", "sh", "-c", "echo \\$HOME"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("RunDocker($) command = %#v, want %#v", got, want)
 	}
 
 	result, err = provider.RunCompose(context.Background(), `C:\Users\Ada\Project One`, "-f", "compose.yaml", "config")
@@ -282,6 +302,25 @@ func TestWindowsWSLRunDockerComposeAndShellCommands(t *testing.T) {
 	}
 	if got, want := backendShell, []string{wslCommandName, "-d", "cairn-dev", "--cd", "/mnt/c/Users/Ada/Project One", "--", "/bin/bash"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("BackendShellCommand(workdir) = %#v, want %#v", got, want)
+	}
+}
+
+func TestWindowsWSLLifecycleRunsSystemctlAsRoot(t *testing.T) {
+	t.Parallel()
+	runner := newFakeRunner()
+	runner.outputs[wslCommandName+" -d cairn-dev -u root -- systemctl start docker"] = ""
+	runner.outputs[wslCommandName+" -d cairn-dev -u root -- systemctl stop docker"] = ""
+	runner.outputs[wslCommandName+" -d cairn-dev -u root -- systemctl restart docker"] = ""
+	provider := NewWindowsWSL(WindowsWSLOptions{Distro: "cairn-dev", Runner: runner})
+
+	if err := provider.Start(context.Background()); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if err := provider.Stop(context.Background()); err != nil {
+		t.Fatalf("Stop() error = %v", err)
+	}
+	if err := provider.Restart(context.Background()); err != nil {
+		t.Fatalf("Restart() error = %v", err)
 	}
 }
 
@@ -382,10 +421,11 @@ func TestWindowsWSLDockerDialerRequiresAvailableTransport(t *testing.T) {
 	}
 }
 
-func TestWindowsWSLBackendIPSelectsFirstNonLoopbackIPv4(t *testing.T) {
+func TestWindowsWSLBackendIPPrefersDefaultRouteSourceIPv4(t *testing.T) {
 	t.Parallel()
 	runner := newFakeRunner()
-	runner.outputs[wslCommandName+" -d cairn-dev -- sh -lc hostname -I"] = "127.0.0.1 172.19.124.14 172.20.0.1 fe80::1\n"
+	runner.outputs[wslCommandName+" -d cairn-dev -- sh -lc "+wslDefaultRouteIPCommand] = "172.19.124.14\n"
+	runner.outputs[wslCommandName+" -d cairn-dev -- sh -lc "+wslHostnameIPsCommand] = "172.20.0.1\n"
 	provider := NewWindowsWSL(WindowsWSLOptions{Distro: "cairn-dev", Runner: runner})
 
 	ip, err := provider.backendIP(context.Background())
@@ -393,7 +433,46 @@ func TestWindowsWSLBackendIPSelectsFirstNonLoopbackIPv4(t *testing.T) {
 		t.Fatalf("backendIP() error = %v", err)
 	}
 	if ip != "172.19.124.14" {
-		t.Fatalf("backendIP() = %q, want first non-loopback IPv4", ip)
+		t.Fatalf("backendIP() = %q, want default-route source IPv4", ip)
+	}
+}
+
+func TestWindowsWSLBackendIPFallsBackToHostnameIPv4(t *testing.T) {
+	t.Parallel()
+	runner := newFakeRunner()
+	runner.errors[wslCommandName+" -d cairn-dev -- sh -lc "+wslDefaultRouteIPCommand] = errors.New("ip missing")
+	runner.outputs[wslCommandName+" -d cairn-dev -- sh -lc "+wslHostnameIPsCommand] = "127.0.0.1 172.19.124.14 172.20.0.1 fe80::1\n"
+	provider := NewWindowsWSL(WindowsWSLOptions{Distro: "cairn-dev", Runner: runner})
+
+	ip, err := provider.backendIP(context.Background())
+	if err != nil {
+		t.Fatalf("backendIP() error = %v", err)
+	}
+	if ip != "172.19.124.14" {
+		t.Fatalf("backendIP() = %q, want first hostname non-loopback IPv4", ip)
+	}
+}
+
+func TestWindowsWSLBackendIPCachesResolution(t *testing.T) {
+	t.Parallel()
+	runner := newFakeRunner()
+	key := wslCommandName + " -d cairn-dev -- sh -lc " + wslDefaultRouteIPCommand
+	runner.outputs[key] = "172.19.124.14\n"
+	provider := NewWindowsWSL(WindowsWSLOptions{Distro: "cairn-dev", Runner: runner})
+
+	first, err := provider.backendIP(context.Background())
+	if err != nil {
+		t.Fatalf("first backendIP() error = %v", err)
+	}
+	second, err := provider.backendIP(context.Background())
+	if err != nil {
+		t.Fatalf("second backendIP() error = %v", err)
+	}
+	if first != second || first != "172.19.124.14" {
+		t.Fatalf("backendIP() results = %q, %q; want cached 172.19.124.14", first, second)
+	}
+	if runner.counts[key] != 1 {
+		t.Fatalf("default route IP calls = %d, want 1", runner.counts[key])
 	}
 }
 

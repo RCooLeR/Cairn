@@ -2,8 +2,10 @@ package portforward
 
 import (
 	"context"
+	"errors"
 	"net"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -52,6 +54,14 @@ func (m *Manager) serveUDP(ctx context.Context, fwd *forward, host net.PacketCon
 	for {
 		n, src, err := host.ReadFrom(buffer)
 		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				return
+			}
+			if isConnReset(err) {
+				continue
+			}
+			fwd.fail(err)
+			m.publishChanged()
 			return
 		}
 		key := src.String()
@@ -89,10 +99,30 @@ func (m *Manager) pumpUDPReplies(fwd *forward, host net.PacketConn, backend net.
 	for {
 		n, err := backend.Read(buffer)
 		if err != nil {
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			if isConnReset(err) {
+				continue
+			}
 			return
 		}
 		if _, werr := host.WriteTo(buffer[:n], dst); werr != nil {
+			if isConnReset(werr) {
+				continue
+			}
 			return
 		}
 	}
+}
+
+func isConnReset(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	var errno syscall.Errno
+	return errors.As(err, &errno) && errno == syscall.Errno(10054)
 }

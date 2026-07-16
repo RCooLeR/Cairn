@@ -40,6 +40,13 @@ type NetworkCacheRecord struct {
 	Containers []string
 }
 
+type ObjectCacheSnapshot struct {
+	Containers map[string]string
+	Images     map[string]string
+	Volumes    map[string]string
+	Networks   map[string]string
+}
+
 func (s *Store) Objects() *ObjectCacheRepository {
 	return &ObjectCacheRepository{db: s.writer}
 }
@@ -92,7 +99,7 @@ func (r *ObjectCacheRepository) saveContainers(ctx context.Context, providerID s
 				ports_json = excluded.ports_json,
 				labels_json = excluded.labels_json,
 				created_at = excluded.created_at,
-				started_at = excluded.started_at,
+				started_at = COALESCE(excluded.started_at, containers_cache.started_at),
 				last_seen_at = excluded.last_seen_at
 		`, summary.ID, providerID, summary.ProjectID, summary.Service, summary.Name, summary.Image,
 			summary.ImageID, summary.Status, state, string(summary.Health), summary.Restarts,
@@ -163,6 +170,7 @@ func (r *ObjectCacheRepository) ListContainers(ctx context.Context, providerID s
 		record.Summary.Health = models.HealthStatus(health.String)
 		record.Summary.CreatedAt = parseStoreTime(createdAt.String)
 		record.StartedAt = parseStoreTime(startedAt.String)
+		record.Summary.StartedAt = record.StartedAt
 		if record.Summary.Health == "" {
 			record.Summary.Health = models.HealthStatusUnknown
 		}
@@ -387,6 +395,80 @@ func (r *ObjectCacheRepository) DeleteStale(ctx context.Context, providerID stri
 		}
 	}
 	return tx.Commit()
+}
+
+func (r *ObjectCacheRepository) SnapshotKeys(ctx context.Context, providerID string) (ObjectCacheSnapshot, error) {
+	snapshot := ObjectCacheSnapshot{
+		Containers: map[string]string{},
+		Images:     map[string]string{},
+		Volumes:    map[string]string{},
+		Networks:   map[string]string{},
+	}
+	if err := scanObjectSnapshot(ctx, r.db, snapshot.Containers, `
+		SELECT id, COALESCE(state, ''), COALESCE(status, ''), COALESCE(image_id, ''), COALESCE(ports_json, '')
+		FROM containers_cache
+		WHERE provider_id = ?
+	`, providerID); err != nil {
+		return ObjectCacheSnapshot{}, err
+	}
+	if err := scanObjectSnapshot(ctx, r.db, snapshot.Images, `
+		SELECT id, COALESCE(repo_tags_json, ''), COALESCE(repo_digests_json, '')
+		FROM images_cache
+		WHERE provider_id = ?
+	`, providerID); err != nil {
+		return ObjectCacheSnapshot{}, err
+	}
+	if err := scanObjectSnapshot(ctx, r.db, snapshot.Volumes, `
+		SELECT name, COALESCE(driver, ''), COALESCE(labels_json, ''), COALESCE(used_by_json, '')
+		FROM volumes_cache
+		WHERE provider_id = ?
+	`, providerID); err != nil {
+		return ObjectCacheSnapshot{}, err
+	}
+	if err := scanObjectSnapshot(ctx, r.db, snapshot.Networks, `
+		SELECT id, COALESCE(name, ''), COALESCE(driver, ''), COALESCE(subnet, ''), COALESCE(containers_json, '')
+		FROM networks_cache
+		WHERE provider_id = ?
+	`, providerID); err != nil {
+		return ObjectCacheSnapshot{}, err
+	}
+	return snapshot, nil
+}
+
+func scanObjectSnapshot(ctx context.Context, db *sql.DB, dest map[string]string, query string, args ...any) error {
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = rows.Close()
+	}()
+	cols, err := rows.Columns()
+	if err != nil {
+		return err
+	}
+	values := make([]sql.NullString, len(cols))
+	scan := make([]any, len(cols))
+	for i := range values {
+		scan[i] = &values[i]
+	}
+	for rows.Next() {
+		for i := range values {
+			values[i] = sql.NullString{}
+		}
+		if err := rows.Scan(scan...); err != nil {
+			return err
+		}
+		if !values[0].Valid || values[0].String == "" {
+			continue
+		}
+		parts := make([]string, 0, len(values)-1)
+		for _, value := range values[1:] {
+			parts = append(parts, value.String)
+		}
+		dest[values[0].String] = strings.Join(parts, "\x00")
+	}
+	return rows.Err()
 }
 
 func jsonText(value any, fallback string) string {

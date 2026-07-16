@@ -8,10 +8,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"unsafe"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/store"
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
 
@@ -22,7 +24,12 @@ const (
 	windowsDockerShimPS1     = "docker.ps1"
 	windowsDockerShimDistro  = "distro.txt"
 	windowsUserEnvKey        = `Environment`
+	windowsHWNDBroadcast     = 0xffff
+	windowsWMSettingChange   = 0x001a
+	windowsSMTOAbortIfHung   = 0x0002
 )
+
+var procSendMessageTimeoutW = windows.NewLazySystemDLL("user32.dll").NewProc("SendMessageTimeoutW")
 
 func windowsDockerCLIShimStatus(ctx context.Context, settings *store.SettingsRepository) (*models.WindowsDockerCLIShimStatus, error) {
 	distro := selectedWindowsShimDistro(ctx, settings)
@@ -171,7 +178,7 @@ func ensureUserPathDir(dir string) error {
 	defer func() {
 		_ = key.Close()
 	}()
-	current, _, err := key.GetStringValue("Path")
+	current, valueType, err := key.GetStringValue("Path")
 	if err != nil && err != registry.ErrNotExist {
 		return err
 	}
@@ -182,7 +189,29 @@ func ensureUserPathDir(dir string) error {
 	if strings.TrimSpace(current) != "" {
 		next += ";" + current
 	}
-	return key.SetStringValue("Path", next)
+	if valueType == registry.EXPAND_SZ || strings.Contains(next, "%") {
+		err = key.SetExpandStringValue("Path", next)
+	} else {
+		err = key.SetStringValue("Path", next)
+	}
+	if err != nil {
+		return err
+	}
+	broadcastWindowsEnvironmentChanged()
+	return nil
+}
+
+func broadcastWindowsEnvironmentChanged() {
+	env := windows.StringToUTF16Ptr("Environment")
+	_, _, _ = procSendMessageTimeoutW.Call(
+		windowsHWNDBroadcast,
+		windowsWMSettingChange,
+		0,
+		uintptr(unsafe.Pointer(env)),
+		windowsSMTOAbortIfHung,
+		5000,
+		0,
+	)
 }
 
 func userPathContainsDir(dir string) bool {

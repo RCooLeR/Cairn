@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"context"
+	"io"
 	"sync"
 	"time"
 
@@ -25,6 +26,7 @@ const (
 	defaultRetainInterval      = time.Hour
 	defaultGPUCacheTTL         = 5 * time.Second
 	defaultTopN                = 8
+	watcherStopTimeout         = 5 * time.Second
 	maxPendingPersistSamples   = 10000
 	streamRetryFallbackSamples = 5
 )
@@ -101,6 +103,7 @@ type Manager struct {
 	gpuCacheAt   time.Time
 	gpuUsage     map[string]containerGPUUsage
 	flushMu      sync.Mutex
+	wg           sync.WaitGroup
 }
 
 type containerGPUUsage struct {
@@ -143,8 +146,11 @@ type SamplePayload struct {
 }
 
 type containerWatcher struct {
-	id     string
-	cancel context.CancelFunc
+	id           string
+	cancel       context.CancelFunc
+	done         chan struct{}
+	activeReader io.Closer
+	mu           sync.Mutex
 }
 
 type streamSession struct {

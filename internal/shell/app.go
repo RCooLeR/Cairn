@@ -84,7 +84,14 @@ func Run(assets fs.FS) error {
 	updateService := &services.UpdateService{RuntimeMu: runtimeMu}
 	lineageService := &services.ImageLineageService{RuntimeMu: runtimeMu}
 	backupService := &services.BackupService{RuntimeMu: runtimeMu}
-	portForwardService := &services.PortForwardService{RuntimeMu: runtimeMu}
+	portForwardService := &services.PortForwardService{Settings: db.Settings(), RuntimeMu: runtimeMu}
+	diagnosticsService := &services.DiagnosticsService{
+		Logs:        logsService,
+		Metrics:     metricsService,
+		Terminal:    terminalService,
+		PortForward: portForwardService,
+		RuntimeMu:   runtimeMu,
+	}
 	registryService := &services.RegistryService{Manager: registryManager}
 	agentService := &services.AgentService{
 		Settings: db.Settings(),
@@ -145,6 +152,7 @@ func Run(assets fs.FS) error {
 			application.NewService(metricsService),
 			application.NewService(logsService),
 			application.NewService(terminalService),
+			application.NewService(diagnosticsService),
 			application.NewService(updateService),
 			application.NewService(lineageService),
 			application.NewService(backupService),

@@ -33,6 +33,9 @@ const (
 	wslNVIDIAGPUCheckCommand     = "command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1"
 	wslNVIDIARuntimeCheckCommand = "docker info 2>/dev/null | sed -n 's/^ Runtimes: //p' | grep -Eq '(^|[[:space:]])nvidia([[:space:]]|$)'"
 	wslSystemdEnabledCommand     = `awk 'BEGIN{inboot=0;found=0} /^\[boot\][[:space:]]*$/{inboot=1;next} /^\[.*\][[:space:]]*$/{inboot=0;next} inboot&&/^[[:space:]]*systemd[[:space:]]*=[[:space:]]*true[[:space:]]*$/{found=1} END{exit found?0:1}' /etc/wsl.conf`
+	wslBackendIPCacheTTL         = 30 * time.Second
+	wslDefaultRouteIPCommand     = "ip -o -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \\([0-9.]*\\).*/\\1/p' | head -n1"
+	wslHostnameIPsCommand        = "hostname -I"
 )
 
 var windowsDrivePathPattern = regexp.MustCompile(`^[A-Za-z]:[\\/]?`)
@@ -48,6 +51,8 @@ type WindowsWSLProvider struct {
 	runner       CommandRunner
 	stdioDialer  WSLStdioDialer
 	configMu     sync.RWMutex
+	ipCacheMu    sync.Mutex
+	ipCache      cachedBackendIP
 	installMu    sync.Mutex
 	installPlans map[string]wslInstallPlan
 }
@@ -62,7 +67,8 @@ type wslDistro struct {
 }
 
 type wslInstallPlan struct {
-	Steps []wslInstallStep
+	Steps     []wslInstallStep
+	ExpiresAt time.Time
 }
 
 type wslInstallStep struct {
@@ -70,6 +76,11 @@ type wslInstallStep struct {
 	Timeout     time.Duration
 	Command     []string
 	RepairHints []string
+}
+
+type cachedBackendIP struct {
+	value     string
+	expiresAt time.Time
 }
 
 func NewWindowsWSL(opts WindowsWSLOptions) *WindowsWSLProvider {
@@ -93,6 +104,7 @@ func (p *WindowsWSLProvider) SetDistro(distro string) {
 	p.configMu.Lock()
 	defer p.configMu.Unlock()
 	p.distro = strings.TrimSpace(distro)
+	p.clearBackendIPCache()
 }
 
 func (p *WindowsWSLProvider) ID() string {
@@ -350,14 +362,21 @@ func (p *WindowsWSLProvider) PlanInstall(_ context.Context, opts models.InstallO
 		ExpiresAt: time.Now().UTC().Add(security.DefaultPlanTTL),
 	}
 	p.installMu.Lock()
-	p.installPlans[planID] = wslInstallPlan{Steps: steps}
+	p.pruneExpiredInstallPlansLocked(time.Now().UTC())
+	p.installPlans[planID] = wslInstallPlan{Steps: steps, ExpiresAt: plan.ExpiresAt}
 	p.installMu.Unlock()
 	return plan, nil
 }
 
 func (p *WindowsWSLProvider) ExecuteInstallStep(ctx context.Context, planID string, step int, progress chan<- InstallProgress) error {
+	now := time.Now().UTC()
 	p.installMu.Lock()
+	p.pruneExpiredInstallPlansLocked(now)
 	plan, ok := p.installPlans[planID]
+	if ok && !plan.ExpiresAt.IsZero() && now.After(plan.ExpiresAt) {
+		delete(p.installPlans, planID)
+		ok = false
+	}
 	p.installMu.Unlock()
 	if !ok || step < 0 || step >= len(plan.Steps) {
 		return apperror.New(apperror.PlanExpired, "Install plan expired or was not found")
@@ -382,18 +401,26 @@ func (p *WindowsWSLProvider) ExecuteInstallStep(ctx context.Context, planID stri
 	return nil
 }
 
+func (p *WindowsWSLProvider) pruneExpiredInstallPlansLocked(now time.Time) {
+	for id, plan := range p.installPlans {
+		if !plan.ExpiresAt.IsZero() && now.After(plan.ExpiresAt) {
+			delete(p.installPlans, id)
+		}
+	}
+}
+
 func (p *WindowsWSLProvider) Start(ctx context.Context) error {
-	_, err := p.runWSL(ctx, p.configuredDistro(), "systemctl", "start", "docker")
+	_, err := p.runWSLAsRoot(ctx, p.configuredDistro(), "systemctl", "start", "docker")
 	return err
 }
 
 func (p *WindowsWSLProvider) Stop(ctx context.Context) error {
-	_, err := p.runWSL(ctx, p.configuredDistro(), "systemctl", "stop", "docker")
+	_, err := p.runWSLAsRoot(ctx, p.configuredDistro(), "systemctl", "stop", "docker")
 	return err
 }
 
 func (p *WindowsWSLProvider) Restart(ctx context.Context) error {
-	_, err := p.runWSL(ctx, p.configuredDistro(), "systemctl", "restart", "docker")
+	_, err := p.runWSLAsRoot(ctx, p.configuredDistro(), "systemctl", "restart", "docker")
 	return err
 }
 
@@ -415,12 +442,7 @@ func (p *WindowsWSLProvider) DockerDialContext(ctx context.Context) (func(contex
 // distro. The address can change across WSL restarts, so it is resolved fresh
 // per connection.
 func (p *WindowsWSLProvider) DialStream(ctx context.Context, port int) (net.Conn, error) {
-	ip, err := p.backendIP(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var dialer net.Dialer
-	return dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
+	return p.dialBackendPort(ctx, "tcp", port)
 }
 
 // DialPacket dials a UDP datagram connection to a published port inside the
@@ -428,23 +450,73 @@ func (p *WindowsWSLProvider) DialStream(ctx context.Context, port int) (net.Conn
 // datagram boundaries, so it dials the distro IP directly. The address can
 // change across WSL restarts, so it is resolved fresh per session.
 func (p *WindowsWSLProvider) DialPacket(ctx context.Context, port int) (net.Conn, error) {
+	return p.dialBackendPort(ctx, "udp", port)
+}
+
+func (p *WindowsWSLProvider) dialBackendPort(ctx context.Context, network string, port int) (net.Conn, error) {
 	ip, err := p.backendIP(ctx)
 	if err != nil {
 		return nil, err
 	}
 	var dialer net.Dialer
-	return dialer.DialContext(ctx, "udp", net.JoinHostPort(ip, strconv.Itoa(port)))
+	conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(ip, strconv.Itoa(port)))
+	if err == nil {
+		return conn, nil
+	}
+	p.clearBackendIPCache()
+	ip, resolveErr := p.backendIP(ctx)
+	if resolveErr != nil {
+		return nil, err
+	}
+	return dialer.DialContext(ctx, network, net.JoinHostPort(ip, strconv.Itoa(port)))
 }
 
 func (p *WindowsWSLProvider) backendIP(ctx context.Context) (string, error) {
-	if output, ok := p.runWSLText(ctx, p.configuredDistro(), "sh", "-lc", "hostname -I"); ok {
-		for _, field := range strings.Fields(output) {
-			if ip := net.ParseIP(strings.TrimSpace(field)); ip != nil && ip.To4() != nil && !ip.IsLoopback() {
-				return ip.String(), nil
-			}
+	p.ipCacheMu.Lock()
+	if p.ipCache.value != "" && time.Now().Before(p.ipCache.expiresAt) {
+		value := p.ipCache.value
+		p.ipCacheMu.Unlock()
+		return value, nil
+	}
+	p.ipCacheMu.Unlock()
+
+	if output, ok := p.runWSLText(ctx, p.configuredDistro(), "sh", "-lc", wslDefaultRouteIPCommand); ok {
+		if value := firstUsableBackendIPv4(output); value != "" {
+			p.cacheBackendIP(value)
+			return value, nil
+		}
+	}
+	if output, ok := p.runWSLText(ctx, p.configuredDistro(), "sh", "-lc", wslHostnameIPsCommand); ok {
+		if value := firstUsableBackendIPv4(output); value != "" {
+			p.cacheBackendIP(value)
+			return value, nil
 		}
 	}
 	return "", apperror.New(apperror.ProviderNotReady, "Could not resolve the WSL distro IP for port forwarding")
+}
+
+func (p *WindowsWSLProvider) cacheBackendIP(value string) {
+	p.ipCacheMu.Lock()
+	p.ipCache = cachedBackendIP{
+		value:     value,
+		expiresAt: time.Now().Add(wslBackendIPCacheTTL),
+	}
+	p.ipCacheMu.Unlock()
+}
+
+func firstUsableBackendIPv4(output string) string {
+	for _, field := range strings.Fields(output) {
+		if ip := net.ParseIP(strings.TrimSpace(field)); ip != nil && ip.To4() != nil && !ip.IsLoopback() {
+			return ip.String()
+		}
+	}
+	return ""
+}
+
+func (p *WindowsWSLProvider) clearBackendIPCache() {
+	p.ipCacheMu.Lock()
+	p.ipCache = cachedBackendIP{}
+	p.ipCacheMu.Unlock()
 }
 
 func (p *WindowsWSLProvider) DockerContext(ctx context.Context) (string, error) {
@@ -460,11 +532,11 @@ func (p *WindowsWSLProvider) BackendIdentity(context.Context) (string, error) {
 }
 
 func (p *WindowsWSLProvider) RunDocker(ctx context.Context, args ...string) (*CommandResult, error) {
-	return p.runWSLWithTimeout(ctx, dockerOperationTimeout, p.configuredDistro(), append([]string{"docker"}, args...)...)
+	return p.runWSLWithTimeout(ctx, dockerOperationTimeout, p.configuredDistro(), append([]string{"docker"}, escapeWSLArgs(args)...)...)
 }
 
 func (p *WindowsWSLProvider) RunDockerWithInput(ctx context.Context, input string, args ...string) (*CommandResult, error) {
-	return p.runWSLWithOptions(ctx, dockerOperationTimeout, input, p.configuredDistro(), append([]string{"docker"}, args...)...)
+	return p.runWSLWithOptions(ctx, dockerOperationTimeout, input, p.configuredDistro(), append([]string{"docker"}, escapeWSLArgs(args)...)...)
 }
 
 func (p *WindowsWSLProvider) RunBackendCommand(ctx context.Context, input string, args ...string) (*CommandResult, error) {
@@ -661,12 +733,25 @@ func (p *WindowsWSLProvider) runWSL(ctx context.Context, distro string, args ...
 	return p.runWSLWithTimeout(ctx, wslCommandTimeout, distro, args...)
 }
 
+func (p *WindowsWSLProvider) runWSLAsRoot(ctx context.Context, distro string, args ...string) (*CommandResult, error) {
+	return p.runWSLWithOptionsAndUser(ctx, wslCommandTimeout, "", distro, "root", args...)
+}
+
 func (p *WindowsWSLProvider) runWSLWithTimeout(ctx context.Context, timeout time.Duration, distro string, args ...string) (*CommandResult, error) {
 	return p.runWSLWithOptions(ctx, timeout, "", distro, args...)
 }
 
 func (p *WindowsWSLProvider) runWSLWithOptions(ctx context.Context, timeout time.Duration, input string, distro string, args ...string) (*CommandResult, error) {
-	wslArgs := append([]string{"-d", distro, "--"}, args...)
+	return p.runWSLWithOptionsAndUser(ctx, timeout, input, distro, "", args...)
+}
+
+func (p *WindowsWSLProvider) runWSLWithOptionsAndUser(ctx context.Context, timeout time.Duration, input string, distro string, user string, args ...string) (*CommandResult, error) {
+	wslArgs := []string{"-d", distro}
+	if strings.TrimSpace(user) != "" {
+		wslArgs = append(wslArgs, "-u", strings.TrimSpace(user))
+	}
+	wslArgs = append(wslArgs, "--")
+	wslArgs = append(wslArgs, args...)
 	if runner, ok := p.runner.(OptionsCommandRunner); ok {
 		return runner.RunWithOptions(ctx, CommandRunOptions{
 			Timeout: timeout,
@@ -753,7 +838,7 @@ func parseWSLListVerbose(output string) ([]wslDistro, error) {
 	distros := []wslDistro{}
 	for _, line := range strings.Split(decoded, "\n") {
 		line = strings.TrimSpace(strings.Trim(line, "\ufeff"))
-		if line == "" || strings.HasPrefix(strings.ToUpper(line), "NAME") {
+		if line == "" || isWSLListVerboseHeader(line) {
 			continue
 		}
 		fields := strings.Fields(line)
@@ -787,6 +872,11 @@ func parseWSLListVerbose(output string) ([]wslDistro, error) {
 		return nil, errors.New("no WSL distros parsed")
 	}
 	return distros, nil
+}
+
+func isWSLListVerboseHeader(line string) bool {
+	fields := strings.Fields(strings.ToUpper(strings.TrimSpace(strings.TrimPrefix(line, "*"))))
+	return len(fields) >= 3 && fields[0] == "NAME" && fields[1] == "STATE" && fields[2] == "VERSION"
 }
 
 func selectWSLDistro(distros []wslDistro, configured string) (wslDistro, bool) {
@@ -1147,6 +1237,17 @@ func psSingleQuote(value string) string {
 
 func escapeWSLCommandDollars(command string) string {
 	return strings.ReplaceAll(command, "$", `\$`)
+}
+
+func escapeWSLArgs(args []string) []string {
+	if len(args) == 0 {
+		return nil
+	}
+	escaped := make([]string, len(args))
+	for i, arg := range args {
+		escaped[i] = escapeWSLCommandDollars(arg)
+	}
+	return escaped
 }
 
 func sendInstallProgress(progress chan<- InstallProgress, step int, totalSteps int, message string, done bool) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"time"
 
 	backupcore "github.com/RCooLeR/Cairn/internal/backups"
 	"github.com/RCooLeR/Cairn/internal/bus"
@@ -166,7 +167,7 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 	// Colima already bind host ports directly.
 	var portForwardManager *portforward.Manager
 	if dialer, ok := provider.(portforward.Dialer); ok && provider.Type() == providers.TypeWindowsWSL {
-		portForwardManager = portforward.NewManager(dockerClient, dialer, r.events, portforward.Options{Enabled: true})
+		portForwardManager = portforward.NewManager(dockerClient, dialer, r.events, portforward.Options{Enabled: r.portForwardEnabled(ctx)})
 		portForwardManager.Start(runtimeCtx)
 	}
 
@@ -184,6 +185,8 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 	logsManager := logsvc.NewManager(dockerClient, r.events, logsvc.Options{})
 	metricsManager := metrics.NewManager(dockerClient, r.db.Metrics(), r.projects, r.audit, r.events, metrics.Options{
 		GPUProbe:              metrics.NewProviderGPUProbe(provider),
+		VisibleInterval:       metricsVisibleInterval(provider),
+		BackgroundInterval:    metricsBackgroundInterval(provider),
 		DisableStreamingStats: disableStreamingStats(provider),
 		StatsConcurrency:      statsConcurrency(provider),
 	})
@@ -223,6 +226,7 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 	r.projectService.PathMapper = provider
 	r.projectService.ProviderID = provider.ID()
 	r.projectService.ContextName = contextName
+	r.projectService.RuntimeCtx = runtimeCtx
 	r.composeService.Client = composeClient
 	r.composeService.PathMapper = provider
 	r.composeService.Detector = projectDetector
@@ -346,6 +350,31 @@ func statsConcurrency(provider providers.PlatformProvider) int {
 	return 0
 }
 
+func (r *appRuntime) portForwardEnabled(ctx context.Context) bool {
+	if r.db == nil {
+		return true
+	}
+	enabled, err := r.db.Settings().GetBool(ctx, "portforward.enabled")
+	if err != nil {
+		return true
+	}
+	return enabled
+}
+
+func metricsVisibleInterval(provider providers.PlatformProvider) time.Duration {
+	if provider != nil && provider.Type() == providers.TypeWindowsWSL {
+		return 5 * time.Second
+	}
+	return 0
+}
+
+func metricsBackgroundInterval(provider providers.PlatformProvider) time.Duration {
+	if provider != nil && provider.Type() == providers.TypeWindowsWSL {
+		return 30 * time.Second
+	}
+	return 0
+}
+
 func (r *appRuntime) clearServicesLocked() {
 	r.dockerService.Client = nil
 	r.projectService.Detector = nil
@@ -354,6 +383,7 @@ func (r *appRuntime) clearServicesLocked() {
 	r.projectService.PathMapper = nil
 	r.projectService.ProviderID = ""
 	r.projectService.ContextName = ""
+	r.projectService.RuntimeCtx = nil
 	r.composeService.Client = nil
 	r.composeService.PathMapper = nil
 	r.composeService.Detector = nil

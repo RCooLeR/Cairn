@@ -159,6 +159,7 @@ type ContainerSummary struct {
 	MacAddress     string        `json:"macAddress,omitempty"`
 	Aliases        []string      `json:"aliases,omitempty"`
 	CreatedAt      time.Time     `json:"createdAt"`
+	StartedAt      time.Time     `json:"startedAt,omitempty"`
 }
 
 type ContainerDetail struct {
@@ -219,6 +220,53 @@ type PortForwardStatus struct {
 	Supported bool          `json:"supported"`
 	Enabled   bool          `json:"enabled"`
 	Forwards  []PortForward `json:"forwards"`
+}
+
+type RuntimeDiagnostics struct {
+	Stdio        StdioTransportDiagnostics     `json:"stdio"`
+	Logs         LogRuntimeDiagnostics         `json:"logs"`
+	Metrics      MetricsRuntimeDiagnostics     `json:"metrics"`
+	Terminals    TerminalRuntimeDiagnostics    `json:"terminals"`
+	PortForwards PortForwardRuntimeDiagnostics `json:"portForwards"`
+	CheckedAt    time.Time                     `json:"checkedAt"`
+}
+
+type StdioTransportDiagnostics struct {
+	Opened            int64                       `json:"opened"`
+	Closed            int64                       `json:"closed"`
+	Active            int                         `json:"active"`
+	ForcedKills       int64                       `json:"forcedKills"`
+	CloseTimeouts     int64                       `json:"closeTimeouts"`
+	LastOpenedAt      time.Time                   `json:"lastOpenedAt,omitempty"`
+	LastClosedAt      time.Time                   `json:"lastClosedAt,omitempty"`
+	ActiveConnections []StdioConnectionDiagnostic `json:"activeConnections,omitempty"`
+}
+
+type StdioConnectionDiagnostic struct {
+	ID       int64     `json:"id"`
+	Command  string    `json:"command"`
+	OpenedAt time.Time `json:"openedAt"`
+	AgeMS    int64     `json:"ageMs"`
+}
+
+type LogRuntimeDiagnostics struct {
+	ActiveStreams   int   `json:"activeStreams"`
+	ActiveProducers int64 `json:"activeProducers"`
+}
+
+type MetricsRuntimeDiagnostics struct {
+	Started        bool `json:"started"`
+	ActiveStreams  int  `json:"activeStreams"`
+	ActiveWatchers int  `json:"activeWatchers"`
+}
+
+type TerminalRuntimeDiagnostics struct {
+	ActiveSessions int `json:"activeSessions"`
+}
+
+type PortForwardRuntimeDiagnostics struct {
+	Supported      bool `json:"supported"`
+	ActiveForwards int  `json:"activeForwards"`
 }
 
 type PortMapping struct {
@@ -566,6 +614,7 @@ type ExportLogsRequest struct {
 	Scope string   `json:"scope"`
 	IDs   []string `json:"ids,omitempty"`
 	Path  string   `json:"path"`
+	Tail  int      `json:"tail,omitempty"`
 }
 
 type ExportResult struct {

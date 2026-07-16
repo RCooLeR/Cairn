@@ -59,6 +59,9 @@ func (m *Manager) Login(ctx context.Context, req models.RegistryLoginRequest) er
 	if status != nil && !status.LoggedIn {
 		return apperror.New(apperror.RegistryAuth, "Registry login verification failed", apperror.WithDetail(status.Error))
 	}
+	if err := m.finalizeRegistryLoginStorage(ctx, provider, registry); err != nil {
+		return err
+	}
 	return nil
 }
 

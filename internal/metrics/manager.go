@@ -7,6 +7,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
@@ -44,8 +45,15 @@ func (m *Manager) Start(ctx context.Context) {
 	m.started = true
 	m.mu.Unlock()
 
-	go m.reconcileLoop()
-	go m.persistLoop()
+	m.wg.Add(2)
+	go func() {
+		defer m.wg.Done()
+		m.reconcileLoop()
+	}()
+	go func() {
+		defer m.wg.Done()
+		m.persistLoop()
+	}()
 }
 
 func (m *Manager) StopAll() {
@@ -72,7 +80,12 @@ func (m *Manager) StopAll() {
 	}
 	for _, watcher := range watchers {
 		watcher.cancel()
+		watcher.closeActiveReader()
 	}
+	for _, watcher := range watchers {
+		waitForWatcher(watcher)
+	}
+	m.wg.Wait()
 	_ = m.flush(context.Background())
 }
 
@@ -224,12 +237,17 @@ func (m *Manager) reconcileOnce(ctx context.Context) error {
 	}
 
 	m.mu.Lock()
+	stale := make([]*containerWatcher, 0)
 	for id, summary := range current {
 		m.containers[id] = summary
 		if m.watchers[id] == nil && m.ctx != nil {
 			watchCtx, cancel := context.WithCancel(m.ctx)
-			m.watchers[id] = &containerWatcher{id: id, cancel: cancel}
-			go m.watchContainer(watchCtx, id)
+			watcher := &containerWatcher{id: id, cancel: cancel, done: make(chan struct{})}
+			m.watchers[id] = watcher
+			go func() {
+				defer close(watcher.done)
+				m.watchContainerWithState(watchCtx, watcher)
+			}()
 		}
 	}
 	for id, watcher := range m.watchers {
@@ -237,6 +255,8 @@ func (m *Manager) reconcileOnce(ctx context.Context) error {
 			continue
 		}
 		watcher.cancel()
+		watcher.closeActiveReader()
+		stale = append(stale, watcher)
 		delete(m.watchers, id)
 		delete(m.containers, id)
 		delete(m.latest, id)
@@ -244,10 +264,18 @@ func (m *Manager) reconcileOnce(ctx context.Context) error {
 		delete(m.lastAccepted, id)
 	}
 	m.mu.Unlock()
+	for _, watcher := range stale {
+		waitForWatcher(watcher)
+	}
 	return nil
 }
 
 func (m *Manager) watchContainer(ctx context.Context, containerID string) {
+	m.watchContainerWithState(ctx, &containerWatcher{id: containerID})
+}
+
+func (m *Manager) watchContainerWithState(ctx context.Context, watcher *containerWatcher) {
+	containerID := watcher.id
 	if m.disableStreamingStats {
 		for ctx.Err() == nil {
 			_ = m.sampleOneShot(ctx, containerID)
@@ -264,7 +292,7 @@ func (m *Manager) watchContainer(ctx context.Context, containerID string) {
 				failures = 0
 				fallbackSamples = 0
 			}
-			err := m.streamContainer(ctx, containerID)
+			err := m.streamContainer(ctx, watcher)
 			if err == nil || errors.Is(err, context.Canceled) {
 				return
 			}
@@ -294,18 +322,21 @@ func (m *Manager) streamRetryDelay(containerID string, failures int) time.Durati
 	return delay
 }
 
-func (m *Manager) streamContainer(ctx context.Context, containerID string) error {
+func (m *Manager) streamContainer(ctx context.Context, watcher *containerWatcher) error {
 	release, err := m.acquireStatsSlot(ctx)
 	if err != nil {
 		return err
 	}
 	defer release()
 
+	containerID := watcher.id
 	reader, err := m.Docker.ContainerStats(ctx, containerID, dockercore.StatsOptions{Stream: true})
 	if err != nil {
 		return err
 	}
+	clearReader := watcher.setActiveReader(reader.Body)
 	defer func() {
+		clearReader()
 		if reader != nil && reader.Body != nil {
 			_ = reader.Body.Close()
 		}
@@ -419,8 +450,12 @@ func (m *Manager) buildSample(containerID string, raw container.StatsResponse) (
 		serviceID = summary.ProjectID + "::" + summary.Service
 	}
 	uptime := int64(0)
-	if !summary.CreatedAt.IsZero() {
-		uptime = int64(raw.Read.Sub(summary.CreatedAt).Seconds())
+	startedAt := summary.StartedAt
+	if startedAt.IsZero() {
+		startedAt = summary.CreatedAt
+	}
+	if !startedAt.IsZero() {
+		uptime = int64(raw.Read.Sub(startedAt).Seconds())
 		if uptime < 0 {
 			uptime = 0
 		}
@@ -903,6 +938,55 @@ func (m *Manager) publish(topic bus.Topic, payload any) {
 	m.Events.Publish(bus.Event{Topic: topic, Payload: payload})
 }
 
+func (m *Manager) Diagnostics() models.MetricsRuntimeDiagnostics {
+	m.ensureReady()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return models.MetricsRuntimeDiagnostics{
+		Started:        m.started,
+		ActiveStreams:  len(m.sessions),
+		ActiveWatchers: len(m.watchers),
+	}
+}
+
+func (w *containerWatcher) setActiveReader(reader io.Closer) func() {
+	if w == nil || reader == nil {
+		return func() {}
+	}
+	w.mu.Lock()
+	w.activeReader = reader
+	w.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			w.mu.Lock()
+			if w.activeReader == reader {
+				w.activeReader = nil
+			}
+			w.mu.Unlock()
+		})
+	}
+}
+
+func (w *containerWatcher) closeActiveReader() {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	reader := w.activeReader
+	w.mu.Unlock()
+	if reader != nil {
+		_ = reader.Close()
+	}
+}
+
+func waitForWatcher(watcher *containerWatcher) bool {
+	if watcher == nil || watcher.done == nil {
+		return true
+	}
+	return waitForClosed(watcher.done, watcherStopTimeout)
+}
+
 func (m *Manager) ensureReady() {
 	if m.watchers == nil {
 		m.watchers = map[string]*containerWatcher{}
@@ -965,6 +1049,7 @@ func (m *Manager) applyOptions(opts Options) {
 	m.disableStreamingStats = opts.DisableStreamingStats
 	if opts.StatsConcurrency > 0 {
 		m.statsSemaphore = make(chan struct{}, opts.StatsConcurrency)
+		m.disableStreamingStats = true
 	} else {
 		m.statsSemaphore = nil
 	}
@@ -1117,5 +1202,19 @@ func sleepContext(ctx context.Context, duration time.Duration) {
 	select {
 	case <-ctx.Done():
 	case <-timer.C:
+	}
+}
+
+func waitForClosed(ch <-chan struct{}, timeout time.Duration) bool {
+	if ch == nil {
+		return true
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-ch:
+		return true
+	case <-timer.C:
+		return false
 	}
 }

@@ -302,6 +302,36 @@ func TestLoginConfiguresCredentialHelperBeforeDockerLogin(t *testing.T) {
 	}
 }
 
+func TestLoginPreservesInlineAuthWhenDockerLoginFails(t *testing.T) {
+	registryHost := "registry.example.test"
+	auth := base64.StdEncoding.EncodeToString([]byte("ada:old-token"))
+	provider := &fakeRegistryProvider{
+		backendResults: map[string]string{
+			`sh -lc cat "${DOCKER_CONFIG:-$HOME/.docker}/config.json" 2>/dev/null || true`: `{"auths":{"` + registryHost + `":{"auth":"` + auth + `"}}}`,
+			"docker-credential-pass list": `{}`,
+		},
+		dockerResult: &providers.CommandResult{ExitCode: 1, Stderr: "denied"},
+	}
+	manager := NewManager(fakeResolver{provider: provider}, nil)
+	manager.Settings = testRegistrySettings(t, registryCredentialModeDockerHelper)
+
+	err := manager.Login(context.Background(), models.RegistryLoginRequest{
+		Registry: registryHost,
+		Username: "ada",
+		Secret:   "bad-token",
+	})
+	if !apperror.IsCode(err, apperror.RegistryAuth) {
+		t.Fatalf("Login() error = %v, want registry auth", err)
+	}
+	var written dockerConfig
+	if err := json.Unmarshal([]byte(provider.backendConfig), &written); err != nil {
+		t.Fatalf("written Docker config is not JSON: %v\n%s", err, provider.backendConfig)
+	}
+	if _, _, ok := authEntryForRegistry(written, registryHost); !ok {
+		t.Fatalf("inline auth for %s was removed after failed login: %s", registryHost, provider.backendConfig)
+	}
+}
+
 func TestLoginFallsBackToDockerConfigWhenCredentialHelperUnavailable(t *testing.T) {
 	var registryHost string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

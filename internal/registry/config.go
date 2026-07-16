@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -149,32 +150,32 @@ func backendConfigCommand(provider providers.PlatformProvider) []string {
 	if provider.Type() == providers.TypeWindowsWSL {
 		return []string{"sh", "-lc", escapeWSLCommandDollarsForRegistry(`cat "${DOCKER_CONFIG:-$HOME/.docker}/config.json" 2>/dev/null || true`)}
 	}
-	if provider.Platform() != providers.PlatformWindows {
-		return []string{"sh", "-lc", `cat "${DOCKER_CONFIG:-$HOME/.docker}/config.json" 2>/dev/null || true`}
+	if runtime.GOOS == "windows" && provider.Platform() != providers.PlatformLinux {
+		return []string{
+			"powershell.exe",
+			"-NoProfile",
+			"-NonInteractive",
+			"-Command",
+			`$cfg=$env:DOCKER_CONFIG; if ([string]::IsNullOrWhiteSpace($cfg)) { $cfg=Join-Path $env:USERPROFILE '.docker' }; $p=Join-Path $cfg 'config.json'; if (Test-Path -LiteralPath $p) { Get-Content -LiteralPath $p -Raw }`,
+		}
 	}
-	return []string{
-		"powershell.exe",
-		"-NoProfile",
-		"-NonInteractive",
-		"-Command",
-		`$cfg=$env:DOCKER_CONFIG; if ([string]::IsNullOrWhiteSpace($cfg)) { $cfg=Join-Path $env:USERPROFILE '.docker' }; $p=Join-Path $cfg 'config.json'; if (Test-Path -LiteralPath $p) { Get-Content -LiteralPath $p -Raw }`,
-	}
+	return []string{"sh", "-lc", `cat "${DOCKER_CONFIG:-$HOME/.docker}/config.json" 2>/dev/null || true`}
 }
 
 func backendWriteConfigCommand(provider providers.PlatformProvider) []string {
 	if provider.Type() == providers.TypeWindowsWSL {
 		return []string{"sh", "-lc", escapeWSLCommandDollarsForRegistry(`cfg="${DOCKER_CONFIG:-$HOME/.docker}"; mkdir -p "$cfg"; umask 077; cat > "$cfg/config.json"`)}
 	}
-	if provider.Platform() != providers.PlatformWindows {
-		return []string{"sh", "-lc", `cfg="${DOCKER_CONFIG:-$HOME/.docker}"; mkdir -p "$cfg"; umask 077; cat > "$cfg/config.json"`}
+	if runtime.GOOS == "windows" && provider.Platform() != providers.PlatformLinux {
+		return []string{
+			"powershell.exe",
+			"-NoProfile",
+			"-NonInteractive",
+			"-Command",
+			`$cfg=$env:DOCKER_CONFIG; if ([string]::IsNullOrWhiteSpace($cfg)) { $cfg=Join-Path $env:USERPROFILE '.docker' }; New-Item -ItemType Directory -Force -Path $cfg | Out-Null; $p=Join-Path $cfg 'config.json'; $content=[Console]::In.ReadToEnd(); $enc=New-Object System.Text.UTF8Encoding($false); [System.IO.File]::WriteAllText($p, $content, $enc)`,
+		}
 	}
-	return []string{
-		"powershell.exe",
-		"-NoProfile",
-		"-NonInteractive",
-		"-Command",
-		`$cfg=$env:DOCKER_CONFIG; if ([string]::IsNullOrWhiteSpace($cfg)) { $cfg=Join-Path $env:USERPROFILE '.docker' }; New-Item -ItemType Directory -Force -Path $cfg | Out-Null; $p=Join-Path $cfg 'config.json'; $content=[Console]::In.ReadToEnd(); Set-Content -LiteralPath $p -Value $content -NoNewline -Encoding UTF8`,
-	}
+	return []string{"sh", "-lc", `cfg="${DOCKER_CONFIG:-$HOME/.docker}"; mkdir -p "$cfg"; umask 077; cat > "$cfg/config.json"`}
 }
 
 func escapeWSLCommandDollarsForRegistry(command string) string {

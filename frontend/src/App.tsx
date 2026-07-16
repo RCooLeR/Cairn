@@ -2,6 +2,7 @@ import type {
   AuditEntry,
   BackupSummary,
   CommandPlan,
+  ComposeServiceStatus,
   ContainerDetail,
   ContainerFileListing,
   ContainerSummary,
@@ -1334,6 +1335,13 @@ function App() {
     useState<AppUpdateNotice | null>(null);
   const [appUpdateNotificationRead, setAppUpdateNotificationRead] =
     useState(false);
+  const appUpdateNoticeVersionRef = useRef<string | null>(null);
+  const pullHubSearchSeqRef = useRef(0);
+  const runHubSearchSeqRef = useRef(0);
+  const updatesNotify = normalizeBoolSetting(
+    appSettings["updates.notify"],
+    true,
+  );
   const [setup, setSetup] = useState<ProviderSetupState>(
     restoreProviderSetupState,
   );
@@ -1876,11 +1884,7 @@ function App() {
   }, [activePage, refreshAuditLog]);
 
   useEffect(() => {
-    if (
-      !settingsLoaded ||
-      !version?.version ||
-      !normalizeBoolSetting(appSettings["updates.notify"], true)
-    ) {
+    if (!settingsLoaded || !version?.version || !updatesNotify) {
       return undefined;
     }
     let active = true;
@@ -1890,19 +1894,25 @@ function App() {
           return;
         }
         setAppUpdateNotice(notice);
-        if (notice) {
+        const noticeVersion = notice?.version ?? null;
+        if (
+          noticeVersion &&
+          noticeVersion !== appUpdateNoticeVersionRef.current
+        ) {
           setAppUpdateNotificationRead(false);
         }
+        appUpdateNoticeVersionRef.current = noticeVersion;
       })
       .catch(() => {
         if (active) {
           setAppUpdateNotice(null);
+          appUpdateNoticeVersionRef.current = null;
         }
       });
     return () => {
       active = false;
     };
-  }, [appSettings, settingsLoaded, version?.version]);
+  }, [settingsLoaded, updatesNotify, version?.version]);
 
   useEffect(() => {
     void refreshInventory();
@@ -2067,7 +2077,12 @@ function App() {
             ? Math.round((payload.done / payload.total) * 100)
             : undefined,
       });
-      if (payload.done && payload.total && payload.done >= payload.total) {
+      if (
+        typeof payload.done === "number" &&
+        typeof payload.total === "number" &&
+        payload.done >= payload.total
+      ) {
+        setUpdateCheckJobID(null);
         setLastUpdateCheckAt(Date.now());
         window.setTimeout(() => setUpdateCheckProgress(null), 1200);
         void refreshUpdateSurfaces();
@@ -2121,11 +2136,13 @@ function App() {
         if (!current.jobID || current.jobID !== payload.jobID) {
           return current;
         }
+        const result = payload.result ?? payload.message ?? "done";
         return {
           ...current,
           applying: false,
           busy: false,
-          result: payload.result ?? payload.message ?? "done",
+          result,
+          error: payload.error,
           progress: current.progress.concat(payload),
         };
       });
@@ -2152,7 +2169,9 @@ function App() {
 
   useEffect(() => {
     const query = pullImage.query.trim();
-    if (!pullImage.open || query.length < 3) {
+    const ref = pullImage.ref.trim();
+    if (!pullImage.open || query.length < 3 || query === ref) {
+      pullHubSearchSeqRef.current += 1;
       setPullImage((current) => ({
         ...current,
         results: [],
@@ -2162,6 +2181,7 @@ function App() {
       return undefined;
     }
     const timer = window.setTimeout(() => {
+      const requestID = ++pullHubSearchSeqRef.current;
       setPullImage((current) => ({
         ...current,
         loadingResults: true,
@@ -2169,27 +2189,42 @@ function App() {
       }));
       DockerService.SearchHub(query, 10)
         .then((results) => {
-          setPullImage((current) => ({
-            ...current,
-            loadingResults: false,
-            results,
-            searchError: undefined,
-          }));
+          setPullImage((current) =>
+            requestID === pullHubSearchSeqRef.current &&
+            current.open &&
+            current.query.trim() === query
+              ? {
+                  ...current,
+                  loadingResults: false,
+                  results,
+                  searchError: undefined,
+                }
+              : current,
+          );
         })
         .catch((error: unknown) => {
-          setPullImage((current) => ({
-            ...current,
-            loadingResults: false,
-            results: [],
-            searchError:
-              error instanceof Error
-                ? error.message
-                : "Docker Hub search is offline",
-          }));
+          setPullImage((current) =>
+            requestID === pullHubSearchSeqRef.current &&
+            current.open &&
+            current.query.trim() === query
+              ? {
+                  ...current,
+                  loadingResults: false,
+                  results: [],
+                  searchError:
+                    error instanceof Error
+                      ? error.message
+                      : "Docker Hub search is offline",
+                }
+              : current,
+          );
         });
     }, 300);
-    return () => window.clearTimeout(timer);
-  }, [pullImage.open, pullImage.query]);
+    return () => {
+      window.clearTimeout(timer);
+      pullHubSearchSeqRef.current += 1;
+    };
+  }, [pullImage.open, pullImage.query, pullImage.ref]);
 
   useEffect(() => {
     const off = Events.On("image:push:progress", (event) => {
@@ -2217,7 +2252,14 @@ function App() {
 
   useEffect(() => {
     const query = runImage.hubQuery.trim();
-    if (!runImage.open || query.length < 3) {
+    const imageRef = runImage.imageRef.trim();
+    if (
+      !runImage.open ||
+      query.length < 3 ||
+      imageRef === query ||
+      imageRef === `${query}:latest`
+    ) {
+      runHubSearchSeqRef.current += 1;
       setRunImage((current) => ({
         ...current,
         hubResults: [],
@@ -2227,6 +2269,7 @@ function App() {
       return undefined;
     }
     const timer = window.setTimeout(() => {
+      const requestID = ++runHubSearchSeqRef.current;
       setRunImage((current) => ({
         ...current,
         hubLoading: true,
@@ -2234,27 +2277,42 @@ function App() {
       }));
       DockerService.SearchHub(query, 10)
         .then((results) => {
-          setRunImage((current) => ({
-            ...current,
-            hubLoading: false,
-            hubResults: results,
-            hubError: undefined,
-          }));
+          setRunImage((current) =>
+            requestID === runHubSearchSeqRef.current &&
+            current.open &&
+            current.hubQuery.trim() === query
+              ? {
+                  ...current,
+                  hubLoading: false,
+                  hubResults: results,
+                  hubError: undefined,
+                }
+              : current,
+          );
         })
         .catch((error: unknown) => {
-          setRunImage((current) => ({
-            ...current,
-            hubLoading: false,
-            hubResults: [],
-            hubError:
-              error instanceof Error
-                ? error.message
-                : "Docker Hub search is offline",
-          }));
+          setRunImage((current) =>
+            requestID === runHubSearchSeqRef.current &&
+            current.open &&
+            current.hubQuery.trim() === query
+              ? {
+                  ...current,
+                  hubLoading: false,
+                  hubResults: [],
+                  hubError:
+                    error instanceof Error
+                      ? error.message
+                      : "Docker Hub search is offline",
+                }
+              : current,
+          );
         });
     }, 300);
-    return () => window.clearTimeout(timer);
-  }, [runImage.hubQuery, runImage.open]);
+    return () => {
+      window.clearTimeout(timer);
+      runHubSearchSeqRef.current += 1;
+    };
+  }, [runImage.hubQuery, runImage.imageRef, runImage.open]);
 
   const activeProvider = useMemo(
     () => activeProviderSummary(providers),
@@ -2349,23 +2407,20 @@ function App() {
         setLiveGPU(payload.gpu);
       }
       const samples = (payload.samples ?? []).filter(isStatsSample);
-      if (samples.length === 0) {
-        return;
-      }
-      const label = sampleLabel(samples[0]);
+      const label = samples.length > 0 ? sampleLabel(samples[0]) : timeLabel();
       const receivedAt = Date.now();
       const shouldUpdateProjectFrame =
         receivedAt - lastProjectStatsFrameAtRef.current >= projectStatsFrameMs;
-      const mergedSamples = mergeStatsSamples(
-        latestSamplesRef.current,
-        samples,
-      );
-      const allSamples = Object.values(mergedSamples);
-      latestSamplesRef.current = mergedSamples;
+      const sampleMap = statsSamplesByID(samples);
+      const allSamples = Object.values(sampleMap);
+      latestSamplesRef.current = sampleMap;
       useInventoryStore.setState((current) => ({
-        containers: applyStatsSamplesToContainers(current.containers, samples),
+        containers: applyStatsSamplesToContainers(
+          current.containers,
+          allSamples,
+        ),
       }));
-      setLatestSamples(mergedSamples);
+      setLatestSamples(sampleMap);
       setContainerSparks((current) =>
         appendSparkEntries(
           current,
@@ -3367,6 +3422,7 @@ function App() {
         message: "Checking updates",
       });
     } catch (error: unknown) {
+      setUpdateCheckJobID(null);
       setUpdateCheckProgress(null);
       setUpdatesError(
         error instanceof Error ? error.message : "Unable to check updates",
@@ -4645,48 +4701,62 @@ function App() {
 
   const openContainerInspect = useCallback((container: ContainerSummary) => {
     const subtitle = shortID(container.id);
+    const title = container.name;
     setInspect({
       open: true,
-      title: container.name,
+      title,
       subtitle,
       rows: containerRows(container),
       loading: true,
     });
     DockerService.InspectContainerRaw(container.id)
       .then((raw) => {
-        setInspect((current) => ({
-          open: true,
-          title: container.name,
-          subtitle,
-          rows: containerRows(container),
-          lineage: current.lineage,
-          raw: formatJSON(raw),
-        }));
+        setInspect((current) =>
+          current.open &&
+          current.title === title &&
+          current.subtitle === subtitle
+            ? {
+                ...current,
+                loading: false,
+                rows: containerRows(container),
+                raw: formatJSON(raw),
+                error: undefined,
+              }
+            : current,
+        );
       })
       .catch((error: unknown) => {
-        setInspect((current) => ({
-          open: true,
-          title: container.name,
-          subtitle,
-          rows: containerRows(container),
-          lineage: current.lineage,
-          error:
-            error instanceof Error
-              ? error.message
-              : "Unable to inspect container",
-        }));
+        setInspect((current) =>
+          current.open &&
+          current.title === title &&
+          current.subtitle === subtitle
+            ? {
+                ...current,
+                loading: false,
+                rows: containerRows(container),
+                error:
+                  error instanceof Error
+                    ? error.message
+                    : "Unable to inspect container",
+              }
+            : current,
+        );
       });
     ImageLineageService.GetContainerLineage(container.id)
       .then((lineage) => {
         setInspect((current) =>
-          current.open && current.subtitle === subtitle
+          current.open &&
+          current.title === title &&
+          current.subtitle === subtitle
             ? { ...current, lineage }
             : current,
         );
       })
       .catch(() => {
         setInspect((current) =>
-          current.open && current.subtitle === subtitle
+          current.open &&
+          current.title === title &&
+          current.subtitle === subtitle
             ? { ...current, lineage: null }
             : current,
         );
@@ -4743,10 +4813,12 @@ function App() {
 
   const openImageInspect = useCallback(
     (image: ImageSummary) => {
+      const title = primaryImageRef(image);
+      const subtitle = shortID(image.id);
       setInspect({
         open: true,
-        title: primaryImageRef(image),
-        subtitle: shortID(image.id),
+        title,
+        subtitle,
         rows: imageRows(image, imageUseCounts[image.id] ?? 0),
         loading: true,
       });
@@ -4755,25 +4827,36 @@ function App() {
           if (!detail) {
             throw new Error("Image detail was empty");
           }
-          setInspect({
-            open: true,
-            title: primaryImageRef(image),
-            subtitle: shortID(image.id),
-            rows: imageDetailRows(detail, imageUseCounts[image.id] ?? 0),
-            raw: JSON.stringify(detail, null, 2),
-          });
+          setInspect((current) =>
+            current.open &&
+            current.title === title &&
+            current.subtitle === subtitle
+              ? {
+                  ...current,
+                  loading: false,
+                  rows: imageDetailRows(detail, imageUseCounts[image.id] ?? 0),
+                  raw: JSON.stringify(detail, null, 2),
+                  error: undefined,
+                }
+              : current,
+          );
         })
         .catch((error: unknown) => {
-          setInspect({
-            open: true,
-            title: primaryImageRef(image),
-            subtitle: shortID(image.id),
-            rows: imageRows(image, imageUseCounts[image.id] ?? 0),
-            error:
-              error instanceof Error
-                ? error.message
-                : "Unable to inspect image",
-          });
+          setInspect((current) =>
+            current.open &&
+            current.title === title &&
+            current.subtitle === subtitle
+              ? {
+                  ...current,
+                  loading: false,
+                  rows: imageRows(image, imageUseCounts[image.id] ?? 0),
+                  error:
+                    error instanceof Error
+                      ? error.message
+                      : "Unable to inspect image",
+                }
+              : current,
+          );
         });
     },
     [imageUseCounts],
@@ -4782,10 +4865,12 @@ function App() {
   const openVolumeInspect = useCallback(
     (volume: VolumeSummary) => {
       const detail = volumeDetails[volume.name];
+      const title = volume.name;
+      const subtitle = volume.driver;
       setInspect({
         open: true,
-        title: volume.name,
-        subtitle: volume.driver,
+        title,
+        subtitle,
         rows: volumeRows(volume, detail),
         raw: detail ? JSON.stringify(detail, null, 2) : undefined,
         loading: !detail,
@@ -4798,25 +4883,38 @@ function App() {
           if (nextDetail) {
             setVolumeDetail(volume.name, nextDetail);
           }
-          setInspect({
-            open: true,
-            title: volume.name,
-            subtitle: volume.driver,
-            rows: volumeRows(volume, nextDetail ?? undefined),
-            raw: nextDetail ? JSON.stringify(nextDetail, null, 2) : undefined,
-          });
+          setInspect((current) =>
+            current.open &&
+            current.title === title &&
+            current.subtitle === subtitle
+              ? {
+                  ...current,
+                  loading: false,
+                  rows: volumeRows(volume, nextDetail ?? undefined),
+                  raw: nextDetail
+                    ? JSON.stringify(nextDetail, null, 2)
+                    : undefined,
+                  error: undefined,
+                }
+              : current,
+          );
         })
         .catch((error: unknown) => {
-          setInspect({
-            open: true,
-            title: volume.name,
-            subtitle: volume.driver,
-            rows: volumeRows(volume),
-            error:
-              error instanceof Error
-                ? error.message
-                : "Unable to inspect volume",
-          });
+          setInspect((current) =>
+            current.open &&
+            current.title === title &&
+            current.subtitle === subtitle
+              ? {
+                  ...current,
+                  loading: false,
+                  rows: volumeRows(volume),
+                  error:
+                    error instanceof Error
+                      ? error.message
+                      : "Unable to inspect volume",
+                }
+              : current,
+          );
         });
     },
     [setVolumeDetail, volumeDetails],
@@ -4852,11 +4950,9 @@ function App() {
       setActiveNetworkID(network.id);
       setNetworkTab("overview");
       setSearch("");
-      if (!networkDetails[network.id]) {
-        void loadNetworkDetail(network.id);
-      }
+      void loadNetworkDetail(network.id);
     },
-    [loadNetworkDetail, networkDetails],
+    [loadNetworkDetail],
   );
 
   const openContainerDetail = useCallback(
@@ -5887,6 +5983,8 @@ function App() {
             name: current.name || suggestContainerName(result.name),
             hubQuery: result.name,
             hubResults: [],
+            hubLoading: false,
+            hubError: undefined,
           }))
         }
         onSubmit={() => {
@@ -5913,6 +6011,8 @@ function App() {
             ref: result.name,
             query: result.name,
             results: [],
+            loadingResults: false,
+            searchError: undefined,
           }))
         }
         onSubmit={() => {
@@ -7393,6 +7493,10 @@ function OverviewPage({
   const [logPeek, setLogPeek] = useState<LogLine[]>([]);
   const [cleanup, setCleanup] = useState<CleanupState>(emptyCleanup);
   const logStreamIDRef = useRef<string | null>(null);
+  const visibleChartPoints = useMemo(
+    () => chartPointsForRange(chartPoints, range),
+    [chartPoints, range],
+  );
 
   const loadDashboard = useCallback(async () => {
     if (!dockerRunning) {
@@ -7725,7 +7829,7 @@ function OverviewPage({
           onRangeChange={setRange}
           onStackedChange={setStacked}
           paused={chartPaused || !dockerRunning}
-          points={chartPoints}
+          points={visibleChartPoints}
           range={range}
           stacked={stacked}
         />
@@ -9020,6 +9124,7 @@ function LogsPage({
         scope,
         ids: streamIDs,
         path: exportLogs.path,
+        tail: exportLogs.range === "tail" ? 5000 : undefined,
       });
       if (!result) {
         throw new Error("Log export did not return a result");
@@ -9049,7 +9154,7 @@ function LogsPage({
         error: error instanceof Error ? error.message : "Unable to export logs",
       }));
     }
-  }, [exportLogs.path, onToast, scope, streamIDs]);
+  }, [exportLogs.path, exportLogs.range, onToast, scope, streamIDs]);
 
   const streamLabel =
     lockedScope && scope === "project" && selectedProjectID
@@ -15275,8 +15380,15 @@ function mergeNetworkContainers(
       return container;
     }
     return {
-      ...current,
       ...container,
+      ...current,
+      networkName: container.networkName,
+      endpointID: container.endpointID,
+      ipv4Address: container.ipv4Address,
+      ipv6Address: container.ipv6Address,
+      gateway: container.gateway,
+      macAddress: container.macAddress,
+      aliases: container.aliases?.length ? container.aliases : current.aliases,
       cpuPercent: current.cpuPercent ?? container.cpuPercent,
       memoryBytes: current.memoryBytes ?? container.memoryBytes,
       memoryLimit: current.memoryLimit ?? container.memoryLimit,
@@ -15804,6 +15916,19 @@ function RemoveProjectModal({
   );
 }
 
+function updatePlanResultTone(result?: string, error?: string) {
+  if (error) {
+    return "error";
+  }
+  switch ((result ?? "").toLowerCase()) {
+    case "failed":
+    case "manual_needed":
+      return "error";
+    default:
+      return "ok";
+  }
+}
+
 function UpdatePlanModal({
   onApply,
   onChange,
@@ -16047,7 +16172,14 @@ function UpdatePlanModal({
         ) : null}
 
         {state.result ? (
-          <div className="rounded-control border border-ok/30 bg-ok/10 p-3 text-sm text-ok">
+          <div
+            className={[
+              "rounded-control border p-3 text-sm",
+              updatePlanResultTone(state.result, state.error) === "error"
+                ? "border-error/30 bg-error/10 text-error"
+                : "border-ok/30 bg-ok/10 text-ok",
+            ].join(" ")}
+          >
             Result: {state.result}
           </div>
         ) : null}
@@ -18838,13 +18970,16 @@ function isStatsSample(value: unknown): value is StatsSample {
   );
 }
 
-function sampleLabel(sample: StatsSample) {
-  const date = toDate(sample.sampledAt) ?? new Date();
+function timeLabel(date = new Date()) {
   return date.toLocaleTimeString(undefined, {
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
   });
+}
+
+function sampleLabel(sample: StatsSample) {
+  return timeLabel(toDate(sample.sampledAt) ?? new Date());
 }
 
 function aggregateChartPoint(
@@ -18862,8 +18997,44 @@ function aggregateChartPoint(
   };
 }
 
+const maxVisibleChartPoints = 300;
+const maxStoredChartPoints = 24 * 60 * 60;
+
+function chartRangeMs(range: DashboardRangeID) {
+  switch (range) {
+    case "5m":
+      return 5 * 60 * 1000;
+    case "1h":
+      return 60 * 60 * 1000;
+    case "24h":
+      return 24 * 60 * 60 * 1000;
+  }
+}
+
+function downsampleChartPoints(points: DashboardChartPoint[]) {
+  if (points.length <= maxVisibleChartPoints) {
+    return points;
+  }
+  const step = Math.ceil(points.length / maxVisibleChartPoints);
+  return points
+    .filter((_, index) => index % step === 0)
+    .slice(-maxVisibleChartPoints);
+}
+
+function chartPointsForRange(
+  points: DashboardChartPoint[],
+  range: DashboardRangeID,
+) {
+  const cutoff = Date.now() - chartRangeMs(range);
+  return downsampleChartPoints(points.filter((point) => point.ts >= cutoff));
+}
+
 function trimChartPoints(points: DashboardChartPoint[]) {
-  return points.length > 300 ? points.slice(points.length - 300) : points;
+  const cutoff = Date.now() - chartRangeMs("24h");
+  const recent = points.filter((point) => point.ts >= cutoff);
+  return recent.length > maxStoredChartPoints
+    ? recent.slice(-maxStoredChartPoints)
+    : recent;
 }
 
 function appendSparkEntries(
@@ -18926,15 +19097,42 @@ function aggregateDeviceIDs(aggregate: SampleAggregate) {
   return Array.from(aggregate.gpuDeviceIDs).sort();
 }
 
-function mergeStatsSamples(
-  current: Record<string, StatsSample>,
-  samples: StatsSample[],
-) {
-  const next = { ...current };
+function statsSamplesByID(samples: StatsSample[]) {
+  const next: Record<string, StatsSample> = {};
   for (const sample of samples) {
     next[sample.containerID] = sample;
   }
   return next;
+}
+
+function containerHasStats(container: ContainerSummary) {
+  return (
+    (container.cpuPercent ?? 0) !== 0 ||
+    (container.gpuDeviceIDs?.length ?? 0) > 0 ||
+    (container.gpuMemoryBytes ?? 0) !== 0 ||
+    (container.gpuUtilizationPercent ?? 0) !== 0 ||
+    (container.memoryBytes ?? 0) !== 0 ||
+    (container.memoryLimit ?? 0) !== 0 ||
+    (container.netRxRate ?? 0) !== 0 ||
+    (container.netTxRate ?? 0) !== 0
+  );
+}
+
+function clearContainerStats(container: ContainerSummary) {
+  if (!containerHasStats(container)) {
+    return container;
+  }
+  return {
+    ...container,
+    cpuPercent: 0,
+    gpuDeviceIDs: [],
+    gpuMemoryBytes: 0,
+    gpuUtilizationPercent: 0,
+    memoryBytes: 0,
+    memoryLimit: 0,
+    netRxRate: 0,
+    netTxRate: 0,
+  };
 }
 
 function applyStatsSamplesToContainers(
@@ -18946,7 +19144,9 @@ function applyStatsSamplesToContainers(
   const next = containers.map((container) => {
     const sample = byID.get(container.id);
     if (!sample) {
-      return container;
+      const cleared = clearContainerStats(container);
+      changed = changed || cleared !== container;
+      return cleared;
     }
     changed = true;
     return {
@@ -18963,6 +19163,58 @@ function applyStatsSamplesToContainers(
     };
   });
   return changed ? next : containers;
+}
+
+function projectHasStats(project: ProjectSummary) {
+  return (
+    project.cpuPercent !== 0 ||
+    (project.gpuDeviceIDs?.length ?? 0) > 0 ||
+    (project.gpuMemoryBytes ?? 0) !== 0 ||
+    (project.gpuUtilizationPercent ?? 0) !== 0 ||
+    project.memoryBytes !== 0 ||
+    project.netRxRate !== 0 ||
+    project.netTxRate !== 0
+  );
+}
+
+function clearProjectStats(project: ProjectSummary) {
+  if (!projectHasStats(project)) {
+    return project;
+  }
+  return {
+    ...project,
+    cpuPercent: 0,
+    gpuDeviceIDs: [],
+    gpuMemoryBytes: 0,
+    gpuUtilizationPercent: 0,
+    memoryBytes: 0,
+    netRxRate: 0,
+    netTxRate: 0,
+  };
+}
+
+function serviceHasStats(service: ComposeServiceStatus) {
+  return (
+    (service.cpuPercent ?? 0) !== 0 ||
+    (service.gpuDeviceIDs?.length ?? 0) > 0 ||
+    (service.gpuMemoryBytes ?? 0) !== 0 ||
+    (service.gpuUtilizationPercent ?? 0) !== 0 ||
+    (service.memoryBytes ?? 0) !== 0
+  );
+}
+
+function clearServiceStats(service: ComposeServiceStatus) {
+  if (!serviceHasStats(service)) {
+    return service;
+  }
+  return {
+    ...service,
+    cpuPercent: 0,
+    gpuDeviceIDs: [],
+    gpuMemoryBytes: 0,
+    gpuUtilizationPercent: 0,
+    memoryBytes: 0,
+  };
 }
 
 function projectAggregates(samples: StatsSample[]) {
@@ -18999,14 +19251,13 @@ function applyStatsSamplesToProjects(
   samples: StatsSample[],
 ) {
   const byProject = projectAggregates(samples);
-  if (byProject.size === 0) {
-    return projects;
-  }
   let changed = false;
   const next = projects.map((project) => {
     const aggregate = byProject.get(project.id);
     if (!aggregate) {
-      return project;
+      const cleared = clearProjectStats(project);
+      changed = changed || cleared !== project;
+      return cleared;
     }
     changed = true;
     return applyProjectAggregate(project, aggregate);
@@ -19022,9 +19273,6 @@ function applyStatsSamplesToProjectDetail(
   const projectSamples = samples.filter(
     (sample) => sample.projectID === projectID,
   );
-  if (projectSamples.length === 0) {
-    return detail;
-  }
 
   const projectAggregate = projectAggregates(projectSamples).get(projectID);
   const serviceAggregates = new Map<string, SampleAggregate>();
@@ -19039,30 +19287,40 @@ function applyStatsSamplesToProjectDetail(
     serviceAggregates.set(serviceName, aggregate);
   }
 
-  return {
-    ...detail,
-    containers: applyStatsSamplesToContainers(
-      detail.containers ?? [],
-      projectSamples,
-    ),
-    services: (detail.services ?? []).map((service) => {
-      const aggregate = serviceAggregates.get(service.name);
-      if (!aggregate) {
-        return service;
-      }
-      return {
-        ...service,
-        cpuPercent: aggregate.cpuPercent,
-        gpuDeviceIDs: aggregateDeviceIDs(aggregate),
-        gpuMemoryBytes: aggregate.gpuMemoryBytes,
-        gpuUtilizationPercent: aggregate.gpuUtilizationPercent,
-        memoryBytes: aggregate.memoryBytes,
-      };
-    }),
-    summary: projectAggregate
-      ? applyProjectAggregate(detail.summary, projectAggregate)
-      : detail.summary,
-  };
+  const containers = applyStatsSamplesToContainers(
+    detail.containers ?? [],
+    projectSamples,
+  );
+  let servicesChanged = false;
+  const services = (detail.services ?? []).map((service) => {
+    const aggregate = serviceAggregates.get(service.name);
+    if (!aggregate) {
+      const cleared = clearServiceStats(service);
+      servicesChanged = servicesChanged || cleared !== service;
+      return cleared;
+    }
+    servicesChanged = true;
+    return {
+      ...service,
+      cpuPercent: aggregate.cpuPercent,
+      gpuDeviceIDs: aggregateDeviceIDs(aggregate),
+      gpuMemoryBytes: aggregate.gpuMemoryBytes,
+      gpuUtilizationPercent: aggregate.gpuUtilizationPercent,
+      memoryBytes: aggregate.memoryBytes,
+    };
+  });
+  const summary = projectAggregate
+    ? applyProjectAggregate(detail.summary, projectAggregate)
+    : clearProjectStats(detail.summary);
+
+  if (
+    containers === detail.containers &&
+    !servicesChanged &&
+    summary === detail.summary
+  ) {
+    return detail;
+  }
+  return { ...detail, containers, services, summary };
 }
 
 function sampleServiceName(sample: StatsSample) {

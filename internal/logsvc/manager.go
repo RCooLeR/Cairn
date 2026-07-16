@@ -32,7 +32,7 @@ func NewManager(docker DockerClient, events bus.Bus, opts Options) *Manager {
 
 func (m *Manager) StartLogStream(ctx context.Context, req models.LogStreamRequest) (string, error) {
 	m.ensureReady()
-	containers, err := m.resolveContainers(ctx, req)
+	containers, err := m.resolveContainers(ctx, req, false)
 	if err != nil {
 		return "", err
 	}
@@ -116,11 +116,15 @@ func (m *Manager) ExportLogs(ctx context.Context, req models.ExportLogsRequest) 
 	if path == "" {
 		return nil, apperror.New(apperror.Internal, "Export path is required")
 	}
+	tail := -1
+	if req.Tail > 0 {
+		tail = req.Tail
+	}
 	lines, err := m.collectLogs(ctx, models.LogStreamRequest{
 		Scope:      req.Scope,
 		IDs:        req.IDs,
 		Follow:     false,
-		Tail:       -1,
+		Tail:       tail,
 		Timestamps: true,
 	})
 	if err != nil {
@@ -158,7 +162,7 @@ func (m *Manager) ExportLogs(ctx context.Context, req models.ExportLogsRequest) 
 }
 
 func (m *Manager) collectLogs(ctx context.Context, req models.LogStreamRequest) ([]models.LogLine, error) {
-	containers, err := m.resolveContainers(ctx, req)
+	containers, err := m.resolveContainers(ctx, req, false)
 	if err != nil {
 		return nil, err
 	}
@@ -190,7 +194,7 @@ func (m *Manager) collectLogs(ctx context.Context, req models.LogStreamRequest) 
 	return lines, nil
 }
 
-func (m *Manager) resolveContainers(ctx context.Context, req models.LogStreamRequest) ([]models.ContainerSummary, error) {
+func (m *Manager) resolveContainers(ctx context.Context, req models.LogStreamRequest, allowEmpty bool) ([]models.ContainerSummary, error) {
 	if err := m.requireDocker(); err != nil {
 		return nil, err
 	}
@@ -251,6 +255,9 @@ func (m *Manager) resolveContainers(ctx context.Context, req models.LogStreamReq
 	}
 	containers = uniqueContainers(containers)
 	if len(containers) == 0 {
+		if allowEmpty {
+			return nil, nil
+		}
 		return nil, apperror.New(apperror.NotFound, "No log containers matched the request")
 	}
 	return containers, nil
@@ -344,27 +351,35 @@ type session struct {
 	ctx      context.Context
 	cancel   context.CancelFunc
 
-	input     chan models.LogLine
-	ring      *ringBuffer
-	attached  map[string]struct{}
-	dropped   atomic.Int64
-	producers sync.WaitGroup
-	done      chan struct{}
-	mu        sync.Mutex
+	input            chan models.LogLine
+	ring             *ringBuffer
+	attached         map[string]struct{}
+	activeReaders    map[string]io.Closer
+	dropped          atomic.Int64
+	activeProducers  atomic.Int64
+	producers        sync.WaitGroup
+	producerDone     chan struct{}
+	producerDoneOnce sync.Once
+	watchDone        chan struct{}
+	done             chan struct{}
+	closeInputOnce   sync.Once
+	mu               sync.Mutex
 }
 
 func newSession(manager *Manager, streamID string, req models.LogStreamRequest) *session {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &session{
-		manager:  manager,
-		streamID: streamID,
-		req:      req,
-		ctx:      ctx,
-		cancel:   cancel,
-		input:    make(chan models.LogLine, manager.inputBuffer),
-		ring:     newRingBuffer(manager.ringSize),
-		attached: map[string]struct{}{},
-		done:     make(chan struct{}),
+		manager:       manager,
+		streamID:      streamID,
+		req:           req,
+		ctx:           ctx,
+		cancel:        cancel,
+		input:         make(chan models.LogLine, manager.inputBuffer),
+		ring:          newRingBuffer(manager.ringSize),
+		attached:      map[string]struct{}{},
+		activeReaders: map[string]io.Closer{},
+		producerDone:  make(chan struct{}),
+		done:          make(chan struct{}),
 	}
 }
 
@@ -374,13 +389,14 @@ func (s *session) start(containers []models.ContainerSummary) {
 		s.attach(container)
 	}
 	if s.req.Follow && s.req.Scope != ScopeContainer {
-		go s.watchObjects()
+		s.watchDone = make(chan struct{})
+		go func() {
+			defer close(s.watchDone)
+			s.watchObjects()
+		}()
 		return
 	}
-	go func() {
-		s.producers.Wait()
-		close(s.input)
-	}()
+	s.finishProducers(true)
 }
 
 func (s *session) attach(container models.ContainerSummary) {
@@ -401,6 +417,8 @@ func (s *session) attach(container models.ContainerSummary) {
 	s.mu.Unlock()
 
 	go func() {
+		s.activeProducers.Add(1)
+		defer s.activeProducers.Add(-1)
 		defer s.producers.Done()
 		source := sourceFromContainer(container)
 		reader, err := s.manager.Docker.ContainerLogs(s.ctx, container.ID, dockercore.LogOptions{
@@ -413,7 +431,14 @@ func (s *session) attach(container models.ContainerSummary) {
 			s.publishError(err)
 			return
 		}
+		s.addReader(key, reader)
+		if s.ctx.Err() != nil {
+			s.removeReader(key)
+			_ = reader.Close()
+			return
+		}
 		defer func() {
+			s.removeReader(key)
 			_ = reader.Close()
 		}()
 		err = ReadDockerLogStream(s.ctx, reader, source, s.manager.now, s.enqueue)
@@ -421,6 +446,51 @@ func (s *session) attach(container models.ContainerSummary) {
 			s.publishError(err)
 		}
 	}()
+}
+
+func (s *session) addReader(key string, reader io.Closer) {
+	if reader == nil {
+		return
+	}
+	s.mu.Lock()
+	s.activeReaders[key] = reader
+	s.mu.Unlock()
+}
+
+func (s *session) removeReader(key string) {
+	s.mu.Lock()
+	delete(s.activeReaders, key)
+	s.mu.Unlock()
+}
+
+func (s *session) closeReaders() {
+	s.mu.Lock()
+	readers := make([]io.Closer, 0, len(s.activeReaders))
+	for _, reader := range s.activeReaders {
+		readers = append(readers, reader)
+	}
+	s.mu.Unlock()
+	for _, reader := range readers {
+		_ = reader.Close()
+	}
+}
+
+func (s *session) closeInput() {
+	s.closeInputOnce.Do(func() {
+		close(s.input)
+	})
+}
+
+func (s *session) finishProducers(closeInput bool) {
+	s.producerDoneOnce.Do(func() {
+		go func() {
+			s.producers.Wait()
+			if closeInput {
+				s.closeInput()
+			}
+			close(s.producerDone)
+		}()
+	})
 }
 
 func (s *session) watchObjects() {
@@ -436,7 +506,7 @@ func (s *session) watchObjects() {
 			if !ok {
 				return
 			}
-			containers, err := s.manager.resolveContainers(s.ctx, s.req)
+			containers, err := s.manager.resolveContainers(s.ctx, s.req, true)
 			if err != nil {
 				s.publishError(err)
 				continue
@@ -527,7 +597,23 @@ func (s *session) publishError(err error) {
 
 func (s *session) stop() {
 	s.cancel()
-	<-s.done
+	s.closeReaders()
+	watcherStopped := true
+	if s.watchDone != nil {
+		watcherStopped = waitForClosed(s.watchDone, streamStopTimeout)
+		if !watcherStopped {
+			s.publishError(fmt.Errorf("log stream watcher did not stop within %s", streamStopTimeout))
+		}
+	}
+	if watcherStopped {
+		s.finishProducers(true)
+		if !waitForClosed(s.producerDone, streamStopTimeout) {
+			s.publishError(fmt.Errorf("log stream readers did not stop within %s", streamStopTimeout))
+		}
+	}
+	if !waitForClosed(s.done, streamStopTimeout) {
+		s.publishError(fmt.Errorf("log stream batcher did not stop within %s", streamStopTimeout))
+	}
 }
 
 func (m *Manager) publish(topic bus.Topic, payload any) {
@@ -535,4 +621,32 @@ func (m *Manager) publish(topic bus.Topic, payload any) {
 		return
 	}
 	m.Events.Publish(bus.Event{Topic: topic, Payload: payload})
+}
+
+func (m *Manager) Diagnostics() models.LogRuntimeDiagnostics {
+	m.ensureReady()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var producers int64
+	for _, s := range m.sessions {
+		producers += s.activeProducers.Load()
+	}
+	return models.LogRuntimeDiagnostics{
+		ActiveStreams:   len(m.sessions),
+		ActiveProducers: producers,
+	}
+}
+
+func waitForClosed(ch <-chan struct{}, timeout time.Duration) bool {
+	if ch == nil {
+		return true
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-ch:
+		return true
+	case <-timer.C:
+		return false
+	}
 }

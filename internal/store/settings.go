@@ -38,6 +38,7 @@ var settingDefaults = map[string]settingDefault{
 	"general.language":                {kind: kindString, value: "en"},
 	"provider.active_id":              {kind: kindString, value: ""},
 	"provider.autostart_backend":      {kind: kindBool, value: true},
+	"portforward.enabled":             {kind: kindBool, value: true},
 	"updates.check_interval_hours":    {kind: kindInt, value: 24},
 	"updates.notify":                  {kind: kindBool, value: true},
 	"metrics.retention_raw_minutes":   {kind: kindInt, value: 60},

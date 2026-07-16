@@ -207,6 +207,34 @@ func TestTrimPendingMetricsKeepsNewestSamples(t *testing.T) {
 	}
 }
 
+func TestManagerBuildSampleUsesStartedAtForUptime(t *testing.T) {
+	now := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)
+	manager := NewManager(&fakeMetricsDocker{}, nil, nil, nil, nil, Options{Now: func() time.Time { return now }})
+	manager.mu.Lock()
+	manager.containers["c1"] = models.ContainerSummary{
+		ID:        "c1",
+		Name:      "web",
+		CreatedAt: now.Add(-time.Hour),
+		StartedAt: now.Add(-5 * time.Minute),
+	}
+	manager.mu.Unlock()
+
+	sample, ok := manager.buildSample("c1", statsResponse(now, 100, 1000, 100, 100, 0))
+	if !ok {
+		t.Fatal("buildSample() ok = false")
+	}
+	if sample.UptimeSeconds != int64((5 * time.Minute).Seconds()) {
+		t.Fatalf("uptime = %d, want 300", sample.UptimeSeconds)
+	}
+}
+
+func TestManagerStatsConcurrencyDisablesStreaming(t *testing.T) {
+	manager := NewManager(&fakeMetricsDocker{}, nil, nil, nil, nil, Options{StatsConcurrency: 1})
+	if !manager.disableStreamingStats {
+		t.Fatal("StatsConcurrency did not force one-shot stats mode")
+	}
+}
+
 func TestAppendPendingMetricsSortsBeforeTrim(t *testing.T) {
 	base := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)
 	var existing []store.MetricsSampleRecord
@@ -331,6 +359,42 @@ func TestWatchContainerCanDisableStreamingStats(t *testing.T) {
 	}
 	if docker.oneShotCalls == 0 {
 		t.Fatal("one-shot stats calls = 0, want at least 1")
+	}
+}
+
+func TestStopAllClosesBlockingStatsReader(t *testing.T) {
+	ctx := context.Background()
+	reader := newBlockingStatsReader()
+	docker := &fakeMetricsDocker{
+		containers: []models.ContainerSummary{{
+			ID:    "c1",
+			Name:  "web",
+			State: "running",
+		}},
+		statsReaders: map[string]io.ReadCloser{"c1": reader},
+	}
+	manager := NewManager(docker, nil, nil, nil, nil, Options{
+		BackgroundInterval: time.Hour,
+	})
+
+	manager.Start(ctx)
+	select {
+	case <-reader.started:
+	case <-time.After(time.Second):
+		t.Fatal("stats reader was not consumed")
+	}
+	if got := manager.Diagnostics(); !got.Started || got.ActiveWatchers != 1 {
+		t.Fatalf("diagnostics while running = %#v", got)
+	}
+
+	manager.StopAll()
+	select {
+	case <-reader.closed:
+	default:
+		t.Fatal("StopAll did not close active stats reader")
+	}
+	if got := manager.Diagnostics(); got.Started || got.ActiveWatchers != 0 {
+		t.Fatalf("diagnostics after stop = %#v", got)
 	}
 }
 
@@ -567,6 +631,7 @@ type fakeMetricsDocker struct {
 	volumes        []models.VolumeSummary
 	diskUsage      *models.DiskUsage
 	stats          map[string][]container.StatsResponse
+	statsReaders   map[string]io.ReadCloser
 	processPIDs    map[string][]int
 	calls          []dockercore.StatsOptions
 	streamErrors   int
@@ -628,6 +693,15 @@ func (f *fakeMetricsDocker) ContainerStats(_ context.Context, id string, opts do
 		}
 		return nil, errors.New("stream stats failed")
 	}
+	if opts.Stream && f.statsReaders != nil {
+		if reader := f.statsReaders[id]; reader != nil {
+			f.mu.Unlock()
+			if f.afterStatsCall != nil {
+				f.afterStatsCall(streamCalls, oneShotCalls)
+			}
+			return &dockercore.StatsReader{Body: reader, OSType: "linux"}, nil
+		}
+	}
 	if opts.OneShot && f.oneShotErrors > 0 {
 		f.oneShotErrors--
 		f.mu.Unlock()
@@ -679,4 +753,33 @@ func statsResponse(read time.Time, cpu uint64, system uint64, memory uint64, rx 
 
 func near(got float64, want float64) bool {
 	return math.Abs(got-want) < 0.0001
+}
+
+type blockingStatsReader struct {
+	started   chan struct{}
+	closed    chan struct{}
+	startOnce sync.Once
+	closeOnce sync.Once
+}
+
+func newBlockingStatsReader() *blockingStatsReader {
+	return &blockingStatsReader{
+		started: make(chan struct{}),
+		closed:  make(chan struct{}),
+	}
+}
+
+func (r *blockingStatsReader) Read([]byte) (int, error) {
+	r.startOnce.Do(func() {
+		close(r.started)
+	})
+	<-r.closed
+	return 0, io.EOF
+}
+
+func (r *blockingStatsReader) Close() error {
+	r.closeOnce.Do(func() {
+		close(r.closed)
+	})
+	return nil
 }

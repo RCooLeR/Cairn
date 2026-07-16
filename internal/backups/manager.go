@@ -226,6 +226,7 @@ func (m *Manager) ApplyBackup(ctx context.Context, planID string) (string, error
 		return "", err
 	}
 	if record.Operation != "backup" {
+		m.savePlan(record)
 		return "", apperror.New(apperror.Conflict, "Plan is not a backup plan")
 	}
 	jobID := "backup-" + m.newID()
@@ -245,6 +246,7 @@ func (m *Manager) RunBackupVolume(ctx context.Context, req models.BackupVolumeRe
 		return err
 	}
 	if record.Operation != "backup" {
+		m.savePlan(record)
 		return apperror.New(apperror.Conflict, "Plan is not a backup plan")
 	}
 	return m.runBackup(ctx, "backup-"+m.newID(), record)
@@ -345,6 +347,7 @@ func (m *Manager) ApplyRestore(ctx context.Context, planID string, typedName str
 		return "", err
 	}
 	if record.Operation != "restore" {
+		m.savePlan(record)
 		return "", apperror.New(apperror.Conflict, "Plan is not a restore plan")
 	}
 	jobID := "restore-" + m.newID()
@@ -401,6 +404,7 @@ func (m *Manager) ApplyDeleteBackup(ctx context.Context, planID string) error {
 		return err
 	}
 	if record.Operation != "delete" {
+		m.savePlan(record)
 		return apperror.New(apperror.Conflict, "Plan is not a backup delete plan")
 	}
 	return m.deleteBackupRecord(ctx, record)
@@ -441,13 +445,13 @@ func (m *Manager) deleteBackupRecord(ctx context.Context, record planRecord) err
 	if err := m.recordAudit(ctx, "backup.delete", "backup", record.BackupID, record.ProviderID, record.ProjectID, command, models.RiskNeedsConfirmation, "started", 0, nil); err != nil {
 		return err
 	}
-	err := m.Backups.Delete(ctx, record.BackupID)
+	err := removeBackupArtifacts(record.ArchivePath, record.MetadataPath)
 	duration := time.Since(started)
 	if err != nil {
 		_ = m.recordAudit(ctx, "backup.delete", "backup", record.BackupID, record.ProviderID, record.ProjectID, command, models.RiskNeedsConfirmation, "failed", duration, err)
 		return err
 	}
-	err = removeBackupArtifacts(record.ArchivePath, record.MetadataPath)
+	err = m.Backups.Delete(ctx, record.BackupID)
 	duration = time.Since(started)
 	if err != nil {
 		_ = m.recordAudit(ctx, "backup.delete", "backup", record.BackupID, record.ProviderID, record.ProjectID, command, models.RiskNeedsConfirmation, "failed", duration, err)
@@ -520,11 +524,23 @@ func (m *Manager) runRestore(ctx context.Context, jobID string, record planRecor
 	_ = m.recordAudit(ctx, "backup.restore", "volume", record.TargetVolumeName, record.ProviderID, record.ProjectID, command, record.Plan.Risk, "started", 0, nil)
 	m.publishProgress(jobID, "restore", "Starting volume restore", nil)
 	provider, err := m.planProvider(ctx, record)
-	if err == nil && record.CreateTargetFirst {
-		err = runProviderDocker(ctx, provider, "volume", "create", record.TargetVolumeName)
-	}
 	if err == nil {
 		err = verifyArchiveChecksum(record.ArchivePath, record.Sidecar.SHA256)
+	}
+	if err == nil && !record.Overwrite {
+		_, exists, existsErr := m.getVolumeIfExists(ctx, record.TargetVolumeName)
+		if existsErr != nil {
+			err = existsErr
+		} else if exists {
+			err = apperror.New(
+				apperror.Conflict,
+				"Target volume already exists",
+				apperror.WithDetail(record.TargetVolumeName),
+			)
+		}
+	}
+	if err == nil && record.CreateTargetFirst {
+		err = runProviderDocker(ctx, provider, "volume", "create", record.TargetVolumeName)
 	}
 	if err == nil {
 		err = runProviderDocker(ctx, provider, dockerRunRestoreArgs(record.TargetVolumeName, record.BackupDirBackend, record.ArchiveName)...)
@@ -832,6 +848,7 @@ func dockerRunBackupArgs(volumeName string, backupDir string, archiveName string
 		"-v", backupDir + ":/backup",
 		helperImage,
 		"tar", "czf", "/backup/" + archiveName,
+		"--exclude=.cairn-restore-old-*",
 		"-C", "/source", ".",
 	}
 }
@@ -851,18 +868,34 @@ func dockerRunRestoreArgs(targetName string, backupDir string, archiveName strin
 
 const restoreHelperScript = `set -eu
 archive=$1
+restore_stash_dir() {
+  old_stash=$1
+  old_name=$(basename "$old_stash")
+  find /restore -mindepth 1 -maxdepth 1 ! -name "$old_name" -exec rm -rf {} +
+  find "$old_stash" -mindepth 1 -maxdepth 1 -exec sh -c 'dest=$1; shift; for path do mv "$path" "$dest"/; done' sh /restore {} +
+  rmdir "$old_stash"
+}
+for old_stash in /restore/.cairn-restore-old-*; do
+  [ -e "$old_stash" ] || continue
+  [ -d "$old_stash" ] || { rm -f "$old_stash"; continue; }
+  restore_stash_dir "$old_stash"
+done
 stash_name=".cairn-restore-old-$$"
 stash="/restore/$stash_name"
 mkdir "$stash"
+cleanup() {
+  code=$?
+  trap - EXIT HUP INT TERM
+  if [ "$code" -ne 0 ] && [ -d "$stash" ]; then
+    restore_stash_dir "$stash" || true
+  fi
+  exit "$code"
+}
+trap cleanup EXIT HUP INT TERM
 find /restore -mindepth 1 -maxdepth 1 ! -name "$stash_name" -exec sh -c 'stash=$1; shift; for path do mv "$path" "$stash"/; done' sh "$stash" {} +
-if tar xzf "$archive" -C /restore; then
-  rm -rf "$stash"
-else
-  find /restore -mindepth 1 -maxdepth 1 ! -name "$stash_name" -exec rm -rf {} +
-  find "$stash" -mindepth 1 -maxdepth 1 -exec sh -c 'dest=$1; shift; for path do mv "$path" "$dest"/; done' sh /restore {} +
-  rmdir "$stash"
-  exit 1
-fi`
+tar xzf "$archive" -C /restore
+rm -rf "$stash"
+trap - EXIT HUP INT TERM`
 
 func backupEffects(volumeName string, archivePath string, metadataPath string, running []string) []string {
 	effects := []string{

@@ -4,6 +4,7 @@
 import * as AgentService from "./agentservice.js";
 import * as BackupService from "./backupservice.js";
 import * as ComposeService from "./composeservice.js";
+import * as DiagnosticsService from "./diagnosticsservice.js";
 import * as DockerService from "./dockerservice.js";
 import * as ImageLineageService from "./imagelineageservice.js";
 import * as LogsService from "./logsservice.js";
@@ -19,6 +20,7 @@ export {
     AgentService,
     BackupService,
     ComposeService,
+    DiagnosticsService,
     DockerService,
     ImageLineageService,
     LogsService,
