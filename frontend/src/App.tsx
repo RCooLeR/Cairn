@@ -1493,6 +1493,7 @@ function App() {
   const notificationEventRefreshQueuedRef = useRef(false);
   const notificationEventRefreshInFlightRef = useRef(false);
   const notificationEventRefreshTimerRef = useRef<number | null>(null);
+  const notificationCenterBoundaryRef = useRef<HTMLDivElement | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [queuedTerminalCommand, setQueuedTerminalCommand] =
     useState<TerminalCommandRequest | null>(null);
@@ -6727,7 +6728,7 @@ function App() {
                   variant="secondary"
                 />
               </Tooltip>
-              <div className="relative">
+              <div className="relative" ref={notificationCenterBoundaryRef}>
                 <Tooltip label="Notifications">
                   <Button
                     aria-label={
@@ -6748,6 +6749,7 @@ function App() {
                 ) : null}
                 <NotificationCenter
                   error={notificationsError}
+                  interactionBoundaryRef={notificationCenterBoundaryRef}
                   loading={notificationsLoading}
                   notifications={notificationsForDisplay}
                   onClose={() => setNotificationsOpen(false)}
@@ -7365,7 +7367,7 @@ function DegradedFrame({
       <div className="pointer-events-none absolute right-3 top-3 z-10 rounded-control border border-neutral/30 bg-bg-panel/95 px-3 py-1 text-xs font-medium uppercase text-text-muted shadow-lg">
         Stale cached data
       </div>
-      <div className="opacity-80 grayscale-[0.25]">{children}</div>
+      <div className="grayscale-[0.25]">{children}</div>
     </div>
   );
 }

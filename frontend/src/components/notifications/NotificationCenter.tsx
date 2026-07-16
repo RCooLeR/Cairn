@@ -1,5 +1,5 @@
 import { Bell } from "lucide-react";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, type RefObject } from "react";
 
 import type { Notification } from "../../../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
 import { useFocusTrap } from "../../hooks/useFocusTrap";
@@ -10,6 +10,7 @@ type BadgeTone = "ok" | "warn" | "error" | "info" | "neutral" | "accent";
 
 type NotificationCenterProps = {
   error: string | null;
+  interactionBoundaryRef?: RefObject<HTMLElement | null>;
   loading: boolean;
   notifications: Notification[];
   onClose: () => void;
@@ -20,6 +21,7 @@ type NotificationCenterProps = {
 
 export function NotificationCenter({
   error,
+  interactionBoundaryRef,
   loading,
   notifications,
   onClose,
@@ -37,14 +39,20 @@ export function NotificationCenter({
     }
     const onPointerDown = (event: PointerEvent) => {
       const panel = panelRef.current;
-      if (!panel || event.composedPath().includes(panel)) {
+      const path = event.composedPath();
+      const interactionBoundary = interactionBoundaryRef?.current;
+      if (
+        !panel ||
+        path.includes(panel) ||
+        (interactionBoundary && path.includes(interactionBoundary))
+      ) {
         return;
       }
       onClose();
     };
     document.addEventListener("pointerdown", onPointerDown);
     return () => document.removeEventListener("pointerdown", onPointerDown);
-  }, [onClose, open]);
+  }, [interactionBoundaryRef, onClose, open]);
 
   if (!open) {
     return null;

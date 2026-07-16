@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen } from "@testing-library/react";
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 
 import type { Notification } from "../../../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
@@ -95,6 +95,40 @@ describe("NotificationCenter", () => {
     expect(
       screen.queryByRole("button", { name: /Informational notice/ }),
     ).not.toBeInTheDocument();
+  });
+
+  it("lets its trigger toggle the dialog without treating it as an outside click", () => {
+    function Harness() {
+      const [open, setOpen] = useState(false);
+      const boundaryRef = useRef<HTMLDivElement | null>(null);
+      return (
+        <div ref={boundaryRef}>
+          <button onClick={() => setOpen((current) => !current)} type="button">
+            Notifications
+          </button>
+          <NotificationCenter
+            error={null}
+            interactionBoundaryRef={boundaryRef}
+            loading={false}
+            notifications={[notification()]}
+            onClose={() => setOpen(false)}
+            onMarkAllRead={vi.fn()}
+            onNavigate={vi.fn()}
+            open={open}
+          />
+        </div>
+      );
+    }
+
+    render(<Harness />);
+    const trigger = screen.getByRole("button", { name: "Notifications" });
+    fireEvent.click(trigger);
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+
+    fireEvent.pointerDown(trigger);
+    fireEvent.click(trigger);
+
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
   it("reports the activated notification and dismisses on outside interaction", () => {
