@@ -195,7 +195,7 @@ func (r *MetricsRepository) querySeriesSegment(ctx context.Context, filter Metri
 		// alternate between individual containers instead of representing the
 		// project. A one-second raw display bucket preserves the collector's
 		// multi-second cadence while combining one logical observation.
-		sampledAtExpression = "MIN(sampled_at)"
+		sampledAtExpression = "strftime('%Y-%m-%dT%H:%M:%SZ', sampled_at)"
 		groupExpression = "CAST(strftime('%s', sampled_at) AS INTEGER)"
 	}
 

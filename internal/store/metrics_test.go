@@ -146,6 +146,9 @@ func TestMetricsRepositoryBucketsSkewedRawProjectSamples(t *testing.T) {
 	if points := bundle.Series[1].Points; len(points) != 2 || points[0].Value != 300 || points[1].Value != 700 {
 		t.Fatalf("project memory points = %#v, want summed logical samples [300 700]", points)
 	}
+	if points := bundle.Series[0].Points; !points[0].TS.Equal(base) || !points[1].TS.Equal(base.Add(2*time.Second)) {
+		t.Fatalf("project bucket timestamps = %#v, want [%v %v]", points, base, base.Add(2*time.Second))
+	}
 }
 
 func TestMetricsRepositoryQueryAndRetentionDownsample(t *testing.T) {
