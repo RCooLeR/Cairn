@@ -8,13 +8,25 @@ import { cx } from "./utils";
 type ButtonVariant = "primary" | "secondary" | "ghost" | "danger";
 type ButtonSize = "sm" | "md" | "icon";
 
-type ButtonProps = ButtonHTMLAttributes<HTMLButtonElement> & {
+type ButtonBaseProps = Omit<
+  ButtonHTMLAttributes<HTMLButtonElement>,
+  "aria-label"
+> & {
   variant?: ButtonVariant;
-  size?: ButtonSize;
   loading?: boolean;
   disabledReason?: string;
   icon?: ReactNode;
 };
+
+type ButtonProps =
+  | (ButtonBaseProps & {
+      "aria-label": string;
+      size?: ButtonSize;
+    })
+  | (ButtonBaseProps & {
+      "aria-label"?: string;
+      size?: Exclude<ButtonSize, "icon">;
+    });
 
 const variantClasses: Record<ButtonVariant, string> = {
   primary: "border-accent bg-accent text-bg-app hover:bg-accent/90",

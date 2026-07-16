@@ -1,7 +1,14 @@
 import type { MouseEvent as ReactMouseEvent, ReactNode } from "react";
 
 import { ArrowDownUp } from "lucide-react";
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 
 import { cx } from "./utils";
 
@@ -85,6 +92,11 @@ export function DataTable<T>({
   const resizeCleanupRef = useRef<(() => void) | null>(null);
   const selectAllRef = useRef<HTMLInputElement>(null);
   const scrollViewportRef = useRef<HTMLDivElement>(null);
+  const columnMenuButtonRef = useRef<HTMLButtonElement>(null);
+  const columnMenuPopoverRef = useRef<HTMLDivElement>(null);
+  const columnMenuReturnFocusRef = useRef<HTMLElement | null>(null);
+  const columnMenuID = useId();
+  const columnMenuHeadingID = useId();
   const visibleColumns = useMemo(
     () => columns.filter((column) => !hiddenColumnIDs.has(column.id)),
     [columns, hiddenColumnIDs],
@@ -176,18 +188,50 @@ export function DataTable<T>({
   const allVisibleSelected =
     canToggleAll && selectedVisibleCount === visibleIDs.length;
 
+  const getColumnMenuPosition = (x: number, y: number) => ({
+    x: Math.max(
+      8,
+      Math.min(x, Math.max(8, window.innerWidth - columnMenuWidth - 8)),
+    ),
+    y: Math.max(
+      8,
+      Math.min(y, Math.max(8, window.innerHeight - columnMenuMaxHeight - 8)),
+    ),
+  });
+
+  const openColumnMenuAt = (
+    x: number,
+    y: number,
+    returnFocus: HTMLElement | null,
+  ) => {
+    columnMenuReturnFocusRef.current =
+      returnFocus ?? columnMenuButtonRef.current;
+    setColumnMenu(getColumnMenuPosition(x, y));
+  };
+
   const openColumnMenu = (event: ReactMouseEvent) => {
     event.preventDefault();
-    setColumnMenu({
-      x: Math.min(
-        event.clientX,
-        Math.max(8, window.innerWidth - columnMenuWidth - 8),
-      ),
-      y: Math.min(
-        event.clientY,
-        Math.max(8, window.innerHeight - columnMenuMaxHeight - 8),
-      ),
-    });
+    const activeElement =
+      document.activeElement instanceof HTMLElement &&
+      document.activeElement !== document.body
+        ? document.activeElement
+        : columnMenuButtonRef.current;
+
+    openColumnMenuAt(event.clientX, event.clientY, activeElement);
+  };
+
+  const openColumnMenuFromButton = (button: HTMLButtonElement) => {
+    const bounds = button.getBoundingClientRect();
+    openColumnMenuAt(bounds.right - columnMenuWidth, bounds.bottom + 4, button);
+  };
+
+  const toggleColumnMenuFromButton = (button: HTMLButtonElement) => {
+    if (columnMenu) {
+      setColumnMenu(null);
+      return;
+    }
+
+    openColumnMenuFromButton(button);
   };
 
   const resetColumnWidth = (columnID: string) => {
@@ -285,19 +329,50 @@ export function DataTable<T>({
       return undefined;
     }
 
-    const closeColumnMenu = () => {
+    const returnFocus = columnMenuReturnFocusRef.current;
+    const firstControl =
+      columnMenuPopoverRef.current?.querySelector<HTMLElement>(
+        'input:not(:disabled), button:not(:disabled), [tabindex]:not([tabindex="-1"])',
+      );
+    (firstControl ?? columnMenuPopoverRef.current)?.focus();
+
+    const closeColumnMenu = (restoreFocus = true) => {
       setColumnMenu(null);
+      if (restoreFocus) {
+        window.setTimeout(() => {
+          if (returnFocus?.isConnected) {
+            returnFocus.focus();
+          } else {
+            columnMenuButtonRef.current?.focus();
+          }
+        }, 0);
+      }
+    };
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!(event.target instanceof Node)) {
+        return;
+      }
+      if (
+        columnMenuPopoverRef.current?.contains(event.target) ||
+        columnMenuButtonRef.current?.contains(event.target)
+      ) {
+        return;
+      }
+
+      closeColumnMenu();
     };
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
         closeColumnMenu();
       }
     };
 
-    window.addEventListener("click", closeColumnMenu);
+    document.addEventListener("pointerdown", handlePointerDown);
     window.addEventListener("keydown", handleKeyDown);
     return () => {
-      window.removeEventListener("click", closeColumnMenu);
+      document.removeEventListener("pointerdown", handlePointerDown);
       window.removeEventListener("keydown", handleKeyDown);
     };
   }, [columnMenu]);
@@ -315,6 +390,25 @@ export function DataTable<T>({
 
   return (
     <div className="relative overflow-hidden rounded-card border border-border bg-bg-card">
+      <div className="flex min-h-10 items-center justify-end border-b border-border bg-bg-panel px-3 py-1.5">
+        <button
+          aria-controls={columnMenuID}
+          aria-expanded={Boolean(columnMenu)}
+          aria-haspopup="dialog"
+          className="rounded border border-border px-3 py-1.5 text-sm text-text-secondary hover:bg-bg-inset hover:text-text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-accent"
+          onClick={(event) => toggleColumnMenuFromButton(event.currentTarget)}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowDown") {
+              event.preventDefault();
+              openColumnMenuFromButton(event.currentTarget);
+            }
+          }}
+          ref={columnMenuButtonRef}
+          type="button"
+        >
+          Columns
+        </button>
+      </div>
       {hasSelection ? (
         <div className="flex h-11 items-center justify-between border-b border-border bg-accent/10 px-3 text-sm">
           <span>{selectedIDs.size} selected</span>
@@ -518,16 +612,21 @@ export function DataTable<T>({
       </div>
       {columnMenu ? (
         <div
-          aria-label="Table columns"
+          aria-labelledby={columnMenuHeadingID}
           className="fixed z-50 w-56 rounded-card border border-border bg-bg-panel p-2 text-sm shadow-xl"
-          onClick={(event) => event.stopPropagation()}
+          id={columnMenuID}
           onContextMenu={(event) => event.preventDefault()}
-          role="menu"
+          ref={columnMenuPopoverRef}
+          role="dialog"
           style={{ left: columnMenu.x, top: columnMenu.y }}
+          tabIndex={-1}
         >
-          <div className="px-2 pb-1 text-xs font-semibold uppercase text-text-muted">
+          <h2
+            className="px-2 pb-1 text-xs font-semibold uppercase text-text-muted"
+            id={columnMenuHeadingID}
+          >
             Columns
-          </div>
+          </h2>
           <div className="max-h-80 space-y-1 overflow-auto">
             {columns.map((column) => {
               const visible = !hiddenColumnIDs.has(column.id);

@@ -1,4 +1,10 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 
 import {
@@ -35,6 +41,24 @@ describe("UI kit", () => {
       "true",
     );
     expect(screen.getByText("Waiting for provider")).toHaveClass("sr-only");
+  });
+
+  it("requires and exposes a name for icon-only buttons", () => {
+    // @ts-expect-error Icon-sized buttons must provide an accessible name.
+    const unlabeledIconButton = <Button icon={<span />} size="icon" />;
+    expect(unlabeledIconButton.props["aria-label"]).toBeUndefined();
+
+    render(
+      <Button
+        aria-label="Refresh provider status"
+        icon={<span aria-hidden="true">R</span>}
+        size="icon"
+      />,
+    );
+
+    expect(
+      screen.getByRole("button", { name: "Refresh provider status" }),
+    ).toBeInTheDocument();
   });
 
   it("renders status text without relying on color alone", () => {
@@ -192,7 +216,7 @@ describe("UI kit", () => {
     ).toBeInTheDocument();
   });
 
-  it("shows and hides table columns from the header menu", () => {
+  it("shows and hides table columns with native checkbox semantics", () => {
     render(
       <DataTable
         columns={[
@@ -214,7 +238,12 @@ describe("UI kit", () => {
     );
 
     fireEvent.contextMenu(screen.getByRole("columnheader", { name: /Name/ }));
-    fireEvent.click(screen.getByLabelText("Status"));
+    expect(screen.getByRole("dialog", { name: "Columns" })).toBeInTheDocument();
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+
+    const statusColumn = screen.getByRole("checkbox", { name: "Status" });
+    expect(statusColumn).toBeChecked();
+    fireEvent.click(statusColumn);
 
     expect(
       screen.queryByRole("columnheader", { name: /Status/ }),
@@ -229,6 +258,62 @@ describe("UI kit", () => {
       screen.getByRole("columnheader", { name: /Status/ }),
     ).toBeInTheDocument();
     expect(screen.getByRole("cell", { name: "running" })).toBeInTheDocument();
+  });
+
+  it("opens the column chooser from its visible control and restores focus", async () => {
+    render(
+      <DataTable
+        columns={[
+          {
+            id: "name",
+            header: "Name",
+            render: (row: { name: string; status: string }) => row.name,
+          },
+          {
+            id: "status",
+            header: "Status",
+            render: (row) => row.status,
+          },
+        ]}
+        getRowID={(row) => row.name}
+        ariaLabel="Workers"
+        rows={[{ name: "api", status: "running" }]}
+      />,
+    );
+
+    const opener = screen.getByRole("button", { name: "Columns" });
+    expect(opener).toHaveAttribute("aria-expanded", "false");
+    expect(opener).toHaveAttribute("aria-haspopup", "dialog");
+
+    opener.focus();
+    fireEvent.click(opener);
+
+    expect(screen.getByRole("dialog", { name: "Columns" })).toBeInTheDocument();
+    expect(opener).toHaveAttribute("aria-expanded", "true");
+    await waitFor(() =>
+      expect(screen.getByRole("checkbox", { name: "Name" })).toHaveFocus(),
+    );
+
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    expect(
+      screen.queryByRole("dialog", { name: "Columns" }),
+    ).not.toBeInTheDocument();
+    await waitFor(() => expect(opener).toHaveFocus());
+
+    fireEvent.keyDown(opener, { key: "ArrowDown" });
+
+    expect(screen.getByRole("dialog", { name: "Columns" })).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.getByRole("checkbox", { name: "Name" })).toHaveFocus(),
+    );
+
+    fireEvent.pointerDown(document.body);
+
+    expect(
+      screen.queryByRole("dialog", { name: "Columns" }),
+    ).not.toBeInTheDocument();
+    await waitFor(() => expect(opener).toHaveFocus());
   });
 
   it("resizes table columns from the header grip", () => {
