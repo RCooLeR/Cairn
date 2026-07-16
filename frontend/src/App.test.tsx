@@ -2823,6 +2823,97 @@ describe("App inventory shell", () => {
     expect(screen.getByText(/request/)).toBeInTheDocument();
   });
 
+  it("keeps the selected log match stable while a deferred search and live lines update", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Logs/ }),
+    );
+    await waitFor(() =>
+      expect(logsServiceMock.StartLogStream).toHaveBeenCalled(),
+    );
+    emitRuntimeEvent("logs:lines", {
+      streamID: "stream-1",
+      lines: [
+        logLine({ text: "needle first" }),
+        logLine({ text: "unrelated line" }),
+        logLine({ text: "needle selected" }),
+      ],
+    });
+
+    fireEvent.change(screen.getByLabelText("Search logs"), {
+      target: { value: "needle" },
+    });
+    await waitFor(() => expect(screen.getByText("1/2")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    expect(screen.getByText("2/2")).toBeInTheDocument();
+
+    vi.useFakeTimers();
+    fireEvent.change(screen.getByLabelText("Search logs"), {
+      target: { value: "replacement" },
+    });
+    emitRuntimeEvent("logs:lines", {
+      streamID: "stream-1",
+      lines: [
+        logLine({ text: "needle arriving during debounce" }),
+        logLine({ text: "replacement result" }),
+      ],
+    });
+
+    expect(screen.getByText("2/3")).toBeInTheDocument();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(200);
+    });
+    expect(screen.getByText("1/1")).toBeInTheDocument();
+  });
+
+  it("remaps the selected log match when live-buffer eviction shifts its index", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Logs/ }),
+    );
+    await waitFor(() =>
+      expect(logsServiceMock.StartLogStream).toHaveBeenCalled(),
+    );
+    emitRuntimeEvent("logs:lines", {
+      streamID: "stream-1",
+      lines: Array.from({ length: 50_000 }, (_, index) =>
+        logLine({
+          text:
+            index === 0 || index >= 49_998
+              ? `needle ${index}`
+              : `ordinary ${index}`,
+        }),
+      ),
+    });
+
+    fireEvent.change(screen.getByLabelText("Search logs"), {
+      target: { value: "needle" },
+    });
+    await waitFor(() => expect(screen.getByText("1/3")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    expect(screen.getByText("3/3")).toBeInTheDocument();
+
+    emitRuntimeEvent("logs:lines", {
+      streamID: "stream-1",
+      lines: [logLine({ text: "new nonmatching line" })],
+    });
+
+    expect(screen.getByText("2/2")).toBeInTheDocument();
+  });
+
   it("accepts initial log lines before the stream state effect can commit", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
     const logStart = deferred<string>();

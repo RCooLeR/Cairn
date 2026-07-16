@@ -119,6 +119,7 @@ export const Components = () => {
           },
           { id: "state", header: "State", render: (row) => row.state },
         ]}
+        datasetKey="component-gallery-workers"
         getRowID={(row) => row.id}
         onToggleAllRows={(ids, isSelected) =>
           setSelected((current) => {

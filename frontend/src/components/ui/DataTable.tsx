@@ -39,6 +39,14 @@ export type DataTableColumn<T> = {
 
 type DataTableProps<T> = {
   columns: Array<DataTableColumn<T>>;
+  /**
+   * Identifies the logical query and resource scope represented by `rows`.
+   * Keep this stable for refreshes of the same query, and change it when a
+   * filter, search, or resource scope changes. Changing this key, the row
+   * count, or the sort resets the virtual window; same-query row refreshes
+   * preserve it.
+   */
+  datasetKey: string;
   rows: T[];
   getRowID: (row: T) => string;
   ariaLabel?: string;
@@ -64,6 +72,7 @@ export function DataTable<T>({
   ariaLabel = "Data table",
   bulkActions,
   columns,
+  datasetKey,
   empty,
   getRowID,
   onToggleRow,
@@ -83,12 +92,6 @@ export function DataTable<T>({
     y: number;
   } | null>(null);
   const activeSort = sort && !hiddenColumnIDs.has(sort.columnID) ? sort : null;
-  const virtualWindowKey = `${rows.length}:${activeSort?.columnID ?? ""}:${activeSort?.direction ?? ""}`;
-  const [scrollState, setScrollState] = useState<ScrollState>({
-    key: virtualWindowKey,
-    top: 0,
-  });
-  const scrollTop = scrollState.key === virtualWindowKey ? scrollState.top : 0;
   const resizeCleanupRef = useRef<(() => void) | null>(null);
   const selectAllRef = useRef<HTMLInputElement>(null);
   const scrollViewportRef = useRef<HTMLDivElement>(null);
@@ -149,6 +152,32 @@ export function DataTable<T>({
   const visibleCount = Math.ceil(virtualViewportHeight / virtualRowHeight);
   const virtualWindowSize = visibleCount + virtualOverscanRows * 2;
   const maxVirtualStart = Math.max(0, visibleRows.length - virtualWindowSize);
+  const maxScrollTop = virtualized
+    ? Math.max(
+        0,
+        (visibleRows.length + 1) * virtualRowHeight - virtualViewportHeight,
+      )
+    : 0;
+  const virtualWindowKey = JSON.stringify([
+    datasetKey,
+    rows.length,
+    activeSort?.columnID ?? null,
+    activeSort?.direction ?? null,
+  ]);
+  const [scrollState, setScrollState] = useState<ScrollState>({
+    key: virtualWindowKey,
+    top: 0,
+  });
+  // Adjusting state behind a guarded prop-derived key makes React retry this
+  // component before its children render, so a replaced dataset never paints
+  // with the previous virtual offset.
+  if (scrollState.key !== virtualWindowKey) {
+    setScrollState({ key: virtualWindowKey, top: 0 });
+  }
+  const scrollTop =
+    scrollState.key === virtualWindowKey
+      ? Math.min(scrollState.top, maxScrollTop)
+      : 0;
   const virtualStart = virtualized
     ? Math.min(
         Math.max(
@@ -312,10 +341,15 @@ export function DataTable<T>({
   };
 
   useLayoutEffect(() => {
-    if (scrollViewportRef.current) {
-      scrollViewportRef.current.scrollTop = 0;
+    const viewport = scrollViewportRef.current;
+    if (!viewport) {
+      return;
     }
-  }, [rows.length, activeSort?.columnID, activeSort?.direction]);
+
+    if (viewport.scrollTop !== scrollTop) {
+      viewport.scrollTop = scrollTop;
+    }
+  }, [rows, scrollTop]);
 
   useEffect(() => {
     if (selectAllRef.current) {
@@ -421,7 +455,7 @@ export function DataTable<T>({
           if (virtualized) {
             setScrollState({
               key: virtualWindowKey,
-              top: event.currentTarget.scrollTop,
+              top: Math.min(event.currentTarget.scrollTop, maxScrollTop),
             });
           }
         }}

@@ -195,6 +195,7 @@ describe("UI kit", () => {
             sortValue: (row) => row.name,
           },
         ]}
+        datasetKey="workers"
         getRowID={(row) => row.name}
         ariaLabel="Workers"
         rows={[{ name: "worker" }, { name: "api" }]}
@@ -231,6 +232,7 @@ describe("UI kit", () => {
             render: (row) => row.status,
           },
         ]}
+        datasetKey="workers"
         getRowID={(row) => row.name}
         ariaLabel="Workers"
         rows={[{ name: "api", status: "running" }]}
@@ -275,6 +277,7 @@ describe("UI kit", () => {
             render: (row) => row.status,
           },
         ]}
+        datasetKey="workers"
         getRowID={(row) => row.name}
         ariaLabel="Workers"
         rows={[{ name: "api", status: "running" }]}
@@ -326,6 +329,7 @@ describe("UI kit", () => {
             render: (row: { name: string }) => row.name,
           },
         ]}
+        datasetKey="workers"
         getRowID={(row) => row.name}
         ariaLabel="Workers"
         rows={[{ name: "api" }]}
@@ -359,6 +363,7 @@ describe("UI kit", () => {
             render: (row: { name: string }) => row.name,
           },
         ]}
+        datasetKey="workers"
         getRowID={(row) => row.name}
         onToggleAllRows={onToggleAll}
         onToggleRow={onToggle}
@@ -531,6 +536,7 @@ describe("UI kit", () => {
             render: (row) => row.label,
           },
         ]}
+        datasetKey="seed-inventory"
         getRowID={(row) => row.id}
         rows={rows}
       />,
@@ -555,6 +561,7 @@ describe("UI kit", () => {
             render: (row) => row.label,
           },
         ]}
+        datasetKey="virtual-workers"
         getRowID={(row) => row.id}
         rows={rows}
       />,
@@ -597,6 +604,7 @@ describe("UI kit", () => {
             render: (row) => row.label,
           },
         ]}
+        datasetKey="mutable-rows"
         getRowID={(row) => row.id}
         rows={rows}
       />
@@ -611,5 +619,71 @@ describe("UI kit", () => {
 
     expect(screen.getByText("Row 0")).toBeInTheDocument();
     expect(screen.queryByText("Row 129")).not.toBeInTheDocument();
+  });
+
+  it("resets the virtual window for a distinct same-length dataset", () => {
+    const makeRows = (dataset: string) =>
+      Array.from({ length: 200 }, (_, index) => ({
+        id: `${dataset}-row-${index}`,
+        label: `${dataset} Row ${index}`,
+      }));
+    const table = (dataset: string) => (
+      <DataTable
+        columns={[
+          {
+            id: "label",
+            header: "Label",
+            render: (row) => row.label,
+          },
+        ]}
+        datasetKey={`workers:${dataset}`}
+        getRowID={(row) => row.id}
+        rows={makeRows(dataset)}
+      />
+    );
+
+    const { rerender } = render(table("Primary"));
+    const viewport = screen.getByRole("table").parentElement as HTMLElement;
+    fireEvent.scroll(viewport, { target: { scrollTop: 4400 } });
+
+    expect(screen.queryByText("Primary Row 0")).not.toBeInTheDocument();
+
+    rerender(table("Replacement"));
+
+    expect(viewport.scrollTop).toBe(0);
+    expect(screen.getByText("Replacement Row 0")).toBeInTheDocument();
+    expect(screen.queryByText("Replacement Row 199")).not.toBeInTheDocument();
+  });
+
+  it("preserves the virtual window for a same-query row refresh", () => {
+    const makeRows = (label: string) =>
+      Array.from({ length: 200 }, (_, index) => ({
+        id: `row-${index}`,
+        label: `${label} Row ${index}`,
+      }));
+    const table = (label: string) => (
+      <DataTable
+        columns={[
+          {
+            id: "label",
+            header: "Label",
+            render: (row) => row.label,
+          },
+        ]}
+        datasetKey="workers:active"
+        getRowID={(row) => row.id}
+        rows={makeRows(label)}
+      />
+    );
+
+    const { rerender } = render(table("Initial"));
+    const viewport = screen.getByRole("table").parentElement as HTMLElement;
+    fireEvent.scroll(viewport, { target: { scrollTop: 4400 } });
+
+    rerender(table("Refreshed"));
+
+    expect(viewport.scrollTop).toBe(4400);
+    expect(screen.queryByText("Refreshed Row 0")).not.toBeInTheDocument();
+    expect(screen.getAllByText(/^Refreshed Row /)).not.toHaveLength(0);
   });
 });

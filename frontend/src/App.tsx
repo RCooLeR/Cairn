@@ -635,6 +635,20 @@ type LogErrorPayload = {
   error?: string;
 };
 
+type BufferedLogLine = LogLine & {
+  readonly bufferSequence: number;
+};
+
+type LogMatch = {
+  rowIndex: number;
+  sequence: number;
+};
+
+type ActiveLogMatch = {
+  selectionKey: string;
+  sequence: number;
+};
+
 type DashboardMetricID = "cpu" | "gpu" | "memory" | "network";
 type DashboardRangeID = "5m" | "1h" | "24h";
 
@@ -2892,6 +2906,10 @@ function App() {
   const pageTitle =
     navItems.find((item) => item.id === activePage)?.label ?? "Overview";
   const providerStatus = activeProvider?.status;
+  const datasetScopeKey = JSON.stringify([
+    activeProvider?.id ?? null,
+    providerStatus?.currentContext ?? null,
+  ]);
   const providerProblems = providerStatus?.problems ?? [];
   const providerWarnings = providerStatus?.warnings ?? [];
   const permissionProblem =
@@ -5987,6 +6005,7 @@ function App() {
               backupsError={backupsError}
               backupsLoading={backupsStatus === "loading"}
               commandOutput={projectCommandOutputs[projectID] ?? null}
+              datasetScopeKey={datasetScopeKey}
               detail={projectDetail}
               error={
                 projectDetailState.requestedID === activeProjectID
@@ -6055,6 +6074,7 @@ function App() {
           <ProjectsPage
             error={projectsError}
             actionBusyIDs={busyActionIDs}
+            datasetScopeKey={datasetScopeKey}
             filter={projectFilter}
             loading={projectsStatus === "loading"}
             mutationsDisabled={mutationsDisabled}
@@ -6079,6 +6099,7 @@ function App() {
           <UpdatesPage
             checkJobID={updateCheckJobID}
             checkProgress={updateCheckProgress}
+            datasetScopeKey={datasetScopeKey}
             error={updatesError}
             filter={updateFilter}
             history={updateHistory}
@@ -6321,6 +6342,7 @@ function App() {
           <ContainersPage
             actionBusyIDs={busyActionIDs}
             containers={containers}
+            datasetScopeKey={datasetScopeKey}
             filter={containerFilter}
             loading={inventoryStatus === "loading"}
             mutationsDisabled={mutationsDisabled}
@@ -6340,6 +6362,7 @@ function App() {
       case "images":
         return (
           <ImagesPage
+            datasetScopeKey={datasetScopeKey}
             filter={imageFilter}
             imageUseCounts={imageUseCounts}
             images={images}
@@ -6361,6 +6384,7 @@ function App() {
       case "volumes":
         return (
           <VolumesPage
+            datasetScopeKey={datasetScopeKey}
             filter={volumeFilter}
             loading={inventoryStatus === "loading"}
             mutationsDisabled={mutationsDisabled}
@@ -6388,6 +6412,7 @@ function App() {
           return (
             <NetworkDetailPage
               containers={containers}
+              datasetScopeKey={datasetScopeKey}
               detail={
                 activeNetworkID ? networkDetails[activeNetworkID] : undefined
               }
@@ -6415,6 +6440,7 @@ function App() {
         }
         return (
           <NetworksPage
+            datasetScopeKey={datasetScopeKey}
             loading={inventoryStatus === "loading"}
             mutationsDisabled={mutationsDisabled}
             mutationDisabledReason={mutationDisabledReason}
@@ -9778,7 +9804,7 @@ function LogsPage({
   const [selectedContainerIDs, setSelectedContainerIDs] = useState<string[]>(
     initialContainerIDs ?? [],
   );
-  const [lines, setLines] = useState<LogLine[]>([]);
+  const [lines, setLines] = useState<BufferedLogLine[]>([]);
   const [streamID, setStreamID] = useState<string | null>(null);
   const streamIDRef = useRef<string | null>(null);
   const [streamStatus, setStreamStatus] = useState<LoadStatus>("idle");
@@ -9798,7 +9824,7 @@ function LogsPage({
   const [query, setQuery] = useState("");
   const [debouncedQuery, setDebouncedQuery] = useState("");
   const [hideNonMatching, setHideNonMatching] = useState(false);
-  const [activeMatch, setActiveMatch] = useState(0);
+  const [activeMatch, setActiveMatch] = useState<ActiveLogMatch | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportHeight, setViewportHeight] = useState(520);
   const [exportLogs, setExportLogs] =
@@ -9807,6 +9833,7 @@ function LogsPage({
   const followScrollRAFRef = useRef<number | null>(null);
   const followScrollTimerRef = useRef<number | null>(null);
   const lastFollowScrollAtRef = useRef(0);
+  const nextLogSequenceRef = useRef(0);
 
   const projectOptions = useMemo<LogOption[]>(
     () =>
@@ -9887,10 +9914,6 @@ function LogsPage({
   }, [query]);
 
   useEffect(() => {
-    setActiveMatch(0);
-  }, [debouncedQuery, hideNonMatching, sourceFilter, levelFilters]);
-
-  useEffect(() => {
     const node = viewerRef.current;
     if (!node) {
       return undefined;
@@ -9917,8 +9940,12 @@ function LogsPage({
       if (nextLines.length === 0) {
         return;
       }
+      const bufferedLines = nextLines.map((line) => ({
+        ...line,
+        bufferSequence: nextLogSequenceRef.current++,
+      }));
       setLines((current) => {
-        const merged = current.concat(nextLines);
+        const merged = current.concat(bufferedLines);
         return merged.length > logBufferLimit
           ? merged.slice(merged.length - logBufferLimit)
           : merged;
@@ -10054,18 +10081,38 @@ function LogsPage({
       visibleSource,
     ],
   );
+  const matchSelectionKey = useMemo(
+    () =>
+      [
+        debouncedQuery,
+        hideNonMatching ? "matches" : "all",
+        sourceFilter ?? "",
+        Array.from(levelFilters).sort().join(","),
+      ].join("\u0000"),
+    [debouncedQuery, hideNonMatching, levelFilters, sourceFilter],
+  );
   const matchRows = useMemo(() => {
     if (!debouncedQuery) {
       return [];
     }
-    const rows: number[] = [];
+    const rows: LogMatch[] = [];
     filteredLines.forEach((line, index) => {
       if (line.text.toLowerCase().includes(debouncedQuery)) {
-        rows.push(index);
+        rows.push({ rowIndex: index, sequence: line.bufferSequence });
       }
     });
     return rows;
   }, [debouncedQuery, filteredLines]);
+  const selectedMatchIndex =
+    activeMatch?.selectionKey === matchSelectionKey
+      ? matchRows.findIndex((match) => match.sequence === activeMatch.sequence)
+      : -1;
+  const activeMatchIndex =
+    matchRows.length === 0 ? -1 : Math.max(0, selectedMatchIndex);
+  const activeMatchSequence =
+    activeMatchIndex >= 0 ? matchRows[activeMatchIndex].sequence : null;
+  const activeMatchRow =
+    activeMatchIndex >= 0 ? matchRows[activeMatchIndex].rowIndex : null;
   const rowHeight = wrapLines ? 44 : 26;
   const totalHeight = filteredLines.length * rowHeight;
   const virtualStart = Math.max(
@@ -10083,6 +10130,24 @@ function LogsPage({
     !follow && !paused && unpinnedAt !== null
       ? Math.max(0, filteredLines.length - unpinnedAt)
       : 0;
+
+  useEffect(() => {
+    setActiveMatch((current) => {
+      if (activeMatchSequence === null) {
+        return current === null ? current : null;
+      }
+      if (
+        current?.selectionKey === matchSelectionKey &&
+        current.sequence === activeMatchSequence
+      ) {
+        return current;
+      }
+      return {
+        selectionKey: matchSelectionKey,
+        sequence: activeMatchSequence,
+      };
+    });
+  }, [activeMatchSequence, matchSelectionKey]);
 
   useEffect(() => {
     if (!follow || paused) {
@@ -10159,16 +10224,31 @@ function LogsPage({
         return;
       }
       setActiveMatch((current) => {
+        const currentIndex =
+          current?.selectionKey === matchSelectionKey
+            ? matchRows.findIndex(
+                (match) => match.sequence === current.sequence,
+              )
+            : -1;
         const next =
-          (current + direction + matchRows.length) % matchRows.length;
+          ((currentIndex >= 0 ? currentIndex : 0) +
+            direction +
+            matchRows.length) %
+          matchRows.length;
         const node = viewerRef.current;
         if (node) {
-          node.scrollTop = Math.max(0, matchRows[next] * rowHeight - rowHeight);
+          node.scrollTop = Math.max(
+            0,
+            matchRows[next].rowIndex * rowHeight - rowHeight,
+          );
         }
-        return next;
+        return {
+          selectionKey: matchSelectionKey,
+          sequence: matchRows[next].sequence,
+        };
       });
     },
-    [matchRows, rowHeight],
+    [matchRows, matchSelectionKey, rowHeight],
   );
 
   const browseExportPath = useCallback(async () => {
@@ -10352,7 +10432,8 @@ function LogsPage({
                 Next
               </Button>
               <Badge>
-                {matchRows.length > 0 ? activeMatch + 1 : 0}/{matchRows.length}
+                {activeMatchIndex >= 0 ? activeMatchIndex + 1 : 0}/
+                {matchRows.length}
               </Badge>
             </div>
 
@@ -10521,8 +10602,8 @@ function LogsPage({
                 const rowIndex = virtualStart + offset;
                 return (
                   <LogRow
-                    activeSearch={matchRows[activeMatch] === rowIndex}
-                    key={`${rowIndex}:${line.ts}:${line.containerID ?? line.containerName ?? ""}:${line.text}`}
+                    activeSearch={activeMatchRow === rowIndex}
+                    key={line.bufferSequence}
                     line={line}
                     onSourceClick={setSourceFilter}
                     query={debouncedQuery}
@@ -11017,6 +11098,7 @@ type ProjectsPageProps = {
   projects: ProjectSummary[];
   projectSparks: Record<string, SparkPoint[]>;
   actionBusyIDs: Set<string>;
+  datasetScopeKey: string;
   filter: FilterID;
   search: string;
   sort: ProjectSortID;
@@ -11037,6 +11119,7 @@ type ProjectsPageProps = {
 
 function ProjectsPage({
   actionBusyIDs,
+  datasetScopeKey,
   error,
   filter,
   loading,
@@ -11198,6 +11281,13 @@ function ProjectsPage({
       ) : (
         <ProjectList
           actionBusyIDs={actionBusyIDs}
+          datasetKey={JSON.stringify([
+            "projects",
+            datasetScopeKey,
+            filter,
+            search,
+            sort,
+          ])}
           mutationsDisabled={mutationsDisabled}
           mutationDisabledReason={mutationDisabledReason}
           onAction={onAction}
@@ -11223,6 +11313,7 @@ function ProjectsPage({
 function UpdatesPage({
   checkJobID,
   checkProgress,
+  datasetScopeKey,
   error,
   filter,
   history,
@@ -11266,6 +11357,7 @@ function UpdatesPage({
   lastCheckAt: number | null;
   checkJobID: string | null;
   checkProgress: UpdateProgressEntry | null;
+  datasetScopeKey: string;
   mutationsDisabled: boolean;
   mutationDisabledReason: string;
   onCheckNow: () => void;
@@ -11526,6 +11618,13 @@ function UpdatesPage({
                         ),
                       },
                     ]}
+                    datasetKey={JSON.stringify([
+                      "updates",
+                      datasetScopeKey,
+                      group.projectID || group.projectName,
+                      filter,
+                      search,
+                    ])}
                     empty={
                       <EmptyState
                         body="This project has no matching update rows."
@@ -11545,6 +11644,7 @@ function UpdatesPage({
 
       {tab === "history" ? (
         <UpdateHistoryTable
+          datasetScopeKey={datasetScopeKey}
           error={historyError}
           history={history}
           loading={historyLoading}
@@ -11555,6 +11655,7 @@ function UpdatesPage({
 
       {tab === "ignored" ? (
         <IgnoredUpdatesTable
+          datasetScopeKey={datasetScopeKey}
           error={ignoredError}
           ignored={ignored}
           loading={ignoredLoading}
@@ -11567,12 +11668,14 @@ function UpdatesPage({
 }
 
 function UpdateHistoryTable({
+  datasetScopeKey,
   error,
   history,
   loading,
   onRollback,
   projects,
 }: {
+  datasetScopeKey: string;
   history: UpdateHistoryItem[];
   projects: ProjectSummary[];
   loading: boolean;
@@ -11657,6 +11760,7 @@ function UpdateHistoryTable({
               ) : null,
           },
         ]}
+        datasetKey={JSON.stringify(["update-history", datasetScopeKey])}
         empty={
           <EmptyState
             body="Applied update results land here."
@@ -11676,12 +11780,14 @@ function HistoryIcon() {
 }
 
 function IgnoredUpdatesTable({
+  datasetScopeKey,
   error,
   ignored,
   loading,
   onUnignore,
   projects,
 }: {
+  datasetScopeKey: string;
   ignored: ImageUpdate[];
   projects: ProjectSummary[];
   loading: boolean;
@@ -11734,6 +11840,7 @@ function IgnoredUpdatesTable({
             ),
           },
         ]}
+        datasetKey={JSON.stringify(["ignored-updates", datasetScopeKey])}
         empty={
           <EmptyState
             body="Ignored updates appear here with their reason and scope."
@@ -11985,6 +12092,7 @@ function ProjectCard({
 
 function ProjectList({
   actionBusyIDs,
+  datasetKey,
   mutationsDisabled,
   mutationDisabledReason,
   onAction,
@@ -11994,6 +12102,7 @@ function ProjectList({
 }: {
   projects: ProjectSummary[];
   actionBusyIDs: Set<string>;
+  datasetKey: string;
   mutationsDisabled: boolean;
   mutationDisabledReason: string;
   onAction: (action: ProjectAction, project: ProjectSummary) => void;
@@ -12106,6 +12215,7 @@ function ProjectList({
           ),
         },
       ]}
+      datasetKey={datasetKey}
       empty={
         <EmptyState
           body="Import a Compose project to populate this list."
@@ -12261,6 +12371,7 @@ function ProjectDetailPage({
   backupsError,
   backupsLoading,
   commandOutput,
+  datasetScopeKey,
   detail,
   dockerRunning,
   error,
@@ -12297,6 +12408,7 @@ function ProjectDetailPage({
   backupsError: string | null;
   backupsLoading: boolean;
   commandOutput: ProjectCommandOutputState | null;
+  datasetScopeKey: string;
   dockerRunning: boolean;
   inventoryLoading: boolean;
   loading: boolean;
@@ -12512,6 +12624,7 @@ function ProjectDetailPage({
       ) : null}
       {tab === "services" ? (
         <ProjectServicesTab
+          datasetScopeKey={datasetScopeKey}
           detail={detail}
           onOpenContainerDrilldown={openContainerDrilldown}
         />
@@ -12519,6 +12632,7 @@ function ProjectDetailPage({
       {tab === "containers" ? (
         <ProjectContainersTab
           actionBusyIDs={actionBusyIDs}
+          datasetScopeKey={datasetScopeKey}
           detail={detail}
           dockerRunning={dockerRunning}
           mutationsDisabled={mutationsDisabled}
@@ -12557,6 +12671,7 @@ function ProjectDetailPage({
       {tab === "backups" ? (
         <ProjectBackupsTab
           backups={backups.filter((backup) => backup.projectID === project.id)}
+          datasetScopeKey={datasetScopeKey}
           error={backupsError}
           loading={backupsLoading}
           mutationsDisabled={mutationsDisabled}
@@ -12564,6 +12679,7 @@ function ProjectDetailPage({
           onBackupVolume={onBackupVolume}
           onDeleteBackup={onDeleteBackup}
           onRestoreBackup={onRestoreBackup}
+          projectID={project.id}
           volumes={projectVolumes}
         />
       ) : null}
@@ -12921,9 +13037,11 @@ function ProjectOverviewTab({
 }
 
 function ProjectServicesTab({
+  datasetScopeKey,
   detail,
   onOpenContainerDrilldown,
 }: {
+  datasetScopeKey: string;
   detail: ProjectDetail;
   onOpenContainerDrilldown: (
     container: ContainerSummary,
@@ -13013,6 +13131,11 @@ function ProjectServicesTab({
           sortable: true,
         },
       ]}
+      datasetKey={JSON.stringify([
+        "project-services",
+        datasetScopeKey,
+        detail.summary.id,
+      ])}
       empty={
         <EmptyState
           body="No Compose services are recorded for this project."
@@ -13028,6 +13151,7 @@ function ProjectServicesTab({
 
 function ProjectContainersTab({
   actionBusyIDs,
+  datasetScopeKey,
   detail,
   dockerRunning,
   mutationsDisabled,
@@ -13037,6 +13161,7 @@ function ProjectContainersTab({
   onOpenContainerTerminal,
 }: {
   actionBusyIDs: Set<string>;
+  datasetScopeKey: string;
   detail: ProjectDetail;
   dockerRunning: boolean;
   mutationsDisabled: boolean;
@@ -13187,6 +13312,11 @@ function ProjectContainersTab({
             ),
           },
         ]}
+        datasetKey={JSON.stringify([
+          "project-containers",
+          datasetScopeKey,
+          detail.summary.id,
+        ])}
         empty={
           <EmptyState
             body="No containers are currently associated with this project."
@@ -14044,6 +14174,7 @@ function ProjectComposeTab({ detail }: { detail: ProjectDetail }) {
 
 function ProjectBackupsTab({
   backups,
+  datasetScopeKey,
   error,
   loading,
   mutationsDisabled,
@@ -14051,13 +14182,16 @@ function ProjectBackupsTab({
   onBackupVolume,
   onDeleteBackup,
   onRestoreBackup,
+  projectID,
   volumes,
 }: {
   backups: BackupSummary[];
+  datasetScopeKey: string;
   error: string | null;
   loading: boolean;
   mutationsDisabled: boolean;
   mutationDisabledReason: string;
+  projectID: string;
   volumes: VolumeSummary[];
   onBackupVolume: (volume: VolumeSummary) => void;
   onDeleteBackup: (backup: BackupSummary) => void;
@@ -14189,6 +14323,11 @@ function ProjectBackupsTab({
             ),
           },
         ]}
+        datasetKey={JSON.stringify([
+          "project-backups",
+          datasetScopeKey,
+          projectID,
+        ])}
         empty={
           <EmptyState
             body={
@@ -14312,6 +14451,7 @@ function ContainerDetailPage({
 
 type ContainersPageProps = {
   containers: ContainerSummary[];
+  datasetScopeKey: string;
   filter: FilterID;
   search: string;
   loading: boolean;
@@ -14332,6 +14472,7 @@ type ContainersPageProps = {
 function ContainersPage({
   actionBusyIDs,
   containers,
+  datasetScopeKey,
   filter,
   loading,
   mutationsDisabled,
@@ -14524,6 +14665,12 @@ function ContainersPage({
             onAction={onBulkAction}
           />
         }
+        datasetKey={JSON.stringify([
+          "containers",
+          datasetScopeKey,
+          filter,
+          search,
+        ])}
         empty={
           <EmptyState
             body="Run your first container or import a Compose project."
@@ -14545,6 +14692,7 @@ function ContainersPage({
 type ImagesPageProps = {
   images: ImageSummary[];
   imageUseCounts: Record<string, number>;
+  datasetScopeKey: string;
   filter: FilterID;
   search: string;
   loading: boolean;
@@ -14562,6 +14710,7 @@ type ImagesPageProps = {
 };
 
 function ImagesPage({
+  datasetScopeKey,
   filter,
   imageUseCounts,
   images,
@@ -14714,6 +14863,7 @@ function ImagesPage({
             ),
           },
         ]}
+        datasetKey={JSON.stringify(["images", datasetScopeKey, filter, search])}
         empty={
           <EmptyState
             body="No images yet - pull one or import a project."
@@ -14731,6 +14881,7 @@ function ImagesPage({
 type VolumesPageProps = {
   volumes: VolumeSummary[];
   volumeDetails: Record<string, VolumeDetail>;
+  datasetScopeKey: string;
   filter: FilterID;
   search: string;
   loading: boolean;
@@ -14745,6 +14896,7 @@ type VolumesPageProps = {
 };
 
 function VolumesPage({
+  datasetScopeKey,
   filter,
   loading,
   mutationsDisabled,
@@ -14879,6 +15031,12 @@ function VolumesPage({
             ),
           },
         ]}
+        datasetKey={JSON.stringify([
+          "volumes",
+          datasetScopeKey,
+          filter,
+          search,
+        ])}
         empty={
           <EmptyState
             body="No volumes - they appear when containers create them."
@@ -14896,6 +15054,7 @@ function VolumesPage({
 type NetworksPageProps = {
   networks: NetworkSummary[];
   networkDetails: Record<string, NetworkDetail>;
+  datasetScopeKey: string;
   search: string;
   loading: boolean;
   mutationsDisabled: boolean;
@@ -14906,6 +15065,7 @@ type NetworksPageProps = {
 };
 
 function NetworksPage({
+  datasetScopeKey,
   loading,
   mutationsDisabled,
   mutationDisabledReason,
@@ -15018,6 +15178,7 @@ function NetworksPage({
             ),
           },
         ]}
+        datasetKey={JSON.stringify(["networks", datasetScopeKey, search])}
         empty={
           <EmptyState
             body="System-only networks are normal on a new daemon."
@@ -15034,6 +15195,7 @@ function NetworksPage({
 
 type NetworkDetailPageProps = {
   containers: ContainerSummary[];
+  datasetScopeKey: string;
   detail?: NetworkDetail;
   loading: boolean;
   mutationsDisabled: boolean;
@@ -15050,6 +15212,7 @@ type NetworkDetailPageProps = {
 
 function NetworkDetailPage({
   containers,
+  datasetScopeKey,
   detail,
   loading,
   mutationsDisabled,
@@ -15182,12 +15345,20 @@ function NetworkDetailPage({
       {tab === "containers" ? (
         <NetworkContainersTab
           containers={attachedContainers}
+          datasetScopeKey={datasetScopeKey}
+          networkID={summary.id}
           onOpenContainerInspect={onOpenContainerInspect}
           onOpenContainerTerminal={onOpenContainerTerminal}
         />
       ) : null}
 
-      {tab === "labels" ? <NetworkLabelsTab labels={labelRows} /> : null}
+      {tab === "labels" ? (
+        <NetworkLabelsTab
+          datasetScopeKey={datasetScopeKey}
+          labels={labelRows}
+          networkID={summary.id}
+        />
+      ) : null}
 
       {tab === "raw" ? (
         <Card>
@@ -15298,10 +15469,14 @@ function NetworkOverviewTab({
 
 function NetworkContainersTab({
   containers,
+  datasetScopeKey,
+  networkID,
   onOpenContainerInspect,
   onOpenContainerTerminal,
 }: {
   containers: ContainerSummary[];
+  datasetScopeKey: string;
+  networkID: string;
   onOpenContainerInspect: (container: ContainerSummary) => void;
   onOpenContainerTerminal: (container: ContainerSummary) => void;
 }) {
@@ -15466,6 +15641,11 @@ function NetworkContainersTab({
           ),
         },
       ]}
+      datasetKey={JSON.stringify([
+        "network-containers",
+        datasetScopeKey,
+        networkID,
+      ])}
       empty={
         <EmptyState
           body="No containers are currently attached to this network."
@@ -15480,9 +15660,13 @@ function NetworkContainersTab({
 }
 
 function NetworkLabelsTab({
+  datasetScopeKey,
   labels,
+  networkID,
 }: {
+  datasetScopeKey: string;
   labels: Array<{ key: string; value: string }>;
+  networkID: string;
 }) {
   return (
     <DataTable
@@ -15524,6 +15708,11 @@ function NetworkLabelsTab({
           ),
         },
       ]}
+      datasetKey={JSON.stringify([
+        "network-labels",
+        datasetScopeKey,
+        networkID,
+      ])}
       empty={
         <EmptyState
           body="This network does not expose Docker labels."
