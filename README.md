@@ -95,6 +95,8 @@ Run in development mode:
 task dev
 ```
 
+Wails server mode is not a supported deployment target because Cairn's desktop services are not a remotely safe API. Stable server and server-container builds are blocked. The narrowly scoped, explicitly acknowledged test path is documented in [docs/development-server-mode.md](docs/development-server-mode.md).
+
 ## Releases
 
 CI builds native installers on each target OS and GoReleaser publishes tagged releases with checksums:

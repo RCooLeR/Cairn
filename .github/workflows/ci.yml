@@ -94,6 +94,16 @@ jobs:
         working-directory: frontend
         run: npm run build
 
+      - name: Server mode containment
+        shell: pwsh
+        run: ./scripts/check-server-mode-containment.ps1 -CompileCheck
+
+      - name: Development server guard tests
+        if: runner.os == 'Linux'
+        env:
+          CGO_ENABLED: "0"
+        run: go test -tags=server,cairn_server_dev .
+
       - name: Go unit tests
         run: go test . ./internal/...
 

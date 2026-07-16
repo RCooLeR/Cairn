@@ -1,3 +1,5 @@
+//go:build !server || cairn_server_dev
+
 package main
 
 import (
@@ -11,6 +13,9 @@ import (
 var assets embed.FS
 
 func main() {
+	if err := configureServerMode(); err != nil {
+		log.Fatal(err)
+	}
 	if err := shell.Run(assets); err != nil {
 		log.Fatal(err)
 	}
