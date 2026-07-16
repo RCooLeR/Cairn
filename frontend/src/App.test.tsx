@@ -1247,6 +1247,550 @@ describe("App inventory shell", () => {
     );
   });
 
+  it("replaces an in-flight notification snapshot after a payload event without losing unrelated rows", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    const initialRead = deferred<Notification[]>();
+    const replacementRead = deferred<Notification[]>();
+    settingsServiceMock.GetNotifications.mockImplementationOnce(
+      () => initialRead.promise,
+    );
+    settingsServiceMock.GetNotifications.mockImplementationOnce(
+      () => replacementRead.promise,
+    );
+    const liveNotification: Notification = {
+      id: 3,
+      level: "info",
+      title: "Project reconciled",
+      body: "The project snapshot is current.",
+      topic: "project",
+      read: false,
+      createdAt: "2026-06-13T09:05:00Z",
+    };
+
+    render(<App />);
+
+    await waitFor(() =>
+      expect(settingsServiceMock.GetNotifications).toHaveBeenCalledTimes(1),
+    );
+    emitRuntimeEvent("notification", liveNotification);
+    await waitFor(() =>
+      expect(settingsServiceMock.GetNotifications).toHaveBeenCalledTimes(2),
+    );
+
+    await act(async () => {
+      replacementRead.resolve([liveNotification, ...seededNotifications()]);
+      await replacementRead.promise;
+    });
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Notifications 2 unread" }),
+    );
+    const dialog = await screen.findByRole("dialog", {
+      name: "Notification center",
+    });
+    expect(within(dialog).getByText("Project reconciled")).toBeInTheDocument();
+    expect(within(dialog).getByText("Provider degraded")).toBeInTheDocument();
+
+    await act(async () => {
+      initialRead.resolve(seededNotifications());
+      await initialRead.promise;
+    });
+    expect(within(dialog).getByText("Project reconciled")).toBeInTheDocument();
+    expect(within(dialog).getByText("Provider degraded")).toBeInTheDocument();
+  });
+
+  it("merges a full refresh that finishes after an individual read succeeds", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    const individualRead = deferred<void>();
+    const fullRefresh = deferred<Notification[]>();
+    settingsServiceMock.GetNotifications.mockResolvedValueOnce(
+      seededNotifications(),
+    );
+    settingsServiceMock.GetNotifications.mockImplementationOnce(
+      () => fullRefresh.promise,
+    );
+    settingsServiceMock.MarkNotificationsRead.mockImplementationOnce(
+      () => individualRead.promise,
+    );
+    const unrelatedNotification: Notification = {
+      id: 3,
+      level: "info",
+      title: "Backup snapshot ready",
+      body: "The volume backup completed.",
+      topic: "backup",
+      read: false,
+      createdAt: "2026-06-13T09:05:00Z",
+    };
+
+    render(<App />);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Notifications 1 unread" }),
+    );
+    fireEvent.click(
+      within(
+        await screen.findByRole("dialog", { name: "Notification center" }),
+      ).getByText("Provider degraded"),
+    );
+    await waitFor(() =>
+      expect(settingsServiceMock.MarkNotificationsRead).toHaveBeenCalledWith([
+        1,
+      ]),
+    );
+
+    emitRuntimeEvent("notification", {});
+    await waitFor(() =>
+      expect(settingsServiceMock.GetNotifications).toHaveBeenCalledTimes(2),
+    );
+    await act(async () => {
+      individualRead.resolve();
+      await individualRead.promise;
+    });
+    await act(async () => {
+      fullRefresh.resolve([...seededNotifications(), unrelatedNotification]);
+      await fullRefresh.promise;
+    });
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Notifications 1 unread" }),
+    );
+    const dialog = await screen.findByRole("dialog", {
+      name: "Notification center",
+    });
+    expect(
+      within(dialog).getByText("Backup snapshot ready"),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByText("1 unread")).toBeInTheDocument();
+  });
+
+  it("keeps a notification mutation failure visible when a newer refresh is pending", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    const markAll = deferred<void>();
+    const fullRefresh = deferred<Notification[]>();
+    settingsServiceMock.GetNotifications.mockResolvedValueOnce(
+      seededNotifications(),
+    );
+    settingsServiceMock.GetNotifications.mockImplementationOnce(
+      () => fullRefresh.promise,
+    );
+    settingsServiceMock.MarkNotificationsRead.mockImplementationOnce(
+      () => markAll.promise,
+    );
+
+    render(<App />);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Notifications 1 unread" }),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Mark all read" }),
+    );
+    await waitFor(() =>
+      expect(settingsServiceMock.MarkNotificationsRead).toHaveBeenCalledWith(
+        [],
+      ),
+    );
+    emitRuntimeEvent("notification", {});
+    await waitFor(() =>
+      expect(settingsServiceMock.GetNotifications).toHaveBeenCalledTimes(2),
+    );
+
+    await act(async () => {
+      markAll.reject(new Error("Mark-all write failed"));
+      try {
+        await markAll.promise;
+      } catch {
+        // The component owns the expected rejection.
+      }
+    });
+    expect(
+      await screen.findByText("Mark-all write failed"),
+    ).toBeInTheDocument();
+    expect(
+      within(
+        screen.getByRole("dialog", { name: "Notification center" }),
+      ).getByText("1 unread"),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      fullRefresh.resolve(seededNotifications());
+      await fullRefresh.promise;
+    });
+    expect(screen.getByText("Mark-all write failed")).toBeInTheDocument();
+  });
+
+  it("does not let an older unread snapshot poison rollback after an individual read succeeds", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    const individualRead = deferred<void>();
+    const olderRefresh = deferred<Notification[]>();
+    const markAll = deferred<void>();
+    const recoveryRefresh = deferred<Notification[]>();
+    const twoUnread = seededNotifications().map((notification) => ({
+      ...notification,
+      read: false,
+    }));
+    settingsServiceMock.GetNotifications.mockResolvedValueOnce(twoUnread);
+    settingsServiceMock.GetNotifications.mockImplementationOnce(
+      () => olderRefresh.promise,
+    );
+    settingsServiceMock.GetNotifications.mockImplementationOnce(
+      () => recoveryRefresh.promise,
+    );
+    settingsServiceMock.MarkNotificationsRead.mockImplementationOnce(
+      () => individualRead.promise,
+    );
+    settingsServiceMock.MarkNotificationsRead.mockImplementationOnce(
+      () => markAll.promise,
+    );
+
+    render(<App />);
+
+    await screen.findByRole("button", { name: "Notifications 2 unread" });
+    emitRuntimeEvent("notification", {});
+    await waitFor(() =>
+      expect(settingsServiceMock.GetNotifications).toHaveBeenCalledTimes(2),
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Notifications 2 unread" }),
+    );
+    fireEvent.click(
+      within(
+        await screen.findByRole("dialog", { name: "Notification center" }),
+      ).getByText("Provider degraded"),
+    );
+    await waitFor(() =>
+      expect(settingsServiceMock.MarkNotificationsRead).toHaveBeenCalledWith([
+        1,
+      ]),
+    );
+    await act(async () => {
+      individualRead.resolve();
+      await individualRead.promise;
+    });
+
+    await act(async () => {
+      olderRefresh.resolve(twoUnread);
+      await olderRefresh.promise;
+    });
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Notifications 1 unread" }),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Mark all read" }),
+    );
+    await waitFor(() =>
+      expect(
+        settingsServiceMock.MarkNotificationsRead,
+      ).toHaveBeenLastCalledWith([]),
+    );
+
+    await act(async () => {
+      markAll.reject(new Error("Mark-all write failed"));
+      try {
+        await markAll.promise;
+      } catch {
+        // The component owns the expected rejection.
+      }
+    });
+    expect(
+      within(
+        screen.getByRole("dialog", { name: "Notification center" }),
+      ).getByText("1 unread"),
+    ).toBeInTheDocument();
+
+    await waitFor(() =>
+      expect(settingsServiceMock.GetNotifications).toHaveBeenCalledTimes(3),
+    );
+    await act(async () => {
+      recoveryRefresh.resolve(
+        twoUnread.map((notification) =>
+          notification.id === 1
+            ? { ...notification, read: true }
+            : notification,
+        ),
+      );
+      await recoveryRefresh.promise;
+    });
+  });
+
+  it("prunes absent notification tracking without dropping a pending read intent", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    const individualRead = deferred<void>();
+    const notification = { ...seededNotifications()[0], read: false };
+    settingsServiceMock.GetNotifications.mockResolvedValueOnce([notification]);
+    settingsServiceMock.GetNotifications.mockResolvedValueOnce([]);
+    settingsServiceMock.GetNotifications.mockResolvedValueOnce([notification]);
+    settingsServiceMock.GetNotifications.mockResolvedValueOnce([]);
+    settingsServiceMock.GetNotifications.mockResolvedValueOnce([notification]);
+    settingsServiceMock.MarkNotificationsRead.mockImplementationOnce(
+      () => individualRead.promise,
+    );
+
+    render(<App />);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Notifications 1 unread" }),
+    );
+    fireEvent.click(
+      within(
+        await screen.findByRole("dialog", { name: "Notification center" }),
+      ).getByText("Provider degraded"),
+    );
+    await waitFor(() =>
+      expect(settingsServiceMock.MarkNotificationsRead).toHaveBeenCalledWith([
+        1,
+      ]),
+    );
+
+    emitRuntimeEvent("notification", {});
+    await waitFor(() =>
+      expect(settingsServiceMock.GetNotifications).toHaveBeenCalledTimes(2),
+    );
+    emitRuntimeEvent("notification", notification);
+    await waitFor(() =>
+      expect(settingsServiceMock.GetNotifications).toHaveBeenCalledTimes(3),
+    );
+    expect(
+      screen.getByRole("button", { name: "Notifications" }),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      individualRead.resolve();
+      await individualRead.promise;
+    });
+    emitRuntimeEvent("notification", {});
+    await waitFor(() =>
+      expect(settingsServiceMock.GetNotifications).toHaveBeenCalledTimes(4),
+    );
+    emitRuntimeEvent("notification", notification);
+    await waitFor(() =>
+      expect(settingsServiceMock.GetNotifications).toHaveBeenCalledTimes(5),
+    );
+    expect(
+      screen.getByRole("button", { name: "Notifications 1 unread" }),
+    ).toBeInTheDocument();
+  });
+
+  it("coalesces notification event bursts into one in-flight and one trailing refresh", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    const firstRefresh = deferred<Notification[]>();
+    const trailingRefresh = deferred<Notification[]>();
+    settingsServiceMock.GetNotifications.mockResolvedValueOnce(
+      seededNotifications(),
+    );
+    settingsServiceMock.GetNotifications.mockImplementationOnce(
+      () => firstRefresh.promise,
+    );
+    settingsServiceMock.GetNotifications.mockImplementationOnce(
+      () => trailingRefresh.promise,
+    );
+    const events = Array.from(
+      { length: 6 },
+      (_, index): Notification => ({
+        id: 20 + index,
+        level: "info",
+        title: `Notification burst ${index + 1}`,
+        body: "Burst payload",
+        topic: "project",
+        read: false,
+        createdAt: `2026-06-13T09:${String(10 + index).padStart(2, "0")}:00Z`,
+      }),
+    );
+
+    render(<App />);
+
+    await waitFor(() =>
+      expect(settingsServiceMock.GetNotifications).toHaveBeenCalledTimes(1),
+    );
+    for (const notification of events.slice(0, 3)) {
+      emitRuntimeEvent("notification", notification);
+    }
+    await waitFor(() =>
+      expect(settingsServiceMock.GetNotifications).toHaveBeenCalledTimes(2),
+    );
+
+    for (const notification of events.slice(3)) {
+      emitRuntimeEvent("notification", notification);
+    }
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    });
+    expect(settingsServiceMock.GetNotifications).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      firstRefresh.resolve([...events.slice(0, 3), ...seededNotifications()]);
+      await firstRefresh.promise;
+    });
+    await waitFor(() =>
+      expect(settingsServiceMock.GetNotifications).toHaveBeenCalledTimes(3),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Notifications 7 unread" }),
+    );
+    expect(await screen.findByText("Notification burst 6")).toBeInTheDocument();
+
+    await act(async () => {
+      trailingRefresh.resolve([...events, ...seededNotifications()]);
+      await trailingRefresh.promise;
+    });
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    });
+    expect(settingsServiceMock.GetNotifications).toHaveBeenCalledTimes(3);
+    expect(screen.getByText("Notification burst 6")).toBeInTheDocument();
+  });
+
+  it("does not let an obsolete notification refresh restore unread state after mark-all", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    const staleRefresh = deferred<Notification[]>();
+    const postMutationRefresh = deferred<Notification[]>();
+    const markAll = deferred<void>();
+    settingsServiceMock.GetNotifications.mockResolvedValueOnce(
+      seededNotifications(),
+    );
+    settingsServiceMock.GetNotifications.mockImplementationOnce(
+      () => staleRefresh.promise,
+    );
+    settingsServiceMock.GetNotifications.mockImplementationOnce(
+      () => postMutationRefresh.promise,
+    );
+    settingsServiceMock.MarkNotificationsRead.mockImplementationOnce(
+      () => markAll.promise,
+    );
+
+    render(<App />);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Notifications 1 unread" }),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Mark all read" }),
+    );
+    await waitFor(() =>
+      expect(settingsServiceMock.MarkNotificationsRead).toHaveBeenCalledWith(
+        [],
+      ),
+    );
+
+    emitRuntimeEvent("notification", {});
+    await waitFor(() =>
+      expect(settingsServiceMock.GetNotifications).toHaveBeenCalledTimes(2),
+    );
+    await act(async () => {
+      markAll.resolve();
+      await markAll.promise;
+    });
+    await waitFor(() =>
+      expect(settingsServiceMock.GetNotifications).toHaveBeenCalledTimes(3),
+    );
+
+    await act(async () => {
+      postMutationRefresh.resolve(
+        seededNotifications().map((notification) => ({
+          ...notification,
+          read: true,
+        })),
+      );
+      await postMutationRefresh.promise;
+    });
+    expect(
+      await screen.findByRole("button", { name: "Notifications" }),
+    ).toBeInTheDocument();
+    expect(
+      within(
+        screen.getByRole("dialog", { name: "Notification center" }),
+      ).getByText("0 unread"),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      staleRefresh.resolve(seededNotifications());
+      await staleRefresh.promise;
+    });
+    expect(
+      screen.getByRole("button", { name: "Notifications" }),
+    ).toBeInTheDocument();
+    expect(
+      within(
+        screen.getByRole("dialog", { name: "Notification center" }),
+      ).getByText("0 unread"),
+    ).toBeInTheDocument();
+  });
+
+  it("does not let an obsolete individual-read failure undo a newer mark-all", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    const individualRead = deferred<void>();
+    const markAll = deferred<void>();
+    const twoUnread = seededNotifications().map((notification) => ({
+      ...notification,
+      read: false,
+    }));
+    settingsServiceMock.GetNotifications.mockResolvedValueOnce(twoUnread);
+    settingsServiceMock.GetNotifications.mockResolvedValueOnce(
+      twoUnread.map((notification) => ({ ...notification, read: true })),
+    );
+    settingsServiceMock.MarkNotificationsRead.mockImplementationOnce(
+      () => individualRead.promise,
+    );
+    settingsServiceMock.MarkNotificationsRead.mockImplementationOnce(
+      () => markAll.promise,
+    );
+
+    render(<App />);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Notifications 2 unread" }),
+    );
+    fireEvent.click(
+      within(
+        await screen.findByRole("dialog", { name: "Notification center" }),
+      ).getByText("Provider degraded"),
+    );
+    await waitFor(() =>
+      expect(settingsServiceMock.MarkNotificationsRead).toHaveBeenCalledWith([
+        1,
+      ]),
+    );
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Notifications 1 unread" }),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Mark all read" }),
+    );
+    await waitFor(() =>
+      expect(
+        settingsServiceMock.MarkNotificationsRead,
+      ).toHaveBeenLastCalledWith([]),
+    );
+    await act(async () => {
+      markAll.resolve();
+      await markAll.promise;
+    });
+    expect(
+      await screen.findByRole("button", { name: "Notifications" }),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      individualRead.reject(new Error("obsolete individual write failed"));
+      try {
+        await individualRead.promise;
+      } catch {
+        // The component owns the expected rejection.
+      }
+    });
+    expect(
+      screen.getByRole("button", { name: "Notifications" }),
+    ).toBeInTheDocument();
+    expect(
+      within(
+        screen.getByRole("dialog", { name: "Notification center" }),
+      ).getByText("0 unread"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("obsolete individual write failed"),
+    ).not.toBeInTheDocument();
+  });
+
   it("rolls back an optimistic notification read when persistence fails", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
     settingsServiceMock.GetNotifications.mockResolvedValue(
@@ -4863,6 +5407,70 @@ describe("App inventory shell", () => {
       within(dialog).getByText("docker compose up -d"),
     ).toBeInTheDocument();
     expect(within(dialog).getByText("linux_native")).toBeInTheDocument();
+  });
+
+  it("keeps the latest audit filter response when requests resolve in reverse order", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    const firstRead = deferred<ReturnType<typeof seededAuditEntries>>();
+    const latestRead = deferred<ReturnType<typeof seededAuditEntries>>();
+    settingsServiceMock.GetAuditLog.mockImplementation(
+      (filter: { topic?: string }) =>
+        filter.topic === "update." ? latestRead.promise : firstRead.promise,
+    );
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", {
+        name: /Settings/,
+      }),
+    );
+    clickSettingsSection("Security & Audit");
+    await waitFor(() =>
+      expect(settingsServiceMock.GetAuditLog).toHaveBeenCalledWith({
+        topic: "",
+        limit: 500,
+      }),
+    );
+    fireEvent.change(await screen.findByLabelText("Range"), {
+      target: { value: "all" },
+    });
+
+    fireEvent.change(await screen.findByLabelText("Action"), {
+      target: { value: "update." },
+    });
+    await waitFor(() =>
+      expect(settingsServiceMock.GetAuditLog).toHaveBeenCalledWith({
+        topic: "update.",
+        limit: 500,
+      }),
+    );
+
+    const latestEntry = {
+      ...seededAuditEntries()[0],
+      id: 101,
+      action: "update.latest",
+    };
+    const staleEntry = {
+      ...seededAuditEntries()[0],
+      id: 102,
+      action: "update.stale",
+    };
+    await act(async () => {
+      latestRead.resolve([latestEntry]);
+      await latestRead.promise;
+    });
+    expect(await screen.findByText("update.latest")).toBeInTheDocument();
+
+    await act(async () => {
+      firstRead.resolve([staleEntry]);
+      await firstRead.promise;
+    });
+    expect(screen.getByText("update.latest")).toBeInTheDocument();
+    expect(screen.queryByText("update.stale")).not.toBeInTheDocument();
   });
 
   it("runs the macOS Colima setup branch through checks and install planning", async () => {

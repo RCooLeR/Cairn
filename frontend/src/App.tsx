@@ -1439,6 +1439,7 @@ function App() {
     status: "",
     projectID: "",
   });
+  const auditReadGenerationRef = useRef(0);
   const [appUpdateNotice, setAppUpdateNotice] =
     useState<AppUpdateNotice | null>(null);
   const [appUpdateNotificationRead, setAppUpdateNotificationRead] =
@@ -1468,10 +1469,30 @@ function App() {
   const providerInstallSessionRef = useRef<ProviderInstallSession | null>(null);
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
-  const [notificationsLoading, setNotificationsLoading] = useState(false);
-  const [notificationsError, setNotificationsError] = useState<string | null>(
-    null,
-  );
+  const [notificationsReadLoading, setNotificationsReadLoading] =
+    useState(false);
+  const [notificationsMutationLoading, setNotificationsMutationLoading] =
+    useState(false);
+  const notificationsLoading =
+    notificationsReadLoading || notificationsMutationLoading;
+  const [notificationsReadError, setNotificationsReadError] = useState<
+    string | null
+  >(null);
+  const [notificationsMutationError, setNotificationsMutationError] = useState<
+    string | null
+  >(null);
+  const notificationsError =
+    notificationsMutationError ?? notificationsReadError;
+  const notificationsRef = useRef<Notification[]>([]);
+  const notificationReadGenerationRef = useRef(0);
+  const notificationMutationGenerationRef = useRef(0);
+  const notificationReadIntentVersionRef = useRef(0);
+  const notificationReadOverridesRef = useRef(new Map<number, number>());
+  const notificationPendingReadIntentsRef = useRef(new Map<number, number>());
+  const notificationServerReadRef = useRef(new Map<number, boolean>());
+  const notificationEventRefreshQueuedRef = useRef(false);
+  const notificationEventRefreshInFlightRef = useRef(false);
+  const notificationEventRefreshTimerRef = useRef<number | null>(null);
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [queuedTerminalCommand, setQueuedTerminalCommand] =
     useState<TerminalCommandRequest | null>(null);
@@ -2014,20 +2035,127 @@ function App() {
     return () => off();
   }, [refreshInventory, refreshProjects]);
 
-  const refreshNotifications = useCallback(async () => {
-    setNotificationsLoading(true);
-    setNotificationsError(null);
-    try {
-      const nextNotifications = await SettingsService.GetNotifications(false);
-      setNotifications(nextNotifications ?? []);
-    } catch (error: unknown) {
-      setNotificationsError(
-        error instanceof Error ? error.message : "Unable to load notifications",
+  const updateNotifications = useCallback(
+    (update: (current: Notification[]) => Notification[]) => {
+      const next = update(notificationsRef.current);
+      notificationsRef.current = next;
+      setNotifications(next);
+    },
+    [],
+  );
+
+  const pruneNotificationReadTracking = useCallback(
+    (visibleNotifications: Notification[]) => {
+      const visibleIDs = new Set(
+        visibleNotifications.map((notification) => notification.id),
       );
+      for (const id of notificationReadOverridesRef.current.keys()) {
+        if (
+          !visibleIDs.has(id) &&
+          !notificationPendingReadIntentsRef.current.has(id)
+        ) {
+          notificationReadOverridesRef.current.delete(id);
+        }
+      }
+      for (const id of notificationServerReadRef.current.keys()) {
+        if (
+          !visibleIDs.has(id) &&
+          !notificationPendingReadIntentsRef.current.has(id)
+        ) {
+          notificationServerReadRef.current.delete(id);
+        }
+      }
+    },
+    [],
+  );
+
+  const refreshNotifications = useCallback(async () => {
+    const readGeneration = ++notificationReadGenerationRef.current;
+    setNotificationsReadLoading(true);
+    setNotificationsReadError(null);
+    try {
+      const nextNotifications =
+        (await SettingsService.GetNotifications(false)) ?? [];
+      if (readGeneration !== notificationReadGenerationRef.current) {
+        return;
+      }
+      const previousServerRead = notificationServerReadRef.current;
+      const nextServerRead = new Map<number, boolean>();
+      for (const notification of nextNotifications) {
+        const hasReadOverride = notificationReadOverridesRef.current.has(
+          notification.id,
+        );
+        nextServerRead.set(
+          notification.id,
+          notification.read ||
+            (hasReadOverride &&
+              previousServerRead.get(notification.id) === true),
+        );
+        if (notification.read) {
+          notificationReadOverridesRef.current.delete(notification.id);
+        }
+      }
+      for (const id of notificationPendingReadIntentsRef.current.keys()) {
+        if (!nextServerRead.has(id) && previousServerRead.has(id)) {
+          nextServerRead.set(id, previousServerRead.get(id) ?? false);
+        }
+      }
+      notificationServerReadRef.current = nextServerRead;
+      pruneNotificationReadTracking(nextNotifications);
+      updateNotifications(() =>
+        nextNotifications.map((notification) =>
+          notification.read ||
+          notificationReadOverridesRef.current.has(notification.id)
+            ? { ...notification, read: true }
+            : notification,
+        ),
+      );
+    } catch (error: unknown) {
+      if (readGeneration === notificationReadGenerationRef.current) {
+        setNotificationsReadError(
+          error instanceof Error
+            ? error.message
+            : "Unable to load notifications",
+        );
+      }
     } finally {
-      setNotificationsLoading(false);
+      if (readGeneration === notificationReadGenerationRef.current) {
+        setNotificationsReadLoading(false);
+      }
     }
-  }, []);
+  }, [pruneNotificationReadTracking, updateNotifications]);
+
+  const scheduleNotificationEventRefresh = useCallback(() => {
+    notificationEventRefreshQueuedRef.current = true;
+    if (
+      notificationEventRefreshTimerRef.current !== null ||
+      notificationEventRefreshInFlightRef.current
+    ) {
+      return;
+    }
+
+    const launch = () => {
+      notificationEventRefreshTimerRef.current = window.setTimeout(() => {
+        notificationEventRefreshTimerRef.current = null;
+        if (
+          !notificationEventRefreshQueuedRef.current ||
+          notificationEventRefreshInFlightRef.current
+        ) {
+          return;
+        }
+        notificationEventRefreshQueuedRef.current = false;
+        notificationEventRefreshInFlightRef.current = true;
+        void refreshNotifications().finally(() => {
+          notificationEventRefreshInFlightRef.current = false;
+          if (notificationEventRefreshQueuedRef.current) {
+            launch();
+          }
+        });
+      }, 0);
+    };
+
+    launch();
+  }, [refreshNotifications]);
 
   useEffect(() => {
     void refreshNotifications();
@@ -2035,74 +2163,231 @@ function App() {
 
   useEffect(() => {
     const off = Events.On("notification", (event) => {
+      notificationReadGenerationRef.current += 1;
       const notification = eventPayload<Notification>(event);
       if (!notification?.id) {
-        void refreshNotifications();
+        scheduleNotificationEventRefresh();
         return;
       }
-      setNotifications((current) => [
-        notification,
+      const hasReadOverride = notificationReadOverridesRef.current.has(
+        notification.id,
+      );
+      notificationServerReadRef.current.set(
+        notification.id,
+        notification.read ||
+          (hasReadOverride &&
+            notificationServerReadRef.current.get(notification.id) === true),
+      );
+      if (notification.read) {
+        notificationReadOverridesRef.current.delete(notification.id);
+      }
+      const effectiveNotification =
+        notification.read ||
+        notificationReadOverridesRef.current.has(notification.id)
+          ? { ...notification, read: true }
+          : notification;
+      updateNotifications((current) => [
+        effectiveNotification,
         ...current.filter((item) => item.id !== notification.id),
       ]);
+      scheduleNotificationEventRefresh();
     });
-    return () => off();
-  }, [refreshNotifications]);
+    return () => {
+      off();
+      notificationEventRefreshQueuedRef.current = false;
+      if (notificationEventRefreshTimerRef.current !== null) {
+        window.clearTimeout(notificationEventRefreshTimerRef.current);
+        notificationEventRefreshTimerRef.current = null;
+      }
+    };
+  }, [scheduleNotificationEventRefresh, updateNotifications]);
 
   const markAllNotificationsRead = useCallback(async () => {
-    setNotificationsLoading(true);
-    setNotificationsError(null);
+    const mutationGeneration = ++notificationMutationGenerationRef.current;
+    const invalidatedReadGeneration = ++notificationReadGenerationRef.current;
+    const intentVersion = ++notificationReadIntentVersionRef.current;
+    const targets = notificationsRef.current.map((notification) => ({
+      id: notification.id,
+      read:
+        notificationServerReadRef.current.get(notification.id) ??
+        notification.read,
+    }));
+    for (const target of targets) {
+      notificationReadOverridesRef.current.set(target.id, intentVersion);
+      notificationPendingReadIntentsRef.current.set(target.id, intentVersion);
+    }
+    setNotificationsMutationLoading(true);
+    setNotificationsMutationError(null);
     setAppUpdateNotificationRead(true);
+    updateNotifications((current) =>
+      current.map((notification) => ({ ...notification, read: true })),
+    );
     try {
       await SettingsService.MarkNotificationsRead([]);
-      setNotifications((current) =>
-        current.map((notification) => ({ ...notification, read: true })),
+      for (const target of targets) {
+        if (
+          notificationPendingReadIntentsRef.current.get(target.id) ===
+          intentVersion
+        ) {
+          notificationPendingReadIntentsRef.current.delete(target.id);
+        }
+        notificationServerReadRef.current.set(target.id, true);
+        if (!notificationReadOverridesRef.current.has(target.id)) {
+          notificationReadOverridesRef.current.set(target.id, intentVersion);
+        }
+      }
+      updateNotifications((current) =>
+        current.map((notification) =>
+          targets.some((target) => target.id === notification.id)
+            ? { ...notification, read: true }
+            : notification,
+        ),
       );
-      await refreshNotifications();
+      pruneNotificationReadTracking(notificationsRef.current);
+      if (
+        mutationGeneration === notificationMutationGenerationRef.current ||
+        invalidatedReadGeneration === notificationReadGenerationRef.current
+      ) {
+        await refreshNotifications();
+      }
     } catch (error: unknown) {
-      setNotificationsError(
-        error instanceof Error
-          ? error.message
-          : "Unable to mark notifications read",
-      );
+      const rollbackRead = new Map<number, boolean>();
+      for (const target of targets) {
+        if (
+          notificationPendingReadIntentsRef.current.get(target.id) ===
+          intentVersion
+        ) {
+          notificationPendingReadIntentsRef.current.delete(target.id);
+        }
+        if (
+          notificationReadOverridesRef.current.get(target.id) === intentVersion
+        ) {
+          notificationReadOverridesRef.current.delete(target.id);
+          rollbackRead.set(
+            target.id,
+            notificationServerReadRef.current.get(target.id) ?? target.read,
+          );
+        }
+      }
+      if (rollbackRead.size > 0) {
+        updateNotifications((current) =>
+          current.map((notification) =>
+            rollbackRead.has(notification.id)
+              ? {
+                  ...notification,
+                  read: rollbackRead.get(notification.id) ?? notification.read,
+                }
+              : notification,
+          ),
+        );
+      }
+      pruneNotificationReadTracking(notificationsRef.current);
+      if (mutationGeneration === notificationMutationGenerationRef.current) {
+        setNotificationsMutationError(
+          error instanceof Error
+            ? error.message
+            : "Unable to mark notifications read",
+        );
+      }
+      if (invalidatedReadGeneration === notificationReadGenerationRef.current) {
+        void refreshNotifications();
+      }
     } finally {
-      setNotificationsLoading(false);
+      if (mutationGeneration === notificationMutationGenerationRef.current) {
+        setNotificationsMutationLoading(false);
+      }
     }
-  }, [refreshNotifications]);
+  }, [
+    pruneNotificationReadTracking,
+    refreshNotifications,
+    updateNotifications,
+  ]);
 
   const markNotificationRead = useCallback(
     async (notification: Notification) => {
       if (notification.read) {
         return;
       }
-      setNotificationsError(null);
       if (notification.id === -1) {
         setAppUpdateNotificationRead(true);
         return;
       }
-      setNotifications((current) =>
+      const mutationGeneration = ++notificationMutationGenerationRef.current;
+      setNotificationsMutationLoading(false);
+      setNotificationsMutationError(null);
+      const intentVersion = ++notificationReadIntentVersionRef.current;
+      const previousRead =
+        notificationServerReadRef.current.get(notification.id) ??
+        notification.read;
+      notificationReadOverridesRef.current.set(notification.id, intentVersion);
+      notificationPendingReadIntentsRef.current.set(
+        notification.id,
+        intentVersion,
+      );
+      updateNotifications((current) =>
         current.map((item) =>
           item.id === notification.id ? { ...item, read: true } : item,
         ),
       );
       try {
         await SettingsService.MarkNotificationsRead([notification.id]);
-      } catch (error: unknown) {
-        setNotifications((current) =>
+        if (
+          notificationPendingReadIntentsRef.current.get(notification.id) ===
+          intentVersion
+        ) {
+          notificationPendingReadIntentsRef.current.delete(notification.id);
+        }
+        notificationServerReadRef.current.set(notification.id, true);
+        if (!notificationReadOverridesRef.current.has(notification.id)) {
+          notificationReadOverridesRef.current.set(
+            notification.id,
+            intentVersion,
+          );
+        }
+        updateNotifications((current) =>
           current.map((item) =>
-            item.id === notification.id ? { ...item, read: false } : item,
+            item.id === notification.id ? { ...item, read: true } : item,
           ),
         );
-        setNotificationsError(
-          error instanceof Error
-            ? error.message
-            : "Unable to mark notification read",
-        );
+        pruneNotificationReadTracking(notificationsRef.current);
+      } catch (error: unknown) {
+        if (
+          notificationPendingReadIntentsRef.current.get(notification.id) ===
+          intentVersion
+        ) {
+          notificationPendingReadIntentsRef.current.delete(notification.id);
+        }
+        if (
+          notificationReadOverridesRef.current.get(notification.id) ===
+          intentVersion
+        ) {
+          notificationReadOverridesRef.current.delete(notification.id);
+          const rollbackRead =
+            notificationServerReadRef.current.get(notification.id) ??
+            previousRead;
+          updateNotifications((current) =>
+            current.map((item) =>
+              item.id === notification.id
+                ? { ...item, read: rollbackRead }
+                : item,
+            ),
+          );
+        }
+        pruneNotificationReadTracking(notificationsRef.current);
+        if (mutationGeneration === notificationMutationGenerationRef.current) {
+          setNotificationsMutationError(
+            error instanceof Error
+              ? error.message
+              : "Unable to mark notification read",
+          );
+        }
       }
     },
-    [],
+    [pruneNotificationReadTracking, updateNotifications],
   );
 
   const refreshAuditLog = useCallback(async () => {
+    const generation = ++auditReadGenerationRef.current;
     setAuditLoading(true);
     setAuditError(null);
     try {
@@ -2110,13 +2395,19 @@ function App() {
         topic: auditFilter.action.trim(),
         limit: 500,
       });
-      setAuditEntries(entries ?? []);
+      if (generation === auditReadGenerationRef.current) {
+        setAuditEntries(entries ?? []);
+      }
     } catch (error: unknown) {
-      setAuditError(
-        error instanceof Error ? error.message : "Unable to load audit log",
-      );
+      if (generation === auditReadGenerationRef.current) {
+        setAuditError(
+          error instanceof Error ? error.message : "Unable to load audit log",
+        );
+      }
     } finally {
-      setAuditLoading(false);
+      if (generation === auditReadGenerationRef.current) {
+        setAuditLoading(false);
+      }
     }
   }, [auditFilter.action]);
 
@@ -2124,6 +2415,9 @@ function App() {
     if (activePage === "settings") {
       void refreshAuditLog();
     }
+    return () => {
+      auditReadGenerationRef.current += 1;
+    };
   }, [activePage, refreshAuditLog]);
 
   useEffect(() => {
@@ -3063,7 +3357,7 @@ function App() {
   const saveWSLDistro = useCallback(async () => {
     const nextDistro = wslDistro.trim() || "Ubuntu";
     setWSLDistro(nextDistro);
-    await saveSetting("windows.wsl_distro", nextDistro);
+    return saveSetting("windows.wsl_distro", nextDistro);
   }, [saveSetting, wslDistro]);
 
   const selectWSLDistro = useCallback(
@@ -5946,9 +6240,7 @@ function App() {
             onSaveColimaProfile={() => {
               void saveColimaProfile();
             }}
-            onSaveWSLDistro={() => {
-              void saveWSLDistro();
-            }}
+            onSaveWSLDistro={saveWSLDistro}
             onUseDockerContext={(name) => {
               void activateDockerContext(name);
             }}
