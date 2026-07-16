@@ -78,6 +78,96 @@ export type SettingsReadStatus =
   | "ready"
   | "refreshing"
   | "stale";
+
+type DiagnosticResourceStatus =
+  | "error"
+  | "loading"
+  | "ready"
+  | "refreshing"
+  | "stale"
+  | "unknown";
+
+type DiagnosticResource<T> = {
+  data: T | null;
+  error: string | null;
+  identity: string | null;
+  lastUpdatedAt: number | null;
+  status: DiagnosticResourceStatus;
+};
+
+function useDiagnosticResource<T>(fallbackError: string) {
+  const [resource, setResource] = useState<DiagnosticResource<T>>({
+    data: null,
+    error: null,
+    identity: null,
+    lastUpdatedAt: null,
+    status: "unknown",
+  });
+  const generationRef = useRef(0);
+
+  const invalidate = useCallback(() => {
+    generationRef.current += 1;
+  }, []);
+
+  const run = useCallback(
+    async (load: () => Promise<T>, identity = "default") => {
+      const generation = generationRef.current + 1;
+      generationRef.current = generation;
+      setResource((current) => {
+        const sameIdentity = current.identity === identity;
+        const data = sameIdentity ? current.data : null;
+        return {
+          data,
+          error: null,
+          identity,
+          lastUpdatedAt: sameIdentity ? current.lastUpdatedAt : null,
+          status: data === null ? "loading" : "refreshing",
+        };
+      });
+      try {
+        const data = await load();
+        if (generation !== generationRef.current) {
+          return false;
+        }
+        setResource({
+          data,
+          error: null,
+          identity,
+          lastUpdatedAt: Date.now(),
+          status: "ready",
+        });
+        return true;
+      } catch (error: unknown) {
+        if (generation !== generationRef.current) {
+          return false;
+        }
+        const message = error instanceof Error ? error.message : fallbackError;
+        setResource((current) => {
+          if (current.identity !== identity) {
+            return current;
+          }
+          return {
+            ...current,
+            error: message,
+            status: current.data === null ? "error" : "stale",
+          };
+        });
+        return false;
+      }
+    },
+    [fallbackError],
+  );
+
+  useEffect(
+    () => () => {
+      invalidate();
+    },
+    [invalidate],
+  );
+
+  return { invalidate, resource, run };
+}
+
 export type AuditRangeID = "24h" | "7d" | "30d" | "90d" | "all";
 export type AuditFilterState = {
   range: AuditRangeID;
@@ -206,7 +296,7 @@ export function SettingsPage({
   onSaveColimaDiskGB: () => void;
   onSaveColimaMemoryGB: () => void;
   onSaveColimaProfile: () => void;
-  onSaveWSLDistro: () => void;
+  onSaveWSLDistro: () => Promise<boolean>;
   onUseDockerContext: (name: string) => void;
   onUseWSLDistro: (distro: string) => void;
   onWSLDistroChange: (distro: string) => void;
@@ -231,19 +321,58 @@ export function SettingsPage({
 }) {
   const [selectedAuditEntry, setSelectedAuditEntry] =
     useState<AuditEntry | null>(null);
-  const [dockerShimStatus, setDockerShimStatus] =
-    useState<WindowsDockerCLIShimStatus | null>(null);
-  const [dockerShimLoading, setDockerShimLoading] = useState(false);
-  const [dockerShimError, setDockerShimError] = useState<string | null>(null);
-  const [runtimeDiagnostics, setRuntimeDiagnostics] =
-    useState<RuntimeDiagnostics | null>(null);
-  const [runtimeDiagnosticsLoading, setRuntimeDiagnosticsLoading] =
-    useState(false);
-  const [runtimeDiagnosticsError, setRuntimeDiagnosticsError] = useState<
-    string | null
-  >(null);
+  const {
+    invalidate: invalidateDockerShimStatus,
+    resource: dockerShimResource,
+    run: runDockerShimRequest,
+  } = useDiagnosticResource<WindowsDockerCLIShimStatus>(
+    "Unable to load Docker CLI shim status",
+  );
+  const {
+    invalidate: invalidateRuntimeDiagnostics,
+    resource: runtimeDiagnosticsResource,
+    run: runRuntimeDiagnosticsRequest,
+  } = useDiagnosticResource<RuntimeDiagnostics>(
+    "Unable to load runtime diagnostics",
+  );
   const activeStatus = activeProvider?.status;
   const providerKind = activeProvider?.kind || "windows_wsl_ubuntu";
+  const selectedWSLDistro = wslDistro.trim() || "Ubuntu";
+  const configuredWSLDistro =
+    settingString(settings, "windows.wsl_distro", "").trim() || "Ubuntu";
+  const dockerShimIdentity = `${providerKind.trim().toLowerCase()}\u0000${selectedWSLDistro.toLowerCase()}`;
+  const dockerShimIdentityRef = useRef(dockerShimIdentity);
+  const dockerShimInstallPendingRef = useRef(false);
+  const [dockerShimInstallPending, setDockerShimInstallPending] =
+    useState(false);
+  const [dockerShimInstallError, setDockerShimInstallError] = useState<
+    string | null
+  >(null);
+  const mountedRef = useRef(true);
+  const wslDistroSaveRequestRef = useRef<{
+    identity: string;
+    promise: Promise<boolean>;
+  } | null>(null);
+  const dockerShimResourceForIdentity: DiagnosticResource<WindowsDockerCLIShimStatus> =
+    dockerShimResource.identity === dockerShimIdentity
+      ? dockerShimResource
+      : {
+          data: null,
+          error: null,
+          identity: dockerShimIdentity,
+          lastUpdatedAt: null,
+          status: "unknown",
+        };
+  const dockerShimStatus = dockerShimInstallPending
+    ? null
+    : dockerShimResourceForIdentity.data;
+  const dockerShimLoading =
+    dockerShimResourceForIdentity.status === "loading" ||
+    dockerShimResourceForIdentity.status === "refreshing";
+  const runtimeDiagnostics = runtimeDiagnosticsResource.data;
+  const runtimeDiagnosticsLoading =
+    runtimeDiagnosticsResource.status === "loading" ||
+    runtimeDiagnosticsResource.status === "refreshing";
   const registryCredentialMode = settingString(
     settings,
     "registry.credentials_mode",
@@ -271,71 +400,135 @@ export function SettingsPage({
     ["help", "Help"],
     ["about", "About"],
   ];
-  const refreshDockerShimStatus = useCallback(async () => {
-    setDockerShimLoading(true);
-    setDockerShimError(null);
-    try {
-      setDockerShimStatus(
-        await SettingsService.GetWindowsDockerCLIShimStatus(),
-      );
-    } catch (err) {
-      setDockerShimError(
-        err instanceof Error
-          ? err.message
-          : "Unable to load Docker CLI shim status",
-      );
-    } finally {
-      setDockerShimLoading(false);
+  const saveSelectedWSLDistro = useCallback(() => {
+    const currentRequest = wslDistroSaveRequestRef.current;
+    if (currentRequest?.identity === selectedWSLDistro) {
+      return currentRequest.promise;
     }
-  }, []);
-  const installDockerShim = async () => {
-    setDockerShimLoading(true);
-    setDockerShimError(null);
-    try {
-      setDockerShimStatus(await SettingsService.InstallWindowsDockerCLIShim());
-    } catch (err) {
-      setDockerShimError(
-        err instanceof Error
-          ? err.message
-          : "Unable to install Docker CLI shim",
-      );
-    } finally {
-      setDockerShimLoading(false);
+    const trackedRequest = Promise.resolve()
+      .then(onSaveWSLDistro)
+      .catch(() => false);
+    const request = {
+      identity: selectedWSLDistro,
+      promise: trackedRequest,
+    };
+    wslDistroSaveRequestRef.current = request;
+    void trackedRequest.then(() => {
+      if (wslDistroSaveRequestRef.current === request) {
+        wslDistroSaveRequestRef.current = null;
+      }
+    });
+    return trackedRequest;
+  }, [onSaveWSLDistro, selectedWSLDistro]);
+  const refreshDockerShimStatus = useCallback(
+    async (identity?: string) => {
+      if (dockerShimInstallPendingRef.current) {
+        return false;
+      }
+      return runDockerShimRequest(async () => {
+        const status = await SettingsService.GetWindowsDockerCLIShimStatus();
+        if (!status) {
+          throw new Error("Docker CLI shim status returned no data");
+        }
+        return status;
+      }, identity ?? dockerShimIdentityRef.current);
+    },
+    [runDockerShimRequest],
+  );
+  const installDockerShim = useCallback(async () => {
+    if (dockerShimInstallPendingRef.current) {
+      return;
     }
-  };
+    dockerShimInstallPendingRef.current = true;
+    invalidateDockerShimStatus();
+    if (mountedRef.current) {
+      setDockerShimInstallError(null);
+      setDockerShimInstallPending(true);
+    }
+    try {
+      const saved = await saveSelectedWSLDistro();
+      if (!saved) {
+        throw new Error(
+          "Save the selected WSL distro before installing the Docker CLI shim.",
+        );
+      }
+      const status = await SettingsService.InstallWindowsDockerCLIShim();
+      if (!status) {
+        throw new Error("Docker CLI shim installation returned no status");
+      }
+    } catch (error: unknown) {
+      if (mountedRef.current) {
+        setDockerShimInstallError(
+          error instanceof Error
+            ? error.message
+            : "Unable to install the Docker CLI shim",
+        );
+      }
+    } finally {
+      dockerShimInstallPendingRef.current = false;
+      if (mountedRef.current) {
+        setDockerShimInstallPending(false);
+        await refreshDockerShimStatus(dockerShimIdentityRef.current);
+      }
+    }
+  }, [
+    invalidateDockerShimStatus,
+    refreshDockerShimStatus,
+    saveSelectedWSLDistro,
+  ]);
   const refreshRuntimeDiagnostics = useCallback(async () => {
-    setRuntimeDiagnosticsLoading(true);
-    setRuntimeDiagnosticsError(null);
-    try {
-      setRuntimeDiagnostics(await DiagnosticsService.GetRuntimeDiagnostics());
-    } catch (err) {
-      setRuntimeDiagnosticsError(
-        err instanceof Error
-          ? err.message
-          : "Unable to load runtime diagnostics",
-      );
-    } finally {
-      setRuntimeDiagnosticsLoading(false);
-    }
+    await runRuntimeDiagnosticsRequest(async () => {
+      const diagnostics = await DiagnosticsService.GetRuntimeDiagnostics();
+      if (!diagnostics) {
+        throw new Error("Runtime diagnostics returned no data");
+      }
+      return diagnostics;
+    });
+  }, [runRuntimeDiagnosticsRequest]);
+  useEffect(() => {
+    dockerShimIdentityRef.current = dockerShimIdentity;
+  }, [dockerShimIdentity]);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
   }, []);
   useEffect(() => {
     if (section === "providers" && providerKind === "windows_wsl_ubuntu") {
+      if (dockerShimInstallPendingRef.current) {
+        return undefined;
+      }
+      const identity = dockerShimIdentity;
       const timer = window.setTimeout(() => {
-        void refreshDockerShimStatus();
+        void refreshDockerShimStatus(identity);
       }, 0);
-      return () => window.clearTimeout(timer);
+      return () => {
+        window.clearTimeout(timer);
+        invalidateDockerShimStatus();
+      };
     }
     return undefined;
-  }, [providerKind, refreshDockerShimStatus, section, wslDistro]);
+  }, [
+    configuredWSLDistro,
+    dockerShimIdentity,
+    invalidateDockerShimStatus,
+    providerKind,
+    refreshDockerShimStatus,
+    section,
+  ]);
   useEffect(() => {
     if (section === "advanced") {
       const timer = window.setTimeout(() => {
         void refreshRuntimeDiagnostics();
       }, 0);
-      return () => window.clearTimeout(timer);
+      return () => {
+        window.clearTimeout(timer);
+        invalidateRuntimeDiagnostics();
+      };
     }
     return undefined;
-  }, [refreshRuntimeDiagnostics, section]);
+  }, [invalidateRuntimeDiagnostics, refreshRuntimeDiagnostics, section]);
 
   if (settingsStatus === "loading" || settingsStatus === "error") {
     const loadFailed = settingsStatus === "error";
@@ -831,6 +1024,7 @@ export function SettingsPage({
             <CardHeader
               actions={
                 <Button
+                  aria-label="Refresh runtime diagnostics"
                   icon={<RefreshCw size={14} />}
                   loading={runtimeDiagnosticsLoading}
                   onClick={() => void refreshRuntimeDiagnostics()}
@@ -843,72 +1037,100 @@ export function SettingsPage({
             />
             <CardBody className="space-y-3">
               <ReadOnlySetting label="Runtime cache" value="Managed by Cairn" />
-              {runtimeDiagnosticsError ? (
-                <div className="rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
-                  {runtimeDiagnosticsError}
-                </div>
-              ) : null}
-              <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-                <RuntimeDiagnosticTile
-                  detail={`${runtimeDiagnostics?.stdio.opened ?? 0} opened / ${runtimeDiagnostics?.stdio.closed ?? 0} closed`}
-                  label="WSL stdio transports"
-                  value={`${runtimeDiagnostics?.stdio.active ?? 0} active`}
-                />
-                <RuntimeDiagnosticTile
-                  detail={`${runtimeDiagnostics?.stdio.forcedKills ?? 0} forced kills / ${runtimeDiagnostics?.stdio.closeTimeouts ?? 0} close timeouts`}
-                  label="Stdio close pressure"
-                  value={formatDiagnosticTime(
-                    runtimeDiagnostics?.stdio.lastClosedAt,
-                  )}
-                />
-                <RuntimeDiagnosticTile
-                  detail={`${runtimeDiagnostics?.logs.activeProducers ?? 0} active readers`}
-                  label="Log streams"
-                  value={`${runtimeDiagnostics?.logs.activeStreams ?? 0} active`}
-                />
-                <RuntimeDiagnosticTile
-                  detail={`${runtimeDiagnostics?.metrics.activeWatchers ?? 0} container watchers`}
-                  label="Metrics"
-                  value={
-                    runtimeDiagnostics?.metrics.started ? "running" : "stopped"
-                  }
-                />
-                <RuntimeDiagnosticTile
-                  detail="Host, backend, project, and container sessions"
-                  label="Terminals"
-                  value={`${runtimeDiagnostics?.terminals.activeSessions ?? 0} active`}
-                />
-                <RuntimeDiagnosticTile
-                  detail={
-                    runtimeDiagnostics?.portForwards.supported
-                      ? "Windows host relays"
-                      : "Native backend networking"
-                  }
-                  label="Port forwards"
-                  value={`${runtimeDiagnostics?.portForwards.activeForwards ?? 0} active`}
-                />
-              </div>
-              {runtimeDiagnostics?.stdio.activeConnections?.length ? (
-                <div className="overflow-hidden rounded-card border border-border">
-                  <div className="border-b border-border bg-bg-inset px-3 py-2 text-xs font-semibold uppercase text-text-muted">
-                    Active WSL stdio commands
+              <DiagnosticResourceNotice
+                label="Runtime diagnostics"
+                resource={runtimeDiagnosticsResource}
+              />
+              {runtimeDiagnostics ? (
+                <>
+                  <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                    <RuntimeDiagnosticTile
+                      detail={`${formatDiagnosticNumber(runtimeDiagnostics.stdio?.opened)} opened / ${formatDiagnosticNumber(runtimeDiagnostics.stdio?.closed)} closed`}
+                      label="WSL stdio transports"
+                      value={formatDiagnosticCount(
+                        runtimeDiagnostics.stdio?.active,
+                        "active",
+                      )}
+                    />
+                    <RuntimeDiagnosticTile
+                      detail={`${formatDiagnosticNumber(runtimeDiagnostics.stdio?.forcedKills)} forced kills / ${formatDiagnosticNumber(runtimeDiagnostics.stdio?.closeTimeouts)} close timeouts`}
+                      label="Stdio close pressure"
+                      value={formatDiagnosticTime(
+                        runtimeDiagnostics.stdio?.lastClosedAt,
+                      )}
+                    />
+                    <RuntimeDiagnosticTile
+                      detail={formatDiagnosticCount(
+                        runtimeDiagnostics.logs?.activeProducers,
+                        "active readers",
+                      )}
+                      label="Log streams"
+                      value={formatDiagnosticCount(
+                        runtimeDiagnostics.logs?.activeStreams,
+                        "active",
+                      )}
+                    />
+                    <RuntimeDiagnosticTile
+                      detail={formatDiagnosticCount(
+                        runtimeDiagnostics.metrics?.activeWatchers,
+                        "container watchers",
+                      )}
+                      label="Metrics"
+                      value={formatDiagnosticBoolean(
+                        runtimeDiagnostics.metrics?.started,
+                        "running",
+                        "stopped",
+                      )}
+                    />
+                    <RuntimeDiagnosticTile
+                      detail="Host, backend, project, and container sessions"
+                      label="Terminals"
+                      value={formatDiagnosticCount(
+                        runtimeDiagnostics.terminals?.activeSessions,
+                        "active",
+                      )}
+                    />
+                    <RuntimeDiagnosticTile
+                      detail={formatDiagnosticBoolean(
+                        runtimeDiagnostics.portForwards?.supported,
+                        "Windows host relays",
+                        "Native backend networking",
+                      )}
+                      label="Port forwards"
+                      value={formatDiagnosticCount(
+                        runtimeDiagnostics.portForwards?.activeForwards,
+                        "active",
+                      )}
+                    />
                   </div>
-                  <div className="divide-y divide-border">
-                    {runtimeDiagnostics.stdio.activeConnections.map((item) => (
-                      <div
-                        className="grid gap-2 px-3 py-2 text-sm md:grid-cols-[minmax(0,1fr)_120px]"
-                        key={item.id}
-                      >
-                        <code className="min-w-0 truncate text-xs text-text-primary">
-                          {item.command || "-"}
-                        </code>
-                        <span className="text-xs text-text-muted md:text-right">
-                          {formatDiagnosticDurationMS(item.ageMs)}
-                        </span>
+                  {Array.isArray(runtimeDiagnostics.stdio?.activeConnections) &&
+                  runtimeDiagnostics.stdio.activeConnections.length > 0 ? (
+                    <div className="overflow-hidden rounded-card border border-border">
+                      <div className="border-b border-border bg-bg-inset px-3 py-2 text-xs font-semibold uppercase text-text-muted">
+                        Active WSL stdio commands
                       </div>
-                    ))}
-                  </div>
-                </div>
+                      <div className="divide-y divide-border">
+                        {runtimeDiagnostics.stdio.activeConnections.map(
+                          (item) => (
+                            <div
+                              className="grid gap-2 px-3 py-2 text-sm md:grid-cols-[minmax(0,1fr)_120px]"
+                              key={item.id}
+                            >
+                              <code className="min-w-0 truncate text-xs text-text-primary">
+                                {item.command || "Unavailable"}
+                              </code>
+                              <span className="text-xs text-text-muted md:text-right">
+                                {formatDiagnosticDurationMS(item.ageMs)}
+                              </span>
+                            </div>
+                          ),
+                        )}
+                      </div>
+                    </div>
+                  ) : null}
+                </>
+              ) : runtimeDiagnosticsResource.status === "loading" ? (
+                <TableSkeleton />
               ) : null}
             </CardBody>
           </Card>
@@ -1182,12 +1404,17 @@ export function SettingsPage({
                   </span>
                   <input
                     className="mt-1 h-9 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
+                    disabled={dockerShimInstallPending}
                     list="wsl-distro-options"
-                    onBlur={onSaveWSLDistro}
+                    onBlur={() => {
+                      void saveSelectedWSLDistro();
+                    }}
                     onChange={(event) => onWSLDistroChange(event.target.value)}
                     onKeyDown={(event) => {
                       if (event.key === "Enter") {
-                        onSaveWSLDistro();
+                        event.preventDefault();
+                        void saveSelectedWSLDistro();
+                        event.currentTarget.blur();
                       }
                     }}
                     value={wslDistro}
@@ -1221,6 +1448,8 @@ export function SettingsPage({
                     </div>
                     <div className="flex flex-wrap gap-2">
                       <Button
+                        aria-label="Refresh Docker CLI shim status"
+                        disabled={dockerShimInstallPending}
                         icon={<RefreshCw size={15} />}
                         loading={dockerShimLoading}
                         onClick={() => void refreshDockerShimStatus()}
@@ -1230,8 +1459,13 @@ export function SettingsPage({
                         Refresh
                       </Button>
                       <Button
+                        aria-label="Install Docker CLI shim"
+                        disabled={
+                          dockerShimLoading ||
+                          dockerShimResourceForIdentity.status === "unknown"
+                        }
                         icon={<Terminal size={15} />}
-                        loading={dockerShimLoading}
+                        loading={dockerShimInstallPending}
                         onClick={() => void installDockerShim()}
                         size="sm"
                       >
@@ -1240,42 +1474,80 @@ export function SettingsPage({
                     </div>
                   </div>
                   <div className="space-y-2 p-3 text-sm">
-                    {dockerShimError ? (
-                      <div className="rounded-control border border-error/30 bg-error/10 px-3 py-2 text-error">
-                        {dockerShimError}
+                    {dockerShimInstallPending ? (
+                      <div
+                        className="rounded-control border border-info/30 bg-info/10 px-3 py-2 text-info"
+                        role="status"
+                      >
+                        Installing the Docker CLI shim. Cairn will refresh its
+                        status when installation finishes.
                       </div>
+                    ) : null}
+                    {dockerShimInstallError ? (
+                      <div
+                        className="rounded-control border border-error/30 bg-error/10 px-3 py-2 text-error"
+                        role="alert"
+                      >
+                        {dockerShimInstallError}
+                      </div>
+                    ) : null}
+                    {!dockerShimInstallPending ? (
+                      <DiagnosticResourceNotice
+                        label="Docker CLI shim status"
+                        resource={dockerShimResourceForIdentity}
+                      />
                     ) : null}
                     {dockerShimStatus ? (
                       <>
                         <div className="flex flex-wrap gap-2">
-                          <Badge
-                            tone={dockerShimStatus.installed ? "ok" : "warn"}
-                          >
-                            {dockerShimStatus.installed
-                              ? "installed"
-                              : "not installed"}
-                          </Badge>
-                          <Badge
-                            tone={dockerShimStatus.onUserPath ? "ok" : "warn"}
-                          >
-                            {dockerShimStatus.onUserPath
-                              ? "on PATH"
-                              : "not on PATH"}
-                          </Badge>
-                          {dockerShimStatus.needsNewShell ? (
+                          <DiagnosticBooleanBadge
+                            falseLabel="unsupported"
+                            trueLabel="supported"
+                            unknownLabel="support unknown"
+                            value={dockerShimStatus.supported}
+                          />
+                          <DiagnosticBooleanBadge
+                            falseLabel="not installed"
+                            trueLabel="installed"
+                            unknownLabel="installation unknown"
+                            value={dockerShimStatus.installed}
+                          />
+                          <DiagnosticBooleanBadge
+                            falseLabel="not on PATH"
+                            trueLabel="on PATH"
+                            unknownLabel="PATH status unknown"
+                            value={dockerShimStatus.onUserPath}
+                          />
+                          {dockerShimStatus.needsNewShell === true ? (
                             <Badge tone="info">open new shell</Badge>
                           ) : null}
                         </div>
                         <div className="grid gap-2 md:grid-cols-2">
                           <ReadOnlySetting
                             label="Command"
-                            value={dockerShimStatus.commandPath || "-"}
+                            value={
+                              dockerShimStatus.commandPath || "Unavailable"
+                            }
                           />
                           <ReadOnlySetting
-                            label="Distro"
-                            value={dockerShimStatus.distro || wslDistro}
+                            label="Shim target distro"
+                            value={dockerShimStatus.distro || "Unavailable"}
                           />
                         </div>
+                        {dockerShimStatus.installed === true &&
+                        dockerShimStatus.distro?.trim() &&
+                        dockerShimStatus.distro.trim().toLowerCase() !==
+                          selectedWSLDistro.toLowerCase() ? (
+                          <div
+                            className="rounded-control border border-warn/30 bg-warn/10 px-3 py-2 text-warn"
+                            role="alert"
+                          >
+                            The installed shim targets “
+                            {dockerShimStatus.distro.trim()}”, while the
+                            selected WSL distro is “{selectedWSLDistro}”.
+                            Reinstall the shim to update its target.
+                          </div>
+                        ) : null}
                         {dockerShimStatus.dockerOnPath ? (
                           <ReadOnlySetting
                             label="Current docker on PATH"
@@ -1287,13 +1559,10 @@ export function SettingsPage({
                             "Install or refresh the shim, then open a new PowerShell window and run `docker ps`."}
                         </div>
                       </>
-                    ) : dockerShimLoading ? (
+                    ) : dockerShimInstallPending ||
+                      dockerShimResourceForIdentity.status === "loading" ? (
                       <TableSkeleton />
-                    ) : (
-                      <div className="text-text-muted">
-                        Refresh to check the Windows Docker CLI shim.
-                      </div>
-                    )}
+                    ) : null}
                   </div>
                 </div>
 
@@ -1371,7 +1640,11 @@ export function SettingsPage({
                                   </div>
                                 </div>
                                 <Button
-                                  disabled={selected || saving}
+                                  disabled={
+                                    selected ||
+                                    saving ||
+                                    dockerShimInstallPending
+                                  }
                                   onClick={() => onUseWSLDistro(distro.name)}
                                   size="sm"
                                   variant={selected ? "secondary" : "primary"}
@@ -1914,6 +2187,93 @@ function ReadOnlySetting({ label, value }: { label: string; value: string }) {
   );
 }
 
+function DiagnosticResourceNotice<T>({
+  label,
+  resource,
+}: {
+  label: string;
+  resource: DiagnosticResource<T>;
+}) {
+  const updatedAt = formatDiagnosticUpdatedAt(resource.lastUpdatedAt);
+  switch (resource.status) {
+    case "unknown":
+      return (
+        <div
+          className="rounded-control border border-border bg-bg-inset px-3 py-2 text-sm text-text-muted"
+          role="status"
+        >
+          {label} has not been checked. Values are unavailable.
+        </div>
+      );
+    case "loading":
+      return (
+        <div
+          className="rounded-control border border-info/30 bg-info/10 px-3 py-2 text-sm text-info"
+          role="status"
+        >
+          Loading {label.toLowerCase()}. No values are available yet.
+        </div>
+      );
+    case "error":
+      return (
+        <div
+          className="rounded-control border border-error/30 bg-error/10 px-3 py-2 text-sm text-error"
+          role="alert"
+        >
+          <div>{resource.error || `${label} could not be loaded.`}</div>
+          <div className="mt-1">No diagnostic claims are available.</div>
+        </div>
+      );
+    case "refreshing":
+      return (
+        <div
+          className="rounded-control border border-info/30 bg-info/10 px-3 py-2 text-sm text-info"
+          role="status"
+        >
+          Refreshing {label.toLowerCase()}. Showing the last successful values
+          from {updatedAt}.
+        </div>
+      );
+    case "stale":
+      return (
+        <div
+          className="rounded-control border border-warn/30 bg-warn/10 px-3 py-2 text-sm text-warn"
+          role="alert"
+        >
+          <div>{resource.error || `${label} could not be refreshed.`}</div>
+          <div className="mt-1">
+            Showing the last successful values from {updatedAt}.
+          </div>
+        </div>
+      );
+    case "ready":
+      return (
+        <div className="text-xs text-text-muted" role="status">
+          Last updated {updatedAt}.
+        </div>
+      );
+  }
+}
+
+function DiagnosticBooleanBadge({
+  falseLabel,
+  trueLabel,
+  unknownLabel,
+  value,
+}: {
+  falseLabel: string;
+  trueLabel: string;
+  unknownLabel: string;
+  value: unknown;
+}) {
+  if (typeof value !== "boolean") {
+    return <Badge tone="neutral">{unknownLabel}</Badge>;
+  }
+  return (
+    <Badge tone={value ? "ok" : "warn"}>{value ? trueLabel : falseLabel}</Badge>
+  );
+}
+
 function RuntimeDiagnosticTile({
   detail,
   label,
@@ -1939,7 +2299,7 @@ function RuntimeDiagnosticTile({
 function formatDiagnosticTime(value: unknown) {
   const timestamp = dateMillis(value);
   if (!timestamp) {
-    return "-";
+    return "Unavailable";
   }
   return new Date(timestamp).toLocaleTimeString(undefined, {
     hour: "2-digit",
@@ -1948,8 +2308,46 @@ function formatDiagnosticTime(value: unknown) {
   });
 }
 
-function formatDiagnosticDurationMS(value: number) {
-  if (!Number.isFinite(value) || value <= 0) {
+function formatDiagnosticUpdatedAt(value: number | null) {
+  if (value === null || !Number.isFinite(value)) {
+    return "an unknown time";
+  }
+  return new Date(value).toLocaleTimeString(undefined, {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+  });
+}
+
+function formatDiagnosticNumber(value: unknown) {
+  return typeof value === "number" && Number.isFinite(value)
+    ? String(value)
+    : "Unavailable";
+}
+
+function formatDiagnosticCount(value: unknown, suffix: string) {
+  return typeof value === "number" && Number.isFinite(value)
+    ? `${value} ${suffix}`
+    : "Unavailable";
+}
+
+function formatDiagnosticBoolean(
+  value: unknown,
+  trueLabel: string,
+  falseLabel: string,
+) {
+  return typeof value === "boolean"
+    ? value
+      ? trueLabel
+      : falseLabel
+    : "Unavailable";
+}
+
+function formatDiagnosticDurationMS(value: unknown) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    return "Unavailable";
+  }
+  if (value === 0) {
     return "0s";
   }
   const seconds = Math.round(value / 1000);

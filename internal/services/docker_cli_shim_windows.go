@@ -32,7 +32,10 @@ const (
 var procSendMessageTimeoutW = windows.NewLazySystemDLL("user32.dll").NewProc("SendMessageTimeoutW")
 
 func windowsDockerCLIShimStatus(ctx context.Context, settings *store.SettingsRepository) (*models.WindowsDockerCLIShimStatus, error) {
-	distro := selectedWindowsShimDistro(ctx, settings)
+	selectedDistro, err := selectedWindowsShimDistro(ctx, settings)
+	if err != nil {
+		return nil, apperror.Wrap(apperror.Internal, "Read Docker CLI shim distro setting failed", err, apperror.WithDetail(err.Error()))
+	}
 	dir, err := windowsDockerShimDir()
 	if err != nil {
 		return nil, apperror.Wrap(apperror.Internal, "Resolve Docker CLI shim directory failed", err, apperror.WithDetail(err.Error()))
@@ -42,11 +45,16 @@ func windowsDockerCLIShimStatus(ctx context.Context, settings *store.SettingsRep
 		Directory:   dir,
 		CommandPath: filepath.Join(dir, windowsDockerShimCmd),
 		ScriptPath:  filepath.Join(dir, windowsDockerShimPS1),
-		Distro:      distro,
 	}
 	if commandExists(status.CommandPath) && commandExists(status.ScriptPath) {
 		status.Installed = true
 	}
+	distro, targetWarning := windowsDockerShimTargetStatus(
+		filepath.Join(dir, windowsDockerShimDistro),
+		selectedDistro,
+		status.Installed,
+	)
+	status.Distro = distro
 	status.OnUserPath = userPathContainsDir(dir)
 	if dockerPath, err := exec.LookPath("docker"); err == nil {
 		status.DockerOnPath = dockerPath
@@ -55,6 +63,8 @@ func windowsDockerCLIShimStatus(ctx context.Context, settings *store.SettingsRep
 	switch {
 	case !status.Installed:
 		status.Message = "Install the Cairn shim so Windows shells can run docker through the selected WSL distro."
+	case targetWarning != "":
+		status.Message = targetWarning
 	case !status.OnUserPath:
 		status.Message = "The shim exists, but its directory is not on the user PATH."
 	case status.NeedsNewShell:
@@ -66,7 +76,16 @@ func windowsDockerCLIShimStatus(ctx context.Context, settings *store.SettingsRep
 }
 
 func installWindowsDockerCLIShim(ctx context.Context, settings *store.SettingsRepository) (*models.WindowsDockerCLIShimStatus, error) {
-	distro := selectedWindowsShimDistro(ctx, settings)
+	distro, err := selectedWindowsShimDistro(ctx, settings)
+	if err != nil {
+		return nil, apperror.Wrap(
+			apperror.Internal,
+			"Read Docker CLI shim distro setting failed",
+			err,
+			apperror.WithDetail(err.Error()),
+			apperror.WithRepairHints("Choose and save a valid single-line WSL distro name, then retry the shim installation."),
+		)
+	}
 	dir, err := windowsDockerShimDir()
 	if err != nil {
 		return nil, apperror.Wrap(apperror.Internal, "Resolve Docker CLI shim directory failed", err, apperror.WithDetail(err.Error()))
@@ -96,15 +115,6 @@ func installWindowsDockerCLIShim(ctx context.Context, settings *store.SettingsRe
 	return windowsDockerCLIShimStatus(ctx, settings)
 }
 
-func selectedWindowsShimDistro(ctx context.Context, settings *store.SettingsRepository) string {
-	if settings != nil {
-		if distro, err := settings.GetString(ctx, "windows.wsl_distro"); err == nil && strings.TrimSpace(distro) != "" {
-			return strings.TrimSpace(distro)
-		}
-	}
-	return "Ubuntu"
-}
-
 func windowsDockerShimDir() (string, error) {
 	root := strings.TrimSpace(os.Getenv("LOCALAPPDATA"))
 	if root == "" {
@@ -124,7 +134,7 @@ func dockerShimCMD() string {
 func dockerShimPowerShell() string {
 	return `$ErrorActionPreference = 'Stop'
 $distroPath = Join-Path $PSScriptRoot 'distro.txt'
-$distro = 'Ubuntu'
+$distro = '` + defaultWindowsDockerShimDistro + `'
 if (Test-Path -LiteralPath $distroPath) {
   $configured = (Get-Content -LiteralPath $distroPath -Raw).Trim()
   if ($configured.Length -gt 0) {
