@@ -37,7 +37,6 @@
   --terminal-selection: 45 212 167;
   color-scheme: dark;
   font-family:
-    Inter,
     ui-sans-serif,
     system-ui,
     -apple-system,
@@ -129,13 +128,6 @@
     background: #0d1117;
     color: #f0f6fc;
   }
-}
-
-@font-face {
-  font-family: "Inter";
-  font-style: normal;
-  font-weight: 400 700;
-  src: url("/Inter-Medium.ttf") format("truetype");
 }
 
 html,
