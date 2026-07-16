@@ -1842,6 +1842,13 @@ describe("App inventory shell", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("Cairn v9.9.9")).toBeInTheDocument();
 
+    fireEvent.click(screen.getByRole("button", { name: "Download" }));
+    await waitFor(() =>
+      expect(runtimeMock.openURL).toHaveBeenCalledWith(
+        "https://github.com/RCooLeR/Cairn/releases/tag/v9.9.9",
+      ),
+    );
+
     fireEvent.click(
       await screen.findByRole("button", { name: "Notifications 1 unread" }),
     );
@@ -1856,6 +1863,49 @@ describe("App inventory shell", () => {
     expect(
       await screen.findByRole("heading", { name: "Settings" }),
     ).toBeInTheDocument();
+  });
+
+  it("blocks an invalid backend app-update URL before it reaches the browser", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    settingsServiceMock.CheckAppUpdate.mockResolvedValueOnce({
+      version: "9.9.9",
+      name: "Cairn v9.9.9",
+      url: "javascript:alert(document.domain)",
+      publishedAt: "2026-06-13T10:00:00Z",
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText("Update link blocked")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Cairn received an invalid release URL and did not open it.",
+      ),
+    ).toBeInTheDocument();
+    expect(runtimeMock.openURL).not.toHaveBeenCalled();
+    expect(
+      screen.queryByRole("button", { name: "Download" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("reports a host-browser failure when opening a valid update URL", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    settingsServiceMock.CheckAppUpdate.mockResolvedValueOnce({
+      version: "9.9.9",
+      name: "Cairn v9.9.9",
+      url: "https://github.com/RCooLeR/Cairn/releases/tag/v9.9.9",
+      publishedAt: "2026-06-13T10:00:00Z",
+    });
+    runtimeMock.openURL.mockRejectedValueOnce(new Error("Browser unavailable"));
+
+    render(<App />);
+
+    fireEvent.click(await screen.findByRole("button", { name: "Download" }));
+
+    expect(
+      await screen.findByText("Unable to open update link"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Browser unavailable")).toBeInTheDocument();
   });
 
   it("updates dashboard charts from stats samples and deep-links container filters", async () => {

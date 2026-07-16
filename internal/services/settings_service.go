@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/url"
+	"regexp"
 	"runtime"
 	"runtime/debug"
 	"strconv"
@@ -18,9 +20,14 @@ import (
 var (
 	appUpdateHTTPClient = &http.Client{Timeout: 10 * time.Second}
 	appUpdateURL        = "https://api.github.com/repos/RCooLeR/Cairn/releases/latest"
+	stableAppReleaseTag = regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
 )
 
-const generalAutostartAppSetting = "general.autostart_app"
+const (
+	generalAutostartAppSetting = "general.autostart_app"
+	cairnReleaseOrigin         = "https://github.com"
+	cairnReleasePathPrefix     = "/RCooLeR/Cairn/releases/tag/"
+)
 
 func (s *SettingsService) GetSettings(ctx context.Context) (map[string]any, error) {
 	if s.Settings != nil {
@@ -121,15 +128,46 @@ func (s *SettingsService) CheckAppUpdate(ctx context.Context, currentVersion str
 	if err := json.NewDecoder(response.Body).Decode(&release); err != nil {
 		return nil, apperror.Wrap(apperror.Internal, "Decode app update response failed", err)
 	}
-	if release.Draft || release.Prerelease || release.TagName == "" || release.HTMLURL == "" || !isNewerAppVersion(release.TagName, currentVersion) {
+	canonicalURL, validReleaseURL := canonicalAppReleaseURL(release.HTMLURL, release.TagName)
+	if release.Draft || release.Prerelease || !validReleaseURL || !isNewerAppVersion(release.TagName, currentVersion) {
 		return nil, nil
 	}
 	return &models.AppUpdateNotice{
 		Version:     normalizeAppVersionLabel(release.TagName),
-		URL:         release.HTMLURL,
+		URL:         canonicalURL,
 		Name:        release.Name,
 		PublishedAt: release.PublishedAt,
 	}, nil
+}
+
+// canonicalAppReleaseURL validates update metadata before it crosses the
+// native-to-renderer boundary. GitHub's release API is the only legitimate
+// source, and Cairn publishes stable releases as vMAJOR.MINOR.PATCH tags.
+func canonicalAppReleaseURL(rawURL string, tagName string) (string, bool) {
+	if !stableAppReleaseTag.MatchString(tagName) {
+		return "", false
+	}
+
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Opaque != "" || parsed.User != nil {
+		return "", false
+	}
+	if !strings.EqualFold(parsed.Scheme, "https") || !strings.EqualFold(parsed.Hostname(), "github.com") {
+		return "", false
+	}
+	if port := parsed.Port(); port != "" && port != "443" {
+		return "", false
+	}
+	if parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || strings.Contains(rawURL, "#") {
+		return "", false
+	}
+
+	expectedPath := cairnReleasePathPrefix + tagName
+	if parsed.Path != expectedPath || parsed.EscapedPath() != expectedPath {
+		return "", false
+	}
+
+	return cairnReleaseOrigin + expectedPath, true
 }
 
 func versionInfo() *models.VersionInfo {

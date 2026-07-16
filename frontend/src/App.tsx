@@ -207,6 +207,7 @@ import {
 } from "./overview/dashboardData";
 import { dateMillis, formatDate, relativeTime, toDate } from "./utils/time";
 import { riskTone, type BadgeTone } from "./utils/tones";
+import { normalizeCairnReleaseURL } from "./utils/appUpdateURL";
 import { frontendVersion } from "./version";
 import type { NavItem, PageID } from "./types/navigation";
 
@@ -2445,7 +2446,20 @@ function App() {
         if (!active) {
           return;
         }
-        setAppUpdateNotice(notice);
+        const normalizedURL = normalizeCairnReleaseURL(notice?.url);
+        if (notice && !normalizedURL) {
+          setAppUpdateNotice(null);
+          appUpdateNoticeVersionRef.current = null;
+          pushToast({
+            body: "Cairn received an invalid release URL and did not open it.",
+            level: "error",
+            title: "Update link blocked",
+          });
+          return;
+        }
+        const normalizedNotice =
+          notice && normalizedURL ? { ...notice, url: normalizedURL } : null;
+        setAppUpdateNotice(normalizedNotice);
         const noticeVersion = notice?.version ?? null;
         if (
           noticeVersion &&
@@ -2464,7 +2478,7 @@ function App() {
     return () => {
       active = false;
     };
-  }, [settingsLoaded, updatesNotify, version?.version]);
+  }, [pushToast, settingsLoaded, updatesNotify, version?.version]);
 
   useEffect(() => {
     void refreshInventory();
@@ -5808,6 +5822,33 @@ function App() {
     [pushToast],
   );
 
+  const openAppUpdate = useCallback(async () => {
+    if (!appUpdateNotice) {
+      return;
+    }
+    const normalizedURL = normalizeCairnReleaseURL(appUpdateNotice.url);
+    if (!normalizedURL) {
+      pushToast({
+        body: "Cairn received an invalid release URL and did not open it.",
+        level: "error",
+        title: "Update link blocked",
+      });
+      return;
+    }
+    try {
+      await Browser.OpenURL(normalizedURL);
+    } catch (error: unknown) {
+      pushToast({
+        body:
+          error instanceof Error
+            ? error.message
+            : "The system browser could not open the release page.",
+        level: "error",
+        title: "Unable to open update link",
+      });
+    }
+  }, [appUpdateNotice, pushToast]);
+
   const openImageInspect = useCallback(
     (image: ImageSummary) => {
       const title = primaryImageRef(image);
@@ -6803,9 +6844,7 @@ function App() {
             inventoryError={inventoryError}
             noProviderConfigured={noProviderConfigured}
             onOpenAppUpdate={() => {
-              if (appUpdateNotice) {
-                window.open(appUpdateNotice.url, "_blank", "noopener");
-              }
+              void openAppUpdate();
             }}
             onOpenProviderUpdate={openProviderSetupForUpdate}
             onOpenRepair={() => setRepairOpen(true)}
