@@ -949,9 +949,16 @@ export function AgentPage({ projects }: AgentPageProps) {
                   onClick={() => setMode("agent")}
                 />
               </div>
+              <label
+                className="mb-1 block text-xs font-medium uppercase text-text-muted"
+                htmlFor="agent-prompt"
+              >
+                Message to Cairn Agent
+              </label>
               <div className="flex gap-2">
                 <textarea
                   className="min-h-16 flex-1 resize-none rounded-control border border-border bg-bg-inset px-3 py-2 text-sm text-text-primary outline-none focus:border-accent"
+                  id="agent-prompt"
                   onChange={(event) => setPrompt(event.target.value)}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" && !event.shiftKey) {
