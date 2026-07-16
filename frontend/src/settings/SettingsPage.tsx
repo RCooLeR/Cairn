@@ -2061,8 +2061,26 @@ function SettingsTextSetting({
   value: string;
 }) {
   const committedValueRef = useRef(value);
+  const dirtyRef = useRef(false);
+  const inputRef = useRef<HTMLInputElement>(null);
   useEffect(() => {
     committedValueRef.current = value;
+    const input = inputRef.current;
+    if (!input || (document.activeElement === input && dirtyRef.current)) {
+      return;
+    }
+    const selectionStart = input.selectionStart;
+    const selectionEnd = input.selectionEnd;
+    const selectionDirection = input.selectionDirection;
+    input.value = value;
+    dirtyRef.current = false;
+    if (document.activeElement === input && selectionStart !== null) {
+      input.setSelectionRange(
+        Math.min(selectionStart, value.length),
+        Math.min(selectionEnd ?? selectionStart, value.length),
+        selectionDirection ?? undefined,
+      );
+    }
   }, [value]);
   const save = async (input: HTMLInputElement) => {
     const nextValue = input.value;
@@ -2071,6 +2089,7 @@ function SettingsTextSetting({
     }
     const previousValue = committedValueRef.current;
     committedValueRef.current = nextValue;
+    dirtyRef.current = false;
     let saved = false;
     try {
       saved = await onSave(nextValue);
@@ -2079,6 +2098,7 @@ function SettingsTextSetting({
         committedValueRef.current = previousValue;
         if (input.value === nextValue) {
           input.value = previousValue;
+          dirtyRef.current = false;
         }
       }
     }
@@ -2092,7 +2112,9 @@ function SettingsTextSetting({
         className="mt-1 h-9 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
         defaultValue={value}
         disabled={disabled}
-        key={value}
+        onChange={() => {
+          dirtyRef.current = true;
+        }}
         onBlur={(event) => {
           void save(event.currentTarget);
         }}
@@ -2104,6 +2126,7 @@ function SettingsTextSetting({
           }
         }}
         placeholder={placeholder}
+        ref={inputRef}
       />
     </label>
   );
@@ -2125,13 +2148,22 @@ function SettingsNumberSetting({
   value: number;
 }) {
   const committedValueRef = useRef(value);
+  const dirtyRef = useRef(false);
+  const inputRef = useRef<HTMLInputElement>(null);
   useEffect(() => {
     committedValueRef.current = value;
+    const input = inputRef.current;
+    if (!input || (document.activeElement === input && dirtyRef.current)) {
+      return;
+    }
+    input.value = String(value);
+    dirtyRef.current = false;
   }, [value]);
   const save = async (input: HTMLInputElement) => {
     const parsed = Number(input.value);
     if (!Number.isFinite(parsed)) {
       input.value = String(value);
+      dirtyRef.current = false;
       return;
     }
     const lowerBounded = min === undefined ? parsed : Math.max(min, parsed);
@@ -2143,6 +2175,7 @@ function SettingsNumberSetting({
     }
     const previousValue = committedValueRef.current;
     committedValueRef.current = nextValue;
+    dirtyRef.current = false;
     let saved = false;
     try {
       saved = await onSave(nextValue);
@@ -2151,6 +2184,7 @@ function SettingsNumberSetting({
         committedValueRef.current = previousValue;
         if (Number(input.value) === nextValue) {
           input.value = String(previousValue);
+          dirtyRef.current = false;
         }
       }
     }
@@ -2164,9 +2198,11 @@ function SettingsNumberSetting({
         className="mt-1 h-9 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
         defaultValue={String(value)}
         disabled={disabled}
-        key={value}
         max={max}
         min={min}
+        onChange={() => {
+          dirtyRef.current = true;
+        }}
         onBlur={(event) => {
           void save(event.currentTarget);
         }}
@@ -2177,6 +2213,7 @@ function SettingsNumberSetting({
             event.currentTarget.blur();
           }
         }}
+        ref={inputRef}
         type="number"
       />
     </label>

@@ -223,6 +223,49 @@ describe("SettingsPage diagnostic resources", () => {
     );
   });
 
+  it("preserves the focused setting input and caret when a delayed save normalizes its value", async () => {
+    const save = deferred<boolean>();
+    const onSettingChange = vi.fn(() => save.promise);
+    const props = createProps({
+      onSettingChange,
+      section: "terminal",
+      settings: { "terminal.default_shell": "bash" },
+    });
+    const view = render(<SettingsPage {...props} />);
+    const input = screen.getByRole("textbox", {
+      name: "Default shell",
+    }) as HTMLInputElement;
+
+    fireEvent.change(input, { target: { value: "zsh" } });
+    fireEvent.blur(input);
+    expect(onSettingChange).toHaveBeenCalledWith(
+      "terminal.default_shell",
+      "zsh",
+    );
+
+    input.focus();
+    input.setSelectionRange(1, 1);
+    view.rerender(
+      <SettingsPage
+        {...props}
+        settings={{ "terminal.default_shell": "/bin/zsh" }}
+      />,
+    );
+
+    const normalizedInput = screen.getByRole("textbox", {
+      name: "Default shell",
+    }) as HTMLInputElement;
+    expect(normalizedInput).toBe(input);
+    expect(normalizedInput).toHaveFocus();
+    expect(normalizedInput).toHaveValue("/bin/zsh");
+    expect(normalizedInput.selectionStart).toBe(1);
+
+    await act(async () => {
+      save.resolve(true);
+      await save.promise;
+    });
+  });
+
   it("does not turn an initial runtime diagnostics failure into zero or false claims and recovers", async () => {
     diagnosticsServiceMock.GetRuntimeDiagnostics.mockRejectedValueOnce(
       new Error("diagnostics offline"),
