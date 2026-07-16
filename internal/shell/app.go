@@ -213,26 +213,7 @@ func Run(assets fs.FS) error {
 	trayNoticeShown := &atomic.Bool{}
 	configureSystemTray(app, mainWindow, icon, notificationService, quitRequested, trayNoticeShown)
 	startDesktopNotificationBridge(ctx, eventBus, notificationService)
-	forwardBusEvents(ctx, eventBus, mainWindow, []bus.Topic{
-		bus.TopicProviderChanged,
-		bus.TopicDockerConnected,
-		bus.TopicDockerReconnecting,
-		bus.TopicDockerDisconnected,
-		bus.TopicObjectsChanged,
-		bus.TopicProjectChanged,
-		bus.TopicProviderInstallProgress,
-		bus.TopicImagePullProgress,
-		bus.TopicLogsLines,
-		bus.TopicLogsEOF,
-		bus.TopicLogsError,
-		bus.TopicTerminalData,
-		bus.TopicTerminalClosed,
-		bus.TopicStatsSample,
-		bus.TopicJobProgress,
-		bus.TopicJobDone,
-		bus.TopicNotification,
-		bus.TopicPortForwardChanged,
-	})
+	forwardBusEvents(ctx, eventBus, mainWindow, bus.FrontendEventRoutes())
 
 	return app.Run()
 }
@@ -444,14 +425,18 @@ func backendContextName(ctx context.Context, provider providers.PlatformProvider
 	return strings.TrimSpace(identity)
 }
 
-func forwardBusEvents(ctx context.Context, eventBus bus.Bus, window application.Window, topics []bus.Topic) {
-	for _, topic := range topics {
-		topic := topic
+type frontendEventEmitter interface {
+	EmitEvent(name string, data ...any) bool
+}
+
+func forwardBusEvents(ctx context.Context, eventBus bus.Bus, window frontendEventEmitter, routes []bus.FrontendEventRoute) {
+	for _, route := range routes {
+		route := route
 		buffer := 32
-		if topic == bus.TopicTerminalData || topic == bus.TopicTerminalClosed {
+		if route.Topic == bus.TopicTerminalData || route.Topic == bus.TopicTerminalClosed {
 			buffer = 4096
 		}
-		ch := eventBus.Subscribe(ctx, topic, buffer)
+		ch := eventBus.Subscribe(ctx, route.Topic, buffer)
 		go func() {
 			for {
 				select {
@@ -461,7 +446,7 @@ func forwardBusEvents(ctx context.Context, eventBus bus.Bus, window application.
 					if !ok {
 						return
 					}
-					window.EmitEvent(string(event.Topic), event.Payload)
+					window.EmitEvent(route.EventName, event.Payload)
 				}
 			}
 		}()
