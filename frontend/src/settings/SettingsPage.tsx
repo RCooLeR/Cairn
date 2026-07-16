@@ -39,6 +39,7 @@ import {
   CardBody,
   CardHeader,
   EmptyState,
+  LiveMessage,
   Modal,
   StatusPill,
   TableSkeleton,
@@ -650,14 +651,20 @@ export function SettingsPage({
           </div>
         ) : null}
         {message ? (
-          <div className="rounded-card border border-ok/30 bg-ok/10 px-3 py-2 text-sm text-ok">
+          <LiveMessage
+            className="rounded-card border border-ok/30 bg-ok/10 px-3 py-2 text-sm text-ok"
+            level="status"
+          >
             {message}
-          </div>
+          </LiveMessage>
         ) : null}
         {error ? (
-          <div className="rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
+          <LiveMessage
+            className="rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error"
+            level="error"
+          >
             {error}
-          </div>
+          </LiveMessage>
         ) : null}
 
         {section === "general" ? (

@@ -222,16 +222,12 @@ describe("TerminalPage operation and session lifecycle", () => {
       "alpha",
       "d2hvYW1p",
     );
-    expect(
-      screen.getByText(
-        "Unable to send terminal input: terminal session closed",
-      ),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByText(
-        "Session is no longer available; close this tab and open a new terminal",
-      ),
-    ).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Unable to send terminal input: terminal session closed",
+    );
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Session is no longer available; close this tab and open a new terminal",
+    );
   });
 
   it("keeps guarded paste available for retry until the write succeeds", async () => {
@@ -257,11 +253,9 @@ describe("TerminalPage operation and session lifecycle", () => {
     });
     fireEvent.click(within(dialog).getByRole("button", { name: "Paste" }));
 
-    expect(
-      await within(dialog).findByText(
-        "Unable to send terminal input: transport unavailable",
-      ),
-    ).toBeInTheDocument();
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+      "Unable to send terminal input: transport unavailable",
+    );
     expect(dialog).toBeInTheDocument();
     expect(
       within(dialog).getByRole("button", { name: "Cancel" }),

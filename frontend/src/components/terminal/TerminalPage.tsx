@@ -45,6 +45,7 @@ import {
   CardBody,
   CardHeader,
   EmptyState,
+  LiveMessage,
   Modal,
 } from "../ui";
 import { decodeBase64Bytes, encodeTerminalInput } from "./terminalEncoding";
@@ -1011,10 +1012,18 @@ export function TerminalPage({
           <span>
             {activeSession ? `${activeSession.kind} session` : "idle"}
           </span>
-          <span className="ml-auto">{status}</span>
-          {error ? <span className="text-error">{error}</span> : null}
+          <LiveMessage className="ml-auto" level="status">
+            {status}
+          </LiveMessage>
+          {error ? (
+            <LiveMessage className="text-error" level="error">
+              {error}
+            </LiveMessage>
+          ) : null}
           {operationError ? (
-            <span className="text-error">{operationError.message}</span>
+            <LiveMessage className="text-error" level="error">
+              {operationError.message}
+            </LiveMessage>
           ) : null}
         </div>
       </section>
@@ -1141,7 +1150,9 @@ export function TerminalPage({
           {pasteGuard?.data}
         </pre>
         {pasteGuard?.error ? (
-          <p className="mt-3 text-sm text-error">{pasteGuard.error}</p>
+          <LiveMessage className="mt-3 text-sm text-error" level="error">
+            {pasteGuard.error}
+          </LiveMessage>
         ) : null}
       </Modal>
 
@@ -1198,7 +1209,9 @@ export function TerminalPage({
           ? The exec session will exit.
         </p>
         {closeGuard?.error ? (
-          <p className="mt-3 text-sm text-error">{closeGuard.error}</p>
+          <LiveMessage className="mt-3 text-sm text-error" level="error">
+            {closeGuard.error}
+          </LiveMessage>
         ) : null}
       </Modal>
 

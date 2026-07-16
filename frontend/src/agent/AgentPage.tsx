@@ -38,6 +38,7 @@ import {
   Card,
   CardBody,
   EmptyState,
+  LiveMessage,
   Modal,
 } from "../components/ui";
 import { SerializedSettingsSaver } from "../settings/serializedSettingsSaver";
@@ -202,6 +203,8 @@ export function AgentPage({ projects }: AgentPageProps) {
   const [analysisLoading, setAnalysisLoading] = useState(false);
   const [settingsSavePendingCount, setSettingsSavePendingCount] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [requestStatusAnnouncement, setRequestStatusAnnouncement] =
+    useState("");
   const [editPath, setEditPath] = useState(".env");
   const [editInstruction, setEditInstruction] = useState(
     "Create/update placeholders for detected app environment variables.",
@@ -626,6 +629,7 @@ export function AgentPage({ projects }: AgentPageProps) {
     setPrompt("");
     setError(null);
     setChatError(null);
+    setRequestStatusAnnouncement("Cairn Agent is generating a response.");
 
     try {
       const request = AgentService.Chat({
@@ -641,6 +645,9 @@ export function AgentPage({ projects }: AgentPageProps) {
       setLastToolResults(response?.toolResults ?? []);
       const parsed = parseAgentToolRequest(response?.message ?? "");
       appendAssistantResponse(response, parsed.cleanedMessage);
+      if (mountedRef.current) {
+        setRequestStatusAnnouncement("Cairn Agent response complete.");
+      }
       if (parsed.call) {
         setPendingToolCall(parsed.call);
       }
@@ -655,6 +662,9 @@ export function AgentPage({ projects }: AgentPageProps) {
     } catch (nextError) {
       if (useAgentSessionStore.getState().activeRequestID === requestID) {
         setChatError(errorMessage(nextError, "Local agent request failed"));
+        if (mountedRef.current) {
+          setRequestStatusAnnouncement("");
+        }
       }
     } finally {
       finishRequest(requestID);
@@ -669,6 +679,7 @@ export function AgentPage({ projects }: AgentPageProps) {
     const requestID = session.activeRequestID;
     void session.activeRequest?.cancel?.("Stopped by user");
     session.finishRequest(requestID);
+    setRequestStatusAnnouncement("Cairn Agent request stopped.");
     session.setMessages((current) => [
       ...current,
       {
@@ -872,14 +883,20 @@ export function AgentPage({ projects }: AgentPageProps) {
             />
           </div>
           {status?.error ? (
-            <div className="rounded-card border border-warn/30 bg-warn/10 px-3 py-2 text-sm text-warn">
+            <LiveMessage
+              className="rounded-card border border-warn/30 bg-warn/10 px-3 py-2 text-sm text-warn"
+              level="error"
+            >
               {status.error}
-            </div>
+            </LiveMessage>
           ) : null}
           {error || chatError ? (
-            <div className="rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
+            <LiveMessage
+              className="rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error"
+              level="error"
+            >
               {error ?? chatError}
-            </div>
+            </LiveMessage>
           ) : null}
         </CardBody>
       </Card>
@@ -1001,6 +1018,13 @@ export function AgentPage({ projects }: AgentPageProps) {
                   </Button>
                 )}
               </div>
+              <LiveMessage
+                aria-label="Agent request status"
+                className="sr-only"
+                level="status"
+              >
+                {requestStatusAnnouncement}
+              </LiveMessage>
             </div>
           </CardBody>
         </Card>

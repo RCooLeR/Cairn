@@ -3,6 +3,7 @@ export * from "./Button";
 export * from "./Card";
 export * from "./DataTable";
 export * from "./EmptyState";
+export * from "./LiveMessage";
 export * from "./Modal";
 export * from "./Skeleton";
 export * from "./StatusDot";

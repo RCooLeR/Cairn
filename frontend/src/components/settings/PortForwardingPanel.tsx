@@ -7,7 +7,15 @@ import type {
   PortForwardStatus,
 } from "../../../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
 import { PortForwardService } from "../../api/services";
-import { Badge, Button, Card, CardBody, CardHeader, EmptyState } from "../ui";
+import {
+  Badge,
+  Button,
+  Card,
+  CardBody,
+  CardHeader,
+  EmptyState,
+  LiveMessage,
+} from "../ui";
 
 function bindLabel(bindAddr: string): string {
   if (bindAddr === "0.0.0.0") {
@@ -96,20 +104,16 @@ export function PortForwardingPanel() {
         />
         <CardBody className="space-y-3">
           {error ? (
-            <div
+            <LiveMessage
               className="rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error"
-              role="alert"
+              level="error"
             >
               {error}
-            </div>
+            </LiveMessage>
           ) : (
-            <p
-              aria-live="polite"
-              className="text-sm text-text-muted"
-              role="status"
-            >
+            <LiveMessage className="text-sm text-text-muted" level="status">
               Loading port forwarding status…
-            </p>
+            </LiveMessage>
           )}
           {error ? (
             <Button loading={loading} onClick={() => void refresh()} size="sm">
@@ -153,6 +157,11 @@ export function PortForwardingPanel() {
         title="Host port forwarding"
       />
       <CardBody className="space-y-3">
+        <LiveMessage className="sr-only" level="status">
+          {busy
+            ? "Updating port forwarding."
+            : `Port forwarding is ${status.enabled ? "enabled" : "disabled"}.`}
+        </LiveMessage>
         <p className="text-sm text-text-muted">
           Binds published container ports on the Windows host and proxies them
           into WSL, so <code>-p</code> behaves like Docker Desktop. Ports a
@@ -173,15 +182,15 @@ export function PortForwardingPanel() {
           </Button>
         </div>
         {error ? (
-          <div
+          <LiveMessage
             className="flex items-center justify-between gap-3 rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error"
-            role="alert"
+            level="error"
           >
             <span>{error}</span>
             <Button loading={loading} onClick={() => void refresh()} size="sm">
               Retry
             </Button>
-          </div>
+          </LiveMessage>
         ) : null}
         {forwards.length === 0 ? (
           <EmptyState

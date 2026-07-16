@@ -51,6 +51,9 @@ describe("PortForwardingPanel", () => {
     render(<PortForwardingPanel />);
 
     expect(screen.getByText("Host port forwarding")).toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Loading port forwarding status",
+    );
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "WSL forwarding bridge is unavailable",
     );
@@ -64,6 +67,40 @@ describe("PortForwardingPanel", () => {
       ).toBeInTheDocument(),
     );
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("announces toggle progress and the resulting forwarding state", async () => {
+    let finishToggle!: () => void;
+    const toggle = new Promise<void>((resolve) => {
+      finishToggle = resolve;
+    });
+    portForwardServiceMock.GetStatus.mockResolvedValueOnce(
+      supportedStatus(),
+    ).mockResolvedValueOnce(supportedStatus(true));
+    portForwardServiceMock.SetEnabled.mockReturnValueOnce(toggle);
+    render(<PortForwardingPanel />);
+
+    const enable = await screen.findByRole("button", {
+      name: "Enable forwarding",
+    });
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Port forwarding is disabled.",
+    );
+    fireEvent.click(enable);
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Updating port forwarding.",
+    );
+
+    await act(async () => {
+      finishToggle();
+      await toggle;
+    });
+
+    await waitFor(() =>
+      expect(screen.getByRole("status")).toHaveTextContent(
+        "Port forwarding is enabled.",
+      ),
+    );
   });
 
   it("hides only after a successful unsupported response", async () => {

@@ -197,6 +197,32 @@ describe("SettingsPage diagnostic resources", () => {
     );
   });
 
+  it("announces save completion and actionable save failures", () => {
+    const props = createProps({
+      message: "Settings saved successfully",
+      section: "general",
+    });
+    const view = render(<SettingsPage {...props} />);
+
+    expect(screen.getByText("Settings saved successfully")).toHaveAttribute(
+      "role",
+      "status",
+    );
+
+    view.rerender(
+      <SettingsPage
+        {...props}
+        error="Settings could not be saved"
+        message={null}
+      />,
+    );
+
+    expect(screen.getByText("Settings could not be saved")).toHaveAttribute(
+      "role",
+      "alert",
+    );
+  });
+
   it("does not turn an initial runtime diagnostics failure into zero or false claims and recovers", async () => {
     diagnosticsServiceMock.GetRuntimeDiagnostics.mockRejectedValueOnce(
       new Error("diagnostics offline"),
