@@ -47,12 +47,14 @@ type MetricsSampleRecord struct {
 }
 
 type MetricsSeriesFilter struct {
-	Scope       runtimescope.Scope
-	ProjectID   string
-	ContainerID string
-	Resolution  string
-	From        time.Time
-	To          time.Time
+	Scope        runtimescope.Scope
+	ProjectID    string
+	ContainerID  string
+	Resolution   string
+	From         time.Time
+	To           time.Time
+	Now          time.Time
+	RawRetention time.Duration
 }
 
 func (s *Store) Metrics() *MetricsRepository {
@@ -89,21 +91,116 @@ func (r *MetricsRepository) QuerySeries(ctx context.Context, filter MetricsSerie
 	if !filter.Scope.Valid() {
 		return nil, errors.New("metrics series runtime scope is required")
 	}
-	resolution := filter.Resolution
-	if resolution == "" {
-		resolution = ResolutionForRange(filter.From, filter.To)
-	}
 	from := filter.From
 	to := filter.To
 	if to.IsZero() {
-		to = time.Now().UTC()
+		if filter.Now.IsZero() {
+			to = time.Now().UTC()
+		} else {
+			to = filter.Now.UTC()
+		}
 	}
 	if from.IsZero() {
 		from = to.Add(-time.Hour)
 	}
+	if from.After(to) {
+		return emptySeriesBundle(), nil
+	}
 
-	query := `
-		SELECT sampled_at,
+	bundle := emptySeriesBundle()
+	for _, segment := range metricsSeriesSegments(filter, from.UTC(), to.UTC()) {
+		segmentBundle, err := r.querySeriesSegment(ctx, filter, segment)
+		if err != nil {
+			return nil, err
+		}
+		appendSeriesBundle(bundle, segmentBundle)
+	}
+	return bundle, nil
+}
+
+type metricsSeriesSegment struct {
+	resolution        string
+	from              time.Time
+	to                time.Time
+	includeUpperBound bool
+}
+
+func metricsSeriesSegments(filter MetricsSeriesFilter, from time.Time, to time.Time) []metricsSeriesSegment {
+	if filter.Resolution != "" {
+		return []metricsSeriesSegment{{
+			resolution:        filter.Resolution,
+			from:              from,
+			to:                to,
+			includeUpperBound: true,
+		}}
+	}
+
+	now := filter.Now.UTC()
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	rawRetention := filter.RawRetention
+	if rawRetention <= 0 {
+		rawRetention = DefaultMetricsRawRetention
+	}
+	rawStart := now.Add(-rawRetention)
+	minuteStart := now.Add(-24 * time.Hour)
+	oldestFineStart := rawStart
+	if minuteStart.Before(oldestFineStart) {
+		oldestFineStart = minuteStart
+	}
+
+	segments := make([]metricsSeriesSegment, 0, 3)
+	appendSegment := func(resolution string, segmentFrom time.Time, segmentTo time.Time) {
+		if segmentFrom.Before(from) {
+			segmentFrom = from
+		}
+		if segmentTo.After(to) {
+			segmentTo = to
+		}
+		if segmentFrom.After(segmentTo) {
+			return
+		}
+		segments = append(segments, metricsSeriesSegment{
+			resolution: resolution,
+			from:       segmentFrom,
+			to:         segmentTo,
+		})
+	}
+
+	appendSegment(MetricsResolution15m, from, oldestFineStart)
+	if minuteStart.Before(rawStart) {
+		appendSegment(MetricsResolution1m, minuteStart, rawStart)
+	}
+	appendSegment(MetricsResolutionRaw, rawStart, to)
+	if len(segments) > 0 {
+		// Tier intervals are half-open so a cutoff timestamp belongs only to the
+		// newer, finer tier. The final intersecting segment owns the request's
+		// inclusive upper endpoint, including a zero-width segment at a cutoff.
+		segments[len(segments)-1].includeUpperBound = true
+	}
+	return segments
+}
+
+func (r *MetricsRepository) querySeriesSegment(ctx context.Context, filter MetricsSeriesFilter, segment metricsSeriesSegment) (*models.SeriesBundle, error) {
+	upperComparison := "<"
+	if segment.includeUpperBound {
+		upperComparison = "<="
+	}
+	sampledAtExpression := "sampled_at"
+	groupExpression := "sampled_at"
+	if segment.resolution == MetricsResolutionRaw && filter.ProjectID != "" && filter.ContainerID == "" {
+		// Raw samples are collected per container and naturally differ by a few
+		// milliseconds. Grouping them by exact timestamp makes a project total
+		// alternate between individual containers instead of representing the
+		// project. A one-second raw display bucket preserves the collector's
+		// multi-second cadence while combining one logical observation.
+		sampledAtExpression = "MIN(sampled_at)"
+		groupExpression = "CAST(strftime('%s', sampled_at) AS INTEGER)"
+	}
+
+	query := fmt.Sprintf(`
+		SELECT %s,
 			COALESCE(SUM(cpu_percent), 0),
 			COALESCE(SUM(memory_bytes), 0),
 			COALESCE(SUM(gpu_memory_bytes), 0),
@@ -114,16 +211,16 @@ func (r *MetricsRepository) QuerySeries(ctx context.Context, filter MetricsSerie
 		FROM metrics_samples
 		WHERE resolution = ?
 			AND sampled_at >= ?
-			AND sampled_at <= ?
+			AND sampled_at %s ?
 			AND provider_id = ?
 			AND context_name = ?
 			AND (? = '' OR project_id = ?)
 			AND (? = '' OR container_id = ?)
-		GROUP BY sampled_at
-		ORDER BY sampled_at ASC
-	`
+		GROUP BY %s
+		ORDER BY 1 ASC
+	`, sampledAtExpression, upperComparison, groupExpression)
 	rows, err := r.reader.QueryContext(ctx, query,
-		resolution, formatTime(from), formatTime(to),
+		segment.resolution, formatTime(segment.from), formatTime(segment.to),
 		filter.Scope.ProviderID(), filter.Scope.ContextName(),
 		filter.ProjectID, filter.ProjectID,
 		filter.ContainerID, filter.ContainerID,
@@ -157,6 +254,12 @@ func (r *MetricsRepository) QuerySeries(ctx context.Context, filter MetricsSerie
 		bundle.Series[6].Points = append(bundle.Series[6].Points, models.Point{TS: ts, Value: bw})
 	}
 	return bundle, rows.Err()
+}
+
+func appendSeriesBundle(target *models.SeriesBundle, source *models.SeriesBundle) {
+	for index := range target.Series {
+		target.Series[index].Points = append(target.Series[index].Points, source.Series[index].Points...)
+	}
 }
 
 func (r *MetricsRepository) RetainAndDownsample(ctx context.Context, now time.Time) error {

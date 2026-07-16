@@ -219,11 +219,12 @@ func (m *Manager) GetProjectMetrics(ctx context.Context, projectID string, r mod
 		return nil, err
 	}
 	return m.Repository.QuerySeries(ctx, store.MetricsSeriesFilter{
-		Scope:      m.Scope,
-		ProjectID:  projectID,
-		Resolution: store.ResolutionForRangeWithRawRetention(r.From, r.To, m.rawRetention),
-		From:       r.From,
-		To:         r.To,
+		Scope:        m.Scope,
+		ProjectID:    projectID,
+		From:         r.From,
+		To:           r.To,
+		Now:          m.now(),
+		RawRetention: m.rawRetention,
 	})
 }
 
@@ -232,11 +233,12 @@ func (m *Manager) GetContainerMetrics(ctx context.Context, containerID string, r
 		return nil, notReady()
 	}
 	return m.Repository.QuerySeries(ctx, store.MetricsSeriesFilter{
-		Scope:       m.Scope,
-		ContainerID: strings.TrimSpace(containerID),
-		Resolution:  store.ResolutionForRangeWithRawRetention(r.From, r.To, m.rawRetention),
-		From:        r.From,
-		To:          r.To,
+		Scope:        m.Scope,
+		ContainerID:  strings.TrimSpace(containerID),
+		From:         r.From,
+		To:           r.To,
+		Now:          m.now(),
+		RawRetention: m.rawRetention,
 	})
 }
 

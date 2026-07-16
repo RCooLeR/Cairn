@@ -28,6 +28,126 @@ func TestMetricsResolutionForRange(t *testing.T) {
 	}
 }
 
+func TestMetricsRepositoryAutoQueryStitchesRetentionTiersThroughLatestSample(t *testing.T) {
+	ctx := context.Background()
+	db := openMigratedStore(t, ctx)
+	defer closeStore(t, db)
+
+	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+	scope := runtimescope.Must("linux_native", "default")
+	record := func(resolution string, age time.Duration, cpu float64) MetricsSampleRecord {
+		return MetricsSampleRecord{
+			ProviderID:  scope.ProviderID(),
+			ContextName: scope.ContextName(),
+			ContainerID: "c1",
+			CPUPercent:  cpu,
+			Resolution:  resolution,
+			SampledAt:   now.Add(-age),
+		}
+	}
+	if err := db.Metrics().InsertBatch(ctx, []MetricsSampleRecord{
+		record(MetricsResolution15m, 47*time.Hour, 47),
+		record(MetricsResolution15m, 25*time.Hour, 25),
+		record(MetricsResolution15m, 24*time.Hour, 2400),
+		record(MetricsResolution1m, 24*time.Hour, 24),
+		record(MetricsResolution1m, 23*time.Hour, 23),
+		record(MetricsResolution1m, 2*time.Hour, 2),
+		record(MetricsResolution1m, time.Hour, 1000),
+		record(MetricsResolutionRaw, time.Hour, 1),
+		record(MetricsResolutionRaw, 30*time.Minute, 30),
+		record(MetricsResolutionRaw, time.Minute, 99),
+	}); err != nil {
+		t.Fatalf("InsertBatch() error = %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		from    time.Time
+		wantCPU []float64
+	}{
+		{name: "59 minutes", from: now.Add(-59 * time.Minute), wantCPU: []float64{30, 99}},
+		{name: "61 minutes", from: now.Add(-61 * time.Minute), wantCPU: []float64{1, 30, 99}},
+		{name: "23 hours", from: now.Add(-23 * time.Hour), wantCPU: []float64{23, 2, 1, 30, 99}},
+		{name: "25 hours", from: now.Add(-25 * time.Hour), wantCPU: []float64{25, 24, 23, 2, 1, 30, 99}},
+		{name: "two days", from: now.Add(-48 * time.Hour), wantCPU: []float64{47, 25, 24, 23, 2, 1, 30, 99}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			bundle, err := db.Metrics().QuerySeries(ctx, MetricsSeriesFilter{
+				Scope:        scope,
+				ContainerID:  "c1",
+				From:         test.from,
+				To:           now,
+				Now:          now,
+				RawRetention: time.Hour,
+			})
+			if err != nil {
+				t.Fatalf("QuerySeries() error = %v", err)
+			}
+			points := bundle.Series[0].Points
+			if len(points) != len(test.wantCPU) {
+				t.Fatalf("CPU points = %#v, want values %#v", points, test.wantCPU)
+			}
+			for index, want := range test.wantCPU {
+				if points[index].Value != want {
+					t.Fatalf("CPU point %d = %#v, want %.0f", index, points[index], want)
+				}
+				if index > 0 && !points[index-1].TS.Before(points[index].TS) {
+					t.Fatalf("CPU timestamps are not strictly increasing: %#v", points)
+				}
+			}
+			if got := points[len(points)-1].TS; !got.Equal(now.Add(-time.Minute)) {
+				t.Fatalf("latest timestamp = %v, want %v", got, now.Add(-time.Minute))
+			}
+		})
+	}
+}
+
+func TestMetricsRepositoryBucketsSkewedRawProjectSamples(t *testing.T) {
+	ctx := context.Background()
+	db := openMigratedStore(t, ctx)
+	defer closeStore(t, db)
+
+	base := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+	scope := runtimescope.Must("linux_native", "default")
+	record := func(containerID string, offset time.Duration, cpu float64, memory int64) MetricsSampleRecord {
+		return MetricsSampleRecord{
+			ProviderID:  scope.ProviderID(),
+			ContextName: scope.ContextName(),
+			ProjectID:   "project",
+			ContainerID: containerID,
+			CPUPercent:  cpu,
+			MemoryBytes: memory,
+			SampledAt:   base.Add(offset),
+		}
+	}
+	if err := db.Metrics().InsertBatch(ctx, []MetricsSampleRecord{
+		record("c1", 10*time.Millisecond, 10, 100),
+		record("c2", 32*time.Millisecond, 20, 200),
+		record("c1", 2*time.Second+10*time.Millisecond, 30, 300),
+		record("c2", 2*time.Second+32*time.Millisecond, 40, 400),
+	}); err != nil {
+		t.Fatalf("InsertBatch() error = %v", err)
+	}
+
+	bundle, err := db.Metrics().QuerySeries(ctx, MetricsSeriesFilter{
+		Scope:      scope,
+		ProjectID:  "project",
+		Resolution: MetricsResolutionRaw,
+		From:       base.Add(-time.Second),
+		To:         base.Add(3 * time.Second),
+	})
+	if err != nil {
+		t.Fatalf("QuerySeries() error = %v", err)
+	}
+	if points := bundle.Series[0].Points; len(points) != 2 || points[0].Value != 30 || points[1].Value != 70 {
+		t.Fatalf("project CPU points = %#v, want summed logical samples [30 70]", points)
+	}
+	if points := bundle.Series[1].Points; len(points) != 2 || points[0].Value != 300 || points[1].Value != 700 {
+		t.Fatalf("project memory points = %#v, want summed logical samples [300 700]", points)
+	}
+}
+
 func TestMetricsRepositoryQueryAndRetentionDownsample(t *testing.T) {
 	ctx := context.Background()
 	db := openMigratedStore(t, ctx)
