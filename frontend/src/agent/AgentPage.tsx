@@ -272,9 +272,9 @@ export function AgentPage({ projects }: AgentPageProps) {
   );
   const {
     handleScroll: handleTranscriptScroll,
-    hasUnseenContent,
     jumpToLatest,
     transcriptRef,
+    unseenIndicatorRef,
   } = useTranscriptAutoFollow(messages, messages.length > 0 || sending);
 
   useEffect(() => {
@@ -920,9 +920,12 @@ export function AgentPage({ projects }: AgentPageProps) {
                   <ChatBubble key={message.id} message={message} />
                 ))}
               </div>
-              {hasUnseenContent ? (
+              <div
+                className="absolute bottom-3 left-1/2 -translate-x-1/2 shadow-lg"
+                hidden
+                ref={unseenIndicatorRef}
+              >
                 <Button
-                  className="absolute bottom-3 left-1/2 -translate-x-1/2 shadow-lg"
                   icon={<ArrowDown size={14} />}
                   onClick={jumpToLatest}
                   size="sm"
@@ -930,7 +933,7 @@ export function AgentPage({ projects }: AgentPageProps) {
                 >
                   New messages · Jump to latest
                 </Button>
-              ) : null}
+              </div>
             </div>
 
             <div className="rounded-card border border-border bg-bg-card p-3">

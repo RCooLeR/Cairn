@@ -7,7 +7,7 @@ import { useTranscriptAutoFollow } from "./useTranscriptAutoFollow";
 function TranscriptHarness() {
   const [revision, setRevision] = useState(0);
   const [hasContent, setHasContent] = useState(true);
-  const { handleScroll, hasUnseenContent, jumpToLatest, transcriptRef } =
+  const { handleScroll, jumpToLatest, transcriptRef, unseenIndicatorRef } =
     useTranscriptAutoFollow(revision, hasContent);
   return (
     <>
@@ -16,9 +16,9 @@ function TranscriptHarness() {
         onScroll={handleScroll}
         ref={transcriptRef}
       />
-      {hasUnseenContent ? (
+      <div hidden ref={unseenIndicatorRef}>
         <button onClick={jumpToLatest}>Jump to latest</button>
-      ) : null}
+      </div>
       <button onClick={() => setRevision((current) => current + 1)}>
         Add content
       </button>
