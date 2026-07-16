@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { getAppVersion } from "../api/app";
+import {
+  PARTICLE_LINK_DISTANCE_SQUARED,
+  visitParticleLinks,
+} from "./cairnLoaderParticles";
 
 /* ---------------------------------------------------------------------------
  * CairnLoader — cinematic boot splash for Cairn.
@@ -354,26 +358,17 @@ export default function CairnLoader({ onDone }: { onDone: () => void }) {
         ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
         ctx.fill();
       }
-      for (let i = 0; i < particles.length; i++) {
-        for (let j = i + 1; j < particles.length; j++) {
-          const a = particles[i];
-          const b = particles[j];
-          const dx = a.x - b.x;
-          const dy = a.y - b.y;
-          const d2 = dx * dx + dy * dy;
-          if (d2 < 11500) {
-            ctx.strokeStyle = rgba(
-              mix(a.color, b.color, 0.5),
-              0.045 * (1 - d2 / 11500),
-            );
-            ctx.lineWidth = 1;
-            ctx.beginPath();
-            ctx.moveTo(a.x, a.y);
-            ctx.lineTo(b.x, b.y);
-            ctx.stroke();
-          }
-        }
-      }
+      visitParticleLinks(particles, (a, b, distanceSquared) => {
+        ctx.strokeStyle = rgba(
+          mix(a.color, b.color, 0.5),
+          0.045 * (1 - distanceSquared / PARTICLE_LINK_DISTANCE_SQUARED),
+        );
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        ctx.stroke();
+      });
       ctx.restore();
     };
 
