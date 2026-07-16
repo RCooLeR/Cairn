@@ -1,6 +1,7 @@
 package lineage
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 	"unicode"
@@ -15,6 +16,7 @@ type DockerfileParseResult struct {
 	Stages          []DockerfileStage
 	FinalStageIndex int
 	Warnings        []string
+	Errors          []string
 	UnresolvedArgs  []string
 }
 
@@ -43,39 +45,54 @@ type argDef struct {
 	HasDefault bool
 }
 
-func ParseDockerfile(content string, opts ParseOptions) DockerfileParseResult {
-	args := copyStringMap(opts.BuildArgs)
-	stageByName := map[string]int{}
-	result := DockerfileParseResult{FinalStageIndex: -1}
+type argValue struct {
+	Value      string
+	Unresolved []string
+}
 
-	for _, line := range logicalDockerfileLines(content) {
-		fields := splitInstructionFields(line.Text)
+type heredocDelimiter struct {
+	Value     string
+	StripTabs bool
+}
+
+func ParseDockerfile(content string, opts ParseOptions) DockerfileParseResult {
+	escape, directiveErrors := dockerfileEscape(content)
+	args := automaticPlatformArgs(opts.BuildArgs)
+	stageByName := map[string]int{}
+	result := DockerfileParseResult{FinalStageIndex: -1, Errors: directiveErrors}
+	lines, lineErrors := logicalDockerfileLines(content, escape)
+	result.Errors = appendUnique(result.Errors, lineErrors...)
+	seenFrom := false
+
+	for _, line := range lines {
+		fields := splitInstructionFields(line.Text, escape)
 		if len(fields) == 0 {
 			continue
 		}
 		switch strings.ToUpper(fields[0]) {
 		case "ARG":
-			for _, def := range parseArgDefinitions(fields[1:]) {
-				if _, ok := args[def.Name]; !ok && def.HasDefault {
-					value, unresolved := substituteArgs(def.Value, args)
-					args[def.Name] = value
-					result.UnresolvedArgs = appendUnique(result.UnresolvedArgs, unresolved...)
-				}
+			// Only ARG instructions before the first FROM are in the global
+			// scope used to interpolate FROM instructions. Stage-local ARGs
+			// must not leak into later, unrelated stages.
+			if !seenFrom {
+				applyGlobalArgDefinitions(args, opts.BuildArgs, parseArgDefinitions(fields[1:]))
 			}
 		case "FROM":
+			seenFrom = true
 			baseRaw, platform, stageName, ok := parseFromFields(fields[1:])
 			if !ok {
-				result.Warnings = append(result.Warnings, "invalid FROM instruction on line "+strconv.Itoa(line.Number))
+				result.Errors = append(result.Errors, "invalid FROM instruction on line "+strconv.Itoa(line.Number))
 				continue
 			}
 			baseResolved, unresolved := substituteArgs(baseRaw, args)
+			platformResolved, _ := substituteArgs(platform, args)
 			unresolved = compactStrings(unresolved)
 			stage := DockerfileStage{
 				Index:          len(result.Stages),
 				Name:           stageName,
 				BaseRaw:        baseRaw,
 				BaseResolved:   baseResolved,
-				Platform:       platform,
+				Platform:       platformResolved,
 				Line:           line.Number,
 				BaseStageIndex: -1,
 				Unresolved:     len(unresolved) > 0,
@@ -92,15 +109,27 @@ func ParseDockerfile(content string, opts ParseOptions) DockerfileParseResult {
 			// Numeric stage references keep legacy multi-stage fixtures resolvable.
 			stageByName[strconv.Itoa(stage.Index)] = stage.Index
 			if stage.Name != "" {
-				stageByName[strings.ToLower(stage.Name)] = stage.Index
+				lowerName := strings.ToLower(stage.Name)
+				if _, duplicate := stageByName[lowerName]; duplicate {
+					result.Errors = append(result.Errors, fmt.Sprintf("duplicate Dockerfile stage name %q on line %d", stage.Name, line.Number))
+				} else {
+					stageByName[lowerName] = stage.Index
+				}
 			}
 			result.UnresolvedArgs = appendUnique(result.UnresolvedArgs, unresolved...)
 		}
 	}
 
-	result.FinalStageIndex = resolveFinalStageIndex(result.Stages, opts.Target)
 	if len(result.Stages) == 0 {
-		result.Warnings = append(result.Warnings, "dockerfile has no FROM instruction")
+		result.Errors = appendUnique(result.Errors, "dockerfile has no valid FROM instruction")
+	}
+	if len(result.Errors) == 0 {
+		finalIndex, err := resolveFinalStageIndex(result.Stages, opts.Target)
+		if err != nil {
+			result.Errors = append(result.Errors, err.Error())
+		} else {
+			result.FinalStageIndex = finalIndex
+		}
 	}
 	return result
 }
@@ -128,82 +157,233 @@ func (r DockerfileParseResult) FinalExternalStageIndex() int {
 	return -1
 }
 
-func logicalDockerfileLines(content string) []dockerfileLine {
+func normalizeDockerfileContent(content string) string {
 	content = strings.TrimPrefix(content, "\ufeff")
 	content = strings.ReplaceAll(content, "\r\n", "\n")
-	content = strings.ReplaceAll(content, "\r", "\n")
-	physical := strings.Split(content, "\n")
-	lines := []dockerfileLine{}
-	var builder strings.Builder
-	startLine := 0
-	continuing := false
-	for index, raw := range physical {
-		lineNo := index + 1
-		line := strings.TrimRight(raw, " \t")
-		if !continuing && strings.HasPrefix(strings.TrimLeft(line, " \t"), "#") {
-			continue
-		}
-		if !continuing {
-			startLine = lineNo
-		}
-		trimmed := strings.TrimSpace(line)
-		continued := strings.HasSuffix(trimmed, `\`)
-		if continued {
-			trimmed = strings.TrimSpace(strings.TrimSuffix(trimmed, `\`))
-		}
-		if builder.Len() > 0 && trimmed != "" {
-			builder.WriteByte(' ')
-		}
-		builder.WriteString(trimmed)
-		continuing = continued
-		if continuing {
-			continue
-		}
-		text := strings.TrimSpace(stripInlineComment(builder.String()))
-		if text != "" {
-			lines = append(lines, dockerfileLine{Number: startLine, Text: text})
-		}
-		builder.Reset()
-	}
-	if builder.Len() > 0 {
-		text := strings.TrimSpace(stripInlineComment(builder.String()))
-		if text != "" {
-			lines = append(lines, dockerfileLine{Number: startLine, Text: text})
-		}
-	}
-	return lines
+	return strings.ReplaceAll(content, "\r", "\n")
 }
 
-func stripInlineComment(line string) string {
-	var quote rune
-	escaped := false
-	for index, ch := range line {
-		if escaped {
-			escaped = false
+func dockerfileEscape(content string) (rune, []string) {
+	escape := rune('\\')
+	errors := []string{}
+	seen := map[string]struct{}{}
+	for index, raw := range strings.Split(normalizeDockerfileContent(content), "\n") {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" || !strings.HasPrefix(trimmed, "#") {
+			break
+		}
+		body := strings.TrimSpace(strings.TrimPrefix(trimmed, "#"))
+		key, value, ok := strings.Cut(body, "=")
+		if !ok {
+			// A regular comment ends the parser-directive preamble.
+			break
+		}
+		key = strings.ToLower(strings.TrimSpace(key))
+		value = strings.TrimSpace(value)
+		if key != "syntax" && key != "escape" && key != "check" {
+			// Unknown directives are comments and also end the preamble.
+			break
+		}
+		if _, duplicate := seen[key]; duplicate {
+			errors = append(errors, fmt.Sprintf("duplicate Dockerfile parser directive %q on line %d", key, index+1))
 			continue
 		}
-		if ch == '\\' {
-			escaped = true
+		seen[key] = struct{}{}
+		if key != "escape" {
 			continue
 		}
-		if quote != 0 {
-			if ch == quote {
-				quote = 0
-			}
+		switch value {
+		case `\`:
+			escape = '\\'
+		case "`":
+			escape = '`'
+		default:
+			errors = append(errors, fmt.Sprintf("invalid Dockerfile escape directive %q on line %d", value, index+1))
+		}
+	}
+	return escape, errors
+}
+
+func automaticPlatformArgs(buildArgs map[string]string) map[string]argValue {
+	result := map[string]argValue{}
+	for _, name := range []string{
+		"BUILDPLATFORM", "BUILDOS", "BUILDARCH", "BUILDVARIANT",
+		"TARGETPLATFORM", "TARGETOS", "TARGETARCH", "TARGETVARIANT",
+	} {
+		if value, ok := buildArgs[name]; ok {
+			result[name] = argValue{Value: value}
+		}
+	}
+	return result
+}
+
+func applyGlobalArgDefinitions(args map[string]argValue, buildArgs map[string]string, defs []argDef) {
+	for _, def := range defs {
+		if override, ok := buildArgs[def.Name]; ok {
+			args[def.Name] = argValue{Value: override}
+			continue
+		}
+		if !def.HasDefault {
+			// A declaration without a default preserves an earlier value. This
+			// also matches consuming a predefined global platform argument.
+			continue
+		}
+		value, unresolved := substituteArgs(def.Value, args)
+		args[def.Name] = argValue{Value: value, Unresolved: compactStrings(unresolved)}
+	}
+}
+
+func hasContinuation(line string, escape rune) bool {
+	if line == "" {
+		return false
+	}
+	count := 0
+	for index := len(line); index > 0; {
+		ch := rune(line[index-1])
+		if ch != escape {
+			break
+		}
+		count++
+		index--
+	}
+	return count%2 == 1
+}
+
+func dockerfileHeredocDelimiters(input string, escape rune) []heredocDelimiter {
+	delimiters := []heredocDelimiter{}
+	for index := 0; index < len(input); {
+		ch := rune(input[index])
+		if ch == escape {
+			index += 2
 			continue
 		}
 		if ch == '\'' || ch == '"' {
-			quote = ch
+			quote := byte(ch)
+			index++
+			for index < len(input) {
+				if rune(input[index]) == escape && index+1 < len(input) {
+					index += 2
+					continue
+				}
+				if input[index] == quote {
+					index++
+					break
+				}
+				index++
+			}
 			continue
 		}
-		if ch == '#' && (index == 0 || unicode.IsSpace(rune(line[index-1]))) {
-			return line[:index]
+		if index+1 >= len(input) || input[index] != '<' || input[index+1] != '<' {
+			index++
+			continue
+		}
+		index += 2
+		if index < len(input) && input[index] == '<' {
+			// A shell here-string is not a Dockerfile heredoc declaration.
+			index++
+			continue
+		}
+		stripTabs := false
+		if index < len(input) && input[index] == '-' {
+			stripTabs = true
+			index++
+		}
+		for index < len(input) && unicode.IsSpace(rune(input[index])) {
+			index++
+		}
+		var builder strings.Builder
+		if index < len(input) && (input[index] == '\'' || input[index] == '"') {
+			quote := input[index]
+			index++
+			for index < len(input) && input[index] != quote {
+				builder.WriteByte(input[index])
+				index++
+			}
+			if index < len(input) {
+				index++
+			}
+		} else {
+			for index < len(input) && !unicode.IsSpace(rune(input[index])) {
+				if rune(input[index]) == escape && index+1 < len(input) {
+					index++
+				}
+				builder.WriteByte(input[index])
+				index++
+			}
+		}
+		if builder.Len() > 0 {
+			delimiters = append(delimiters, heredocDelimiter{Value: builder.String(), StripTabs: stripTabs})
 		}
 	}
-	return line
+	return delimiters
 }
 
-func splitInstructionFields(input string) []string {
+func logicalDockerfileLines(content string, escape rune) ([]dockerfileLine, []string) {
+	content = normalizeDockerfileContent(content)
+	physical := strings.Split(content, "\n")
+	lines := []dockerfileLine{}
+	errors := []string{}
+	for index := 0; index < len(physical); {
+		var builder strings.Builder
+		startLine := 0
+		continuing := false
+		for index < len(physical) {
+			raw := physical[index]
+			lineNo := index + 1
+			index++
+			line := strings.TrimRight(raw, " \t")
+			// Docker removes full-line comments before processing continuations.
+			// A # elsewhere is an instruction argument, not an inline comment.
+			if strings.HasPrefix(strings.TrimLeft(line, " \t"), "#") {
+				continue
+			}
+			if builder.Len() == 0 {
+				startLine = lineNo
+			}
+			trimmed := strings.TrimSpace(line)
+			continued := hasContinuation(trimmed, escape)
+			if continued {
+				trimmed = strings.TrimSpace(strings.TrimSuffix(trimmed, string(escape)))
+			}
+			if builder.Len() > 0 && trimmed != "" {
+				builder.WriteByte(' ')
+			}
+			builder.WriteString(trimmed)
+			continuing = continued
+			if continuing {
+				continue
+			}
+			break
+		}
+
+		text := strings.TrimSpace(builder.String())
+		if text == "" {
+			continue
+		}
+		lines = append(lines, dockerfileLine{Number: startLine, Text: text})
+		for _, delimiter := range dockerfileHeredocDelimiters(text, escape) {
+			closed := false
+			for index < len(physical) {
+				candidate := physical[index]
+				index++
+				if delimiter.StripTabs {
+					candidate = strings.TrimLeft(candidate, "\t")
+				}
+				if candidate == delimiter.Value {
+					closed = true
+					break
+				}
+			}
+			if !closed {
+				errors = append(errors, fmt.Sprintf("unterminated Dockerfile heredoc %q opened on line %d", delimiter.Value, startLine))
+				break
+			}
+		}
+	}
+	return lines, errors
+}
+
+func splitInstructionFields(input string, escape rune) []string {
 	fields := []string{}
 	var builder strings.Builder
 	var quote rune
@@ -221,7 +401,7 @@ func splitInstructionFields(input string) []string {
 			escaped = false
 			continue
 		}
-		if ch == '\\' {
+		if ch == escape {
 			escaped = true
 			continue
 		}
@@ -244,7 +424,7 @@ func splitInstructionFields(input string) []string {
 		builder.WriteRune(ch)
 	}
 	if escaped {
-		builder.WriteRune('\\')
+		builder.WriteRune(escape)
 	}
 	flush()
 	return fields
@@ -279,10 +459,18 @@ func parseFromFields(fields []string) (base string, platform string, stageName s
 			break
 		}
 		if value, found := strings.CutPrefix(field, "--platform="); found {
+			if value == "" {
+				return "", "", "", false
+			}
 			platform = value
 		} else if field == "--platform" && index+1 < len(fields) {
 			index++
 			platform = fields[index]
+			if platform == "" {
+				return "", "", "", false
+			}
+		} else {
+			return "", "", "", false
 		}
 		index++
 	}
@@ -291,13 +479,16 @@ func parseFromFields(fields []string) (base string, platform string, stageName s
 	}
 	base = fields[index]
 	index++
-	if index+1 < len(fields) && strings.EqualFold(fields[index], "AS") {
-		stageName = fields[index+1]
+	if index == len(fields) {
+		return base, platform, "", base != ""
 	}
-	return base, platform, stageName, base != ""
+	if index+2 != len(fields) || !strings.EqualFold(fields[index], "AS") || fields[index+1] == "" {
+		return "", platform, "", false
+	}
+	return base, platform, fields[index+1], base != ""
 }
 
-func substituteArgs(input string, args map[string]string) (string, []string) {
+func substituteArgs(input string, args map[string]argValue) (string, []string) {
 	var builder strings.Builder
 	unresolved := []string{}
 	for index := 0; index < len(input); {
@@ -321,7 +512,8 @@ func substituteArgs(input string, args map[string]string) (string, []string) {
 			name := input[index+2 : index+2+end]
 			token := input[index : index+3+end]
 			if value, ok := args[name]; ok {
-				builder.WriteString(value)
+				builder.WriteString(value.Value)
+				unresolved = append(unresolved, value.Unresolved...)
 			} else {
 				builder.WriteString(token)
 				unresolved = append(unresolved, name)
@@ -342,7 +534,8 @@ func substituteArgs(input string, args map[string]string) (string, []string) {
 		name := input[next:end]
 		token := input[index:end]
 		if value, ok := args[name]; ok {
-			builder.WriteString(value)
+			builder.WriteString(value.Value)
+			unresolved = append(unresolved, value.Unresolved...)
 		} else {
 			builder.WriteString(token)
 			unresolved = append(unresolved, name)
@@ -352,31 +545,26 @@ func substituteArgs(input string, args map[string]string) (string, []string) {
 	return builder.String(), unresolved
 }
 
-func resolveFinalStageIndex(stages []DockerfileStage, target string) int {
+func resolveFinalStageIndex(stages []DockerfileStage, target string) (int, error) {
 	if len(stages) == 0 {
-		return -1
+		return -1, fmt.Errorf("cannot resolve a build target without Dockerfile stages")
 	}
 	target = strings.TrimSpace(target)
 	if target == "" {
-		return len(stages) - 1
+		return len(stages) - 1, nil
 	}
-	if numeric, err := strconv.Atoi(target); err == nil && numeric >= 0 && numeric < len(stages) {
-		return numeric
+	if numeric, err := strconv.Atoi(target); err == nil {
+		if numeric < 0 || numeric >= len(stages) {
+			return -1, fmt.Errorf("Dockerfile build target index %d is out of range for %d stages", numeric, len(stages))
+		}
+		return numeric, nil
 	}
 	for _, stage := range stages {
 		if strings.EqualFold(stage.Name, target) {
-			return stage.Index
+			return stage.Index, nil
 		}
 	}
-	return len(stages) - 1
-}
-
-func copyStringMap(values map[string]string) map[string]string {
-	copied := map[string]string{}
-	for key, value := range values {
-		copied[key] = value
-	}
-	return copied
+	return -1, fmt.Errorf("Dockerfile build target %q does not match a named stage", target)
 }
 
 func appendUnique(values []string, next ...string) []string {

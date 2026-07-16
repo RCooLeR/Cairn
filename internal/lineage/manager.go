@@ -221,12 +221,15 @@ func (m *Manager) discoverService(ctx context.Context, project store.ProjectReco
 		Target:    service.BuildTarget,
 	})
 	record.Source = models.LineageSourceComposeDockerfile
-	record.Confidence = models.ConfidenceMedium
-	record.BaseRefs = baseRefsFromParse(parsed)
-	if len(parsed.Stages) == 0 {
+	if len(parsed.Errors) > 0 || len(parsed.Stages) == 0 {
+		// A parse or target-selection error means we cannot know which build
+		// graph Compose would produce. Persisting any guessed base here would
+		// allow update checks to recommend rebuilding against the wrong stage.
 		record.Confidence = models.ConfidenceUnknown
 		return record
 	}
+	record.Confidence = models.ConfidenceMedium
+	record.BaseRefs = baseRefsFromParse(parsed)
 	if len(parsed.UnresolvedArgs) > 0 {
 		record.Confidence = models.ConfidenceLow
 	}

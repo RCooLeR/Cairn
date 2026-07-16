@@ -1,6 +1,7 @@
 package lineage
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/RCooLeR/Cairn/internal/models"
@@ -18,6 +19,7 @@ func TestParseDockerfileFixtures(t *testing.T) {
 		wantFinalExternal string
 		wantUnresolved    []string
 		wantWarnings      int
+		wantErrors        int
 		wantPlatform      string
 		wantPinned        bool
 		wantScratch       bool
@@ -32,7 +34,7 @@ func TestParseDockerfileFixtures(t *testing.T) {
 		{name: "multi final last", dockerfile: "FROM alpine:3.20 AS builder\nFROM nginx:alpine AS runtime", wantBases: []string{"alpine:3.20", "nginx:alpine"}, wantExternal: []string{"alpine:3.20", "nginx:alpine"}, wantFinalExternal: "nginx:alpine"},
 		{name: "multi target by name", dockerfile: "FROM alpine:3.20 AS builder\nFROM nginx:alpine AS runtime", target: "builder", wantBases: []string{"alpine:3.20", "nginx:alpine"}, wantExternal: []string{"alpine:3.20", "nginx:alpine"}, wantFinalExternal: "alpine:3.20"},
 		{name: "multi target by index", dockerfile: "FROM alpine:3.20 AS builder\nFROM nginx:alpine AS runtime", target: "1", wantBases: []string{"alpine:3.20", "nginx:alpine"}, wantExternal: []string{"alpine:3.20", "nginx:alpine"}, wantFinalExternal: "nginx:alpine"},
-		{name: "missing target falls back", dockerfile: "FROM alpine AS a\nFROM debian AS b", target: "missing", wantBases: []string{"alpine", "debian"}, wantExternal: []string{"alpine", "debian"}, wantFinalExternal: "debian"},
+		{name: "missing target fails closed", dockerfile: "FROM alpine AS a\nFROM debian AS b", target: "missing", wantBases: []string{"alpine", "debian"}, wantExternal: []string{"alpine", "debian"}, wantErrors: 1},
 		{name: "arg default braces", dockerfile: "ARG BASE=alpine:3.20\nFROM ${BASE}", wantBases: []string{"alpine:3.20"}, wantExternal: []string{"alpine:3.20"}, wantFinalExternal: "alpine:3.20"},
 		{name: "arg override", dockerfile: "ARG BASE=alpine:3.20\nFROM ${BASE}", args: map[string]string{"BASE": "ubuntu:24.04"}, wantBases: []string{"ubuntu:24.04"}, wantExternal: []string{"ubuntu:24.04"}, wantFinalExternal: "ubuntu:24.04"},
 		{name: "arg dollar", dockerfile: "ARG BASE=postgres:16-alpine\nFROM $BASE", wantBases: []string{"postgres:16-alpine"}, wantExternal: []string{"postgres:16-alpine"}, wantFinalExternal: "postgres:16-alpine"},
@@ -44,17 +46,19 @@ func TestParseDockerfileFixtures(t *testing.T) {
 		{name: "digest pinned", dockerfile: "FROM alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", wantBases: []string{"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, wantExternal: []string{"alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, wantFinalExternal: "alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", wantPinned: true},
 		{name: "previous stage internal", dockerfile: "FROM alpine AS builder\nFROM builder AS final", wantBases: []string{"alpine", "builder"}, wantExternal: []string{"alpine"}, wantFinalExternal: "alpine", wantInternal: true},
 		{name: "previous numeric stage internal", dockerfile: "FROM alpine\nFROM 0 AS final", wantBases: []string{"alpine", "0"}, wantExternal: []string{"alpine"}, wantFinalExternal: "alpine", wantInternal: true},
-		{name: "inline comment", dockerfile: "FROM nginx:alpine # runtime image", wantBases: []string{"nginx:alpine"}, wantExternal: []string{"nginx:alpine"}, wantFinalExternal: "nginx:alpine"},
+		{name: "inline hash is an argument", dockerfile: "FROM nginx:alpine # runtime image", wantErrors: 2},
 		{name: "quoted arg default", dockerfile: "ARG BASE=\"node:22-alpine\"\nFROM $BASE", wantBases: []string{"node:22-alpine"}, wantExternal: []string{"node:22-alpine"}, wantFinalExternal: "node:22-alpine"},
-		{name: "invalid from", dockerfile: "FROM", wantWarnings: 2},
-		{name: "no from", dockerfile: "RUN echo hi", wantWarnings: 1},
+		{name: "invalid from", dockerfile: "FROM", wantErrors: 2},
+		{name: "no from", dockerfile: "RUN echo hi", wantErrors: 1},
 		{name: "multiple arg fields", dockerfile: "ARG DIST=alpine VERSION=3.20\nFROM ${DIST}:${VERSION}", wantBases: []string{"alpine:3.20"}, wantExternal: []string{"alpine:3.20"}, wantFinalExternal: "alpine:3.20"},
 		{name: "registry port", dockerfile: "FROM localhost:5000/team/app:dev", wantBases: []string{"localhost:5000/team/app:dev"}, wantExternal: []string{"localhost:5000/team/app:dev"}, wantFinalExternal: "localhost:5000/team/app:dev"},
 		{name: "quoted from ref", dockerfile: "FROM 'alpine:3.20'", wantBases: []string{"alpine:3.20"}, wantExternal: []string{"alpine:3.20"}, wantFinalExternal: "alpine:3.20"},
 		{name: "escaped whitespace in quoted arg", dockerfile: "ARG BASE='busybox:1.36'\nFROM ${BASE}", wantBases: []string{"busybox:1.36"}, wantExternal: []string{"busybox:1.36"}, wantFinalExternal: "busybox:1.36"},
 		{name: "nested arg defaults", dockerfile: "ARG DIST=alpine\nARG BASE=${DIST}:3.20\nFROM ${BASE}", wantBases: []string{"alpine:3.20"}, wantExternal: []string{"alpine:3.20"}, wantFinalExternal: "alpine:3.20"},
+		{name: "nested unresolved arg", dockerfile: "ARG BASE=${MISSING}:latest\nFROM ${BASE}", wantBases: []string{"${MISSING}:latest"}, wantExternal: []string{"${MISSING}:latest"}, wantFinalExternal: "${MISSING}:latest", wantUnresolved: []string{"MISSING"}},
 		{name: "duplicate unresolved unique", dockerfile: "FROM ${BASE}-${BASE}", wantBases: []string{"${BASE}-${BASE}"}, wantExternal: []string{"${BASE}-${BASE}"}, wantFinalExternal: "${BASE}-${BASE}", wantUnresolved: []string{"BASE"}},
 		{name: "continuation comment", dockerfile: "FROM \\\n  alpine:3.20 \\\n  # comment\n", wantBases: []string{"alpine:3.20"}, wantExternal: []string{"alpine:3.20"}, wantFinalExternal: "alpine:3.20"},
+		{name: "automatic platform override", dockerfile: "FROM --platform=$BUILDPLATFORM alpine:3.20", args: map[string]string{"BUILDPLATFORM": "linux/amd64"}, wantBases: []string{"alpine:3.20"}, wantExternal: []string{"alpine:3.20"}, wantFinalExternal: "alpine:3.20", wantPlatform: "linux/amd64"},
 	}
 	if len(cases) < 30 {
 		t.Fatalf("parser fixture count = %d, want at least 30", len(cases))
@@ -91,6 +95,9 @@ func TestParseDockerfileFixtures(t *testing.T) {
 			if len(got.Warnings) != tt.wantWarnings {
 				t.Fatalf("warnings = %v, want count %d", got.Warnings, tt.wantWarnings)
 			}
+			if len(got.Errors) != tt.wantErrors {
+				t.Fatalf("errors = %v, want count %d", got.Errors, tt.wantErrors)
+			}
 			if tt.wantPlatform != "" && got.Stages[0].Platform != tt.wantPlatform {
 				t.Fatalf("platform = %q, want %q", got.Stages[0].Platform, tt.wantPlatform)
 			}
@@ -102,6 +109,89 @@ func TestParseDockerfileFixtures(t *testing.T) {
 			}
 			if tt.wantInternal && !got.Stages[len(got.Stages)-1].Internal {
 				t.Fatalf("last stage not marked internal")
+			}
+		})
+	}
+}
+
+func TestParseDockerfileFromArgScope(t *testing.T) {
+	t.Parallel()
+
+	t.Run("stage arg does not shadow global for later FROM", func(t *testing.T) {
+		t.Parallel()
+		parsed := ParseDockerfile(`
+ARG BASE=alpine:3.20
+FROM ${BASE} AS build
+ARG BASE=ubuntu:24.04
+FROM ${BASE} AS runtime
+`, ParseOptions{})
+		if len(parsed.Errors) > 0 {
+			t.Fatalf("errors = %v", parsed.Errors)
+		}
+		if got := []string{parsed.Stages[0].BaseResolved, parsed.Stages[1].BaseResolved}; !sameStrings(got, []string{"alpine:3.20", "alpine:3.20"}) {
+			t.Fatalf("bases = %v", got)
+		}
+	})
+
+	t.Run("ARG declared after FROM is not global", func(t *testing.T) {
+		t.Parallel()
+		parsed := ParseDockerfile(`
+FROM alpine:3.20 AS build
+ARG BASE=ubuntu:24.04
+FROM ${BASE} AS runtime
+`, ParseOptions{BuildArgs: map[string]string{"BASE": "debian:bookworm"}})
+		if len(parsed.Errors) > 0 {
+			t.Fatalf("errors = %v", parsed.Errors)
+		}
+		if got := parsed.Stages[1].BaseResolved; got != "${BASE}" {
+			t.Fatalf("second base = %q, want unresolved global ARG", got)
+		}
+		if !parsed.Stages[1].Unresolved || !sameStrings(parsed.UnresolvedArgs, []string{"BASE"}) {
+			t.Fatalf("unresolved stage/result = %#v / %v", parsed.Stages[1], parsed.UnresolvedArgs)
+		}
+	})
+
+	t.Run("build override requires global declaration", func(t *testing.T) {
+		t.Parallel()
+		parsed := ParseDockerfile("FROM ${BASE}", ParseOptions{BuildArgs: map[string]string{"BASE": "debian:bookworm"}})
+		if got := parsed.Stages[0].BaseResolved; got != "${BASE}" || !parsed.Stages[0].Unresolved {
+			t.Fatalf("stage = %#v", parsed.Stages[0])
+		}
+	})
+}
+
+func TestParseDockerfileEscapeDirectiveAndHeredoc(t *testing.T) {
+	t.Parallel()
+	parsed := ParseDockerfile("# escape=`\n\nARG BASE=mcr.microsoft.com/windows/nanoserver:ltsc2022\nFROM `\n  ${BASE} `\n  AS build\nCOPY <<'BODY' /tmp/example\nFROM not-a-stage\nBODY\nFROM build AS runtime\n", ParseOptions{})
+	if len(parsed.Errors) > 0 {
+		t.Fatalf("errors = %v", parsed.Errors)
+	}
+	if len(parsed.Stages) != 2 {
+		t.Fatalf("stages = %#v, want heredoc body ignored", parsed.Stages)
+	}
+	if parsed.Stages[0].BaseResolved != "mcr.microsoft.com/windows/nanoserver:ltsc2022" || !parsed.Stages[1].Internal {
+		t.Fatalf("stages = %#v", parsed.Stages)
+	}
+	if final := parsed.FinalExternalStageIndex(); final != 0 {
+		t.Fatalf("final external stage = %d", final)
+	}
+}
+
+func TestParseDockerfileInvalidTargetsFailClosed(t *testing.T) {
+	t.Parallel()
+	for _, target := range []string{"missing", "2", "-1"} {
+		target := target
+		t.Run(target, func(t *testing.T) {
+			t.Parallel()
+			parsed := ParseDockerfile("FROM alpine AS build\nFROM debian AS runtime\n", ParseOptions{Target: target})
+			if parsed.FinalStageIndex != -1 || parsed.FinalExternalStageIndex() != -1 {
+				t.Fatalf("target %q selected stage %d", target, parsed.FinalStageIndex)
+			}
+			if len(parsed.Errors) != 1 {
+				t.Fatalf("target %q errors = %v", target, parsed.Errors)
+			}
+			if !strings.Contains(parsed.Errors[0], target) {
+				t.Fatalf("target %q error is not explicit: %v", target, parsed.Errors)
 			}
 		})
 	}

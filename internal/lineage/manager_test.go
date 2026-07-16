@@ -120,6 +120,7 @@ func TestManagerConfidenceAssignments(t *testing.T) {
 	writeFile(t, filepath.Join(root, "high", "Dockerfile"), "FROM alpine:3.20\n")
 	writeFile(t, filepath.Join(root, "medium", "Dockerfile"), "FROM nginx:alpine\n")
 	writeFile(t, filepath.Join(root, "unresolved", "Dockerfile"), "ARG BASE\nFROM ${BASE}:latest\n")
+	writeFile(t, filepath.Join(root, "invalid-target", "Dockerfile"), "FROM alpine:3.20 AS build\nFROM nginx:alpine AS runtime\n")
 	projectID := "linux_native/confidence"
 	now := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)
 	if err := db.Projects().SaveSnapshot(ctx, runtimescope.Must("linux_native", "default"), []store.ProjectRecord{{
@@ -135,6 +136,7 @@ func TestManagerConfidenceAssignments(t *testing.T) {
 		{ID: projectID + "/medium", ProjectID: projectID, Name: "medium", ImageRef: "local/medium:latest", BuildContext: "medium", LastSeenAt: now},
 		{ID: projectID + "/low", ProjectID: projectID, Name: "low", ImageRef: "local/low:latest", LastSeenAt: now},
 		{ID: projectID + "/unresolved", ProjectID: projectID, Name: "unresolved", ImageRef: "local/unresolved:latest", BuildContext: "unresolved", LastSeenAt: now},
+		{ID: projectID + "/invalid-target", ProjectID: projectID, Name: "invalid-target", ImageRef: "local/invalid-target:latest", BuildContext: "invalid-target", BuildTarget: "runtim", LastSeenAt: now},
 		{ID: projectID + "/unknown", ProjectID: projectID, Name: "unknown", ImageRef: "local/unknown:latest", LastSeenAt: now},
 	}, now, time.Time{}); err != nil {
 		t.Fatalf("SaveSnapshot() error = %v", err)
@@ -165,7 +167,17 @@ func TestManagerConfidenceAssignments(t *testing.T) {
 	assertLineage(t, byService["medium"], models.LineageSourceComposeDockerfile, models.ConfidenceMedium, "nginx:alpine")
 	assertLineage(t, byService["low"], models.LineageSourceOCIAnnotation, models.ConfidenceLow, "debian:12")
 	assertLineage(t, byService["unresolved"], models.LineageSourceComposeDockerfile, models.ConfidenceLow, "${BASE}:latest")
+	assertLineage(t, byService["invalid-target"], models.LineageSourceComposeDockerfile, models.ConfidenceUnknown, "")
 	assertLineage(t, byService["unknown"], models.LineageSourceUnknown, models.ConfidenceUnknown, "")
+	records, err := db.Lineage().ListProject(ctx, projectID)
+	if err != nil {
+		t.Fatalf("ListProject() error = %v", err)
+	}
+	for _, record := range records {
+		if record.ServiceName == "invalid-target" && len(record.BaseRefs) != 0 {
+			t.Fatalf("invalid target persisted guessed base refs = %#v", record.BaseRefs)
+		}
+	}
 }
 
 func TestManagerGetAndRefreshLineage(t *testing.T) {
