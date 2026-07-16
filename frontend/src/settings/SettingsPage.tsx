@@ -1114,7 +1114,7 @@ export function SettingsPage({
                   runtimeDiagnostics.stdio.activeConnections.length > 0 ? (
                     <div className="overflow-hidden rounded-card border border-border">
                       <div className="border-b border-border bg-bg-inset px-3 py-2 text-xs font-semibold uppercase text-text-muted">
-                        Active WSL stdio commands
+                        Active WSL stdio transports
                       </div>
                       <div className="divide-y divide-border">
                         {runtimeDiagnostics.stdio.activeConnections.map(
