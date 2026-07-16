@@ -41,7 +41,7 @@ Open **Projects** and select **Import Project**. Pick a folder that contains one
 - `docker-compose.yml`
 - `docker-compose.yaml`
 
-When importing a project with no containers yet, Cairn deploys it instead of requiring a separate redeploy step.
+Importing validates and saves the project configuration without starting containers. Use the reviewed **Redeploy** action when you are ready to create them.
 
 On Windows WSL, heavy Compose projects perform better inside the WSL filesystem, such as `~/projects`, instead of under `/mnt/c/...`.
 

@@ -2519,7 +2519,7 @@ describe("App inventory shell", () => {
       "APP_ENV=local",
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Import" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save project" }));
 
     await waitFor(() =>
       expect(projectServiceMock.ImportProject).toHaveBeenCalledWith(
@@ -2535,9 +2535,32 @@ describe("App inventory shell", () => {
     await waitFor(() =>
       expect(projectServiceMock.RefreshProjects).toHaveBeenCalledTimes(2),
     );
+    const importCalls = projectServiceMock.ImportProject.mock.calls;
+    const completedRequest = importCalls[importCalls.length - 1][0] as {
+      jobID: string;
+    };
+    await act(async () => {
+      emitRuntimeEvent("job:progress", {
+        jobID: completedRequest.jobID,
+        projectID: "linux_native/app-db",
+        action: "import",
+        phase: "save",
+        message: "Late save progress",
+      });
+      emitRuntimeEvent("job:done", {
+        jobID: completedRequest.jobID,
+        projectID: "linux_native/app-db",
+        action: "import",
+        error: "Late save failure",
+      });
+      await Promise.resolve();
+    });
+    expect(screen.queryByText("Late save progress")).not.toBeInTheDocument();
+    expect(screen.queryByText("Late save failure")).not.toBeInTheDocument();
+    expect(screen.getByText("Imported app-db")).toBeInTheDocument();
   });
 
-  it("streams import progress and closes while build continues", async () => {
+  it("streams save-only import progress without following deploy jobs", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
     projectServiceMock.RefreshProjects.mockResolvedValueOnce(
       [],
@@ -2575,7 +2598,7 @@ describe("App inventory shell", () => {
     expect(await screen.findByTestId("monaco-viewer")).toHaveTextContent(
       "image: cairn/app:latest",
     );
-    fireEvent.click(screen.getByRole("button", { name: "Import" }));
+    fireEvent.click(screen.getByRole("button", { name: "Save project" }));
 
     await waitFor(() =>
       expect(projectServiceMock.ImportProject).toHaveBeenCalled(),
@@ -2591,9 +2614,17 @@ describe("App inventory shell", () => {
       phase: "stdout",
       message: "Container app Started",
     });
-    expect(
-      await screen.findByText("Container app Started"),
-    ).toBeInTheDocument();
+    expect(screen.queryByText("Container app Started")).not.toBeInTheDocument();
+
+    emitRuntimeEvent("job:progress", {
+      jobID: request.jobID,
+      projectID: "linux_native/app-db",
+      action: "import",
+      phase: "save",
+      pct: 100,
+      message: "Project saved",
+    });
+    expect(await screen.findByText("Project saved")).toBeInTheDocument();
 
     const closeButtons = screen.getAllByRole("button", { name: "Close" });
     fireEvent.click(closeButtons[closeButtons.length - 1]);
@@ -2607,6 +2638,200 @@ describe("App inventory shell", () => {
     await waitFor(() =>
       expect(projectServiceMock.RefreshProjects).toHaveBeenCalledTimes(2),
     );
+  });
+
+  it("keeps job completion busy and ignores a stale import success after reopening", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValue([]);
+    runtimeMock.openFile.mockResolvedValue(
+      "E:\\Development\\projects\\apps\\rcooler\\Cairn\\testdata\\projects\\app-db",
+    );
+    const pendingImport = deferred<ProjectDetail>();
+    projectServiceMock.ImportProject.mockReturnValueOnce(pendingImport.promise);
+
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Overview" });
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Projects/ }),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Import Project" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Browse" }));
+    expect(await screen.findByTestId("monaco-viewer")).toHaveTextContent(
+      "image: cairn/app:latest",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save project" }));
+
+    await waitFor(() =>
+      expect(projectServiceMock.ImportProject).toHaveBeenCalled(),
+    );
+    const importCalls = projectServiceMock.ImportProject.mock.calls;
+    const request = importCalls[importCalls.length - 1][0] as {
+      jobID: string;
+    };
+    await act(async () => {
+      emitRuntimeEvent("job:done", {
+        jobID: request.jobID,
+        projectID: "linux_native/app-db",
+        action: "import",
+        result: "success",
+      });
+      await Promise.resolve();
+    });
+
+    const savingDialog = screen.getByRole("dialog", {
+      name: "Import Project",
+    });
+    expect(
+      within(savingDialog).queryByRole("button", { name: "Save project" }),
+    ).not.toBeInTheDocument();
+    const savingCloseButtons = within(savingDialog).getAllByRole("button", {
+      name: "Close",
+    });
+    fireEvent.click(savingCloseButtons[savingCloseButtons.length - 1]);
+    expect(
+      screen.queryByRole("dialog", { name: "Import Project" }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Import Project" }),
+    );
+    const freshDialog = await screen.findByRole("dialog", {
+      name: "Import Project",
+    });
+    expect(within(freshDialog).getByLabelText("Folder")).toHaveValue("");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: "Overview" }),
+    );
+    const refreshCallsBeforeStaleCompletion =
+      projectServiceMock.RefreshProjects.mock.calls.length;
+
+    await act(async () => {
+      pendingImport.resolve(seededProjectDetail());
+      await pendingImport.promise;
+      await Promise.resolve();
+    });
+
+    expect(projectServiceMock.RefreshProjects).toHaveBeenCalledTimes(
+      refreshCallsBeforeStaleCompletion,
+    );
+    expect(
+      screen.getByRole("heading", { name: "Overview" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("dialog", { name: "Import Project" }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Imported app-db")).not.toBeInTheDocument();
+  });
+
+  it("ignores a stale import failure after a replacement session closes", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValue([]);
+    runtimeMock.openFile.mockResolvedValue(
+      "E:\\Development\\projects\\apps\\rcooler\\Cairn\\testdata\\projects\\app-db",
+    );
+    const pendingImport = deferred<ProjectDetail>();
+    projectServiceMock.ImportProject.mockReturnValueOnce(pendingImport.promise);
+
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Overview" });
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Projects/ }),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Import Project" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Browse" }));
+    expect(await screen.findByTestId("monaco-viewer")).toHaveTextContent(
+      "image: cairn/app:latest",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save project" }));
+    await waitFor(() =>
+      expect(projectServiceMock.ImportProject).toHaveBeenCalled(),
+    );
+
+    let dialog = screen.getByRole("dialog", { name: "Import Project" });
+    const savingCloseButtons = within(dialog).getAllByRole("button", {
+      name: "Close",
+    });
+    fireEvent.click(savingCloseButtons[savingCloseButtons.length - 1]);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Import Project" }),
+    );
+    dialog = await screen.findByRole("dialog", { name: "Import Project" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: "Overview" }),
+    );
+
+    await act(async () => {
+      pendingImport.reject(new Error("stale import failure"));
+      try {
+        await pendingImport.promise;
+      } catch {
+        // The submit handler owns and suppresses errors from stale sessions.
+      }
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByText("stale import failure")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "Overview" }),
+    ).toBeInTheDocument();
+  });
+
+  it("ignores a stale project review after closing and reopening import", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    runtimeMock.openFile.mockResolvedValue(
+      "E:\\Development\\projects\\apps\\rcooler\\Cairn\\testdata\\projects\\app-db",
+    );
+    const pendingReview = deferred<ImportProjectReview>();
+    projectServiceMock.ReviewImportProject.mockReturnValueOnce(
+      pendingReview.promise,
+    );
+
+    render(<App />);
+
+    await screen.findByRole("heading", { name: "Overview" });
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Projects/ }),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Import Project" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Browse" }));
+    await waitFor(() =>
+      expect(projectServiceMock.ReviewImportProject).toHaveBeenCalled(),
+    );
+    let dialog = screen.getByRole("dialog", { name: "Import Project" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+
+    fireEvent.click(screen.getByRole("button", { name: "Import Project" }));
+    dialog = await screen.findByRole("dialog", { name: "Import Project" });
+    expect(within(dialog).getByLabelText("Folder")).toHaveValue("");
+
+    await act(async () => {
+      pendingReview.resolve(seededImportProjectReview());
+      await pendingReview.promise;
+      await Promise.resolve();
+    });
+
+    dialog = screen.getByRole("dialog", { name: "Import Project" });
+    expect(within(dialog).getByLabelText("Folder")).toHaveValue("");
+    expect(screen.queryByTestId("monaco-viewer")).not.toBeInTheDocument();
   });
 
   it("warns when importing a project from a WSL mount path", async () => {
@@ -4065,6 +4290,13 @@ describe("App inventory shell", () => {
       }),
     ).toBeDisabled();
 
+    clickSettingsSection("Help");
+    expect(
+      await screen.findByText(
+        "Imports save project configuration without starting containers; use the reviewed Redeploy action when you are ready to create them.",
+      ),
+    ).toBeInTheDocument();
+
     clickSettingsSection("About");
     expect(await screen.findByText("1.0.0")).toBeInTheDocument();
     expect(screen.getByText("go1.26.4")).toBeInTheDocument();
@@ -5026,7 +5258,7 @@ function seededImportProjectReview(): ImportProjectReview {
       },
     ],
     services: ["app", "db"],
-    buildRequired: true,
+    buildRequired: false,
   };
 }
 

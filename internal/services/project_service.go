@@ -146,7 +146,7 @@ func (s *ProjectService) ReviewImportProject(ctx context.Context, req models.Imp
 		Compose:       config.API,
 		EnvFiles:      readImportEnvFiles(workdir, config.EnvFiles),
 		Services:      services,
-		BuildRequired: s.shouldAutoDeployImportedProject(ctx, importOpts),
+		BuildRequired: false,
 	}, nil
 }
 
@@ -231,31 +231,13 @@ func (s *ProjectService) ImportProject(ctx context.Context, req models.ImportPro
 	if err := s.Projects.SaveSnapshot(ctx, s.ProviderID, []store.ProjectRecord{project}, services, now, time.Time{}); err != nil {
 		return fail(apperror.Wrap(apperror.Internal, "Import project failed", err))
 	}
-	s.publishImportJobProgress(jobID, projectID, "review", "Project saved", progressPct(65))
-	s.publishImportJobProgress(jobID, projectID, "build", "Checking existing containers", progressPct(75))
-	if s.shouldAutoDeployImportedProject(ctx, importOpts) {
-		s.publishImportJobProgress(jobID, projectID, "build", "Container build started in the background", progressPct(85))
-		s.runImportedProjectDeploy(context.WithoutCancel(ctx), projectID)
-	} else if s.Detector != nil {
-		s.publishImportJobProgress(jobID, projectID, "build", "Existing containers found; build skipped", progressPct(100))
-		_, _ = s.Detector.Reconcile(ctx)
-	} else {
-		s.publishImportJobProgress(jobID, projectID, "build", "Existing containers found; build skipped", progressPct(100))
-	}
+	s.publishImportJobProgress(jobID, projectID, "save", "Project saved", progressPct(100))
 	detail, err := s.getProject(ctx, projectID)
 	if err != nil {
 		return fail(err)
 	}
 	s.publishImportJobDone(jobID, projectID, "success", nil)
 	return detail, nil
-}
-
-func (s *ProjectService) shouldAutoDeployImportedProject(ctx context.Context, opts composecore.ProjectOptions) bool {
-	statuses, err := s.Client.Ps(ctx, opts)
-	if err != nil {
-		return false
-	}
-	return len(statuses) == 0
 }
 
 func (s *ProjectService) RemoveProjectFromList(ctx context.Context, projectID string) error {
@@ -1305,32 +1287,6 @@ func (s *ProjectService) publishProjectComposeOutput(jobID string, projectID str
 	for _, line := range splitOutputLines(result.Stderr) {
 		s.publishProjectJobProgress(jobID, projectID, action, command, "stderr", line, nil)
 	}
-}
-
-func (s *ProjectService) runImportedProjectDeploy(ctx context.Context, projectID string) {
-	go func() {
-		unlock := s.lockRuntime()
-		snapshot := *s
-		runtimeCtx := s.RuntimeCtx
-		unlock()
-
-		deployCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
-		defer cancel()
-		if runtimeCtx != nil {
-			go func() {
-				select {
-				case <-runtimeCtx.Done():
-					cancel()
-				case <-deployCtx.Done():
-				}
-			}()
-		}
-		snapshot.RuntimeMu = nil
-		snapshot.RuntimeCtx = nil
-		if err := snapshot.runProjectAction(deployCtx, security.ProjectActionDeploy, projectID, false, nil); err != nil && snapshot.Detector != nil {
-			_, _ = snapshot.Detector.Reconcile(deployCtx)
-		}
-	}()
 }
 
 func (s *ProjectService) publishImportJobProgress(jobID string, projectID string, phase string, message string, pct *float64) {

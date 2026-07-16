@@ -17,6 +17,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
 	registrycore "github.com/RCooLeR/Cairn/internal/registry"
+	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/store"
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types/container"
@@ -326,20 +327,20 @@ func (c *Client) SearchHub(ctx context.Context, query string, limit int) ([]mode
 }
 
 func (c *Client) CreateVolume(ctx context.Context, req models.CreateVolumeRequest) (*models.VolumeSummary, error) {
+	var err error
+	req, err = security.NormalizeCreateVolumeRequest(req)
+	if err != nil {
+		return nil, err
+	}
 	api, err := c.ensureConnected(ctx)
 	if err != nil {
 		return nil, err
 	}
-	req.Name = strings.TrimSpace(req.Name)
-	req.Driver = strings.TrimSpace(req.Driver)
 	if req.Name == "" {
 		return nil, apperror.New(apperror.Conflict, "Volume name is required")
 	}
 	if !dockerNamePattern.MatchString(req.Name) {
 		return nil, apperror.New(apperror.Conflict, "Volume name must start with a letter or number and use only letters, numbers, '.', '_' or '-'")
-	}
-	if req.Driver == "" {
-		req.Driver = "local"
 	}
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()

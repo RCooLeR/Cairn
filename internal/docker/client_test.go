@@ -1135,6 +1135,86 @@ func TestClientRunImageRenameAndCreateObjects(t *testing.T) {
 	}
 }
 
+func TestClientCreateVolumeRejectsLocalBindOptionsBeforeDocker(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	client := New(fakeDockerProvider{}, nil)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	tests := []struct {
+		name string
+		opts map[string]string
+	}{
+		{
+			name: "bind host root",
+			opts: map[string]string{"type": "none", "device": "/", "o": "bind"},
+		},
+		{
+			name: "recursive bind docker socket with normalized keys",
+			opts: map[string]string{" TYPE ": " none ", " DEVICE ": "/var/run/docker.sock", " O ": " ro, RBIND "},
+		},
+		{
+			name: "ambiguous duplicate option key",
+			opts: map[string]string{"o": "rw", " O ": "ro"},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := client.CreateVolume(ctx, models.CreateVolumeRequest{
+				Name:       "blocked-volume",
+				Driver:     "local",
+				DriverOpts: tt.opts,
+			})
+			if !apperror.IsCode(err, apperror.Conflict) {
+				t.Fatalf("CreateVolume() error = %v, want %s", err, apperror.Conflict)
+			}
+		})
+	}
+	if len(api.createdVolumes) != 0 {
+		t.Fatalf("VolumeCreate calls = %#v, want none", api.createdVolumes)
+	}
+}
+
+func TestClientCreateVolumePreservesOpaqueLocalOptionValues(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	client := New(fakeDockerProvider{}, nil)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	wantOpts := map[string]string{
+		"type":   " nfs ",
+		"device": " :/exports/private path ",
+		"o":      " addr=10.0.0.2,username=ada,password=  keep spaces  , rw ",
+	}
+	_, err := client.CreateVolume(ctx, models.CreateVolumeRequest{
+		Name:   "opaque-options",
+		Driver: " LOCAL ",
+		DriverOpts: map[string]string{
+			" TYPE ":   wantOpts["type"],
+			" DEVICE ": wantOpts["device"],
+			" O ":      wantOpts["o"],
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateVolume() error = %v", err)
+	}
+	if len(api.createdVolumes) != 1 {
+		t.Fatalf("VolumeCreate calls = %#v, want one", api.createdVolumes)
+	}
+	if !reflect.DeepEqual(api.createdVolumes[0].DriverOpts, wantOpts) {
+		t.Fatalf("VolumeCreate driver opts = %#v, want exact values %#v", api.createdVolumes[0].DriverOpts, wantOpts)
+	}
+}
+
 func TestProgressReaderWriterEmitFinalSmallTransfers(t *testing.T) {
 	t.Parallel()
 

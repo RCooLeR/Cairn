@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -1125,14 +1127,19 @@ func TestDockerServiceObjectCreationAudits(t *testing.T) {
 
 	client := newFakeDockerClient()
 	service := &DockerService{Client: client, Audit: db.Audit()}
-	if id, err := service.RunImage(ctx, models.RunImageRequest{
+	runRequest := models.RunImageRequest{
 		ImageRef: "alpine:latest",
 		Name:     "demo",
 		Env:      []models.EnvVar{{Name: "API_TOKEN", Value: "secret-value"}},
 		Volumes:  []models.MountSpec{{Type: "volume", Source: "demo_data", Target: "/data"}},
 		Detach:   true,
-	}); err != nil || id != "container-created" {
-		t.Fatalf("RunImage() id=%q err=%v", id, err)
+	}
+	runPlan, err := service.PlanRunImage(ctx, runRequest)
+	if err != nil {
+		t.Fatalf("PlanRunImage() error = %v", err)
+	}
+	if id, err := service.ApplyRunImagePlan(ctx, runPlan.PlanID, ""); err != nil || id != "container-created" {
+		t.Fatalf("ApplyRunImagePlan() id=%q err=%v", id, err)
 	}
 	if err := service.RenameContainer(ctx, "container-1", "web2"); err != nil {
 		t.Fatalf("RenameContainer() error = %v", err)
@@ -1208,7 +1215,7 @@ func TestDockerServiceObjectCreationAudits(t *testing.T) {
 	}
 }
 
-func TestDockerServiceRunImageRejectsBindMountWithoutPlan(t *testing.T) {
+func TestDockerServiceRunImageRequiresPlan(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "cairn.db"))
@@ -1224,14 +1231,20 @@ func TestDockerServiceRunImageRejectsBindMountWithoutPlan(t *testing.T) {
 	client := newFakeDockerClient()
 	service := &DockerService{Client: client, Audit: db.Audit()}
 
-	_, err = service.RunImage(ctx, models.RunImageRequest{
-		ImageRef: "alpine:latest",
-		Name:     "danger",
-		Volumes:  []models.MountSpec{{Type: "bind", Source: "/", Target: "/host"}},
-		Detach:   true,
-	})
-	if !apperror.IsCode(err, apperror.ConfirmationRequired) {
-		t.Fatalf("RunImage(bind) error = %v, want confirmation required", err)
+	directRequests := []models.RunImageRequest{
+		{ImageRef: "alpine:latest", Name: "plain", Detach: true},
+		{
+			ImageRef: "alpine:latest",
+			Name:     "danger",
+			Volumes:  []models.MountSpec{{Type: "bind", Source: "/", Target: "/host"}},
+			Detach:   true,
+		},
+	}
+	for _, req := range directRequests {
+		_, runErr := service.RunImage(ctx, req)
+		if !apperror.IsCode(runErr, apperror.ConfirmationRequired) {
+			t.Fatalf("RunImage(%s) error = %v, want confirmation required", req.Name, runErr)
+		}
 	}
 	if len(client.runImages) != 0 {
 		t.Fatalf("RunImage reached Docker client: %#v", client.runImages)
@@ -1241,8 +1254,18 @@ func TestDockerServiceRunImageRejectsBindMountWithoutPlan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetAuditLog() error = %v", err)
 	}
-	if len(entries) != 1 || entries[0].Result != "failed" || entries[0].Metadata["risk"] != string(models.RiskDangerous) {
+	if len(entries) != 2 {
 		t.Fatalf("audit entries = %#v", entries)
+	}
+	risks := map[string]bool{}
+	for _, entry := range entries {
+		if entry.Result != "failed" {
+			t.Fatalf("audit entry = %#v, want failed", entry)
+		}
+		risks[fmt.Sprint(entry.Metadata["risk"])] = true
+	}
+	if !risks[string(models.RiskSafe)] || !risks[string(models.RiskDangerous)] {
+		t.Fatalf("audit risks = %#v, want safe and dangerous", risks)
 	}
 
 	plan, err := service.PlanRunImage(ctx, models.RunImageRequest{
@@ -1266,6 +1289,51 @@ func TestDockerServiceRunImageRejectsBindMountWithoutPlan(t *testing.T) {
 	}
 	if containerID != "container-created" || len(client.runImages) != 1 {
 		t.Fatalf("ApplyRunImagePlan() id=%q runImages=%#v", containerID, client.runImages)
+	}
+}
+
+func TestDockerServiceCreateVolumeRejectsLocalBindOptionsBeforeClient(t *testing.T) {
+	t.Parallel()
+	client := newFakeDockerClient()
+	service := &DockerService{Client: client}
+
+	_, err := service.CreateVolume(context.Background(), models.CreateVolumeRequest{
+		Name: "host-root",
+		DriverOpts: map[string]string{
+			" DEVICE ": "/",
+			" O ":      " rw, BIND ",
+			" TYPE ":   " none ",
+		},
+	})
+	if !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("CreateVolume(bind) error = %v, want %s", err, apperror.Conflict)
+	}
+	if len(client.volumes) != 0 {
+		t.Fatalf("CreateVolume(bind) reached Docker client: %#v", client.volumes)
+	}
+
+	_, err = service.CreateVolume(context.Background(), models.CreateVolumeRequest{
+		Name:   "nfs-data",
+		Driver: " LOCAL ",
+		DriverOpts: map[string]string{
+			" TYPE ":   " nfs ",
+			" DEVICE ": ":/exports/data ",
+			" O ":      " addr=10.0.0.2,password=  keep me  , rw ",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateVolume(nfs) error = %v", err)
+	}
+	if len(client.volumes) != 1 {
+		t.Fatalf("CreateVolume(nfs) client requests = %#v", client.volumes)
+	}
+	wantOpts := map[string]string{
+		"type":   " nfs ",
+		"device": ":/exports/data ",
+		"o":      " addr=10.0.0.2,password=  keep me  , rw ",
+	}
+	if client.volumes[0].Driver != "local" || !reflect.DeepEqual(client.volumes[0].DriverOpts, wantOpts) {
+		t.Fatalf("CreateVolume(nfs) normalized request = %#v", client.volumes[0])
 	}
 }
 
@@ -1381,12 +1449,6 @@ func TestProjectServiceImportProject(t *testing.T) {
 	runner.outputs[root+"|-f "+composeFile+" config"] = providers.CommandResult{
 		Stdout: "services:\n  app:\n    image: nginx:alpine\n  db:\n    image: postgres:16-alpine\n",
 	}
-	runner.outputs[root+"|-f "+composeFile+" ps --format json --all"] = providers.CommandResult{
-		Stdout: "[]",
-	}
-	runner.outputs[root+"|-f "+composeFile+" up -d"] = providers.CommandResult{
-		Stdout: "Container app Started\nContainer db Started\n",
-	}
 	service := &ProjectService{
 		Client:     composecore.NewClient(runner),
 		Projects:   db.Projects(),
@@ -1404,7 +1466,9 @@ func TestProjectServiceImportProject(t *testing.T) {
 	if len(detail.Services) != 2 || detail.Services[0].Name != "app" || detail.Services[1].Name != "db" {
 		t.Fatalf("services = %#v", detail.Services)
 	}
-	waitForComposeCall(t, runner, root+"|-f "+composeFile+" up -d")
+	if runner.hasCall(root+"|-f "+composeFile+" ps --format json --all") || runner.hasCall(root+"|-f "+composeFile+" up -d") {
+		t.Fatalf("compose calls = %#v, import must only validate and save", runner.callsSnapshot())
+	}
 	projects, err := service.ListProjects(ctx)
 	if err != nil {
 		t.Fatalf("ListProjects() error = %v", err)
@@ -1414,16 +1478,13 @@ func TestProjectServiceImportProject(t *testing.T) {
 	}
 }
 
-func TestProjectServiceImportProjectSkipsAutoDeployWhenContainersExist(t *testing.T) {
+func TestProjectServiceReviewImportProjectIsSaveOnly(t *testing.T) {
 	ctx := context.Background()
 	db := openServiceTestStore(t)
 	root, composeFile := writeServiceComposeProject(t, "app-db")
 	runner := newFakeComposeRunner()
 	runner.outputs[root+"|-f "+composeFile+" config"] = providers.CommandResult{
 		Stdout: "services:\n  app:\n    image: nginx:alpine\n",
-	}
-	runner.outputs[root+"|-f "+composeFile+" ps --format json --all"] = providers.CommandResult{
-		Stdout: `[{"ID":"abc","Name":"app-db-app-1","Project":"app-db","Service":"app","State":"running"}]`,
 	}
 	service := &ProjectService{
 		Client:     composecore.NewClient(runner),
@@ -1431,24 +1492,25 @@ func TestProjectServiceImportProjectSkipsAutoDeployWhenContainersExist(t *testin
 		ProviderID: "linux_native",
 	}
 
-	if _, err := service.ImportProject(ctx, models.ImportProjectRequest{FolderPath: root}); err != nil {
-		t.Fatalf("ImportProject() error = %v", err)
+	review, err := service.ReviewImportProject(ctx, models.ImportProjectRequest{FolderPath: root})
+	if err != nil {
+		t.Fatalf("ReviewImportProject() error = %v", err)
 	}
-	if runner.hasCall(root + "|-f " + composeFile + " up -d") {
-		t.Fatalf("compose calls = %#v, did not want auto deploy", runner.calls)
+	if review.BuildRequired {
+		t.Fatalf("ReviewImportProject() buildRequired = true, want false for save-only import")
+	}
+	if runner.hasCall(root+"|-f "+composeFile+" ps --format json --all") || runner.hasCall(root+"|-f "+composeFile+" up -d") {
+		t.Fatalf("compose calls = %#v, review must not inspect or deploy containers", runner.callsSnapshot())
 	}
 }
 
-func TestProjectServiceImportProjectKeepsProjectWhenAutoDeployFails(t *testing.T) {
+func TestProjectServiceImportProjectDoesNotInvokeComposeUp(t *testing.T) {
 	ctx := context.Background()
 	db := openServiceTestStore(t)
 	root, composeFile := writeServiceComposeProject(t, "app-db")
 	runner := newFakeComposeRunner()
 	runner.outputs[root+"|-f "+composeFile+" config"] = providers.CommandResult{
 		Stdout: "services:\n  app:\n    image: nginx:alpine\n",
-	}
-	runner.outputs[root+"|-f "+composeFile+" ps --format json --all"] = providers.CommandResult{
-		Stdout: "[]",
 	}
 	runner.errors[root+"|-f "+composeFile+" up -d"] = errors.New("nvidia runtime is not available")
 	service := &ProjectService{
@@ -1464,7 +1526,9 @@ func TestProjectServiceImportProjectKeepsProjectWhenAutoDeployFails(t *testing.T
 	if detail.Summary.ID != "linux_native/app-db" {
 		t.Fatalf("detail summary = %#v", detail.Summary)
 	}
-	waitForComposeCall(t, runner, root+"|-f "+composeFile+" up -d")
+	if runner.hasCall(root+"|-f "+composeFile+" ps --format json --all") || runner.hasCall(root+"|-f "+composeFile+" up -d") {
+		t.Fatalf("compose calls = %#v, import must not inspect or deploy containers", runner.callsSnapshot())
+	}
 	projects, err := service.ListProjects(ctx)
 	if err != nil {
 		t.Fatalf("ListProjects() error = %v", err)
@@ -2255,18 +2319,6 @@ func (r *fakeComposeRunner) callsSnapshot() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return append([]string(nil), r.calls...)
-}
-
-func waitForComposeCall(t *testing.T, runner *fakeComposeRunner, want string) {
-	t.Helper()
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		if runner.hasCall(want) {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("compose calls = %#v, want %s", runner.callsSnapshot(), want)
 }
 
 func (r *fakeComposeRunner) MapPathToBackend(path string) (string, error) {

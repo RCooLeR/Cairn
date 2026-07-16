@@ -331,26 +331,13 @@ func (s *DockerService) RunImage(ctx context.Context, req models.RunImageRequest
 	command := dockerRunCommand(req)
 	risk := runImageRisk(req)
 	targetID := runImageTarget(req)
-	if risk != models.RiskSafe {
-		err := apperror.New(
-			apperror.ConfirmationRequired,
-			"Run image with bind mounts requires a confirmed plan",
-			apperror.WithDetail("Call PlanRunImage and ApplyRunImagePlan before creating containers with bind mounts."),
-		)
-		_ = s.recordAudit(ctx, "container.run", "container", targetID, "", command, risk, "failed", 0, err)
-		return "", err
-	}
-	started := time.Now().UTC()
-	if err := s.recordAudit(ctx, "container.run", "container", targetID, "", command, risk, "started", 0, nil); err != nil {
-		return "", err
-	}
-	id, err := s.Client.RunImage(ctx, req)
-	duration := time.Since(started)
-	if err != nil {
-		_ = s.recordAudit(ctx, "container.run", "container", targetID, "", command, risk, "failed", duration, err)
-		return "", err
-	}
-	return id, s.recordAudit(ctx, "container.run", "container", id, "", command, risk, "success", duration, nil)
+	err := apperror.New(
+		apperror.ConfirmationRequired,
+		"Running an image requires a confirmed plan",
+		apperror.WithDetail("Call PlanRunImage and ApplyRunImagePlan before creating a container."),
+	)
+	_ = s.recordAudit(ctx, "container.run", "container", targetID, "", command, risk, "failed", 0, err)
+	return "", err
 }
 
 func (s *DockerService) BulkContainerAction(ctx context.Context, ids []string, action string) (*models.BulkResult, error) {
@@ -743,6 +730,11 @@ func (s *DockerService) CreateVolume(ctx context.Context, req models.CreateVolum
 	defer unlock()
 	if s.Client == nil {
 		return nil, notReady()
+	}
+	var err error
+	req, err = security.NormalizeCreateVolumeRequest(req)
+	if err != nil {
+		return nil, err
 	}
 	command := dockerVolumeCreateCommand(req)
 	started := time.Now().UTC()

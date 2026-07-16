@@ -526,7 +526,7 @@ type CreateNetworkState = {
   error?: string;
 };
 
-type ImportProjectStepID = "open" | "review" | "build";
+type ImportProjectStepID = "open" | "review" | "save";
 type ImportProjectStepStatus = "pending" | "running" | "done" | "error";
 type ImportProjectLogTone = "muted" | "info" | "ok" | "error";
 
@@ -546,6 +546,7 @@ type ImportReviewEditorFile = {
 };
 
 type ImportProjectState = {
+  sessionID: string;
   open: boolean;
   folderPath: string;
   busy: boolean;
@@ -686,7 +687,7 @@ const importProjectStepOrder: Array<{
 }> = [
   { id: "open", label: "Open dir" },
   { id: "review", label: "Review YAML" },
-  { id: "build", label: "Build containers" },
+  { id: "save", label: "Save project" },
 ];
 const projectStatsFrameMs = 2 * 1000;
 const navItems: NavItem[] = [
@@ -863,6 +864,7 @@ const emptyCreateNetwork: CreateNetworkState = {
 };
 
 const emptyImportProject: ImportProjectState = {
+  sessionID: "",
   open: false,
   folderPath: "",
   busy: false,
@@ -1307,9 +1309,64 @@ function App() {
   >({});
   const [createNetwork, setCreateNetwork] =
     useState<CreateNetworkState>(emptyCreateNetwork);
-  const [importProject, setImportProject] =
-    useState<ImportProjectState>(emptyImportProject);
+  const [importProject, setImportProject] = useState<ImportProjectState>(
+    () => ({
+      ...emptyImportProject,
+      sessionID: newImportProjectSessionID(),
+      steps: initialImportProjectSteps(),
+      progress: [],
+    }),
+  );
+  const importProjectSessionRef = useRef(importProject.sessionID);
   const importProjectOpenRef = useRef(false);
+  const importProjectStateRef = useRef(importProject);
+  importProjectStateRef.current = importProject;
+  const beginImportProjectSession = useCallback(
+    (patch: Partial<ImportProjectState> = {}) => {
+      const sessionID = newImportProjectSessionID();
+      const next: ImportProjectState = {
+        ...emptyImportProject,
+        sessionID,
+        steps: initialImportProjectSteps(),
+        progress: [],
+        ...patch,
+      };
+      importProjectSessionRef.current = sessionID;
+      importProjectOpenRef.current = next.open;
+      importProjectStateRef.current = next;
+      setImportProject(next);
+      return sessionID;
+    },
+    [],
+  );
+  const importProjectSessionMatches = useCallback(
+    (sessionID: string) => importProjectSessionRef.current === sessionID,
+    [],
+  );
+  const openImportProject = useCallback(() => {
+    beginImportProjectSession({ open: true });
+  }, [beginImportProjectSession]);
+  const changeImportProjectFolder = useCallback(
+    (folderPath: string) => {
+      beginImportProjectSession({ open: true, folderPath });
+    },
+    [beginImportProjectSession],
+  );
+  const closeImportProject = useCallback(() => {
+    if (importProjectStateRef.current.busy) {
+      importProjectOpenRef.current = false;
+      setImportProject((current) => {
+        if (current.sessionID !== importProjectSessionRef.current) {
+          return current;
+        }
+        const next = { ...current, open: false };
+        importProjectStateRef.current = next;
+        return next;
+      });
+      return;
+    }
+    beginImportProjectSession();
+  }, [beginImportProjectSession]);
   const [selectedContainerIDs, setSelectedContainerIDs] = useState(
     () => new Set<string>(),
   );
@@ -3734,8 +3791,8 @@ function App() {
 
   const openSetupProjectImport = useCallback(() => {
     closeProviderSetup();
-    setImportProject({ ...emptyImportProject, open: true });
-  }, [closeProviderSetup]);
+    openImportProject();
+  }, [closeProviderSetup, openImportProject]);
 
   const ensureDockerReady = useCallback(() => {
     if (!mutationsDisabled) {
@@ -4826,86 +4883,100 @@ function App() {
     [ensureDockerReady],
   );
 
-  const reviewImportProjectFolder = useCallback(async (folderPath: string) => {
-    const trimmed = folderPath.trim();
-    if (!trimmed) {
-      setImportProject((current) => ({
-        ...current,
-        error: "Choose a project folder",
-      }));
-      return;
-    }
-    setImportProject((current) => ({
-      ...current,
-      folderPath: trimmed,
-      reviewLoading: true,
-      review: null,
-      activeReviewTab: "",
-      jobID: undefined,
-      projectID: undefined,
-      steps: {
-        open: "running",
-        review: "pending",
-        build: "pending",
-      },
-      progress: [
-        importProjectLogEntry("open", `Opening ${trimmed}`, "info", "review"),
-      ],
-      error: undefined,
-      imported: null,
-    }));
-    try {
-      const review = await ProjectService.ReviewImportProject({
+  const reviewImportProjectFolder = useCallback(
+    async (folderPath: string) => {
+      const trimmed = folderPath.trim();
+      if (!trimmed) {
+        setImportProject((current) => ({
+          ...current,
+          error: "Choose a project folder",
+        }));
+        return;
+      }
+      const sessionID = beginImportProjectSession({
+        open: true,
         folderPath: trimmed,
-        composeFilePaths: [],
-      });
-      setImportProject((current) => ({
-        ...current,
-        folderPath: review?.folderPath || trimmed,
-        review,
-        reviewLoading: false,
-        activeReviewTab: firstImportReviewTabID(review),
-        projectID: review?.projectID || current.projectID,
+        reviewLoading: true,
         steps: {
-          open: "done",
-          review: review?.compose.valid ? "done" : "error",
-          build: "pending",
+          open: "running",
+          review: "pending",
+          save: "pending",
         },
-        progress: appendImportProjectLog(current.progress, {
-          step: "review",
-          message: review
-            ? review.compose.valid
-              ? `Loaded ${importReviewEditorFiles(review).length} file(s) for review`
-              : review.compose.errors?.join("\n") || "Compose YAML is invalid"
-            : "No review data returned",
-          tone: review?.compose.valid ? "ok" : "error",
-          jobID: "review",
-        }),
-        error: review?.compose.valid
-          ? undefined
-          : review?.compose.errors?.join("\n") || "Compose YAML is invalid",
-      }));
-    } catch (error: unknown) {
-      const message =
-        error instanceof Error ? error.message : "Unable to review project";
-      setImportProject((current) => ({
-        ...current,
-        reviewLoading: false,
-        review: null,
-        activeReviewTab: "",
-        steps: failImportProjectSteps(current.steps),
-        progress: appendImportProjectLog(current.progress, {
-          step: "review",
-          message,
-          tone: "error",
-          jobID: "review",
-        }),
-        error: message,
-      }));
-    }
-  }, []);
+        progress: [
+          importProjectLogEntry("open", `Opening ${trimmed}`, "info", "review"),
+        ],
+      });
+      try {
+        const review = await ProjectService.ReviewImportProject({
+          folderPath: trimmed,
+          composeFilePaths: [],
+        });
+        if (!importProjectSessionMatches(sessionID)) {
+          return;
+        }
+        setImportProject((current) =>
+          current.sessionID === sessionID
+            ? {
+                ...current,
+                folderPath: review?.folderPath || trimmed,
+                review,
+                reviewLoading: false,
+                activeReviewTab: firstImportReviewTabID(review),
+                projectID: review?.projectID || current.projectID,
+                steps: {
+                  open: "done",
+                  review: review?.compose.valid ? "done" : "error",
+                  save: "pending",
+                },
+                progress: appendImportProjectLog(current.progress, {
+                  step: "review",
+                  message: review
+                    ? review.compose.valid
+                      ? `Loaded ${importReviewEditorFiles(review).length} file(s) for review`
+                      : review.compose.errors?.join("\n") ||
+                        "Compose YAML is invalid"
+                    : "No review data returned",
+                  tone: review?.compose.valid ? "ok" : "error",
+                  jobID: "review",
+                }),
+                error: review?.compose.valid
+                  ? undefined
+                  : review?.compose.errors?.join("\n") ||
+                    "Compose YAML is invalid",
+              }
+            : current,
+        );
+      } catch (error: unknown) {
+        if (!importProjectSessionMatches(sessionID)) {
+          return;
+        }
+        const message =
+          error instanceof Error ? error.message : "Unable to review project";
+        setImportProject((current) =>
+          current.sessionID === sessionID
+            ? {
+                ...current,
+                reviewLoading: false,
+                review: null,
+                activeReviewTab: "",
+                steps: failImportProjectSteps(current.steps),
+                progress: appendImportProjectLog(current.progress, {
+                  step: "review",
+                  message,
+                  tone: "error",
+                  jobID: "review",
+                }),
+                error: message,
+              }
+            : current,
+        );
+      }
+    },
+    [beginImportProjectSession, importProjectSessionMatches],
+  );
 
   const browseImportFolder = useCallback(async () => {
+    const sessionID = importProjectSessionRef.current;
     try {
       const selected = await Dialogs.OpenFile({
         Title: "Import Compose Project",
@@ -4914,27 +4985,37 @@ function App() {
         CanChooseDirectories: true,
         CanChooseFiles: false,
       });
+      if (!importProjectSessionMatches(sessionID)) {
+        return;
+      }
       const folderPath = Array.isArray(selected) ? selected[0] : selected;
       if (folderPath) {
         await reviewImportProjectFolder(folderPath);
       }
     } catch (error: unknown) {
-      setImportProject((current) => ({
-        ...current,
-        reviewLoading: false,
-        review: null,
-        activeReviewTab: "",
-        jobID: undefined,
-        projectID: undefined,
-        steps: initialImportProjectSteps(),
-        progress: [],
-        error:
-          error instanceof Error
-            ? error.message
-            : "Unable to open folder picker",
-      }));
+      if (!importProjectSessionMatches(sessionID)) {
+        return;
+      }
+      setImportProject((current) =>
+        current.sessionID === sessionID
+          ? {
+              ...current,
+              reviewLoading: false,
+              review: null,
+              activeReviewTab: "",
+              jobID: undefined,
+              projectID: undefined,
+              steps: initialImportProjectSteps(),
+              progress: [],
+              error:
+                error instanceof Error
+                  ? error.message
+                  : "Unable to open folder picker",
+            }
+          : current,
+      );
     }
-  }, [reviewImportProjectFolder]);
+  }, [importProjectSessionMatches, reviewImportProjectFolder]);
 
   const submitImportProject = useCallback(async () => {
     const folderPath = importProject.folderPath.trim();
@@ -4961,76 +5042,114 @@ function App() {
       }));
       return;
     }
+    const sessionID = newImportProjectSessionID();
     const jobID = newImportProjectJobID();
-    setImportProject((current) => ({
-      ...current,
+    const submittingState: ImportProjectState = {
+      ...importProject,
+      sessionID,
       busy: true,
       jobID,
-      projectID: current.review?.projectID || current.projectID,
+      projectID: importProject.review.projectID || importProject.projectID,
       steps: {
         open: "done",
         review: "done",
-        build: "running",
+        save: "running",
       },
-      progress: appendImportProjectLog(current.progress, {
-        step: "build",
-        message: "Confirmed. Importing project and building containers",
+      progress: appendImportProjectLog(importProject.progress, {
+        step: "save",
+        message: "Saving the reviewed project",
         tone: "info",
         jobID,
       }),
       error: undefined,
       imported: null,
-    }));
+    };
+    importProjectSessionRef.current = sessionID;
+    importProjectStateRef.current = submittingState;
+    setImportProject(submittingState);
+    let detail: ProjectDetail | null;
     try {
-      const detail = await ProjectService.ImportProject({
+      detail = await ProjectService.ImportProject({
         folderPath,
         composeFilePaths: [],
         jobID,
       });
-      setImportProject((current) => ({
-        ...current,
-        projectID: detail?.summary.id ?? current.projectID,
-        steps: completeImportProjectSteps(current.steps),
-        busy: current.review?.buildRequired ? current.busy : false,
-        imported: detail,
-        error: undefined,
-      }));
-      await refreshProjects();
-      setActivePage("projects");
-      if (!importProjectOpenRef.current && detail) {
-        pushToast({
-          level: "ok",
-          title: "Import started",
-          body: `${detail.summary.name} is building in the background.`,
-        });
-      }
     } catch (error: unknown) {
+      if (!importProjectSessionMatches(sessionID)) {
+        return;
+      }
       const message =
         error instanceof Error ? error.message : "Unable to import project";
-      setImportProject((current) => ({
-        ...current,
-        steps: failImportProjectSteps(current.steps),
-        progress: appendImportProjectLog(current.progress, {
-          step: importProjectFirstActiveStep(current.steps),
-          message,
-          tone: "error",
-          jobID,
-        }),
-        busy: false,
-        imported: null,
-        error: message,
-      }));
-      if (!importProjectOpenRef.current) {
+      setImportProject((current) =>
+        current.sessionID === sessionID
+          ? {
+              ...current,
+              steps: failImportProjectSteps(current.steps),
+              progress: appendImportProjectLog(current.progress, {
+                step: importProjectFirstActiveStep(current.steps),
+                message,
+                tone: "error",
+                jobID,
+              }),
+              busy: false,
+              imported: null,
+              error: message,
+            }
+          : current,
+      );
+      if (
+        importProjectSessionMatches(sessionID) &&
+        !importProjectOpenRef.current
+      ) {
         pushToast({
           level: "error",
           title: "Import failed",
           body: message,
         });
       }
+      return;
+    }
+    if (!importProjectSessionMatches(sessionID)) {
+      return;
+    }
+    setImportProject((current) =>
+      current.sessionID === sessionID
+        ? {
+            ...current,
+            projectID: detail?.summary.id ?? current.projectID,
+            steps: completeImportProjectSteps(current.steps),
+            busy: false,
+            imported: detail,
+            error: undefined,
+          }
+        : current,
+    );
+    try {
+      await refreshProjects();
+    } catch (error: unknown) {
+      if (importProjectSessionMatches(sessionID)) {
+        setProjectsError(
+          error instanceof Error
+            ? error.message
+            : "Unable to refresh projects after saving the project",
+        );
+        setProjectsStatus("error");
+      }
+    }
+    if (!importProjectSessionMatches(sessionID)) {
+      return;
+    }
+    setActivePage("projects");
+    if (!importProjectOpenRef.current && detail) {
+      pushToast({
+        level: "ok",
+        title: "Project imported",
+        body: `${detail.summary.name} was saved without deploying containers.`,
+      });
     }
   }, [
-    importProject.folderPath,
-    importProject.review,
+    importProject,
+    importProjectSessionMatches,
     pushToast,
     refreshProjects,
     reviewImportProjectFolder,
@@ -5448,9 +5567,7 @@ function App() {
             mutationDisabledReason={mutationDisabledReason}
             onAction={runProjectAction}
             onFilterChange={setProjectFilter}
-            onImport={() =>
-              setImportProject({ ...emptyImportProject, open: true })
-            }
+            onImport={openImportProject}
             onOpen={openProjectDetail}
             onOpenFolder={openProjectFolder}
             onRefresh={refreshProjects}
@@ -5832,9 +5949,7 @@ function App() {
             mutationsDisabled={mutationsDisabled}
             mutationDisabledReason={mutationDisabledReason}
             onChartPausedChange={setChartPaused}
-            onImportProject={() =>
-              setImportProject({ ...emptyImportProject, open: true })
-            }
+            onImportProject={openImportProject}
             onCheckUpdates={checkAllUpdates}
             onCleanupApplied={async () => {
               await refreshInventory();
@@ -6532,26 +6647,8 @@ function App() {
         onBrowse={() => {
           void browseImportFolder();
         }}
-        onChange={(folderPath) =>
-          setImportProject((current) => ({
-            ...current,
-            folderPath,
-            reviewLoading: false,
-            review: null,
-            activeReviewTab: "",
-            jobID: undefined,
-            projectID: undefined,
-            steps: initialImportProjectSteps(),
-            progress: [],
-            error: undefined,
-            imported: null,
-          }))
-        }
-        onClose={() =>
-          setImportProject((current) =>
-            current.busy ? { ...current, open: false } : emptyImportProject,
-          )
-        }
+        onChange={changeImportProjectFolder}
+        onClose={closeImportProject}
         onReviewTabChange={(activeReviewTab) =>
           setImportProject((current) => ({ ...current, activeReviewTab }))
         }
@@ -15340,7 +15437,7 @@ function initialImportProjectSteps(): Record<
   return {
     open: "pending",
     review: "pending",
-    build: "pending",
+    save: "pending",
   };
 }
 
@@ -15377,6 +15474,10 @@ function firstImportReviewTabID(
 
 function newImportProjectJobID() {
   return `import-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function newImportProjectSessionID() {
+  return `import-session-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function importProjectLogEntry(
@@ -15421,7 +15522,7 @@ function completeImportProjectSteps(
   return {
     open: steps.open === "error" ? "error" : "done",
     review: steps.review === "error" ? "error" : "done",
-    build: steps.build === "pending" ? "running" : steps.build,
+    save: steps.save === "error" ? "error" : "done",
   };
 }
 
@@ -15468,25 +15569,28 @@ function appendImportProjectProgressFromJob(
     return current;
   }
   if (payload.action === "import") {
-    if (!current.jobID || current.jobID !== payload.jobID) {
+    if (
+      !current.busy ||
+      !current.review ||
+      !current.jobID ||
+      current.jobID !== payload.jobID
+    ) {
       return current;
     }
     const step = importProjectStepFromPhase(payload.phase);
-    if (current.review && current.busy && step !== "build") {
-      return {
-        ...current,
-        projectID: payload.projectID || current.projectID,
-      };
+    if (
+      step !== "save" ||
+      current.steps.save === "done" ||
+      current.steps.save === "error"
+    ) {
+      return current;
     }
-    const done = (payload.pct ?? 0) >= 100;
     return {
       ...current,
       projectID: payload.projectID || current.projectID,
-      steps: setImportProjectStepStatus(
-        current.steps,
-        step,
-        done ? "done" : "running",
-      ),
+      // Progress is advisory. Only job:done or the authoritative RPC result
+      // may complete the save, so a late progress event cannot regress it.
+      steps: setImportProjectStepStatus(current.steps, step, "running"),
       progress: appendImportProjectLog(current.progress, {
         step,
         message: payload.message,
@@ -15495,23 +15599,7 @@ function appendImportProjectProgressFromJob(
       }),
     };
   }
-  if (
-    payload.action !== "deploy" ||
-    !current.projectID ||
-    payload.projectID !== current.projectID
-  ) {
-    return current;
-  }
-  return {
-    ...current,
-    steps: setImportProjectStepStatus(current.steps, "build", "running"),
-    progress: appendImportProjectLog(current.progress, {
-      step: "build",
-      message: payload.message,
-      tone: importProjectLogToneFromPhase(payload.phase),
-      jobID: payload.jobID,
-    }),
-  };
+  return current;
 }
 
 function appendImportProjectDoneFromJob(
@@ -15523,7 +15611,14 @@ function appendImportProjectDoneFromJob(
   }
   const failed = Boolean(payload.error);
   if (payload.action === "import") {
-    if (!current.jobID || current.jobID !== payload.jobID) {
+    if (
+      !current.busy ||
+      !current.review ||
+      !current.jobID ||
+      current.jobID !== payload.jobID ||
+      current.steps.save === "done" ||
+      current.steps.save === "error"
+    ) {
       return current;
     }
     return {
@@ -15533,41 +15628,14 @@ function appendImportProjectDoneFromJob(
         ? failImportProjectSteps(current.steps)
         : completeImportProjectSteps(current.steps),
       progress: appendImportProjectLog(current.progress, {
-        step: failed ? importProjectFirstActiveStep(current.steps) : "review",
-        message: failed
-          ? payload.error || "Import failed"
-          : "Import request finished",
+        step: failed ? importProjectFirstActiveStep(current.steps) : "save",
+        message: failed ? payload.error || "Import failed" : "Project saved",
         tone: failed ? "error" : "ok",
         jobID: payload.jobID,
       }),
     };
   }
-  if (
-    payload.action !== "deploy" ||
-    !current.projectID ||
-    payload.projectID !== current.projectID
-  ) {
-    return current;
-  }
-  return {
-    ...current,
-    busy: false,
-    steps: setImportProjectStepStatus(
-      current.steps,
-      "build",
-      failed ? "error" : "done",
-    ),
-    progress: appendImportProjectLog(current.progress, {
-      step: "build",
-      message: failed
-        ? payload.error || "Container build failed"
-        : payload.result
-          ? `Result: ${payload.result}`
-          : "Container build finished",
-      tone: failed ? "error" : "ok",
-      jobID: payload.jobID,
-    }),
-  };
+  return current;
 }
 
 function importProjectStepFromPhase(
@@ -15576,8 +15644,9 @@ function importProjectStepFromPhase(
   switch (phase) {
     case "review":
       return "review";
+    case "save":
     case "build":
-      return "build";
+      return "save";
     default:
       return "open";
   }
@@ -15589,7 +15658,7 @@ function importProjectFirstActiveStep(
   return (
     importProjectStepOrder.find((step) => steps[step.id] === "running")?.id ??
     importProjectStepOrder.find((step) => steps[step.id] === "pending")?.id ??
-    "build"
+    "save"
   );
 }
 
@@ -17720,7 +17789,7 @@ function ImportProjectModal({
     ? (state.review.compose.rawFiles ?? []).map((file) => file.path)
     : composeFileCandidates(state.folderPath);
   const wslMount = state.folderPath.replace(/\\/g, "/").startsWith("/mnt/");
-  const primaryLabel = reviewed ? "Import" : "Review";
+  const primaryLabel = reviewed ? "Save project" : "Review";
   const primaryDisabled =
     !state.folderPath.trim() ||
     state.reviewLoading ||

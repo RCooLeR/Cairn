@@ -220,8 +220,9 @@ export function SettingsPage({
     useState<RuntimeDiagnostics | null>(null);
   const [runtimeDiagnosticsLoading, setRuntimeDiagnosticsLoading] =
     useState(false);
-  const [runtimeDiagnosticsError, setRuntimeDiagnosticsError] =
-    useState<string | null>(null);
+  const [runtimeDiagnosticsError, setRuntimeDiagnosticsError] = useState<
+    string | null
+  >(null);
   const activeStatus = activeProvider?.status;
   const providerKind = activeProvider?.kind || "windows_wsl_ubuntu";
   const registryCredentialMode = settingString(
@@ -838,7 +839,7 @@ export function SettingsPage({
                     items={[
                       "Import folders that contain compose.yaml, compose.yml, docker-compose.yml, or docker-compose.yaml.",
                       "On Windows WSL, heavy projects perform better inside the WSL filesystem than under /mnt/c.",
-                      "If a new import has no containers yet, Cairn deploys it instead of requiring a separate redeploy step.",
+                      "Imports save project configuration without starting containers; use the reviewed Redeploy action when you are ready to create them.",
                     ]}
                     title="Projects"
                   />
