@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { AgentPage, resetAgentSessionForTest } from "./AgentPage";
@@ -15,7 +15,7 @@ vi.mock("../api/services", () => ({
 
 describe("AgentPage accessibility", () => {
   afterEach(() => {
-    resetAgentSessionForTest();
+    act(() => resetAgentSessionForTest());
   });
 
   it("keeps a persistent accessible name on the message composer", () => {
