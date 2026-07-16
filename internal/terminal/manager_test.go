@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"errors"
 	"io"
-	"os"
 	"os/user"
 	"path/filepath"
 	"strings"
@@ -126,7 +126,7 @@ func TestManagerSessionLimitAndClose(t *testing.T) {
 	}
 }
 
-func TestManagerContainerTerminalDetectsShellWithoutDefaultUserProbe(t *testing.T) {
+func TestManagerContainerTerminalDetectsDefaultRootUser(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	docker := &fakeDockerClient{
@@ -146,14 +146,14 @@ func TestManagerContainerTerminalDetectsShellWithoutDefaultUserProbe(t *testing.
 	if err != nil {
 		t.Fatalf("OpenContainerTerminal() error = %v", err)
 	}
-	if info.Kind != KindContainer || info.Title != "api-1" || info.Shell != "/bin/sh" || info.IsRoot || info.User != "" {
+	if info.Kind != KindContainer || info.Title != "api-1" || info.Shell != "/bin/sh" || !info.IsRoot || info.User != "" {
 		t.Fatalf("info = %#v", info)
 	}
 	if docker.detectedID != "abc123" {
 		t.Fatalf("detectedID = %q", docker.detectedID)
 	}
-	if docker.runCmd.Cmd != nil {
-		t.Fatalf("unexpected default user probe = %#v", docker.runCmd.Cmd)
+	if got := docker.runCmd; strings.Join(got.Cmd, " ") != "/bin/sh -c id -u" || got.User != "" {
+		t.Fatalf("default user probe = %#v", got)
 	}
 	if docker.openContainerID != "abc123" || strings.Join(docker.openOpts.Cmd, " ") != "/bin/sh" {
 		t.Fatalf("open = %q %#v", docker.openContainerID, docker.openOpts)
@@ -247,11 +247,54 @@ func TestManagerProjectTerminalRegistersProjectInfo(t *testing.T) {
 		}
 		expectedFiles = append(expectedFiles, file)
 	}
-	expectedComposeFile := strings.Join(expectedFiles, string(os.PathListSeparator))
+	expectedComposeFile := strings.Join(expectedFiles, backendPathListSep)
 	if started.spec.Env["COMPOSE_PROJECT_NAME"] != "demo" ||
 		started.spec.Env["COMPOSE_FILE"] != expectedComposeFile ||
 		started.spec.Env["EXTRA"] != "1" {
 		t.Fatalf("env = %#v", started.spec.Env)
+	}
+}
+
+func TestManagerBackendTerminalFailsClosedOnPathMappingError(t *testing.T) {
+	t.Parallel()
+	starter := &fakePTYStarter{}
+	provider := fakeProvider{mapPath: func(string) (string, error) {
+		return "", errors.New("unmappable path")
+	}}
+	manager := NewManager(provider, nil, nil, nil, Options{PTYStarter: starter})
+
+	_, err := manager.OpenBackendTerminal(context.Background(), models.TerminalOptions{WorkingDir: `C:\Users\Ada\project`})
+	if !apperror.IsCode(err, apperror.WorkdirMissing) {
+		t.Fatalf("OpenBackendTerminal() error = %v, want workdir missing", err)
+	}
+	if starter.last() != nil {
+		t.Fatal("terminal process started after path mapping failed")
+	}
+}
+
+func TestManagerProjectTerminalFailsClosedOnComposePathMappingError(t *testing.T) {
+	t.Parallel()
+	starter := &fakePTYStarter{}
+	projects := fakeProjectStore{record: store.ProjectRecord{
+		ID:           "windows_wsl/demo",
+		Name:         "demo",
+		WorkingDir:   `C:\Users\Ada\demo`,
+		ComposeFiles: []string{"compose.yml"},
+	}}
+	provider := fakeProvider{mapPath: func(path string) (string, error) {
+		if strings.HasSuffix(path, "compose.yml") {
+			return "", errors.New("Compose file is outside the backend mount")
+		}
+		return "/mnt/c/Users/Ada/demo", nil
+	}}
+	manager := NewManager(provider, nil, projects, nil, Options{PTYStarter: starter})
+
+	_, err := manager.OpenProjectTerminal(context.Background(), projects.record.ID, models.TerminalOptions{})
+	if !apperror.IsCode(err, apperror.WorkdirMissing) {
+		t.Fatalf("OpenProjectTerminal() error = %v, want workdir missing", err)
+	}
+	if starter.last() != nil {
+		t.Fatal("terminal process started after Compose path mapping failed")
 	}
 }
 
@@ -378,7 +421,9 @@ func commandPlaceholders(command string) []string {
 	return placeholders
 }
 
-type fakeProvider struct{}
+type fakeProvider struct {
+	mapPath func(string) (string, error)
+}
 
 func (fakeProvider) ID() string          { return "linux_native" }
 func (fakeProvider) DisplayName() string { return "Linux native" }
@@ -388,7 +433,11 @@ func (fakeProvider) HostShellCommand(models.TerminalOptions) ([]string, error) {
 func (fakeProvider) BackendShellCommand(models.TerminalOptions) ([]string, error) {
 	return []string{"/bin/sh"}, nil
 }
-func (fakeProvider) MapPathToBackend(path string) (string, error) {
+
+func (p fakeProvider) MapPathToBackend(path string) (string, error) {
+	if p.mapPath != nil {
+		return p.mapPath(path)
+	}
 	return path, nil
 }
 

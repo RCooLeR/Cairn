@@ -42,6 +42,12 @@ type DockerClient interface {
 	CreateVolume(context.Context, models.CreateVolumeRequest) (*models.VolumeSummary, error)
 }
 
+type sidecarFile interface {
+	io.Writer
+	Sync() error
+	Close() error
+}
+
 type Manager struct {
 	Providers ProviderResolver
 	Docker    DockerClient
@@ -1016,13 +1022,42 @@ func writeSidecar(path string, sidecar BackupSidecar) error {
 	if err != nil {
 		return apperror.Wrap(apperror.Internal, "Create backup metadata failed", err)
 	}
-	defer func() {
-		_ = file.Close()
-	}()
+	if err := writeSidecarContents(file, sidecar); err != nil {
+		cleanupErr := os.Remove(path)
+		if cleanupErr != nil && !os.IsNotExist(cleanupErr) {
+			cleanupErr = apperror.Wrap(apperror.Internal, "Remove incomplete backup metadata failed", cleanupErr)
+		} else {
+			cleanupErr = nil
+		}
+		return errors.Join(err, cleanupErr)
+	}
+	return nil
+}
+
+func writeSidecarContents(file sidecarFile, sidecar BackupSidecar) error {
 	encoder := json.NewEncoder(file)
 	encoder.SetIndent("", "  ")
 	if err := encoder.Encode(sidecar); err != nil {
-		return apperror.Wrap(apperror.Internal, "Write backup metadata failed", err)
+		return errors.Join(
+			apperror.Wrap(apperror.Internal, "Write backup metadata failed", err),
+			closeSidecarFile(file),
+		)
+	}
+	if err := file.Sync(); err != nil {
+		return errors.Join(
+			apperror.Wrap(apperror.Internal, "Flush backup metadata failed", err),
+			closeSidecarFile(file),
+		)
+	}
+	if err := file.Close(); err != nil {
+		return apperror.Wrap(apperror.Internal, "Close backup metadata failed", err)
+	}
+	return nil
+}
+
+func closeSidecarFile(file sidecarFile) error {
+	if err := file.Close(); err != nil {
+		return apperror.Wrap(apperror.Internal, "Close backup metadata failed", err)
 	}
 	return nil
 }

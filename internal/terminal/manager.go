@@ -29,6 +29,7 @@ const (
 	defaultCols        = 120
 	defaultRows        = 30
 	defaultMaxSessions = 16
+	backendPathListSep = ":"
 )
 
 type DataPayload struct {
@@ -157,8 +158,9 @@ func (m *Manager) OpenBackendTerminal(ctx context.Context, opts models.TerminalO
 	}
 	cwd := opts.WorkingDir
 	if cwd != "" {
-		if mapped, err := m.provider.MapPathToBackend(cwd); err == nil && mapped != "" {
-			cwd = mapped
+		cwd, err = mapTerminalPathToBackend(m.provider, cwd, "terminal working directory")
+		if err != nil {
+			return nil, err
 		}
 	}
 	return m.openProviderPTYTerminal(ctx, opts, argv, cwd, models.TerminalSessionInfo{
@@ -196,19 +198,21 @@ func (m *Manager) OpenProjectTerminal(ctx context.Context, projectID string, opt
 			if !filepath.IsAbs(path) {
 				path = filepath.Join(project.WorkingDir, path)
 			}
-			if mapped, err := m.provider.MapPathToBackend(path); err == nil && mapped != "" {
-				path = mapped
+			path, err = mapTerminalPathToBackend(m.provider, path, "Compose file")
+			if err != nil {
+				return nil, err
 			}
 			mappedFiles = append(mappedFiles, path)
 		}
-		env["COMPOSE_FILE"] = strings.Join(mappedFiles, string(os.PathListSeparator))
+		env["COMPOSE_FILE"] = strings.Join(mappedFiles, backendPathListSep)
 	}
 	for key, value := range opts.Env {
 		env[key] = value
 	}
 	cwd := project.WorkingDir
-	if mapped, err := m.provider.MapPathToBackend(cwd); err == nil && mapped != "" {
-		cwd = mapped
+	cwd, err = mapTerminalPathToBackend(m.provider, cwd, "project working directory")
+	if err != nil {
+		return nil, err
 	}
 	opts.WorkingDir = cwd
 	opts.Env = env
@@ -504,9 +508,6 @@ func (m *Manager) publishClosed(sessionID string, exitCode int) {
 
 func (m *Manager) containerUser(ctx context.Context, containerID string, shell string, requested string) (bool, string) {
 	user := strings.TrimSpace(requested)
-	if user == "" {
-		return false, ""
-	}
 	out, code, err := m.docker.RunContainerExec(ctx, containerID, dockercore.ExecOptions{
 		Cmd:  shellCommand(shell, "id -u"),
 		User: requested,
@@ -516,6 +517,29 @@ func (m *Manager) containerUser(ctx context.Context, containerID string, shell s
 	}
 	uid := strings.TrimSpace(out)
 	return uid == "0", user
+}
+
+func mapTerminalPathToBackend(provider Provider, path string, purpose string) (string, error) {
+	mapped, err := provider.MapPathToBackend(path)
+	if err != nil {
+		return "", apperror.Wrap(
+			apperror.WorkdirMissing,
+			"Map "+purpose+" to Docker backend failed",
+			err,
+			apperror.WithDetail(path),
+			apperror.WithRepairHints("Use a path available to the active Docker provider."),
+		)
+	}
+	mapped = strings.TrimSpace(mapped)
+	if mapped == "" {
+		return "", apperror.New(
+			apperror.WorkdirMissing,
+			"Map "+purpose+" to Docker backend returned an empty path",
+			apperror.WithDetail(path),
+			apperror.WithRepairHints("Use a path available to the active Docker provider."),
+		)
+	}
+	return mapped, nil
 }
 
 func shellCommand(shell string, command string) []string {

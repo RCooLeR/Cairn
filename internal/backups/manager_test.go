@@ -101,6 +101,69 @@ func TestBackupSidecarAndFilenameCollision(t *testing.T) {
 	}
 }
 
+func TestWriteSidecarContentsChecksWriteFlushAndClose(t *testing.T) {
+	t.Parallel()
+	sidecar := BackupSidecar{FormatVersion: formatVersion, Volume: "app-db", SHA256: "abc"}
+	tests := []struct {
+		name      string
+		file      *fakeSidecarFile
+		wantError string
+		wantSync  int
+	}{
+		{name: "success", file: &fakeSidecarFile{}, wantSync: 1},
+		{name: "write", file: &fakeSidecarFile{writeErr: errors.New("disk full")}, wantError: "Write backup metadata failed"},
+		{name: "flush", file: &fakeSidecarFile{syncErr: errors.New("flush failed")}, wantError: "Flush backup metadata failed", wantSync: 1},
+		{name: "close", file: &fakeSidecarFile{closeErr: errors.New("close failed")}, wantError: "Close backup metadata failed", wantSync: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := writeSidecarContents(tt.file, sidecar)
+			if tt.wantError == "" && err != nil {
+				t.Fatalf("writeSidecarContents() error = %v", err)
+			}
+			if tt.wantError != "" && (err == nil || !strings.Contains(err.Error(), tt.wantError)) {
+				t.Fatalf("writeSidecarContents() error = %v, want %q", err, tt.wantError)
+			}
+			if tt.file.syncCalls != tt.wantSync {
+				t.Fatalf("Sync calls = %d, want %d", tt.file.syncCalls, tt.wantSync)
+			}
+			if tt.file.closeCalls != 1 {
+				t.Fatalf("Close calls = %d, want 1", tt.file.closeCalls)
+			}
+			if tt.wantError == "" && !strings.Contains(tt.file.content.String(), `"format_version": 1`) {
+				t.Fatalf("sidecar payload = %q", tt.file.content.String())
+			}
+		})
+	}
+}
+
+type fakeSidecarFile struct {
+	content    strings.Builder
+	writeErr   error
+	syncErr    error
+	closeErr   error
+	syncCalls  int
+	closeCalls int
+}
+
+func (f *fakeSidecarFile) Write(payload []byte) (int, error) {
+	if f.writeErr != nil {
+		return 0, f.writeErr
+	}
+	return f.content.Write(payload)
+}
+
+func (f *fakeSidecarFile) Sync() error {
+	f.syncCalls++
+	return f.syncErr
+}
+
+func (f *fakeSidecarFile) Close() error {
+	f.closeCalls++
+	return f.closeErr
+}
+
 func TestBackupPathsReturnStatErrorsAndCapCollisions(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
