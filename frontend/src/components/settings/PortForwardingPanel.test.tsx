@@ -113,4 +113,31 @@ describe("PortForwardingPanel", () => {
       ).toBeInTheDocument(),
     );
   });
+
+  it("keeps every forwarding column reachable in a narrow viewport", async () => {
+    portForwardServiceMock.GetStatus.mockResolvedValueOnce(
+      new PortForwardStatus({
+        enabled: true,
+        supported: true,
+        forwards: [
+          {
+            bindAddr: "0.0.0.0",
+            containerName: "a-container-with-a-long-name",
+            hostPort: 8080,
+            protocol: "tcp",
+            reason: "",
+            status: "active",
+          },
+        ],
+      }),
+    );
+
+    render(<PortForwardingPanel />);
+
+    const table = await screen.findByRole("table");
+    expect(table.parentElement).toHaveClass("overflow-x-auto");
+    expect(table).toHaveClass("min-w-[720px]");
+    expect(screen.getByText("a-container-with-a-long-name")).toBeVisible();
+    expect(screen.getByText("active")).toBeVisible();
+  });
 });
