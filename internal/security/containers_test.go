@@ -5,6 +5,7 @@ import (
 	"errors"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -351,6 +352,35 @@ func TestPlanStoreJanitorPrunesExpiredEntriesWithoutTraffic(t *testing.T) {
 		case <-time.After(time.Millisecond):
 		}
 	}
+}
+
+func TestPlanStoreCloseIsConcurrentAndIdempotent(t *testing.T) {
+	store := NewPlanStore(nil)
+	const callers = 16
+	var callersDone sync.WaitGroup
+	callersDone.Add(callers)
+	for range callers {
+		go func() {
+			defer callersDone.Done()
+			store.Close()
+		}()
+	}
+	completed := make(chan struct{})
+	go func() {
+		callersDone.Wait()
+		close(completed)
+	}()
+	select {
+	case <-completed:
+	case <-time.After(time.Second):
+		t.Fatal("concurrent Close calls did not join the plan-store janitor")
+	}
+	select {
+	case <-store.janitorDone:
+	default:
+		t.Fatal("plan-store janitor was still running after Close returned")
+	}
+	store.Close()
 }
 
 func TestPlanStoreRejectsHighRiskWithoutTypedName(t *testing.T) {

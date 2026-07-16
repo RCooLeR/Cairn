@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
@@ -35,6 +36,84 @@ const (
 type objectChange struct {
 	kind string
 	id   string
+}
+
+func newObjectReconcileGates() map[string]chan struct{} {
+	return map[string]chan struct{}{
+		objectKindContainer: make(chan struct{}, 1),
+		objectKindImage:     make(chan struct{}, 1),
+		objectKindVolume:    make(chan struct{}, 1),
+		objectKindNetwork:   make(chan struct{}, 1),
+	}
+}
+
+// objectReconcileScheduler bounds event-triggered inventory work to one
+// worker and one queued dirty signal per object kind. A burst that arrives
+// while a scan is running therefore produces at most one follow-up scan
+// instead of one goroutine per event batch.
+type objectReconcileScheduler struct {
+	client   *Client
+	ctx      context.Context
+	cancel   context.CancelFunc
+	requests map[string]chan struct{}
+	wg       sync.WaitGroup
+}
+
+func newObjectReconcileScheduler(ctx context.Context, client *Client) *objectReconcileScheduler {
+	workerCtx, cancel := context.WithCancel(ctx)
+	scheduler := &objectReconcileScheduler{
+		client:   client,
+		ctx:      workerCtx,
+		cancel:   cancel,
+		requests: make(map[string]chan struct{}, 4),
+	}
+	for _, kind := range []string{objectKindContainer, objectKindImage, objectKindVolume, objectKindNetwork} {
+		requests := make(chan struct{}, 1)
+		scheduler.requests[kind] = requests
+		scheduler.wg.Add(1)
+		go scheduler.run(kind, requests)
+	}
+	return scheduler
+}
+
+func (s *objectReconcileScheduler) run(kind string, requests <-chan struct{}) {
+	defer s.wg.Done()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-requests:
+			if s.ctx.Err() != nil {
+				return
+			}
+			s.client.reconcileKind(s.ctx, kind)
+		}
+	}
+}
+
+func (s *objectReconcileScheduler) request(kind string) {
+	if s == nil || s.ctx.Err() != nil {
+		return
+	}
+	requests := s.requests[kind]
+	if requests == nil {
+		return
+	}
+	select {
+	case requests <- struct{}{}:
+	case <-s.ctx.Done():
+	default:
+		// One request is already queued while this kind's sole worker is
+		// active. That queued request is the dirty follow-up for the burst.
+	}
+}
+
+func (s *objectReconcileScheduler) stop() {
+	if s == nil {
+		return
+	}
+	s.cancel()
+	s.wg.Wait()
 }
 
 type volumeUsage struct {
@@ -299,14 +378,9 @@ func (c *Client) Reconcile(ctx context.Context) error {
 	cache := c.objectCache()
 	before, compareSnapshots, snapshotErr := c.objectSnapshot(ctx, cache)
 	joined = errors.Join(joined, snapshotErr)
-	_, err := c.ListContainers(ctx, models.ContainerListOptions{All: true})
-	joined = errors.Join(joined, err)
-	_, err = c.ListImages(ctx)
-	joined = errors.Join(joined, err)
-	_, err = c.ListVolumes(ctx)
-	joined = errors.Join(joined, err)
-	_, err = c.ListNetworks(ctx)
-	joined = errors.Join(joined, err)
+	for _, kind := range []string{objectKindContainer, objectKindImage, objectKindVolume, objectKindNetwork} {
+		joined = errors.Join(joined, c.reconcileObjectKind(ctx, kind))
+	}
 	if compareSnapshots && joined == nil {
 		after, _, err := c.objectSnapshot(ctx, cache)
 		if err != nil {
@@ -375,8 +449,9 @@ func (c *Client) objectEventLoop(ctx context.Context, changes chan<- objectChang
 			continue
 		}
 		if c.usesProcessBackedTransport() {
-			c.objectPollLoop(ctx)
-			continue
+			// Process-backed transports cannot expose Docker's streaming event
+			// API. StartReconcileLoop is their sole periodic inventory owner.
+			return
 		}
 		backoff = c.backoffMin
 		if backoff <= 0 {
@@ -428,25 +503,6 @@ func (c *Client) objectEventLoop(ctx context.Context, changes chan<- objectChang
 			return
 		}
 		backoff = nextBackoff(backoff, c.backoffMax)
-	}
-}
-
-func (c *Client) objectPollLoop(ctx context.Context) {
-	interval := c.reconcileEvery
-	if interval <= 0 {
-		interval = defaultReconcileEvery
-	}
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if err := c.Reconcile(ctx); err != nil {
-				slog.Debug("docker object poll failed", "error", mapDockerError("poll Docker objects", err))
-			}
-		}
 	}
 }
 
@@ -504,6 +560,8 @@ func (c *Client) objectChangePublisher(ctx context.Context, changes <-chan objec
 	if window <= 0 {
 		window = defaultEventBatchWindow
 	}
+	scheduler := newObjectReconcileScheduler(ctx, c)
+	defer scheduler.stop()
 
 	pending := map[string]map[string]struct{}{}
 	var timer *time.Timer
@@ -520,8 +578,8 @@ func (c *Client) objectChangePublisher(ctx context.Context, changes <-chan objec
 		}
 		for kind, ids := range pending {
 			payload := ObjectsChangedPayload{Kind: kind, IDs: sortedSet(ids)}
+			scheduler.request(kind)
 			c.publish(bus.TopicObjectsChanged, payload)
-			go c.reconcileKind(ctx, kind)
 		}
 		pending = map[string]map[string]struct{}{}
 		if timer != nil {
@@ -569,18 +627,40 @@ func (c *Client) reconcileKind(ctx context.Context, kind string) {
 	}
 	reconcileCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	var err error
+	_ = c.reconcileObjectKind(reconcileCtx, kind)
+}
+
+func (c *Client) reconcileObjectKind(ctx context.Context, kind string) error {
+	release, err := c.acquireObjectReconcile(ctx, kind)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	switch kind {
 	case objectKindContainer:
-		_, err = c.ListContainers(reconcileCtx, models.ContainerListOptions{All: true})
+		_, err = c.ListContainers(ctx, models.ContainerListOptions{All: true})
 	case objectKindImage:
-		_, err = c.ListImages(reconcileCtx)
+		_, err = c.ListImages(ctx)
 	case objectKindVolume:
-		_, err = c.ListVolumes(reconcileCtx)
+		_, err = c.ListVolumes(ctx)
 	case objectKindNetwork:
-		_, err = c.ListNetworks(reconcileCtx)
+		_, err = c.ListNetworks(ctx)
 	}
-	_ = err
+	return err
+}
+
+func (c *Client) acquireObjectReconcile(ctx context.Context, kind string) (func(), error) {
+	gate := c.objectGates[kind]
+	if gate == nil {
+		return func() {}, nil
+	}
+	select {
+	case gate <- struct{}{}:
+		return func() { <-gate }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 }
 
 func objectChangeFromEvent(msg events.Message) (objectChange, bool) {

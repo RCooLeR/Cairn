@@ -16,7 +16,7 @@ func lifecycleCommand(provider PlatformProvider, action string) (string, error) 
 	case *LinuxNativeProvider:
 		command = []string{"systemctl", action, "docker"}
 	case *WindowsWSLProvider:
-		command = []string{wslCommandName, "-d", p.configuredDistro(), "--", "systemctl", action, "docker"}
+		command = []string{wslCommandName, "-d", p.configuredDistro(), "-u", "root", "--", "systemctl", action, "docker"}
 	case *MacOSColimaProvider:
 		switch action {
 		case "start":

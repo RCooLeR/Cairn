@@ -208,3 +208,80 @@ func TestManagerDashboardIncludesCachedGPUMetrics(t *testing.T) {
 		t.Fatalf("GPU probe calls = %d, want cached single call", calls)
 	}
 }
+
+func TestManagerGPUProbeUnavailableClearsContainerAttribution(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+	docker := &fakeMetricsDocker{
+		containers: []models.ContainerSummary{{
+			ID:        "c1",
+			Name:      "ollama",
+			State:     "running",
+			ProjectID: "ai",
+			Service:   "ollama",
+		}},
+		processPIDs: map[string][]int{"c1": {4242}},
+	}
+	probeCalls := 0
+	manager := NewManager(docker, nil, nil, nil, nil, Options{
+		Scope:       testRuntimeScope,
+		Now:         func() time.Time { return now },
+		GPUCacheTTL: time.Second,
+		GPUProbe: GPUProbeFunc(func(context.Context) models.GPUMetrics {
+			probeCalls++
+			if probeCalls == 1 {
+				return models.GPUMetrics{
+					Available:          true,
+					UtilizationPercent: 44,
+					Processes: []models.GPUProcessMetric{{
+						PID:         4242,
+						DeviceID:    "0",
+						MemoryBytes: 2 * 1024 * 1024 * 1024,
+					}},
+				}
+			}
+			return models.GPUMetrics{Available: false, Message: "GPU probe failed"}
+		}),
+	})
+	manager.ensureReady()
+	manager.containers["c1"] = docker.containers[0]
+
+	if metrics := manager.gpuMetrics(ctx); !metrics.Available {
+		t.Fatalf("first GPU probe = %#v, want available", metrics)
+	}
+	manager.ingest("c1", statsResponse(now, 100, 1000, 100, 10, 10))
+	manager.mu.Lock()
+	firstSummary := manager.containers["c1"]
+	firstSample := manager.latest["c1"]
+	manager.mu.Unlock()
+	if firstSummary.GPUMemoryBytes == 0 || firstSample.GPUMemoryBytes == 0 {
+		t.Fatalf("initial GPU attribution summary=%#v sample=%#v", firstSummary, firstSample)
+	}
+
+	now = now.Add(2 * time.Second)
+	if metrics := manager.gpuMetrics(ctx); metrics.Available {
+		t.Fatalf("second GPU probe = %#v, want unavailable", metrics)
+	}
+	manager.mu.Lock()
+	usageCount := len(manager.gpuUsage)
+	clearedSummary := manager.containers["c1"]
+	clearedSample := manager.latest["c1"]
+	manager.mu.Unlock()
+	if usageCount != 0 {
+		t.Fatalf("GPU attribution entries after unavailable probe = %d, want 0", usageCount)
+	}
+	if clearedSummary.GPUMemoryBytes != 0 || clearedSummary.GPULoadPercent != 0 || len(clearedSummary.GPUDeviceIDs) != 0 {
+		t.Fatalf("container retained stale GPU attribution: %#v", clearedSummary)
+	}
+	if clearedSample.GPUMemoryBytes != 0 || clearedSample.GPULoadPercent != 0 || len(clearedSample.GPUDeviceIDs) != 0 {
+		t.Fatalf("latest sample retained stale GPU attribution: %#v", clearedSample)
+	}
+	if sample, ok := manager.buildSample("c1", statsResponse(now, 200, 2000, 100, 10, 10)); !ok {
+		t.Fatal("buildSample() after unavailable probe ok = false")
+	} else if sample.GPUMemoryBytes != 0 || sample.GPULoadPercent != 0 || len(sample.GPUDeviceIDs) != 0 {
+		t.Fatalf("new sample retained stale GPU attribution: %#v", sample)
+	}
+	if probeCalls != 2 {
+		t.Fatalf("GPU probe calls = %d, want 2", probeCalls)
+	}
+}

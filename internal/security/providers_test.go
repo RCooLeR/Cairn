@@ -8,25 +8,30 @@ import (
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 )
 
 func TestNewProviderLifecyclePlanValidationAndDefaults(t *testing.T) {
 	t.Parallel()
 	now := time.Date(2026, 6, 16, 10, 0, 0, 0, time.UTC)
 
-	if _, err := NewProviderLifecyclePlan("stop", "linux_native", "Linux", "", "", now); !apperror.IsCode(err, apperror.Conflict) {
+	scope := runtimescope.Must("linux_native", "unix:///var/run/docker.sock")
+	if _, err := NewProviderLifecyclePlan("start", "linux_native", "Linux", "", "", scope, now); !apperror.IsCode(err, apperror.Conflict) {
 		t.Fatalf("unsupported action error = %v, want E_CONFLICT", err)
 	}
-	if _, err := NewProviderLifecyclePlan("restart", "  ", "Linux", "", "", now); !apperror.IsCode(err, apperror.Conflict) {
+	if _, err := NewProviderLifecyclePlan("restart", "  ", "Linux", "", "", scope, now); !apperror.IsCode(err, apperror.Conflict) {
 		t.Fatalf("blank provider error = %v, want E_CONFLICT", err)
 	}
 
-	plan, err := NewProviderLifecyclePlan(" RESTART ", "linux_native", "", "", "", now)
+	plan, err := NewProviderLifecyclePlan(" RESTART ", "linux_native", "", "", "", scope, now)
 	if err != nil {
 		t.Fatalf("NewProviderLifecyclePlan() error = %v", err)
 	}
 	if plan.Action != "restart" || plan.ProviderID != "linux_native" {
 		t.Fatalf("provider plan metadata = %#v", plan)
+	}
+	if !plan.Scope.Equal(scope) {
+		t.Fatalf("provider plan scope = %#v, want exact runtime scope", plan.Scope)
 	}
 	if !strings.HasPrefix(plan.Plan.PlanID, "plan-provider-") {
 		t.Fatalf("PlanID = %q, want plan-provider-*", plan.Plan.PlanID)
@@ -44,7 +49,7 @@ func TestNewProviderLifecyclePlanValidationAndDefaults(t *testing.T) {
 
 func TestProviderLifecyclePlanRequiresTypedNameForHighRisk(t *testing.T) {
 	now := time.Date(2026, 6, 16, 11, 0, 0, 0, time.UTC)
-	plan, err := NewProviderLifecyclePlan("restart", "windows_wsl_ubuntu", "Windows WSL Ubuntu", "wsl docker restart", models.RiskDangerous, now)
+	plan, err := NewProviderLifecyclePlan("restart", "windows_wsl_ubuntu", "Windows WSL Ubuntu", "wsl docker restart", models.RiskDangerous, runtimescope.Must("windows_wsl_ubuntu", "wsl:ubuntu"), now)
 	if err != nil {
 		t.Fatalf("NewProviderLifecyclePlan() error = %v", err)
 	}
@@ -68,5 +73,28 @@ func TestProviderLifecyclePlanRequiresTypedNameForHighRisk(t *testing.T) {
 	}
 	if _, err := store.Take(context.Background(), plan.Plan.PlanID, "Windows WSL Ubuntu"); !apperror.IsCode(err, apperror.PlanExpired) {
 		t.Fatalf("consumed plan error = %v, want E_PLAN_EXPIRED", err)
+	}
+}
+
+func TestProviderLifecyclePlanDescribesStopImpact(t *testing.T) {
+	t.Parallel()
+	now := time.Date(2026, 6, 16, 11, 30, 0, 0, time.UTC)
+	plan, err := NewProviderLifecyclePlan(
+		"stop",
+		"windows_wsl_ubuntu",
+		"Windows WSL Ubuntu",
+		"wsl.exe -d Ubuntu -u root -- systemctl stop docker",
+		models.RiskNeedsConfirmation,
+		runtimescope.Must("windows_wsl_ubuntu", "wsl:ubuntu"),
+		now,
+	)
+	if err != nil {
+		t.Fatalf("NewProviderLifecyclePlan(stop) error = %v", err)
+	}
+	if plan.Plan.Title != "Stop Docker backend" || len(plan.Plan.Effects) != 2 {
+		t.Fatalf("stop plan = %#v, want explicit stop impact", plan.Plan)
+	}
+	if !strings.Contains(plan.Plan.Effects[0], "will stop") || !strings.Contains(plan.Plan.Effects[1], "Running containers may stop") {
+		t.Fatalf("stop effects = %#v", plan.Plan.Effects)
 	}
 }

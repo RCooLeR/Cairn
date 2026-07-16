@@ -27,10 +27,7 @@ export function useDebouncedRuntimeEvent<E extends Events.WailsEventName>(
       }, delayMs);
     });
     return () => {
-      if (timer !== undefined && pending) {
-        callbackRef.current(pending);
-        pending = undefined;
-      }
+      pending = undefined;
       window.clearTimeout(timer);
       off();
     };

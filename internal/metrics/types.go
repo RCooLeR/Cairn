@@ -25,6 +25,8 @@ const (
 	defaultPublishInterval     = time.Second
 	defaultPersistInterval     = 10 * time.Second
 	defaultRetainInterval      = time.Hour
+	defaultRetainRetryInterval = 30 * time.Second
+	minimumRetainRetryInterval = time.Second
 	defaultGPUCacheTTL         = 5 * time.Second
 	defaultTopN                = 8
 	watcherStopTimeout         = 5 * time.Second
@@ -50,13 +52,17 @@ type Options struct {
 	PublishInterval       time.Duration
 	PersistInterval       time.Duration
 	RetainInterval        time.Duration
+	RetainRetryInterval   time.Duration
 	GPUCacheTTL           time.Duration
 	TopN                  int
 	DisableStreamingStats bool
 	StatsConcurrency      int
 	Now                   func() time.Time
 	GPUProbe              GPUProbe
+	RetentionFunc         RetentionFunc
 }
+
+type RetentionFunc func(context.Context, time.Time) error
 
 type GPUProbe interface {
 	ProbeGPUs(context.Context) models.GPUMetrics
@@ -81,31 +87,34 @@ type Manager struct {
 	publishInterval       time.Duration
 	persistInterval       time.Duration
 	retainInterval        time.Duration
+	retainRetryInterval   time.Duration
 	gpuCacheTTL           time.Duration
 	topN                  int
 	disableStreamingStats bool
 	statsSemaphore        chan struct{}
 	now                   func() time.Time
 	gpuProbe              GPUProbe
+	retentionFunc         RetentionFunc
 
-	mu           sync.Mutex
-	ctx          context.Context
-	cancel       context.CancelFunc
-	started      bool
-	watchers     map[string]*containerWatcher
-	sessions     map[string]*streamSession
-	containers   map[string]models.ContainerSummary
-	latest       map[string]Sample
-	previous     map[string]container.StatsResponse
-	lastAccepted map[string]time.Time
-	pending      []store.MetricsSampleRecord
-	lastRetain   time.Time
-	onlineCPUs   uint32
-	gpuCache     models.GPUMetrics
-	gpuCacheAt   time.Time
-	gpuUsage     map[string]containerGPUUsage
-	flushMu      sync.Mutex
-	wg           sync.WaitGroup
+	mu                sync.Mutex
+	ctx               context.Context
+	cancel            context.CancelFunc
+	started           bool
+	watchers          map[string]*containerWatcher
+	sessions          map[string]*streamSession
+	containers        map[string]models.ContainerSummary
+	latest            map[string]Sample
+	previous          map[string]container.StatsResponse
+	lastAccepted      map[string]time.Time
+	pending           []store.MetricsSampleRecord
+	lastRetain        time.Time
+	lastRetainAttempt time.Time
+	onlineCPUs        uint32
+	gpuCache          models.GPUMetrics
+	gpuCacheAt        time.Time
+	gpuUsage          map[string]containerGPUUsage
+	flushMu           sync.Mutex
+	wg                sync.WaitGroup
 }
 
 type containerGPUUsage struct {

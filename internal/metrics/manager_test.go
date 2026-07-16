@@ -495,6 +495,66 @@ func TestManagerQueriesStopsFallbackAndScopes(t *testing.T) {
 	}
 }
 
+func TestManagerRetentionFailureKeepsSuccessTimeAndRetriesWithBackoff(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)
+	previousSuccess := now.Add(-2 * time.Hour)
+	retentionErr := errors.New("retention unavailable")
+	calls := 0
+	var callTimes []time.Time
+	manager := NewManager(nil, nil, nil, nil, nil, Options{
+		Now:                 func() time.Time { return now },
+		RetainInterval:      time.Hour,
+		RetainRetryInterval: time.Minute,
+		RetentionFunc: func(_ context.Context, calledAt time.Time) error {
+			calls++
+			callTimes = append(callTimes, calledAt)
+			if calls == 1 {
+				return retentionErr
+			}
+			return nil
+		},
+	})
+	manager.lastRetain = previousSuccess
+
+	if err := manager.maybeRetain(ctx); !errors.Is(err, retentionErr) {
+		t.Fatalf("maybeRetain(first) error = %v, want retention failure", err)
+	}
+	if !manager.lastRetain.Equal(previousSuccess) {
+		t.Fatalf("last successful retention = %v, want unchanged %v", manager.lastRetain, previousSuccess)
+	}
+
+	now = now.Add(30 * time.Second)
+	if err := manager.maybeRetain(ctx); err != nil {
+		t.Fatalf("maybeRetain(backoff) error = %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("retention calls during retry backoff = %d, want 1", calls)
+	}
+
+	now = now.Add(31 * time.Second)
+	if err := manager.maybeRetain(ctx); err != nil {
+		t.Fatalf("maybeRetain(retry) error = %v", err)
+	}
+	if calls != 2 || len(callTimes) != 2 || !callTimes[1].Equal(now) {
+		t.Fatalf("retention retry calls=%d times=%v, want retry at %v", calls, callTimes, now)
+	}
+	if !manager.lastRetain.Equal(now) {
+		t.Fatalf("last successful retention = %v, want retry success %v", manager.lastRetain, now)
+	}
+	if !manager.lastRetainAttempt.IsZero() {
+		t.Fatalf("last retention attempt = %v after success, want cleared", manager.lastRetainAttempt)
+	}
+
+	now = now.Add(30 * time.Minute)
+	if err := manager.maybeRetain(ctx); err != nil {
+		t.Fatalf("maybeRetain(success interval) error = %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("retention calls before success interval elapsed = %d, want 2", calls)
+	}
+}
+
 func TestManagerSeriesQueriesAuthorizeExactRuntimeScope(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 7, 16, 12, 0, 0, 0, time.UTC)

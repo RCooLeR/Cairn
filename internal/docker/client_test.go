@@ -1145,6 +1145,133 @@ func TestClientProcessBackedTransportDoesNotOpenDockerEventStream(t *testing.T) 
 	}
 }
 
+func TestClientProcessBackedTransportHasOnePeriodicInventoryOwner(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	api := newBlockingContainerListAPI(true)
+	client := New(fakeDialerProvider{
+		host: "unix:///var/run/docker.sock",
+		dialer: func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("test dialer should not be called by fake API")
+		},
+	}, nil)
+	client.reconcileEvery = time.Millisecond
+	client.factoryWithDialer = func(string, func(context.Context, string, string) (net.Conn, error)) (APIClient, error) {
+		return api, nil
+	}
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	// Runtime starts both loops for every transport. The event loop must exit
+	// for process-backed clients instead of becoming a second polling owner.
+	processChanges := make(chan objectChange)
+	eventLoopDone := make(chan struct{})
+	go func() {
+		defer close(eventLoopDone)
+		client.objectEventLoop(ctx, processChanges)
+	}()
+	select {
+	case <-eventLoopDone:
+	case <-time.After(time.Second):
+		t.Fatal("process-backed object event loop did not relinquish polling ownership")
+	}
+	if _, ok := <-processChanges; ok {
+		t.Fatal("process-backed object event loop did not close its change stream")
+	}
+
+	// Only the explicit periodic loop may now begin an inventory scan.
+	client.StartReconcileLoop(ctx)
+	if call := waitContainerListStarted(t, api.started, time.Second); call != 1 {
+		t.Fatalf("first ContainerList call = %d, want 1", call)
+	}
+	select {
+	case call := <-api.started:
+		t.Fatalf("overlapping ContainerList call = %d, want one blocked periodic inventory owner", call)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if calls, active, maximum := api.counts(); calls != 1 || active != 1 || maximum != 1 {
+		t.Fatalf("ContainerList calls=%d active=%d max=%d, want 1/1/1", calls, active, maximum)
+	}
+}
+
+func TestClientObjectEventBurstQueuesOnlyOneFollowUpReconcile(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	eventBus := bus.New()
+	defer func() {
+		cancel()
+		eventBus.Close()
+	}()
+	changed := eventBus.Subscribe(ctx, bus.TopicObjectsChanged, 64)
+
+	api := newBlockingContainerListAPI(false)
+	client := New(fakeDockerProvider{}, eventBus)
+	client.eventBatch = time.Millisecond
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	changes := make(chan objectChange, 256)
+	publisherDone := make(chan struct{})
+	go func() {
+		defer close(publisherDone)
+		client.objectChangePublisher(ctx, changes)
+	}()
+
+	changes <- objectChange{kind: objectKindContainer, id: "first"}
+	payload := waitObjectsChanged(t, ctx, changed, time.Second)
+	if payload.Kind != objectKindContainer {
+		t.Fatalf("first objects:changed kind = %q, want %q", payload.Kind, objectKindContainer)
+	}
+	if call := waitContainerListStarted(t, api.started, time.Second); call != 1 {
+		t.Fatalf("first ContainerList call = %d, want 1", call)
+	}
+
+	// Force twenty separate flush windows containing 2,000 events while the
+	// first inventory call is blocked. Every flush requests reconciliation,
+	// but the one-slot dirty queue must collapse all of them into one follow-up.
+	for batch := 0; batch < 20; batch++ {
+		for item := 0; item < 100; item++ {
+			changes <- objectChange{
+				kind: objectKindContainer,
+				id:   fmt.Sprintf("container-%02d-%03d", batch, item),
+			}
+		}
+		payload = waitObjectsChanged(t, ctx, changed, time.Second)
+		if payload.Kind != objectKindContainer || len(payload.IDs) != 100 {
+			t.Fatalf("burst payload = %#v, want 100 container IDs", payload)
+		}
+	}
+	if calls, active, maximum := api.counts(); calls != 1 || active != 1 || maximum != 1 {
+		t.Fatalf("blocked burst calls=%d active=%d max=%d, want 1/1/1", calls, active, maximum)
+	}
+
+	close(api.releaseFirst)
+	if call := waitContainerListStarted(t, api.started, time.Second); call != 2 {
+		t.Fatalf("follow-up ContainerList call = %d, want 2", call)
+	}
+	waitContainerListFinished(t, api.finished, 2, time.Second)
+	select {
+	case call := <-api.started:
+		t.Fatalf("extra ContainerList call = %d, want exactly one coalesced follow-up", call)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if calls, active, maximum := api.counts(); calls != 2 || active != 0 || maximum != 1 {
+		t.Fatalf("completed burst calls=%d active=%d max=%d, want 2/0/1", calls, active, maximum)
+	}
+
+	// Cancellation owns worker shutdown even if the changes channel remains
+	// open; the publisher joins all four fixed workers before returning.
+	cancel()
+	select {
+	case <-publisherDone:
+	case <-time.After(time.Second):
+		t.Fatal("object change publisher did not stop after context cancellation")
+	}
+}
+
 func TestClientReconcilePublishesSnapshotChanges(t *testing.T) {
 	ctx := context.Background()
 	api := newFakeAPI()
@@ -2546,6 +2673,90 @@ func (p fakeDialerProvider) DockerContext(context.Context) (string, error) {
 
 func (p fakeDialerProvider) DockerDialContext(context.Context) (func(context.Context, string, string) (net.Conn, error), error) {
 	return p.dialer, nil
+}
+
+type blockingContainerListAPI struct {
+	*fakeAPI
+
+	controlMu    sync.Mutex
+	calls        int
+	active       int
+	maxActive    int
+	blockEvery   bool
+	releaseFirst chan struct{}
+	started      chan int
+	finished     chan int
+}
+
+func newBlockingContainerListAPI(blockEvery bool) *blockingContainerListAPI {
+	return &blockingContainerListAPI{
+		fakeAPI:      newFakeAPI(),
+		blockEvery:   blockEvery,
+		releaseFirst: make(chan struct{}),
+		started:      make(chan int, 64),
+		finished:     make(chan int, 64),
+	}
+}
+
+func (a *blockingContainerListAPI) ContainerList(ctx context.Context, opts container.ListOptions) ([]container.Summary, error) {
+	a.controlMu.Lock()
+	a.calls++
+	call := a.calls
+	a.active++
+	if a.active > a.maxActive {
+		a.maxActive = a.active
+	}
+	a.controlMu.Unlock()
+
+	a.started <- call
+	defer func() {
+		a.controlMu.Lock()
+		a.active--
+		a.controlMu.Unlock()
+		a.finished <- call
+	}()
+
+	if a.blockEvery || call == 1 {
+		select {
+		case <-a.releaseFirst:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return a.fakeAPI.ContainerList(ctx, opts)
+}
+
+func (a *blockingContainerListAPI) counts() (calls int, active int, maximum int) {
+	a.controlMu.Lock()
+	defer a.controlMu.Unlock()
+	return a.calls, a.active, a.maxActive
+}
+
+func waitContainerListStarted(t *testing.T, started <-chan int, timeout time.Duration) int {
+	t.Helper()
+	select {
+	case call := <-started:
+		return call
+	case <-time.After(timeout):
+		t.Fatal("timed out waiting for ContainerList to start")
+		return 0
+	}
+}
+
+func waitContainerListFinished(t *testing.T, finished <-chan int, wanted int, timeout time.Duration) {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case call := <-finished:
+			if call == wanted {
+				return
+			}
+		case <-timer.C:
+			t.Fatalf("timed out waiting for ContainerList call %d to finish", wanted)
+		}
+	}
 }
 
 type fakeAPI struct {

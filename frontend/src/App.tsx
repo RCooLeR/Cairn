@@ -1297,6 +1297,7 @@ function App() {
   const [updateCheckJobID, setUpdateCheckJobID] = useState<string | null>(null);
   const [updateCheckProgress, setUpdateCheckProgress] =
     useState<UpdateProgressEntry | null>(null);
+  const updateCheckCompletionTimerRef = useRef<number | null>(null);
   const [updatePlan, setUpdatePlan] =
     useState<UpdatePlanState>(emptyUpdatePlan);
   const [ignoreUpdate, setIgnoreUpdate] =
@@ -2225,6 +2226,10 @@ function App() {
       if (!payload) {
         return;
       }
+      if (updateCheckCompletionTimerRef.current !== null) {
+        window.clearTimeout(updateCheckCompletionTimerRef.current);
+        updateCheckCompletionTimerRef.current = null;
+      }
       setUpdateCheckJobID(payload.jobID ?? null);
       setUpdateCheckProgress({
         jobID: payload.jobID,
@@ -2244,9 +2249,15 @@ function App() {
         typeof payload.total === "number" &&
         payload.done >= payload.total
       ) {
+        const completedJobID = payload.jobID;
         setUpdateCheckJobID(null);
         setLastUpdateCheckAt(Date.now());
-        window.setTimeout(() => setUpdateCheckProgress(null), 1200);
+        updateCheckCompletionTimerRef.current = window.setTimeout(() => {
+          updateCheckCompletionTimerRef.current = null;
+          setUpdateCheckProgress((current) =>
+            current?.jobID === completedJobID ? null : current,
+          );
+        }, 1200);
         void refreshUpdateSurfaces();
       }
     });
@@ -2328,6 +2339,16 @@ function App() {
     refreshProjects,
     refreshUpdateSurfaces,
   ]);
+
+  useEffect(
+    () => () => {
+      if (updateCheckCompletionTimerRef.current !== null) {
+        window.clearTimeout(updateCheckCompletionTimerRef.current);
+        updateCheckCompletionTimerRef.current = null;
+      }
+    },
+    [],
+  );
 
   useEffect(() => {
     const query = pullImage.query.trim();
@@ -2646,7 +2667,7 @@ function App() {
     MetricsService.StartStatsStream({ kind: "all", ids: [] })
       .then((streamID) => {
         if (cancelled) {
-          void MetricsService.StopStream(streamID);
+          stopMetricsStreamSafely(streamID);
           return;
         }
         activeStreamID = streamID;
@@ -2654,15 +2675,17 @@ function App() {
         setStatsStreamError(null);
       })
       .catch((error: unknown) => {
-        setStatsStreamError(
-          error instanceof Error ? error.message : "Unable to start metrics",
-        );
+        if (!cancelled) {
+          setStatsStreamError(
+            error instanceof Error ? error.message : "Unable to start metrics",
+          );
+        }
       });
     return () => {
       cancelled = true;
       statsStreamIDRef.current = null;
       if (activeStreamID) {
-        void MetricsService.StopStream(activeStreamID);
+        stopMetricsStreamSafely(activeStreamID);
       }
     };
   }, [dockerRunning]);
@@ -8207,7 +8230,7 @@ function OverviewPage({
     })
       .then((streamID) => {
         if (cancelled) {
-          void LogsService.StopStream(streamID);
+          stopLogStreamSafely(streamID);
           return;
         }
         activeStreamID = streamID;
@@ -8220,7 +8243,7 @@ function OverviewPage({
       cancelled = true;
       logStreamIDRef.current = null;
       if (activeStreamID) {
-        void LogsService.StopStream(activeStreamID);
+        stopLogStreamSafely(activeStreamID);
       }
     };
   }, [dockerRunning]);
@@ -9234,6 +9257,26 @@ const logLevelOptions: Array<{
 const logBufferLimit = 50000;
 const logRowOverscan = 8;
 
+function stopMetricsStreamSafely(streamID: string) {
+  try {
+    void MetricsService.StopStream(streamID).catch((error: unknown) => {
+      console.error("Unable to stop metrics stream", streamID, error);
+    });
+  } catch (error: unknown) {
+    console.error("Unable to stop metrics stream", streamID, error);
+  }
+}
+
+function stopLogStreamSafely(streamID: string) {
+  try {
+    void LogsService.StopStream(streamID).catch((error: unknown) => {
+      console.error("Unable to stop log stream", streamID, error);
+    });
+  } catch (error: unknown) {
+    console.error("Unable to stop log stream", streamID, error);
+  }
+}
+
 type LogsPageProps = {
   containers: ContainerSummary[];
   dockerRunning: boolean;
@@ -9375,10 +9418,6 @@ function LogsPage({
   ]);
 
   useEffect(() => {
-    streamIDRef.current = streamID;
-  }, [streamID]);
-
-  useEffect(() => {
     const timer = window.setTimeout(() => {
       setDebouncedQuery(query.trim().toLowerCase());
     }, 200);
@@ -9462,6 +9501,7 @@ function LogsPage({
 
   useEffect(() => {
     if (!canStream) {
+      streamIDRef.current = null;
       setLines([]);
       setStreamID(null);
       setStreamStatus("idle");
@@ -9472,6 +9512,7 @@ function LogsPage({
 
     let cancelled = false;
     let activeStreamID: string | null = null;
+    streamIDRef.current = null;
     setLines([]);
     setStreamID(null);
     setStreamStatus("loading");
@@ -9491,10 +9532,11 @@ function LogsPage({
     })
       .then((nextStreamID) => {
         if (cancelled) {
-          void LogsService.StopStream(nextStreamID);
+          stopLogStreamSafely(nextStreamID);
           return;
         }
         activeStreamID = nextStreamID;
+        streamIDRef.current = nextStreamID;
         setStreamID(nextStreamID);
         setStreamStatus("ready");
       })
@@ -9509,8 +9551,9 @@ function LogsPage({
 
     return () => {
       cancelled = true;
+      streamIDRef.current = null;
       if (activeStreamID) {
-        void LogsService.StopStream(activeStreamID);
+        stopLogStreamSafely(activeStreamID);
       }
     };
   }, [canStream, restartNonce, scope, streamIDs]);

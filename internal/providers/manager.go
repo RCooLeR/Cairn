@@ -28,9 +28,10 @@ type Manager struct {
 	now       func() time.Time
 	runner    CommandRunner
 
-	mu           sync.RWMutex
-	activeID     string
-	installPlans map[string]installPlanRecord
+	mu               sync.RWMutex
+	providerConfigMu sync.Mutex
+	activeID         string
+	installPlans     map[string]installPlanRecord
 }
 
 type installPlanRecord struct {
@@ -354,12 +355,52 @@ func (m *Manager) PlanLifecycle(ctx context.Context, action string, providerID s
 	if !ok {
 		return security.ProviderPlan{}, apperror.New(apperror.NotFound, "Provider was not found")
 	}
-	m.applyProviderSettings(ctx, provider)
+	m.providerConfigMu.Lock()
+	defer m.providerConfigMu.Unlock()
+	m.applyProviderSettingsLocked(ctx, provider)
+	if m.ActiveProviderID(ctx) != providerID {
+		return security.ProviderPlan{}, apperror.New(apperror.NotFound, "Provider is not the active runtime")
+	}
+	runtimeScope, err := ResolveRuntimeScope(ctx, provider)
+	if err != nil {
+		return security.ProviderPlan{}, err
+	}
 	command, err := lifecycleCommand(provider, action)
 	if err != nil {
 		return security.ProviderPlan{}, err
 	}
-	return security.NewProviderLifecyclePlan(action, providerID, provider.DisplayName(), command, models.RiskNeedsConfirmation, m.now())
+	return security.NewProviderLifecyclePlan(action, providerID, provider.DisplayName(), command, models.RiskNeedsConfirmation, runtimeScope, m.now())
+}
+
+// ApplyLifecyclePlan revalidates the active provider and exact backend scope
+// while holding the same configuration lock through the external lifecycle
+// command. A settings change therefore cannot retarget a confirmed plan.
+func (m *Manager) ApplyLifecyclePlan(ctx context.Context, plan security.ProviderPlan) error {
+	provider, ok := m.providerByID(plan.ProviderID)
+	if !ok {
+		return apperror.New(apperror.NotFound, "Provider was not found")
+	}
+	m.providerConfigMu.Lock()
+	defer m.providerConfigMu.Unlock()
+	m.applyProviderSettingsLocked(ctx, provider)
+	if !plan.Scope.Valid() || m.ActiveProviderID(ctx) != plan.ProviderID {
+		return apperror.New(apperror.NotFound, "Provider plan does not belong to the active runtime")
+	}
+	currentScope, err := ResolveRuntimeScope(ctx, provider)
+	if err != nil {
+		return err
+	}
+	if !currentScope.Equal(plan.Scope) {
+		return apperror.New(apperror.NotFound, "Provider runtime context changed after confirmation")
+	}
+	switch strings.ToLower(strings.TrimSpace(plan.Action)) {
+	case "stop":
+		return provider.Stop(ctx)
+	case "restart":
+		return provider.Restart(ctx)
+	default:
+		return apperror.New(apperror.Conflict, "Unsupported provider action", apperror.WithDetail(plan.Action))
+	}
 }
 
 func (m *Manager) LifecycleCommand(ctx context.Context, action string, providerID string) (string, error) {
@@ -367,7 +408,9 @@ func (m *Manager) LifecycleCommand(ctx context.Context, action string, providerI
 	if !ok {
 		return "", apperror.New(apperror.NotFound, "Provider was not found")
 	}
-	m.applyProviderSettings(ctx, provider)
+	m.providerConfigMu.Lock()
+	defer m.providerConfigMu.Unlock()
+	m.applyProviderSettingsLocked(ctx, provider)
 	return lifecycleCommand(provider, action)
 }
 
@@ -516,6 +559,12 @@ func (m *Manager) providerIDsSnapshot() []string {
 }
 
 func (m *Manager) applyProviderSettings(ctx context.Context, provider PlatformProvider) {
+	m.providerConfigMu.Lock()
+	defer m.providerConfigMu.Unlock()
+	m.applyProviderSettingsLocked(ctx, provider)
+}
+
+func (m *Manager) applyProviderSettingsLocked(ctx context.Context, provider PlatformProvider) {
 	if m.settings == nil || provider == nil {
 		return
 	}

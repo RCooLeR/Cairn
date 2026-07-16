@@ -319,7 +319,11 @@ func (s *ProviderService) Stop(ctx context.Context, providerID string) error {
 	if s.Manager == nil {
 		return notReady()
 	}
-	return s.runProviderLifecycle(ctx, "stop", providerID, models.RiskSafe)
+	return apperror.New(
+		apperror.ConfirmationRequired,
+		"Stopping the Docker backend requires a confirmed plan",
+		apperror.WithDetail("Provider "+providerID+" must be stopped through PlanStop and ApplyProviderPlan."),
+	)
 }
 
 func (s *ProviderService) Restart(_ context.Context, providerID string) error {
@@ -331,10 +335,18 @@ func (s *ProviderService) Restart(_ context.Context, providerID string) error {
 }
 
 func (s *ProviderService) PlanRestart(ctx context.Context, providerID string) (*models.CommandPlan, error) {
+	return s.planProviderLifecycle(ctx, "restart", providerID)
+}
+
+func (s *ProviderService) PlanStop(ctx context.Context, providerID string) (*models.CommandPlan, error) {
+	return s.planProviderLifecycle(ctx, "stop", providerID)
+}
+
+func (s *ProviderService) planProviderLifecycle(ctx context.Context, action string, providerID string) (*models.CommandPlan, error) {
 	if s.Manager == nil {
 		return nil, notReady()
 	}
-	plan, err := s.Manager.PlanLifecycle(ctx, "restart", providerID)
+	plan, err := s.Manager.PlanLifecycle(ctx, action, providerID)
 	if err != nil {
 		return nil, err
 	}
@@ -352,7 +364,35 @@ func (s *ProviderService) ApplyProviderPlan(ctx context.Context, planID string, 
 	if err != nil {
 		return err
 	}
-	return s.runProviderLifecycle(ctx, plan.Action, plan.ProviderID, plan.Plan.Risk)
+	return s.runPlannedProviderLifecycle(ctx, plan)
+}
+
+func (s *ProviderService) runPlannedProviderLifecycle(ctx context.Context, plan security.ProviderPlan) error {
+	commandParts := make([]string, 0, len(plan.Plan.Commands))
+	for _, planned := range plan.Plan.Commands {
+		if command := strings.TrimSpace(planned.Command); command != "" {
+			commandParts = append(commandParts, command)
+		}
+	}
+	command := strings.Join(commandParts, "\n")
+	started := time.Now().UTC()
+	if err := s.recordProviderLifecycleAudit(ctx, plan.Action, plan.ProviderID, command, plan.Plan.Risk, "started", 0, nil); err != nil {
+		return err
+	}
+	if err := s.Manager.ApplyLifecyclePlan(ctx, plan); err != nil {
+		_ = s.recordProviderLifecycleAudit(ctx, plan.Action, plan.ProviderID, command, plan.Plan.Risk, "failed", time.Since(started), err)
+		return err
+	}
+	if err := s.recordProviderLifecycleAudit(ctx, plan.Action, plan.ProviderID, command, plan.Plan.Risk, "success", time.Since(started), nil); err != nil {
+		return err
+	}
+	if plan.Action == "restart" {
+		return s.rebindActiveProvider(ctx)
+	}
+	if plan.Action == "stop" {
+		return s.clearRuntimeIfActiveProvider(ctx, plan.ProviderID)
+	}
+	return nil
 }
 
 func (s *ProviderService) SetActiveProvider(ctx context.Context, providerID string) error {

@@ -2100,6 +2100,42 @@ describe("App inventory shell", () => {
     expect(updateServiceMock.UnignoreUpdate).toHaveBeenCalledWith(201);
   });
 
+  it("does not let a completed update check clear a newer job's progress", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Updates/ }),
+    );
+    vi.useFakeTimers();
+
+    emitRuntimeEvent("updates:check:progress", {
+      jobID: "check-a",
+      done: 1,
+      total: 1,
+      current: "Check A complete",
+    });
+    expect(screen.getByText("Check A complete")).toBeInTheDocument();
+
+    emitRuntimeEvent("updates:check:progress", {
+      jobID: "check-b",
+      done: 0,
+      total: 2,
+      current: "Checking job B",
+    });
+    expect(screen.getByText("Checking job B")).toBeInTheDocument();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1200);
+    });
+
+    expect(screen.getByText("Checking job B")).toBeInTheDocument();
+  });
+
   it("shows project Updates tab grouping and lineage wording", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
     projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
@@ -2196,8 +2232,60 @@ describe("App inventory shell", () => {
     expect(screen.getByText(/request/)).toBeInTheDocument();
   });
 
-  it("stops a metrics stream that resolves after app cleanup", async () => {
+  it("accepts initial log lines before the stream state effect can commit", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    const logStart = deferred<string>();
+    logsServiceMock.StartLogStream.mockImplementation(
+      (request: { tail?: number }) =>
+        request.tail === 500
+          ? logStart.promise
+          : Promise.resolve("overview-stream"),
+    );
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    await waitFor(() =>
+      expect(logsServiceMock.StartLogStream).toHaveBeenCalled(),
+    );
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Logs/ }),
+    );
+    await waitFor(() =>
+      expect(logsServiceMock.StartLogStream).toHaveBeenCalledWith(
+        expect.objectContaining({ tail: 500 }),
+      ),
+    );
+
+    const onLogLines = runtimeEventCallback("logs:lines");
+    const emitInitialLines = logStart.promise.then((streamID) => {
+      onLogLines({
+        name: "logs:lines",
+        data: {
+          streamID,
+          lines: [logLine({ text: "INFO first synchronous line" })],
+        },
+      });
+    });
+    await act(async () => {
+      logStart.resolve("stream-race");
+      await emitInitialLines;
+    });
+
+    expect(
+      await screen.findByText(/first synchronous line/),
+    ).toBeInTheDocument();
+  });
+
+  it("handles a stop failure when a metrics stream resolves after cleanup", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    const stopError = new Error("metrics stream already stopped");
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    metricsServiceMock.StopStream.mockRejectedValueOnce(stopError);
     let resolveStatsStream: (streamID: string) => void = () => undefined;
     metricsServiceMock.StartStatsStream.mockImplementationOnce(
       () =>
@@ -2220,16 +2308,62 @@ describe("App inventory shell", () => {
     expect(metricsServiceMock.StopStream).toHaveBeenCalledWith(
       "late-stats-stream",
     );
+    await waitFor(() =>
+      expect(consoleError).toHaveBeenCalledWith(
+        "Unable to stop metrics stream",
+        "late-stats-stream",
+        stopError,
+      ),
+    );
+    consoleError.mockRestore();
   });
 
-  it("stops a log stream that resolves after logs page cleanup", async () => {
+  it("ignores a metrics start failure after its runtime became obsolete", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    const statsStart = deferred<string>();
+    metricsServiceMock.StartStatsStream.mockImplementationOnce(
+      () => statsStart.promise,
+    );
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    await waitFor(() =>
+      expect(metricsServiceMock.StartStatsStream).toHaveBeenCalled(),
+    );
+    act(() => {
+      useInventoryStore.setState({
+        dockerInfo: null,
+        dockerVersion: null,
+        providers: [],
+      });
+    });
+
+    await act(async () => {
+      statsStart.reject(new Error("obsolete metrics start failed"));
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByText("obsolete metrics start failed")).toBeNull();
+  });
+
+  it("handles a stop failure when a log stream resolves after cleanup", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    const stopError = new Error("stream already stopped");
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
     let resolveLogStream: (streamID: string) => void = () => undefined;
     logsServiceMock.StartLogStream.mockImplementationOnce(
       () =>
         new Promise<string>((resolve) => {
           resolveLogStream = resolve;
         }),
+    );
+    logsServiceMock.StopStream.mockImplementation((streamID: string) =>
+      streamID === "late-log-stream"
+        ? Promise.reject(stopError)
+        : Promise.resolve(),
     );
 
     const { unmount } = render(<App />);
@@ -2252,6 +2386,14 @@ describe("App inventory shell", () => {
     });
 
     expect(logsServiceMock.StopStream).toHaveBeenCalledWith("late-log-stream");
+    await waitFor(() =>
+      expect(consoleError).toHaveBeenCalledWith(
+        "Unable to stop log stream",
+        "late-log-stream",
+        stopError,
+      ),
+    );
+    consoleError.mockRestore();
   });
 
   it("uses checkboxes for container log scope selection", async () => {
@@ -4698,15 +4840,20 @@ function clickSettingsSection(name: string) {
   fireEvent.click(buttons[buttons.length - 1]);
 }
 
-function emitRuntimeEvent(eventName: string, data: unknown) {
+function runtimeEventCallback(eventName: string) {
   const callback = [...runtimeMock.on.mock.calls]
     .reverse()
     .find(([name]) => name === eventName)?.[1] as
     | ((event?: unknown) => void)
     | undefined;
   expect(callback).toEqual(expect.any(Function));
+  return callback as (event?: unknown) => void;
+}
+
+function emitRuntimeEvent(eventName: string, data: unknown) {
+  const callback = runtimeEventCallback(eventName);
   act(() => {
-    callback?.({ name: eventName, data });
+    callback({ name: eventName, data });
   });
 }
 

@@ -1,0 +1,116 @@
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+import { PortForwardStatus } from "../../../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
+
+const portForwardServiceMock = vi.hoisted(() => ({
+  GetStatus: vi.fn(),
+  SetEnabled: vi.fn(),
+}));
+
+const runtimeMock = vi.hoisted(() => ({
+  on: vi.fn<
+    (eventName: string, callback: (event?: unknown) => void) => () => void
+  >(() => vi.fn()),
+}));
+
+vi.mock("../../api/services", () => ({
+  PortForwardService: portForwardServiceMock,
+}));
+
+vi.mock("@wailsio/runtime", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@wailsio/runtime")>();
+  return {
+    ...actual,
+    Events: { ...actual.Events, On: runtimeMock.on },
+  };
+});
+
+import { PortForwardingPanel } from "./PortForwardingPanel";
+
+function supportedStatus(enabled = false) {
+  return new PortForwardStatus({ enabled, forwards: [], supported: true });
+}
+
+describe("PortForwardingPanel", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    runtimeMock.on.mockImplementation(() => vi.fn());
+  });
+
+  it("renders an initial load error and recovers through Retry", async () => {
+    portForwardServiceMock.GetStatus.mockRejectedValueOnce(
+      new Error("WSL forwarding bridge is unavailable"),
+    );
+    render(<PortForwardingPanel />);
+
+    expect(screen.getByText("Host port forwarding")).toBeInTheDocument();
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "WSL forwarding bridge is unavailable",
+    );
+
+    portForwardServiceMock.GetStatus.mockResolvedValueOnce(supportedStatus());
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Enable forwarding" }),
+      ).toBeInTheDocument(),
+    );
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("hides only after a successful unsupported response", async () => {
+    portForwardServiceMock.GetStatus.mockResolvedValueOnce(
+      new PortForwardStatus({ supported: false }),
+    );
+    render(<PortForwardingPanel />);
+
+    expect(screen.getByText("Host port forwarding")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        screen.queryByText("Host port forwarding"),
+      ).not.toBeInTheDocument(),
+    );
+  });
+
+  it("retains the last good status when a refresh fails, then retries", async () => {
+    portForwardServiceMock.GetStatus.mockResolvedValueOnce(supportedStatus());
+    render(<PortForwardingPanel />);
+    await screen.findByRole("button", { name: "Enable forwarding" });
+
+    portForwardServiceMock.GetStatus.mockRejectedValueOnce(
+      new Error("refresh failed"),
+    );
+    const providerChanged = runtimeMock.on.mock.calls.find(
+      ([eventName]) => eventName === "provider:changed",
+    )?.[1];
+    expect(providerChanged).toBeTypeOf("function");
+    await act(async () => {
+      providerChanged?.();
+    });
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "refresh failed",
+    );
+    expect(
+      screen.getByRole("button", { name: "Enable forwarding" }),
+    ).toBeInTheDocument();
+
+    portForwardServiceMock.GetStatus.mockResolvedValueOnce(
+      supportedStatus(true),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Disable forwarding" }),
+      ).toBeInTheDocument(),
+    );
+  });
+});

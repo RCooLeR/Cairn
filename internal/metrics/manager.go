@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync"
@@ -28,6 +29,9 @@ func NewManager(docker DockerClient, repo *store.MetricsRepository, projects *st
 		Audit:      audit,
 		Events:     events,
 		Scope:      opts.Scope,
+	}
+	if repo != nil {
+		manager.retentionFunc = repo.RetainAndDownsample
 	}
 	manager.applyOptions(opts)
 	return manager
@@ -512,7 +516,9 @@ func (m *Manager) persistLoop() {
 			return
 		case <-ticker.C:
 			_ = m.flush(m.ctx)
-			m.maybeRetain(m.ctx)
+			if err := m.maybeRetain(m.ctx); err != nil {
+				slog.WarnContext(m.ctx, "metrics retention failed; retry scheduled", "error", err)
+			}
 		}
 	}
 }
@@ -557,20 +563,31 @@ func trimPendingMetrics(records []store.MetricsSampleRecord) []store.MetricsSamp
 	return append([]store.MetricsSampleRecord(nil), records[len(records)-maxPendingPersistSamples:]...)
 }
 
-func (m *Manager) maybeRetain(ctx context.Context) {
-	if m.Repository == nil {
-		return
+func (m *Manager) maybeRetain(ctx context.Context) error {
+	if m.retentionFunc == nil {
+		return nil
 	}
 	now := m.now()
 	m.mu.Lock()
-	last := m.lastRetain
-	if !last.IsZero() && now.Sub(last) < m.retainInterval {
+	if !m.lastRetain.IsZero() && now.Sub(m.lastRetain) < m.retainInterval {
 		m.mu.Unlock()
-		return
+		return nil
 	}
-	m.lastRetain = now
+	if !m.lastRetainAttempt.IsZero() && now.Sub(m.lastRetainAttempt) < m.retainRetryInterval {
+		m.mu.Unlock()
+		return nil
+	}
+	m.lastRetainAttempt = now
 	m.mu.Unlock()
-	_ = m.Repository.RetainAndDownsample(ctx, now)
+
+	if err := m.retentionFunc(ctx, now); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.lastRetain = now
+	m.lastRetainAttempt = time.Time{}
+	m.mu.Unlock()
+	return nil
 }
 
 func (m *Manager) refreshDockerInfo(ctx context.Context) {
@@ -622,6 +639,7 @@ func (m *Manager) attributeGPUMetrics(ctx context.Context, metrics models.GPUMet
 		return metrics
 	}
 	if !metrics.Available {
+		m.setGPUUsage(nil)
 		return metrics
 	}
 	if len(metrics.Processes) == 0 {
@@ -1001,6 +1019,8 @@ func waitForWatcher(watcher *containerWatcher) bool {
 }
 
 func (m *Manager) ensureReady() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.watchers == nil {
 		m.watchers = map[string]*containerWatcher{}
 	}
@@ -1037,6 +1057,12 @@ func (m *Manager) ensureReady() {
 	if m.retainInterval <= 0 {
 		m.retainInterval = defaultRetainInterval
 	}
+	if m.retainRetryInterval <= 0 {
+		m.retainRetryInterval = defaultRetainRetryInterval
+	}
+	if m.retainRetryInterval < minimumRetainRetryInterval {
+		m.retainRetryInterval = minimumRetainRetryInterval
+	}
 	if m.gpuCacheTTL <= 0 {
 		m.gpuCacheTTL = defaultGPUCacheTTL
 	}
@@ -1057,6 +1083,7 @@ func (m *Manager) applyOptions(opts Options) {
 	m.publishInterval = opts.PublishInterval
 	m.persistInterval = opts.PersistInterval
 	m.retainInterval = opts.RetainInterval
+	m.retainRetryInterval = opts.RetainRetryInterval
 	m.gpuCacheTTL = opts.GPUCacheTTL
 	m.topN = opts.TopN
 	m.disableStreamingStats = opts.DisableStreamingStats
@@ -1068,6 +1095,9 @@ func (m *Manager) applyOptions(opts Options) {
 	}
 	m.now = opts.Now
 	m.gpuProbe = opts.GPUProbe
+	if opts.RetentionFunc != nil {
+		m.retentionFunc = opts.RetentionFunc
+	}
 	m.ensureReady()
 }
 

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Network, Power } from "lucide-react";
 import { Events } from "@wailsio/runtime";
 
@@ -27,17 +27,34 @@ export function PortForwardingPanel() {
   const [status, setStatus] = useState<PortForwardStatus | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const refreshGenerationRef = useRef(0);
 
   const refresh = useCallback(async () => {
+    const generation = ++refreshGenerationRef.current;
+    setLoading(true);
     try {
-      setStatus(await PortForwardService.GetStatus());
+      const nextStatus = await PortForwardService.GetStatus();
+      if (generation !== refreshGenerationRef.current) {
+        return;
+      }
+      setStatus(nextStatus);
       setError(null);
     } catch (err) {
+      if (generation !== refreshGenerationRef.current) {
+        return;
+      }
       setError(
         err instanceof Error
           ? err.message
           : "Unable to load port forwarding status",
       );
+    } finally {
+      if (generation === refreshGenerationRef.current) {
+        setLoaded(true);
+        setLoading(false);
+      }
     }
   }, []);
 
@@ -55,6 +72,7 @@ export function PortForwardingPanel() {
       void refresh();
     });
     return () => {
+      refreshGenerationRef.current += 1;
       window.clearTimeout(timer);
       off();
       offProvider();
@@ -62,8 +80,49 @@ export function PortForwardingPanel() {
     };
   }, [refresh]);
 
+  if (!status) {
+    if (loaded && !error) {
+      // Only the WSL backend forwards host ports; native/Colima bind them
+      // directly. A successful null response is treated the same way.
+      return null;
+    }
+    return (
+      <Card>
+        <CardHeader
+          status={
+            <Badge tone="neutral">{loading ? "Checking" : "Unavailable"}</Badge>
+          }
+          title="Host port forwarding"
+        />
+        <CardBody className="space-y-3">
+          {error ? (
+            <div
+              className="rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error"
+              role="alert"
+            >
+              {error}
+            </div>
+          ) : (
+            <p
+              aria-live="polite"
+              className="text-sm text-text-muted"
+              role="status"
+            >
+              Loading port forwarding status…
+            </p>
+          )}
+          {error ? (
+            <Button loading={loading} onClick={() => void refresh()} size="sm">
+              Retry
+            </Button>
+          ) : null}
+        </CardBody>
+      </Card>
+    );
+  }
+
   // Only the WSL backend forwards host ports; native/Colima bind them directly.
-  if (!status?.supported) {
+  if (!status.supported) {
     return null;
   }
 
@@ -114,8 +173,14 @@ export function PortForwardingPanel() {
           </Button>
         </div>
         {error ? (
-          <div className="rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error">
-            {error}
+          <div
+            className="flex items-center justify-between gap-3 rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error"
+            role="alert"
+          >
+            <span>{error}</span>
+            <Button loading={loading} onClick={() => void refresh()} size="sm">
+              Retry
+            </Button>
           </div>
         ) : null}
         {forwards.length === 0 ? (

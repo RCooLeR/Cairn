@@ -63,6 +63,16 @@ func Run(assets fs.FS) error {
 	providerPlans := security.NewProviderPlanStore(nil)
 	projectPlans := security.NewProjectPlanStore(nil)
 	agentFilePlans := security.NewAgentFileEditPlanStore(nil)
+	closePlanStores := func() {
+		containerPlans.Close()
+		objectPlans.Close()
+		providerPlans.Close()
+		projectPlans.Close()
+		agentFilePlans.Close()
+	}
+	// OnShutdown normally owns this cleanup. The defer also covers a Wails
+	// startup failure or any other return path before that callback completes.
+	defer closePlanStores()
 	registryManager := registrycore.NewManager(providerManager, auditRepo)
 	registryManager.Settings = db.Settings()
 	providerService := &services.ProviderService{Manager: providerManager, Events: eventBus, Audit: auditRepo, Plans: providerPlans}
@@ -169,7 +179,7 @@ func Run(assets fs.FS) error {
 		OnShutdown: func() {
 			cancel()
 			runtimeController.StopAll()
-			agentFilePlans.Close()
+			closePlanStores()
 			eventBus.Close()
 			_ = db.Close()
 		},

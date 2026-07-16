@@ -920,10 +920,22 @@ func TestProviderServiceStopClearsRuntimeForActiveProvider(t *testing.T) {
 		t.Fatalf("SetActiveProvider() error = %v", err)
 	}
 	runtime := &fakeProviderRuntime{}
-	service := &ProviderService{Manager: manager, Runtime: runtime, Audit: db.Audit()}
+	plans := security.NewProviderPlanStore(nil)
+	t.Cleanup(plans.Close)
+	service := &ProviderService{Manager: manager, Runtime: runtime, Audit: db.Audit(), Plans: plans}
 
-	if err := service.Stop(ctx, provider.ID()); err != nil {
-		t.Fatalf("Stop() error = %v", err)
+	if err := service.Stop(ctx, provider.ID()); !apperror.IsCode(err, apperror.ConfirmationRequired) {
+		t.Fatalf("direct Stop() error = %v, want %s", err, apperror.ConfirmationRequired)
+	}
+	if len(runner.commands) != 0 || runtime.rebindCalls != 0 {
+		t.Fatalf("direct Stop caused side effects: commands=%#v rebinds=%d", runner.commands, runtime.rebindCalls)
+	}
+	plan, err := service.PlanStop(ctx, provider.ID())
+	if err != nil {
+		t.Fatalf("PlanStop() error = %v", err)
+	}
+	if err := service.ApplyProviderPlan(ctx, plan.PlanID, ""); err != nil {
+		t.Fatalf("ApplyProviderPlan() error = %v", err)
 	}
 
 	if len(runner.commands) != 1 {
@@ -934,6 +946,16 @@ func TestProviderServiceStopClearsRuntimeForActiveProvider(t *testing.T) {
 	}
 	if runtime.rebindCalls != 1 || runtime.lastProvider != nil {
 		t.Fatalf("runtime rebind calls = %d provider = %#v, want one nil rebind", runtime.rebindCalls, runtime.lastProvider)
+	}
+	if err := service.ApplyProviderPlan(ctx, plan.PlanID, ""); !apperror.IsCode(err, apperror.PlanExpired) {
+		t.Fatalf("replayed stop plan error = %v, want %s", err, apperror.PlanExpired)
+	}
+	entries, err := (&SettingsService{Audit: db.Audit()}).GetAuditLog(ctx, models.AuditFilter{Topic: "provider.stop", Limit: 5})
+	if err != nil {
+		t.Fatalf("GetAuditLog() error = %v", err)
+	}
+	if len(entries) != 2 || entries[0].Metadata["risk"] != string(models.RiskNeedsConfirmation) || entries[1].Metadata["risk"] != string(models.RiskNeedsConfirmation) {
+		t.Fatalf("provider stop audit entries = %#v, want started/success confirmation-risk entries", entries)
 	}
 }
 
@@ -950,18 +972,46 @@ func TestProviderServiceStopNonActiveProviderKeepsRuntime(t *testing.T) {
 	runtime := &fakeProviderRuntime{}
 	service := &ProviderService{Manager: manager, Runtime: runtime, Audit: db.Audit()}
 
-	if err := service.Stop(ctx, inactive.ID()); err != nil {
-		t.Fatalf("Stop(inactive) error = %v", err)
+	if err := service.Stop(ctx, inactive.ID()); !apperror.IsCode(err, apperror.ConfirmationRequired) {
+		t.Fatalf("direct Stop(inactive) error = %v, want %s", err, apperror.ConfirmationRequired)
 	}
-
-	if len(runner.commands) != 1 {
-		t.Fatalf("lifecycle commands = %#v, want one command", runner.commands)
+	if _, err := service.PlanStop(ctx, inactive.ID()); !apperror.IsCode(err, apperror.NotFound) {
+		t.Fatalf("PlanStop(inactive) error = %v, want %s", err, apperror.NotFound)
 	}
-	if got, want := strings.Join(runner.commands[0], " "), "wsl.exe -d Ubuntu -u root -- systemctl stop docker"; got != want {
-		t.Fatalf("lifecycle command = %q, want %q", got, want)
+	if len(runner.commands) != 0 {
+		t.Fatalf("inactive stop commands = %#v, want none", runner.commands)
 	}
 	if runtime.rebindCalls != 0 {
 		t.Fatalf("runtime rebind calls = %d, want 0", runtime.rebindCalls)
+	}
+}
+
+func TestProviderServiceStopPlanRejectsRuntimeScopeDrift(t *testing.T) {
+	ctx := context.Background()
+	db := openServiceTestStore(t)
+	runner := &fakeLifecycleRunner{}
+	provider := providers.NewWindowsWSL(providers.WindowsWSLOptions{Distro: "Ubuntu", Runner: runner})
+	manager := providers.NewManager(db.Providers(), db.Settings(), []providers.PlatformProvider{provider})
+	if err := manager.SetActiveProvider(ctx, provider.ID()); err != nil {
+		t.Fatalf("SetActiveProvider() error = %v", err)
+	}
+	plans := security.NewProviderPlanStore(nil)
+	t.Cleanup(plans.Close)
+	runtime := &fakeProviderRuntime{}
+	service := &ProviderService{Manager: manager, Runtime: runtime, Audit: db.Audit(), Plans: plans}
+	plan, err := service.PlanStop(ctx, provider.ID())
+	if err != nil {
+		t.Fatalf("PlanStop() error = %v", err)
+	}
+	if err := db.Settings().SetString(ctx, "windows.wsl_distro", "cairn-other"); err != nil {
+		t.Fatalf("SetString(windows.wsl_distro) error = %v", err)
+	}
+
+	if err := service.ApplyProviderPlan(ctx, plan.PlanID, ""); !apperror.IsCode(err, apperror.NotFound) {
+		t.Fatalf("ApplyProviderPlan() after scope drift error = %v, want %s", err, apperror.NotFound)
+	}
+	if len(runner.commands) != 0 || runtime.rebindCalls != 0 {
+		t.Fatalf("scope-drifted plan caused side effects: commands=%#v rebinds=%d", runner.commands, runtime.rebindCalls)
 	}
 }
 

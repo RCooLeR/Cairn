@@ -153,6 +153,7 @@ type Client struct {
 	failureThreshold int
 	connectedOnce    bool
 	shellCache       map[string][]string
+	objectGates      map[string]chan struct{}
 }
 
 func New(provider Provider, eventBus bus.Bus) *Client {
@@ -169,6 +170,7 @@ func New(provider Provider, eventBus bus.Bus) *Client {
 		backoffMin:        defaultBackoffMin,
 		backoffMax:        defaultBackoffMax,
 		failureThreshold:  defaultFailureThreshold,
+		objectGates:       newObjectReconcileGates(),
 	}
 }
 

@@ -67,6 +67,12 @@ export function PlanRestart(providerID: string): $CancellablePromise<models$0.Co
     });
 }
 
+export function PlanStop(providerID: string): $CancellablePromise<models$0.CommandPlan | null> {
+    return $Call.ByID(1363817634, providerID).then(($result: any) => {
+        return $$createType14($result);
+    });
+}
+
 export function Restart(providerID: string): $CancellablePromise<void> {
     return $Call.ByID(3893040676, providerID);
 }
