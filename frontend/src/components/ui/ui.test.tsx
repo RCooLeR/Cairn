@@ -115,11 +115,19 @@ describe("UI kit", () => {
       </Tabs>,
     );
 
-    fireEvent.click(screen.getByRole("tab", { name: "Services" }));
+    const overviewTab = screen.getByRole("tab", { name: "Overview" });
+    const servicesTab = screen.getByRole("tab", { name: "Services" });
+    const panel = screen.getByRole("tabpanel");
+    expect(overviewTab).toHaveAttribute("aria-controls", panel.id);
+    expect(panel).toHaveAttribute("aria-labelledby", overviewTab.id);
+
+    fireEvent.click(servicesTab);
     expect(onChange).toHaveBeenCalledWith("services");
 
-    fireEvent.keyDown(screen.getByRole("tablist"), { key: "ArrowRight" });
+    overviewTab.focus();
+    fireEvent.keyDown(overviewTab, { key: "ArrowRight" });
     expect(onChange).toHaveBeenCalledWith("services");
+    expect(servicesTab).toHaveFocus();
   });
 
   it("keeps tab keyboard navigation working when the active tab is disabled", () => {
@@ -143,8 +151,12 @@ describe("UI kit", () => {
       "tabindex",
       "0",
     );
-    fireEvent.keyDown(screen.getByRole("tablist"), { key: "ArrowRight" });
+    const servicesTab = screen.getByRole("tab", { name: "Services" });
+    const logsTab = screen.getByRole("tab", { name: "Logs" });
+    servicesTab.focus();
+    fireEvent.keyDown(servicesTab, { key: "ArrowRight" });
     expect(onChange).toHaveBeenCalledWith("logs");
+    expect(logsTab).toHaveFocus();
   });
 
   it("sorts table rows by sortable columns", async () => {
