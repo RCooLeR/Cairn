@@ -97,6 +97,110 @@ describe("TerminalPage operation and session lifecycle", () => {
     terminalServiceMock.WriteTerminal.mockResolvedValue(undefined);
   });
 
+  it("moves tab selection and focus through repeated arrows, Home, and End", async () => {
+    terminalServiceMock.ListTerminalSessions.mockResolvedValue([
+      terminalSession({ id: "alpha", title: "Alpha" }),
+      terminalSession({ id: "bravo", title: "Bravo" }),
+      terminalSession({ id: "charlie", title: "Charlie" }),
+    ]);
+
+    renderTerminalPage();
+    const alpha = await screen.findByRole("tab", {
+      name: "Alpha",
+      selected: true,
+    });
+    alpha.focus();
+
+    pressTerminalTabKey("ArrowRight", "Bravo");
+    pressTerminalTabKey("ArrowRight", "Charlie");
+    pressTerminalTabKey("ArrowRight", "Alpha");
+    pressTerminalTabKey("ArrowLeft", "Charlie");
+    pressTerminalTabKey("Home", "Alpha");
+    pressTerminalTabKey("End", "Charlie");
+  });
+
+  it("keeps the only terminal tab selected and focused for every navigation key", async () => {
+    terminalServiceMock.ListTerminalSessions.mockResolvedValue([
+      terminalSession({ id: "alpha", title: "Alpha" }),
+    ]);
+
+    renderTerminalPage();
+    const alpha = await screen.findByRole("tab", {
+      name: "Alpha",
+      selected: true,
+    });
+    alpha.focus();
+
+    for (const key of ["ArrowLeft", "ArrowRight", "Home", "End"]) {
+      pressTerminalTabKey(key, "Alpha");
+    }
+  });
+
+  it("restores tab focus after closing non-active and active sessions", async () => {
+    terminalServiceMock.ListTerminalSessions.mockResolvedValue([
+      terminalSession({ id: "alpha", title: "Alpha" }),
+      terminalSession({ id: "bravo", title: "Bravo" }),
+      terminalSession({
+        id: "charlie",
+        kind: "container",
+        title: "Charlie",
+      }),
+    ]);
+
+    renderTerminalPage();
+    await screen.findByRole("tab", { name: "Alpha", selected: true });
+
+    const closeBravo = screen.getByRole("button", { name: "Close Bravo" });
+    closeBravo.focus();
+    fireEvent.click(closeBravo);
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("tab", { name: "Bravo" }),
+      ).not.toBeInTheDocument(),
+    );
+    const alpha = screen.getByRole("tab", {
+      name: "Alpha",
+      selected: true,
+    });
+    expect(alpha).toHaveFocus();
+
+    fireEvent.keyDown(alpha, { key: "ArrowRight" });
+    const charlie = screen.getByRole("tab", {
+      name: "Charlie",
+      selected: true,
+    });
+    expect(charlie).toHaveFocus();
+
+    const closeCharlie = screen.getByRole("button", {
+      name: "Close Charlie",
+    });
+    closeCharlie.focus();
+    fireEvent.click(closeCharlie);
+    const closeDialog = await screen.findByRole("dialog", {
+      name: "Close Terminal",
+    });
+    const confirmCloseButtons = within(closeDialog).getAllByRole("button", {
+      name: "Close",
+    });
+    fireEvent.click(confirmCloseButtons[confirmCloseButtons.length - 1]);
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("tab", { name: "Charlie" }),
+      ).not.toBeInTheDocument(),
+    );
+    expect(
+      screen.getByRole("tab", { name: "Alpha", selected: true }),
+    ).toHaveFocus();
+    expect(terminalServiceMock.CloseTerminal).toHaveBeenNthCalledWith(
+      1,
+      "bravo",
+    );
+    expect(terminalServiceMock.CloseTerminal).toHaveBeenNthCalledWith(
+      2,
+      "charlie",
+    );
+  });
+
   it("catches typed-input failures and exposes stale-session recovery", async () => {
     terminalServiceMock.ListTerminalSessions.mockResolvedValue([
       terminalSession({ id: "alpha", title: "Alpha" }),
@@ -244,6 +348,7 @@ describe("TerminalPage operation and session lifecycle", () => {
     expect(
       await screen.findByRole("tab", { name: "Alpha", selected: true }),
     ).toBeInTheDocument();
+    screen.getByRole("tab", { name: "Alpha" }).focus();
 
     act(() => {
       emit("terminal:closed", { exitCode: 0, sessionID: "alpha" });
@@ -252,7 +357,7 @@ describe("TerminalPage operation and session lifecycle", () => {
 
     expect(
       await screen.findByRole("tab", { name: "Charlie", selected: true }),
-    ).toBeInTheDocument();
+    ).toHaveFocus();
     expect(
       screen.queryByRole("tab", { name: "Alpha" }),
     ).not.toBeInTheDocument();
@@ -302,6 +407,19 @@ function emit(eventName: string, data: unknown) {
   for (const listener of runtimeMock.listeners.get(eventName) ?? []) {
     listener({ data, name: eventName });
   }
+}
+
+function pressTerminalTabKey(key: string, selectedName: string) {
+  const focused = document.activeElement;
+  if (!(focused instanceof HTMLElement)) {
+    throw new Error("Expected a focused terminal tab");
+  }
+  fireEvent.keyDown(focused, { key });
+  const selected = screen.getByRole("tab", {
+    name: selectedName,
+    selected: true,
+  });
+  expect(selected).toHaveFocus();
 }
 
 function deferred<T>() {

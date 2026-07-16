@@ -29,6 +29,7 @@ import {
   useCallback,
   useEffect,
   useImperativeHandle,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -112,6 +113,12 @@ type TerminalSessionsState = {
   sessions: TerminalSessionInfo[];
 };
 
+type TerminalSessionTabNavigationKey =
+  | "ArrowLeft"
+  | "ArrowRight"
+  | "End"
+  | "Home";
+
 type TerminalOperation = "input" | "resize";
 
 type TerminalOperationFailure = {
@@ -191,6 +198,8 @@ export function TerminalPage({
   const [busy, setBusy] = useState(false);
   const mountedRef = useRef(true);
   const pendingTimer = useRef<number | null>(null);
+  const focusActiveSessionTabAfterUpdateRef = useRef(false);
+  const sessionTabRefs = useRef(new Map<string, HTMLButtonElement>());
   const terminalSurfaceRefs = useRef<
     Record<string, TerminalSurfaceHandle | null>
   >({});
@@ -199,39 +208,49 @@ export function TerminalPage({
     () => sessions.find((session) => session.id === activeSessionID) ?? null,
     [activeSessionID, sessions],
   );
-  const activateSessionAt = useCallback(
-    (index: number) => {
-      const session = sessions[index];
-      if (session) {
-        setTerminalSessions((current) =>
-          current.sessions.some((item) => item.id === session.id)
-            ? { ...current, activeSessionID: session.id }
-            : current,
-        );
+  useLayoutEffect(() => {
+    if (!focusActiveSessionTabAfterUpdateRef.current) {
+      return;
+    }
+    const targetID = terminalSessions.activeSessionID;
+    if (!targetID) {
+      focusActiveSessionTabAfterUpdateRef.current = false;
+      return;
+    }
+    const target = sessionTabRefs.current.get(targetID);
+    if (target?.isConnected) {
+      target.focus();
+      focusActiveSessionTabAfterUpdateRef.current = false;
+    }
+  }, [terminalSessions]);
+
+  const restoreSessionTabFocusWhenRemoving = useCallback(
+    (sessionID: string) => {
+      const tab = sessionTabRefs.current.get(sessionID);
+      if (tab?.parentElement?.contains(document.activeElement)) {
+        focusActiveSessionTabAfterUpdateRef.current = true;
       }
     },
-    [sessions],
+    [],
   );
+
   const onSessionTabKeyDown = useCallback(
-    (event: ReactKeyboardEvent<HTMLButtonElement>, index: number) => {
-      if (sessions.length === 0) {
+    (
+      event: ReactKeyboardEvent<HTMLButtonElement>,
+      focusedSessionID: string,
+    ) => {
+      const key = event.key;
+      if (!isTerminalSessionTabNavigationKey(key)) {
         return;
       }
-      if (event.key === "ArrowRight") {
-        event.preventDefault();
-        activateSessionAt((index + 1) % sessions.length);
-      } else if (event.key === "ArrowLeft") {
-        event.preventDefault();
-        activateSessionAt((index - 1 + sessions.length) % sessions.length);
-      } else if (event.key === "Home") {
-        event.preventDefault();
-        activateSessionAt(0);
-      } else if (event.key === "End") {
-        event.preventDefault();
-        activateSessionAt(sessions.length - 1);
-      }
+
+      event.preventDefault();
+      focusActiveSessionTabAfterUpdateRef.current = true;
+      setTerminalSessions((current) =>
+        navigateTerminalSessionTab(current, focusedSessionID, key),
+      );
     },
-    [activateSessionAt, sessions.length],
+    [],
   );
   const terminalContainers = useMemo(
     () =>
@@ -311,13 +330,14 @@ export function TerminalPage({
       if (!payload) {
         return;
       }
+      restoreSessionTabFocusWhenRemoving(payload.sessionID);
       setTerminalSessions((current) =>
         removeTerminalSession(current, payload.sessionID),
       );
       setStatus(`Session exited with code ${payload.exitCode}`);
     });
     return () => off();
-  }, []);
+  }, [restoreSessionTabFocusWhenRemoving]);
 
   useEffect(() => {
     if (!selectedTerminalContainerID) {
@@ -483,12 +503,26 @@ export function TerminalPage({
     selectedTerminalContainerID,
   ]);
 
-  const closeSessionNow = useCallback(async (session: TerminalSessionInfo) => {
-    await TerminalService.CloseTerminal(session.id);
-    setTerminalSessions((current) =>
-      removeTerminalSession(current, session.id),
-    );
-  }, []);
+  const closeSessionNow = useCallback(
+    async (
+      session: TerminalSessionInfo,
+      focusActiveTabAfterRemoval = false,
+    ) => {
+      await TerminalService.CloseTerminal(session.id);
+      if (
+        focusActiveTabAfterRemoval &&
+        sessionTabRefs.current.get(session.id)?.isConnected
+      ) {
+        focusActiveSessionTabAfterUpdateRef.current = true;
+      } else {
+        restoreSessionTabFocusWhenRemoving(session.id);
+      }
+      setTerminalSessions((current) =>
+        removeTerminalSession(current, session.id),
+      );
+    },
+    [restoreSessionTabFocusWhenRemoving],
+  );
 
   const closeSession = useCallback(
     (session: TerminalSessionInfo) => {
@@ -839,7 +873,7 @@ export function TerminalPage({
           className="flex min-h-11 items-center gap-2 overflow-x-auto border-b border-border bg-bg-inset px-2 py-2"
           role={sessions.length > 0 ? "tablist" : undefined}
         >
-          {sessions.map((session, index) => {
+          {sessions.map((session) => {
             const active = activeSessionID === session.id;
             const tabID = `terminal-tab-${session.id}`;
             const panelID = `terminal-panel-${session.id}`;
@@ -865,7 +899,14 @@ export function TerminalPage({
                         : current,
                     )
                   }
-                  onKeyDown={(event) => onSessionTabKeyDown(event, index)}
+                  onKeyDown={(event) => onSessionTabKeyDown(event, session.id)}
+                  ref={(element) => {
+                    if (element) {
+                      sessionTabRefs.current.set(session.id, element);
+                    } else {
+                      sessionTabRefs.current.delete(session.id);
+                    }
+                  }}
                   role="tab"
                   tabIndex={active ? 0 : -1}
                   type="button"
@@ -1122,7 +1163,7 @@ export function TerminalPage({
                 }
                 const session = closeGuard.session;
                 setCloseGuard({ busy: true, session });
-                void closeSessionNow(session)
+                void closeSessionNow(session, true)
                   .then(() => setCloseGuard(null))
                   .catch((closeError: unknown) => {
                     setCloseGuard({
@@ -1683,6 +1724,56 @@ function removeTerminalSession(
       : (sessions[Math.min(removedIndex, sessions.length - 1)]?.id ?? null),
     sessions,
   };
+}
+
+function isTerminalSessionTabNavigationKey(
+  key: string,
+): key is TerminalSessionTabNavigationKey {
+  return (
+    key === "ArrowLeft" ||
+    key === "ArrowRight" ||
+    key === "Home" ||
+    key === "End"
+  );
+}
+
+function navigateTerminalSessionTab(
+  current: TerminalSessionsState,
+  focusedSessionID: string,
+  key: TerminalSessionTabNavigationKey,
+): TerminalSessionsState {
+  const { sessions } = current;
+  if (sessions.length === 0) {
+    return { activeSessionID: null, sessions };
+  }
+
+  let targetIndex: number;
+  if (key === "Home") {
+    targetIndex = 0;
+  } else if (key === "End") {
+    targetIndex = sessions.length - 1;
+  } else {
+    const focusedIndex = sessions.findIndex(
+      (session) => session.id === focusedSessionID,
+    );
+    const activeIndex = sessions.findIndex(
+      (session) => session.id === current.activeSessionID,
+    );
+    const originIndex =
+      focusedIndex >= 0
+        ? focusedIndex
+        : activeIndex >= 0
+          ? activeIndex
+          : key === "ArrowRight"
+            ? -1
+            : 0;
+    targetIndex =
+      key === "ArrowRight"
+        ? (originIndex + 1) % sessions.length
+        : (originIndex - 1 + sessions.length) % sessions.length;
+  }
+
+  return { activeSessionID: sessions[targetIndex].id, sessions };
 }
 
 function terminalOperationFailure(
