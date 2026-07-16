@@ -15,7 +15,6 @@
   z-index: 9999;
   overflow: hidden;
   isolation: isolate;
-  cursor: pointer;
   background: #03090e;
   color: var(--text);
   font-family:
@@ -30,6 +29,55 @@
   transition:
     opacity 0.62s ease,
     filter 0.62s ease;
+}
+
+.cairn-loader .progress-semantics {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.cairn-loader .skip-intro {
+  position: absolute;
+  top: 42px;
+  right: 56px;
+  z-index: 6;
+  min-height: 40px;
+  padding: 0 16px;
+  border: 1px solid rgba(22, 216, 207, 0.65);
+  border-radius: 999px;
+  background: rgba(3, 12, 18, 0.84);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 650;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  cursor: pointer;
+  backdrop-filter: blur(8px);
+  transition:
+    border-color 0.16s ease,
+    background 0.16s ease,
+    box-shadow 0.16s ease;
+}
+
+.cairn-loader .skip-intro:hover {
+  border-color: var(--cyan-2);
+  background: rgba(10, 39, 44, 0.92);
+  box-shadow: 0 0 18px rgba(22, 216, 207, 0.28);
+}
+
+.cairn-loader .skip-intro:focus-visible {
+  outline: 3px solid var(--cyan-2);
+  outline-offset: 3px;
+}
+
+.cairn-loader .skip-intro:disabled {
+  cursor: default;
+  opacity: 0.65;
 }
 .cairn-loader.leaving {
   opacity: 0;
@@ -452,6 +500,10 @@
   }
 }
 @media (max-width: 760px) {
+  .cairn-loader .skip-intro {
+    top: 28px;
+    right: 28px;
+  }
   .cairn-loader .hud {
     padding: 26px;
   }

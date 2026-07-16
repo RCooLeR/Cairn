@@ -10,7 +10,7 @@ import { getAppVersion } from "../api/app";
  * rings, drifting particles + links, a scan beam), and a cyan init panel
  * (per-service progress, system log, bottom strip) — all React-rendered from
  * one `progress` value. Mounted as a top-level overlay; ramps 1→100%, holds,
- * fades out, and calls onDone. Click anywhere to skip.
+ * fades out, and calls onDone. A dedicated button lets users skip the intro.
  * ------------------------------------------------------------------------- */
 
 // The bar ramps to CAP, then holds there until Cairn's Go backend actually
@@ -321,17 +321,26 @@ export default function CairnLoader({ onDone }: { onDone: () => void }) {
   return (
     <div
       className={`cairn-loader${leaving ? " leaving" : ""}`}
-      role="progressbar"
-      aria-label="Initializing Cairn"
-      aria-valuenow={pct}
-      aria-valuemin={0}
-      aria-valuemax={100}
-      title="Click to skip"
-      onClick={beginLeave}
       onTransitionEnd={(e) => {
         if (e.propertyName === "opacity" && leavingRef.current) finish();
       }}
     >
+      <div
+        className="progress-semantics"
+        role="progressbar"
+        aria-label="Initializing Cairn"
+        aria-valuenow={pct}
+        aria-valuemin={0}
+        aria-valuemax={100}
+      />
+      <button
+        type="button"
+        className="skip-intro"
+        onClick={beginLeave}
+        disabled={leaving}
+      >
+        Skip intro
+      </button>
       <div className="bg" />
       <canvas className="fx" ref={canvasRef} />
       <div className="scan" />
