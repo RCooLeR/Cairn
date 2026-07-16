@@ -15,11 +15,18 @@ const (
 	DefaultRegistry      = "docker.io"
 	dockerHubAPIRegistry = "registry-1.docker.io"
 
-	defaultCacheTTL         = time.Hour
-	defaultRequestTimeout   = 10 * time.Second
-	defaultTotalTimeout     = 30 * time.Second
-	defaultGlobalLimit      = 8
-	defaultPerRegistryLimit = 3
+	defaultCacheTTL          = time.Hour
+	defaultRequestTimeout    = 10 * time.Second
+	defaultTotalTimeout      = 30 * time.Second
+	defaultGlobalLimit       = 8
+	defaultPerRegistryLimit  = 3
+	defaultCacheEntryLimit   = 1024
+	defaultCircuitEntryLimit = 256
+
+	maxTokenResponseBytes         = 64 << 10
+	maxManifestIndexResponseBytes = 4 << 20
+	maxRegistryTokenBytes         = 32 << 10
+	maxManifestIndexEntries       = 4096
 )
 
 type ProviderResolver interface {
@@ -43,13 +50,21 @@ type Manager struct {
 	Now                 func() time.Time
 	CacheTTL            time.Duration
 	PlainHTTPRegistries map[string]bool
+	// TrustedAuthRealms maps a registry host to additional HTTPS origins that
+	// may receive credentials for that registry. Same-origin realms are always
+	// accepted; cross-origin realms must be listed explicitly.
+	TrustedAuthRealms map[string][]string
 
-	globalLimit      chan struct{}
-	perRegistryLimit int
+	globalLimit       chan struct{}
+	perRegistryLimit  int
+	cacheEntryLimit   int
+	circuitEntryLimit int
 
 	mu           sync.Mutex
+	loginMu      sync.Mutex
+	configMu     sync.Mutex
 	cache        map[string]cacheEntry
-	registryGate map[string]chan struct{}
+	registryGate map[string]*registryGateState
 	circuit      map[string]circuitState
 }
 
@@ -59,8 +74,14 @@ type cacheEntry struct {
 }
 
 type circuitState struct {
-	Failures  int
-	OpenUntil time.Time
+	Failures    int
+	OpenUntil   time.Time
+	LastTouched time.Time
+}
+
+type registryGateState struct {
+	gate chan struct{}
+	refs int
 }
 
 type ImageRef struct {
@@ -116,16 +137,23 @@ type credential struct {
 
 func NewManager(providers ProviderResolver, audit *store.AuditRepository) *Manager {
 	return &Manager{
-		Providers:        providers,
-		Audit:            audit,
-		HTTPClient:       &http.Client{Timeout: defaultRequestTimeout},
-		Now:              func() time.Time { return time.Now().UTC() },
-		CacheTTL:         defaultCacheTTL,
-		globalLimit:      make(chan struct{}, defaultGlobalLimit),
-		perRegistryLimit: defaultPerRegistryLimit,
-		cache:            map[string]cacheEntry{},
-		registryGate:     map[string]chan struct{}{},
-		circuit:          map[string]circuitState{},
+		Providers:  providers,
+		Audit:      audit,
+		HTTPClient: &http.Client{Timeout: defaultRequestTimeout},
+		Now:        func() time.Time { return time.Now().UTC() },
+		CacheTTL:   defaultCacheTTL,
+		TrustedAuthRealms: map[string][]string{
+			DefaultRegistry:       {"https://auth.docker.io"},
+			dockerHubAPIRegistry:  {"https://auth.docker.io"},
+			"registry.gitlab.com": {"https://gitlab.com"},
+		},
+		globalLimit:       make(chan struct{}, defaultGlobalLimit),
+		perRegistryLimit:  defaultPerRegistryLimit,
+		cacheEntryLimit:   defaultCacheEntryLimit,
+		circuitEntryLimit: defaultCircuitEntryLimit,
+		cache:             map[string]cacheEntry{},
+		registryGate:      map[string]*registryGateState{},
+		circuit:           map[string]circuitState{},
 	}
 }
 

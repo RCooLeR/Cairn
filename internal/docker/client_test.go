@@ -1224,6 +1224,12 @@ func TestClientImagePullSaveLoadAndSearch(t *testing.T) {
 	jobDone := eventBus.Subscribe(ctx, bus.TopicJobDone, 8)
 
 	client := New(fakeDockerProvider{}, eventBus)
+	client.registryAuth = func(_ context.Context, registry string) (string, error) {
+		if registry != "docker.io" {
+			t.Fatalf("registry auth requested for %q", registry)
+		}
+		return "encoded-pull-auth", nil
+	}
 	client.factory = func(string) (APIClient, error) { return api, nil }
 	if err := client.Connect(ctx); err != nil {
 		t.Fatalf("Connect() error = %v", err)
@@ -1235,6 +1241,9 @@ func TestClientImagePullSaveLoadAndSearch(t *testing.T) {
 	}
 	if streamID == "" || len(api.pulled) != 1 || api.pulled[0] != "alpine:latest" {
 		t.Fatalf("streamID=%q pulled=%#v", streamID, api.pulled)
+	}
+	if len(api.pullAuth) != 1 || api.pullAuth[0] != "encoded-pull-auth" {
+		t.Fatalf("pull auth = %#v", api.pullAuth)
 	}
 	if got := waitImageProgress(t, ctx, pullEvents, time.Second); got.StreamID != streamID {
 		t.Fatalf("pull progress = %#v, want stream %q", got, streamID)
@@ -1276,6 +1285,54 @@ func TestClientImagePullSaveLoadAndSearch(t *testing.T) {
 	}
 	if len(results) != 1 || results[0].Name != "library/alpine" || !results[0].Official {
 		t.Fatalf("hub results = %#v", results)
+	}
+}
+
+func TestEnsureImagePresentUsesRegistryAuthForPullBeforeRun(t *testing.T) {
+	t.Parallel()
+	api := newFakeAPI()
+	client := New(fakeDockerProvider{}, nil)
+	client.registryAuth = func(_ context.Context, registry string) (string, error) {
+		if registry != "private.example.test" {
+			t.Fatalf("registry auth requested for %q", registry)
+		}
+		return "private-pull-auth", nil
+	}
+
+	if err := client.ensureImagePresent(context.Background(), api, "private.example.test/team/app:1", true); err != nil {
+		t.Fatalf("ensureImagePresent() error = %v", err)
+	}
+	if len(api.pullAuth) != 1 || api.pullAuth[0] != "private-pull-auth" {
+		t.Fatalf("pull auth = %#v", api.pullAuth)
+	}
+}
+
+func TestImagePullMapsImmediateAndStreamedRegistryFailures(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		err  error
+		body string
+		code apperror.Code
+	}{
+		{name: "immediate auth", err: errors.New("unauthorized: authentication required"), code: apperror.RegistryAuth},
+		{name: "immediate rate limit", err: errors.New("too many requests: rate limit exceeded"), code: apperror.RegistryRateLimit},
+		{name: "stream auth", body: `{"error":"denied: requested access to the resource is denied"}` + "\n", code: apperror.RegistryAuth},
+		{name: "stream rate limit", body: `{"error":"too many requests: rate limit exceeded"}` + "\n", code: apperror.RegistryRateLimit},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			api := newFakeAPI()
+			api.pullErr = tt.err
+			api.pullBody = tt.body
+			client := New(fakeDockerProvider{}, nil)
+			err := client.pullImage(context.Background(), api, "private.example/team/app:1", "private.example", "pull-test", "auth")
+			if !apperror.IsCode(err, tt.code) {
+				t.Fatalf("pull error = %v, want %s", err, tt.code)
+			}
+		})
 	}
 }
 
@@ -2232,6 +2289,9 @@ type fakeAPI struct {
 	createdContainers []createdContainerCall
 	renamed           []string
 	pulled            []string
+	pullAuth          []string
+	pullBody          string
+	pullErr           error
 	tagged            []string
 	pushed            []string
 	pushAuth          []string
@@ -2572,10 +2632,14 @@ func (a *fakeAPI) ImageInspectWithRaw(_ context.Context, id string) (image.Inspe
 	return image.InspectResponse{}, nil, cerrdefs.ErrNotFound.WithMessage(fmt.Sprintf("no such image: %s", id))
 }
 
-func (a *fakeAPI) ImagePull(_ context.Context, ref string, _ image.PullOptions) (io.ReadCloser, error) {
+func (a *fakeAPI) ImagePull(_ context.Context, ref string, opts image.PullOptions) (io.ReadCloser, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.pulled = append(a.pulled, ref)
+	a.pullAuth = append(a.pullAuth, opts.RegistryAuth)
+	if a.pullErr != nil {
+		return nil, a.pullErr
+	}
 	a.imageInspects[ref] = image.InspectResponse{
 		ID:           "sha256:pulled",
 		RepoTags:     []string{ref},
@@ -2583,7 +2647,11 @@ func (a *fakeAPI) ImagePull(_ context.Context, ref string, _ image.PullOptions) 
 		Architecture: "amd64",
 		Os:           "linux",
 	}
-	return io.NopCloser(strings.NewReader(`{"status":"pulling","id":"layer","progressDetail":{"current":1,"total":2}}` + "\n" + `{"status":"done"}` + "\n")), nil
+	body := a.pullBody
+	if body == "" {
+		body = `{"status":"pulling","id":"layer","progressDetail":{"current":1,"total":2}}` + "\n" + `{"status":"done"}` + "\n"
+	}
+	return io.NopCloser(strings.NewReader(body)), nil
 }
 
 func (a *fakeAPI) ImageTag(_ context.Context, imageID string, ref string) error {

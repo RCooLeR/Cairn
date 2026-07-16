@@ -67,8 +67,16 @@ func (c *Client) PullImage(ctx context.Context, imageRef string) (string, error)
 	if ref == "" {
 		return "", apperror.New(apperror.Conflict, "Image reference is required")
 	}
+	normalized, err := registrycore.NormalizeImageRef(ref)
+	if err != nil {
+		return "", err
+	}
 	streamID := newJobID("pull")
-	if err := c.pullImage(ctx, api, ref, streamID); err != nil {
+	auth, err := c.registryAuthFor(ctx, normalized.Registry)
+	if err != nil {
+		return streamID, err
+	}
+	if err := c.pullImage(ctx, api, ref, normalized.Registry, streamID, auth); err != nil {
 		return streamID, err
 	}
 	c.publishImageChanged(ref)
@@ -108,7 +116,7 @@ func (c *Client) PushImage(ctx context.Context, imageRef string) (string, error)
 		return "", err
 	}
 	streamID := newJobID("push")
-	auth, err := c.registryAuthForPush(ctx, ref.Registry)
+	auth, err := c.registryAuthFor(ctx, ref.Registry)
 	if err != nil {
 		return streamID, err
 	}
@@ -420,7 +428,15 @@ func (c *Client) ensureImagePresent(ctx context.Context, api APIClient, imageRef
 	if !pullIfMissing {
 		return apperror.Wrap(apperror.NotFound, "Image is not present locally", err, apperror.WithDetail(imageRef))
 	}
-	return c.pullImage(ctx, api, imageRef, newJobID("pull"))
+	ref, err := registrycore.NormalizeImageRef(imageRef)
+	if err != nil {
+		return err
+	}
+	auth, err := c.registryAuthFor(ctx, ref.Registry)
+	if err != nil {
+		return err
+	}
+	return c.pullImage(ctx, api, imageRef, ref.Registry, newJobID("pull"), auth)
 }
 
 func (c *Client) validateContainerNameAvailable(ctx context.Context, api APIClient, name string) error {
@@ -436,11 +452,11 @@ func (c *Client) validateContainerNameAvailable(ctx context.Context, api APIClie
 	return mapDockerError("inspect container name", err)
 }
 
-func (c *Client) pullImage(ctx context.Context, api APIClient, imageRef string, streamID string) error {
+func (c *Client) pullImage(ctx context.Context, api APIClient, imageRef string, registry string, streamID string, auth string) error {
 	c.publishImageProgress(bus.TopicImagePullProgress, streamID, "", "starting", 0, 0)
-	reader, err := api.ImagePull(ctx, imageRef, image.PullOptions{})
+	reader, err := api.ImagePull(ctx, imageRef, image.PullOptions{RegistryAuth: auth})
 	if err != nil {
-		return mapDockerError("pull image", err)
+		return mapRegistryPullError(registry, err)
 	}
 	defer func() {
 		_ = reader.Close()
@@ -463,7 +479,7 @@ func (c *Client) pullImage(ctx context.Context, api APIClient, imageRef string, 
 			return mapDockerError("read pull progress", err)
 		}
 		if message.ErrorMessage != "" {
-			return apperror.New(apperror.RegistryUnreachable, "Pull image failed", apperror.WithDetail(message.ErrorMessage))
+			return registryPullStreamError(registry, message.ErrorMessage)
 		}
 		status := message.Status
 		if status == "" {
@@ -475,7 +491,10 @@ func (c *Client) pullImage(ctx context.Context, api APIClient, imageRef string, 
 	return nil
 }
 
-func (c *Client) registryAuthForPush(ctx context.Context, registry string) (string, error) {
+func (c *Client) registryAuthFor(ctx context.Context, registry string) (string, error) {
+	if c.registryAuth != nil {
+		return c.registryAuth(ctx, registry)
+	}
 	provider, ok := c.provider.(providers.PlatformProvider)
 	if !ok {
 		return "", nil
@@ -771,6 +790,14 @@ func floatPtr(value float64) *float64 {
 }
 
 func mapRegistryPushError(registry string, err error) error {
+	return mapRegistryOperationError("push", registry, err)
+}
+
+func mapRegistryPullError(registry string, err error) error {
+	return mapRegistryOperationError("pull", registry, err)
+}
+
+func mapRegistryOperationError(operation string, registry string, err error) error {
 	if err == nil {
 		return nil
 	}
@@ -780,17 +807,25 @@ func mapRegistryPushError(registry string, err error) error {
 	if registryRateLimitMessage(err.Error()) {
 		return apperror.Wrap(apperror.RegistryRateLimit, "Registry rate limit reached", err, apperror.WithDetail(registry+": "+err.Error()))
 	}
-	return mapDockerError("push image", err)
+	return mapDockerError(operation+" image", err)
 }
 
 func registryPushStreamError(registry string, detail string) error {
+	return registryStreamError("Push", registry, detail)
+}
+
+func registryPullStreamError(registry string, detail string) error {
+	return registryStreamError("Pull", registry, detail)
+}
+
+func registryStreamError(operation string, registry string, detail string) error {
 	if registryAuthMessage(detail) {
 		return apperror.New(apperror.RegistryAuth, "Registry authentication failed", apperror.WithDetail(registry+": "+detail))
 	}
 	if registryRateLimitMessage(detail) {
 		return apperror.New(apperror.RegistryRateLimit, "Registry rate limit reached", apperror.WithDetail(registry+": "+detail))
 	}
-	return apperror.New(apperror.RegistryUnreachable, "Push image failed", apperror.WithDetail(detail))
+	return apperror.New(apperror.RegistryUnreachable, operation+" image failed", apperror.WithDetail(detail))
 }
 
 func registryAuthMessage(detail string) bool {

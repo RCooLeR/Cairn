@@ -4,11 +4,14 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -145,6 +148,56 @@ func TestEncodeDockerAuthConfigUsesCredentialHelper(t *testing.T) {
 	}
 }
 
+func TestEncodeDockerAuthConfigMapsHelperTokenUsernameToIdentityToken(t *testing.T) {
+	t.Parallel()
+	provider := &fakeRegistryProvider{
+		backendResults: map[string]string{
+			`sh -lc cat "${DOCKER_CONFIG:-$HOME/.docker}/config.json" 2>/dev/null || true`: `{"credHelpers":{"ghcr.io":"gh"}}`,
+			"docker-credential-gh get": `{"Username":"<token>","Secret":"identity-token"}`,
+		},
+	}
+	encoded, err := EncodeDockerAuthConfig(context.Background(), provider, "ghcr.io")
+	if err != nil {
+		t.Fatalf("EncodeDockerAuthConfig() error = %v", err)
+	}
+	raw, err := base64.URLEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var auth dockerregistry.AuthConfig
+	if err := json.Unmarshal(raw, &auth); err != nil {
+		t.Fatal(err)
+	}
+	if auth.IdentityToken != "identity-token" || auth.Username != "" || auth.Password != "" {
+		t.Fatalf("auth config = %#v", auth)
+	}
+}
+
+func TestCredentialHelperNotFoundRecognizesOfficialStdoutMarkerOnly(t *testing.T) {
+	t.Parallel()
+	if !credentialHelperNotFound(&providers.CommandResult{ExitCode: 1, Stdout: "credentials not found in native keychain\n"}, errors.New("exit status 1")) {
+		t.Fatal("official helper stdout marker was not recognized")
+	}
+	if credentialHelperNotFound(&providers.CommandResult{ExitCode: 1, Stdout: "keychain service unavailable\n"}, errors.New("exit status 1")) {
+		t.Fatal("unknown helper failure was treated as a missing credential")
+	}
+	if credentialHelperNotFound(&providers.CommandResult{ExitCode: 1, Stderr: "no credentials store is configured"}, nil) {
+		t.Fatal("generic no-credentials diagnostic was treated as a missing registry credential")
+	}
+	if credentialHelperNotFound(&providers.CommandResult{ExitCode: 1, Stdout: "credentials not found in native keychain\nfatal backend corruption\n"}, errors.New("exit status 1")) {
+		t.Fatal("mixed helper stdout was treated as a missing credential")
+	}
+	if credentialHelperNotFound(&providers.CommandResult{ExitCode: 1, Stdout: "credentials not found in native keychain\n", Stderr: "fatal backend corruption\n"}, errors.New("exit status 1")) {
+		t.Fatal("mixed helper streams were treated as a missing credential")
+	}
+	if credentialHelperNotFound(&providers.CommandResult{ExitCode: 1, Stdout: "credentials not found in native keychain\n"}, errors.New("backend transport failed")) {
+		t.Fatal("additional runner error was treated as a missing credential")
+	}
+	if credentialHelperNotFound(&providers.CommandResult{ExitCode: 1, Stdout: strings.Repeat("x", (4<<10)+1) + " credentials not found"}, errors.New("exit status 1")) {
+		t.Fatal("oversized helper output was used to authorize missing-credential handling")
+	}
+}
+
 func TestEncodeDockerAuthConfigHandlesBadDockerConfigJSON(t *testing.T) {
 	t.Parallel()
 	provider := &fakeRegistryProvider{
@@ -159,7 +212,7 @@ func TestEncodeDockerAuthConfigHandlesBadDockerConfigJSON(t *testing.T) {
 	}
 }
 
-func TestEncodeDockerAuthConfigIgnoresBadCredentialHelperJSON(t *testing.T) {
+func TestEncodeDockerAuthConfigFailsClosedOnBadCredentialHelperJSON(t *testing.T) {
 	t.Parallel()
 	config := `{"auths":{"ghcr.io":{}},"credHelpers":{"ghcr.io":"gh"}}`
 	provider := &fakeRegistryProvider{
@@ -169,12 +222,35 @@ func TestEncodeDockerAuthConfigIgnoresBadCredentialHelperJSON(t *testing.T) {
 		},
 	}
 
-	encoded, err := EncodeDockerAuthConfig(context.Background(), provider, "ghcr.io")
-	if err != nil {
-		t.Fatalf("EncodeDockerAuthConfig() error = %v", err)
+	_, err := EncodeDockerAuthConfig(context.Background(), provider, "ghcr.io")
+	if !apperror.IsCode(err, apperror.RegistryAuth) {
+		t.Fatalf("EncodeDockerAuthConfig() error = %v, want registry auth", err)
 	}
-	if encoded != "" {
-		t.Fatalf("encoded auth = %q, want empty", encoded)
+}
+
+func TestEncodeDockerAuthConfigDistinguishesMissingCredentialFromHelperFailure(t *testing.T) {
+	t.Parallel()
+	config := `{"credHelpers":{"ghcr.io":"gh"}}`
+	configCommand := `sh -lc cat "${DOCKER_CONFIG:-$HOME/.docker}/config.json" 2>/dev/null || true`
+
+	missing := &fakeRegistryProvider{
+		backendResults:         map[string]string{configCommand: config},
+		backendDefaultExitCode: 1,
+		backendDefaultStderr:   "credentials not found in native keychain",
+	}
+	encoded, err := EncodeDockerAuthConfig(context.Background(), missing, "ghcr.io")
+	if err != nil || encoded != "" {
+		t.Fatalf("missing credential encoded=%q error=%v", encoded, err)
+	}
+
+	broken := &fakeRegistryProvider{
+		backendResults:         map[string]string{configCommand: config},
+		backendDefaultExitCode: 2,
+		backendDefaultStderr:   "helper process crashed",
+	}
+	_, err = EncodeDockerAuthConfig(context.Background(), broken, "ghcr.io")
+	if !apperror.IsCode(err, apperror.RegistryAuth) {
+		t.Fatalf("broken helper error = %v, want registry auth", err)
 	}
 }
 
@@ -219,19 +295,25 @@ func TestLoginPipesSecretThroughStdin(t *testing.T) {
 
 	auth := base64.StdEncoding.EncodeToString([]byte("ada:token"))
 	provider := &fakeRegistryProvider{
-		backendStdout: `{"auths":{"` + registryHost + `":{"auth":"` + auth + `"}}}`,
-		dockerResult:  &providers.CommandResult{ExitCode: 0},
+		backendResults: map[string]string{
+			`sh -lc cat "${DOCKER_CONFIG:-$HOME/.docker}/config.json" 2>/dev/null || true`: `{"auths":{"` + registryHost + `":{"auth":"` + auth + `"}}}`,
+			"docker-credential-pass list": `{}`,
+		},
+		backendDefaultExitCode: 1,
+		backendDefaultStderr:   "credentials not found in native keychain",
+		dockerResult:           &providers.CommandResult{ExitCode: 0},
 	}
 	manager := NewManager(fakeResolver{provider: provider}, nil)
+	secret := " \ttoken\n"
 	err := manager.Login(context.Background(), models.RegistryLoginRequest{
 		Registry: registryHost,
 		Username: "ada",
-		Secret:   "token",
+		Secret:   secret,
 	})
 	if err != nil {
 		t.Fatalf("Login() error = %v", err)
 	}
-	if provider.dockerInput != "token\n" {
+	if provider.dockerInput != registryLoginInput(secret) {
 		t.Fatalf("docker input = %q", provider.dockerInput)
 	}
 	got := strings.Join(provider.dockerArgs, " ")
@@ -240,6 +322,31 @@ func TestLoginPipesSecretThroughStdin(t *testing.T) {
 	}
 	if want := []string{"login", registryHost, "-u", "ada", "--password-stdin"}; !reflect.DeepEqual(provider.dockerArgs, want) {
 		t.Fatalf("docker args = %#v, want %#v", provider.dockerArgs, want)
+	}
+}
+
+func TestRegistryLoginInputPreservesOpaqueSecretAfterDockerDelimiterRemoval(t *testing.T) {
+	t.Parallel()
+	secrets := []string{
+		" token ",
+		"\ttoken\t",
+		"token\n",
+		"token\r",
+		"token\r\n",
+		"token\u00a0",
+	}
+	for _, secret := range secrets {
+		input := registryLoginInput(secret)
+		decoded := input
+		for _, eol := range []string{"\r\n", "\n", "\r"} {
+			if value, ok := strings.CutSuffix(decoded, eol); ok {
+				decoded = value
+				break
+			}
+		}
+		if decoded != secret {
+			t.Fatalf("secret %q became %q through password stdin", secret, decoded)
+		}
 	}
 }
 
@@ -310,7 +417,9 @@ func TestLoginPreservesInlineAuthWhenDockerLoginFails(t *testing.T) {
 			`sh -lc cat "${DOCKER_CONFIG:-$HOME/.docker}/config.json" 2>/dev/null || true`: `{"auths":{"` + registryHost + `":{"auth":"` + auth + `"}}}`,
 			"docker-credential-pass list": `{}`,
 		},
-		dockerResult: &providers.CommandResult{ExitCode: 1, Stderr: "denied"},
+		backendDefaultExitCode: 1,
+		backendDefaultStderr:   "credentials not found in native keychain",
+		dockerResult:           &providers.CommandResult{ExitCode: 1, Stderr: "denied"},
 	}
 	manager := NewManager(fakeResolver{provider: provider}, nil)
 	manager.Settings = testRegistrySettings(t, registryCredentialModeDockerHelper)
@@ -330,9 +439,116 @@ func TestLoginPreservesInlineAuthWhenDockerLoginFails(t *testing.T) {
 	if _, _, ok := authEntryForRegistry(written, registryHost); !ok {
 		t.Fatalf("inline auth for %s was removed after failed login: %s", registryHost, provider.backendConfig)
 	}
+	if helperForRegistry(written, registryHost) != "" {
+		t.Fatalf("preparatory helper mapping still masks old inline auth: %s", provider.backendConfig)
+	}
 }
 
-func TestLoginFallsBackToDockerConfigWhenCredentialHelperUnavailable(t *testing.T) {
+func TestLoginRollsBackCredentialAfterPostLoginVerificationFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer server.Close()
+	registryHost := strings.TrimPrefix(server.URL, "http://")
+	provider := &fakeRegistryProvider{
+		backendResults: map[string]string{
+			`sh -lc cat "${DOCKER_CONFIG:-$HOME/.docker}/config.json" 2>/dev/null || true`: `{}`,
+			"docker-credential-pass list": `{}`,
+		},
+		backendDefaultExitCode: 1,
+		backendDefaultStderr:   "credentials not found in native keychain",
+		dockerResult:           &providers.CommandResult{ExitCode: 0},
+	}
+	manager := NewManager(fakeResolver{provider: provider}, nil)
+
+	err := manager.Login(context.Background(), models.RegistryLoginRequest{
+		Registry: registryHost,
+		Username: "ada",
+		Secret:   "new-token",
+	})
+	if !apperror.IsCode(err, apperror.RegistryAuth) {
+		t.Fatalf("Login() error = %v, want registry auth", err)
+	}
+	if len(provider.dockerCalls) != 0 {
+		t.Fatalf("rollback destroyed credentials through docker logout: %#v", provider.dockerCalls)
+	}
+}
+
+func TestLoginRestoresPreexistingHelperCredentialAfterVerificationFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer server.Close()
+	registryHost := strings.TrimPrefix(server.URL, "http://")
+	provider := &fakeRegistryProvider{
+		backendResults: map[string]string{
+			`sh -lc cat "${DOCKER_CONFIG:-$HOME/.docker}/config.json" 2>/dev/null || true`: `{"credHelpers":{"` + registryHost + `":"pass"}}`,
+			"docker-credential-pass list": `{}`,
+			"docker-credential-pass get":  `{"Username":"old-user","Secret":"old-secret"}`,
+		},
+		dockerResult: &providers.CommandResult{ExitCode: 0},
+	}
+	manager := NewManager(fakeResolver{provider: provider}, nil)
+	manager.Settings = testRegistrySettings(t, registryCredentialModeDockerHelper)
+
+	err := manager.Login(context.Background(), models.RegistryLoginRequest{
+		Registry: registryHost,
+		Username: "new-user",
+		Secret:   "new-secret",
+	})
+	if !apperror.IsCode(err, apperror.RegistryAuth) {
+		t.Fatalf("Login() error = %v, want registry auth", err)
+	}
+	storeInput := ""
+	for i, call := range provider.backendCalls {
+		if strings.Contains(call, "docker-credential-pass store") {
+			storeInput = provider.backendInputs[i]
+		}
+	}
+	if !strings.Contains(storeInput, `"Username":"old-user"`) || !strings.Contains(storeInput, `"Secret":"old-secret"`) {
+		t.Fatalf("restored helper payload = %q", storeInput)
+	}
+	if len(provider.dockerCalls) != 0 {
+		t.Fatalf("rollback used destructive docker logout: %#v", provider.dockerCalls)
+	}
+}
+
+func TestRegistryTransactionLockSerializesDifferentManagersAndRegistries(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	provider := &fakeRegistryProvider{
+		backendResults: map[string]string{
+			`sh -lc cat "${DOCKER_CONFIG:-$HOME/.docker}/config.json" 2>/dev/null || true`: `{}`,
+			"docker-credential-pass list": `{}`,
+		},
+		backendDefaultExitCode: 1,
+		backendDefaultStderr:   "credentials not found in native keychain",
+		dockerResult:           &providers.CommandResult{ExitCode: 1, Stderr: "denied"},
+		dockerInputStarted:     started,
+		dockerInputRelease:     release,
+	}
+	first := NewManager(fakeResolver{provider: provider}, nil)
+	second := NewManager(fakeResolver{provider: provider}, nil)
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- first.Login(context.Background(), models.RegistryLoginRequest{Registry: "first.example.test", Username: "ada", Secret: "one"})
+	}()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first login did not reach Docker")
+	}
+	secondErr := second.Login(context.Background(), models.RegistryLoginRequest{Registry: "second.example.test", Username: "grace", Secret: "two"})
+	if !apperror.IsCode(secondErr, apperror.Conflict) {
+		t.Fatalf("concurrent login error = %v, want config-wide conflict", secondErr)
+	}
+	close(release)
+	if err := <-firstDone; !apperror.IsCode(err, apperror.RegistryAuth) {
+		t.Fatalf("first login error = %v, want registry auth", err)
+	}
+}
+
+func TestLoginDefaultsToFailClosedCredentialHelperModeWhenSettingsUnavailable(t *testing.T) {
 	var registryHost string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v2/" {
@@ -353,21 +569,17 @@ func TestLoginFallsBackToDockerConfigWhenCredentialHelperUnavailable(t *testing.
 		dockerResult:           &providers.CommandResult{ExitCode: 0},
 	}
 	manager := NewManager(fakeResolver{provider: provider}, nil)
-	manager.Settings = testRegistrySettings(t, registryCredentialModeDockerHelper)
 
 	err := manager.Login(context.Background(), models.RegistryLoginRequest{
 		Registry: registryHost,
 		Username: "ada",
 		Secret:   "token",
 	})
-	if err != nil {
-		t.Fatalf("Login() error = %v", err)
+	if !apperror.IsCode(err, apperror.ProviderNotReady) {
+		t.Fatalf("Login() error = %v, want provider not ready", err)
 	}
-	if provider.dockerInput != "token\n" {
-		t.Fatalf("docker input = %q", provider.dockerInput)
-	}
-	if want := []string{"login", registryHost, "-u", "ada", "--password-stdin"}; !reflect.DeepEqual(provider.dockerArgs, want) {
-		t.Fatalf("docker args = %#v, want %#v", provider.dockerArgs, want)
+	if provider.dockerInput != "" || len(provider.dockerArgs) != 0 {
+		t.Fatalf("docker login ran despite missing helper: input=%q args=%#v", provider.dockerInput, provider.dockerArgs)
 	}
 	if provider.backendConfig != "" {
 		t.Fatalf("backend config was rewritten despite missing helper: %s", provider.backendConfig)
@@ -380,9 +592,185 @@ func TestBackendDockerConfigCommandsEscapeWSLDollars(t *testing.T) {
 	if !strings.Contains(readCommand, `\${DOCKER_CONFIG:-\$HOME/.docker}`) {
 		t.Fatalf("WSL read command does not escape Docker config variables: %q", readCommand)
 	}
+	if strings.Contains(readCommand, "|| true") || !strings.Contains(readCommand, "set -eu") {
+		t.Fatalf("WSL config read can hide permission or I/O errors: %q", readCommand)
+	}
 	writeCommand := strings.Join(backendWriteConfigCommand(provider), " ")
 	if !strings.Contains(writeCommand, `\${DOCKER_CONFIG:-\$HOME/.docker}`) || !strings.Contains(writeCommand, `"\$cfg/config.json"`) {
 		t.Fatalf("WSL write command does not escape Docker config variables: %q", writeCommand)
+	}
+	if !strings.Contains(writeCommand, "mktemp") || !strings.Contains(writeCommand, "mv -f") || !strings.Contains(writeCommand, "chmod 600") {
+		t.Fatalf("WSL write command is not an atomic restrictive replacement: %q", writeCommand)
+	}
+	if !strings.Contains(writeCommand, `sync -f "\$tmp"`) || !strings.Contains(writeCommand, `sync -f "\$cfg"`) || strings.Contains(writeCommand, "sync -f \"\\$tmp\" 2>/dev/null || true") {
+		t.Fatalf("WSL atomic write does not fail closed on supported file/directory sync: %q", writeCommand)
+	}
+	acquireCommand := strings.Join(backendConfigLockCommand(provider, true), " ")
+	releaseCommand := strings.Join(backendConfigLockCommand(provider, false), " ")
+	if !strings.Contains(acquireCommand, `.cairn-config.lock`) || !strings.Contains(acquireCommand, "mkdir") || !strings.Contains(releaseCommand, "owner") {
+		t.Fatalf("WSL Docker config lock commands are incomplete: acquire=%q release=%q", acquireCommand, releaseCommand)
+	}
+	if dockerConfigLockStaleMinutes <= 120 || !strings.Contains(acquireCommand, `-mmin +180`) {
+		t.Fatalf("WSL config lock can steal a supported two-hour Docker transaction: %q", acquireCommand)
+	}
+	if !strings.Contains(acquireCommand, `if ! printf`) || !strings.Contains(acquireCommand, `rmdir "\$lock"; exit 74`) {
+		t.Fatalf("WSL config lock can orphan a newly-created lock after owner write failure: %q", acquireCommand)
+	}
+}
+
+func TestWindowsDockerConfigCommandsUseDurableUTF8IO(t *testing.T) {
+	provider := &fakeRegistryProvider{providerPlatform: providers.PlatformWindows}
+	readArgs := backendConfigCommand(provider)
+	if len(readArgs) == 0 || readArgs[0] != "powershell.exe" {
+		t.Skip("Windows PowerShell command shape is only selected by a Windows build")
+	}
+	readCommand := strings.Join(readArgs, " ")
+	if !strings.Contains(readCommand, `[Console]::InputEncoding=$utf8`) || !strings.Contains(readCommand, `[Console]::OutputEncoding=$utf8`) || !strings.Contains(readCommand, "ReadAllText") {
+		t.Fatalf("Windows read command does not preserve UTF-8 JSON: %q", readCommand)
+	}
+
+	writeCommand := strings.Join(backendWriteConfigCommand(provider), " ")
+	for _, required := range []string{`[Console]::InputEncoding=$utf8`, `[Console]::OutputEncoding=$utf8`, `[System.IO.File]::Open`, `$stream.Flush($true)`, `[System.IO.File]::Replace($tmp,$p,$null,$false)`} {
+		if !strings.Contains(writeCommand, required) {
+			t.Fatalf("Windows write command is missing %q: %q", required, writeCommand)
+		}
+	}
+	if strings.Contains(writeCommand, "WriteAllText") || strings.Contains(writeCommand, `Replace($tmp,$p,$null,$true)`) {
+		t.Fatalf("Windows write command can skip durable flush or metadata errors: %q", writeCommand)
+	}
+
+	lockCommand := strings.Join(backendConfigLockCommand(provider, true), " ")
+	for _, required := range []string{`AddMinutes(-180)`, `[IO.File]::WriteAllText`, `ReparsePoint`, `Remove-Item -LiteralPath $lock -Force`, `exit 74`} {
+		if !strings.Contains(lockCommand, required) {
+			t.Fatalf("Windows config lock command is missing %q: %q", required, lockCommand)
+		}
+	}
+}
+
+func TestDockerConfigCommandsFailClosedOnNilResult(t *testing.T) {
+	t.Parallel()
+	provider := &fakeRegistryProvider{backendNilResult: true}
+	manager := NewManager(fakeResolver{provider: provider}, nil)
+	if _, err := manager.readDockerConfigRaw(context.Background(), provider); !apperror.IsCode(err, apperror.ProviderNotReady) {
+		t.Fatalf("readDockerConfigRaw() error = %v, want provider not ready", err)
+	}
+	if err := manager.writeDockerConfigRaw(context.Background(), provider, []byte(`{"label":"Привіт"}`)); !apperror.IsCode(err, apperror.ProviderNotReady) {
+		t.Fatalf("writeDockerConfigRaw() error = %v, want provider not ready", err)
+	}
+}
+
+func TestCredentialHelperConfigAbortsOnConcurrentDockerConfigChange(t *testing.T) {
+	t.Parallel()
+	provider := &fakeRegistryProvider{
+		backendReadSequence: []string{`{}`, `{"experimental":true}`},
+		backendResults: map[string]string{
+			"docker-credential-pass list": `{}`,
+		},
+	}
+	manager := NewManager(fakeResolver{provider: provider}, nil)
+	err := manager.ensureCredentialHelper(context.Background(), provider, "ghcr.io", false)
+	if !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("ensureCredentialHelper() error = %v, want conflict", err)
+	}
+	if provider.backendConfig != "" {
+		t.Fatalf("concurrent Docker config was overwritten: %s", provider.backendConfig)
+	}
+}
+
+func TestCredentialHelperConfigHandlesNullSectionsAndRejectsWrongTypes(t *testing.T) {
+	t.Parallel()
+	rawConfig := map[string]json.RawMessage{"credHelpers": json.RawMessage("null")}
+	changed, err := setCredentialHelper(rawConfig, "ghcr.io", "pass")
+	if err != nil || !changed {
+		t.Fatalf("setCredentialHelper(null) = %v, %v", changed, err)
+	}
+	var helpers map[string]string
+	if err := json.Unmarshal(rawConfig["credHelpers"], &helpers); err != nil || helpers["ghcr.io"] != "pass" {
+		t.Fatalf("credHelpers = %s, %v", rawConfig["credHelpers"], err)
+	}
+
+	for _, malformed := range []string{`[]`, `"invalid"`, `{"ghcr.io":42}`} {
+		config := map[string]json.RawMessage{"credHelpers": json.RawMessage(malformed)}
+		if _, err := setCredentialHelper(config, "ghcr.io", "pass"); !apperror.IsCode(err, apperror.Internal) {
+			t.Fatalf("setCredentialHelper(%s) error = %v, want internal", malformed, err)
+		}
+	}
+}
+
+func TestCredentialHelperConfigAddsDockerExactKeyForNormalizedAlias(t *testing.T) {
+	t.Parallel()
+	provider := &fakeRegistryProvider{
+		backendConfig: `{"credHelpers":{"https://ghcr.io":"pass"}}`,
+		backendResults: map[string]string{
+			"docker-credential-pass list": `{}`,
+		},
+	}
+	manager := NewManager(fakeResolver{provider: provider}, nil)
+	if err := manager.ensureCredentialHelper(context.Background(), provider, "ghcr.io", false); err != nil {
+		t.Fatalf("ensureCredentialHelper() error = %v", err)
+	}
+	var config dockerConfig
+	if err := json.Unmarshal([]byte(provider.backendConfig), &config); err != nil {
+		t.Fatalf("written config is invalid: %v\n%s", err, provider.backendConfig)
+	}
+	if got := config.CredHelpers["ghcr.io"]; got != "pass" {
+		t.Fatalf("Docker exact helper key = %q, config=%s", got, provider.backendConfig)
+	}
+	if got := config.CredHelpers["https://ghcr.io"]; got != "pass" {
+		t.Fatalf("pre-existing alias was not preserved: %q, config=%s", got, provider.backendConfig)
+	}
+}
+
+func TestCredentialHelperConfigRejectsConflictingNormalizedAliasesWithoutExactKey(t *testing.T) {
+	t.Parallel()
+	original := `{"credHelpers":{"https://ghcr.io":"pass","ghcr.io/":"secretservice"}}`
+	provider := &fakeRegistryProvider{backendConfig: original}
+	manager := NewManager(fakeResolver{provider: provider}, nil)
+	if err := manager.ensureCredentialHelper(context.Background(), provider, "ghcr.io", false); !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("ensureCredentialHelper() error = %v, want conflict", err)
+	}
+	if provider.backendConfig != original {
+		t.Fatalf("conflicting config was overwritten: %s", provider.backendConfig)
+	}
+}
+
+func TestHelperForRegistryUsesDockerExactKeyDeterministically(t *testing.T) {
+	t.Parallel()
+	config := dockerConfig{CredHelpers: map[string]string{
+		"ghcr.io":         "wincred",
+		"https://ghcr.io": "pass",
+		"ghcr.io/":        "secretservice",
+	}}
+	for i := 0; i < 100; i++ {
+		if got := helperForRegistry(config, "ghcr.io"); got != "wincred" {
+			t.Fatalf("helperForRegistry() = %q, want exact helper", got)
+		}
+	}
+}
+
+func TestRegistryLoginConfigRestorationHandlesNullCurrentSections(t *testing.T) {
+	t.Parallel()
+	registryHost := "registry.example.test"
+	oldAuth := json.RawMessage(`{"auth":"b2xkOnNlY3JldA=="}`)
+	provider := &fakeRegistryProvider{backendConfig: `{"auths":null,"credHelpers":null}`}
+	manager := NewManager(fakeResolver{provider: provider}, nil)
+	tx := &registryLoginTransaction{
+		provider:              provider,
+		registry:              registryHost,
+		originalAuthEntries:   map[string]json.RawMessage{registryHost: oldAuth},
+		originalHelperEntries: map[string]string{registryHost: "pass"},
+		hadAuthsSection:       true,
+		hadCredHelpersSection: true,
+	}
+	if err := manager.restoreRegistryLoginConfigWithContext(context.Background(), tx); err != nil {
+		t.Fatalf("restoreRegistryLoginConfigWithContext() error = %v", err)
+	}
+	var restored dockerConfig
+	if err := json.Unmarshal([]byte(provider.backendConfig), &restored); err != nil {
+		t.Fatalf("restored config is invalid: %v\n%s", err, provider.backendConfig)
+	}
+	if _, _, ok := authEntryForRegistry(restored, registryHost); !ok || helperForRegistry(restored, registryHost) != "pass" {
+		t.Fatalf("restored config = %s", provider.backendConfig)
 	}
 }
 
@@ -535,12 +923,203 @@ func TestAuthDoesNotTreatAnonymousBearerTokenAsLoggedIn(t *testing.T) {
 func TestBearerTokenRealmRejectsPlainHTTPRemote(t *testing.T) {
 	t.Parallel()
 	manager := NewManager(fakeResolver{provider: &fakeRegistryProvider{}}, nil)
-	_, err := manager.fetchBearerToken(context.Background(), authChallenge{
+	challengedURL, parseErr := url.Parse("https://registry.example/v2/")
+	if parseErr != nil {
+		t.Fatal(parseErr)
+	}
+	_, err := manager.fetchBearerToken(context.Background(), "registry.example", challengedURL, authChallenge{
 		Scheme: "Bearer",
 		Params: map[string]string{"realm": "http://registry-token.example/token"},
 	}, "repository:library/nginx:pull", credential{Username: "ada", Password: "secret"})
 	if !apperror.IsCode(err, apperror.RegistryAuth) {
 		t.Fatalf("fetchBearerToken() error = %v, want registry auth", err)
+	}
+}
+
+func TestDockerHubBearerTokenRealmIsExplicitlyTrusted(t *testing.T) {
+	t.Parallel()
+	manager := NewManager(fakeResolver{provider: &fakeRegistryProvider{}}, nil)
+	challengedURL, _ := url.Parse("https://registry-1.docker.io/v2/")
+	tokenURL, _ := url.Parse("https://auth.docker.io/token")
+	got, err := manager.trustedTokenOrigin(DefaultRegistry, challengedURL, tokenURL)
+	if err != nil {
+		t.Fatalf("trustedTokenOrigin() error = %v", err)
+	}
+	if got != "https://auth.docker.io:443" {
+		t.Fatalf("trusted token origin = %q", got)
+	}
+}
+
+func TestBearerTokenRealmRejectsUntrustedCrossOriginWithoutSendingCredentials(t *testing.T) {
+	attackerRequested := make(chan struct{}, 1)
+	attacker := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case attackerRequested <- struct{}{}:
+		default:
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"token": "stolen"})
+	}))
+	defer attacker.Close()
+
+	registryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="`+attacker.URL+`/token"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer registryServer.Close()
+	registryHost := strings.TrimPrefix(registryServer.URL, "http://")
+	auth := base64.StdEncoding.EncodeToString([]byte("ada:secret"))
+	manager := NewManager(fakeResolver{provider: &fakeRegistryProvider{
+		backendStdout: `{"auths":{"` + registryHost + `":{"auth":"` + auth + `"}}}`,
+	}}, nil)
+
+	_, err := manager.ResolveDigest(context.Background(), registryHost+"/team/app:1", ResolveOptions{BypassCache: true})
+	if !apperror.IsCode(err, apperror.RegistryAuth) {
+		t.Fatalf("ResolveDigest() error = %v, want registry auth", err)
+	}
+	select {
+	case <-attackerRequested:
+		t.Fatal("untrusted token realm received a request")
+	default:
+	}
+}
+
+func TestBearerTokenRedirectCannotLeaveTrustedOrigin(t *testing.T) {
+	attackerRequested := make(chan struct{}, 1)
+	attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case attackerRequested <- struct{}{}:
+		default:
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"token": "stolen"})
+	}))
+	defer attacker.Close()
+
+	var registryURL string
+	registryServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/token" {
+			http.Redirect(w, r, attacker.URL+"/steal", http.StatusTemporaryRedirect)
+			return
+		}
+		w.Header().Set("WWW-Authenticate", `Bearer realm="`+registryURL+`/token"`)
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer registryServer.Close()
+	registryURL = registryServer.URL
+	registryHost := strings.TrimPrefix(registryURL, "http://")
+	auth := base64.StdEncoding.EncodeToString([]byte("ada:secret"))
+	manager := NewManager(fakeResolver{provider: &fakeRegistryProvider{
+		backendStdout: `{"auths":{"` + registryHost + `":{"auth":"` + auth + `"}}}`,
+	}}, nil)
+
+	_, err := manager.ResolveDigest(context.Background(), registryHost+"/team/app:1", ResolveOptions{BypassCache: true})
+	if !apperror.IsCode(err, apperror.RegistryAuth) {
+		t.Fatalf("ResolveDigest() error = %v, want registry auth", err)
+	}
+	select {
+	case <-attackerRequested:
+		t.Fatal("redirect target received a credential-bearing request")
+	default:
+	}
+}
+
+func TestBearerTokenResponseBodyAndTokenAreBounded(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name string
+		body string
+	}{
+		{name: "response body", body: `{"token":"` + strings.Repeat("x", maxTokenResponseBytes) + `"}`},
+		{name: "token field", body: `{"token":"` + strings.Repeat("x", maxRegistryTokenBytes+1) + `"}`},
+	} {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(tt.body))
+			}))
+			defer server.Close()
+			registryHost := strings.TrimPrefix(server.URL, "http://")
+			challengedURL, _ := url.Parse(server.URL + "/v2/")
+			manager := NewManager(nil, nil)
+			_, err := manager.fetchBearerToken(context.Background(), registryHost, challengedURL, authChallenge{
+				Scheme: "Bearer",
+				Params: map[string]string{"realm": server.URL + "/token"},
+			}, "repository:team/app:pull", credential{Username: "ada", Password: "secret"})
+			if !apperror.IsCode(err, apperror.RegistryUnreachable) {
+				t.Fatalf("fetchBearerToken() error = %v, want registry unreachable", err)
+			}
+		})
+	}
+}
+
+func TestDecodeBoundedJSONRejectsOversizeAndTrailingValues(t *testing.T) {
+	t.Parallel()
+	var payload map[string]any
+	err := decodeBoundedJSON(strings.NewReader(strings.Repeat("x", 17)), -1, 16, &payload)
+	var tooLarge responseTooLargeError
+	if !errors.As(err, &tooLarge) {
+		t.Fatalf("oversize error = %v, want responseTooLargeError", err)
+	}
+	err = decodeBoundedJSON(strings.NewReader(`{"token":"ok"} {"second":true}`), -1, 1024, &payload)
+	if err == nil || !strings.Contains(err.Error(), "multiple JSON values") {
+		t.Fatalf("trailing JSON error = %v", err)
+	}
+}
+
+func TestDecodePlatformManifestRejectsEntryCountDuringStreaming(t *testing.T) {
+	t.Parallel()
+	body := `{"manifests":[` + strings.Repeat("null,", maxManifestIndexEntries) + `null]}`
+	_, err := decodePlatformManifest(strings.NewReader(body), int64(len(body)), Platform{OS: "linux", Architecture: "amd64"})
+	if err == nil || !strings.Contains(err.Error(), "more than") {
+		t.Fatalf("decodePlatformManifest() error = %v, want entry limit", err)
+	}
+}
+
+func TestRegistryHeadMetadataIsBoundedAndValidated(t *testing.T) {
+	t.Parallel()
+	validDigest := "sha256:" + strings.Repeat("a", 64)
+	if got, err := validatedRegistryDigest(validDigest); err != nil || got != validDigest {
+		t.Fatalf("valid digest = %q, %v", got, err)
+	}
+	for _, value := range []string{"not-a-digest", "sha256:short", strings.Repeat("a", maxRegistryDigestHeaderBytes+1)} {
+		if _, err := validatedRegistryDigest(value); !apperror.IsCode(err, apperror.RegistryUnreachable) {
+			t.Fatalf("validatedRegistryDigest(%q) error = %v", value, err)
+		}
+	}
+	if got, err := validatedManifestMediaType("application/vnd.oci.image.index.v1+json; charset=utf-8"); err != nil || got != "application/vnd.oci.image.index.v1+json" {
+		t.Fatalf("valid media type = %q, %v", got, err)
+	}
+	for _, value := range []string{"not a media type", strings.Repeat("a", maxRegistryContentTypeHeaderBytes+1)} {
+		if _, err := validatedManifestMediaType(value); !apperror.IsCode(err, apperror.RegistryUnreachable) {
+			t.Fatalf("validatedManifestMediaType(%q) error = %v", value, err)
+		}
+	}
+}
+
+func TestRegistryStateMapsRemainBoundedAndLimitersAreReleased(t *testing.T) {
+	t.Parallel()
+	manager := NewManager(nil, nil)
+	manager.cacheEntryLimit = 4
+	manager.circuitEntryLimit = 3
+	now := time.Now().UTC()
+	manager.Now = func() time.Time { return now }
+	for i := 0; i < 20; i++ {
+		key := string(rune('a'+i)) + "/image:1"
+		manager.storeCache(key, DigestResult{}, now.Add(time.Duration(i+1)*time.Minute))
+		host := string(rune('a'+i)) + ".example.test"
+		manager.recordRegistryFailure(host, apperror.New(apperror.RegistryUnreachable, "down"), now.Add(time.Duration(i)*time.Second), 0)
+		if err := manager.withLimits(context.Background(), host, func() error { return nil }); err != nil {
+			t.Fatalf("withLimits(%q) error = %v", host, err)
+		}
+	}
+	if len(manager.cache) != manager.cacheEntryLimit {
+		t.Fatalf("cache entries = %d, want %d", len(manager.cache), manager.cacheEntryLimit)
+	}
+	if len(manager.circuit) != manager.circuitEntryLimit {
+		t.Fatalf("circuit entries = %d, want %d", len(manager.circuit), manager.circuitEntryLimit)
+	}
+	if len(manager.registryGate) != 0 {
+		t.Fatalf("idle registry limiters retained = %d", len(manager.registryGate))
 	}
 }
 
@@ -678,7 +1257,7 @@ func testRegistrySettings(t *testing.T, mode string) *store.SettingsRepository {
 
 func isBackendConfigReadForTest(command string) bool {
 	return strings.Contains(command, "config.json") &&
-		(strings.Contains(command, "cat \"${DOCKER_CONFIG") || strings.Contains(command, "Get-Content"))
+		(strings.Contains(command, "cat \"") || strings.Contains(command, "Get-Content") || strings.Contains(command, "ReadAllText"))
 }
 
 func isBackendConfigWriteForTest(command string) bool {
@@ -687,8 +1266,11 @@ func isBackendConfigWriteForTest(command string) bool {
 }
 
 type fakeRegistryProvider struct {
+	mu                     sync.Mutex
 	backendStdout          string
 	backendResults         map[string]string
+	backendReadSequence    []string
+	backendReadIndex       int
 	backendDefaultExitCode int
 	backendDefaultStderr   string
 	backendConfig          string
@@ -698,7 +1280,13 @@ type fakeRegistryProvider struct {
 	backendCalls           []string
 	dockerInput            string
 	dockerArgs             []string
+	dockerCalls            [][]string
 	dockerResult           *providers.CommandResult
+	dockerInputStarted     chan struct{}
+	dockerInputRelease     chan struct{}
+	dockerStartOnce        sync.Once
+	backendLocks           map[string]string
+	backendNilResult       bool
 	providerType           string
 	providerPlatform       string
 }
@@ -735,27 +1323,66 @@ func (p *fakeRegistryProvider) DockerHost(context.Context) (string, error) {
 func (p *fakeRegistryProvider) DockerContext(context.Context) (string, error) {
 	return "", nil
 }
-func (p *fakeRegistryProvider) RunDocker(context.Context, ...string) (*providers.CommandResult, error) {
+func (p *fakeRegistryProvider) RunDocker(_ context.Context, args ...string) (*providers.CommandResult, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.dockerCalls = append(p.dockerCalls, append([]string(nil), args...))
 	if p.dockerResult != nil {
 		return p.dockerResult, nil
 	}
 	return &providers.CommandResult{ExitCode: 0}, nil
 }
 func (p *fakeRegistryProvider) RunDockerWithInput(_ context.Context, input string, args ...string) (*providers.CommandResult, error) {
+	p.mu.Lock()
 	p.dockerInput = input
 	p.dockerArgs = append([]string(nil), args...)
-	if p.dockerResult != nil {
-		p.dockerResult.Command = append([]string{"docker"}, args...)
-		return p.dockerResult, nil
+	started := p.dockerInputStarted
+	release := p.dockerInputRelease
+	result := p.dockerResult
+	if started != nil {
+		p.dockerStartOnce.Do(func() { close(started) })
+	}
+	p.mu.Unlock()
+	if release != nil {
+		<-release
+	}
+	if result != nil {
+		result.Command = append([]string{"docker"}, args...)
+		return result, nil
 	}
 	return &providers.CommandResult{Command: append([]string{"docker"}, args...), ExitCode: 0}, nil
 }
 func (p *fakeRegistryProvider) RunBackendCommand(_ context.Context, input string, args ...string) (*providers.CommandResult, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	p.backendInput = input
 	p.backendInputs = append(p.backendInputs, input)
 	p.backendArgs = append([]string(nil), args...)
 	joined := strings.Join(args, " ")
 	p.backendCalls = append(p.backendCalls, joined)
+	if lockName := backendLockNameForTest(joined); lockName != "" {
+		if p.backendLocks == nil {
+			p.backendLocks = map[string]string{}
+		}
+		acquire := strings.Contains(joined, "while ! mkdir") || strings.Contains(joined, "for ($i=0")
+		if acquire {
+			if _, exists := p.backendLocks[lockName]; exists {
+				return &providers.CommandResult{Command: args, ExitCode: 73}, nil
+			}
+			p.backendLocks[lockName] = input
+		} else if p.backendLocks[lockName] == input {
+			delete(p.backendLocks, lockName)
+		}
+		return &providers.CommandResult{Command: args, ExitCode: 0}, nil
+	}
+	if p.backendNilResult {
+		return nil, nil
+	}
+	if isBackendConfigReadForTest(joined) && p.backendReadIndex < len(p.backendReadSequence) {
+		stdout := p.backendReadSequence[p.backendReadIndex]
+		p.backendReadIndex++
+		return &providers.CommandResult{Command: args, Stdout: stdout, ExitCode: 0}, nil
+	}
 	if isBackendConfigWriteForTest(joined) {
 		p.backendConfig = input
 		return &providers.CommandResult{Command: args, ExitCode: 0}, nil
@@ -763,12 +1390,31 @@ func (p *fakeRegistryProvider) RunBackendCommand(_ context.Context, input string
 	if isBackendConfigReadForTest(joined) && p.backendConfig != "" {
 		return &providers.CommandResult{Command: args, Stdout: p.backendConfig, ExitCode: 0}, nil
 	}
+	if isBackendConfigReadForTest(joined) {
+		for configuredCommand, stdout := range p.backendResults {
+			if isBackendConfigReadForTest(configuredCommand) {
+				return &providers.CommandResult{Command: args, Stdout: stdout, ExitCode: 0}, nil
+			}
+		}
+	}
 	if p.backendResults != nil {
 		if stdout, ok := p.backendResults[joined]; ok {
 			return &providers.CommandResult{Command: args, Stdout: stdout, ExitCode: 0}, nil
 		}
 	}
 	return &providers.CommandResult{Command: args, Stdout: p.backendStdout, Stderr: p.backendDefaultStderr, ExitCode: p.backendDefaultExitCode}, nil
+}
+
+func backendLockNameForTest(command string) string {
+	start := strings.Index(command, ".cairn-")
+	if start < 0 {
+		return ""
+	}
+	end := strings.Index(command[start:], ".lock")
+	if end < 0 {
+		return ""
+	}
+	return command[start : start+end+len(".lock")]
 }
 func (p *fakeRegistryProvider) RunCompose(context.Context, string, ...string) (*providers.CommandResult, error) {
 	return nil, nil

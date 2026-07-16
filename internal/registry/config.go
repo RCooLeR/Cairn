@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf16"
@@ -13,7 +14,44 @@ import (
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
+	"github.com/google/uuid"
 )
+
+type dockerConfigLockContextKey struct{}
+
+// Built-in providers cap Docker operations at two hours. Recovery must not
+// classify a supported live login as stale, including verification and rollback.
+const dockerConfigLockStaleMinutes = 180
+
+func withDockerConfigLockHeld(ctx context.Context) context.Context {
+	return context.WithValue(ctx, dockerConfigLockContextKey{}, true)
+}
+
+func dockerConfigLockHeld(ctx context.Context) bool {
+	held, _ := ctx.Value(dockerConfigLockContextKey{}).(bool)
+	return held
+}
+
+// lockDockerConfigState serializes Cairn Docker config access in one lock order:
+// the backend-wide lock first, followed by the in-process mutex. Login and logout
+// transactions already hold the backend lock and mark their contexts, so nested
+// config operations only take the in-process mutex.
+func (m *Manager) lockDockerConfigState(ctx context.Context, provider providers.PlatformProvider) (func(), error) {
+	if dockerConfigLockHeld(ctx) {
+		m.configMu.Lock()
+		return m.configMu.Unlock, nil
+	}
+
+	lockToken, err := acquireDockerConfigLock(ctx, provider)
+	if err != nil {
+		return nil, err
+	}
+	m.configMu.Lock()
+	return func() {
+		m.configMu.Unlock()
+		releaseDockerConfigLock(provider, lockToken)
+	}, nil
+}
 
 func (m *Manager) ListRegistryAccounts(ctx context.Context) ([]models.RegistryAccount, error) {
 	provider, err := m.provider(ctx)
@@ -56,20 +94,20 @@ func (m *Manager) readDockerConfigRaw(ctx context.Context, provider providers.Pl
 
 	command := backendConfigCommand(provider)
 	result, err := runner.RunBackendCommand(ctx, "", command...)
-	if err != nil && result == nil {
+	if err != nil {
 		return "", apperror.Wrap(apperror.ProviderNotReady, "Read Docker config failed", err)
 	}
-	if result != nil && result.ExitCode != 0 {
+	if result == nil {
+		return "", apperror.New(apperror.ProviderNotReady, "Read Docker config failed", apperror.WithDetail("Backend command returned no result."))
+	}
+	if result.ExitCode != 0 {
 		return "", apperror.New(
 			apperror.ProviderNotReady,
 			"Read Docker config failed",
 			apperror.WithDetail(strings.TrimSpace(result.Stderr)),
 		)
 	}
-	raw := ""
-	if result != nil {
-		raw = normalizeDockerConfigJSON(result.Stdout)
-	}
+	raw := normalizeDockerConfigJSON(result.Stdout)
 	if raw == "" {
 		return "", nil
 	}
@@ -93,10 +131,13 @@ func (m *Manager) writeDockerConfigRaw(ctx context.Context, provider providers.P
 	}
 	command := backendWriteConfigCommand(provider)
 	result, err := runner.RunBackendCommand(ctx, string(raw), command...)
-	if err != nil && result == nil {
+	if err != nil {
 		return apperror.Wrap(apperror.ProviderNotReady, "Write Docker config failed", err)
 	}
-	if result != nil && result.ExitCode != 0 {
+	if result == nil {
+		return apperror.New(apperror.ProviderNotReady, "Write Docker config failed", apperror.WithDetail("Backend command returned no result."))
+	}
+	if result.ExitCode != 0 {
 		detail := strings.TrimSpace(result.Stderr)
 		if detail == "" {
 			detail = strings.TrimSpace(result.Stdout)
@@ -104,6 +145,45 @@ func (m *Manager) writeDockerConfigRaw(ctx context.Context, provider providers.P
 		return apperror.New(apperror.ProviderNotReady, "Write Docker config failed", apperror.WithDetail(detail))
 	}
 	return nil
+}
+
+func acquireDockerConfigLock(ctx context.Context, provider providers.PlatformProvider) (string, error) {
+	return acquireBackendLock(ctx, provider, ".cairn-config.lock", "Docker credential configuration is busy")
+}
+
+func acquireBackendLock(ctx context.Context, provider providers.PlatformProvider, name string, busyMessage string) (string, error) {
+	runner, ok := provider.(BackendCommandRunner)
+	if !ok {
+		return "", apperror.New(apperror.ProviderNotReady, "Provider cannot lock backend Docker configuration")
+	}
+	token := uuid.NewString()
+	command := backendNamedLockCommand(provider, true, name)
+	result, err := runner.RunBackendCommand(ctx, token, command...)
+	if err != nil {
+		return "", apperror.Wrap(apperror.ProviderNotReady, "Lock Docker config failed", err)
+	}
+	if result == nil || result.ExitCode != 0 {
+		return "", apperror.New(
+			apperror.Conflict,
+			busyMessage,
+			apperror.WithRepairHints("Close other Cairn registry login operations and retry."),
+		)
+	}
+	return token, nil
+}
+
+func releaseDockerConfigLock(provider providers.PlatformProvider, token string) {
+	releaseBackendLock(provider, token, ".cairn-config.lock")
+}
+
+func releaseBackendLock(provider providers.PlatformProvider, token string, name string) {
+	runner, ok := provider.(BackendCommandRunner)
+	if !ok || token == "" {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _ = runner.RunBackendCommand(ctx, token, backendNamedLockCommand(provider, false, name)...)
 }
 
 func normalizeDockerConfigJSON(raw string) string {
@@ -147,8 +227,9 @@ func decodeUTF16LE(bytes []byte) string {
 }
 
 func backendConfigCommand(provider providers.PlatformProvider) []string {
+	posixCommand := `set -eu; cfg="${DOCKER_CONFIG:-$HOME/.docker}"; p="$cfg/config.json"; if [ -e "$p" ]; then cat "$p"; fi`
 	if provider.Type() == providers.TypeWindowsWSL {
-		return []string{"sh", "-lc", escapeWSLCommandDollarsForRegistry(`cat "${DOCKER_CONFIG:-$HOME/.docker}/config.json" 2>/dev/null || true`)}
+		return []string{"sh", "-lc", escapeWSLCommandDollarsForRegistry(posixCommand)}
 	}
 	if runtime.GOOS == "windows" && provider.Platform() != providers.PlatformLinux {
 		return []string{
@@ -156,15 +237,16 @@ func backendConfigCommand(provider providers.PlatformProvider) []string {
 			"-NoProfile",
 			"-NonInteractive",
 			"-Command",
-			`$cfg=$env:DOCKER_CONFIG; if ([string]::IsNullOrWhiteSpace($cfg)) { $cfg=Join-Path $env:USERPROFILE '.docker' }; $p=Join-Path $cfg 'config.json'; if (Test-Path -LiteralPath $p) { Get-Content -LiteralPath $p -Raw }`,
+			`$ErrorActionPreference='Stop'; $utf8=New-Object System.Text.UTF8Encoding($false); [Console]::InputEncoding=$utf8; [Console]::OutputEncoding=$utf8; $cfg=$env:DOCKER_CONFIG; if ([string]::IsNullOrWhiteSpace($cfg)) { $cfg=Join-Path $env:USERPROFILE '.docker' }; $p=Join-Path $cfg 'config.json'; if (Test-Path -LiteralPath $p) { [Console]::Out.Write([IO.File]::ReadAllText($p)) }`,
 		}
 	}
-	return []string{"sh", "-lc", `cat "${DOCKER_CONFIG:-$HOME/.docker}/config.json" 2>/dev/null || true`}
+	return []string{"sh", "-lc", posixCommand}
 }
 
 func backendWriteConfigCommand(provider providers.PlatformProvider) []string {
+	posixCommand := `set -eu; cfg="${DOCKER_CONFIG:-$HOME/.docker}"; mkdir -p "$cfg"; umask 077; tmp="$(mktemp "$cfg/.config.json.cairn.XXXXXX")"; trap 'rm -f "$tmp"' EXIT HUP INT TERM; cat > "$tmp"; chmod 600 "$tmp"; sync_f=0; if command -v sync >/dev/null 2>&1 && sync --help 2>&1 | grep -q -- '-f'; then sync_f=1; sync -f "$tmp"; fi; mv -f "$tmp" "$cfg/config.json"; if [ "$sync_f" -eq 1 ]; then sync -f "$cfg"; fi; trap - EXIT HUP INT TERM`
 	if provider.Type() == providers.TypeWindowsWSL {
-		return []string{"sh", "-lc", escapeWSLCommandDollarsForRegistry(`cfg="${DOCKER_CONFIG:-$HOME/.docker}"; mkdir -p "$cfg"; umask 077; cat > "$cfg/config.json"`)}
+		return []string{"sh", "-lc", escapeWSLCommandDollarsForRegistry(posixCommand)}
 	}
 	if runtime.GOOS == "windows" && provider.Platform() != providers.PlatformLinux {
 		return []string{
@@ -172,10 +254,41 @@ func backendWriteConfigCommand(provider providers.PlatformProvider) []string {
 			"-NoProfile",
 			"-NonInteractive",
 			"-Command",
-			`$cfg=$env:DOCKER_CONFIG; if ([string]::IsNullOrWhiteSpace($cfg)) { $cfg=Join-Path $env:USERPROFILE '.docker' }; New-Item -ItemType Directory -Force -Path $cfg | Out-Null; $p=Join-Path $cfg 'config.json'; $content=[Console]::In.ReadToEnd(); $enc=New-Object System.Text.UTF8Encoding($false); [System.IO.File]::WriteAllText($p, $content, $enc)`,
+			`$ErrorActionPreference='Stop'; $utf8=New-Object System.Text.UTF8Encoding($false); [Console]::InputEncoding=$utf8; [Console]::OutputEncoding=$utf8; $cfg=$env:DOCKER_CONFIG; if ([string]::IsNullOrWhiteSpace($cfg)) { $cfg=Join-Path $env:USERPROFILE '.docker' }; New-Item -ItemType Directory -Force -Path $cfg | Out-Null; $p=Join-Path $cfg 'config.json'; $tmp=Join-Path $cfg ('.config.json.cairn.'+[Guid]::NewGuid().ToString('N')+'.tmp'); try { $content=[Console]::In.ReadToEnd(); $bytes=$utf8.GetBytes($content); $stream=[System.IO.File]::Open($tmp,[System.IO.FileMode]::CreateNew,[System.IO.FileAccess]::Write,[System.IO.FileShare]::None); try { $stream.Write($bytes,0,$bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }; if (Test-Path -LiteralPath $p) { [System.IO.File]::Replace($tmp,$p,$null,$false) } else { [System.IO.File]::Move($tmp,$p) } } finally { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force } }`,
 		}
 	}
-	return []string{"sh", "-lc", `cfg="${DOCKER_CONFIG:-$HOME/.docker}"; mkdir -p "$cfg"; umask 077; cat > "$cfg/config.json"`}
+	return []string{"sh", "-lc", posixCommand}
+}
+
+func backendConfigLockCommand(provider providers.PlatformProvider, acquire bool) []string {
+	return backendNamedLockCommand(provider, acquire, ".cairn-config.lock")
+}
+
+func backendNamedLockCommand(provider providers.PlatformProvider, acquire bool, name string) []string {
+	staleMinutes := strconv.Itoa(dockerConfigLockStaleMinutes)
+	posixAcquire := `set -eu; cfg="${DOCKER_CONFIG:-$HOME/.docker}"; mkdir -p "$cfg"; lock="$cfg/` + name + `"; token="$(cat)"; i=0; while ! mkdir "$lock" 2>/dev/null; do if [ -d "$lock" ] && [ ! -L "$lock" ] && [ -n "$(find "$lock" -prune -mmin +` + staleMinutes + ` -print 2>/dev/null)" ]; then rm -f "$lock/owner"; rmdir "$lock" 2>/dev/null || true; fi; i=$((i+1)); if [ "$i" -ge 50 ]; then exit 73; fi; sleep 0.1; done; if ! printf '%s' "$token" > "$lock/owner"; then rm -f "$lock/owner"; rmdir "$lock"; exit 74; fi`
+	posixRelease := `set -eu; cfg="${DOCKER_CONFIG:-$HOME/.docker}"; lock="$cfg/` + name + `"; token="$(cat)"; if [ -d "$lock" ] && [ ! -L "$lock" ] && [ -f "$lock/owner" ] && [ "$(cat "$lock/owner")" = "$token" ]; then rm -f "$lock/owner"; rmdir "$lock"; fi`
+	posixCommand := posixRelease
+	if acquire {
+		posixCommand = posixAcquire
+	}
+	if provider.Type() == providers.TypeWindowsWSL {
+		return []string{"sh", "-lc", escapeWSLCommandDollarsForRegistry(posixCommand)}
+	}
+	if runtime.GOOS == "windows" && provider.Platform() != providers.PlatformLinux {
+		operation := `$token=[Console]::In.ReadToEnd(); if (Test-Path -LiteralPath $lock -PathType Container) { $item=Get-Item -LiteralPath $lock -Force; $owner=Join-Path $lock 'owner'; if ((($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) -and (Test-Path -LiteralPath $owner -PathType Leaf) -and ([IO.File]::ReadAllText($owner) -eq $token)) { Remove-Item -LiteralPath $owner -Force; Remove-Item -LiteralPath $lock -Force } }; exit 0`
+		if acquire {
+			operation = `$token=[Console]::In.ReadToEnd(); for ($i=0; $i -lt 50; $i++) { try { New-Item -ItemType Directory -Path $lock -ErrorAction Stop | Out-Null } catch { if (Test-Path -LiteralPath $lock -PathType Container) { $item=Get-Item -LiteralPath $lock -Force; if ((($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) -and ($item.LastWriteTimeUtc -lt [DateTime]::UtcNow.AddMinutes(-` + staleMinutes + `))) { $owner=Join-Path $lock 'owner'; if (Test-Path -LiteralPath $owner -PathType Leaf) { Remove-Item -LiteralPath $owner -Force }; Remove-Item -LiteralPath $lock -Force } }; Start-Sleep -Milliseconds 100; continue }; try { [IO.File]::WriteAllText((Join-Path $lock 'owner'),$token); exit 0 } catch { $owner=Join-Path $lock 'owner'; if (Test-Path -LiteralPath $owner -PathType Leaf) { Remove-Item -LiteralPath $owner -Force }; if (Test-Path -LiteralPath $lock -PathType Container) { Remove-Item -LiteralPath $lock -Force }; exit 74 } }; exit 73`
+		}
+		return []string{
+			"powershell.exe",
+			"-NoProfile",
+			"-NonInteractive",
+			"-Command",
+			`$ErrorActionPreference='Stop'; $cfg=$env:DOCKER_CONFIG; if ([string]::IsNullOrWhiteSpace($cfg)) { $cfg=Join-Path $env:USERPROFILE '.docker' }; New-Item -ItemType Directory -Force -Path $cfg | Out-Null; $lock=Join-Path $cfg '` + name + `'; ` + operation,
+		}
+	}
+	return []string{"sh", "-lc", posixCommand}
 }
 
 func escapeWSLCommandDollarsForRegistry(command string) string {
@@ -238,12 +351,7 @@ func decodeDockerAuth(entry dockerAuth) (string, string, string) {
 }
 
 func helperForRegistry(config dockerConfig, registry string) string {
-	for key, helper := range config.CredHelpers {
-		if normalizeRegistryHost(key) == normalizeRegistryHost(registry) {
-			return strings.TrimSpace(helper)
-		}
-	}
-	return ""
+	return strings.TrimSpace(config.CredHelpers[registryCredentialConfigKey(registry)])
 }
 
 func authEntryForRegistry(config dockerConfig, registry string) (string, dockerAuth, bool) {

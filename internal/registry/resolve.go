@@ -1,10 +1,15 @@
 package registry
 
 import (
+	"bytes"
 	"context"
+	_ "crypto/sha256"
+	_ "crypto/sha512"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -14,9 +19,14 @@ import (
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
+	digest "github.com/opencontainers/go-digest"
 )
 
-const manifestAccept = "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
+const (
+	manifestAccept                    = "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json"
+	maxRegistryDigestHeaderBytes      = 256
+	maxRegistryContentTypeHeaderBytes = 256
+)
 
 func (m *Manager) ResolveDigest(ctx context.Context, image string, opts ResolveOptions) (*DigestResult, error) {
 	ref, err := NormalizeImageRef(image)
@@ -52,7 +62,10 @@ func (m *Manager) ResolveDigest(ctx context.Context, image string, opts ResolveO
 		if err != nil {
 			return err
 		}
-		creds, _ := m.credentialForRegistry(ctx, provider, ref.Registry)
+		creds, err := m.credentialForRegistry(ctx, provider, ref.Registry)
+		if err != nil {
+			return err
+		}
 		resolved, err := m.resolveRemoteDigest(ctx, ref, platform, creds)
 		if err != nil {
 			return err
@@ -91,19 +104,22 @@ func (m *Manager) resolveRemoteDigest(ctx context.Context, ref ImageRef, platfor
 	if err := statusError(resp); err != nil {
 		return nil, err
 	}
-	digest := strings.TrimSpace(resp.Header.Get("Docker-Content-Digest"))
-	mediaType := manifestMediaType(resp.Header.Get("Content-Type"))
-	if digest == "" {
-		return nil, apperror.New(apperror.RegistryUnreachable, "Registry response did not include Docker-Content-Digest")
+	digestValue, err := validatedRegistryDigest(resp.Header.Get("Docker-Content-Digest"))
+	if err != nil {
+		return nil, err
+	}
+	mediaType, err := validatedManifestMediaType(resp.Header.Get("Content-Type"))
+	if err != nil {
+		return nil, err
 	}
 	result := &DigestResult{
 		Ref:            ref,
-		ManifestDigest: digest,
+		ManifestDigest: digestValue,
 		MediaType:      mediaType,
 		CheckedAt:      m.now(),
 	}
 	if isIndexMediaType(mediaType) {
-		result.IndexDigest = digest
+		result.IndexDigest = digestValue
 		manifestDigest, err := m.resolvePlatformManifest(ctx, ref, tag, scope, platform, creds)
 		if err != nil {
 			return nil, err
@@ -130,32 +146,127 @@ func (m *Manager) resolvePlatformManifest(ctx context.Context, ref ImageRef, tag
 	if err := statusError(resp); err != nil {
 		return "", err
 	}
-	var payload struct {
-		Manifests []struct {
-			Digest   string `json:"digest"`
-			Platform struct {
-				OS           string `json:"os"`
-				Architecture string `json:"architecture"`
-				Variant      string `json:"variant"`
-			} `json:"platform"`
-		} `json:"manifests"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+	manifestDigest, err := decodePlatformManifest(resp.Body, resp.ContentLength, platform)
+	if err != nil {
 		return "", apperror.Wrap(apperror.RegistryUnreachable, "Parse registry index failed", err)
 	}
-	for _, manifest := range payload.Manifests {
-		if platformMatches(platform, Platform{
-			OS:           manifest.Platform.OS,
-			Architecture: manifest.Platform.Architecture,
-			Variant:      manifest.Platform.Variant,
-		}) {
-			if strings.TrimSpace(manifest.Digest) == "" {
-				break
-			}
-			return manifest.Digest, nil
-		}
+	if manifestDigest != "" {
+		return manifestDigest, nil
 	}
 	return "", apperror.New(apperror.RegistryUnreachable, "No manifest matched the requested platform", apperror.WithDetail(fmt.Sprintf("%s/%s", platform.OS, platform.Architecture)))
+}
+
+func decodePlatformManifest(body io.Reader, contentLength int64, want Platform) (string, error) {
+	raw, err := readBoundedBody(body, contentLength, maxManifestIndexResponseBytes)
+	if err != nil {
+		return "", err
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	token, err := decoder.Token()
+	if err != nil {
+		return "", err
+	}
+	if delimiter, ok := token.(json.Delim); !ok || delimiter != '{' {
+		return "", fmt.Errorf("registry index must be a JSON object")
+	}
+	matched := ""
+	entryCount := 0
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return "", err
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return "", fmt.Errorf("registry index contains a non-string object key")
+		}
+		if key != "manifests" {
+			var ignored json.RawMessage
+			if err := decoder.Decode(&ignored); err != nil {
+				return "", err
+			}
+			continue
+		}
+		token, err := decoder.Token()
+		if err != nil {
+			return "", err
+		}
+		if delimiter, ok := token.(json.Delim); !ok || delimiter != '[' {
+			return "", fmt.Errorf("registry manifests must be a JSON array")
+		}
+		for decoder.More() {
+			entryCount++
+			if entryCount > maxManifestIndexEntries {
+				return "", fmt.Errorf("registry index contains more than %d manifests", maxManifestIndexEntries)
+			}
+			var manifest struct {
+				Digest   string `json:"digest"`
+				Platform struct {
+					OS           string `json:"os"`
+					Architecture string `json:"architecture"`
+					Variant      string `json:"variant"`
+				} `json:"platform"`
+			}
+			if err := decoder.Decode(&manifest); err != nil {
+				return "", err
+			}
+			if len(manifest.Digest) > maxRegistryDigestHeaderBytes || len(manifest.Platform.OS) > 128 || len(manifest.Platform.Architecture) > 128 || len(manifest.Platform.Variant) > 128 {
+				return "", fmt.Errorf("registry index contains an oversized field")
+			}
+			if manifest.Digest != "" {
+				if _, err := digest.Parse(manifest.Digest); err != nil {
+					return "", fmt.Errorf("registry index contains an invalid digest: %w", err)
+				}
+			}
+			if matched == "" && manifest.Digest != "" && platformMatches(want, Platform{
+				OS: manifest.Platform.OS, Architecture: manifest.Platform.Architecture, Variant: manifest.Platform.Variant,
+			}) {
+				matched = manifest.Digest
+			}
+		}
+		if _, err := decoder.Token(); err != nil {
+			return "", err
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return "", err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return "", fmt.Errorf("registry index contains multiple JSON values")
+		}
+		return "", err
+	}
+	return matched, nil
+}
+
+func validatedRegistryDigest(header string) (string, error) {
+	if len(header) > maxRegistryDigestHeaderBytes {
+		return "", apperror.New(apperror.RegistryUnreachable, "Registry digest header exceeds safe size limit")
+	}
+	value := strings.TrimSpace(header)
+	if value == "" {
+		return "", apperror.New(apperror.RegistryUnreachable, "Registry response did not include Docker-Content-Digest")
+	}
+	if _, err := digest.Parse(value); err != nil {
+		return "", apperror.Wrap(apperror.RegistryUnreachable, "Registry response included an invalid Docker-Content-Digest", err)
+	}
+	return value, nil
+}
+
+func validatedManifestMediaType(header string) (string, error) {
+	if len(header) > maxRegistryContentTypeHeaderBytes {
+		return "", apperror.New(apperror.RegistryUnreachable, "Registry Content-Type header exceeds safe size limit")
+	}
+	if strings.TrimSpace(header) == "" {
+		return "", nil
+	}
+	mediaType, _, err := mime.ParseMediaType(header)
+	if err != nil || len(mediaType) > 128 {
+		return "", apperror.New(apperror.RegistryUnreachable, "Registry response included an invalid Content-Type header")
+	}
+	return mediaType, nil
 }
 
 func (m *Manager) registryBaseURL(registry string) string {
@@ -260,6 +371,30 @@ func (m *Manager) storeCache(key string, result DigestResult, expiresAt time.Tim
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.cache == nil {
+		m.cache = map[string]cacheEntry{}
+	}
+	now := m.now()
+	for cachedKey, entry := range m.cache {
+		if !now.Before(entry.ExpiresAt) {
+			delete(m.cache, cachedKey)
+		}
+	}
+	limit := m.cacheEntryLimit
+	if limit <= 0 {
+		limit = defaultCacheEntryLimit
+	}
+	if _, exists := m.cache[key]; !exists && len(m.cache) >= limit {
+		var oldestKey string
+		var oldestExpiry time.Time
+		for cachedKey, entry := range m.cache {
+			if oldestKey == "" || entry.ExpiresAt.Before(oldestExpiry) {
+				oldestKey = cachedKey
+				oldestExpiry = entry.ExpiresAt
+			}
+		}
+		delete(m.cache, oldestKey)
+	}
 	m.cache[key] = cacheEntry{Result: result, ExpiresAt: expiresAt}
 }
 
@@ -273,7 +408,8 @@ func (m *Manager) withLimits(ctx context.Context, registry string, fn func() err
 	case <-ctx.Done():
 		return apperror.Wrap(apperror.Timeout, "Registry check timed out", ctx.Err())
 	}
-	gate := m.registryLimiter(registry)
+	gate, releaseGate := m.registryLimiter(registry)
+	defer releaseGate()
 	select {
 	case gate <- struct{}{}:
 		defer func() { <-gate }()
@@ -283,20 +419,31 @@ func (m *Manager) withLimits(ctx context.Context, registry string, fn func() err
 	return fn()
 }
 
-func (m *Manager) registryLimiter(registry string) chan struct{} {
+func (m *Manager) registryLimiter(registry string) (chan struct{}, func()) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	key := normalizeRegistryHost(registry)
-	gate, ok := m.registryGate[key]
+	if m.registryGate == nil {
+		m.registryGate = map[string]*registryGateState{}
+	}
+	state, ok := m.registryGate[key]
 	if !ok {
 		limit := m.perRegistryLimit
 		if limit <= 0 {
 			limit = defaultPerRegistryLimit
 		}
-		gate = make(chan struct{}, limit)
-		m.registryGate[key] = gate
+		state = &registryGateState{gate: make(chan struct{}, limit)}
+		m.registryGate[key] = state
 	}
-	return gate
+	state.refs++
+	m.mu.Unlock()
+	return state.gate, func() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		state.refs--
+		if state.refs == 0 && m.registryGate[key] == state {
+			delete(m.registryGate, key)
+		}
+	}
 }
 
 func (m *Manager) checkCircuit(registry string, now time.Time) (time.Duration, error) {
@@ -305,8 +452,18 @@ func (m *Manager) checkCircuit(registry string, now time.Time) (time.Duration, e
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	state := m.circuit[normalizeRegistryHost(registry)]
+	key := normalizeRegistryHost(registry)
+	state, ok := m.circuit[key]
+	if !ok {
+		return 0, nil
+	}
+	if (!state.OpenUntil.IsZero() && !now.Before(state.OpenUntil)) || (!state.LastTouched.IsZero() && now.Sub(state.LastTouched) >= 10*time.Minute) {
+		delete(m.circuit, key)
+		return 0, nil
+	}
 	if now.Before(state.OpenUntil) {
+		state.LastTouched = now
+		m.circuit[key] = state
 		err := apperror.New(apperror.RegistryRateLimit, "Registry backoff is active")
 		return state.OpenUntil.Sub(now), err
 	}
@@ -331,9 +488,33 @@ func (m *Manager) recordRegistryFailure(registry string, err error, now time.Tim
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.circuit == nil {
+		m.circuit = map[string]circuitState{}
+	}
 	key := normalizeRegistryHost(registry)
+	for circuitKey, existing := range m.circuit {
+		if (!existing.OpenUntil.IsZero() && !now.Before(existing.OpenUntil)) || (!existing.LastTouched.IsZero() && now.Sub(existing.LastTouched) >= 10*time.Minute) {
+			delete(m.circuit, circuitKey)
+		}
+	}
+	limit := m.circuitEntryLimit
+	if limit <= 0 {
+		limit = defaultCircuitEntryLimit
+	}
+	if _, exists := m.circuit[key]; !exists && len(m.circuit) >= limit {
+		var oldestKey string
+		var oldestTouched time.Time
+		for circuitKey, existing := range m.circuit {
+			if oldestKey == "" || existing.LastTouched.Before(oldestTouched) {
+				oldestKey = circuitKey
+				oldestTouched = existing.LastTouched
+			}
+		}
+		delete(m.circuit, oldestKey)
+	}
 	state := m.circuit[key]
 	state.Failures++
+	state.LastTouched = now
 	if retryAfter > 0 {
 		state.OpenUntil = now.Add(retryAfter)
 	} else if apperror.IsCode(err, apperror.RegistryRateLimit) || state.Failures >= 5 {

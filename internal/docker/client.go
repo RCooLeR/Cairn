@@ -132,6 +132,7 @@ type Client struct {
 	now               func() time.Time
 	factory           func(string) (APIClient, error)
 	factoryWithDialer func(string, func(context.Context, string, string) (net.Conn, error)) (APIClient, error)
+	registryAuth      func(context.Context, string) (string, error)
 
 	reconnectMu      sync.Mutex
 	mu               sync.RWMutex
