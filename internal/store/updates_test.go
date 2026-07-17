@@ -11,15 +11,17 @@ import (
 
 func TestUpdateRepositoryIgnoreOverlayAndBadges(t *testing.T) {
 	ctx := context.Background()
-	db := openMigratedStore(t, ctx)
-	defer closeStore(t, db)
+	db := openStoreForProjectTest(t)
 	repo := db.Updates()
 	now := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)
-
-	id, err := repo.InsertCheck(ctx, UpdateCheckRecord{
+	scope := runtimescope.Must("linux_native", "default")
+	projectID := "linux_native/app"
+	seedGenerationProject(t, ctx, db, scope, projectID, projectID+"/web", projectID+"/api")
+	published := publishProjectGeneration(t, ctx, repo, scope, projectID, []UpdateCheckRecord{{
 		ProviderID:        "linux_native",
-		ProjectID:         "linux_native/app",
-		ServiceID:         "linux_native/app/web",
+		ContextName:       scope.ContextName(),
+		ProjectID:         projectID,
+		ServiceID:         projectID + "/web",
 		Kind:              models.UpdateKindServiceImage,
 		ImageRef:          "nginx:1.25",
 		LocalDigest:       "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -28,14 +30,11 @@ func TestUpdateRepositoryIgnoreOverlayAndBadges(t *testing.T) {
 		RecommendedAction: models.RecommendedActionPullRecreate,
 		Status:            models.UpdateStatusServiceImageUpdateAvailable,
 		CheckedAt:         now,
-	})
-	if err != nil {
-		t.Fatalf("InsertCheck() error = %v", err)
-	}
-	if _, err := repo.InsertCheck(ctx, UpdateCheckRecord{
+	}, {
 		ProviderID:        "linux_native",
-		ProjectID:         "linux_native/app",
-		ServiceID:         "linux_native/app/api",
+		ContextName:       scope.ContextName(),
+		ProjectID:         projectID,
+		ServiceID:         projectID + "/api",
 		Kind:              models.UpdateKindBaseImage,
 		ImageRef:          "app:local",
 		BaseImageRef:      "alpine:3.20",
@@ -43,11 +42,10 @@ func TestUpdateRepositoryIgnoreOverlayAndBadges(t *testing.T) {
 		RecommendedAction: models.RecommendedActionRebuildRedeploy,
 		Status:            models.UpdateStatusRebuildRequired,
 		CheckedAt:         now,
-	}); err != nil {
-		t.Fatalf("InsertCheck(base) error = %v", err)
-	}
+	}}, now)
+	id := published[0].ID
 
-	badges, err := repo.Badges(ctx, "linux_native/app")
+	badges, err := repo.Badges(ctx, projectID)
 	if err != nil {
 		t.Fatalf("Badges() error = %v", err)
 	}
@@ -112,15 +110,19 @@ func TestUpdateRepositoryIgnoreOverlayAndBadges(t *testing.T) {
 
 func TestUpdateRepositoryBadgesByProjectIDs(t *testing.T) {
 	ctx := context.Background()
-	db := openMigratedStore(t, ctx)
-	defer closeStore(t, db)
+	db := openStoreForProjectTest(t)
 	repo := db.Updates()
 	now := time.Date(2026, 6, 13, 13, 0, 0, 0, time.UTC)
-
-	ignoredID, err := repo.InsertCheck(ctx, UpdateCheckRecord{
+	scope := runtimescope.Must("linux_native", "default")
+	webProjectID := "linux_native/web"
+	cacheProjectID := "linux_native/cache"
+	seedGenerationProject(t, ctx, db, scope, webProjectID, webProjectID+"/api", webProjectID+"/worker")
+	seedGenerationProject(t, ctx, db, scope, cacheProjectID, cacheProjectID+"/redis")
+	publishedWeb := publishProjectGeneration(t, ctx, repo, scope, webProjectID, []UpdateCheckRecord{{
 		ProviderID:        "linux_native",
-		ProjectID:         "linux_native/web",
-		ServiceID:         "linux_native/web/api",
+		ContextName:       scope.ContextName(),
+		ProjectID:         webProjectID,
+		ServiceID:         webProjectID + "/api",
 		Kind:              models.UpdateKindServiceImage,
 		ImageRef:          "nginx:1.25",
 		LocalDigest:       "sha256:1111111111111111111111111111111111111111111111111111111111111111",
@@ -129,37 +131,32 @@ func TestUpdateRepositoryBadgesByProjectIDs(t *testing.T) {
 		RecommendedAction: models.RecommendedActionPullRecreate,
 		Status:            models.UpdateStatusServiceImageUpdateAvailable,
 		CheckedAt:         now,
-	})
-	if err != nil {
-		t.Fatalf("InsertCheck(ignored) error = %v", err)
-	}
-	if err := repo.InsertChecks(ctx, []UpdateCheckRecord{
-		{
-			ProviderID:        "linux_native",
-			ProjectID:         "linux_native/web",
-			ServiceID:         "linux_native/web/worker",
-			Kind:              models.UpdateKindBaseImage,
-			ImageRef:          "web-worker:local",
-			BaseImageRef:      "alpine:3.20",
-			Confidence:        models.ConfidenceHigh,
-			RecommendedAction: models.RecommendedActionRebuildRedeploy,
-			Status:            models.UpdateStatusRebuildRequired,
-			CheckedAt:         now,
-		},
-		{
-			ProviderID:        "linux_native",
-			ProjectID:         "linux_native/cache",
-			ServiceID:         "linux_native/cache/redis",
-			Kind:              models.UpdateKindServiceImage,
-			ImageRef:          "redis:7",
-			Confidence:        models.ConfidenceMedium,
-			RecommendedAction: models.RecommendedActionPullRecreate,
-			Status:            models.UpdateStatusPinnedDigest,
-			CheckedAt:         now,
-		},
-	}); err != nil {
-		t.Fatalf("InsertChecks() error = %v", err)
-	}
+	}, {
+		ProviderID:        "linux_native",
+		ContextName:       scope.ContextName(),
+		ProjectID:         webProjectID,
+		ServiceID:         webProjectID + "/worker",
+		Kind:              models.UpdateKindBaseImage,
+		ImageRef:          "web-worker:local",
+		BaseImageRef:      "alpine:3.20",
+		Confidence:        models.ConfidenceHigh,
+		RecommendedAction: models.RecommendedActionRebuildRedeploy,
+		Status:            models.UpdateStatusRebuildRequired,
+		CheckedAt:         now,
+	}}, now)
+	publishProjectGeneration(t, ctx, repo, scope, cacheProjectID, []UpdateCheckRecord{{
+		ProviderID:        "linux_native",
+		ContextName:       scope.ContextName(),
+		ProjectID:         cacheProjectID,
+		ServiceID:         cacheProjectID + "/redis",
+		Kind:              models.UpdateKindServiceImage,
+		ImageRef:          "redis:7",
+		Confidence:        models.ConfidenceMedium,
+		RecommendedAction: models.RecommendedActionPullRecreate,
+		Status:            models.UpdateStatusPinnedDigest,
+		CheckedAt:         now,
+	}}, now)
+	ignoredID := publishedWeb[0].ID
 	if err := repo.IgnoreCheck(ctx, ignoredID, "keep pinned for test", now.Add(time.Minute)); err != nil {
 		t.Fatalf("IgnoreCheck() error = %v", err)
 	}
@@ -201,19 +198,20 @@ func TestUpdateRepositoryBadgesByProjectIDsInScopeRejectsForeignRecords(t *testi
 	}}, nil, now, time.Time{}); err != nil {
 		t.Fatalf("SaveSnapshot() error = %v", err)
 	}
-	if err := repo.InsertChecks(ctx, []UpdateCheckRecord{
-		{
-			ProviderID: scope.ProviderID(), ContextName: scope.ContextName(), ProjectID: projectID, ServiceID: projectID + "/web",
-			Kind: models.UpdateKindServiceImage, ImageRef: "nginx:1.25",
-			Status: models.UpdateStatusServiceImageUpdateAvailable, CheckedAt: now,
-		},
-		{
-			ProviderID: "existing_context:foreign", ContextName: "foreign", ProjectID: projectID, ServiceID: projectID + "/api",
-			Kind: models.UpdateKindBaseImage, ImageRef: "app:foreign", BaseImageRef: "alpine:3.20",
-			Status: models.UpdateStatusRebuildRequired, CheckedAt: now.Add(time.Minute),
-		},
-	}); err != nil {
-		t.Fatalf("InsertChecks() error = %v", err)
+	publishProjectGeneration(t, ctx, repo, scope, projectID, []UpdateCheckRecord{{
+		ProviderID: scope.ProviderID(), ContextName: scope.ContextName(), ProjectID: projectID, ServiceID: projectID + "/web",
+		Kind: models.UpdateKindServiceImage, ImageRef: "nginx:1.25",
+		Status: models.UpdateStatusServiceImageUpdateAvailable, CheckedAt: now,
+	}}, now)
+	if _, err := db.writer.ExecContext(ctx, `
+		INSERT INTO image_update_checks (
+			generation_id, is_current, provider_id, context_name, project_id, service_id,
+			kind, image_ref, base_image_ref, status, checked_at
+		) VALUES (999, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, "existing_context:foreign", "foreign", projectID, projectID+"/api",
+		string(models.UpdateKindBaseImage), "app:foreign", "alpine:3.20",
+		string(models.UpdateStatusRebuildRequired), formatTime(now.Add(time.Minute))); err != nil {
+		t.Fatalf("insert corrupt foreign check: %v", err)
 	}
 	badges, err := repo.BadgesByProjectIDsInScope(ctx, scope, []string{projectID})
 	if err != nil {

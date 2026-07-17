@@ -394,9 +394,21 @@ func seedWSLUpdateProject(t *testing.T, ctx context.Context, db *store.Store, pr
 
 func insertWSLUpdateCheck(t *testing.T, ctx context.Context, db *store.Store, record store.UpdateCheckRecord) {
 	t.Helper()
+	if strings.TrimSpace(record.ContextName) == "" {
+		project, err := db.Projects().Get(ctx, record.ProjectID)
+		if err != nil {
+			t.Fatalf("Get project scope for update check: %v", err)
+		}
+		record.ContextName = project.ContextName
+	}
 	record.CheckedAt = time.Now().UTC()
-	if _, err := db.Updates().InsertCheck(ctx, record); err != nil {
-		t.Fatalf("InsertCheck() error = %v", err)
+	scope := runtimescope.Must(record.ProviderID, record.ContextName)
+	run, err := db.Updates().BeginServiceCheckRunInScope(ctx, scope, record.ProjectID, record.ServiceID, record.CheckedAt)
+	if err != nil {
+		t.Fatalf("BeginServiceCheckRunInScope() error = %v", err)
+	}
+	if published, accepted, err := db.Updates().PublishCheckRunInScope(ctx, scope, run.ID, []store.UpdateCheckRecord{record}, record.CheckedAt); err != nil || !accepted || len(published) != 1 {
+		t.Fatalf("PublishCheckRunInScope() = %#v/%v/%v", published, accepted, err)
 	}
 }
 

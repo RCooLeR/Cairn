@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	expectedMigrationCount       = 9
+	expectedMigrationCount       = 10
 	releaseFixtureMigrationCount = 6
 )
 
@@ -37,6 +37,8 @@ func TestMigrateFreshDatabaseCreatesV1Schema(t *testing.T) {
 		"forgotten_projects",
 		"ignored_updates",
 		"image_lineage",
+		"image_update_check_heads",
+		"image_update_check_runs",
 		"image_update_checks",
 		"images_cache",
 		"metrics_samples",
@@ -64,6 +66,8 @@ func TestMigrateFreshDatabaseCreatesV1Schema(t *testing.T) {
 		"idx_checks_latest",
 		"idx_checks_kind",
 		"idx_checks_project",
+		"idx_checks_retention",
+		"idx_check_runs_project",
 		"idx_containers_project",
 		"idx_forgotten_projects_id",
 		"idx_ignored_updates_unique",

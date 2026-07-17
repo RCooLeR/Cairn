@@ -114,6 +114,201 @@ func TestManagerServiceImageStatusMachine(t *testing.T) {
 	}
 }
 
+func TestManagerCheckProjectReplacesChangedImageReferenceGeneration(t *testing.T) {
+	ctx := context.Background()
+	db := openUpdatesStore(t)
+	projectID := "linux_native/reference-change"
+	seedUpdateProject(t, ctx, db, projectID, []store.ServiceRecord{
+		serviceRecord(projectID, "web", "nginx:1.25", ""),
+	})
+	images := fakeImages{details: map[string]*models.ImageDetail{
+		"nginx:1.25": imageDetail("sha256:old", "docker.io/library/nginx@"+digestA),
+		"nginx:1.26": imageDetail("sha256:new", "docker.io/library/nginx@"+digestC),
+	}}
+	registry := &fakeRegistry{digests: map[string]string{
+		"nginx:1.25": digestB,
+		"nginx:1.26": digestD,
+	}}
+	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), images, registry, db.Settings(), nil, nil)
+	manager.Scope = runtimescope.Must("linux_native", "default")
+	manager.Now = func() time.Time { return time.Date(2026, 7, 17, 11, 0, 0, 0, time.UTC) }
+
+	first, err := manager.CheckProjectUpdates(ctx, projectID)
+	if err != nil {
+		t.Fatalf("CheckProjectUpdates(first) error = %v", err)
+	}
+	if len(first) != 1 || first[0].CurrentImage != "nginx:1.25" {
+		t.Fatalf("first current checks = %#v", first)
+	}
+
+	seedUpdateProject(t, ctx, db, projectID, []store.ServiceRecord{
+		serviceRecord(projectID, "web", "nginx:1.26", ""),
+	})
+	manager.Now = func() time.Time { return time.Date(2026, 7, 17, 12, 0, 0, 0, time.UTC) }
+	second, err := manager.CheckProjectUpdates(ctx, projectID)
+	if err != nil {
+		t.Fatalf("CheckProjectUpdates(second) error = %v", err)
+	}
+	if len(second) != 1 || second[0].CurrentImage != "nginx:1.26" {
+		t.Fatalf("second current checks = %#v, want changed reference only", second)
+	}
+}
+
+func TestManagerSupersededRunReturnsNewerCurrentState(t *testing.T) {
+	ctx := context.Background()
+	db := openUpdatesStore(t)
+	projectID := "linux_native/overlapping-managers"
+	seedUpdateProject(t, ctx, db, projectID, []store.ServiceRecord{
+		serviceRecord(projectID, "web", "nginx:1.25", ""),
+	})
+	images := fakeImages{details: map[string]*models.ImageDetail{
+		"nginx:1.25": imageDetail("sha256:web", "docker.io/library/nginx@"+digestA),
+	}}
+	releaseOld := make(chan struct{})
+	oldRegistry := &controlledRegistry{digest: digestB, calls: make(chan struct{}, 1), release: releaseOld}
+	oldManager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), images, oldRegistry, db.Settings(), nil, nil)
+	oldManager.Scope = runtimescope.Must("linux_native", "default")
+	oldManager.Now = func() time.Time { return time.Date(2026, 7, 17, 11, 0, 0, 0, time.UTC) }
+	newManager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), images, &fakeRegistry{digests: map[string]string{"nginx:1.25": digestD}}, db.Settings(), nil, nil)
+	newManager.Scope = oldManager.Scope
+	newManager.Now = func() time.Time { return time.Date(2026, 7, 17, 11, 1, 0, 0, time.UTC) }
+
+	type checkResult struct {
+		updates []models.ImageUpdate
+		err     error
+	}
+	oldDone := make(chan checkResult, 1)
+	go func() {
+		updates, err := oldManager.CheckProjectUpdates(ctx, projectID)
+		oldDone <- checkResult{updates: updates, err: err}
+	}()
+	select {
+	case <-oldRegistry.calls:
+	case <-time.After(2 * time.Second):
+		t.Fatal("older run did not reach controlled registry")
+	}
+	newer, err := newManager.CheckProjectUpdates(ctx, projectID)
+	if err != nil || len(newer) != 1 || newer[0].RemoteDigest != digestD {
+		t.Fatalf("newer manager result = %#v/%v", newer, err)
+	}
+	close(releaseOld)
+	select {
+	case result := <-oldDone:
+		if result.err != nil || len(result.updates) != 1 || result.updates[0].RemoteDigest != digestD {
+			t.Fatalf("superseded older caller returned stale computation = %#v/%v", result.updates, result.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("older run did not finish after release")
+	}
+}
+
+func TestManagerSupersededServiceRunReturnsNewerProjectState(t *testing.T) {
+	ctx := context.Background()
+	db := openUpdatesStore(t)
+	projectID := "linux_native/overlapping-service-project"
+	seedUpdateProject(t, ctx, db, projectID, []store.ServiceRecord{
+		serviceRecord(projectID, "web", "nginx:1.25", ""),
+	})
+	images := fakeImages{details: map[string]*models.ImageDetail{
+		"nginx:1.25": imageDetail("sha256:web", "docker.io/library/nginx@"+digestA),
+	}}
+	releaseOld := make(chan struct{})
+	oldRegistry := &controlledRegistry{digest: digestB, calls: make(chan struct{}, 1), release: releaseOld}
+	oldManager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), images, oldRegistry, db.Settings(), nil, nil)
+	oldManager.Scope = runtimescope.Must("linux_native", "default")
+	oldManager.Now = func() time.Time { return time.Date(2026, 7, 17, 11, 10, 0, 0, time.UTC) }
+	newManager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), images, &fakeRegistry{digests: map[string]string{"nginx:1.25": digestD}}, db.Settings(), nil, nil)
+	newManager.Scope = oldManager.Scope
+	newManager.Now = func() time.Time { return time.Date(2026, 7, 17, 11, 11, 0, 0, time.UTC) }
+
+	type serviceCheckResult struct {
+		update *models.ImageUpdate
+		err    error
+	}
+	oldDone := make(chan serviceCheckResult, 1)
+	go func() {
+		update, err := oldManager.CheckServiceUpdate(ctx, projectID, "web")
+		oldDone <- serviceCheckResult{update: update, err: err}
+	}()
+	select {
+	case <-oldRegistry.calls:
+	case <-time.After(2 * time.Second):
+		t.Fatal("older service run did not reach controlled registry")
+	}
+	newer, err := newManager.CheckProjectUpdates(ctx, projectID)
+	if err != nil || len(newer) != 1 || newer[0].RemoteDigest != digestD {
+		t.Fatalf("newer project result = %#v/%v", newer, err)
+	}
+	close(releaseOld)
+	select {
+	case result := <-oldDone:
+		if result.err != nil || result.update == nil || result.update.RemoteDigest != digestD {
+			t.Fatalf("superseded service caller returned stale computation = %#v/%v", result.update, result.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("older service run did not finish after release")
+	}
+}
+
+func TestManagerSerializesProjectAndServiceChecksPerProject(t *testing.T) {
+	ctx := context.Background()
+	db := openUpdatesStore(t)
+	projectID := "linux_native/serialized-checks"
+	seedUpdateProject(t, ctx, db, projectID, []store.ServiceRecord{
+		serviceRecord(projectID, "web", "nginx:1.25", ""),
+	})
+	images := fakeImages{details: map[string]*models.ImageDetail{
+		"nginx:1.25": imageDetail("sha256:web", "docker.io/library/nginx@"+digestA),
+	}}
+	release := make(chan struct{})
+	registry := &controlledRegistry{digest: digestB, calls: make(chan struct{}, 2), release: release}
+	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), images, registry, db.Settings(), nil, nil)
+	manager.Scope = runtimescope.Must("linux_native", "default")
+
+	projectDone := make(chan error, 1)
+	go func() {
+		_, err := manager.CheckProjectUpdates(ctx, projectID)
+		projectDone <- err
+	}()
+	select {
+	case <-registry.calls:
+	case <-time.After(2 * time.Second):
+		t.Fatal("project check did not reach controlled registry")
+	}
+	serviceDone := make(chan error, 1)
+	go func() {
+		_, err := manager.CheckServiceUpdate(ctx, projectID, "web")
+		serviceDone <- err
+	}()
+	select {
+	case <-registry.calls:
+		t.Fatal("service check entered evaluation before the project check released its keyed lock")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-projectDone:
+		if err != nil {
+			t.Fatalf("project check error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("project check did not finish")
+	}
+	select {
+	case <-registry.calls:
+	case <-time.After(2 * time.Second):
+		t.Fatal("service check did not start after project check released its keyed lock")
+	}
+	select {
+	case err := <-serviceDone:
+		if err != nil {
+			t.Fatalf("service check error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("service check did not finish")
+	}
+}
+
 func TestManagerServiceImageAcceptsRemoteIndexDigestMatch(t *testing.T) {
 	ctx := context.Background()
 	db := openUpdatesStore(t)
@@ -290,7 +485,7 @@ func TestManagerIgnoreAndUnignoreRejectForeignRuntimeScope(t *testing.T) {
 	foreignProjectID := "linux_native/foreign"
 	if err := db.Projects().SaveSnapshot(ctx, foreignScope, []store.ProjectRecord{{
 		ID: foreignProjectID, ProviderID: "linux_native", ContextName: foreignScope.ContextName(), Name: "foreign", WorkingDir: t.TempDir(), LastSeenAt: now,
-	}}, nil, now, time.Time{}); err != nil {
+	}}, []store.ServiceRecord{serviceRecord(foreignProjectID, "web", "nginx:1.25", "")}, now, time.Time{}); err != nil {
 		t.Fatalf("SaveSnapshot(foreign) error = %v", err)
 	}
 	checkID := insertCheck(t, ctx, db, store.UpdateCheckRecord{
@@ -1538,6 +1733,22 @@ type registryResultError struct {
 	err    error
 }
 
+type controlledRegistry struct {
+	digest  string
+	calls   chan struct{}
+	release <-chan struct{}
+}
+
+func (r *controlledRegistry) ResolveDigest(ctx context.Context, _ string, _ registrycore.ResolveOptions) (*registrycore.DigestResult, error) {
+	r.calls <- struct{}{}
+	select {
+	case <-r.release:
+		return &registrycore.DigestResult{ManifestDigest: r.digest}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
 func (r *fakeRegistry) ResolveDigest(_ context.Context, image string, opts registrycore.ResolveOptions) (*registrycore.DigestResult, error) {
 	if r.platforms == nil {
 		r.platforms = map[string]registrycore.Platform{}
@@ -1704,11 +1915,20 @@ func insertCheck(t *testing.T, ctx context.Context, db *store.Store, record stor
 		}
 		record.ContextName = project.ContextName
 	}
-	id, err := db.Updates().InsertCheck(ctx, record)
-	if err != nil {
-		t.Fatalf("InsertCheck() error = %v", err)
+	scope := runtimescope.Must(record.ProviderID, record.ContextName)
+	startedAt := record.CheckedAt
+	if startedAt.IsZero() {
+		startedAt = time.Date(2026, 6, 13, 12, 30, 0, 0, time.UTC)
 	}
-	return id
+	run, err := db.Updates().BeginServiceCheckRunInScope(ctx, scope, record.ProjectID, record.ServiceID, startedAt)
+	if err != nil {
+		t.Fatalf("BeginServiceCheckRunInScope() error = %v", err)
+	}
+	published, accepted, err := db.Updates().PublishCheckRunInScope(ctx, scope, run.ID, []store.UpdateCheckRecord{record}, startedAt)
+	if err != nil || !accepted || len(published) != 1 {
+		t.Fatalf("PublishCheckRunInScope() = %#v/%v/%v", published, accepted, err)
+	}
+	return published[0].ID
 }
 
 func commandTexts(commands []models.PlannedCommand) []string {

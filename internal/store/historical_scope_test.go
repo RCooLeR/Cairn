@@ -30,15 +30,13 @@ func TestHistoricalRepositoriesIsolateSequentialProjectIDReuse(t *testing.T) {
 	}}); err != nil {
 		t.Fatalf("ReplaceProjectInScope(A): %v", err)
 	}
-	checkA, err := db.Updates().InsertCheckInScope(ctx, scopeA, UpdateCheckRecord{
+	publishedA := publishProjectGeneration(t, ctx, db.Updates(), scopeA, projectID, []UpdateCheckRecord{{
 		ProviderID: scopeA.ProviderID(), ContextName: scopeA.ContextName(), ProjectID: projectID,
 		ServiceID: projectID + "/web", Kind: models.UpdateKindServiceImage,
 		ImageRef: "nginx:latest", LocalDigest: "sha256:a", RemoteDigest: "sha256:b",
 		Status: models.UpdateStatusServiceImageUpdateAvailable, CheckedAt: now,
-	})
-	if err != nil {
-		t.Fatalf("InsertCheckInScope(A): %v", err)
-	}
+	}}, now)
+	checkA := publishedA[0].ID
 	if err := db.Updates().IgnoreCheckInScope(ctx, scopeA, checkA, "scope A only", now); err != nil {
 		t.Fatalf("IgnoreCheckInScope(A): %v", err)
 	}
@@ -71,15 +69,13 @@ func TestHistoricalRepositoriesIsolateSequentialProjectIDReuse(t *testing.T) {
 	}}); err != nil {
 		t.Fatalf("ReplaceProjectInScope(B): %v", err)
 	}
-	checkB, err := db.Updates().InsertCheckInScope(ctx, scopeB, UpdateCheckRecord{
+	publishedB := publishProjectGeneration(t, ctx, db.Updates(), scopeB, projectID, []UpdateCheckRecord{{
 		ProviderID: scopeB.ProviderID(), ContextName: scopeB.ContextName(), ProjectID: projectID,
 		ServiceID: projectID + "/web", Kind: models.UpdateKindServiceImage,
 		ImageRef: "nginx:latest", LocalDigest: "sha256:b", RemoteDigest: "sha256:c",
 		Status: models.UpdateStatusServiceImageUpdateAvailable, CheckedAt: now.Add(time.Hour),
-	})
-	if err != nil {
-		t.Fatalf("InsertCheckInScope(B): %v", err)
-	}
+	}}, now.Add(time.Hour))
+	checkB := publishedB[0].ID
 	historyB, err := db.Updates().InsertHistoryInScope(ctx, scopeB, UpdateHistoryRecord{
 		ProviderID: scopeB.ProviderID(), ContextName: scopeB.ContextName(), ProjectID: projectID,
 		ServiceID: projectID + "/web", UpdateKind: models.UpdateKindServiceImage,
@@ -181,7 +177,7 @@ func TestHistoricalScopeMigrationLeavesLegacyRowsUnclaimed(t *testing.T) {
 		t.Fatalf("Migrate through historical scope: %v", err)
 	}
 
-	for _, table := range []string{"image_lineage", "image_update_checks", "ignored_updates", "update_history"} {
+	for _, table := range []string{"image_lineage", "ignored_updates", "update_history"} {
 		var contextName string
 		if err := db.writer.QueryRowContext(ctx, `SELECT context_name FROM `+table+` LIMIT 1`).Scan(&contextName); err != nil {
 			t.Fatalf("read %s context_name: %v", table, err)
@@ -189,6 +185,13 @@ func TestHistoricalScopeMigrationLeavesLegacyRowsUnclaimed(t *testing.T) {
 		if contextName != "" {
 			t.Fatalf("%s legacy context_name = %q, want unclaimed empty context", table, contextName)
 		}
+	}
+	var legacyCheckCount int
+	if err := db.writer.QueryRowContext(ctx, `SELECT COUNT(*) FROM image_update_checks WHERE id = ?`, legacyCheckID).Scan(&legacyCheckCount); err != nil {
+		t.Fatalf("count orphaned legacy check: %v", err)
+	}
+	if legacyCheckCount != 0 {
+		t.Fatalf("orphaned legacy check count = %d, want migration cleanup", legacyCheckCount)
 	}
 	for _, index := range []string{"idx_lineage_project", "idx_lineage_service", "idx_lineage_container", "idx_checks_project", "idx_checks_kind", "idx_checks_latest", "idx_ignored_updates_unique", "idx_update_history_scope"} {
 		var definition string

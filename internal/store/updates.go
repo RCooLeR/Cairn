@@ -16,12 +16,21 @@ type UpdateRepository struct {
 	db *sql.DB
 }
 
+const (
+	updateCheckHistoryRetention       = 30 * 24 * time.Hour
+	updateCheckHistoryKeepGenerations = 20
+	updateCheckRunningLease           = 24 * time.Hour
+	updateCheckLegacyKeepRows         = 1000
+)
+
 type updateCheckExecutor interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
 type UpdateCheckRecord struct {
 	ID                int64
+	GenerationID      int64
+	IsCurrent         bool
 	ProviderID        string
 	ContextName       string
 	ProjectID         string
@@ -40,6 +49,17 @@ type UpdateCheckRecord struct {
 	Status            models.UpdateStatus
 	CheckedAt         time.Time
 	Error             string
+}
+
+type UpdateCheckRun struct {
+	ID          int64
+	ProviderID  string
+	ContextName string
+	ProjectID   string
+	ServiceID   string
+	StartedAt   time.Time
+	FinishedAt  time.Time
+	Status      string
 }
 
 type IgnoredUpdateRecord struct {
@@ -85,21 +105,7 @@ func (s *Store) Updates() *UpdateRepository {
 	return &UpdateRepository{db: s.writer}
 }
 
-func (r *UpdateRepository) InsertCheck(ctx context.Context, record UpdateCheckRecord) (int64, error) {
-	return insertCheck(ctx, r.db, record)
-}
-
-func (r *UpdateRepository) InsertCheckInScope(ctx context.Context, scope runtimescope.Scope, record UpdateCheckRecord) (int64, error) {
-	if !scope.Valid() {
-		return 0, errors.New("runtime scope is required")
-	}
-	if !scope.Matches(record.ProviderID, record.ContextName) {
-		return 0, errors.New("update check does not belong to the runtime scope")
-	}
-	return insertCheck(ctx, r.db, record)
-}
-
-func insertCheck(ctx context.Context, exec updateCheckExecutor, record UpdateCheckRecord) (int64, error) {
+func normalizeUpdateCheck(record UpdateCheckRecord) UpdateCheckRecord {
 	if record.CheckedAt.IsZero() {
 		record.CheckedAt = time.Now().UTC()
 	}
@@ -115,18 +121,23 @@ func insertCheck(ctx context.Context, exec updateCheckExecutor, record UpdateChe
 	if record.RecommendedAction == "" {
 		record.RecommendedAction = models.RecommendedActionNone
 	}
+	return record
+}
+
+func insertCheck(ctx context.Context, exec updateCheckExecutor, record UpdateCheckRecord, generationID int64) (int64, error) {
+	record = normalizeUpdateCheck(record)
 	result, err := exec.ExecContext(ctx, `
 		INSERT INTO image_update_checks (
-			provider_id, context_name, project_id, service_id, container_id, kind, image_ref,
+			generation_id, is_current, provider_id, context_name, project_id, service_id, container_id, kind, image_ref,
 			base_image_ref, local_image_id, local_digest, remote_digest,
 			lineage_id, base_image_ref_id, confidence, recommended_action,
 			status, checked_at, error
 		)
-		VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?, ?,
+		VALUES (?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), ?, ?,
 			NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''),
 			NULLIF(?, 0), NULLIF(?, 0), NULLIF(?, ''), NULLIF(?, ''),
 			?, ?, NULLIF(?, ''))
-	`, record.ProviderID, record.ContextName, record.ProjectID, record.ServiceID, record.ContainerID,
+	`, generationID, true, record.ProviderID, record.ContextName, record.ProjectID, record.ServiceID, record.ContainerID,
 		string(record.Kind), record.ImageRef, record.BaseImageRef, record.LocalImageID,
 		record.LocalDigest, record.RemoteDigest, record.LineageID, record.BaseImageRefID,
 		string(record.Confidence), string(record.RecommendedAction), string(record.Status),
@@ -137,34 +148,332 @@ func insertCheck(ctx context.Context, exec updateCheckExecutor, record UpdateChe
 	return result.LastInsertId()
 }
 
-func (r *UpdateRepository) InsertChecks(ctx context.Context, records []UpdateCheckRecord) error {
-	return r.insertChecks(ctx, runtimescope.Scope{}, records)
+// BeginProjectCheckRunInScope reserves the ordering token before a project
+// snapshot is evaluated. A later run ID can supersede this run even when the
+// later publication contains no check rows.
+func (r *UpdateRepository) BeginProjectCheckRunInScope(ctx context.Context, scope runtimescope.Scope, projectID string, startedAt time.Time) (UpdateCheckRun, error) {
+	return r.beginCheckRunInScope(ctx, scope, projectID, "", startedAt)
 }
 
-func (r *UpdateRepository) InsertChecksInScope(ctx context.Context, scope runtimescope.Scope, records []UpdateCheckRecord) error {
+func (r *UpdateRepository) BeginServiceCheckRunInScope(ctx context.Context, scope runtimescope.Scope, projectID string, serviceID string, startedAt time.Time) (UpdateCheckRun, error) {
+	serviceID = strings.TrimSpace(serviceID)
+	if serviceID == "" {
+		return UpdateCheckRun{}, errors.New("service ID is required")
+	}
+	return r.beginCheckRunInScope(ctx, scope, projectID, serviceID, startedAt)
+}
+
+func (r *UpdateRepository) beginCheckRunInScope(ctx context.Context, scope runtimescope.Scope, projectID string, serviceID string, startedAt time.Time) (UpdateCheckRun, error) {
+	if !scope.Valid() {
+		return UpdateCheckRun{}, errors.New("runtime scope is required")
+	}
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return UpdateCheckRun{}, errors.New("project ID is required")
+	}
+	if startedAt.IsZero() {
+		startedAt = time.Now().UTC()
+	} else {
+		startedAt = startedAt.UTC()
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return UpdateCheckRun{}, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var exists int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT 1 FROM projects
+		WHERE id = ? AND provider_id = ? AND context_name = ?
+	`, projectID, scope.ProviderID(), scope.ContextName()).Scan(&exists); err != nil {
+		return UpdateCheckRun{}, err
+	}
+	if serviceID != "" {
+		if err := tx.QueryRowContext(ctx, `
+			SELECT 1 FROM services WHERE id = ? AND project_id = ?
+		`, serviceID, projectID).Scan(&exists); err != nil {
+			return UpdateCheckRun{}, err
+		}
+	}
+	leaseNow := time.Now().UTC()
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE image_update_check_runs
+		SET status = 'abandoned', finished_at = ?
+		WHERE provider_id = ? AND context_name = ? AND project_id = ?
+			AND status = 'running' AND julianday(reserved_at) < julianday(?)
+	`, formatTime(leaseNow), scope.ProviderID(), scope.ContextName(), projectID,
+		formatTime(leaseNow.Add(-updateCheckRunningLease))); err != nil {
+		return UpdateCheckRun{}, err
+	}
+	if err := pruneUpdateCheckRuns(ctx, tx, scope, projectID); err != nil {
+		return UpdateCheckRun{}, err
+	}
+	result, err := tx.ExecContext(ctx, `
+		INSERT INTO image_update_check_runs (
+			provider_id, context_name, project_id, service_id, started_at, status
+		) VALUES (?, ?, ?, ?, ?, 'running')
+	`, scope.ProviderID(), scope.ContextName(), projectID, serviceID, formatTime(startedAt))
+	if err != nil {
+		return UpdateCheckRun{}, err
+	}
+	runID, err := result.LastInsertId()
+	if err != nil {
+		return UpdateCheckRun{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return UpdateCheckRun{}, err
+	}
+	return UpdateCheckRun{
+		ID: runID, ProviderID: scope.ProviderID(), ContextName: scope.ContextName(),
+		ProjectID: projectID, ServiceID: serviceID, StartedAt: startedAt, Status: "running",
+	}, nil
+}
+
+// PublishCheckRunInScope atomically publishes a complete generation if no
+// equal-or-newer project/service head has already committed. accepted=false is
+// a successful supersession outcome; callers must read and return current state.
+func (r *UpdateRepository) PublishCheckRunInScope(ctx context.Context, scope runtimescope.Scope, runID int64, records []UpdateCheckRecord, completedAt time.Time) ([]UpdateCheckRecord, bool, error) {
+	if !scope.Valid() {
+		return nil, false, errors.New("runtime scope is required")
+	}
+	if runID <= 0 {
+		return nil, false, errors.New("update check run ID is required")
+	}
+	if completedAt.IsZero() {
+		completedAt = time.Now().UTC()
+	} else {
+		completedAt = completedAt.UTC()
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	run, err := scanUpdateCheckRun(tx.QueryRowContext(ctx, `
+		SELECT id, provider_id, context_name, project_id, service_id,
+			started_at, COALESCE(finished_at, ''), status
+		FROM image_update_check_runs
+		WHERE id = ? AND provider_id = ? AND context_name = ?
+	`, runID, scope.ProviderID(), scope.ContextName()))
+	if err != nil {
+		return nil, false, err
+	}
+	if run.Status != "running" {
+		return nil, false, nil
+	}
+	if err := validatePublishedChecks(scope, run, records); err != nil {
+		return nil, false, err
+	}
+	headQuery := `
+		SELECT COALESCE(MAX(last_run_id), 0)
+		FROM image_update_check_heads
+		WHERE provider_id = ? AND context_name = ? AND project_id = ?
+	`
+	headArgs := []any{scope.ProviderID(), scope.ContextName(), run.ProjectID}
+	if run.ServiceID != "" {
+		headQuery += ` AND service_id IN ('', ?)`
+		headArgs = append(headArgs, run.ServiceID)
+	}
+	var lastPublishedRunID int64
+	if err := tx.QueryRowContext(ctx, headQuery, headArgs...).Scan(&lastPublishedRunID); err != nil {
+		return nil, false, err
+	}
+	if lastPublishedRunID >= run.ID {
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE image_update_check_runs
+			SET status = 'superseded', finished_at = ?
+			WHERE id = ? AND status = 'running'
+		`, formatTime(completedAt), run.ID); err != nil {
+			return nil, false, err
+		}
+		if err := pruneUpdateCheckRuns(ctx, tx, scope, run.ProjectID); err != nil {
+			return nil, false, err
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, false, err
+		}
+		return nil, false, nil
+	}
+
+	demoteQuery := `
+		UPDATE image_update_checks
+		SET is_current = 0
+		WHERE provider_id = ? AND context_name = ? AND COALESCE(project_id, '') = ? AND is_current = 1
+	`
+	demoteArgs := []any{scope.ProviderID(), scope.ContextName(), run.ProjectID}
+	if run.ServiceID != "" {
+		demoteQuery += ` AND COALESCE(service_id, '') = ?`
+		demoteArgs = append(demoteArgs, run.ServiceID)
+	}
+	if _, err := tx.ExecContext(ctx, demoteQuery, demoteArgs...); err != nil {
+		return nil, false, err
+	}
+	published := make([]UpdateCheckRecord, len(records))
+	for i, record := range records {
+		record.CheckedAt = completedAt
+		record = normalizeUpdateCheck(record)
+		id, err := insertCheck(ctx, tx, record, run.ID)
+		if err != nil {
+			return nil, false, err
+		}
+		record.ID = id
+		record.GenerationID = run.ID
+		record.IsCurrent = true
+		published[i] = record
+	}
+	if run.ServiceID == "" {
+		if _, err := tx.ExecContext(ctx, `
+			DELETE FROM image_update_check_heads
+			WHERE provider_id = ? AND context_name = ? AND project_id = ? AND service_id <> ''
+		`, scope.ProviderID(), scope.ContextName(), run.ProjectID); err != nil {
+			return nil, false, err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO image_update_check_heads (
+			provider_id, context_name, project_id, service_id, last_run_id
+		) VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(provider_id, context_name, project_id, service_id) DO UPDATE SET
+			last_run_id = excluded.last_run_id
+	`, scope.ProviderID(), scope.ContextName(), run.ProjectID, run.ServiceID, run.ID); err != nil {
+		return nil, false, err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE image_update_check_runs
+		SET status = 'published', finished_at = ?
+		WHERE id = ? AND status = 'running'
+	`, formatTime(completedAt), run.ID); err != nil {
+		return nil, false, err
+	}
+	if err := pruneUpdateCheckHistory(ctx, tx, scope, run.ProjectID, completedAt); err != nil {
+		return nil, false, err
+	}
+	if err := pruneUpdateCheckRuns(ctx, tx, scope, run.ProjectID); err != nil {
+		return nil, false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, false, err
+	}
+	return published, true, nil
+}
+
+func validatePublishedChecks(scope runtimescope.Scope, run UpdateCheckRun, records []UpdateCheckRecord) error {
+	for _, record := range records {
+		if !scope.Matches(record.ProviderID, record.ContextName) {
+			return errors.New("update check does not belong to the runtime scope")
+		}
+		if record.ProjectID != run.ProjectID {
+			return errors.New("update check does not belong to the project")
+		}
+		if strings.TrimSpace(record.ServiceID) == "" {
+			return errors.New("update check service ID is required")
+		}
+		if run.ServiceID != "" && record.ServiceID != run.ServiceID {
+			return errors.New("update check does not belong to the service")
+		}
+	}
+	return nil
+}
+
+func (r *UpdateRepository) AbandonCheckRunInScope(ctx context.Context, scope runtimescope.Scope, runID int64, finishedAt time.Time) error {
 	if !scope.Valid() {
 		return errors.New("runtime scope is required")
 	}
-	return r.insertChecks(ctx, scope, records)
-}
-
-func (r *UpdateRepository) insertChecks(ctx context.Context, scope runtimescope.Scope, records []UpdateCheckRecord) error {
+	if runID <= 0 {
+		return errors.New("update check run ID is required")
+	}
+	if finishedAt.IsZero() {
+		finishedAt = time.Now().UTC()
+	}
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	defer func() {
-		_ = tx.Rollback()
-	}()
-	for _, record := range records {
-		if scope.Valid() && !scope.Matches(record.ProviderID, record.ContextName) {
-			return errors.New("update check does not belong to the runtime scope")
-		}
-		if _, err := insertCheck(ctx, tx, record); err != nil {
-			return err
-		}
+	defer func() { _ = tx.Rollback() }()
+	var projectID string
+	err = tx.QueryRowContext(ctx, `
+		SELECT project_id FROM image_update_check_runs
+		WHERE id = ? AND provider_id = ? AND context_name = ?
+	`, runID, scope.ProviderID(), scope.ContextName()).Scan(&projectID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE image_update_check_runs
+		SET status = 'abandoned', finished_at = ?
+		WHERE id = ? AND status = 'running'
+	`, formatTime(finishedAt), runID); err != nil {
+		return err
+	}
+	if err := pruneUpdateCheckRuns(ctx, tx, scope, projectID); err != nil {
+		return err
 	}
 	return tx.Commit()
+}
+
+func scanUpdateCheckRun(scanner interface{ Scan(...any) error }) (UpdateCheckRun, error) {
+	var run UpdateCheckRun
+	var startedAt string
+	var finishedAt string
+	if err := scanner.Scan(
+		&run.ID, &run.ProviderID, &run.ContextName, &run.ProjectID, &run.ServiceID,
+		&startedAt, &finishedAt, &run.Status,
+	); err != nil {
+		return UpdateCheckRun{}, err
+	}
+	run.StartedAt = parseStoreTime(startedAt)
+	run.FinishedAt = parseStoreTime(finishedAt)
+	return run, nil
+}
+
+func pruneUpdateCheckHistory(ctx context.Context, tx *sql.Tx, scope runtimescope.Scope, projectID string, completedAt time.Time) error {
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM image_update_checks
+		WHERE provider_id = ? AND context_name = ? AND COALESCE(project_id, '') = ?
+			AND is_current = 0 AND julianday(checked_at) < julianday(?)
+	`, scope.ProviderID(), scope.ContextName(), projectID,
+		formatTime(completedAt.Add(-updateCheckHistoryRetention))); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `
+		DELETE FROM image_update_checks
+		WHERE provider_id = ? AND context_name = ? AND COALESCE(project_id, '') = ?
+			AND is_current = 0
+			AND generation_id NOT IN (
+				SELECT generation_id
+				FROM image_update_checks
+				WHERE provider_id = ? AND context_name = ? AND COALESCE(project_id, '') = ?
+					AND is_current = 0
+				GROUP BY generation_id
+				ORDER BY generation_id DESC
+				LIMIT ?
+			)
+	`, scope.ProviderID(), scope.ContextName(), projectID,
+		scope.ProviderID(), scope.ContextName(), projectID, updateCheckHistoryKeepGenerations)
+	return err
+}
+
+func pruneUpdateCheckRuns(ctx context.Context, tx *sql.Tx, scope runtimescope.Scope, projectID string) error {
+	_, err := tx.ExecContext(ctx, `
+		DELETE FROM image_update_check_runs AS candidate
+		WHERE candidate.provider_id = ? AND candidate.context_name = ? AND candidate.project_id = ?
+			AND candidate.status <> 'running'
+			AND NOT EXISTS (
+				SELECT 1 FROM image_update_check_heads
+				WHERE last_run_id = candidate.id
+			)
+			AND NOT EXISTS (
+				SELECT 1 FROM image_update_checks
+				WHERE generation_id = candidate.id
+					AND provider_id = candidate.provider_id
+					AND context_name = candidate.context_name
+					AND COALESCE(project_id, '') = candidate.project_id
+			)
+	`, scope.ProviderID(), scope.ContextName(), projectID)
+	return err
 }
 
 func (r *UpdateRepository) GetCheck(ctx context.Context, id int64) (UpdateCheckRecord, error) {
@@ -189,6 +498,27 @@ func (r *UpdateRepository) ListCurrentInScope(ctx context.Context, scope runtime
 		return nil, errors.New("runtime scope is required")
 	}
 	return r.listCurrent(ctx, scope, filter)
+}
+
+func (r *UpdateRepository) ListCurrentServiceChecksInScope(ctx context.Context, scope runtimescope.Scope, projectID string, serviceID string) ([]UpdateCheckRecord, error) {
+	if !scope.Valid() {
+		return nil, errors.New("runtime scope is required")
+	}
+	serviceID = strings.TrimSpace(serviceID)
+	if serviceID == "" {
+		return nil, errors.New("service ID is required")
+	}
+	records, err := r.listLatestChecks(ctx, scope, strings.TrimSpace(projectID))
+	if err != nil {
+		return nil, err
+	}
+	result := make([]UpdateCheckRecord, 0, len(records))
+	for _, record := range records {
+		if record.ServiceID == serviceID {
+			result = append(result, record)
+		}
+	}
+	return result, nil
 }
 
 func (r *UpdateRepository) listCurrent(ctx context.Context, scope runtimescope.Scope, filter models.UpdateFilter) ([]UpdateCheckRecord, error) {
@@ -738,12 +1068,8 @@ type updateHistoryScanner interface {
 
 func (r *UpdateRepository) listLatestChecks(ctx context.Context, scope runtimescope.Scope, projectID string) ([]UpdateCheckRecord, error) {
 	args := []any{}
-	query := updateCheckSelectSQL() + `
-		JOIN (
-			SELECT MAX(id) AS latest_id
-			FROM image_update_checks
-`
-	conditions := make([]string, 0, 2)
+	query := updateCheckSelectSQL()
+	conditions := []string{`is_current = 1`}
 	if scope.Valid() {
 		conditions = append(conditions, `provider_id = ? AND context_name = ?`)
 		args = append(args, scope.ProviderID(), scope.ContextName())
@@ -752,13 +1078,8 @@ func (r *UpdateRepository) listLatestChecks(ctx context.Context, scope runtimesc
 		conditions = append(conditions, `COALESCE(project_id, '') = ?`)
 		args = append(args, projectID)
 	}
-	if len(conditions) > 0 {
-		query += `			WHERE ` + strings.Join(conditions, ` AND `) + `
-`
-	}
-	query += `			GROUP BY COALESCE(project_id, ''), provider_id, context_name, COALESCE(service_id, ''),
-				COALESCE(container_id, ''), kind, image_ref, COALESCE(base_image_ref, '')
-		) latest ON latest.latest_id = image_update_checks.id
+	query += `
+		WHERE ` + strings.Join(conditions, ` AND `) + `
 		ORDER BY COALESCE(project_id, ''), COALESCE(service_id, ''), kind, image_ref, COALESCE(base_image_ref, '')
 	`
 	rows, err := r.db.QueryContext(ctx, query, args...)
@@ -827,7 +1148,7 @@ func (r *UpdateRepository) listIgnored(ctx context.Context, scope runtimescope.S
 
 func updateCheckSelectSQL() string {
 	return `
-		SELECT id, provider_id, context_name, COALESCE(project_id, ''), COALESCE(service_id, ''),
+		SELECT id, generation_id, is_current, provider_id, context_name, COALESCE(project_id, ''), COALESCE(service_id, ''),
 			COALESCE(container_id, ''), kind, image_ref, COALESCE(base_image_ref, ''),
 			COALESCE(local_image_id, ''), COALESCE(local_digest, ''),
 			COALESCE(remote_digest, ''), COALESCE(lineage_id, 0),
@@ -844,8 +1165,11 @@ type updateCheckScanner interface {
 func scanUpdateCheck(scanner updateCheckScanner) (UpdateCheckRecord, error) {
 	var record UpdateCheckRecord
 	var checkedAt string
+	var isCurrent int
 	if err := scanner.Scan(
 		&record.ID,
+		&record.GenerationID,
+		&isCurrent,
 		&record.ProviderID,
 		&record.ContextName,
 		&record.ProjectID,
@@ -867,6 +1191,7 @@ func scanUpdateCheck(scanner updateCheckScanner) (UpdateCheckRecord, error) {
 	); err != nil {
 		return UpdateCheckRecord{}, err
 	}
+	record.IsCurrent = isCurrent == 1
 	record.CheckedAt = parseStoreTime(checkedAt)
 	if record.Confidence == "" {
 		record.Confidence = models.ConfidenceUnknown

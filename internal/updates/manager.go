@@ -69,10 +69,17 @@ type Manager struct {
 	startOnce sync.Once
 	planMu    sync.Mutex
 	plans     map[string]updatePlanRecord
+	checkMu   sync.Mutex
+	checkLock map[string]*projectCheckLock
 
 	jobsMu  sync.Mutex
 	rootCtx context.Context
 	jobs    map[string]context.CancelFunc
+}
+
+type projectCheckLock struct {
+	mu   sync.Mutex
+	refs int
 }
 
 type checkProgressPayload struct {
@@ -84,18 +91,19 @@ type checkProgressPayload struct {
 
 func NewManager(projects *store.ProjectRepository, lineage *store.LineageRepository, updates *store.UpdateRepository, objects *store.ObjectCacheRepository, images ImageInspector, registry RegistryResolver, settings *store.SettingsRepository, events bus.Bus, discover LineageDiscoverer) *Manager {
 	manager := &Manager{
-		Projects: projects,
-		Lineage:  lineage,
-		Updates:  updates,
-		Objects:  objects,
-		Images:   images,
-		Registry: registry,
-		Settings: settings,
-		Events:   events,
-		Discover: discover,
-		Now:      func() time.Time { return time.Now().UTC() },
-		plans:    map[string]updatePlanRecord{},
-		jobs:     map[string]context.CancelFunc{},
+		Projects:  projects,
+		Lineage:   lineage,
+		Updates:   updates,
+		Objects:   objects,
+		Images:    images,
+		Registry:  registry,
+		Settings:  settings,
+		Events:    events,
+		Discover:  discover,
+		Now:       func() time.Time { return time.Now().UTC() },
+		plans:     map[string]updatePlanRecord{},
+		checkLock: map[string]*projectCheckLock{},
+		jobs:      map[string]context.CancelFunc{},
 	}
 	if dockerRuntime, ok := images.(DockerRuntime); ok {
 		manager.Docker = dockerRuntime
@@ -153,6 +161,19 @@ func (m *Manager) CheckProjectUpdates(ctx context.Context, projectID string) ([]
 	if err := m.ready(); err != nil {
 		return nil, err
 	}
+	unlock := m.lockProjectCheck(projectID)
+	defer unlock()
+	now := m.now()
+	run, err := m.Updates.BeginProjectCheckRunInScope(ctx, m.Scope, projectID, now)
+	if err != nil {
+		return nil, mapStoreError(err, "Project was not found")
+	}
+	runOpen := true
+	defer func() {
+		if runOpen {
+			m.abandonCheckRun(ctx, run.ID)
+		}
+	}()
 	if m.Discover != nil {
 		if _, err := m.Discover.DiscoverProjectLineage(ctx, projectID); err != nil {
 			return nil, err
@@ -167,15 +188,14 @@ func (m *Manager) CheckProjectUpdates(ctx context.Context, projectID string) ([]
 		return nil, err
 	}
 	containers := m.containersByService(ctx, project)
-	now := m.now()
+	checks := make([]store.UpdateCheckRecord, 0, len(services))
 	for _, service := range services {
-		checks := m.checkService(ctx, project, service, lineageByService[service.Name], containers[service.Name], now)
-		for _, check := range checks {
-			if _, err := m.Updates.InsertCheckInScope(ctx, m.Scope, check); err != nil {
-				return nil, apperror.Wrap(apperror.Internal, "Persist update check failed", err)
-			}
-		}
+		checks = append(checks, m.checkService(ctx, project, service, lineageByService[service.Name], containers[service.Name], now)...)
 	}
+	if _, _, err := m.Updates.PublishCheckRunInScope(ctx, m.Scope, run.ID, checks, m.now()); err != nil {
+		return nil, apperror.Wrap(apperror.Internal, "Publish update check generation failed", err)
+	}
+	runOpen = false
 	return m.ListCurrentUpdates(ctx, models.UpdateFilter{ProjectID: projectID})
 }
 
@@ -183,6 +203,33 @@ func (m *Manager) CheckServiceUpdate(ctx context.Context, projectID string, serv
 	if err := m.ready(); err != nil {
 		return nil, err
 	}
+	unlock := m.lockProjectCheck(projectID)
+	defer unlock()
+	_, initialServices, err := m.projectWithServices(ctx, projectID)
+	if err != nil {
+		return nil, err
+	}
+	var serviceID string
+	for _, service := range initialServices {
+		if service.Name == serviceName {
+			serviceID = service.ID
+			break
+		}
+	}
+	if serviceID == "" {
+		return nil, apperror.New(apperror.NotFound, "Service was not found", apperror.WithDetail(serviceName))
+	}
+	now := m.now()
+	run, err := m.Updates.BeginServiceCheckRunInScope(ctx, m.Scope, projectID, serviceID, now)
+	if err != nil {
+		return nil, mapStoreError(err, "Service was not found")
+	}
+	runOpen := true
+	defer func() {
+		if runOpen {
+			m.abandonCheckRun(ctx, run.ID)
+		}
+	}()
 	if m.Discover != nil {
 		if _, err := m.Discover.DiscoverProjectLineage(ctx, projectID); err != nil {
 			return nil, err
@@ -198,21 +245,61 @@ func (m *Manager) CheckServiceUpdate(ctx context.Context, projectID string, serv
 	}
 	containers := m.containersByService(ctx, project)
 	for _, service := range services {
-		if service.Name != serviceName {
+		if service.ID != serviceID || service.Name != serviceName {
 			continue
 		}
-		checks := m.checkService(ctx, project, service, lineageByService[service.Name], containers[service.Name], m.now())
-		for i := range checks {
-			id, err := m.Updates.InsertCheckInScope(ctx, m.Scope, checks[i])
-			if err != nil {
-				return nil, apperror.Wrap(apperror.Internal, "Persist service update check failed", err)
-			}
-			checks[i].ID = id
+		checks := m.checkService(ctx, project, service, lineageByService[service.Name], containers[service.Name], now)
+		_, _, err = m.Updates.PublishCheckRunInScope(ctx, m.Scope, run.ID, checks, m.now())
+		if err != nil {
+			return nil, apperror.Wrap(apperror.Internal, "Publish service update check generation failed", err)
 		}
-		model := primaryUpdate(checks).ToModel()
-		return &model, nil
+		runOpen = false
+		return m.currentServiceUpdate(ctx, projectID, service.ID)
 	}
 	return nil, apperror.New(apperror.NotFound, "Service was not found", apperror.WithDetail(serviceName))
+}
+
+func (m *Manager) lockProjectCheck(projectID string) func() {
+	projectID = strings.TrimSpace(projectID)
+	m.checkMu.Lock()
+	if m.checkLock == nil {
+		m.checkLock = map[string]*projectCheckLock{}
+	}
+	lock := m.checkLock[projectID]
+	if lock == nil {
+		lock = &projectCheckLock{}
+		m.checkLock[projectID] = lock
+	}
+	lock.refs++
+	m.checkMu.Unlock()
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		m.checkMu.Lock()
+		lock.refs--
+		if lock.refs == 0 && m.checkLock[projectID] == lock {
+			delete(m.checkLock, projectID)
+		}
+		m.checkMu.Unlock()
+	}
+}
+
+func (m *Manager) abandonCheckRun(ctx context.Context, runID int64) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	_ = m.Updates.AbandonCheckRunInScope(cleanupCtx, m.Scope, runID, m.now())
+}
+
+func (m *Manager) currentServiceUpdate(ctx context.Context, projectID string, serviceID string) (*models.ImageUpdate, error) {
+	records, err := m.Updates.ListCurrentServiceChecksInScope(ctx, m.Scope, projectID, serviceID)
+	if err != nil {
+		return nil, apperror.Wrap(apperror.Internal, "Load current service update failed", err)
+	}
+	if len(records) == 0 {
+		return nil, apperror.New(apperror.NotFound, "Current service update was superseded or removed")
+	}
+	model := primaryUpdate(records).ToModel()
+	return &model, nil
 }
 
 func (m *Manager) startJob(jobID string, run func(context.Context)) {
