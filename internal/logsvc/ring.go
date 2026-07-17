@@ -9,44 +9,92 @@ import (
 )
 
 type ringBuffer struct {
-	limit        int
-	lines        []models.LogLine
-	start        int
-	dropped      int64
-	nextSequence uint64
+	limit         int
+	byteLimit     int64
+	entries       []ringEntry
+	start         int
+	retainedBytes int64
+	dropped       int64
+	nextSequence  uint64
 }
 
-func newRingBuffer(limit int) *ringBuffer {
+type ringEntry struct {
+	line models.LogLine
+	size int64
+}
+
+func newRingBuffer(limit int, byteLimits ...int64) *ringBuffer {
 	if limit <= 0 {
 		limit = defaultRingSize
 	}
-	return &ringBuffer{limit: limit}
+	byteLimit := defaultRingBytes
+	if len(byteLimits) > 0 && byteLimits[0] > 0 {
+		byteLimit = byteLimits[0]
+	}
+	return &ringBuffer{limit: limit, byteLimit: byteLimit}
 }
 
 func (r *ringBuffer) add(line models.LogLine) models.LogLine {
 	r.nextSequence++
 	line.Sequence = r.nextSequence
-	if len(r.lines) < r.limit {
-		r.lines = append(r.lines, line)
+	size := retainedLogLineBytes(line)
+	if size > r.byteLimit {
+		r.dropped++
 		return line
 	}
-	r.lines[r.start] = line
-	r.start = (r.start + 1) % r.limit
-	r.dropped++
+	for r.retainedCount() > 0 && (r.retainedCount() >= r.limit || r.retainedBytes+size > r.byteLimit) {
+		r.evictOldest()
+	}
+	r.compact()
+	r.entries = append(r.entries, ringEntry{line: line, size: size})
+	r.retainedBytes += size
 	return line
 }
 
 func (r *ringBuffer) snapshot() []models.LogLine {
-	if len(r.lines) == 0 {
+	if r.retainedCount() == 0 {
 		return []models.LogLine{}
 	}
-	if len(r.lines) < r.limit || r.start == 0 {
-		return append([]models.LogLine(nil), r.lines...)
+	lines := make([]models.LogLine, 0, r.retainedCount())
+	for _, entry := range r.entries[r.start:] {
+		lines = append(lines, entry.line)
 	}
-	lines := make([]models.LogLine, 0, len(r.lines))
-	lines = append(lines, r.lines[r.start:]...)
-	lines = append(lines, r.lines[:r.start]...)
 	return lines
+}
+
+func (r *ringBuffer) retainedCount() int {
+	return len(r.entries) - r.start
+}
+
+func (r *ringBuffer) evictOldest() {
+	entry := &r.entries[r.start]
+	r.retainedBytes -= entry.size
+	*entry = ringEntry{}
+	r.start++
+	r.dropped++
+}
+
+func (r *ringBuffer) compact() {
+	if r.start == 0 {
+		return
+	}
+	if r.start == len(r.entries) {
+		r.entries = r.entries[:0]
+		r.start = 0
+		return
+	}
+	if r.start < 1024 && r.start*2 < len(r.entries) {
+		return
+	}
+	copy(r.entries, r.entries[r.start:])
+	r.entries = r.entries[:len(r.entries)-r.start]
+	r.start = 0
+}
+
+func retainedLogLineBytes(line models.LogLine) int64 {
+	const retainedStructOverhead = 192
+	return int64(retainedStructOverhead + len(line.ContainerID) + len(line.ContainerName) +
+		len(line.Service) + len(line.Stream) + len(line.Level) + len(line.Text))
 }
 
 func SortLines(lines []models.LogLine) {

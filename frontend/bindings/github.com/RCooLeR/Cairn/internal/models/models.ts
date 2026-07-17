@@ -2176,12 +2176,28 @@ export class LogPageRequest {
 
 export class LogRuntimeDiagnostics {
     "activeStreams": number;
+    "pendingStreams": number;
+    "drainingStreams": number;
+    "reservedReaders": number;
+    "retainedBytes": number;
     "activeProducers": number;
 
     /** Creates a new LogRuntimeDiagnostics instance. */
     constructor($$source: Partial<LogRuntimeDiagnostics> = {}) {
         if (!("activeStreams" in $$source)) {
             this["activeStreams"] = 0;
+        }
+        if (!("pendingStreams" in $$source)) {
+            this["pendingStreams"] = 0;
+        }
+        if (!("drainingStreams" in $$source)) {
+            this["drainingStreams"] = 0;
+        }
+        if (!("reservedReaders" in $$source)) {
+            this["reservedReaders"] = 0;
+        }
+        if (!("retainedBytes" in $$source)) {
+            this["retainedBytes"] = 0;
         }
         if (!("activeProducers" in $$source)) {
             this["activeProducers"] = 0;

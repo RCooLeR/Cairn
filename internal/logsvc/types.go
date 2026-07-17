@@ -17,15 +17,24 @@ const (
 	ScopeProject   = "project"
 	ScopeAll       = "all"
 
-	defaultRingSize      = 50000
-	defaultInputBuffer   = 1000
-	defaultBatchMaxLines = 200
-	defaultBatchWindow   = 50 * time.Millisecond
-	defaultFetchTail     = 5000
-	streamStopTimeout    = 5 * time.Second
-	defaultRetryAttempts = 8
-	defaultRetryInitial  = 250 * time.Millisecond
-	defaultRetryMaximum  = 5 * time.Second
+	defaultRingSize                  = 50000
+	defaultInputBuffer               = 1000
+	defaultBatchMaxLines             = 200
+	defaultBatchWindow               = 50 * time.Millisecond
+	defaultFetchTail                 = 5000
+	defaultRetryAttempts             = 8
+	defaultRetryInitial              = 250 * time.Millisecond
+	defaultRetryMaximum              = 5 * time.Second
+	defaultRetryHealthyAfter         = 30 * time.Second
+	defaultStopTimeout               = 5 * time.Second
+	defaultMaxStreams                = 8
+	defaultMaxScopeStreams           = 4
+	defaultMaxReadersPerStream       = 64
+	defaultMaxReaders                = 128
+	defaultRingBytes           int64 = 8 * 1024 * 1024
+	defaultInputBytes          int64 = 4 * 1024 * 1024
+	defaultBatchBytes          int64 = 4 * 1024 * 1024
+	minimumBatchBytes          int64 = 1024
 )
 
 type DockerClient interface {
@@ -42,6 +51,15 @@ type Options struct {
 	ReaderRetryAttempts int
 	ReaderRetryInitial  time.Duration
 	ReaderRetryMaximum  time.Duration
+	ReaderRetryHealthy  time.Duration
+	StopTimeout         time.Duration
+	MaxStreams          int
+	MaxScopeStreams     int
+	MaxReadersPerStream int
+	MaxReaders          int
+	RingBytes           int64
+	InputBytes          int64
+	BatchBytes          int64
 	Now                 func() time.Time
 }
 
@@ -49,17 +67,34 @@ type Manager struct {
 	Docker DockerClient
 	Events bus.Bus
 
-	ringSize      int
-	inputBuffer   int
-	batchMaxLines int
-	batchWindow   time.Duration
-	retryAttempts int
-	retryInitial  time.Duration
-	retryMaximum  time.Duration
-	now           func() time.Time
+	ringSize            int
+	inputBuffer         int
+	batchMaxLines       int
+	batchWindow         time.Duration
+	retryAttempts       int
+	retryInitial        time.Duration
+	retryMaximum        time.Duration
+	retryHealthy        time.Duration
+	stopTimeout         time.Duration
+	maxStreams          int
+	maxScopeStreams     int
+	maxReadersPerStream int
+	maxReaders          int
+	ringBytes           int64
+	inputBytes          int64
+	batchBytes          int64
+	now                 func() time.Time
 
-	mu       sync.Mutex
-	sessions map[string]*session
+	mu                  sync.Mutex
+	sessions            map[string]*session
+	draining            map[string]*session
+	pendingScopeStreams map[string]int
+	pendingStarts       sync.WaitGroup
+	pendingStreams      int
+	reservedReaders     int
+	rootCtx             context.Context
+	rootCancel          context.CancelFunc
+	closed              bool
 }
 
 type LinesPayload struct {

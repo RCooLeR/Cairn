@@ -251,6 +251,10 @@ type StdioConnectionDiagnostic struct {
 
 type LogRuntimeDiagnostics struct {
 	ActiveStreams   int   `json:"activeStreams"`
+	PendingStreams  int   `json:"pendingStreams"`
+	DrainingStreams int   `json:"drainingStreams"`
+	ReservedReaders int   `json:"reservedReaders"`
+	RetainedBytes   int64 `json:"retainedBytes"`
 	ActiveProducers int64 `json:"activeProducers"`
 }
 

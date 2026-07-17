@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -13,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/bus"
 	dockercore "github.com/RCooLeR/Cairn/internal/docker"
 	"github.com/RCooLeR/Cairn/internal/models"
@@ -128,6 +131,63 @@ func TestReadDockerLogStreamPlainRecordsUseTheSameBoundedSemantics(t *testing.T)
 	}
 }
 
+func TestReadDockerLogStreamStreamsMaximumFrameThroughBoundedScratch(t *testing.T) {
+	header := make([]byte, 8)
+	header[0] = 1
+	binary.BigEndian.PutUint32(header[4:], maxDockerLogFrame)
+	payload := &boundedFillReader{remaining: maxDockerLogFrame, value: 'x'}
+	reader := io.MultiReader(bytes.NewReader(header), payload)
+	var lines []models.LogLine
+
+	err := ReadDockerLogStream(context.Background(), reader, sourceInfo{}, time.Now, func(line models.LogLine) bool {
+		lines = append(lines, line)
+		return true
+	})
+	if err != nil {
+		t.Fatalf("ReadDockerLogStream() error = %v", err)
+	}
+	if payload.maxRequest > dockerLogReadChunkBytes {
+		t.Fatalf("largest frame-body read = %d, scratch limit = %d", payload.maxRequest, dockerLogReadChunkBytes)
+	}
+	if len(lines) != 1 || !lines[0].Truncated {
+		t.Fatalf("maximum-frame lines = %#v", lines)
+	}
+}
+
+func TestReadDockerLogStreamShortFrameUsesOnlyBytesActuallyRead(t *testing.T) {
+	header := make([]byte, 8)
+	header[0] = 1
+	binary.BigEndian.PutUint32(header[4:], 1024)
+	var lines []models.LogLine
+
+	err := ReadDockerLogStream(context.Background(), io.MultiReader(bytes.NewReader(header), strings.NewReader("partial")), sourceInfo{}, time.Now, func(line models.LogLine) bool {
+		lines = append(lines, line)
+		return true
+	})
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("ReadDockerLogStream() error = %v, want io.ErrUnexpectedEOF", err)
+	}
+	if len(lines) != 1 || lines[0].Text != "partial" || strings.ContainsRune(lines[0].Text, '\x00') {
+		t.Fatalf("short-frame lines = %#v", lines)
+	}
+}
+
+func TestReadDockerLogStreamRejectsPartialHeaderAfterValidFrame(t *testing.T) {
+	input := bytes.NewBuffer(dockerLogFrame(1, "2026-06-13T09:00:00Z INFO complete\n"))
+	input.Write([]byte{1, 0, 0})
+	var lines []models.LogLine
+	err := ReadDockerLogStream(context.Background(), input, sourceInfo{}, time.Now, func(line models.LogLine) bool {
+		lines = append(lines, line)
+		return true
+	})
+	if !errors.Is(err, io.ErrUnexpectedEOF) {
+		t.Fatalf("ReadDockerLogStream() error = %v, want io.ErrUnexpectedEOF", err)
+	}
+	if len(lines) != 1 || lines[0].Text != "INFO complete" {
+		t.Fatalf("lines before partial header = %#v", lines)
+	}
+}
+
 func TestRingDropsOldestAndCursorPages(t *testing.T) {
 	ring := newRingBuffer(2)
 	base := time.Date(2026, 6, 13, 9, 0, 0, 0, time.UTC)
@@ -146,6 +206,32 @@ func TestRingDropsOldestAndCursorPages(t *testing.T) {
 	next := pageLines(lines, page.NextCursor, 1)
 	if len(next.Lines) != 1 || next.Lines[0].Text != "three" {
 		t.Fatalf("next page = %#v", next)
+	}
+}
+
+func TestRingEnforcesRetainedByteBudget(t *testing.T) {
+	line := models.LogLine{ContainerID: "container", Stream: "stdout", Text: strings.Repeat("x", 128)}
+	lineBytes := retainedLogLineBytes(line)
+	ring := newRingBuffer(10, lineBytes*2)
+
+	ring.add(models.LogLine{ContainerID: "container", Stream: "stdout", Text: strings.Repeat("a", 128)})
+	ring.add(models.LogLine{ContainerID: "container", Stream: "stdout", Text: strings.Repeat("b", 128)})
+	ring.add(models.LogLine{ContainerID: "container", Stream: "stdout", Text: strings.Repeat("c", 128)})
+
+	lines := ring.snapshot()
+	if ring.retainedBytes > ring.byteLimit {
+		t.Fatalf("retained bytes = %d, limit = %d", ring.retainedBytes, ring.byteLimit)
+	}
+	if ring.dropped != 1 || len(lines) != 2 || lines[0].Text != strings.Repeat("b", 128) {
+		t.Fatalf("byte-bounded ring dropped=%d lines=%#v", ring.dropped, lines)
+	}
+
+	oversized := ring.add(models.LogLine{Text: strings.Repeat("z", int(ring.byteLimit)+1)})
+	if oversized.Sequence != 4 {
+		t.Fatalf("oversized line sequence = %d, want 4", oversized.Sequence)
+	}
+	if got := ring.snapshot(); len(got) != 2 {
+		t.Fatalf("oversized line was retained: %#v", got)
 	}
 }
 
@@ -255,6 +341,352 @@ func TestStopStreamClosesBlockingLogReader(t *testing.T) {
 	}
 }
 
+func TestManagerCapsConcurrentLogStreams(t *testing.T) {
+	ctx := context.Background()
+	docker := newFakeLogDocker()
+	manager := NewManager(docker, nil, Options{
+		MaxStreams:         3,
+		MaxScopeStreams:    3,
+		ReaderRetryInitial: time.Minute,
+		ReaderRetryMaximum: time.Minute,
+	})
+
+	const attempts = 24
+	results := make(chan struct {
+		id  string
+		err error
+	}, attempts)
+	var starts sync.WaitGroup
+	for range attempts {
+		starts.Add(1)
+		go func() {
+			defer starts.Done()
+			id, err := manager.StartLogStream(ctx, models.LogStreamRequest{
+				Scope:  ScopeContainer,
+				IDs:    []string{"container-1"},
+				Follow: true,
+			})
+			results <- struct {
+				id  string
+				err error
+			}{id: id, err: err}
+		}()
+	}
+	starts.Wait()
+	close(results)
+
+	var admitted []string
+	for result := range results {
+		if result.err == nil {
+			admitted = append(admitted, result.id)
+			continue
+		}
+		if !apperror.IsCode(result.err, apperror.Conflict) {
+			t.Fatalf("rejected StartLogStream() error = %v, want conflict", result.err)
+		}
+	}
+	if len(admitted) != 3 {
+		t.Fatalf("admitted streams = %d, want 3", len(admitted))
+	}
+	manager.mu.Lock()
+	streams := len(manager.sessions)
+	readers := manager.reservedReaders
+	manager.mu.Unlock()
+	if streams != 3 || readers != 3 {
+		t.Fatalf("capacity state streams=%d readers=%d, want 3/3", streams, readers)
+	}
+	manager.StopAll()
+	manager.mu.Lock()
+	readers = manager.reservedReaders
+	manager.mu.Unlock()
+	if readers != 0 {
+		t.Fatalf("reserved readers after StopAll = %d, want 0", readers)
+	}
+}
+
+func TestManagerReservesPendingAdmissionAndStopCancelsResolution(t *testing.T) {
+	docker := newBlockingResolveLogDocker()
+	manager := NewManager(docker, nil, Options{
+		MaxStreams:      3,
+		MaxScopeStreams: 3,
+		StopTimeout:     200 * time.Millisecond,
+	})
+	const attempts = 24
+	results := make(chan error, attempts)
+	var callers sync.WaitGroup
+	for range attempts {
+		callers.Add(1)
+		go func() {
+			defer callers.Done()
+			_, err := manager.StartLogStream(context.Background(), models.LogStreamRequest{Scope: ScopeAll, Follow: true})
+			results <- err
+		}()
+	}
+	docker.waitForCalls(t, 3)
+	time.Sleep(20 * time.Millisecond)
+	if calls := docker.callCount(); calls != 3 {
+		t.Fatalf("Docker resolutions = %d, want exactly three admitted pending starts", calls)
+	}
+	manager.StopAll()
+	callers.Wait()
+	close(results)
+	for err := range results {
+		if err == nil {
+			t.Fatal("pending start survived StopAll")
+		}
+	}
+	if got := manager.Diagnostics(); got.ActiveStreams != 0 || got.PendingStreams != 0 || got.DrainingStreams != 0 {
+		t.Fatalf("diagnostics after pending shutdown = %#v", got)
+	}
+	if _, err := manager.StartLogStream(context.Background(), models.LogStreamRequest{Scope: ScopeAll}); !apperror.IsCode(err, apperror.ProviderNotReady) {
+		t.Fatalf("StartLogStream(after StopAll) error = %v, want provider-not-ready", err)
+	}
+}
+
+func TestTimedOutStopKeepsSessionDrainingAndCharged(t *testing.T) {
+	reader := newStubbornLogReader()
+	docker := newFakeLogDocker()
+	docker.readers["container-1"] = reader
+	manager := NewManager(docker, nil, Options{
+		MaxStreams:      1,
+		MaxScopeStreams: 1,
+		StopTimeout:     20 * time.Millisecond,
+	})
+	streamID, err := manager.StartLogStream(context.Background(), models.LogStreamRequest{
+		Scope: ScopeContainer, IDs: []string{"container-1"}, Follow: true,
+	})
+	if err != nil {
+		t.Fatalf("StartLogStream() error = %v", err)
+	}
+	reader.waitStarted(t)
+	if err := manager.StopStream(streamID); !apperror.IsCode(err, apperror.Timeout) {
+		t.Fatalf("StopStream() error = %v, want timeout", err)
+	}
+	if got := manager.Diagnostics(); got.ActiveStreams != 0 || got.DrainingStreams != 1 || got.ReservedReaders != 1 {
+		t.Fatalf("diagnostics while reader is stuck = %#v", got)
+	}
+	if _, err := manager.StartLogStream(context.Background(), models.LogStreamRequest{
+		Scope: ScopeContainer, IDs: []string{"container-1"}, Follow: true,
+	}); !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("StartLogStream(while draining) error = %v, want conflict", err)
+	}
+	reader.release()
+	waitForLogDiagnostics(t, manager, func(value models.LogRuntimeDiagnostics) bool {
+		return value.DrainingStreams == 0 && value.ReservedReaders == 0 && value.ActiveProducers == 0
+	})
+}
+
+func TestReaderCloseMustFinishBeforeSessionReleasesCapacity(t *testing.T) {
+	reader := newBlockingCloseLogReader()
+	docker := newFakeLogDocker()
+	docker.readers["container-1"] = reader
+	manager := NewManager(docker, nil, Options{
+		MaxStreams:      1,
+		MaxScopeStreams: 1,
+		StopTimeout:     20 * time.Millisecond,
+	})
+	streamID, err := manager.StartLogStream(context.Background(), models.LogStreamRequest{
+		Scope: ScopeContainer, IDs: []string{"container-1"}, Follow: false,
+	})
+	if err != nil {
+		t.Fatalf("StartLogStream() error = %v", err)
+	}
+	reader.waitCloseStarted(t)
+	if got := manager.Diagnostics(); got.ActiveStreams != 1 || got.ReservedReaders != 1 || got.ActiveProducers != 1 {
+		t.Fatalf("diagnostics while Close is blocked = %#v", got)
+	}
+	if _, err := manager.StartLogStream(context.Background(), models.LogStreamRequest{
+		Scope: ScopeContainer, IDs: []string{"container-1"}, Follow: false,
+	}); !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("StartLogStream(while Close blocked) error = %v, want conflict", err)
+	}
+	if err := manager.StopStream(streamID); !apperror.IsCode(err, apperror.Timeout) {
+		t.Fatalf("StopStream() error = %v, want timeout", err)
+	}
+	if got := manager.Diagnostics(); got.DrainingStreams != 1 || got.ReservedReaders != 1 {
+		t.Fatalf("diagnostics while blocked Close is draining = %#v", got)
+	}
+	reader.releaseClose()
+	waitForLogDiagnostics(t, manager, func(value models.LogRuntimeDiagnostics) bool {
+		return value.DrainingStreams == 0 && value.ReservedReaders == 0 && value.ActiveProducers == 0
+	})
+}
+
+func TestStopAllUsesOneSharedDeadlineForBlockedSessions(t *testing.T) {
+	docker := newFakeLogDocker()
+	containers := make([]models.ContainerSummary, 0, 4)
+	readers := make([]*stubbornLogReader, 0, 4)
+	for index := range 4 {
+		id := fmt.Sprintf("container-%d", index+1)
+		containers = append(containers, models.ContainerSummary{ID: id, Name: id, State: "running"})
+		reader := newStubbornLogReader()
+		readers = append(readers, reader)
+		docker.readers[id] = reader
+	}
+	docker.setContainers(containers)
+	manager := NewManager(docker, nil, Options{
+		MaxStreams:      4,
+		MaxScopeStreams: 4,
+		StopTimeout:     30 * time.Millisecond,
+	})
+	for _, container := range containers {
+		if _, err := manager.StartLogStream(context.Background(), models.LogStreamRequest{
+			Scope: ScopeContainer, IDs: []string{container.ID}, Follow: true,
+		}); err != nil {
+			t.Fatalf("StartLogStream(%s) error = %v", container.ID, err)
+		}
+	}
+	for _, reader := range readers {
+		reader.waitStarted(t)
+	}
+	started := time.Now()
+	manager.StopAll()
+	if elapsed := time.Since(started); elapsed > 150*time.Millisecond {
+		t.Fatalf("StopAll elapsed = %s, want one shared deadline", elapsed)
+	}
+	if got := manager.Diagnostics(); got.DrainingStreams != 4 || got.ReservedReaders != 4 {
+		t.Fatalf("diagnostics after timed-out StopAll = %#v", got)
+	}
+	for _, reader := range readers {
+		reader.release()
+	}
+	waitForLogDiagnostics(t, manager, func(value models.LogRuntimeDiagnostics) bool {
+		return value.DrainingStreams == 0 && value.ReservedReaders == 0
+	})
+}
+
+func TestProjectFollowFinishesWhenWatcherCannotSubscribe(t *testing.T) {
+	docker := newFakeLogDocker()
+	container := docker.containers[0]
+	container.State = "exited"
+	container.Status = "exited"
+	docker.setContainers([]models.ContainerSummary{container})
+	manager := NewManager(docker, nil, Options{BatchWindow: time.Millisecond})
+	if _, err := manager.StartLogStream(context.Background(), models.LogStreamRequest{
+		Scope: ScopeProject, IDs: []string{"linux_native/app"}, Follow: true,
+	}); err != nil {
+		t.Fatalf("StartLogStream() error = %v", err)
+	}
+	waitForLogDiagnostics(t, manager, func(value models.LogRuntimeDiagnostics) bool {
+		return value.ActiveStreams == 0 && value.ActiveProducers == 0
+	})
+}
+
+func TestLogRequestIdentifierLimitRejectsBeforeDockerCalls(t *testing.T) {
+	docker := newBlockingResolveLogDocker()
+	manager := NewManager(docker, nil, Options{MaxReadersPerStream: 4})
+	ids := make([]string, 100)
+	for index := range ids {
+		ids[index] = fmt.Sprintf("unknown-%d", index)
+	}
+	if _, err := manager.StartLogStream(context.Background(), models.LogStreamRequest{
+		Scope: ScopeContainer, IDs: ids,
+	}); !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("StartLogStream(too many IDs) error = %v, want conflict", err)
+	}
+	if calls := docker.callCount(); calls != 0 {
+		t.Fatalf("Docker calls before ID rejection = %d, want zero", calls)
+	}
+}
+
+func TestManagerCapsStreamsPerScope(t *testing.T) {
+	ctx := context.Background()
+	docker := newFakeLogDocker()
+	manager := NewManager(docker, nil, Options{
+		MaxStreams:         4,
+		MaxScopeStreams:    1,
+		ReaderRetryInitial: time.Minute,
+		ReaderRetryMaximum: time.Minute,
+	})
+
+	first, err := manager.StartLogStream(ctx, models.LogStreamRequest{
+		Scope: ScopeContainer, IDs: []string{"container-1"}, Follow: true,
+	})
+	if err != nil {
+		t.Fatalf("StartLogStream(first) error = %v", err)
+	}
+	if _, err := manager.StartLogStream(ctx, models.LogStreamRequest{
+		Scope: ScopeContainer, IDs: []string{"container-1"}, Follow: true,
+	}); !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("same-scope StartLogStream() error = %v, want conflict", err)
+	}
+	project, err := manager.StartLogStream(ctx, models.LogStreamRequest{
+		Scope: ScopeProject, IDs: []string{"linux_native/app"}, Follow: true,
+	})
+	if err != nil {
+		t.Fatalf("different-scope StartLogStream() error = %v", err)
+	}
+	if err := manager.StopStream(first); err != nil {
+		t.Fatalf("StopStream(first) error = %v", err)
+	}
+	if err := manager.StopStream(project); err != nil {
+		t.Fatalf("StopStream(project) error = %v", err)
+	}
+}
+
+func TestManagerRejectsReaderCapacityBeforeRegisteringStream(t *testing.T) {
+	ctx := context.Background()
+	second := models.ContainerSummary{
+		ID: "container-2", Name: "app-2", State: "running", Status: "running", ProjectID: "linux_native/app",
+	}
+	docker := newFakeLogDocker()
+	docker.setContainers(append(docker.containers, second))
+	manager := NewManager(docker, nil, Options{
+		MaxReadersPerStream: 1,
+		MaxReaders:          4,
+	})
+	_, err := manager.StartLogStream(ctx, models.LogStreamRequest{Scope: ScopeAll, Follow: true})
+	if !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("StartLogStream() error = %v, want conflict", err)
+	}
+	manager.mu.Lock()
+	streams := len(manager.sessions)
+	readers := manager.reservedReaders
+	manager.mu.Unlock()
+	if streams != 0 || readers != 0 {
+		t.Fatalf("rejected capacity state streams=%d readers=%d", streams, readers)
+	}
+}
+
+func TestManagerCapsReadersAcrossStreams(t *testing.T) {
+	ctx := context.Background()
+	docker := newFakeLogDocker()
+	manager := NewManager(docker, nil, Options{
+		MaxStreams:          2,
+		MaxScopeStreams:     2,
+		MaxReadersPerStream: 1,
+		MaxReaders:          1,
+		ReaderRetryInitial:  time.Minute,
+		ReaderRetryMaximum:  time.Minute,
+	})
+	first, err := manager.StartLogStream(ctx, models.LogStreamRequest{
+		Scope: ScopeContainer, IDs: []string{"container-1"}, Follow: true,
+	})
+	if err != nil {
+		t.Fatalf("StartLogStream(first) error = %v", err)
+	}
+	if _, err := manager.StartLogStream(ctx, models.LogStreamRequest{
+		Scope: ScopeProject, IDs: []string{"linux_native/app"}, Follow: true,
+	}); !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("StartLogStream(over global reader cap) error = %v, want conflict", err)
+	}
+	manager.mu.Lock()
+	readers := manager.reservedReaders
+	manager.mu.Unlock()
+	if readers != 1 {
+		t.Fatalf("reserved readers = %d, want 1", readers)
+	}
+	if err := manager.StopStream(first); err != nil {
+		t.Fatalf("StopStream(first) error = %v", err)
+	}
+	manager.mu.Lock()
+	readers = manager.reservedReaders
+	manager.mu.Unlock()
+	if readers != 0 {
+		t.Fatalf("reserved readers after stop = %d, want 0", readers)
+	}
+}
+
 func TestFollowReaderRetriesTransientFailureAndResumes(t *testing.T) {
 	ctx := context.Background()
 	eventBus := bus.New()
@@ -304,6 +736,215 @@ func TestFollowReaderRetriesTransientFailureAndResumes(t *testing.T) {
 	time.Sleep(10 * time.Millisecond)
 	if calls := docker.callCount(); calls != 2 {
 		t.Fatalf("ContainerLogs calls after stop = %d, want 2", calls)
+	}
+}
+
+func TestFollowReaderResumesAfterPartialReadWithoutReplayingTail(t *testing.T) {
+	ctx := context.Background()
+	eventBus := bus.New()
+	defer eventBus.Close()
+	linesCh := eventBus.Subscribe(ctx, bus.TopicLogsLines, 8)
+	blocking := newBlockingLogReader()
+	one := "2026-06-13T09:00:00Z INFO one\n"
+	two := "2026-06-13T09:00:01Z INFO two\n"
+	docker := newScriptedLogDocker(
+		logReaderStep{reader: readerEndingWith(one, errors.New("connection reset"))},
+		logReaderStep{reader: &composedLogReader{Reader: io.MultiReader(strings.NewReader(one+two), blocking), Closer: blocking}},
+	)
+	manager := NewManager(docker, eventBus, Options{
+		BatchMaxLines:       1,
+		BatchWindow:         time.Millisecond,
+		ReaderRetryAttempts: 3,
+		ReaderRetryInitial:  time.Millisecond,
+		ReaderRetryMaximum:  time.Millisecond,
+	})
+	streamID, err := manager.StartLogStream(ctx, models.LogStreamRequest{
+		Scope: ScopeContainer, IDs: []string{"container-1"}, Follow: true, Tail: 500,
+	})
+	if err != nil {
+		t.Fatalf("StartLogStream() error = %v", err)
+	}
+	first := receiveLogEvent[LinesPayload](t, linesCh, time.Second)
+	second := receiveLogEvent[LinesPayload](t, linesCh, time.Second)
+	if len(first.Lines) != 1 || first.Lines[0].Text != "INFO one" || len(second.Lines) != 1 || second.Lines[0].Text != "INFO two" {
+		t.Fatalf("resumed payloads = %#v / %#v", first, second)
+	}
+	if first.StreamID != streamID || second.StreamID != streamID {
+		t.Fatalf("stream IDs = %q/%q, want %q", first.StreamID, second.StreamID, streamID)
+	}
+	docker.waitForCalls(t, 2)
+	requests := docker.requestsSnapshot()
+	if requests[1].Tail != -1 || requests[1].Since != "2026-06-13T09:00:00Z" {
+		t.Fatalf("reconnect options = %#v", requests[1])
+	}
+	select {
+	case event := <-linesCh:
+		t.Fatalf("replayed duplicate payload = %#v", event.Payload)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if err := manager.StopStream(streamID); err != nil {
+		t.Fatalf("StopStream() error = %v", err)
+	}
+}
+
+func TestFollowReaderBoundaryMismatchReplaysInsteadOfLosingRecord(t *testing.T) {
+	ctx := context.Background()
+	eventBus := bus.New()
+	defer eventBus.Close()
+	linesCh := eventBus.Subscribe(ctx, bus.TopicLogsLines, 8)
+	errorCh := eventBus.Subscribe(ctx, bus.TopicLogsError, 8)
+	blocking := newBlockingLogReader()
+	timestamp := "2026-06-13T09:00:00Z "
+	docker := newScriptedLogDocker(
+		logReaderStep{reader: readerEndingWith(timestamp+"INFO old-boundary\n", errors.New("connection reset"))},
+		logReaderStep{reader: &composedLogReader{
+			Reader: io.MultiReader(strings.NewReader(timestamp+"INFO new-boundary\n"), blocking),
+			Closer: blocking,
+		}},
+	)
+	manager := NewManager(docker, eventBus, Options{
+		BatchMaxLines:       1,
+		BatchWindow:         time.Millisecond,
+		ReaderRetryAttempts: 3,
+		ReaderRetryInitial:  time.Millisecond,
+		ReaderRetryMaximum:  time.Millisecond,
+	})
+	streamID, err := manager.StartLogStream(ctx, models.LogStreamRequest{
+		Scope: ScopeContainer, IDs: []string{"container-1"}, Follow: true, Tail: 500,
+	})
+	if err != nil {
+		t.Fatalf("StartLogStream() error = %v", err)
+	}
+	first := receiveLogEvent[LinesPayload](t, linesCh, time.Second)
+	second := receiveLogEvent[LinesPayload](t, linesCh, time.Second)
+	if len(first.Lines) != 1 || first.Lines[0].Text != "INFO old-boundary" || len(second.Lines) != 1 || second.Lines[0].Text != "INFO new-boundary" {
+		t.Fatalf("boundary payloads = %#v / %#v", first, second)
+	}
+	warning := receiveLogEvent[ErrorPayload](t, errorCh, time.Second)
+	if warning.StreamID != streamID || !strings.Contains(warning.Error, "replayed to avoid loss") {
+		t.Fatalf("boundary warning = %#v", warning)
+	}
+	if err := manager.StopStream(streamID); err != nil {
+		t.Fatalf("StopStream() error = %v", err)
+	}
+}
+
+func TestFollowReaderTailZeroCapturesLinesProducedDuringBackoff(t *testing.T) {
+	ctx := context.Background()
+	eventBus := bus.New()
+	defer eventBus.Close()
+	linesCh := eventBus.Subscribe(ctx, bus.TopicLogsLines, 8)
+	blocking := newBlockingLogReader()
+	docker := newScriptedLogDocker(
+		logReaderStep{err: errors.New("dial failed")},
+		logReaderStep{reader: &composedLogReader{
+			Reader: io.MultiReader(strings.NewReader("2026-06-13T09:00:01Z INFO during backoff\n"), blocking),
+			Closer: blocking,
+		}},
+	)
+	watermark := time.Date(2026, 6, 13, 9, 0, 0, 0, time.UTC)
+	manager := NewManager(docker, eventBus, Options{
+		BatchMaxLines:       1,
+		BatchWindow:         time.Millisecond,
+		ReaderRetryAttempts: 3,
+		ReaderRetryInitial:  time.Millisecond,
+		ReaderRetryMaximum:  time.Millisecond,
+		Now:                 func() time.Time { return watermark },
+	})
+	streamID, err := manager.StartLogStream(ctx, models.LogStreamRequest{
+		Scope: ScopeContainer, IDs: []string{"container-1"}, Follow: true, Tail: 0,
+	})
+	if err != nil {
+		t.Fatalf("StartLogStream() error = %v", err)
+	}
+	payload := receiveLogEvent[LinesPayload](t, linesCh, time.Second)
+	if len(payload.Lines) != 1 || payload.Lines[0].Text != "INFO during backoff" {
+		t.Fatalf("backoff payload = %#v", payload)
+	}
+	requests := docker.requestsSnapshot()
+	if len(requests) < 2 || requests[1].Tail != -1 || requests[1].Since != watermark.Format(time.RFC3339Nano) {
+		t.Fatalf("tail-zero reconnect options = %#v", requests)
+	}
+	if err := manager.StopStream(streamID); err != nil {
+		t.Fatalf("StopStream() error = %v", err)
+	}
+}
+
+func TestFollowReaderHealthyReconnectsResetFailureBudget(t *testing.T) {
+	ctx := context.Background()
+	eventBus := bus.New()
+	defer eventBus.Close()
+	linesCh := eventBus.Subscribe(ctx, bus.TopicLogsLines, 32)
+	steps := make([]logReaderStep, 0, 11)
+	lineAt := func(index int) string {
+		return fmt.Sprintf("2026-06-13T09:00:%02dZ INFO line-%d\n", index, index)
+	}
+	for index := range 10 {
+		data := lineAt(index)
+		if index > 0 {
+			data = lineAt(index-1) + data
+		}
+		steps = append(steps, logReaderStep{reader: readerEndingWith(data, errors.New("intermittent disconnect"))})
+	}
+	blocking := newBlockingLogReader()
+	steps = append(steps, logReaderStep{reader: &composedLogReader{
+		Reader: io.MultiReader(strings.NewReader(lineAt(9)), blocking),
+		Closer: blocking,
+	}})
+	docker := newScriptedLogDocker(steps...)
+	manager := NewManager(docker, eventBus, Options{
+		BatchMaxLines:       1,
+		BatchWindow:         time.Millisecond,
+		ReaderRetryAttempts: 3,
+		ReaderRetryInitial:  time.Millisecond,
+		ReaderRetryMaximum:  time.Millisecond,
+	})
+	streamID, err := manager.StartLogStream(ctx, models.LogStreamRequest{
+		Scope: ScopeContainer, IDs: []string{"container-1"}, Follow: true, Tail: 10,
+	})
+	if err != nil {
+		t.Fatalf("StartLogStream() error = %v", err)
+	}
+	for index := range 10 {
+		payload := receiveLogEvent[LinesPayload](t, linesCh, time.Second)
+		want := fmt.Sprintf("INFO line-%d", index)
+		if len(payload.Lines) != 1 || payload.Lines[0].Text != want {
+			t.Fatalf("payload %d = %#v, want %q", index, payload, want)
+		}
+	}
+	docker.waitForCalls(t, 11)
+	if err := manager.StopStream(streamID); err != nil {
+		t.Fatalf("StopStream() error = %v", err)
+	}
+}
+
+func TestFollowReaderDoesNotRetryPermanentFailure(t *testing.T) {
+	ctx := context.Background()
+	eventBus := bus.New()
+	defer eventBus.Close()
+	errorCh := eventBus.Subscribe(ctx, bus.TopicLogsError, 8)
+	eofCh := eventBus.Subscribe(ctx, bus.TopicLogsEOF, 8)
+	docker := newScriptedLogDocker(logReaderStep{err: apperror.New(apperror.NotFound, "container disappeared")})
+	manager := NewManager(docker, eventBus, Options{
+		BatchWindow:         time.Millisecond,
+		ReaderRetryAttempts: 8,
+		ReaderRetryInitial:  time.Millisecond,
+		ReaderRetryMaximum:  time.Millisecond,
+	})
+	streamID, err := manager.StartLogStream(ctx, models.LogStreamRequest{
+		Scope: ScopeContainer, IDs: []string{"container-1"}, Follow: true,
+	})
+	if err != nil {
+		t.Fatalf("StartLogStream() error = %v", err)
+	}
+	if payload := receiveLogEvent[ErrorPayload](t, errorCh, time.Second); payload.StreamID != streamID {
+		t.Fatalf("error payload = %#v", payload)
+	}
+	if payload := receiveLogEvent[EOFPayload](t, eofCh, time.Second); payload.StreamID != streamID {
+		t.Fatalf("EOF payload = %#v", payload)
+	}
+	if calls := docker.callCount(); calls != 1 {
+		t.Fatalf("ContainerLogs calls = %d, want one permanent attempt", calls)
 	}
 }
 
@@ -452,6 +1093,48 @@ func TestProjectFollowIgnoresEmptyContainerSetOnObjectChange(t *testing.T) {
 	}
 }
 
+func TestProjectFollowCoalescesDynamicCapacityRejection(t *testing.T) {
+	ctx := context.Background()
+	eventBus := bus.New()
+	defer eventBus.Close()
+	errorCh := eventBus.Subscribe(ctx, bus.TopicLogsError, 16)
+	docker := newFakeLogDocker()
+	reader := newBlockingLogReader()
+	docker.readers["container-1"] = reader
+	manager := NewManager(docker, eventBus, Options{
+		BatchWindow:         time.Millisecond,
+		MaxReadersPerStream: 1,
+		MaxReaders:          2,
+	})
+	streamID, err := manager.StartLogStream(ctx, models.LogStreamRequest{
+		Scope: ScopeProject, IDs: []string{"linux_native/app"}, Follow: true,
+	})
+	if err != nil {
+		t.Fatalf("StartLogStream() error = %v", err)
+	}
+	reader.waitStarted(t)
+	containers := append([]models.ContainerSummary(nil), docker.containers...)
+	for index := 2; index <= 1000; index++ {
+		containers = append(containers, models.ContainerSummary{
+			ID: fmt.Sprintf("container-%d", index), ProjectID: "linux_native/app", State: "running",
+		})
+	}
+	docker.setContainers(containers)
+	eventBus.Publish(bus.Event{Topic: bus.TopicObjectsChanged})
+	payload := receiveLogEvent[ErrorPayload](t, errorCh, time.Second)
+	if payload.StreamID != streamID || !strings.Contains(payload.Error, "candidate containers were not attached") {
+		t.Fatalf("coalesced capacity error = %#v", payload)
+	}
+	select {
+	case event := <-errorCh:
+		t.Fatalf("capacity rejection fanned out: %#v", event.Payload)
+	case <-time.After(30 * time.Millisecond):
+	}
+	if err := manager.StopStream(streamID); err != nil {
+		t.Fatalf("StopStream() error = %v", err)
+	}
+}
+
 func TestStopStreamClosesReaderReturnedAfterStop(t *testing.T) {
 	ctx := context.Background()
 	docker := newFakeLogDocker()
@@ -516,6 +1199,98 @@ func TestSessionEnqueueDropsAndReportsWhenInputFull(t *testing.T) {
 	}
 	if dropped := s.dropped.Load(); dropped != 1 {
 		t.Fatalf("dropped count = %d, want 1", dropped)
+	}
+}
+
+func TestSessionEnqueueEnforcesByteBudgetBeforeChannelCapacity(t *testing.T) {
+	line := models.LogLine{Text: strings.Repeat("x", 256)}
+	manager := NewManager(nil, nil, Options{
+		InputBuffer: 10,
+		InputBytes:  retainedLogLineBytes(line),
+	})
+	s := newSession(manager, "stream-byte-budget", models.LogStreamRequest{})
+
+	if !s.enqueue(line) {
+		t.Fatal("first enqueue returned false")
+	}
+	if !s.enqueue(line) {
+		t.Fatal("overflow enqueue returned false")
+	}
+	if queued := len(s.input); queued != 1 {
+		t.Fatalf("queued lines = %d, want 1", queued)
+	}
+	if bytes := s.queuedBytes.Load(); bytes != retainedLogLineBytes(line) {
+		t.Fatalf("queued bytes = %d, want %d", bytes, retainedLogLineBytes(line))
+	}
+	if dropped := s.dropped.Load(); dropped != 1 {
+		t.Fatalf("dropped lines = %d, want 1", dropped)
+	}
+	s.cancel()
+}
+
+func TestManagerFlushesLiveBatchesAtByteBudget(t *testing.T) {
+	ctx := context.Background()
+	eventBus := bus.New()
+	defer eventBus.Close()
+	linesCh := eventBus.Subscribe(ctx, bus.TopicLogsLines, 8)
+	eofCh := eventBus.Subscribe(ctx, bus.TopicLogsEOF, 8)
+	docker := newFakeLogDocker()
+	firstText := "INFO " + strings.Repeat("a", 700)
+	secondText := "INFO " + strings.Repeat("b", 700)
+	docker.logs["container-1"] = "2026-06-13T09:00:00Z " + firstText + "\n2026-06-13T09:00:01Z " + secondText + "\n"
+	manager := NewManager(docker, eventBus, Options{
+		BatchMaxLines: 100,
+		BatchWindow:   time.Hour,
+		BatchBytes:    minimumBatchBytes,
+	})
+
+	streamID, err := manager.StartLogStream(ctx, models.LogStreamRequest{
+		Scope: ScopeContainer, IDs: []string{"container-1"}, Follow: false,
+	})
+	if err != nil {
+		t.Fatalf("StartLogStream() error = %v", err)
+	}
+	first := receiveLogEvent[LinesPayload](t, linesCh, time.Second)
+	second := receiveLogEvent[LinesPayload](t, linesCh, time.Second)
+	if first.StreamID != streamID || len(first.Lines) != 1 || first.Lines[0].Text != firstText {
+		t.Fatalf("first byte-bounded batch = %#v", first)
+	}
+	if second.StreamID != streamID || len(second.Lines) != 1 || second.Lines[0].Text != secondText {
+		t.Fatalf("second byte-bounded batch = %#v", second)
+	}
+	if eof := receiveLogEvent[EOFPayload](t, eofCh, time.Second); eof.StreamID != streamID {
+		t.Fatalf("EOF = %#v", eof)
+	}
+}
+
+func TestManagerTruncatesSerializedLiveEventAtHardByteBudget(t *testing.T) {
+	ctx := context.Background()
+	eventBus := bus.New()
+	defer eventBus.Close()
+	linesCh := eventBus.Subscribe(ctx, bus.TopicLogsLines, 8)
+	docker := newFakeLogDocker()
+	docker.logs["container-1"] = "2026-06-13T09:00:00Z " + strings.Repeat("\x01", 700) + "\n"
+	manager := NewManager(docker, eventBus, Options{
+		BatchMaxLines: 100,
+		BatchWindow:   time.Millisecond,
+		BatchBytes:    minimumBatchBytes,
+	})
+
+	if _, err := manager.StartLogStream(ctx, models.LogStreamRequest{
+		Scope: ScopeContainer, IDs: []string{"container-1"}, Follow: false,
+	}); err != nil {
+		t.Fatalf("StartLogStream() error = %v", err)
+	}
+	payload := receiveLogEvent[LinesPayload](t, linesCh, time.Second)
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("Marshal(lines payload) error = %v", err)
+	}
+	if len(raw) > int(minimumBatchBytes) {
+		t.Fatalf("serialized payload bytes = %d, limit = %d", len(raw), minimumBatchBytes)
+	}
+	if len(payload.Lines) != 1 || !payload.Lines[0].Truncated {
+		t.Fatalf("bounded payload = %#v", payload)
 	}
 }
 
@@ -722,6 +1497,29 @@ type blockingLogReader struct {
 	closeOnce sync.Once
 }
 
+type boundedFillReader struct {
+	remaining  int
+	value      byte
+	maxRequest int
+}
+
+func (r *boundedFillReader) Read(buffer []byte) (int, error) {
+	if len(buffer) > r.maxRequest {
+		r.maxRequest = len(buffer)
+	}
+	if r.remaining == 0 {
+		return 0, io.EOF
+	}
+	if len(buffer) > r.remaining {
+		buffer = buffer[:r.remaining]
+	}
+	for index := range buffer {
+		buffer[index] = r.value
+	}
+	r.remaining -= len(buffer)
+	return len(buffer), nil
+}
+
 type composedLogReader struct {
 	io.Reader
 	io.Closer
@@ -734,6 +1532,216 @@ type retryLogDocker struct {
 	reader       io.ReadCloser
 	calls        int
 	callsChanged chan struct{}
+}
+
+type logReaderStep struct {
+	reader io.ReadCloser
+	err    error
+}
+
+type scriptedLogDocker struct {
+	mu           sync.Mutex
+	container    models.ContainerSummary
+	steps        []logReaderStep
+	requests     []dockercore.LogOptions
+	callsChanged chan struct{}
+}
+
+func newScriptedLogDocker(steps ...logReaderStep) *scriptedLogDocker {
+	return &scriptedLogDocker{
+		container:    models.ContainerSummary{ID: "container-1", Name: "app-1", State: "running", Status: "running"},
+		steps:        append([]logReaderStep(nil), steps...),
+		callsChanged: make(chan struct{}, 32),
+	}
+}
+
+func (f *scriptedLogDocker) ContainerLogs(_ context.Context, _ string, options dockercore.LogOptions) (io.ReadCloser, error) {
+	f.mu.Lock()
+	call := len(f.requests)
+	f.requests = append(f.requests, options)
+	var step logReaderStep
+	if call < len(f.steps) {
+		step = f.steps[call]
+	} else {
+		step.err = errors.New("unexpected scripted log call")
+	}
+	f.mu.Unlock()
+	select {
+	case f.callsChanged <- struct{}{}:
+	default:
+	}
+	return step.reader, step.err
+}
+
+func (f *scriptedLogDocker) ListContainers(context.Context, models.ContainerListOptions) ([]models.ContainerSummary, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return []models.ContainerSummary{f.container}, nil
+}
+
+func (f *scriptedLogDocker) GetContainer(context.Context, string) (*models.ContainerDetail, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return &models.ContainerDetail{Summary: f.container}, nil
+}
+
+func (f *scriptedLogDocker) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.requests)
+}
+
+func (f *scriptedLogDocker) requestsSnapshot() []dockercore.LogOptions {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]dockercore.LogOptions(nil), f.requests...)
+}
+
+func (f *scriptedLogDocker) waitForCalls(t *testing.T, want int) {
+	t.Helper()
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	for f.callCount() < want {
+		select {
+		case <-f.callsChanged:
+		case <-timer.C:
+			t.Fatalf("ContainerLogs calls = %d, want at least %d", f.callCount(), want)
+		}
+	}
+}
+
+type terminalErrorReader struct{ err error }
+
+func (r terminalErrorReader) Read([]byte) (int, error) { return 0, r.err }
+
+func readerEndingWith(data string, err error) io.ReadCloser {
+	return io.NopCloser(io.MultiReader(strings.NewReader(data), terminalErrorReader{err: err}))
+}
+
+type blockingResolveLogDocker struct {
+	mu           sync.Mutex
+	calls        int
+	callsChanged chan struct{}
+}
+
+func newBlockingResolveLogDocker() *blockingResolveLogDocker {
+	return &blockingResolveLogDocker{callsChanged: make(chan struct{}, 32)}
+}
+
+func (f *blockingResolveLogDocker) ContainerLogs(context.Context, string, dockercore.LogOptions) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("")), nil
+}
+
+func (f *blockingResolveLogDocker) ListContainers(ctx context.Context, _ models.ContainerListOptions) ([]models.ContainerSummary, error) {
+	f.mu.Lock()
+	f.calls++
+	f.mu.Unlock()
+	select {
+	case f.callsChanged <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (f *blockingResolveLogDocker) GetContainer(ctx context.Context, _ string) (*models.ContainerDetail, error) {
+	_, err := f.ListContainers(ctx, models.ContainerListOptions{})
+	return nil, err
+}
+
+func (f *blockingResolveLogDocker) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func (f *blockingResolveLogDocker) waitForCalls(t *testing.T, want int) {
+	t.Helper()
+	timer := time.NewTimer(time.Second)
+	defer timer.Stop()
+	for f.callCount() < want {
+		select {
+		case <-f.callsChanged:
+		case <-timer.C:
+			t.Fatalf("Docker resolution calls = %d, want at least %d", f.callCount(), want)
+		}
+	}
+}
+
+type stubbornLogReader struct {
+	started     chan struct{}
+	releaseRead chan struct{}
+	startOnce   sync.Once
+	releaseOnce sync.Once
+}
+
+type blockingCloseLogReader struct {
+	closeStarted chan struct{}
+	release      chan struct{}
+	startOnce    sync.Once
+	releaseOnce  sync.Once
+}
+
+func newBlockingCloseLogReader() *blockingCloseLogReader {
+	return &blockingCloseLogReader{closeStarted: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (r *blockingCloseLogReader) Read([]byte) (int, error) { return 0, io.EOF }
+
+func (r *blockingCloseLogReader) Close() error {
+	r.startOnce.Do(func() { close(r.closeStarted) })
+	<-r.release
+	return nil
+}
+
+func (r *blockingCloseLogReader) waitCloseStarted(t *testing.T) {
+	t.Helper()
+	select {
+	case <-r.closeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("reader Close was not called")
+	}
+}
+
+func (r *blockingCloseLogReader) releaseClose() {
+	r.releaseOnce.Do(func() { close(r.release) })
+}
+
+func newStubbornLogReader() *stubbornLogReader {
+	return &stubbornLogReader{started: make(chan struct{}), releaseRead: make(chan struct{})}
+}
+
+func (r *stubbornLogReader) Read([]byte) (int, error) {
+	r.startOnce.Do(func() { close(r.started) })
+	<-r.releaseRead
+	return 0, io.EOF
+}
+
+func (r *stubbornLogReader) Close() error { return nil }
+
+func (r *stubbornLogReader) release() {
+	r.releaseOnce.Do(func() { close(r.releaseRead) })
+}
+
+func (r *stubbornLogReader) waitStarted(t *testing.T) {
+	t.Helper()
+	select {
+	case <-r.started:
+	case <-time.After(time.Second):
+		t.Fatal("stubborn log reader was not consumed")
+	}
+}
+
+func waitForLogDiagnostics(t *testing.T, manager *Manager, predicate func(models.LogRuntimeDiagnostics) bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if value := manager.Diagnostics(); predicate(value) {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("diagnostics did not settle: %#v", manager.Diagnostics())
 }
 
 func newRetryLogDocker(state string, failures int, reader io.ReadCloser) *retryLogDocker {
@@ -817,4 +1825,13 @@ func (r *blockingLogReader) Close() error {
 		close(r.closed)
 	})
 	return nil
+}
+
+func (r *blockingLogReader) waitStarted(t *testing.T) {
+	t.Helper()
+	select {
+	case <-r.started:
+	case <-time.After(time.Second):
+		t.Fatal("blocking log reader was not consumed")
+	}
 }

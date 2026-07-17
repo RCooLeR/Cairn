@@ -52,7 +52,14 @@ function deferred<T>() {
 function runtimeDiagnostics(active: number, started = true) {
   return new RuntimeDiagnostics({
     checkedAt: null,
-    logs: { activeProducers: 3, activeStreams: 4 },
+    logs: {
+      activeProducers: 3,
+      activeStreams: 4,
+      drainingStreams: 1,
+      pendingStreams: 2,
+      retainedBytes: 4096,
+      reservedReaders: 8,
+    },
     metrics: { activeStreams: 2, activeWatchers: 5, started },
     portForwards: { activeForwards: 7, supported: true },
     stdio: {

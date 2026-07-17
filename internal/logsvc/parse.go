@@ -17,6 +17,7 @@ import (
 const (
 	maxDockerLogFrame       = 16 * 1024 * 1024
 	maxDockerLogRecordBytes = 1024 * 1024
+	dockerLogReadChunkBytes = 64 * 1024
 	truncatedRecordSuffix   = " … [truncated: log record exceeded 1 MiB]"
 )
 
@@ -39,6 +40,7 @@ func ReadDockerLogStream(ctx context.Context, reader io.Reader, source sourceInf
 
 func readFramedDockerLogs(ctx context.Context, reader *bufio.Reader, source sourceInfo, now func() time.Time, emit func(models.LogLine) bool) error {
 	assembler := newLineAssembler(source, now, emit)
+	scratch := make([]byte, dockerLogReadChunkBytes)
 	for {
 		select {
 		case <-ctx.Done():
@@ -47,10 +49,15 @@ func readFramedDockerLogs(ctx context.Context, reader *bufio.Reader, source sour
 		}
 
 		header := make([]byte, 8)
-		if _, err := io.ReadFull(reader, header); err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		n, err := io.ReadFull(reader, header)
+		if err != nil {
+			if errors.Is(err, io.EOF) && n == 0 {
 				assembler.flush()
 				return nil
+			}
+			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+				assembler.flush()
+				return io.ErrUnexpectedEOF
 			}
 			return err
 		}
@@ -59,16 +66,29 @@ func readFramedDockerLogs(ctx context.Context, reader *bufio.Reader, source sour
 			continue
 		}
 		size := binary.BigEndian.Uint32(header[4:])
-		payload := make([]byte, size)
-		if _, err := io.ReadFull(reader, payload); err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-				assembler.add(streamName(header[0]), payload)
-				assembler.flush()
-				return nil
+		stream := streamName(header[0])
+		remaining := int64(size)
+		for remaining > 0 {
+			chunkSize := int64(len(scratch))
+			if remaining < chunkSize {
+				chunkSize = remaining
 			}
-			return err
+			n, readErr := io.ReadFull(reader, scratch[:chunkSize])
+			if n > 0 {
+				assembler.add(stream, scratch[:n])
+				remaining -= int64(n)
+				if assembler.stopped {
+					return nil
+				}
+			}
+			if readErr != nil {
+				assembler.flush()
+				if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
+					return io.ErrUnexpectedEOF
+				}
+				return readErr
+			}
 		}
-		assembler.add(streamName(header[0]), payload)
 	}
 }
 
