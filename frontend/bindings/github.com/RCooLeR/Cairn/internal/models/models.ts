@@ -2090,6 +2090,8 @@ export class LogLine {
     "stream": string;
     "level"?: string;
     "text": string;
+    "sequence"?: number;
+    "truncated"?: boolean;
 
     /** Creates a new LogLine instance. */
     constructor($$source: Partial<LogLine> = {}) {

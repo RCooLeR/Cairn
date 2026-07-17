@@ -9,10 +9,11 @@ import (
 )
 
 type ringBuffer struct {
-	limit   int
-	lines   []models.LogLine
-	start   int
-	dropped int64
+	limit        int
+	lines        []models.LogLine
+	start        int
+	dropped      int64
+	nextSequence uint64
 }
 
 func newRingBuffer(limit int) *ringBuffer {
@@ -22,14 +23,17 @@ func newRingBuffer(limit int) *ringBuffer {
 	return &ringBuffer{limit: limit}
 }
 
-func (r *ringBuffer) add(line models.LogLine) {
+func (r *ringBuffer) add(line models.LogLine) models.LogLine {
+	r.nextSequence++
+	line.Sequence = r.nextSequence
 	if len(r.lines) < r.limit {
 		r.lines = append(r.lines, line)
-		return
+		return line
 	}
 	r.lines[r.start] = line
 	r.start = (r.start + 1) % r.limit
 	r.dropped++
+	return line
 }
 
 func (r *ringBuffer) snapshot() []models.LogLine {
@@ -58,7 +62,10 @@ func SortLines(lines []models.LogLine) {
 		if a.Stream != b.Stream {
 			return a.Stream < b.Stream
 		}
-		return a.Text < b.Text
+		if a.Text != b.Text {
+			return a.Text < b.Text
+		}
+		return a.Sequence < b.Sequence
 	})
 }
 
@@ -67,6 +74,7 @@ type lineCursor struct {
 	ContainerID string `json:"containerID"`
 	Stream      string `json:"stream"`
 	Text        string `json:"text"`
+	Sequence    uint64 `json:"sequence"`
 }
 
 func pageLines(lines []models.LogLine, cursor string, limit int) models.LogPage {
@@ -103,6 +111,7 @@ func encodeCursor(line models.LogLine) string {
 		ContainerID: line.ContainerID,
 		Stream:      line.Stream,
 		Text:        line.Text,
+		Sequence:    line.Sequence,
 	})
 	if err != nil {
 		return ""
@@ -131,6 +140,7 @@ func compareCursor(line models.LogLine, cursor lineCursor) int {
 		ContainerID: line.ContainerID,
 		Stream:      line.Stream,
 		Text:        line.Text,
+		Sequence:    line.Sequence,
 	}
 	return compareLineCursor(lineCursor, cursor)
 }
@@ -158,6 +168,12 @@ func compareLineCursor(a lineCursor, b lineCursor) int {
 		return -1
 	}
 	if a.Text > b.Text {
+		return 1
+	}
+	if a.Sequence < b.Sequence {
+		return -1
+	}
+	if a.Sequence > b.Sequence {
 		return 1
 	}
 	return 0

@@ -65,6 +65,68 @@ func TestReadDockerLogStreamPlainTTYUsesNowForUntimestampedLines(t *testing.T) {
 	}
 }
 
+func TestReadDockerLogStreamBoundsFragmentedFramedRecords(t *testing.T) {
+	input := bytes.NewBuffer(nil)
+	exact := strings.Repeat("a", maxDockerLogRecordBytes)
+	input.Write(dockerLogFrame(1, exact+"\n"))
+	input.Write(dockerLogFrame(2, strings.Repeat("b", maxDockerLogRecordBytes/2)))
+	input.Write(dockerLogFrame(2, strings.Repeat("b", maxDockerLogRecordBytes/2+128)))
+	input.Write(dockerLogFrame(2, "\nstderr-next\n"))
+	input.Write(dockerLogFrame(1, strings.Repeat("c", maxDockerLogRecordBytes/2)))
+	input.Write(dockerLogFrame(1, strings.Repeat("c", maxDockerLogRecordBytes)))
+	var lines []models.LogLine
+
+	err := ReadDockerLogStream(context.Background(), input, sourceInfo{}, time.Now, func(line models.LogLine) bool {
+		lines = append(lines, line)
+		return true
+	})
+	if err != nil {
+		t.Fatalf("ReadDockerLogStream() error = %v", err)
+	}
+	if len(lines) != 4 {
+		t.Fatalf("lines count = %d, want 4: %#v", len(lines), lines)
+	}
+	if lines[0].Text != exact || lines[0].Truncated {
+		t.Fatalf("exact-limit line = len %d truncated %v", len(lines[0].Text), lines[0].Truncated)
+	}
+	for _, index := range []int{1, 3} {
+		line := lines[index]
+		if !line.Truncated || len(line.Text) != maxDockerLogRecordBytes+len(truncatedRecordSuffix) || !strings.HasSuffix(line.Text, truncatedRecordSuffix) {
+			t.Fatalf("truncated line %d = len %d truncated %v suffix %v", index, len(line.Text), line.Truncated, strings.HasSuffix(line.Text, truncatedRecordSuffix))
+		}
+	}
+	if lines[1].Stream != "stderr" || lines[2].Text != "stderr-next" || lines[2].Truncated {
+		t.Fatalf("stderr recovery lines = %#v", lines[1:3])
+	}
+}
+
+func TestReadDockerLogStreamPlainRecordsUseTheSameBoundedSemantics(t *testing.T) {
+	exact := strings.Repeat("x", maxDockerLogRecordBytes)
+	oversized := strings.Repeat("y", maxDockerLogRecordBytes+4096)
+	input := strings.NewReader(exact + "\n" + oversized + "\nnext\n")
+	var lines []models.LogLine
+
+	err := ReadDockerLogStream(context.Background(), input, sourceInfo{}, time.Now, func(line models.LogLine) bool {
+		lines = append(lines, line)
+		return true
+	})
+	if err != nil {
+		t.Fatalf("ReadDockerLogStream() error = %v", err)
+	}
+	if len(lines) != 3 {
+		t.Fatalf("lines count = %d, want 3", len(lines))
+	}
+	if lines[0].Text != exact || lines[0].Truncated {
+		t.Fatalf("exact-limit plain line = len %d truncated %v", len(lines[0].Text), lines[0].Truncated)
+	}
+	if !lines[1].Truncated || !strings.HasSuffix(lines[1].Text, truncatedRecordSuffix) {
+		t.Fatalf("oversized plain line = len %d truncated %v", len(lines[1].Text), lines[1].Truncated)
+	}
+	if lines[2].Text != "next" || lines[2].Truncated {
+		t.Fatalf("plain recovery line = %#v", lines[2])
+	}
+}
+
 func TestRingDropsOldestAndCursorPages(t *testing.T) {
 	ring := newRingBuffer(2)
 	base := time.Date(2026, 6, 13, 9, 0, 0, 0, time.UTC)
@@ -83,6 +145,38 @@ func TestRingDropsOldestAndCursorPages(t *testing.T) {
 	next := pageLines(lines, page.NextCursor, 1)
 	if len(next.Lines) != 1 || next.Lines[0].Text != "three" {
 		t.Fatalf("next page = %#v", next)
+	}
+}
+
+func TestRingCursorPaginatesByteIdenticalLinesExactlyOnce(t *testing.T) {
+	ring := newRingBuffer(10)
+	timestamp := time.Date(2026, 6, 13, 9, 0, 0, 123, time.UTC)
+	for range 7 {
+		ring.add(models.LogLine{TS: timestamp, ContainerID: "same", Stream: "stdout", Text: "duplicate"})
+	}
+	lines := ring.snapshot()
+	SortLines(lines)
+
+	var sequences []uint64
+	cursor := ""
+	for {
+		page := pageLines(lines, cursor, 2)
+		for _, line := range page.Lines {
+			sequences = append(sequences, line.Sequence)
+		}
+		if page.NextCursor == "" {
+			break
+		}
+		cursor = page.NextCursor
+	}
+
+	if len(sequences) != 7 {
+		t.Fatalf("paginated sequences = %v, want seven records", sequences)
+	}
+	for index, sequence := range sequences {
+		if sequence != uint64(index+1) {
+			t.Fatalf("paginated sequences = %v, want [1 2 3 4 5 6 7]", sequences)
+		}
 	}
 }
 

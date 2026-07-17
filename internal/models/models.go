@@ -608,6 +608,8 @@ type LogLine struct {
 	Stream        string    `json:"stream"`
 	Level         string    `json:"level,omitempty"`
 	Text          string    `json:"text"`
+	Sequence      uint64    `json:"sequence,omitempty"`
+	Truncated     bool      `json:"truncated,omitempty"`
 }
 
 type ExportLogsRequest struct {

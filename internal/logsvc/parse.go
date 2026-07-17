@@ -2,6 +2,7 @@ package logsvc
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -13,7 +14,11 @@ import (
 	"github.com/RCooLeR/Cairn/internal/models"
 )
 
-const maxDockerLogFrame = 16 * 1024 * 1024
+const (
+	maxDockerLogFrame       = 16 * 1024 * 1024
+	maxDockerLogRecordBytes = 1024 * 1024
+	truncatedRecordSuffix   = " … [truncated: log record exceeded 1 MiB]"
+)
 
 var (
 	levelJSONPattern  = regexp.MustCompile(`(?i)"level"\s*:\s*"([a-z]+)"`)
@@ -68,22 +73,39 @@ func readFramedDockerLogs(ctx context.Context, reader *bufio.Reader, source sour
 }
 
 func readPlainDockerLogs(ctx context.Context, reader io.Reader, source sourceInfo, now func() time.Time, emit func(models.LogLine) bool) error {
-	scanner := bufio.NewScanner(reader)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
+	assembler := newLineAssembler(source, now, emit)
+	buffer := make([]byte, 64*1024)
+	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		default:
 		}
-		if !emit(ParseRawLogLine(scanner.Text(), "stdout", source, now)) {
-			return nil
+
+		count, err := reader.Read(buffer)
+		if count > 0 {
+			assembler.add("stdout", buffer[:count])
+			if assembler.stopped {
+				return nil
+			}
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				assembler.flush()
+				return nil
+			}
+			return err
+		}
+		if count == 0 {
+			// Readers should not return (0, nil), but avoid a tight loop if a
+			// non-conforming provider does so repeatedly.
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Millisecond):
+			}
 		}
 	}
-	if err := scanner.Err(); err != nil {
-		return err
-	}
-	return nil
 }
 
 func validDockerLogHeader(header []byte) bool {
@@ -107,19 +129,21 @@ func streamName(value byte) string {
 }
 
 type lineAssembler struct {
-	source  sourceInfo
-	now     func() time.Time
-	emit    func(models.LogLine) bool
-	pending map[string]string
-	stopped bool
+	source     sourceInfo
+	now        func() time.Time
+	emit       func(models.LogLine) bool
+	pending    map[string][]byte
+	discarding map[string]bool
+	stopped    bool
 }
 
 func newLineAssembler(source sourceInfo, now func() time.Time, emit func(models.LogLine) bool) *lineAssembler {
 	return &lineAssembler{
-		source:  source,
-		now:     now,
-		emit:    emit,
-		pending: map[string]string{},
+		source:     source,
+		now:        now,
+		emit:       emit,
+		pending:    map[string][]byte{},
+		discarding: map[string]bool{},
 	}
 }
 
@@ -127,28 +151,66 @@ func (a *lineAssembler) add(stream string, chunk []byte) {
 	if a.stopped || len(chunk) == 0 {
 		return
 	}
-	text := a.pending[stream] + string(chunk)
-	parts := strings.Split(text, "\n")
-	for _, part := range parts[:len(parts)-1] {
-		part = strings.TrimSuffix(part, "\r")
-		if !a.emit(ParseRawLogLine(part, stream, a.source, a.now)) {
-			a.stopped = true
+	for len(chunk) > 0 && !a.stopped {
+		newline := bytes.IndexByte(chunk, '\n')
+		if newline < 0 {
+			a.addFragment(stream, chunk, false)
 			return
 		}
+		a.addFragment(stream, chunk[:newline], true)
+		chunk = chunk[newline+1:]
 	}
-	a.pending[stream] = parts[len(parts)-1]
+}
+
+func (a *lineAssembler) addFragment(stream string, fragment []byte, recordEnd bool) {
+	if a.discarding[stream] {
+		if recordEnd {
+			a.discarding[stream] = false
+		}
+		return
+	}
+
+	pending := a.pending[stream]
+	remaining := maxDockerLogRecordBytes - len(pending)
+	if len(fragment) > remaining {
+		pending = append(pending, fragment[:remaining]...)
+		a.pending[stream] = pending
+		a.emitPending(stream, true)
+		if !recordEnd {
+			a.discarding[stream] = true
+		}
+		return
+	}
+
+	a.pending[stream] = append(pending, fragment...)
+	if recordEnd {
+		a.emitPending(stream, false)
+	}
+}
+
+func (a *lineAssembler) emitPending(stream string, truncated bool) {
+	text := strings.TrimSuffix(string(a.pending[stream]), "\r")
+	a.pending[stream] = a.pending[stream][:0]
+	if truncated {
+		text += truncatedRecordSuffix
+	}
+	line := ParseRawLogLine(text, stream, a.source, a.now)
+	line.Truncated = truncated
+	if !a.emit(line) {
+		a.stopped = true
+	}
 }
 
 func (a *lineAssembler) flush() {
 	if a.stopped {
 		return
 	}
-	for stream, text := range a.pending {
-		text = strings.TrimSuffix(text, "\r")
-		if text == "" {
+	for stream, pending := range a.pending {
+		if len(pending) == 0 || a.discarding[stream] {
 			continue
 		}
-		if !a.emit(ParseRawLogLine(text, stream, a.source, a.now)) {
+		a.emitPending(stream, false)
+		if a.stopped {
 			return
 		}
 	}

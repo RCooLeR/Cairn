@@ -544,7 +544,7 @@ func (s *session) batchLoop() {
 		batch = batch[:0]
 	}
 	appendLine := func(line models.LogLine) {
-		s.ring.add(line)
+		line = s.ring.add(line)
 		batch = append(batch, line)
 		if len(batch) >= s.manager.batchMaxLines {
 			flush()
