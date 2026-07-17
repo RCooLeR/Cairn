@@ -5,11 +5,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -94,29 +96,35 @@ func TestBackupSidecarAndFilenameCollision(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	ts := time.Date(2026, 6, 13, 16, 0, 0, 0, time.UTC)
-	archive, archivePath, metadataPath, err := backupPaths(dir, "app/db", ts)
+	reservation, err := reserveBackupPaths(dir, "app/db", ts, "plan-one")
 	if err != nil {
-		t.Fatalf("backupPaths() error = %v", err)
+		t.Fatalf("reserveBackupPaths() error = %v", err)
 	}
-	if archive != "app-db-20260613T160000Z.tar.gz" {
-		t.Fatalf("archive = %q", archive)
+	if reservation.ArchiveName != "app-db-20260613T160000Z.tar.gz" {
+		t.Fatalf("archive = %q", reservation.ArchiveName)
 	}
-	if err := os.WriteFile(archivePath, []byte("old"), 0o600); err != nil {
+	if err := releaseBackupReservationRecord(reservation); err != nil {
+		t.Fatalf("releaseBackupReservationRecord() error = %v", err)
+	}
+	if err := os.WriteFile(reservation.ArchivePath, []byte("old"), 0o600); err != nil {
 		t.Fatalf("write archive: %v", err)
 	}
-	if err := os.WriteFile(metadataPath, []byte("{}"), 0o600); err != nil {
+	if err := os.WriteFile(reservation.MetadataPath, []byte("{}"), 0o600); err != nil {
 		t.Fatalf("write sidecar: %v", err)
 	}
-	archive, _, _, err = backupPaths(dir, "app/db", ts)
+	reservation, err = reserveBackupPaths(dir, "app/db", ts, "plan-two")
 	if err != nil {
-		t.Fatalf("backupPaths(collision) error = %v", err)
+		t.Fatalf("reserveBackupPaths(collision) error = %v", err)
 	}
-	if archive != "app-db-20260613T160000Z-2.tar.gz" {
-		t.Fatalf("collision archive = %q", archive)
+	if reservation.ArchiveName != "app-db-20260613T160000Z-2.tar.gz" {
+		t.Fatalf("collision archive = %q", reservation.ArchiveName)
+	}
+	if err := releaseBackupReservationRecord(reservation); err != nil {
+		t.Fatalf("releaseBackupReservationRecord(collision) error = %v", err)
 	}
 
 	payload := []byte("backup-data")
-	path := filepath.Join(dir, archive)
+	path := filepath.Join(dir, "sidecar-test.tar.gz")
 	if err := os.WriteFile(path, payload, 0o600); err != nil {
 		t.Fatalf("write backup: %v", err)
 	}
@@ -138,6 +146,512 @@ func TestBackupSidecarAndFilenameCollision(t *testing.T) {
 	}
 	if err := verifyArchiveChecksum(path, "bad"); !apperror.IsCode(err, apperror.Conflict) {
 		t.Fatalf("checksum mismatch error = %v", err)
+	}
+}
+
+func TestConcurrentBackupPlansAndAppliesKeepArtifactsIndependent(t *testing.T) {
+	ctx := context.Background()
+	mgr, events, _ := newTestManager(t)
+	mgr.Backups = nil
+	mgr.Audit = nil
+	dest := t.TempDir()
+	mgr.Docker.(*fakeBackupDocker).volumes["app-db"] = &models.VolumeDetail{Summary: models.VolumeSummary{Name: "app-db"}}
+	var nextID atomic.Uint64
+	mgr.NewID = func() string {
+		return fmt.Sprintf("id-%d", nextID.Add(1))
+	}
+
+	const count = 32
+	plans := make([]*models.CommandPlan, count)
+	planErrs := make([]error, count)
+	startPlanning := make(chan struct{})
+	var planning sync.WaitGroup
+	planning.Add(count)
+	for i := 0; i < count; i++ {
+		go func(index int) {
+			defer planning.Done()
+			<-startPlanning
+			plans[index], planErrs[index] = mgr.PlanBackupVolume(ctx, models.BackupVolumeRequest{VolumeName: "app-db", DestPath: dest})
+		}(i)
+	}
+	close(startPlanning)
+	planning.Wait()
+
+	records := make([]planRecord, count)
+	archivePaths := make(map[string]struct{}, count)
+	metadataPaths := make(map[string]struct{}, count)
+	commands := make(map[string]struct{}, count)
+	for i := range plans {
+		if planErrs[i] != nil {
+			t.Fatalf("PlanBackupVolume(%d) error = %v", i, planErrs[i])
+		}
+		if plans[i] == nil {
+			t.Fatalf("PlanBackupVolume(%d) plan = nil", i)
+		}
+		records[i] = savedPlanRecord(t, mgr, plans[i].PlanID)
+		if _, duplicate := archivePaths[records[i].ArchivePath]; duplicate {
+			t.Fatalf("duplicate archive path reserved: %s", records[i].ArchivePath)
+		}
+		if _, duplicate := metadataPaths[records[i].MetadataPath]; duplicate {
+			t.Fatalf("duplicate metadata path reserved: %s", records[i].MetadataPath)
+		}
+		if _, duplicate := commands[plans[i].Commands[0].Command]; duplicate {
+			t.Fatalf("duplicate private staging command planned: %s", plans[i].Commands[0].Command)
+		}
+		archivePaths[records[i].ArchivePath] = struct{}{}
+		metadataPaths[records[i].MetadataPath] = struct{}{}
+		commands[plans[i].Commands[0].Command] = struct{}{}
+		if err := verifyReservationOwner(records[i].ReservationPath, records[i].ReservationOwner); err != nil {
+			t.Fatalf("reservation %d is not owned: %v", i, err)
+		}
+	}
+
+	done := events.Subscribe(ctx, bus.TopicJobDone, count*2)
+	jobIDs := make([]string, count)
+	applyErrs := make([]error, count)
+	startApply := make(chan struct{})
+	var applying sync.WaitGroup
+	applying.Add(count)
+	for i := range plans {
+		go func(index int) {
+			defer applying.Done()
+			<-startApply
+			jobIDs[index], applyErrs[index] = mgr.ApplyBackup(ctx, plans[index].PlanID)
+		}(i)
+	}
+	close(startApply)
+	applying.Wait()
+	wantJobs := make(map[string]struct{}, count)
+	for i, err := range applyErrs {
+		if err != nil {
+			t.Fatalf("ApplyBackup(%d) error = %v", i, err)
+		}
+		if _, duplicate := wantJobs[jobIDs[i]]; duplicate {
+			t.Fatalf("duplicate job ID: %s", jobIDs[i])
+		}
+		wantJobs[jobIDs[i]] = struct{}{}
+	}
+	waitBackupJobs(t, done, wantJobs)
+
+	var previousArchive os.FileInfo
+	for i, record := range records {
+		archiveInfo, err := os.Stat(record.ArchivePath)
+		if err != nil {
+			t.Fatalf("archive %d missing: %v", i, err)
+		}
+		if previousArchive != nil && os.SameFile(previousArchive, archiveInfo) {
+			t.Fatalf("archive %d aliases another backup", i)
+		}
+		previousArchive = archiveInfo
+		sidecar, err := readSidecar(record.MetadataPath)
+		if err != nil {
+			t.Fatalf("metadata %d invalid: %v", i, err)
+		}
+		if err := verifyArchiveChecksum(record.ArchivePath, sidecar.SHA256); err != nil {
+			t.Fatalf("archive %d checksum error: %v", i, err)
+		}
+		assertPathMissing(t, record.ReservationPath)
+		assertPathMissing(t, record.StagingDirHost)
+	}
+}
+
+func TestExpiredBackupPlanReleasesOnlyOwnedReservationFiles(t *testing.T) {
+	ctx := context.Background()
+	mgr, _, _ := newTestManager(t)
+	dest := t.TempDir()
+	mgr.Docker.(*fakeBackupDocker).volumes["app-db"] = &models.VolumeDetail{Summary: models.VolumeSummary{Name: "app-db"}}
+	now := time.Date(2026, 6, 13, 16, 0, 0, 0, time.UTC)
+	mgr.Now = func() time.Time { return now }
+
+	plan, err := mgr.PlanBackupVolume(ctx, models.BackupVolumeRequest{VolumeName: "app-db", DestPath: dest})
+	if err != nil {
+		t.Fatalf("PlanBackupVolume() error = %v", err)
+	}
+	record := savedPlanRecord(t, mgr, plan.PlanID)
+	foreignArchive := []byte("created by another operation")
+	if err := os.WriteFile(record.ArchivePath, foreignArchive, 0o600); err != nil {
+		t.Fatalf("write foreign archive: %v", err)
+	}
+	now = plan.ExpiresAt.Add(time.Nanosecond)
+
+	if _, err := mgr.ApplyBackup(ctx, plan.PlanID); !apperror.IsCode(err, apperror.PlanExpired) {
+		t.Fatalf("ApplyBackup(expired) error = %v, want %s", err, apperror.PlanExpired)
+	}
+	got, err := os.ReadFile(record.ArchivePath)
+	if err != nil {
+		t.Fatalf("foreign archive was removed: %v", err)
+	}
+	if string(got) != string(foreignArchive) {
+		t.Fatalf("foreign archive = %q, want %q", got, foreignArchive)
+	}
+	assertPathMissing(t, record.ReservationPath)
+	assertPathMissing(t, record.StagingDirHost)
+}
+
+func TestStopAllReleasesUnappliedBackupReservation(t *testing.T) {
+	ctx := context.Background()
+	mgr, _, _ := newTestManager(t)
+	dest := t.TempDir()
+	mgr.Docker.(*fakeBackupDocker).volumes["app-db"] = &models.VolumeDetail{Summary: models.VolumeSummary{Name: "app-db"}}
+
+	plan, err := mgr.PlanBackupVolume(ctx, models.BackupVolumeRequest{VolumeName: "app-db", DestPath: dest})
+	if err != nil {
+		t.Fatalf("PlanBackupVolume() error = %v", err)
+	}
+	record := savedPlanRecord(t, mgr, plan.PlanID)
+	mgr.StopAll()
+
+	assertPathMissing(t, record.ReservationPath)
+	assertPathMissing(t, record.StagingDirHost)
+	if _, err := mgr.ApplyBackup(ctx, plan.PlanID); !apperror.IsCode(err, apperror.PlanExpired) {
+		t.Fatalf("ApplyBackup(after StopAll) error = %v, want %s", err, apperror.PlanExpired)
+	}
+}
+
+func TestBackupMetadataPublishCollisionPreservesForeignMetadata(t *testing.T) {
+	ctx := context.Background()
+	mgr, events, provider := newTestManager(t)
+	mgr.Backups = nil
+	mgr.Audit = nil
+	dest := t.TempDir()
+	mgr.Docker.(*fakeBackupDocker).volumes["app-db"] = &models.VolumeDetail{Summary: models.VolumeSummary{Name: "app-db"}}
+	done := events.Subscribe(ctx, bus.TopicJobDone, 4)
+
+	plan, err := mgr.PlanBackupVolume(ctx, models.BackupVolumeRequest{VolumeName: "app-db", DestPath: dest})
+	if err != nil {
+		t.Fatalf("PlanBackupVolume() error = %v", err)
+	}
+	record := savedPlanRecord(t, mgr, plan.PlanID)
+	foreignMetadata := []byte("foreign-metadata")
+	provider.afterBackupWrite = func() error {
+		return os.WriteFile(record.MetadataPath, foreignMetadata, 0o600)
+	}
+	jobID, err := mgr.ApplyBackup(ctx, plan.PlanID)
+	if err != nil {
+		t.Fatalf("ApplyBackup() error = %v", err)
+	}
+	payload := waitJobDonePayload(t, done, jobID)
+	if payload.Error == "" {
+		t.Fatal("backup succeeded despite metadata publication collision")
+	}
+	got, err := os.ReadFile(record.MetadataPath)
+	if err != nil {
+		t.Fatalf("foreign metadata was removed: %v", err)
+	}
+	if string(got) != string(foreignMetadata) {
+		t.Fatalf("foreign metadata = %q, want %q", got, foreignMetadata)
+	}
+	assertPathMissing(t, record.ArchivePath)
+	assertPathMissing(t, record.ReservationPath)
+	assertPathMissing(t, record.StagingDirHost)
+}
+
+func TestBackupRepositoryFailureRemovesUntrackedPublishedPair(t *testing.T) {
+	ctx := context.Background()
+	mgr, events, _ := newTestManager(t)
+	mgr.Audit = nil
+	brokenDB, err := store.Open(ctx, filepath.Join(t.TempDir(), "closed.db"))
+	if err != nil {
+		t.Fatalf("Open broken store: %v", err)
+	}
+	if err := brokenDB.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate broken store: %v", err)
+	}
+	mgr.Backups = brokenDB.Backups()
+	if err := brokenDB.Close(); err != nil {
+		t.Fatalf("Close broken store: %v", err)
+	}
+	dest := t.TempDir()
+	mgr.Docker.(*fakeBackupDocker).volumes["app-db"] = &models.VolumeDetail{Summary: models.VolumeSummary{Name: "app-db"}}
+	done := events.Subscribe(ctx, bus.TopicJobDone, 4)
+
+	plan, err := mgr.PlanBackupVolume(ctx, models.BackupVolumeRequest{VolumeName: "app-db", DestPath: dest})
+	if err != nil {
+		t.Fatalf("PlanBackupVolume() error = %v", err)
+	}
+	record := savedPlanRecord(t, mgr, plan.PlanID)
+	jobID, err := mgr.ApplyBackup(ctx, plan.PlanID)
+	if err != nil {
+		t.Fatalf("ApplyBackup() error = %v", err)
+	}
+	payload := waitJobDonePayload(t, done, jobID)
+	if payload.Error == "" {
+		t.Fatal("backup succeeded despite closed repository")
+	}
+	assertPathMissing(t, record.ArchivePath)
+	assertPathMissing(t, record.MetadataPath)
+	assertPathMissing(t, record.ReservationPath)
+	assertPathMissing(t, record.StagingDirHost)
+}
+
+func TestBackupCleanupFailureReportsRecordedPartialSuccess(t *testing.T) {
+	ctx := context.Background()
+	mgr, _, provider := newTestManager(t)
+	dest := t.TempDir()
+	mgr.Docker.(*fakeBackupDocker).volumes["app-db"] = &models.VolumeDetail{Summary: models.VolumeSummary{Name: "app-db"}}
+
+	plan, err := mgr.PlanBackupVolume(ctx, models.BackupVolumeRequest{VolumeName: "app-db", DestPath: dest})
+	if err != nil {
+		t.Fatalf("PlanBackupVolume() error = %v", err)
+	}
+	record, err := mgr.takePlan(ctx, plan.PlanID, "")
+	if err != nil {
+		t.Fatalf("takePlan() error = %v", err)
+	}
+	unexpectedPath := filepath.Join(record.StagingDirHost, "unexpected")
+	provider.afterBackupWrite = func() error {
+		return os.WriteFile(unexpectedPath, []byte("ownership unclear"), 0o600)
+	}
+
+	err = mgr.runBackup(ctx, "backup-partial", record)
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) || appErr.Partial == nil {
+		t.Fatalf("runBackup() error = %#v, want structured partial resource", err)
+	}
+	if appErr.Partial.Type != "backup" || appErr.Partial.State != "created" || !appErr.Partial.CleanupRequired {
+		t.Fatalf("partial resource = %#v", appErr.Partial)
+	}
+	backups, listErr := mgr.ListBackups(ctx, models.BackupFilter{VolumeName: "app-db"})
+	if listErr != nil {
+		t.Fatalf("ListBackups() error = %v", listErr)
+	}
+	if len(backups) != 1 || backups[0].Result != backupResultOK {
+		t.Fatalf("recorded backups = %#v", backups)
+	}
+	if _, err := os.Stat(record.ArchivePath); err != nil {
+		t.Fatalf("recorded archive missing: %v", err)
+	}
+	if _, err := os.Stat(record.MetadataPath); err != nil {
+		t.Fatalf("recorded metadata missing: %v", err)
+	}
+	if _, err := os.Stat(record.ReservationPath); err != nil {
+		t.Fatalf("reservation evidence missing: %v", err)
+	}
+	if _, err := os.Stat(unexpectedPath); err != nil {
+		t.Fatalf("unexpected staging entry was removed: %v", err)
+	}
+}
+
+func TestOwnedCleanupRefusesForeignArtifacts(t *testing.T) {
+	dir := t.TempDir()
+	stagingPath := filepath.Join(dir, "staged.tar.gz")
+	destinationPath := filepath.Join(dir, "published.tar.gz")
+	if err := os.WriteFile(stagingPath, []byte("ours"), 0o600); err != nil {
+		t.Fatalf("write staged file: %v", err)
+	}
+	if err := os.WriteFile(destinationPath, []byte("foreign"), 0o600); err != nil {
+		t.Fatalf("write foreign file: %v", err)
+	}
+	if err := removePublishedBackupFile(stagingPath, destinationPath); !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("removePublishedBackupFile() error = %v, want conflict", err)
+	}
+	got, err := os.ReadFile(destinationPath)
+	if err != nil || string(got) != "foreign" {
+		t.Fatalf("foreign destination changed: content=%q error=%v", got, err)
+	}
+
+	reservation, err := reserveBackupPaths(dir, "app-db", time.Now(), "plan-owner")
+	if err != nil {
+		t.Fatalf("reserveBackupPaths() error = %v", err)
+	}
+	if err := os.WriteFile(reservation.ReservationPath, []byte("another-owner\n"), 0o600); err != nil {
+		t.Fatalf("replace reservation owner: %v", err)
+	}
+	if err := releaseBackupReservationRecord(reservation); !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("releaseBackupReservationRecord() error = %v, want conflict", err)
+	}
+	if _, err := os.Stat(reservation.StagingDir); err != nil {
+		t.Fatalf("foreign-owned staging directory was removed: %v", err)
+	}
+	if _, err := os.Stat(reservation.ReservationPath); err != nil {
+		t.Fatalf("foreign-owned reservation marker was removed: %v", err)
+	}
+}
+
+func TestReservationCleanupRefusesSamePathStagingDirectorySwap(t *testing.T) {
+	dir := t.TempDir()
+	reservation, err := reserveBackupPaths(dir, "app-db", time.Now(), "plan-owner")
+	if err != nil {
+		t.Fatalf("reserveBackupPaths() error = %v", err)
+	}
+	originalDir := reservation.StagingDir + ".original"
+	if err := os.Rename(reservation.StagingDir, originalDir); err != nil {
+		t.Fatalf("move owned staging directory: %v", err)
+	}
+	if err := os.Mkdir(reservation.StagingDir, 0o700); err != nil {
+		t.Fatalf("create replacement staging directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(reservation.StagingDir, stagingOwnerName), []byte(reservation.Owner+"\n"), 0o600); err != nil {
+		t.Fatalf("write copied owner marker: %v", err)
+	}
+	foreignPath := filepath.Join(reservation.StagingDir, "foreign-data")
+	if err := os.WriteFile(foreignPath, []byte("do not delete"), 0o600); err != nil {
+		t.Fatalf("write foreign staging data: %v", err)
+	}
+
+	if err := releaseBackupReservationRecord(reservation); !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("releaseBackupReservationRecord() error = %v, want conflict", err)
+	}
+	got, err := os.ReadFile(foreignPath)
+	if err != nil || string(got) != "do not delete" {
+		t.Fatalf("foreign staging data changed: content=%q error=%v", got, err)
+	}
+	if _, err := os.Stat(reservation.ReservationPath); err != nil {
+		t.Fatalf("reservation evidence was removed after directory swap: %v", err)
+	}
+}
+
+func TestReservationCleanupRefusesUnexpectedOwnedDirectoryEntries(t *testing.T) {
+	dir := t.TempDir()
+	reservation, err := reserveBackupPaths(dir, "app-db", time.Now(), "plan-owner")
+	if err != nil {
+		t.Fatalf("reserveBackupPaths() error = %v", err)
+	}
+	unexpectedPath := filepath.Join(reservation.StagingDir, "unexpected")
+	if err := os.WriteFile(unexpectedPath, []byte("keep"), 0o600); err != nil {
+		t.Fatalf("write unexpected entry: %v", err)
+	}
+
+	if err := releaseBackupReservationRecord(reservation); !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("releaseBackupReservationRecord() error = %v, want conflict", err)
+	}
+	got, err := os.ReadFile(unexpectedPath)
+	if err != nil || string(got) != "keep" {
+		t.Fatalf("unexpected entry changed: content=%q error=%v", got, err)
+	}
+	if _, err := os.Stat(reservation.ReservationPath); err != nil {
+		t.Fatalf("reservation evidence was removed: %v", err)
+	}
+}
+
+func TestUntrackedPublishCleanupFailurePreservesOwnershipEvidence(t *testing.T) {
+	dir := t.TempDir()
+	reservation, err := reserveBackupPaths(dir, "app-db", time.Now(), "plan-owner")
+	if err != nil {
+		t.Fatalf("reserveBackupPaths() error = %v", err)
+	}
+	if err := os.WriteFile(reservation.StagingArchivePath, []byte("archive"), 0o600); err != nil {
+		t.Fatalf("write staged archive: %v", err)
+	}
+	if err := os.WriteFile(reservation.StagingMetadataPath, []byte("metadata"), 0o600); err != nil {
+		t.Fatalf("write staged metadata: %v", err)
+	}
+	archiveIdentity, err := regularFileIdentity(reservation.StagingArchivePath)
+	if err != nil {
+		t.Fatalf("archive identity: %v", err)
+	}
+	metadataIdentity, err := regularFileIdentity(reservation.StagingMetadataPath)
+	if err != nil {
+		t.Fatalf("metadata identity: %v", err)
+	}
+	record := planRecord{
+		Operation:               "backup",
+		ArchivePath:             reservation.ArchivePath,
+		MetadataPath:            reservation.MetadataPath,
+		ReservationPath:         reservation.ReservationPath,
+		ReservationOwner:        reservation.Owner,
+		ReservationIdentity:     reservation.ReservationIdentity,
+		StagingDirHost:          reservation.StagingDir,
+		StagingDirIdentity:      reservation.StagingDirIdentity,
+		StagingArchivePath:      reservation.StagingArchivePath,
+		StagingArchiveIdentity:  archiveIdentity,
+		StagingMetadataPath:     reservation.StagingMetadataPath,
+		StagingMetadataIdentity: metadataIdentity,
+		StagingOwnerPath:        reservation.StagingOwnerPath,
+		StagingOwnerIdentity:    reservation.StagingOwnerIdentity,
+	}
+	if err := publishStagedBackupFile(record.StagingArchivePath, record.ArchivePath, record.StagingArchiveIdentity); err != nil {
+		t.Fatalf("publish archive: %v", err)
+	}
+	if err := publishStagedBackupFile(record.StagingMetadataPath, record.MetadataPath, record.StagingMetadataIdentity); err != nil {
+		t.Fatalf("publish metadata: %v", err)
+	}
+	if err := os.Remove(record.MetadataPath); err != nil {
+		t.Fatalf("replace published metadata: %v", err)
+	}
+	if err := os.WriteFile(record.MetadataPath, []byte("foreign"), 0o600); err != nil {
+		t.Fatalf("write foreign metadata: %v", err)
+	}
+
+	if err := cleanupUntrackedPublishedBackup(record); !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("cleanupUntrackedPublishedBackup() error = %v, want conflict", err)
+	}
+	got, err := os.ReadFile(record.MetadataPath)
+	if err != nil || string(got) != "foreign" {
+		t.Fatalf("foreign metadata changed: content=%q error=%v", got, err)
+	}
+	assertPathMissing(t, record.ArchivePath)
+	if _, err := os.Stat(record.ReservationPath); err != nil {
+		t.Fatalf("reservation evidence was removed after cleanup failure: %v", err)
+	}
+	if _, err := os.Stat(record.StagingDirHost); err != nil {
+		t.Fatalf("staging evidence was removed after cleanup failure: %v", err)
+	}
+}
+
+func TestPublishStagedBackupFileRejectsArchiveAndMetadataSwaps(t *testing.T) {
+	tests := []struct {
+		name string
+		link func(stagingPath string, destinationPath string) error
+	}{
+		{
+			name: "archive staging swap after preflight",
+			link: func(stagingPath string, destinationPath string) error {
+				foreignPath := stagingPath + ".foreign"
+				if err := os.WriteFile(foreignPath, []byte("foreign-archive"), 0o600); err != nil {
+					return err
+				}
+				if err := os.Remove(stagingPath); err != nil {
+					return err
+				}
+				if err := os.Rename(foreignPath, stagingPath); err != nil {
+					return err
+				}
+				return os.Link(stagingPath, destinationPath)
+			},
+		},
+		{
+			name: "metadata destination swap after link",
+			link: func(stagingPath string, destinationPath string) error {
+				foreignPath := destinationPath + ".foreign"
+				if err := os.WriteFile(foreignPath, []byte("foreign-metadata"), 0o600); err != nil {
+					return err
+				}
+				if err := os.Link(stagingPath, destinationPath); err != nil {
+					return err
+				}
+				if err := os.Remove(destinationPath); err != nil {
+					return err
+				}
+				return os.Rename(foreignPath, destinationPath)
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			stagingPath := filepath.Join(dir, "staged")
+			destinationPath := filepath.Join(dir, "published")
+			if err := os.WriteFile(stagingPath, []byte("owned"), 0o600); err != nil {
+				t.Fatalf("write staged file: %v", err)
+			}
+			expected, err := regularFileIdentity(stagingPath)
+			if err != nil {
+				t.Fatalf("capture staged identity: %v", err)
+			}
+
+			err = publishStagedBackupFileWithLink(stagingPath, destinationPath, expected, tt.link)
+			if !apperror.IsCode(err, apperror.Conflict) {
+				t.Fatalf("publishStagedBackupFileWithLink() error = %v, want conflict", err)
+			}
+			if !errors.Is(err, errPreserveBackupReservation) {
+				t.Fatalf("publish error = %v, want preserved ownership evidence", err)
+			}
+			got, readErr := os.ReadFile(destinationPath)
+			if readErr != nil || !strings.HasPrefix(string(got), "foreign-") {
+				t.Fatalf("foreign destination changed: content=%q error=%v", got, readErr)
+			}
+		})
 	}
 }
 
@@ -202,25 +716,6 @@ func (f *fakeSidecarFile) Sync() error {
 func (f *fakeSidecarFile) Close() error {
 	f.closeCalls++
 	return f.closeErr
-}
-
-func TestBackupPathsReturnStatErrorsAndCapCollisions(t *testing.T) {
-	t.Parallel()
-	dir := t.TempDir()
-	ts := time.Date(2026, 6, 13, 16, 0, 0, 0, time.UTC)
-	_, _, _, err := backupPathsWithStat(dir, "app/db", ts, func(string) (os.FileInfo, error) {
-		return nil, os.ErrPermission
-	}, 3)
-	if !apperror.IsCode(err, apperror.Internal) {
-		t.Fatalf("stat error = %v", err)
-	}
-
-	_, _, _, err = backupPathsWithStat(dir, "app/db", ts, func(string) (os.FileInfo, error) {
-		return nil, nil
-	}, 3)
-	if !apperror.IsCode(err, apperror.Conflict) {
-		t.Fatalf("collision cap error = %v", err)
-	}
 }
 
 func TestCheckFreeSpaceIgnoresUnknownOrNegativeEstimates(t *testing.T) {
@@ -476,6 +971,7 @@ func TestApplyBackupStopsWithManager(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PlanBackupVolume() error = %v", err)
 	}
+	record := savedPlanRecord(t, mgr, plan.PlanID)
 	jobID, err := mgr.ApplyBackup(ctx, plan.PlanID)
 	if err != nil {
 		t.Fatalf("ApplyBackup() error = %v", err)
@@ -498,6 +994,10 @@ func TestApplyBackupStopsWithManager(t *testing.T) {
 	if payload.Error == "" {
 		t.Fatalf("job error is empty, want cancellation failure")
 	}
+	assertPathMissing(t, record.ArchivePath)
+	assertPathMissing(t, record.MetadataPath)
+	assertPathMissing(t, record.ReservationPath)
+	assertPathMissing(t, record.StagingDirHost)
 }
 
 func TestRestoreOverwriteRequiresTypedNameAndRunsHelper(t *testing.T) {
@@ -696,6 +1196,7 @@ func newTestManager(t *testing.T) (*Manager, *bus.MemoryBus, *fakeBackupProvider
 	mgr.Now = func() time.Time { return time.Date(2026, 6, 13, 16, 0, 0, 0, time.UTC) }
 	mgr.NewID = func() string { return "id" }
 	mgr.AvailableBytes = func(string) (uint64, bool) { return 1 << 40, true }
+	t.Cleanup(mgr.StopAll)
 	return mgr, eventBus, provider
 }
 
@@ -708,11 +1209,12 @@ func (r fakeProviderResolver) ActiveProvider(context.Context) (providers.Platfor
 }
 
 type fakeBackupProvider struct {
-	mu          sync.Mutex
-	calls       [][]string
-	blockRun    chan struct{}
-	runStarted  chan struct{}
-	runCanceled chan error
+	mu               sync.Mutex
+	calls            [][]string
+	blockRun         chan struct{}
+	runStarted       chan struct{}
+	runCanceled      chan error
+	afterBackupWrite func() error
 }
 
 func (p *fakeBackupProvider) ID() string          { return "linux_native" }
@@ -741,6 +1243,7 @@ func (p *fakeBackupProvider) RunDocker(ctx context.Context, args ...string) (*pr
 	blockRun := p.blockRun
 	runStarted := p.runStarted
 	runCanceled := p.runCanceled
+	afterBackupWrite := p.afterBackupWrite
 	p.mu.Unlock()
 	if runStarted != nil {
 		select {
@@ -772,6 +1275,11 @@ func (p *fakeBackupProvider) RunDocker(ctx context.Context, args ...string) (*pr
 		if archive != "" && backupDir != "" {
 			if err := os.WriteFile(filepath.Join(backupDir, archive), []byte("backup-data"), 0o600); err != nil {
 				return &providers.CommandResult{ExitCode: 1, Stderr: err.Error()}, err
+			}
+			if afterBackupWrite != nil {
+				if err := afterBackupWrite(); err != nil {
+					return &providers.CommandResult{ExitCode: 1, Stderr: err.Error()}, err
+				}
 			}
 		}
 	}
@@ -839,5 +1347,46 @@ func waitJobDonePayload(t *testing.T, events <-chan bus.Event, jobID string) job
 		case <-deadline:
 			t.Fatalf("timed out waiting for job %s", jobID)
 		}
+	}
+}
+
+func waitBackupJobs(t *testing.T, events <-chan bus.Event, remaining map[string]struct{}) {
+	t.Helper()
+	deadline := time.After(10 * time.Second)
+	for len(remaining) > 0 {
+		select {
+		case event := <-events:
+			payload, ok := event.Payload.(jobDonePayload)
+			if !ok {
+				continue
+			}
+			if _, wanted := remaining[payload.JobID]; !wanted {
+				continue
+			}
+			if payload.Error != "" {
+				t.Fatalf("job %s failed: %s", payload.JobID, payload.Error)
+			}
+			delete(remaining, payload.JobID)
+		case <-deadline:
+			t.Fatalf("timed out waiting for %d backup jobs", len(remaining))
+		}
+	}
+}
+
+func savedPlanRecord(t *testing.T, mgr *Manager, planID string) planRecord {
+	t.Helper()
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	record, ok := mgr.plans[planID]
+	if !ok {
+		t.Fatalf("plan %s is not saved", planID)
+	}
+	return record
+}
+
+func assertPathMissing(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Lstat(path); !os.IsNotExist(err) {
+		t.Fatalf("path %s still exists: %v", path, err)
 	}
 }

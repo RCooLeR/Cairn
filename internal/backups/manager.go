@@ -30,6 +30,11 @@ const (
 	backupResultOK        = "success"
 	backupResultFailed    = "failed"
 	backupTimestampLayout = "20060102T150405Z"
+	stagingArchiveName    = "archive.tar.gz"
+	stagingMetadataName   = "archive.json"
+	stagingOwnerName      = ".cairn-owner"
+	reservationSuffix     = ".cairn-reservation"
+	maxReservationBytes   = 256
 )
 
 type ProviderResolver interface {
@@ -62,8 +67,9 @@ type Manager struct {
 
 	AvailableBytes func(string) (uint64, bool)
 
-	mu    sync.Mutex
-	plans map[string]planRecord
+	mu             sync.Mutex
+	plans          map[string]planRecord
+	planGeneration uint64
 
 	jobsMu  sync.Mutex
 	rootCtx context.Context
@@ -71,23 +77,52 @@ type Manager struct {
 }
 
 type planRecord struct {
-	Plan              models.CommandPlan
-	Operation         string
-	Provider          providers.PlatformProvider
-	ProviderID        string
-	ProjectID         string
-	VolumeName        string
-	TargetVolumeName  string
-	BackupDirHost     string
-	BackupDirBackend  string
-	ArchiveName       string
-	ArchivePath       string
-	MetadataPath      string
-	BackupID          string
-	UsingContainers   []string
-	Overwrite         bool
-	CreateTargetFirst bool
-	Sidecar           BackupSidecar
+	Plan                    models.CommandPlan
+	Operation               string
+	Provider                providers.PlatformProvider
+	ProviderID              string
+	ProjectID               string
+	VolumeName              string
+	TargetVolumeName        string
+	BackupDirHost           string
+	BackupDirBackend        string
+	ArchiveName             string
+	ArchivePath             string
+	MetadataPath            string
+	ReservationPath         string
+	ReservationOwner        string
+	ReservationIdentity     os.FileInfo
+	StagingDirHost          string
+	StagingDirBackend       string
+	StagingDirIdentity      os.FileInfo
+	StagingArchivePath      string
+	StagingArchiveIdentity  os.FileInfo
+	StagingMetadataPath     string
+	StagingMetadataIdentity os.FileInfo
+	StagingOwnerPath        string
+	StagingOwnerIdentity    os.FileInfo
+	BackupID                string
+	UsingContainers         []string
+	Overwrite               bool
+	CreateTargetFirst       bool
+	Sidecar                 BackupSidecar
+	expiryTimer             *time.Timer
+	generation              uint64
+}
+
+type backupReservation struct {
+	ArchiveName          string
+	ArchivePath          string
+	MetadataPath         string
+	ReservationPath      string
+	ReservationIdentity  os.FileInfo
+	Owner                string
+	StagingDir           string
+	StagingDirIdentity   os.FileInfo
+	StagingArchivePath   string
+	StagingMetadataPath  string
+	StagingOwnerPath     string
+	StagingOwnerIdentity os.FileInfo
 }
 
 type BackupSidecar struct {
@@ -123,6 +158,8 @@ type objectsChangedPayload struct {
 }
 
 var safeFilenamePattern = regexp.MustCompile(`[^A-Za-z0-9_.-]+`)
+
+var errPreserveBackupReservation = errors.New("preserve backup reservation ownership evidence")
 
 const maxBackupPathAttempts = 10000
 
@@ -166,6 +203,9 @@ func (m *Manager) StopAll() {
 	for _, cancel := range cancels {
 		cancel()
 	}
+	for _, record := range m.discardPlans() {
+		_ = releaseBackupReservation(record)
+	}
 }
 
 func (m *Manager) PlanBackupVolume(ctx context.Context, req models.BackupVolumeRequest) (*models.CommandPlan, error) {
@@ -200,32 +240,46 @@ func (m *Manager) PlanBackupVolume(ctx context.Context, req models.BackupVolumeR
 	}
 
 	now := m.now()
-	archiveName, archivePath, metadataPath, err := backupPaths(backupDirHost, volumeName, now)
+	reservation, err := reserveBackupPaths(backupDirHost, volumeName, now, planID)
 	if err != nil {
 		return nil, err
+	}
+	stagingDirBackend, err := provider.MapPathToBackend(reservation.StagingDir)
+	if err != nil {
+		return nil, errors.Join(err, releaseBackupReservationRecord(reservation))
 	}
 	containers := runningContainerNames(detail.Containers)
 	plan := models.CommandPlan{
 		PlanID:    planID,
 		Title:     "Back up " + volumeName,
 		Risk:      models.RiskSafe,
-		Commands:  []models.PlannedCommand{backupCommand(1, volumeName, backupDirBackend, archiveName, models.RiskSafe)},
-		Effects:   backupEffects(volumeName, archivePath, metadataPath, containers),
+		Commands:  []models.PlannedCommand{backupCommand(1, volumeName, stagingDirBackend, stagingArchiveName, models.RiskSafe)},
+		Effects:   backupEffects(volumeName, reservation.ArchivePath, reservation.MetadataPath, containers),
 		ExpiresAt: now.Add(security.DefaultPlanTTL),
 	}
 	record := planRecord{
-		Plan:             plan,
-		Operation:        "backup",
-		Provider:         provider,
-		ProviderID:       provider.ID(),
-		ProjectID:        firstNonEmpty(req.ProjectID, detail.Summary.Labels["com.docker.compose.project"]),
-		VolumeName:       volumeName,
-		BackupDirHost:    backupDirHost,
-		BackupDirBackend: backupDirBackend,
-		ArchiveName:      archiveName,
-		ArchivePath:      archivePath,
-		MetadataPath:     metadataPath,
-		UsingContainers:  containers,
+		Plan:                 plan,
+		Operation:            "backup",
+		Provider:             provider,
+		ProviderID:           provider.ID(),
+		ProjectID:            firstNonEmpty(req.ProjectID, detail.Summary.Labels["com.docker.compose.project"]),
+		VolumeName:           volumeName,
+		BackupDirHost:        backupDirHost,
+		BackupDirBackend:     backupDirBackend,
+		ArchiveName:          reservation.ArchiveName,
+		ArchivePath:          reservation.ArchivePath,
+		MetadataPath:         reservation.MetadataPath,
+		ReservationPath:      reservation.ReservationPath,
+		ReservationOwner:     reservation.Owner,
+		ReservationIdentity:  reservation.ReservationIdentity,
+		StagingDirHost:       reservation.StagingDir,
+		StagingDirBackend:    stagingDirBackend,
+		StagingDirIdentity:   reservation.StagingDirIdentity,
+		StagingArchivePath:   reservation.StagingArchivePath,
+		StagingMetadataPath:  reservation.StagingMetadataPath,
+		StagingOwnerPath:     reservation.StagingOwnerPath,
+		StagingOwnerIdentity: reservation.StagingOwnerIdentity,
+		UsingContainers:      containers,
 	}
 	m.savePlan(record)
 	return &plan, nil
@@ -239,6 +293,9 @@ func (m *Manager) ApplyBackup(ctx context.Context, planID string) (string, error
 	if record.Operation != "backup" {
 		m.savePlan(record)
 		return "", apperror.New(apperror.Conflict, "Plan is not a backup plan")
+	}
+	if err := validateBackupReservation(record); err != nil {
+		return "", errors.Join(err, releaseBackupReservation(record))
 	}
 	jobID := "backup-" + m.newID()
 	m.startJob(jobID, func(jobCtx context.Context) {
@@ -484,23 +541,24 @@ func (m *Manager) runBackup(ctx context.Context, jobID string, record planRecord
 	command := plannedCommandText(record.Plan)
 	_ = m.recordAudit(ctx, "backup.volume", "volume", record.VolumeName, record.ProviderID, record.ProjectID, command, record.Plan.Risk, "started", 0, nil)
 	m.publishProgress(jobID, "backup", "Starting volume backup", nil)
+	if err := validateBackupReservation(record); err != nil {
+		return m.finishBackupFailure(ctx, jobID, started, command, record, 0, err)
+	}
 	provider, err := m.planProvider(ctx, record)
 	if err == nil {
-		err = runProviderDocker(ctx, provider, dockerRunBackupArgs(record.VolumeName, record.BackupDirBackend, record.ArchiveName)...)
+		err = runProviderDocker(ctx, provider, dockerRunBackupArgs(record.VolumeName, record.StagingDirBackend, stagingArchiveName)...)
 	}
-	duration := time.Since(started)
-	if err != nil {
-		_ = m.insertBackupRecord(ctx, record, backupResultFailed, 0, err)
-		_ = m.recordAudit(ctx, "backup.volume", "volume", record.VolumeName, record.ProviderID, record.ProjectID, command, record.Plan.Risk, "failed", duration, err)
-		m.publishDone(jobID, "", err)
-		return err
+	archiveIdentity, identityErr := optionalRegularFileIdentity(record.StagingArchivePath)
+	record.StagingArchiveIdentity = archiveIdentity
+	if identityErr != nil {
+		err = errors.Join(err, apperror.Wrap(apperror.Conflict, "Capture staged backup archive ownership failed", identityErr))
 	}
-	sum, size, err := fileSHA256(record.ArchivePath)
 	if err != nil {
-		_ = m.insertBackupRecord(ctx, record, backupResultFailed, 0, err)
-		_ = m.recordAudit(ctx, "backup.volume", "volume", record.VolumeName, record.ProviderID, record.ProjectID, command, record.Plan.Risk, "failed", duration, err)
-		m.publishDone(jobID, "", err)
-		return err
+		return m.finishBackupFailure(ctx, jobID, started, command, record, 0, err)
+	}
+	sum, size, err := fileSHA256(record.StagingArchivePath)
+	if err != nil {
+		return m.finishBackupFailure(ctx, jobID, started, command, record, 0, err)
 	}
 	contextName, _ := provider.DockerContext(ctx)
 	sidecar := BackupSidecar{
@@ -516,24 +574,120 @@ func (m *Manager) runBackup(ctx context.Context, jobID string, record planRecord
 		CairnVersion:         m.Version,
 		ArchiveFormatVersion: formatVersion,
 	}
-	if err := writeSidecar(record.MetadataPath, sidecar); err != nil {
-		if cleanupErr := removeBackupArtifacts(record.ArchivePath, record.MetadataPath); cleanupErr != nil {
-			err = errors.Join(err, apperror.Wrap(apperror.Internal, "Clean up failed backup artifacts failed", cleanupErr))
+	if err := writeSidecar(record.StagingMetadataPath, sidecar); err != nil {
+		return m.finishBackupFailure(ctx, jobID, started, command, record, size, err)
+	}
+	record.StagingMetadataIdentity, err = regularFileIdentity(record.StagingMetadataPath)
+	if err != nil {
+		return m.finishBackupFailure(ctx, jobID, started, command, record, size, err)
+	}
+	metadataSum, _, err := fileSHA256(record.StagingMetadataPath)
+	if err != nil {
+		return m.finishBackupFailure(ctx, jobID, started, command, record, size, err)
+	}
+	if err := publishStagedBackupFile(record.StagingArchivePath, record.ArchivePath, record.StagingArchiveIdentity); err != nil {
+		if errors.Is(err, errPreserveBackupReservation) {
+			return m.recordBackupFailure(ctx, jobID, started, command, record, size, err)
 		}
-		_ = m.insertBackupRecord(ctx, record, backupResultFailed, size, err)
-		_ = m.recordAudit(ctx, "backup.volume", "volume", record.VolumeName, record.ProviderID, record.ProjectID, command, record.Plan.Risk, "failed", duration, err)
-		m.publishDone(jobID, "", err)
-		return err
+		return m.finishBackupFailure(ctx, jobID, started, command, record, size, err)
+	}
+	if err := publishStagedBackupFile(record.StagingMetadataPath, record.MetadataPath, record.StagingMetadataIdentity); err != nil {
+		preserveEvidence := errors.Is(err, errPreserveBackupReservation)
+		if cleanupErr := removePublishedBackupFileWithIdentity(record.StagingArchiveIdentity, record.ArchivePath); cleanupErr != nil {
+			err = errors.Join(err, apperror.Wrap(apperror.Internal, "Clean up published backup archive failed", cleanupErr))
+			preserveEvidence = true
+		}
+		if preserveEvidence {
+			return m.recordBackupFailure(ctx, jobID, started, command, record, size, err)
+		}
+		return m.finishBackupFailure(ctx, jobID, started, command, record, size, err)
+	}
+	if err := verifyPublishedBackupPair(record, sum, metadataSum); err != nil {
+		if cleanupErr := removePublishedBackupPair(record); cleanupErr != nil {
+			err = errors.Join(err, apperror.Wrap(apperror.Internal, "Clean up invalid published backup failed", cleanupErr))
+			return m.recordBackupFailure(ctx, jobID, started, command, record, size, err)
+		}
+		return m.finishBackupFailure(ctx, jobID, started, command, record, size, err)
 	}
 	record.Sidecar = sidecar
-	if err := m.insertBackupRecord(ctx, record, backupResultOK, size, nil); err != nil {
+	backupID, err := m.insertBackupRecord(ctx, record, backupResultOK, size, nil)
+	if err != nil {
+		if cleanupErr := cleanupUntrackedPublishedBackup(record); cleanupErr != nil {
+			err = errors.Join(err, apperror.Wrap(apperror.Internal, "Clean up untracked published backup failed", cleanupErr))
+			duration := time.Since(started)
+			_ = m.recordAudit(ctx, "backup.volume", "volume", record.VolumeName, record.ProviderID, record.ProjectID, command, record.Plan.Risk, "failed", duration, err)
+			m.publishDone(jobID, "", err)
+			return err
+		}
+		duration := time.Since(started)
 		_ = m.recordAudit(ctx, "backup.volume", "volume", record.VolumeName, record.ProviderID, record.ProjectID, command, record.Plan.Risk, "failed", duration, err)
 		m.publishDone(jobID, "", err)
 		return err
 	}
+	if cleanupErr := releaseBackupReservation(record); cleanupErr != nil {
+		err = apperror.Wrap(
+			apperror.Internal,
+			"Backup was created but its reservation cleanup failed",
+			cleanupErr,
+			apperror.WithPartialResource("backup", firstNonEmpty(backupID, record.ArchivePath), "created", true),
+			apperror.WithRepairHints("The backup archive and metadata are valid and recorded. Remove only the matching hidden reservation and staging files after verifying ownership."),
+		)
+		duration := time.Since(started)
+		_ = m.recordAudit(ctx, "backup.volume", "volume", record.VolumeName, record.ProviderID, record.ProjectID, command, record.Plan.Risk, "failed", duration, err)
+		m.publishDone(jobID, "", err)
+		return err
+	}
+	duration := time.Since(started)
 	m.publishProgress(jobID, "backup", "Volume backup complete", floatPtr(100))
 	_ = m.recordAudit(ctx, "backup.volume", "volume", record.VolumeName, record.ProviderID, record.ProjectID, command, record.Plan.Risk, "success", duration, nil)
 	m.publishDone(jobID, record.ArchivePath, nil)
+	return nil
+}
+
+func (m *Manager) finishBackupFailure(ctx context.Context, jobID string, started time.Time, command string, record planRecord, size int64, actionErr error) error {
+	if cleanupErr := releaseBackupReservation(record); cleanupErr != nil {
+		actionErr = errors.Join(actionErr, apperror.Wrap(apperror.Internal, "Release backup reservation failed", cleanupErr))
+	}
+	return m.recordBackupFailure(ctx, jobID, started, command, record, size, actionErr)
+}
+
+func (m *Manager) recordBackupFailure(ctx context.Context, jobID string, started time.Time, command string, record planRecord, size int64, actionErr error) error {
+	duration := time.Since(started)
+	_, _ = m.insertBackupRecord(ctx, record, backupResultFailed, size, actionErr)
+	_ = m.recordAudit(ctx, "backup.volume", "volume", record.VolumeName, record.ProviderID, record.ProjectID, command, record.Plan.Risk, "failed", duration, actionErr)
+	m.publishDone(jobID, "", actionErr)
+	return actionErr
+}
+
+func cleanupUntrackedPublishedBackup(record planRecord) error {
+	if err := removePublishedBackupPair(record); err != nil {
+		return err
+	}
+	return releaseBackupReservation(record)
+}
+
+func removePublishedBackupPair(record planRecord) error {
+	return errors.Join(
+		removePublishedBackupFileWithIdentity(record.StagingMetadataIdentity, record.MetadataPath),
+		removePublishedBackupFileWithIdentity(record.StagingArchiveIdentity, record.ArchivePath),
+	)
+}
+
+func verifyPublishedBackupPair(record planRecord, archiveSHA256 string, metadataSHA256 string) error {
+	gotArchive, _, err := fileSHA256WithIdentity(record.ArchivePath, record.StagingArchiveIdentity)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(gotArchive, archiveSHA256) {
+		return apperror.New(apperror.Conflict, "Published backup archive changed during publication")
+	}
+	gotMetadata, _, err := fileSHA256WithIdentity(record.MetadataPath, record.StagingMetadataIdentity)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(gotMetadata, metadataSHA256) {
+		return apperror.New(apperror.Conflict, "Published backup metadata changed during publication")
+	}
 	return nil
 }
 
@@ -604,8 +758,22 @@ func (m *Manager) forgetJob(jobID string) {
 
 func (m *Manager) savePlan(record planRecord) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	if previous, ok := m.plans[record.Plan.PlanID]; ok && previous.expiryTimer != nil {
+		previous.expiryTimer.Stop()
+	}
+	m.planGeneration++
+	record.generation = m.planGeneration
+	delay := record.Plan.ExpiresAt.Sub(m.now())
+	if delay < 0 {
+		delay = 0
+	}
+	generation := record.generation
+	planID := record.Plan.PlanID
+	record.expiryTimer = time.AfterFunc(delay, func() {
+		m.expirePlan(planID, generation)
+	})
 	m.plans[record.Plan.PlanID] = record
+	m.mu.Unlock()
 }
 
 func (m *Manager) takePlan(ctx context.Context, planID string, typedName string) (planRecord, error) {
@@ -613,20 +781,59 @@ func (m *Manager) takePlan(ctx context.Context, planID string, typedName string)
 		return planRecord{}, err
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	record, ok := m.plans[planID]
 	if !ok {
+		m.mu.Unlock()
 		return planRecord{}, apperror.New(apperror.PlanExpired, "Plan expired or was not found")
 	}
 	if m.now().After(record.Plan.ExpiresAt) {
 		delete(m.plans, planID)
-		return planRecord{}, apperror.New(apperror.PlanExpired, "Plan expired")
+		if record.expiryTimer != nil {
+			record.expiryTimer.Stop()
+		}
+		m.mu.Unlock()
+		var err error = apperror.New(apperror.PlanExpired, "Plan expired")
+		if cleanupErr := releaseBackupReservation(record); cleanupErr != nil {
+			err = errors.Join(err, apperror.Wrap(apperror.Internal, "Release expired backup reservation failed", cleanupErr))
+		}
+		return planRecord{}, err
 	}
 	if err := security.RequireConfirmation(record.Plan, typedName); err != nil {
+		m.mu.Unlock()
 		return planRecord{}, err
 	}
 	delete(m.plans, planID)
+	if record.expiryTimer != nil {
+		record.expiryTimer.Stop()
+	}
+	m.mu.Unlock()
 	return record, nil
+}
+
+func (m *Manager) expirePlan(planID string, generation uint64) {
+	m.mu.Lock()
+	record, ok := m.plans[planID]
+	if !ok || record.generation != generation {
+		m.mu.Unlock()
+		return
+	}
+	delete(m.plans, planID)
+	m.mu.Unlock()
+	_ = releaseBackupReservation(record)
+}
+
+func (m *Manager) discardPlans() []planRecord {
+	m.mu.Lock()
+	records := make([]planRecord, 0, len(m.plans))
+	for planID, record := range m.plans {
+		if record.expiryTimer != nil {
+			record.expiryTimer.Stop()
+		}
+		records = append(records, record)
+		delete(m.plans, planID)
+	}
+	m.mu.Unlock()
+	return records
 }
 
 func (m *Manager) backupDir(ctx context.Context, provider providers.PlatformProvider, requested string) (string, string, error) {
@@ -695,16 +902,17 @@ func (m *Manager) getVolumeIfExists(ctx context.Context, name string) (*models.V
 	return nil, false, err
 }
 
-func (m *Manager) insertBackupRecord(ctx context.Context, record planRecord, result string, size int64, actionErr error) error {
+func (m *Manager) insertBackupRecord(ctx context.Context, record planRecord, result string, size int64, actionErr error) (string, error) {
 	if m.Backups == nil {
-		return nil
+		return "", nil
 	}
 	errText := ""
 	if actionErr != nil {
 		errText = actionErr.Error()
 	}
-	return m.Backups.Insert(ctx, store.BackupRecord{
-		ID:                  "backup-" + m.newID(),
+	backupID := "backup-" + m.newID()
+	err := m.Backups.Insert(ctx, store.BackupRecord{
+		ID:                  backupID,
 		ProviderID:          record.ProviderID,
 		ProjectID:           record.ProjectID,
 		VolumeName:          record.VolumeName,
@@ -715,6 +923,7 @@ func (m *Manager) insertBackupRecord(ctx context.Context, record planRecord, res
 		CreatedAt:           m.now(),
 		Error:               errText,
 	})
+	return backupID, err
 }
 
 func (m *Manager) planProvider(ctx context.Context, record planRecord) (providers.PlatformProvider, error) {
@@ -950,49 +1159,456 @@ func restoreTitle(targetName string, overwrite bool) string {
 	return "Restore into " + targetName
 }
 
-func backupPaths(dir string, volumeName string, ts time.Time) (string, string, string, error) {
-	return backupPathsWithStat(dir, volumeName, ts, os.Stat, maxBackupPathAttempts)
-}
-
-func backupPathsWithStat(dir string, volumeName string, ts time.Time, stat func(string) (os.FileInfo, error), maxAttempts int) (string, string, string, error) {
+func reserveBackupPaths(dir string, volumeName string, ts time.Time, owner string) (backupReservation, error) {
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		return backupReservation{}, apperror.New(apperror.Internal, "Backup reservation owner is required")
+	}
+	if len(owner)+1 > maxReservationBytes {
+		return backupReservation{}, apperror.New(apperror.Internal, "Backup reservation owner is too long")
+	}
 	base := sanitizeFilename(volumeName)
 	if base == "" {
 		base = "volume"
 	}
+	ownerName := sanitizeFilename(owner)
+	if ownerName == "" {
+		return backupReservation{}, apperror.New(apperror.Internal, "Backup reservation owner is invalid")
+	}
 	stamp := ts.UTC().Format(backupTimestampLayout)
-	for i := 0; i < maxAttempts; i++ {
+	for i := 0; i < maxBackupPathAttempts; i++ {
 		suffix := ""
 		if i > 0 {
 			suffix = fmt.Sprintf("-%d", i+1)
 		}
-		archive := fmt.Sprintf("%s-%s%s.tar.gz", base, stamp, suffix)
-		archivePath := filepath.Join(dir, archive)
+		archiveName := fmt.Sprintf("%s-%s%s.tar.gz", base, stamp, suffix)
+		archivePath := filepath.Join(dir, archiveName)
 		metadataPath := metadataPathForArchive(archivePath)
-		if err := requirePathAvailable(archivePath, stat); err != nil {
-			if errors.Is(err, os.ErrExist) {
+		if unavailable, err := backupPathUnavailable(archivePath); err != nil {
+			return backupReservation{}, err
+		} else if unavailable {
+			continue
+		}
+		if unavailable, err := backupPathUnavailable(metadataPath); err != nil {
+			return backupReservation{}, err
+		} else if unavailable {
+			continue
+		}
+
+		reservationPath := reservationPathForArchive(archivePath)
+		if err := createReservationOwnerFile(reservationPath, owner); err != nil {
+			if os.IsExist(err) {
 				continue
 			}
-			return "", "", "", err
+			return backupReservation{}, apperror.Wrap(apperror.Internal, "Create backup path reservation failed", err)
 		}
-		if err := requirePathAvailable(metadataPath, stat); err != nil {
-			if errors.Is(err, os.ErrExist) {
-				continue
+		reservationIdentity, err := regularFileIdentity(reservationPath)
+		if err != nil {
+			cleanupErr := removeReservationOwnerFile(reservationPath, owner)
+			return backupReservation{}, errors.Join(err, cleanupErr)
+		}
+
+		collision := false
+		for _, path := range []string{archivePath, metadataPath} {
+			unavailable, err := backupPathUnavailable(path)
+			if err != nil {
+				cleanupErr := removeReservationOwnerFile(reservationPath, owner)
+				return backupReservation{}, errors.Join(err, cleanupErr)
 			}
-			return "", "", "", err
+			if unavailable {
+				collision = true
+				break
+			}
 		}
-		return archive, archivePath, metadataPath, nil
+		if collision {
+			if err := removeReservationOwnerFile(reservationPath, owner); err != nil {
+				return backupReservation{}, err
+			}
+			continue
+		}
+
+		stagingDir := filepath.Join(dir, ".cairn-backup-"+ownerName)
+		if err := os.Mkdir(stagingDir, 0o700); err != nil {
+			cleanupErr := removeReservationOwnerFile(reservationPath, owner)
+			if os.IsExist(err) {
+				err = apperror.New(apperror.Conflict, "Backup staging directory already exists", apperror.WithDetail(stagingDir))
+			} else {
+				err = apperror.Wrap(apperror.Internal, "Create backup staging directory failed", err)
+			}
+			return backupReservation{}, errors.Join(err, cleanupErr)
+		}
+		stagingDirIdentity, err := directoryIdentity(stagingDir)
+		if err != nil {
+			cleanupErr := errors.Join(os.Remove(stagingDir), removeReservationOwnerFile(reservationPath, owner))
+			return backupReservation{}, errors.Join(err, cleanupErr)
+		}
+		stagingOwnerPath := filepath.Join(stagingDir, stagingOwnerName)
+		if err := createReservationOwnerFile(stagingOwnerPath, owner); err != nil {
+			cleanupErr := errors.Join(removeFileIfExists(stagingOwnerPath), os.Remove(stagingDir), removeReservationOwnerFile(reservationPath, owner))
+			return backupReservation{}, errors.Join(
+				apperror.Wrap(apperror.Internal, "Create backup staging ownership marker failed", err),
+				cleanupErr,
+			)
+		}
+		stagingOwnerIdentity, err := regularFileIdentity(stagingOwnerPath)
+		if err != nil {
+			cleanupErr := errors.Join(removeFileIfExists(stagingOwnerPath), os.Remove(stagingDir), removeReservationOwnerFile(reservationPath, owner))
+			return backupReservation{}, errors.Join(err, cleanupErr)
+		}
+		return backupReservation{
+			ArchiveName:          archiveName,
+			ArchivePath:          archivePath,
+			MetadataPath:         metadataPath,
+			ReservationPath:      reservationPath,
+			ReservationIdentity:  reservationIdentity,
+			Owner:                owner,
+			StagingDir:           stagingDir,
+			StagingDirIdentity:   stagingDirIdentity,
+			StagingArchivePath:   filepath.Join(stagingDir, stagingArchiveName),
+			StagingMetadataPath:  filepath.Join(stagingDir, stagingMetadataName),
+			StagingOwnerPath:     stagingOwnerPath,
+			StagingOwnerIdentity: stagingOwnerIdentity,
+		}, nil
 	}
-	return "", "", "", apperror.New(apperror.Conflict, "Could not allocate a unique backup filename")
+	return backupReservation{}, apperror.New(apperror.Conflict, "Could not reserve a unique backup filename")
 }
 
-func requirePathAvailable(path string, stat func(string) (os.FileInfo, error)) error {
-	if _, err := stat(path); err != nil {
+func backupPathUnavailable(path string) (bool, error) {
+	if _, err := os.Lstat(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, apperror.Wrap(apperror.Internal, "Check backup path failed", err)
+	}
+	return true, nil
+}
+
+func regularFileIdentity(path string) (os.FileInfo, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, apperror.New(apperror.Conflict, "Expected an owned regular file", apperror.WithDetail(path))
+	}
+	return info, nil
+}
+
+func optionalRegularFileIdentity(path string) (os.FileInfo, error) {
+	info, err := regularFileIdentity(path)
+	if err != nil && os.IsNotExist(err) {
+		return nil, nil
+	}
+	return info, err
+}
+
+func directoryIdentity(path string) (os.FileInfo, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() {
+		return nil, apperror.New(apperror.Conflict, "Expected an owned directory", apperror.WithDetail(path))
+	}
+	return info, nil
+}
+
+func verifyPathIdentity(path string, expected os.FileInfo, wantDirectory bool) error {
+	if expected == nil {
+		return apperror.New(apperror.Conflict, "Owned path identity is missing", apperror.WithDetail(path))
+	}
+	current, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if wantDirectory {
+		if !current.IsDir() {
+			return apperror.New(apperror.Conflict, "Owned path is no longer a directory", apperror.WithDetail(path))
+		}
+	} else if !current.Mode().IsRegular() {
+		return apperror.New(apperror.Conflict, "Owned path is no longer a regular file", apperror.WithDetail(path))
+	}
+	if !os.SameFile(expected, current) {
+		return apperror.New(apperror.Conflict, "Owned path identity changed", apperror.WithDetail(path))
+	}
+	return nil
+}
+
+func reservationPathForArchive(archivePath string) string {
+	dir, name := filepath.Split(archivePath)
+	return filepath.Join(dir, "."+name+reservationSuffix)
+}
+
+func createReservationOwnerFile(path string, owner string) error {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	payload := []byte(owner + "\n")
+	if _, err := file.Write(payload); err != nil {
+		return errors.Join(err, closeReservationOwnerFile(file), removeFileIfExists(path))
+	}
+	if err := file.Sync(); err != nil {
+		return errors.Join(err, closeReservationOwnerFile(file), removeFileIfExists(path))
+	}
+	if err := file.Close(); err != nil {
+		return errors.Join(err, removeFileIfExists(path))
+	}
+	return nil
+}
+
+func closeReservationOwnerFile(file *os.File) error {
+	if file == nil {
+		return nil
+	}
+	return file.Close()
+}
+
+func verifyReservationOwner(path string, owner string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = file.Close()
+	}()
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Size() > maxReservationBytes {
+		return apperror.New(apperror.Conflict, "Backup reservation ownership marker is invalid", apperror.WithDetail(path))
+	}
+	payload, err := io.ReadAll(io.LimitReader(file, maxReservationBytes+1))
+	if err != nil {
+		return err
+	}
+	if len(payload) > maxReservationBytes || string(payload) != owner+"\n" {
+		return apperror.New(apperror.Conflict, "Backup reservation is owned by another operation", apperror.WithDetail(path))
+	}
+	return nil
+}
+
+func removeReservationOwnerFile(path string, owner string) error {
+	if err := verifyReservationOwner(path, owner); err != nil {
+		return err
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func validateBackupReservation(record planRecord) error {
+	if record.Operation != "backup" {
+		return nil
+	}
+	if record.ReservationPath == "" || record.ReservationOwner == "" || record.StagingDirHost == "" ||
+		record.StagingArchivePath == "" || record.StagingMetadataPath == "" || record.StagingOwnerPath == "" ||
+		record.ReservationIdentity == nil || record.StagingDirIdentity == nil || record.StagingOwnerIdentity == nil {
+		return apperror.New(apperror.Conflict, "Backup reservation is incomplete")
+	}
+	if err := verifyPathIdentity(record.ReservationPath, record.ReservationIdentity, false); err != nil {
+		return apperror.Wrap(apperror.Conflict, "Backup path reservation identity changed", err)
+	}
+	if err := verifyReservationOwner(record.ReservationPath, record.ReservationOwner); err != nil {
+		return apperror.Wrap(apperror.Conflict, "Backup path reservation is no longer valid", err)
+	}
+	if err := verifyPathIdentity(record.StagingDirHost, record.StagingDirIdentity, true); err != nil {
+		return apperror.Wrap(apperror.Conflict, "Backup staging directory is no longer valid", err)
+	}
+	if err := verifyPathIdentity(record.StagingOwnerPath, record.StagingOwnerIdentity, false); err != nil {
+		return apperror.Wrap(apperror.Conflict, "Backup staging ownership identity changed", err)
+	}
+	if err := verifyReservationOwner(record.StagingOwnerPath, record.ReservationOwner); err != nil {
+		return apperror.Wrap(apperror.Conflict, "Backup staging ownership is no longer valid", err)
+	}
+	if err := verifyOwnedStagingEntries(record); err != nil {
+		return err
+	}
+	for _, path := range []string{record.ArchivePath, record.MetadataPath, record.StagingArchivePath, record.StagingMetadataPath} {
+		unavailable, err := backupPathUnavailable(path)
+		if err != nil {
+			return err
+		}
+		if unavailable {
+			return apperror.New(apperror.Conflict, "Backup destination changed after planning", apperror.WithDetail(path))
+		}
+	}
+	return nil
+}
+
+func releaseBackupReservationRecord(reservation backupReservation) error {
+	return releaseBackupReservation(planRecord{
+		Operation:            "backup",
+		ReservationPath:      reservation.ReservationPath,
+		ReservationOwner:     reservation.Owner,
+		ReservationIdentity:  reservation.ReservationIdentity,
+		StagingDirHost:       reservation.StagingDir,
+		StagingDirIdentity:   reservation.StagingDirIdentity,
+		StagingArchivePath:   reservation.StagingArchivePath,
+		StagingMetadataPath:  reservation.StagingMetadataPath,
+		StagingOwnerPath:     reservation.StagingOwnerPath,
+		StagingOwnerIdentity: reservation.StagingOwnerIdentity,
+	})
+}
+
+func releaseBackupReservation(record planRecord) error {
+	if record.Operation != "backup" || record.ReservationPath == "" {
+		return nil
+	}
+	if err := verifyPathIdentity(record.ReservationPath, record.ReservationIdentity, false); err != nil {
+		if os.IsNotExist(err) {
+			if _, stageErr := os.Lstat(record.StagingDirHost); os.IsNotExist(stageErr) {
+				return nil
+			}
+		}
+		return apperror.Wrap(apperror.Conflict, "Refusing to release a backup reservation whose identity changed", err)
+	}
+	if err := verifyReservationOwner(record.ReservationPath, record.ReservationOwner); err != nil {
+		return apperror.Wrap(apperror.Conflict, "Refusing to release a backup reservation without matching ownership", err)
+	}
+	_, err := os.Lstat(record.StagingDirHost)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+	} else {
+		if err := verifyPathIdentity(record.StagingDirHost, record.StagingDirIdentity, true); err != nil {
+			return apperror.Wrap(apperror.Conflict, "Refusing to remove a backup staging directory whose identity changed", err)
+		}
+		if err := verifyPathIdentity(record.StagingOwnerPath, record.StagingOwnerIdentity, false); err != nil {
+			return apperror.Wrap(apperror.Conflict, "Refusing to remove a backup staging ownership marker whose identity changed", err)
+		}
+		if err := verifyReservationOwner(record.StagingOwnerPath, record.ReservationOwner); err != nil {
+			return apperror.Wrap(apperror.Conflict, "Refusing to remove a backup staging directory without matching ownership", err)
+		}
+		if err := verifyOwnedStagingEntries(record); err != nil {
+			return err
+		}
+		if err := removeFileWithIdentity(record.StagingMetadataPath, record.StagingMetadataIdentity); err != nil {
+			return err
+		}
+		if err := removeFileWithIdentity(record.StagingArchivePath, record.StagingArchiveIdentity); err != nil {
+			return err
+		}
+		if err := removeOwnedMarkerWithIdentity(record.StagingOwnerPath, record.ReservationOwner, record.StagingOwnerIdentity); err != nil {
+			return err
+		}
+		if err := os.Remove(record.StagingDirHost); err != nil {
+			return err
+		}
+	}
+	if err := removeOwnedMarkerWithIdentity(record.ReservationPath, record.ReservationOwner, record.ReservationIdentity); err != nil {
+		return err
+	}
+	return nil
+}
+
+func verifyOwnedStagingEntries(record planRecord) error {
+	entries, err := os.ReadDir(record.StagingDirHost)
+	if err != nil {
+		return err
+	}
+	allowed := map[string]os.FileInfo{
+		stagingOwnerName: record.StagingOwnerIdentity,
+	}
+	if record.StagingArchiveIdentity != nil {
+		allowed[stagingArchiveName] = record.StagingArchiveIdentity
+	}
+	if record.StagingMetadataIdentity != nil {
+		allowed[stagingMetadataName] = record.StagingMetadataIdentity
+	}
+	for _, entry := range entries {
+		identity, ok := allowed[entry.Name()]
+		if !ok || identity == nil {
+			return apperror.New(
+				apperror.Conflict,
+				"Refusing to remove a backup staging directory containing an unowned entry",
+				apperror.WithDetail(filepath.Join(record.StagingDirHost, entry.Name())),
+			)
+		}
+		if err := verifyPathIdentity(filepath.Join(record.StagingDirHost, entry.Name()), identity, false); err != nil {
+			return apperror.Wrap(apperror.Conflict, "Refusing to remove a backup staging entry whose identity changed", err)
+		}
+	}
+	return nil
+}
+
+func removeFileWithIdentity(path string, expected os.FileInfo) error {
+	if expected == nil {
+		if _, err := os.Lstat(path); os.IsNotExist(err) {
+			return nil
+		} else if err != nil {
+			return err
+		}
+		return apperror.New(apperror.Conflict, "Refusing to remove a file without captured ownership", apperror.WithDetail(path))
+	}
+	if err := verifyPathIdentity(path, expected, false); err != nil {
 		if os.IsNotExist(err) {
 			return nil
 		}
-		return apperror.Wrap(apperror.Internal, "Check backup path failed", err)
+		return err
 	}
-	return os.ErrExist
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func removeOwnedMarkerWithIdentity(path string, owner string, expected os.FileInfo) error {
+	if err := verifyPathIdentity(path, expected, false); err != nil {
+		return err
+	}
+	if err := verifyReservationOwner(path, owner); err != nil {
+		return err
+	}
+	return removeFileWithIdentity(path, expected)
+}
+
+func publishStagedBackupFile(stagingPath string, destinationPath string, expected os.FileInfo) error {
+	return publishStagedBackupFileWithLink(stagingPath, destinationPath, expected, os.Link)
+}
+
+func publishStagedBackupFileWithLink(stagingPath string, destinationPath string, expected os.FileInfo, link func(string, string) error) error {
+	if err := verifyPathIdentity(stagingPath, expected, false); err != nil {
+		return apperror.Wrap(apperror.Conflict, "Staged backup file identity changed before publication", err)
+	}
+	if err := link(stagingPath, destinationPath); err != nil {
+		if os.IsExist(err) {
+			return apperror.New(apperror.Conflict, "Backup destination already exists", apperror.WithDetail(destinationPath))
+		}
+		return apperror.Wrap(apperror.Internal, "Publish staged backup file failed", err, apperror.WithDetail(destinationPath))
+	}
+	if err := verifyPathIdentity(destinationPath, expected, false); err != nil {
+		cleanupErr := removeFileWithIdentity(destinationPath, expected)
+		publicationErr := apperror.Wrap(apperror.Conflict, "Published backup file identity did not match the staged file", err)
+		if cleanupErr != nil {
+			return errors.Join(publicationErr, cleanupErr, errPreserveBackupReservation)
+		}
+		return publicationErr
+	}
+	if err := verifyPathIdentity(stagingPath, expected, false); err != nil {
+		cleanupErr := removeFileWithIdentity(destinationPath, expected)
+		publicationErr := apperror.Wrap(apperror.Conflict, "Staged backup file identity changed during publication", err)
+		if cleanupErr != nil {
+			return errors.Join(publicationErr, cleanupErr, errPreserveBackupReservation)
+		}
+		return publicationErr
+	}
+	return nil
+}
+
+func removePublishedBackupFile(stagingPath string, destinationPath string) error {
+	stagingInfo, err := regularFileIdentity(stagingPath)
+	if err != nil {
+		return err
+	}
+	return removePublishedBackupFileWithIdentity(stagingInfo, destinationPath)
+}
+
+func removePublishedBackupFileWithIdentity(expected os.FileInfo, destinationPath string) error {
+	return removeFileWithIdentity(destinationPath, expected)
 }
 
 func sanitizeFilename(value string) string {
@@ -1035,14 +1651,32 @@ func writeSidecar(path string, sidecar BackupSidecar) error {
 	if err != nil {
 		return apperror.Wrap(apperror.Internal, "Create backup metadata failed", err)
 	}
+	identity, err := file.Stat()
+	if err != nil {
+		return errors.Join(
+			apperror.Wrap(apperror.Internal, "Capture backup metadata ownership failed", err),
+			closeReservationOwnerFile(file),
+		)
+	}
+	if !identity.Mode().IsRegular() {
+		return errors.Join(
+			apperror.New(apperror.Conflict, "Backup metadata path is not a regular file", apperror.WithDetail(path)),
+			closeReservationOwnerFile(file),
+		)
+	}
 	if err := writeSidecarContents(file, sidecar); err != nil {
-		cleanupErr := os.Remove(path)
-		if cleanupErr != nil && !os.IsNotExist(cleanupErr) {
+		cleanupErr := removeFileWithIdentity(path, identity)
+		if cleanupErr != nil {
 			cleanupErr = apperror.Wrap(apperror.Internal, "Remove incomplete backup metadata failed", cleanupErr)
-		} else {
-			cleanupErr = nil
 		}
 		return errors.Join(err, cleanupErr)
+	}
+	if err := verifyPathIdentity(path, identity, false); err != nil {
+		cleanupErr := removeFileWithIdentity(path, identity)
+		return errors.Join(
+			apperror.Wrap(apperror.Conflict, "Backup metadata identity changed while writing", err),
+			cleanupErr,
+		)
 	}
 	return nil
 }
@@ -1098,6 +1732,42 @@ func fileSHA256(path string) (string, int64, error) {
 	n, err := io.Copy(hash, file)
 	if err != nil {
 		return "", 0, apperror.Wrap(apperror.Internal, "Read backup archive failed", err)
+	}
+	return hex.EncodeToString(hash.Sum(nil)), n, nil
+}
+
+func fileSHA256WithIdentity(path string, expected os.FileInfo) (string, int64, error) {
+	if err := verifyPathIdentity(path, expected, false); err != nil {
+		return "", 0, apperror.Wrap(apperror.Conflict, "Backup file identity changed before checksum verification", err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return "", 0, apperror.Wrap(apperror.NotFound, "Open backup file for checksum verification failed", err)
+	}
+	defer func() {
+		_ = file.Close()
+	}()
+	openedInfo, err := file.Stat()
+	if err != nil {
+		return "", 0, err
+	}
+	if !openedInfo.Mode().IsRegular() || !os.SameFile(expected, openedInfo) {
+		return "", 0, apperror.New(apperror.Conflict, "Opened backup file identity did not match the published file", apperror.WithDetail(path))
+	}
+	hash := sha256.New()
+	n, err := io.Copy(hash, file)
+	if err != nil {
+		return "", 0, apperror.Wrap(apperror.Internal, "Read published backup file failed", err)
+	}
+	openedAfter, err := file.Stat()
+	if err != nil {
+		return "", 0, err
+	}
+	if !openedAfter.Mode().IsRegular() || !os.SameFile(expected, openedAfter) {
+		return "", 0, apperror.New(apperror.Conflict, "Published backup file identity changed while hashing", apperror.WithDetail(path))
+	}
+	if err := verifyPathIdentity(path, expected, false); err != nil {
+		return "", 0, apperror.Wrap(apperror.Conflict, "Backup file identity changed after checksum verification", err)
 	}
 	return hex.EncodeToString(hash.Sum(nil)), n, nil
 }
