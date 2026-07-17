@@ -23,6 +23,9 @@ const (
 	defaultBatchWindow   = 50 * time.Millisecond
 	defaultFetchTail     = 5000
 	streamStopTimeout    = 5 * time.Second
+	defaultRetryAttempts = 8
+	defaultRetryInitial  = 250 * time.Millisecond
+	defaultRetryMaximum  = 5 * time.Second
 )
 
 type DockerClient interface {
@@ -32,11 +35,14 @@ type DockerClient interface {
 }
 
 type Options struct {
-	RingSize      int
-	InputBuffer   int
-	BatchMaxLines int
-	BatchWindow   time.Duration
-	Now           func() time.Time
+	RingSize            int
+	InputBuffer         int
+	BatchMaxLines       int
+	BatchWindow         time.Duration
+	ReaderRetryAttempts int
+	ReaderRetryInitial  time.Duration
+	ReaderRetryMaximum  time.Duration
+	Now                 func() time.Time
 }
 
 type Manager struct {
@@ -47,6 +53,9 @@ type Manager struct {
 	inputBuffer   int
 	batchMaxLines int
 	batchWindow   time.Duration
+	retryAttempts int
+	retryInitial  time.Duration
+	retryMaximum  time.Duration
 	now           func() time.Time
 
 	mu       sync.Mutex

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -251,6 +252,167 @@ func TestStopStreamClosesBlockingLogReader(t *testing.T) {
 	}
 	if got := manager.Diagnostics(); got.ActiveStreams != 0 || got.ActiveProducers != 0 {
 		t.Fatalf("diagnostics after stop = %#v", got)
+	}
+}
+
+func TestFollowReaderRetriesTransientFailureAndResumes(t *testing.T) {
+	ctx := context.Background()
+	eventBus := bus.New()
+	defer eventBus.Close()
+	linesCh := eventBus.Subscribe(ctx, bus.TopicLogsLines, 8)
+	errorCh := eventBus.Subscribe(ctx, bus.TopicLogsError, 8)
+	blocking := newBlockingLogReader()
+	reader := &composedLogReader{
+		Reader: io.MultiReader(
+			bytes.NewReader(dockerLogFrame(1, "2026-06-13T09:00:00Z INFO resumed\n")),
+			blocking,
+		),
+		Closer: blocking,
+	}
+	docker := newRetryLogDocker("running", 1, reader)
+	manager := NewManager(docker, eventBus, Options{
+		BatchWindow:         time.Millisecond,
+		ReaderRetryAttempts: 3,
+		ReaderRetryInitial:  time.Millisecond,
+		ReaderRetryMaximum:  2 * time.Millisecond,
+	})
+
+	streamID, err := manager.StartLogStream(ctx, models.LogStreamRequest{
+		Scope:  ScopeContainer,
+		IDs:    []string{"container-1"},
+		Follow: true,
+		Tail:   10,
+	})
+	if err != nil {
+		t.Fatalf("StartLogStream() error = %v", err)
+	}
+	lines := receiveLogEvent[LinesPayload](t, linesCh, time.Second)
+	if lines.StreamID != streamID || len(lines.Lines) != 1 || lines.Lines[0].Text != "INFO resumed" {
+		t.Fatalf("resumed lines = %#v", lines)
+	}
+	if calls := docker.callCount(); calls != 2 {
+		t.Fatalf("ContainerLogs calls = %d, want 2", calls)
+	}
+	select {
+	case event := <-errorCh:
+		t.Fatalf("successful retry published terminal error: %#v", event.Payload)
+	default:
+	}
+	if err := manager.StopStream(streamID); err != nil {
+		t.Fatalf("StopStream() error = %v", err)
+	}
+	time.Sleep(10 * time.Millisecond)
+	if calls := docker.callCount(); calls != 2 {
+		t.Fatalf("ContainerLogs calls after stop = %d, want 2", calls)
+	}
+}
+
+func TestFollowReaderRetryChainIsBounded(t *testing.T) {
+	ctx := context.Background()
+	eventBus := bus.New()
+	defer eventBus.Close()
+	errorCh := eventBus.Subscribe(ctx, bus.TopicLogsError, 8)
+	eofCh := eventBus.Subscribe(ctx, bus.TopicLogsEOF, 8)
+	docker := newRetryLogDocker("running", 100, nil)
+	manager := NewManager(docker, eventBus, Options{
+		BatchWindow:         time.Millisecond,
+		ReaderRetryAttempts: 3,
+		ReaderRetryInitial:  10 * time.Millisecond,
+		ReaderRetryMaximum:  20 * time.Millisecond,
+	})
+
+	streamID, err := manager.StartLogStream(ctx, models.LogStreamRequest{
+		Scope:  ScopeContainer,
+		IDs:    []string{"container-1"},
+		Follow: true,
+	})
+	if err != nil {
+		t.Fatalf("StartLogStream() error = %v", err)
+	}
+	manager.mu.Lock()
+	session := manager.sessions[streamID]
+	manager.mu.Unlock()
+	if session == nil {
+		t.Fatal("session completed before retry chain could be observed")
+	}
+	terminal := receiveLogEvent[ErrorPayload](t, errorCh, time.Second)
+	if terminal.StreamID != streamID || !strings.Contains(terminal.Error, "stopped after 3 attempts") {
+		t.Fatalf("terminal error = %#v", terminal)
+	}
+	if eof := receiveLogEvent[EOFPayload](t, eofCh, time.Second); eof.StreamID != streamID {
+		t.Fatalf("EOF = %#v", eof)
+	}
+	if calls := docker.callCount(); calls != 3 {
+		t.Fatalf("ContainerLogs calls = %d, want 3", calls)
+	}
+	session.mu.Lock()
+	attachments := len(session.attached)
+	session.mu.Unlock()
+	if attachments != 0 {
+		t.Fatalf("attached markers after producer exit = %d, want 0", attachments)
+	}
+}
+
+func TestFollowReaderDoesNotRetryStoppedContainerEOF(t *testing.T) {
+	ctx := context.Background()
+	eventBus := bus.New()
+	defer eventBus.Close()
+	errorCh := eventBus.Subscribe(ctx, bus.TopicLogsError, 8)
+	eofCh := eventBus.Subscribe(ctx, bus.TopicLogsEOF, 8)
+	docker := newRetryLogDocker("exited", 0, io.NopCloser(strings.NewReader("")))
+	manager := NewManager(docker, eventBus, Options{
+		BatchWindow:         time.Millisecond,
+		ReaderRetryAttempts: 3,
+		ReaderRetryInitial:  time.Millisecond,
+		ReaderRetryMaximum:  2 * time.Millisecond,
+	})
+
+	streamID, err := manager.StartLogStream(ctx, models.LogStreamRequest{
+		Scope:  ScopeContainer,
+		IDs:    []string{"container-1"},
+		Follow: true,
+	})
+	if err != nil {
+		t.Fatalf("StartLogStream() error = %v", err)
+	}
+	if eof := receiveLogEvent[EOFPayload](t, eofCh, time.Second); eof.StreamID != streamID {
+		t.Fatalf("EOF = %#v", eof)
+	}
+	if calls := docker.callCount(); calls != 1 {
+		t.Fatalf("ContainerLogs calls = %d, want 1", calls)
+	}
+	select {
+	case event := <-errorCh:
+		t.Fatalf("stopped-container EOF published error: %#v", event.Payload)
+	default:
+	}
+}
+
+func TestStopCancelsFollowReaderRetryBackoff(t *testing.T) {
+	ctx := context.Background()
+	docker := newRetryLogDocker("running", 100, nil)
+	manager := NewManager(docker, nil, Options{
+		BatchWindow:         time.Millisecond,
+		ReaderRetryAttempts: 3,
+		ReaderRetryInitial:  100 * time.Millisecond,
+		ReaderRetryMaximum:  100 * time.Millisecond,
+	})
+
+	streamID, err := manager.StartLogStream(ctx, models.LogStreamRequest{
+		Scope:  ScopeContainer,
+		IDs:    []string{"container-1"},
+		Follow: true,
+	})
+	if err != nil {
+		t.Fatalf("StartLogStream() error = %v", err)
+	}
+	docker.waitForCalls(t, 1)
+	if err := manager.StopStream(streamID); err != nil {
+		t.Fatalf("StopStream() error = %v", err)
+	}
+	time.Sleep(120 * time.Millisecond)
+	if calls := docker.callCount(); calls != 1 {
+		t.Fatalf("ContainerLogs calls after canceled backoff = %d, want 1", calls)
 	}
 }
 
@@ -558,6 +720,81 @@ type blockingLogReader struct {
 	closed    chan struct{}
 	startOnce sync.Once
 	closeOnce sync.Once
+}
+
+type composedLogReader struct {
+	io.Reader
+	io.Closer
+}
+
+type retryLogDocker struct {
+	mu           sync.Mutex
+	container    models.ContainerSummary
+	failures     int
+	reader       io.ReadCloser
+	calls        int
+	callsChanged chan struct{}
+}
+
+func newRetryLogDocker(state string, failures int, reader io.ReadCloser) *retryLogDocker {
+	return &retryLogDocker{
+		container: models.ContainerSummary{
+			ID:     "container-1",
+			Name:   "app-1",
+			State:  state,
+			Status: state,
+		},
+		failures:     failures,
+		reader:       reader,
+		callsChanged: make(chan struct{}, 16),
+	}
+}
+
+func (f *retryLogDocker) ContainerLogs(_ context.Context, _ string, _ dockercore.LogOptions) (io.ReadCloser, error) {
+	f.mu.Lock()
+	f.calls++
+	call := f.calls
+	reader := f.reader
+	f.mu.Unlock()
+	select {
+	case f.callsChanged <- struct{}{}:
+	default:
+	}
+	if call <= f.failures {
+		return nil, errors.New("transient log reader failure")
+	}
+	return reader, nil
+}
+
+func (f *retryLogDocker) ListContainers(context.Context, models.ContainerListOptions) ([]models.ContainerSummary, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return []models.ContainerSummary{f.container}, nil
+}
+
+func (f *retryLogDocker) GetContainer(context.Context, string) (*models.ContainerDetail, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return &models.ContainerDetail{Summary: f.container}, nil
+}
+
+func (f *retryLogDocker) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls
+}
+
+func (f *retryLogDocker) waitForCalls(t *testing.T, want int) {
+	t.Helper()
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for f.callCount() < want {
+		select {
+		case <-f.callsChanged:
+		case <-deadline.C:
+			t.Fatalf("ContainerLogs calls = %d, want at least %d", f.callCount(), want)
+		}
+	}
 }
 
 func newBlockingLogReader() *blockingLogReader {

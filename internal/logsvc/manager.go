@@ -330,6 +330,18 @@ func (m *Manager) ensureReady() {
 	if m.batchWindow <= 0 {
 		m.batchWindow = defaultBatchWindow
 	}
+	if m.retryAttempts <= 0 {
+		m.retryAttempts = defaultRetryAttempts
+	}
+	if m.retryInitial <= 0 {
+		m.retryInitial = defaultRetryInitial
+	}
+	if m.retryMaximum <= 0 {
+		m.retryMaximum = defaultRetryMaximum
+	}
+	if m.retryMaximum < m.retryInitial {
+		m.retryMaximum = m.retryInitial
+	}
 	if m.now == nil {
 		m.now = func() time.Time { return time.Now().UTC() }
 	}
@@ -340,6 +352,9 @@ func (m *Manager) applyOptions(opts Options) {
 	m.inputBuffer = opts.InputBuffer
 	m.batchMaxLines = opts.BatchMaxLines
 	m.batchWindow = opts.BatchWindow
+	m.retryAttempts = opts.ReaderRetryAttempts
+	m.retryInitial = opts.ReaderRetryInitial
+	m.retryMaximum = opts.ReaderRetryMaximum
 	m.now = opts.Now
 	m.ensureReady()
 }
@@ -420,32 +435,117 @@ func (s *session) attach(container models.ContainerSummary) {
 		s.activeProducers.Add(1)
 		defer s.activeProducers.Add(-1)
 		defer s.producers.Done()
-		source := sourceFromContainer(container)
-		reader, err := s.manager.Docker.ContainerLogs(s.ctx, container.ID, dockercore.LogOptions{
-			Follow:     s.req.Follow,
-			Tail:       s.req.Tail,
-			Since:      s.req.Since,
-			Timestamps: true,
-		})
-		if err != nil {
-			s.publishError(err)
-			return
-		}
-		s.addReader(key, reader)
-		if s.ctx.Err() != nil {
-			s.removeReader(key)
-			_ = reader.Close()
-			return
-		}
-		defer func() {
-			s.removeReader(key)
-			_ = reader.Close()
-		}()
-		err = ReadDockerLogStream(s.ctx, reader, source, s.manager.now, s.enqueue)
-		if err != nil && !errors.Is(err, context.Canceled) {
-			s.publishError(err)
-		}
+		defer s.removeAttachment(key)
+		s.produce(container, key)
 	}()
+}
+
+func (s *session) produce(container models.ContainerSummary, key string) {
+	backoff := s.manager.retryInitial
+	var lastErr error
+	for attempt := 1; attempt <= s.manager.retryAttempts; attempt++ {
+		lastErr = s.readContainer(container, key)
+		if s.ctx.Err() != nil || errors.Is(lastErr, context.Canceled) {
+			return
+		}
+		if !s.req.Follow {
+			if lastErr != nil {
+				s.publishError(lastErr)
+			}
+			return
+		}
+		retry, stateErr := s.containerCanProduce(container)
+		if stateErr != nil && lastErr == nil {
+			lastErr = stateErr
+		}
+		if !retry {
+			if lastErr != nil {
+				s.publishError(lastErr)
+			}
+			return
+		}
+		if lastErr == nil {
+			lastErr = io.ErrUnexpectedEOF
+		}
+		if attempt == s.manager.retryAttempts {
+			s.publishError(fmt.Errorf("log reader for %s stopped after %d attempts: %w", key, attempt, lastErr))
+			return
+		}
+		if !waitForRetry(s.ctx, backoff) {
+			return
+		}
+		backoff *= 2
+		if backoff > s.manager.retryMaximum {
+			backoff = s.manager.retryMaximum
+		}
+	}
+}
+
+func (s *session) readContainer(container models.ContainerSummary, key string) error {
+	id := container.ID
+	if id == "" {
+		id = container.Name
+	}
+	reader, err := s.manager.Docker.ContainerLogs(s.ctx, id, dockercore.LogOptions{
+		Follow:     s.req.Follow,
+		Tail:       s.req.Tail,
+		Since:      s.req.Since,
+		Timestamps: true,
+	})
+	if err != nil {
+		return err
+	}
+	if reader == nil {
+		return fmt.Errorf("Docker returned an empty log reader for %s", key)
+	}
+	s.addReader(key, reader)
+	if s.ctx.Err() != nil {
+		s.removeReader(key)
+		_ = reader.Close()
+		return s.ctx.Err()
+	}
+	defer func() {
+		s.removeReader(key)
+		_ = reader.Close()
+	}()
+	return ReadDockerLogStream(s.ctx, reader, sourceFromContainer(container), s.manager.now, s.enqueue)
+}
+
+func (s *session) containerCanProduce(container models.ContainerSummary) (bool, error) {
+	id := container.ID
+	if id == "" {
+		id = container.Name
+	}
+	detail, err := s.manager.Docker.GetContainer(s.ctx, id)
+	if err != nil {
+		return true, err
+	}
+	if detail == nil {
+		return false, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(detail.Summary.State)) {
+	case "dead", "exited", "removed", "removing", "stopped":
+		return false, nil
+	default:
+		return true, nil
+	}
+}
+
+func (s *session) removeAttachment(key string) {
+	s.mu.Lock()
+	delete(s.attached, key)
+	s.mu.Unlock()
+}
+
+func waitForRetry(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
 }
 
 func (s *session) addReader(key string, reader io.Closer) {
