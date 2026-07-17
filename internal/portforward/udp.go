@@ -25,6 +25,21 @@ func (m *Manager) serveUDP(ctx context.Context, fwd *forward, host net.PacketCon
 
 	var mu sync.Mutex
 	sessions := map[string]*udpSession{}
+	evict := func(key string, expected *udpSession) {
+		mu.Lock()
+		if sessions[key] != expected {
+			mu.Unlock()
+			return
+		}
+		delete(sessions, key)
+		mu.Unlock()
+
+		// Remove the connection from the forward before closing it. The
+		// identity check above prevents a delayed pump from evicting a newer
+		// session that reused the same client address.
+		fwd.untrack(expected.backend)
+		_ = expected.backend.Close()
+	}
 
 	fwd.wg.Add(1)
 	go func() {
@@ -37,15 +52,23 @@ func (m *Manager) serveUDP(ctx context.Context, fwd *forward, host net.PacketCon
 				return
 			case <-ticker.C:
 				cutoff := m.now().Add(-udpIdleTimeout)
+				var expired []struct {
+					key     string
+					session *udpSession
+				}
 				mu.Lock()
 				for key, session := range sessions {
 					if session.lastSeen.Before(cutoff) {
-						fwd.untrack(session.backend)
-						_ = session.backend.Close()
-						delete(sessions, key)
+						expired = append(expired, struct {
+							key     string
+							session *udpSession
+						}{key: key, session: session})
 					}
 				}
 				mu.Unlock()
+				for _, entry := range expired {
+					evict(entry.key, entry.session)
+				}
 			}
 		}
 	}()
@@ -70,7 +93,7 @@ func (m *Manager) serveUDP(ctx context.Context, fwd *forward, host net.PacketCon
 		session := sessions[key]
 		if session == nil {
 			backend, derr := m.dialer.DialPacket(ctx, fwd.spec.hostPort)
-			if derr != nil {
+			if derr != nil || backend == nil {
 				mu.Unlock()
 				continue
 			}
@@ -78,7 +101,9 @@ func (m *Manager) serveUDP(ctx context.Context, fwd *forward, host net.PacketCon
 			sessions[key] = session
 			fwd.track(backend)
 			fwd.wg.Add(1)
-			go m.pumpUDPReplies(fwd, host, backend, src)
+			go m.pumpUDPReplies(fwd, host, session, src, func() {
+				evict(key, session)
+			})
 		}
 		session.lastSeen = m.now()
 		backend := session.backend
@@ -86,25 +111,28 @@ func (m *Manager) serveUDP(ctx context.Context, fwd *forward, host net.PacketCon
 
 		payload := make([]byte, n)
 		copy(payload, buffer[:n])
-		_, _ = backend.Write(payload)
+		if written, writeErr := backend.Write(payload); writeErr != nil || written != len(payload) {
+			evict(key, session)
+		}
 	}
 }
 
 // pumpUDPReplies forwards datagrams coming back from the backend to the
 // originating client source. It exits when the backend connection closes (on
 // idle reap or forward shutdown).
-func (m *Manager) pumpUDPReplies(fwd *forward, host net.PacketConn, backend net.Conn, dst net.Addr) {
+func (m *Manager) pumpUDPReplies(
+	fwd *forward,
+	host net.PacketConn,
+	session *udpSession,
+	dst net.Addr,
+	evict func(),
+) {
 	defer fwd.wg.Done()
+	defer evict()
 	buffer := make([]byte, udpBufferSize)
 	for {
-		n, err := backend.Read(buffer)
+		n, err := session.backend.Read(buffer)
 		if err != nil {
-			if errors.Is(err, net.ErrClosed) {
-				return
-			}
-			if isConnReset(err) {
-				continue
-			}
 			return
 		}
 		if _, werr := host.WriteTo(buffer[:n], dst); werr != nil {

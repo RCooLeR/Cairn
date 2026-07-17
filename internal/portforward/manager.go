@@ -149,7 +149,13 @@ func (m *Manager) ListForwards() []models.PortForward {
 		if out[i].HostPort != out[j].HostPort {
 			return out[i].HostPort < out[j].HostPort
 		}
-		return out[i].Protocol < out[j].Protocol
+		if out[i].Protocol != out[j].Protocol {
+			return out[i].Protocol < out[j].Protocol
+		}
+		if out[i].BindAddr != out[j].BindAddr {
+			return out[i].BindAddr < out[j].BindAddr
+		}
+		return out[i].ContainerID < out[j].ContainerID
 	})
 	return out
 }
@@ -221,7 +227,7 @@ func (m *Manager) reconcileOnce(ctx context.Context) {
 
 	changed := false
 	for key, fwd := range current {
-		if want, ok := desired[key]; ok && want == fwd.spec && !fwd.failed() {
+		if want, ok := desired[key]; ok && reusableForward(fwd, want) {
 			continue
 		}
 		m.mu.Lock()
@@ -233,7 +239,7 @@ func (m *Manager) reconcileOnce(ctx context.Context) {
 	}
 
 	for key, want := range desired {
-		if existing, ok := current[key]; ok && existing.spec == want && !existing.failed() {
+		if existing, ok := current[key]; ok && reusableForward(existing, want) {
 			continue
 		}
 		fwd := m.startForward(ctx, want)
@@ -253,9 +259,25 @@ func (m *Manager) reconcileOnce(ctx context.Context) {
 	}
 }
 
+func reusableForward(existing *forward, desired spec) bool {
+	if existing == nil || existing.spec != desired {
+		return false
+	}
+	// Policy/shape failures are deterministic for this exact desired snapshot.
+	// Keep the visible row until inventory changes instead of retrying and
+	// re-emitting it on every reconciliation tick. Listener/dial failures remain
+	// retryable because their blockedReason is empty.
+	return desired.blockedReason != "" || !existing.failed()
+}
+
 func (m *Manager) startForward(ctx context.Context, s spec) *forward {
 	fctx, cancel := context.WithCancel(ctx)
 	fwd := &forward{spec: s, cancel: cancel, status: statusActive, closers: map[interface{ Close() error }]struct{}{}}
+	if s.blockedReason != "" {
+		fwd.fail(errors.New(s.blockedReason))
+		cancel()
+		return fwd
+	}
 	address := net.JoinHostPort(s.bindAddr, strconv.Itoa(s.hostPort))
 
 	if s.protocol == protoUDP {

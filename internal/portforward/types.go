@@ -2,10 +2,11 @@
 // the WSL backend, so a container's `-p` publish behaves like Docker Desktop's
 // host networking even though Docker Engine runs inside a WSL distro.
 //
-// For each running container port with a host binding it opens a host listener
-// on the mirrored interface (0.0.0.0 stays LAN-reachable, 127.0.0.1 stays
-// loopback) and relays traffic into the distro. TCP and UDP dial the current
-// WSL distro IP; the provider resolves it fresh so restarts do not require a
+// For each supported running-container publish it opens an exact IPv4 host
+// listener (0.0.0.0 stays LAN-reachable) and relays traffic into the distro.
+// Loopback and IPv6 publishes currently fail closed because the backend dial
+// path cannot preserve those semantics. TCP and UDP dial the current WSL
+// distro IP; the provider resolves it fresh so restarts do not require a
 // static portproxy entry.
 package portforward
 
@@ -91,6 +92,7 @@ type spec struct {
 	bindAddr      string
 	containerID   string
 	containerName string
+	blockedReason string
 }
 
 // forward owns the OS resources for one host port: a listener (or packet conn)

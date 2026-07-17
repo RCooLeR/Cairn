@@ -28,7 +28,7 @@ function bindLabel(bindAddr: string): string {
 }
 
 function forwardRowKey(forward: PortForward): string {
-  return `${forward.protocol}/${forward.hostPort}`;
+  return `${forward.protocol}/${forward.bindAddr}/${forward.hostPort}/${forward.containerID}`;
 }
 
 export function PortForwardingPanel() {
@@ -163,10 +163,10 @@ export function PortForwardingPanel() {
             : `Port forwarding is ${status.enabled ? "enabled" : "disabled"}.`}
         </LiveMessage>
         <p className="text-sm text-text-muted">
-          Binds published container ports on the Windows host and proxies them
-          into WSL, so <code>-p</code> behaves like Docker Desktop. Ports a
-          container publishes on <code>0.0.0.0</code> are mirrored to the
-          Windows LAN interface; loopback-only publishes use WSL localhost.
+          Proxies supported published container ports from Windows into WSL.
+          Enabling this can expose ports published on <code>0.0.0.0</code> to
+          other devices on the Windows LAN. Cairn currently does not mirror
+          loopback-only or IPv6 publishes.
         </p>
         <div className="flex items-center gap-3">
           <Button

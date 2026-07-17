@@ -83,6 +83,12 @@ describe("PortForwardingPanel", () => {
     const enable = await screen.findByRole("button", {
       name: "Enable forwarding",
     });
+    expect(
+      screen.getByText(/can expose ports published on/i),
+    ).toHaveTextContent("Windows LAN");
+    expect(screen.getByText(/does not mirror/i)).toHaveTextContent(
+      "loopback-only or IPv6 publishes",
+    );
     expect(screen.getByRole("status")).toHaveTextContent(
       "Port forwarding is disabled.",
     );

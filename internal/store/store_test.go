@@ -374,6 +374,14 @@ func TestSettingsDefaultsAndRoundTrip(t *testing.T) {
 		t.Fatalf("provider.autostart_backend = false, want true")
 	}
 
+	portForwarding, err := settings.GetBool(ctx, "portforward.enabled")
+	if err != nil {
+		t.Fatalf("GetBool portforward.enabled: %v", err)
+	}
+	if portForwarding {
+		t.Fatal("portforward.enabled = true, want secure fresh-install default false")
+	}
+
 	sampleInterval, err := settings.GetInt(ctx, "metrics.sample_interval_seconds")
 	if err != nil {
 		t.Fatalf("GetInt metrics.sample_interval_seconds: %v", err)

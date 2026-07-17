@@ -23,11 +23,11 @@ func TestBindAddrForMirrorsPublishInterface(t *testing.T) {
 	}{
 		{"", "0.0.0.0"},
 		{"0.0.0.0", "0.0.0.0"},
-		{"::", "0.0.0.0"},
+		{"::", "::"},
 		{"127.0.0.1", "127.0.0.1"},
-		{"::1", "127.0.0.1"},
+		{"::1", "::1"},
 		{"192.168.1.50", "192.168.1.50"},
-		{"not-an-ip", "0.0.0.0"},
+		{"not-an-ip", "not-an-ip"},
 	}
 	for _, tc := range cases {
 		if got := bindAddrFor(tc.hostIP); got != tc.want {
@@ -36,7 +36,7 @@ func TestBindAddrForMirrorsPublishInterface(t *testing.T) {
 	}
 }
 
-func TestDesiredForwardsKeepsBroadestBindAndSkipsUnpublished(t *testing.T) {
+func TestDesiredForwardsKeepsPublishedBindsAndSkipsUnpublished(t *testing.T) {
 	t.Parallel()
 	containers := []models.ContainerSummary{
 		{
@@ -51,20 +51,24 @@ func TestDesiredForwardsKeepsBroadestBindAndSkipsUnpublished(t *testing.T) {
 		},
 	}
 	got := desiredForwards(containers)
-	if len(got) != 2 {
-		t.Fatalf("desiredForwards size = %d, want 2 (%+v)", len(got), got)
+	if len(got) != 3 {
+		t.Fatalf("desiredForwards size = %d, want two supported and one visible unsupported row (%+v)", len(got), got)
 	}
-	tcp, ok := got[forwardKey("tcp", 8080)]
+	tcp, ok := got[forwardKey("tcp", "0.0.0.0", 8080)]
 	if !ok || tcp.bindAddr != "0.0.0.0" {
 		t.Fatalf("tcp 8080 = %+v, want bind 0.0.0.0 (broadest wins)", tcp)
 	}
-	udp, ok := got[forwardKey("udp", 53)]
+	udp, ok := got[forwardKey("udp", "0.0.0.0", 53)]
 	if !ok || udp.bindAddr != "0.0.0.0" || udp.protocol != "udp" {
 		t.Fatalf("udp 53 = %+v, want udp/0.0.0.0", udp)
 	}
+	loopback := got[forwardKey("tcp", "127.0.0.1", 8080)]
+	if loopback.blockedReason == "" || loopback.containerID != "a" {
+		t.Fatalf("loopback diagnostic = %+v, want visible target-bound error", loopback)
+	}
 }
 
-func TestDesiredForwardsSkipsUnsupportedLoopbackAndIPv6Binds(t *testing.T) {
+func TestDesiredForwardsSurfacesUnsupportedLoopbackAndIPv6Binds(t *testing.T) {
 	t.Parallel()
 	containers := []models.ContainerSummary{{
 		ID:   "a",
@@ -74,15 +78,67 @@ func TestDesiredForwardsSkipsUnsupportedLoopbackAndIPv6Binds(t *testing.T) {
 			{HostIP: "::1", HostPort: "8081", ContainerPort: "80", Protocol: "tcp"},
 			{HostIP: "fe80::1", HostPort: "8082", ContainerPort: "80", Protocol: "tcp"},
 			{HostIP: "192.168.1.50", HostPort: "8083", ContainerPort: "80", Protocol: "tcp"},
+			{HostIP: "::", HostPort: "8084", ContainerPort: "80", Protocol: "tcp"},
+			{HostIP: "not-an-ip", HostPort: "8085", ContainerPort: "80", Protocol: "tcp"},
 		},
 	}}
 
 	got := desiredForwards(containers)
-	if len(got) != 1 {
-		t.Fatalf("desiredForwards size = %d, want 1 (%+v)", len(got), got)
+	if len(got) != 6 {
+		t.Fatalf("desiredForwards size = %d, want one supported and five visible unsupported rows (%+v)", len(got), got)
 	}
-	if fwd, ok := got[forwardKey("tcp", 8083)]; !ok || fwd.bindAddr != "192.168.1.50" {
+	if fwd, ok := got[forwardKey("tcp", "192.168.1.50", 8083)]; !ok || fwd.bindAddr != "192.168.1.50" {
 		t.Fatalf("tcp 8083 = %+v, want mirrored IPv4 bind", fwd)
+	}
+	unsupported := []string{
+		forwardKey("tcp", "127.0.0.1", 8080),
+		forwardKey("tcp", "::1", 8081),
+		forwardKey("tcp", "fe80::1", 8082),
+		forwardKey("tcp", "::", 8084),
+		forwardKey("tcp", "not-an-ip", 8085),
+	}
+	for _, key := range unsupported {
+		forward, ok := got[key]
+		if !ok || forward.blockedReason == "" || forward.containerID != "a" {
+			t.Errorf("unsupported forward %q = %+v/%t, want visible target-bound error", key, forward, ok)
+		}
+	}
+}
+
+func TestDesiredForwardsKeepsDistinctConcreteBindsAndRejectsExactConflict(t *testing.T) {
+	t.Parallel()
+	containers := []models.ContainerSummary{
+		{ID: "a", Name: "first", Ports: []models.PortBinding{{HostIP: "192.168.1.50", HostPort: "8080", Protocol: "tcp"}}},
+		{ID: "b", Name: "second", Ports: []models.PortBinding{{HostIP: "192.168.1.51", HostPort: "8080", Protocol: "tcp"}}},
+		{ID: "c", Name: "conflict", Ports: []models.PortBinding{{HostIP: "192.168.1.50", HostPort: "8080", Protocol: "tcp"}}},
+	}
+
+	got := desiredForwards(containers)
+	if len(got) != 2 {
+		t.Fatalf("desiredForwards size = %d, want two address-specific listeners (%+v)", len(got), got)
+	}
+	conflict := got[forwardKey("tcp", "192.168.1.50", 8080)]
+	if conflict.blockedReason == "" || conflict.containerID != "" {
+		t.Fatalf("exact listener collision = %+v, want targetless visible conflict", conflict)
+	}
+	independent := got[forwardKey("tcp", "192.168.1.51", 8080)]
+	if independent.containerID != "b" || independent.blockedReason != "" {
+		t.Fatalf("independent listener = %+v, want container b", independent)
+	}
+}
+
+func TestDesiredForwardsRejectsWildcardConcreteListenerOverlap(t *testing.T) {
+	t.Parallel()
+	containers := []models.ContainerSummary{
+		{ID: "a", Name: "wildcard", Ports: []models.PortBinding{{HostIP: "0.0.0.0", HostPort: "8080", Protocol: "tcp"}}},
+		{ID: "b", Name: "concrete", Ports: []models.PortBinding{{HostIP: "192.168.1.51", HostPort: "8080", Protocol: "tcp"}}},
+	}
+
+	got := desiredForwards(containers)
+	for key, forward := range got {
+		if forward.blockedReason == "" || forward.containerID != "" {
+			t.Fatalf("overlapping listener %q = %+v, want targetless visible conflict", key, forward)
+		}
 	}
 }
 
@@ -165,6 +221,54 @@ func TestManagerForwardsUDPEndToEnd(t *testing.T) {
 	}
 }
 
+func TestManagerReplacesFailedUDPBackendSessionImmediately(t *testing.T) {
+	t.Parallel()
+	packetCh := make(chan net.PacketConn, 1)
+	dialer := &controlledPacketDialer{created: make(chan *controlledPacketConn, 2)}
+	manager := newTestManager(t, fakeListerWithPort("15354", "udp"), dialer, Options{
+		Enabled:           true,
+		ReconcileInterval: time.Hour,
+		ListenPacket:      capturingListenPacket(packetCh),
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager.Start(ctx)
+	t.Cleanup(manager.StopAll)
+
+	host := awaitPacketConn(t, packetCh)
+	client, err := net.Dial("udp", host.LocalAddr().String())
+	if err != nil {
+		t.Fatalf("dial udp host forward: %v", err)
+	}
+	defer client.Close()
+
+	if _, err := client.Write([]byte("first")); err != nil {
+		t.Fatalf("write first datagram: %v", err)
+	}
+	first := awaitControlledPacketConn(t, dialer.created)
+	if got := awaitControlledPacketWrite(t, first.writes); string(got) != "first" {
+		t.Fatalf("first backend payload = %q, want first", got)
+	}
+	first.fail(errors.New("backend read failed"))
+	select {
+	case <-first.closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("failed backend session was not evicted and closed")
+	}
+
+	if _, err := client.Write([]byte("second")); err != nil {
+		t.Fatalf("write second datagram: %v", err)
+	}
+	second := awaitControlledPacketConn(t, dialer.created)
+	if second == first {
+		t.Fatal("same failed backend session was reused")
+	}
+	if got := awaitControlledPacketWrite(t, second.writes); string(got) != "second" {
+		t.Fatalf("replacement backend payload = %q, want second", got)
+	}
+}
+
 func TestManagerReportsBindConflict(t *testing.T) {
 	t.Parallel()
 	failingListen := func(context.Context, string, string) (net.Listener, error) {
@@ -186,6 +290,60 @@ func TestManagerReportsBindConflict(t *testing.T) {
 	})
 	if forward.Reason == "" || forward.HostPort != 18081 {
 		t.Fatalf("conflict forward = %+v", forward)
+	}
+}
+
+func TestManagerSurfacesAmbiguousTargetWithoutBinding(t *testing.T) {
+	t.Parallel()
+	lister := &fakeLister{containers: []models.ContainerSummary{
+		{ID: "a", Name: "first", Ports: []models.PortBinding{{HostIP: "192.168.1.50", HostPort: "18082", Protocol: "tcp"}}},
+		{ID: "b", Name: "second", Ports: []models.PortBinding{{HostIP: "192.168.1.50", HostPort: "18082", Protocol: "tcp"}}},
+	}}
+	var mu sync.Mutex
+	listenCalls := 0
+	manager := newTestManager(t, lister, &echoDialer{}, Options{
+		Enabled:           true,
+		ReconcileInterval: time.Hour,
+		Listen: func(context.Context, string, string) (net.Listener, error) {
+			mu.Lock()
+			listenCalls++
+			mu.Unlock()
+			return nil, errors.New("listener must not be attempted for an ambiguous target")
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	manager.Start(ctx)
+	t.Cleanup(manager.StopAll)
+
+	reported := awaitForward(t, manager, func(forwards []models.PortForward) bool {
+		return len(forwards) == 1 && forwards[0].Status == statusError
+	})
+	if !strings.Contains(reported.Reason, "will not choose") || reported.ContainerID != "" {
+		t.Fatalf("ambiguous forward = %+v, want targetless conflict", reported)
+	}
+	manager.mu.Lock()
+	var before *forward
+	for _, active := range manager.forwards {
+		before = active
+	}
+	manager.mu.Unlock()
+	manager.reconcileOnce(ctx)
+	manager.mu.Lock()
+	var after *forward
+	for _, active := range manager.forwards {
+		after = active
+	}
+	manager.mu.Unlock()
+	if before == nil || after != before {
+		t.Fatal("deterministic policy conflict was needlessly recreated during reconciliation")
+	}
+	mu.Lock()
+	gotListenCalls := listenCalls
+	mu.Unlock()
+	if gotListenCalls != 0 {
+		t.Fatalf("listen calls = %d, want zero for ambiguous target", gotListenCalls)
 	}
 }
 
@@ -352,6 +510,89 @@ func (*udpDialer) DialStream(context.Context, int) (net.Conn, error) {
 func (d *udpDialer) DialPacket(ctx context.Context, _ int) (net.Conn, error) {
 	var dialer net.Dialer
 	return dialer.DialContext(ctx, "udp", d.target)
+}
+
+type controlledPacketDialer struct {
+	created chan *controlledPacketConn
+}
+
+func (*controlledPacketDialer) DialStream(context.Context, int) (net.Conn, error) {
+	return nil, errors.New("not supported")
+}
+
+func (d *controlledPacketDialer) DialPacket(context.Context, int) (net.Conn, error) {
+	conn := &controlledPacketConn{
+		failRead: make(chan error, 1),
+		closed:   make(chan struct{}),
+		writes:   make(chan []byte, 2),
+	}
+	d.created <- conn
+	return conn, nil
+}
+
+type controlledPacketConn struct {
+	failRead chan error
+	closed   chan struct{}
+	writes   chan []byte
+	close    sync.Once
+}
+
+func (c *controlledPacketConn) Read([]byte) (int, error) {
+	select {
+	case err := <-c.failRead:
+		return 0, err
+	case <-c.closed:
+		return 0, net.ErrClosed
+	}
+}
+
+func (c *controlledPacketConn) Write(payload []byte) (int, error) {
+	select {
+	case <-c.closed:
+		return 0, net.ErrClosed
+	default:
+	}
+	copyOfPayload := append([]byte(nil), payload...)
+	select {
+	case c.writes <- copyOfPayload:
+		return len(payload), nil
+	case <-c.closed:
+		return 0, net.ErrClosed
+	}
+}
+
+func (c *controlledPacketConn) Close() error {
+	c.close.Do(func() { close(c.closed) })
+	return nil
+}
+
+func (*controlledPacketConn) LocalAddr() net.Addr              { return fakeAddr("backend-local") }
+func (*controlledPacketConn) RemoteAddr() net.Addr             { return fakeAddr("backend-remote") }
+func (*controlledPacketConn) SetDeadline(time.Time) error      { return nil }
+func (*controlledPacketConn) SetReadDeadline(time.Time) error  { return nil }
+func (*controlledPacketConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *controlledPacketConn) fail(err error)                 { c.failRead <- err }
+
+func awaitControlledPacketConn(t *testing.T, created <-chan *controlledPacketConn) *controlledPacketConn {
+	t.Helper()
+	select {
+	case conn := <-created:
+		return conn
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for UDP backend session")
+		return nil
+	}
+}
+
+func awaitControlledPacketWrite(t *testing.T, writes <-chan []byte) []byte {
+	t.Helper()
+	select {
+	case payload := <-writes:
+		return payload
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for relayed UDP datagram")
+		return nil
+	}
 }
 
 type errorAcceptListener struct{}
