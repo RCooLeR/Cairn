@@ -26,9 +26,9 @@ const (
 )
 
 var (
-	errVerifiedConfigNotRegular = errors.New("Compose input is not a regular file")
-	errVerifiedConfigTooLarge   = errors.New("Compose input exceeds the read limit")
-	errVerifiedConfigChanged    = errors.New("Compose input changed while it was opened")
+	errVerifiedConfigNotRegular = errors.New("compose input is not a regular file")
+	errVerifiedConfigTooLarge   = errors.New("compose input exceeds the read limit")
+	errVerifiedConfigChanged    = errors.New("compose input changed while it was opened")
 )
 
 // VerifiedConfigInput is an immutable in-memory copy of one selected Compose
@@ -341,7 +341,7 @@ func readVerifiedConfigFile(root verifiedConfigRoot, path string, limit int64) (
 	if err != nil {
 		return nil, 0, nil, err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	opened, err := file.Stat()
 	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(before, opened) {
 		return nil, 0, nil, errVerifiedConfigChanged

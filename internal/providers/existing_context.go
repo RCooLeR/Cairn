@@ -593,23 +593,23 @@ func existingContextTLSFingerprint(inspected existingContextInspect, captureCont
 		return tlsPath, nil, nil
 	}
 	if tlsPath == "" {
-		return "", nil, errors.New("Docker context TLS storage path is empty")
+		return "", nil, errors.New("docker context TLS storage path is empty")
 	}
 	if len(filenames) > maxExistingContextTLSFiles {
-		return "", nil, fmt.Errorf("Docker context declares %d TLS files; maximum is %d", len(filenames), maxExistingContextTLSFiles)
+		return "", nil, fmt.Errorf("docker context declares %d TLS files; maximum is %d", len(filenames), maxExistingContextTLSFiles)
 	}
 	seen := make(map[string]struct{}, len(filenames))
 	for i, rawFilename := range filenames {
 		filename := strings.TrimSpace(rawFilename)
 		if filename == "" {
-			return "", nil, errors.New("Docker context declares an empty TLS filename")
+			return "", nil, errors.New("docker context declares an empty TLS filename")
 		}
 		if filename != rawFilename || filepath.IsAbs(filename) || filepath.VolumeName(filename) != "" || filepath.Base(filename) != filename || strings.ContainsAny(filename, `/\<>:"|?*`) || filename == "." || filename == ".." {
-			return "", nil, fmt.Errorf("Docker context TLS filename %q is not a portable basename", rawFilename)
+			return "", nil, fmt.Errorf("docker context TLS filename %q is not a portable basename", rawFilename)
 		}
 		key := strings.ToLower(filename)
 		if _, duplicate := seen[key]; duplicate {
-			return "", nil, fmt.Errorf("Docker context declares duplicate TLS filename %q", filename)
+			return "", nil, fmt.Errorf("docker context declares duplicate TLS filename %q", filename)
 		}
 		seen[key] = struct{}{}
 		filenames[i] = filename
@@ -621,7 +621,7 @@ func existingContextTLSFingerprint(inspected existingContextInspect, captureCont
 		path := filepath.Clean(filepath.Join(baseDir, filename))
 		relative, err := filepath.Rel(baseDir, path)
 		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.IsAbs(relative) {
-			return "", nil, fmt.Errorf("Docker context TLS filename %q escapes its storage directory", filename)
+			return "", nil, fmt.Errorf("docker context TLS filename %q escapes its storage directory", filename)
 		}
 		digest, content, err := readExistingContextTLSFile(path, captureContent)
 		if err != nil {
@@ -680,7 +680,7 @@ func freezeExistingContextTLSFiles(files []existingContextTLSFileFingerprint) ([
 	frozen := make([]existingContextTLSFileFingerprint, 0, len(files))
 	for _, source := range files {
 		if !source.captured {
-			return nil, "", fmt.Errorf("Docker context TLS file %q was not captured", source.Name)
+			return nil, "", fmt.Errorf("docker context TLS file %q was not captured", source.Name)
 		}
 		destination := filepath.Join(dockerDir, source.Name)
 		if err := writeExistingContextTLSFile(destination, source.content); err != nil {

@@ -875,15 +875,6 @@ func composeConfigCommand(args []string) bool {
 	return false
 }
 
-func (r *fakeRunner) hasCall(key string) bool {
-	for _, call := range r.calls {
-		if call.workdir+"|"+strings.Join(call.args, " ") == key {
-			return true
-		}
-	}
-	return false
-}
-
 func contains(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {

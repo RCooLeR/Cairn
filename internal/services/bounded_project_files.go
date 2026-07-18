@@ -174,18 +174,6 @@ func readBoundedRegularProjectFile(root string, candidate string, maxBytes int64
 	return readBoundedRegularProjectFileVerified(root, candidate, maxBytes, allowTruncate, nil)
 }
 
-func readBoundedRegularProjectFileOnce(root string, candidate string, maxBytes int64, allowTruncate bool, opened *[]fs.FileInfo) (boundedFileRead, string, error) {
-	return readBoundedRegularProjectFileVerified(root, candidate, maxBytes, allowTruncate, func(info fs.FileInfo) error {
-		for _, existing := range *opened {
-			if os.SameFile(existing, info) {
-				return errBoundedFileDuplicate
-			}
-		}
-		*opened = append(*opened, info)
-		return nil
-	})
-}
-
 func readBoundedRegularProjectFileVerified(root string, candidate string, maxBytes int64, allowTruncate bool, openedVerify func(fs.FileInfo) error) (boundedFileRead, string, error) {
 	verifiedRoot, err := verifyProjectReadRoot(root)
 	if err != nil {
@@ -279,7 +267,7 @@ func readBoundedRegularFileVerified(path string, maxBytes int64, allowTruncate b
 	if err != nil {
 		return boundedFileRead{}, err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 
 	opened, err := file.Stat()
 	if err != nil {
@@ -320,15 +308,6 @@ func readBoundedRegularFileVerified(path string, maxBytes int64, allowTruncate b
 		ReadBytes: readBytes,
 		Truncated: allowTruncate && opened.Size() > int64(len(content)),
 	}, nil
-}
-
-func resolveProjectReadPath(root string, candidate string) (string, string, string, error) {
-	verifiedRoot, err := verifyProjectReadRoot(root)
-	if err != nil {
-		return "", "", "", err
-	}
-	absPath, relPath, err := resolveProjectReadPathFromRoot(verifiedRoot, candidate)
-	return verifiedRoot.realPath, absPath, relPath, err
 }
 
 func verifyProjectReadRoot(root string) (verifiedProjectRoot, error) {

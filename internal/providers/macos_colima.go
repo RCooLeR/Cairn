@@ -473,11 +473,6 @@ func (p *MacOSColimaProvider) composeCommand(ctx context.Context, host string) (
 	return "docker-compose", []string{"--host", host}
 }
 
-func (p *MacOSColimaProvider) runDockerContextText(ctx context.Context, contextName string, args ...string) (string, bool) {
-	dockerArgs := append([]string{"--context", contextName}, args...)
-	return p.runText(ctx, "docker", dockerArgs...)
-}
-
 func (p *MacOSColimaProvider) runDockerHostText(ctx context.Context, args ...string) (string, bool) {
 	host := p.profileDockerHost(ctx)
 	if host == "" {
@@ -501,31 +496,6 @@ func (p *MacOSColimaProvider) runText(ctx context.Context, name string, args ...
 		return "", false
 	}
 	return strings.TrimSpace(result.Stdout), true
-}
-
-func (p *MacOSColimaProvider) listDockerContexts(ctx context.Context) ([]models.DockerContextInfo, bool) {
-	output, ok := p.runText(ctx, "docker", "context", "ls", "--format", "json")
-	if !ok {
-		return nil, false
-	}
-	contexts, err := parseDockerContextList(output)
-	return contexts, err == nil
-}
-
-func (p *MacOSColimaProvider) contextDockerHost(ctx context.Context, contextName string) (string, bool) {
-	contexts, ok := p.listDockerContexts(ctx)
-	if ok {
-		for _, dockerContext := range contexts {
-			if dockerContext.Name == contextName && dockerContext.DockerHost != "" {
-				return dockerContext.DockerHost, true
-			}
-		}
-	}
-	output, ok := p.runText(ctx, "docker", "context", "inspect", contextName, "--format", "{{json .Endpoints.docker.Host}}")
-	if !ok {
-		return "", false
-	}
-	return parseDockerHostValue(output)
 }
 
 func (p *MacOSColimaProvider) colimaStatus(ctx context.Context) (colimaStatusInfo, bool) {
@@ -583,14 +553,6 @@ func (p *MacOSColimaProvider) configuredDiskGB() int {
 		return p.diskGB
 	}
 	return 60
-}
-
-func (p *MacOSColimaProvider) contextName() string {
-	profile := p.configuredProfile()
-	if profile == defaultColimaProfile {
-		return "colima"
-	}
-	return "colima-" + profile
 }
 
 func (p *MacOSColimaProvider) colimaStartArgs() []string {
@@ -681,14 +643,6 @@ func homebrewOutdatedPackages(output string) []string {
 		outdated = append(outdated, fields[0])
 	}
 	return outdated
-}
-
-func colimaContextName(profile string) string {
-	profile = strings.TrimSpace(profile)
-	if profile == "" || profile == defaultColimaProfile {
-		return "colima"
-	}
-	return "colima-" + profile
 }
 
 func optionInt(values map[string]string, key string, fallback int) int {
@@ -787,18 +741,6 @@ func (b *boolish) UnmarshalJSON(data []byte) error {
 
 func (b boolish) Bool() bool {
 	return b.value
-}
-
-func parseDockerHostValue(output string) (string, bool) {
-	value := strings.TrimSpace(output)
-	if value == "" || value == "null" {
-		return "", false
-	}
-	var decoded string
-	if err := json.Unmarshal([]byte(value), &decoded); err == nil {
-		value = decoded
-	}
-	return strings.TrimSpace(value), strings.TrimSpace(value) != ""
 }
 
 func defaultColimaSocket(homeDir, profile string) string {

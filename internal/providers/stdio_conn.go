@@ -240,7 +240,9 @@ func (c *commandStdioConn) setDeadline(deadline time.Time, read, write bool) err
 	c.deadlineMu.Unlock()
 
 	if expired {
-		go c.close(true, "stdio command did not exit after deadline")
+		go func() {
+			_ = c.close(true, "stdio command did not exit after deadline")
+		}()
 	}
 	return nil
 }
@@ -353,7 +355,7 @@ func stdioStartupFailure(data []byte) error {
 	if message == "" {
 		return nil
 	}
-	return fmt.Errorf("Docker API stdio transport failed: %s", truncateSingleLine(message, 500))
+	return fmt.Errorf("docker API stdio transport failed: %s", truncateSingleLine(message, 500))
 }
 
 func looksLikeUTF16LEText(data []byte) bool {

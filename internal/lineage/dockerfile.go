@@ -555,7 +555,7 @@ func resolveFinalStageIndex(stages []DockerfileStage, target string) (int, error
 	}
 	if numeric, err := strconv.Atoi(target); err == nil {
 		if numeric < 0 || numeric >= len(stages) {
-			return -1, fmt.Errorf("Dockerfile build target index %d is out of range for %d stages", numeric, len(stages))
+			return -1, fmt.Errorf("dockerfile build target index %d is out of range for %d stages", numeric, len(stages))
 		}
 		return numeric, nil
 	}
@@ -564,7 +564,7 @@ func resolveFinalStageIndex(stages []DockerfileStage, target string) (int, error
 			return stage.Index, nil
 		}
 	}
-	return -1, fmt.Errorf("Dockerfile build target %q does not match a named stage", target)
+	return -1, fmt.Errorf("dockerfile build target %q does not match a named stage", target)
 }
 
 func appendUnique(values []string, next ...string) []string {

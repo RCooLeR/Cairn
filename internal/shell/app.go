@@ -420,21 +420,6 @@ func defaultProviderSet() []providers.PlatformProvider {
 	return []providers.PlatformProvider{providers.NewExistingContext(providers.ExistingContextOptions{ContextName: "default"})}
 }
 
-func backendContextName(ctx context.Context, provider providers.PlatformProvider) string {
-	if provider == nil {
-		return ""
-	}
-	identityProvider, ok := provider.(providers.BackendIdentityProvider)
-	if !ok {
-		return ""
-	}
-	identity, err := identityProvider.BackendIdentity(ctx)
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(identity)
-}
-
 type frontendEventEmitter interface {
 	EmitEvent(name string, data ...any) bool
 }

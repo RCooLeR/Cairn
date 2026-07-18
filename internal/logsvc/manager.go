@@ -961,7 +961,7 @@ func (s *session) readContainer(container models.ContainerSummary, key string, r
 	}
 	result.opened = true
 	if reader == nil {
-		result.err = fmt.Errorf("Docker returned an empty log reader for %s", key)
+		result.err = fmt.Errorf("docker returned an empty log reader for %s", key)
 		return result
 	}
 	connectedAt := time.Now()

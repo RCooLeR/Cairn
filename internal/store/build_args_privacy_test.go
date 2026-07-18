@@ -297,7 +297,11 @@ func TestPendingMigrationBackupDoesNotRetainLegacyBuildArgumentValues(t *testing
 	if err != nil {
 		t.Fatalf("open migration backup: %v", err)
 	}
-	defer backup.Close()
+	t.Cleanup(func() {
+		if err := backup.Close(); err != nil {
+			t.Errorf("close migration backup: %v", err)
+		}
+	})
 	var serviceMetadata, lineageArgs, historyArgs string
 	if err := backup.writer.QueryRowContext(ctx, `SELECT metadata_json FROM services WHERE id = 'service'`).Scan(&serviceMetadata); err != nil {
 		t.Fatalf("read backup service metadata: %v", err)

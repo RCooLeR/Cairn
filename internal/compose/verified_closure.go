@@ -574,13 +574,14 @@ func (closure *verifiedConfigClosure) scanIncludeEntry(node *yaml.Node, parentPr
 		return nil
 	}
 	var pathNode, envNode, projectNode *yaml.Node
-	if node.Kind == yaml.ScalarNode {
+	switch node.Kind {
+	case yaml.ScalarNode:
 		pathNode = node
-	} else if node.Kind == yaml.MappingNode {
+	case yaml.MappingNode:
 		pathNode = yamlMappingValue(node, "path")
 		envNode = yamlMappingValue(node, "env_file")
 		projectNode = yamlMappingValue(node, "project_directory")
-	} else {
+	default:
 		return nil
 	}
 	paths, err := staticPathValues(pathNode)

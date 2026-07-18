@@ -454,6 +454,7 @@ func TestPublishCriticalValidationAndCompatibilityHelper(t *testing.T) {
 	b := New()
 	defer b.Close()
 
+	//nolint:staticcheck // Exercise the API's explicit nil-context validation.
 	if err := b.PublishCritical(nil, Event{Topic: TopicJobDone}); !errors.Is(err, ErrNilContext) {
 		t.Fatalf("nil-context error = %v, want ErrNilContext", err)
 	}

@@ -420,7 +420,7 @@ func commandFailed(result *providers.CommandResult, err error) bool {
 }
 
 func composeCommandError(code apperror.Code, message string, result *providers.CommandResult, err error) error {
-	if contextErr := composeContextError(nil, err); contextErr != nil {
+	if contextErr := composeContextError(context.Background(), err); contextErr != nil {
 		return contextErr
 	}
 	// Scope/provider failures happen before a Compose process is started and

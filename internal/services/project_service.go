@@ -1691,14 +1691,6 @@ func safeComposeRendererError(err error, details []string, message string) error
 	return apperror.New(code, message, apperror.WithDetail(safeDetails[0]))
 }
 
-func safeProjectFileNames(workdir string, files []string) []string {
-	return safeProjectFileNamesWithBudget(workdir, files, newProjectPreviewBudget())
-}
-
-func safeProjectFileNamesWithBudget(workdir string, files []string, budget *projectPreviewBudget) []string {
-	return safeProjectFileNamesWithBudgetContext(context.Background(), workdir, files, budget)
-}
-
 func safeProjectFileNamesWithBudgetContext(ctx context.Context, workdir string, files []string, budget *projectPreviewBudget) []string {
 	verifiedRoot, err := verifyProjectReadRoot(workdir)
 	if err != nil {
@@ -1892,10 +1884,6 @@ func (s *ProjectService) now() time.Time {
 		return s.Now().UTC()
 	}
 	return time.Now().UTC()
-}
-
-func (s *ProjectService) projectInCurrentContext(project store.ProjectRecord) bool {
-	return s.Scope.Matches(project.ProviderID, project.ContextName)
 }
 
 func mapStoreNotFound(err error, message string) error {

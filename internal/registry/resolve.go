@@ -312,14 +312,6 @@ func statusError(resp *http.Response) error {
 	}
 }
 
-func manifestMediaType(contentType string) string {
-	if contentType == "" {
-		return ""
-	}
-	mediaType, _, _ := strings.Cut(contentType, ";")
-	return strings.TrimSpace(mediaType)
-}
-
 func isIndexMediaType(mediaType string) bool {
 	return strings.Contains(mediaType, "manifest.list") || strings.Contains(mediaType, "image.index")
 }

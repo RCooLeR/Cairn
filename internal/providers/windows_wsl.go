@@ -689,11 +689,6 @@ func (p *WindowsWSLProvider) detectDefaultWSLVersion(ctx context.Context) (int, 
 	return parseWSLDefaultVersion(result.Stdout)
 }
 
-func (p *WindowsWSLProvider) listDistros(ctx context.Context) ([]wslDistro, bool) {
-	distros, ok, _ := p.listDistrosForDetect(ctx)
-	return distros, ok
-}
-
 func (p *WindowsWSLProvider) listDistrosForDetect(ctx context.Context) ([]wslDistro, bool, bool) {
 	result, err := p.runner.Run(ctx, wslCommandTimeout, wslCommandName, "-l", "-v")
 	if isWSLInvocationFailure(result, err) {

@@ -618,7 +618,9 @@ func TestManagerQueriesStopsFallbackAndScopes(t *testing.T) {
 	if got := manager.sampleInterval("c1"); got != defaultBackgroundInterval {
 		t.Fatalf("sampleInterval() = %v, want background", got)
 	}
-	manager.maybeRetain(ctx)
+	if err := manager.maybeRetain(ctx); err != nil {
+		t.Fatalf("maybeRetain() error = %v", err)
+	}
 	if manager.lastRetain.IsZero() {
 		t.Fatal("maybeRetain did not record retention time")
 	}

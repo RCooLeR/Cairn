@@ -698,13 +698,6 @@ func (m *Manager) currentProviderProjectIDs(ctx context.Context) (map[string]str
 	return ids, true, nil
 }
 
-func (m *Manager) providerID() string {
-	if m == nil || !m.Scope.Valid() {
-		return ""
-	}
-	return m.Scope.ProviderID()
-}
-
 func (m *Manager) projectInScope(ctx context.Context, projectID string) (store.ProjectRecord, error) {
 	if m == nil || m.Projects == nil || !m.Scope.Valid() {
 		return store.ProjectRecord{}, notReady()

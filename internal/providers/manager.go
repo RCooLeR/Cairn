@@ -607,11 +607,6 @@ func (m *Manager) updateActiveAfterDetect(ctx context.Context, statuses map[stri
 	}
 }
 
-func (m *Manager) setActiveBestEffort(ctx context.Context, providerID string) {
-	_ = m.settings.SetString(ctx, "provider.active_id", providerID)
-	m.setEffectiveActive(providerID)
-}
-
 func (m *Manager) setEffectiveActive(providerID string) {
 	m.mu.Lock()
 	m.activeID = providerID

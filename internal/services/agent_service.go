@@ -1442,8 +1442,8 @@ func newAgentProductionTransport() *http.Transport {
 
 func hardenAgentTransport(transport *http.Transport) {
 	transport.Proxy = nil
-	transport.Dial = nil
-	transport.DialTLS = nil
+	transport.Dial = nil    //nolint:staticcheck // Clear the deprecated hook on caller-supplied transports.
+	transport.DialTLS = nil //nolint:staticcheck // Clear the deprecated hook on caller-supplied transports.
 	transport.DialTLSContext = nil
 	enforceAgentTransportLimits(transport)
 	transport.DialContext = newAgentLoopbackDialContext()
@@ -2288,10 +2288,6 @@ func safeAgentProjectReadError(err error) error {
 	default:
 		return apperror.New(apperror.Conflict, "Project files could not be read safely")
 	}
-}
-
-func retainAgentPathCandidate(candidates []agentPathCandidate, path string) []agentPathCandidate {
-	return retainAgentPathCandidateWithLimit(candidates, path, maxAgentProjectCandidates)
 }
 
 func retainAgentPathCandidateWithLimit(candidates []agentPathCandidate, path string, limit int) []agentPathCandidate {

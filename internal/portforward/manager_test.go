@@ -174,7 +174,7 @@ func TestManagerForwardsTCPEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial host forward: %v", err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 
 	if _, err := conn.Write([]byte("ping")); err != nil {
 		t.Fatalf("write: %v", err)
@@ -205,7 +205,7 @@ func TestManagerForwardsUDPEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial udp host forward: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	if _, err := client.Write([]byte("pong")); err != nil {
 		t.Fatalf("udp write: %v", err)
@@ -241,7 +241,7 @@ func TestManagerReplacesFailedUDPBackendSessionImmediately(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial udp host forward: %v", err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	if _, err := client.Write([]byte("first")); err != nil {
 		t.Fatalf("write first datagram: %v", err)

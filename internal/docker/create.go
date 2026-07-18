@@ -216,7 +216,7 @@ func inspectedContainerState(inspect container.InspectResponse) string {
 	if inspect.ContainerJSONBase == nil || inspect.State == nil {
 		return "unknown"
 	}
-	state := strings.ToLower(strings.TrimSpace(string(inspect.State.Status)))
+	state := strings.ToLower(strings.TrimSpace(inspect.State.Status))
 	if state == "" {
 		return "unknown"
 	}

@@ -198,8 +198,7 @@ func TestAgentServiceNeverFollowsAgentRedirects(t *testing.T) {
 			}))
 			t.Cleanup(collector.Close)
 
-			var source *httptest.Server
-			source = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
 				case "/api/tags":
 					_, _ = io.WriteString(w, `{"models":[{"name":"gemma4:12b-it-q8_0"}]}`)
@@ -493,6 +492,7 @@ func TestCloneAgentHTTPClientEnforcesPolicyWithoutMutatingInjectedClient(t *test
 	if clonedTransport.ResponseHeaderTimeout != agentResponseHeaderTimeout || clonedTransport.MaxResponseHeaderBytes != 64*1024 {
 		t.Fatalf("cloned transport limits = %#v", clonedTransport)
 	}
+	//nolint:staticcheck // Verify that cloned transports clear every legacy dial hook.
 	if clonedTransport.Proxy != nil || clonedTransport.Dial != nil || clonedTransport.DialTLS != nil || clonedTransport.DialTLSContext != nil || clonedTransport.DialContext == nil {
 		t.Fatalf("cloned transport retained an unsafe network hook: %#v", clonedTransport)
 	}
@@ -502,6 +502,7 @@ func TestCloneAgentHTTPClientEnforcesPolicyWithoutMutatingInjectedClient(t *test
 	if original.Timeout != 0 || originalTransport.ResponseHeaderTimeout != 0 || originalTransport.MaxResponseHeaderBytes != 0 {
 		t.Fatalf("injected client was mutated: client=%#v transport=%#v", original, originalTransport)
 	}
+	//nolint:staticcheck // Verify that hardening does not mutate legacy hooks on the caller's transport.
 	if originalTransport.Proxy == nil || originalTransport.Dial == nil || originalTransport.DialContext == nil || originalTransport.DialTLS == nil || originalTransport.DialTLSContext == nil {
 		t.Fatal("injected transport hooks were mutated")
 	}
@@ -590,7 +591,7 @@ func TestAgentServiceOverridesInjectedDialAndTLSDialHooks(t *testing.T) {
 		protocolCalls.Add(1)
 		return nil, errors.New("injected alternate protocol must not run")
 	}))
-	transport.Dial = func(string, string) (net.Conn, error) {
+	transport.Dial = func(string, string) (net.Conn, error) { //nolint:staticcheck // Inject a legacy hook to verify hardening removes it.
 		dialCalls.Add(1)
 		return nil, errors.New("injected Dial must not run")
 	}
@@ -598,7 +599,7 @@ func TestAgentServiceOverridesInjectedDialAndTLSDialHooks(t *testing.T) {
 		dialCalls.Add(1)
 		return nil, errors.New("injected DialContext must not run")
 	}
-	transport.DialTLS = func(string, string) (net.Conn, error) {
+	transport.DialTLS = func(string, string) (net.Conn, error) { //nolint:staticcheck // Inject a legacy hook to verify hardening removes it.
 		dialCalls.Add(1)
 		return nil, errors.New("injected DialTLS must not run")
 	}
