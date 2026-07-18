@@ -152,9 +152,15 @@ jobs:
           if (!(Test-Path -LiteralPath $binary -PathType Leaf)) {
             throw "Packaged application binary not found: $binary"
           }
-          $header = & go version -m $binary | Select-Object -First 1
-          if ($LASTEXITCODE -ne 0 -or !$header.EndsWith(": $expected", [StringComparison]::Ordinal)) {
-            throw "Application build info is '$header', want Go toolchain $expected."
+          $buildInfoJson = & go version -m -json $binary
+          $buildInfoExitCode = $LASTEXITCODE
+          if ($buildInfoExitCode -ne 0) {
+            throw "Reading application Go build info failed with exit code $buildInfoExitCode."
+          }
+          $buildInfo = $buildInfoJson | ConvertFrom-Json -ErrorAction Stop
+          $actual = [string]$buildInfo.GoVersion
+          if ($actual -cne $expected) {
+            throw "Application Go toolchain is '$actual', want $expected."
           }
 
       - name: Verify server mode build guard
