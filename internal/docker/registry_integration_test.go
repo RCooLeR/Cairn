@@ -5,8 +5,8 @@ package docker
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
@@ -88,6 +88,7 @@ func TestClientRealRegistryTagPushRoundTrip(t *testing.T) {
 		t.Fatalf("PushImage without login error = %v, want %s", err, apperror.RegistryAuth)
 	}
 
+	installRealPushCredentialHelper(t, provider, registryHost, username)
 	manager := registrycore.NewManager(realPushResolver{provider: provider}, nil)
 	if err := manager.Login(ctx, models.RegistryLoginRequest{
 		Registry:   registryHost,
@@ -97,6 +98,7 @@ func TestClientRealRegistryTagPushRoundTrip(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Login() error = %v", err)
 	}
+	assertRealPushCredentialStorage(t, provider, registryHost, secret)
 
 	progressEvents := eventBus.Subscribe(ctx, bus.TopicImagePushProgress, 16)
 	streamID, err := client.PushImage(ctx, imageRef)
@@ -134,6 +136,13 @@ func TestClientRealRegistryTagPushRoundTrip(t *testing.T) {
 	}
 	if !strings.Contains(result.Stdout, digest.ManifestDigest) {
 		t.Fatalf("pulled digest %q does not contain %q", strings.TrimSpace(result.Stdout), digest.ManifestDigest)
+	}
+
+	if err := manager.Logout(ctx, registryHost); err != nil {
+		t.Fatalf("Logout() error = %v", err)
+	}
+	if _, err := os.Stat(provider.credentialState); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("credential helper state after logout error = %v, want not exist", err)
 	}
 }
 
@@ -177,6 +186,123 @@ func normalizePushRegistryPort(stdout string) string {
 	return host
 }
 
+const realPushCredentialHelperName = "cairn-test"
+
+const realPushCredentialHelperScript = `#!/bin/sh
+set -eu
+
+state=${CAIRN_TEST_CREDENTIAL_STATE:?}
+registry=${CAIRN_TEST_CREDENTIAL_REGISTRY:?}
+username=${CAIRN_TEST_CREDENTIAL_USERNAME:?}
+
+case "${1:-}" in
+store)
+	umask 077
+	tmp="${state}.tmp.$$"
+	trap 'rm -f "$tmp"' 0 1 2 15
+	cat > "$tmp"
+	chmod 0600 "$tmp"
+	mv "$tmp" "$state"
+	trap - 0 1 2 15
+	;;
+get)
+	cat >/dev/null
+	if [ ! -s "$state" ]; then
+		printf '%s\n' 'credentials not found in native keychain' >&2
+		exit 1
+	fi
+	cat "$state"
+	;;
+erase)
+	cat >/dev/null
+	rm -f "$state"
+	;;
+list)
+	if [ -s "$state" ]; then
+		printf '{"%s":"%s"}\n' "$registry" "$username"
+	else
+		printf '{}\n'
+	fi
+	;;
+*)
+	printf '%s\n' 'unsupported credential helper command' >&2
+	exit 64
+	;;
+esac
+`
+
+func installRealPushCredentialHelper(t *testing.T, provider *realPushProvider, registry string, username string) {
+	t.Helper()
+	helpersDir := t.TempDir()
+	if err := os.Chmod(helpersDir, 0o700); err != nil {
+		t.Fatalf("secure credential helper directory: %v", err)
+	}
+	helperPath := filepath.Join(helpersDir, "docker-credential-"+realPushCredentialHelperName)
+	if err := os.WriteFile(helperPath, []byte(realPushCredentialHelperScript), 0o700); err != nil {
+		t.Fatalf("write credential helper: %v", err)
+	}
+
+	provider.credentialHelperDir = helpersDir
+	provider.credentialState = filepath.Join(helpersDir, "credentials.json")
+	provider.credentialRegistry = registry
+	provider.credentialUsername = username
+
+	config := map[string]map[string]string{
+		"credHelpers": {
+			registry: realPushCredentialHelperName,
+		},
+	}
+	raw, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		t.Fatalf("encode Docker credential config: %v", err)
+	}
+	raw = append(raw, '\n')
+	if err := os.WriteFile(filepath.Join(provider.dockerConfig, "config.json"), raw, 0o600); err != nil {
+		t.Fatalf("write Docker credential config: %v", err)
+	}
+}
+
+type realPushDockerConfig struct {
+	Auths map[string]struct {
+		Auth          string `json:"auth"`
+		Username      string `json:"username"`
+		Password      string `json:"password"`
+		IdentityToken string `json:"identitytoken"`
+	} `json:"auths"`
+	CredHelpers map[string]string `json:"credHelpers"`
+}
+
+func assertRealPushCredentialStorage(t *testing.T, provider *realPushProvider, registry string, secret string) {
+	t.Helper()
+	info, err := os.Stat(provider.credentialState)
+	if err != nil {
+		t.Fatalf("stat credential helper state: %v", err)
+	}
+	if got, want := info.Mode().Perm(), os.FileMode(0o600); got != want {
+		t.Fatalf("credential helper state mode = %o, want %o", got, want)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(provider.dockerConfig, "config.json"))
+	if err != nil {
+		t.Fatalf("read Docker credential config: %v", err)
+	}
+	if bytes.Contains(raw, []byte(secret)) {
+		t.Fatal("Docker credential config contains the registry secret")
+	}
+	var config realPushDockerConfig
+	if err := json.Unmarshal(raw, &config); err != nil {
+		t.Fatalf("parse Docker credential config: %v", err)
+	}
+	if got, want := strings.TrimSpace(config.CredHelpers[registry]), realPushCredentialHelperName; got != want {
+		t.Fatalf("credential helper = %q, want %q", got, want)
+	}
+	if entry, ok := config.Auths[registry]; ok {
+		if strings.TrimSpace(entry.Auth) != "" || entry.Username != "" || entry.Password != "" || entry.IdentityToken != "" {
+			t.Fatalf("inline credential remained for %q", registry)
+		}
+	}
+}
+
 type realPushResolver struct {
 	provider providers.PlatformProvider
 }
@@ -186,7 +312,11 @@ func (r realPushResolver) ActiveProvider(context.Context) (providers.PlatformPro
 }
 
 type realPushProvider struct {
-	dockerConfig string
+	dockerConfig        string
+	credentialHelperDir string
+	credentialState     string
+	credentialRegistry  string
+	credentialUsername  string
 }
 
 func (p *realPushProvider) ID() string          { return "real-push" }
@@ -221,16 +351,6 @@ func (p *realPushProvider) RunBackendCommand(ctx context.Context, input string, 
 	if len(args) == 0 {
 		return nil, errors.New("backend command is required")
 	}
-	if len(args) >= 3 && args[0] == "sh" && args[1] == "-lc" && strings.Contains(args[2], "config.json") {
-		raw, err := os.ReadFile(filepath.Join(p.dockerConfig, "config.json"))
-		if errors.Is(err, os.ErrNotExist) {
-			return &providers.CommandResult{Command: args, ExitCode: 0}, nil
-		}
-		if err != nil {
-			return &providers.CommandResult{Command: args, ExitCode: 1, Stderr: err.Error()}, err
-		}
-		return &providers.CommandResult{Command: args, Stdout: string(raw), ExitCode: 0}, nil
-	}
 	return p.run(ctx, input, args[0], args[1:]...)
 }
 func (p *realPushProvider) RunCompose(context.Context, string, ...string) (*providers.CommandResult, error) {
@@ -247,8 +367,20 @@ func (p *realPushProvider) MapPathToHost(path string) (string, error)    { retur
 
 func (p *realPushProvider) run(ctx context.Context, input string, name string, args ...string) (*providers.CommandResult, error) {
 	started := time.Now()
+	commandName := name
+	if p.credentialHelperDir != "" && name == "docker-credential-"+realPushCredentialHelperName {
+		name = filepath.Join(p.credentialHelperDir, name)
+	}
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Env = append(os.Environ(), "DOCKER_CONFIG="+p.dockerConfig)
+	if p.credentialHelperDir != "" {
+		cmd.Env = append(cmd.Env,
+			"PATH="+p.credentialHelperDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"CAIRN_TEST_CREDENTIAL_STATE="+p.credentialState,
+			"CAIRN_TEST_CREDENTIAL_REGISTRY="+p.credentialRegistry,
+			"CAIRN_TEST_CREDENTIAL_USERNAME="+p.credentialUsername,
+		)
+	}
 	if input != "" {
 		cmd.Stdin = strings.NewReader(input)
 	}
@@ -258,7 +390,7 @@ func (p *realPushProvider) run(ctx context.Context, input string, name string, a
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	result := &providers.CommandResult{
-		Command:  append([]string{name}, args...),
+		Command:  append([]string{commandName}, args...),
 		Stdout:   stdout.String(),
 		Stderr:   stderr.String(),
 		ExitCode: 0,
@@ -273,5 +405,5 @@ func (p *realPushProvider) run(ctx context.Context, input string, name string, a
 	} else {
 		result.ExitCode = -1
 	}
-	return result, fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
+	return result, err
 }
