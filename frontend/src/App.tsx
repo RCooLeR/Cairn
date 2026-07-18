@@ -8,7 +8,6 @@ import type {
   ContainerSummary,
   DashboardMetrics,
   DockerContextInfo,
-  ExportResult,
   GPUMetrics,
   HubSearchResult,
   ImageDetail,
@@ -302,13 +301,203 @@ type UpdateProgressEntry = {
   pct?: number;
 };
 
-type ProjectJobEvent = UpdateProgressEntry & {
+export type ProjectJobEvent = UpdateProgressEntry & {
   projectID?: string;
   action?: string;
   command?: string;
   result?: string;
   error?: string;
 };
+
+type UpdateCheckProgressPayload = UpdateProgressEntry & {
+  done?: number;
+  total?: number;
+  current?: string;
+};
+
+type ScopedRequestOwner = {
+  scopeGeneration: number;
+  requestGeneration: number;
+};
+
+type UpdateCheckOperation = ScopedRequestOwner & {
+  jobID?: string;
+};
+
+type BufferedProjectJobEvent = {
+  progress: ProjectJobEvent[];
+  terminal: ProjectJobEvent | null;
+  updatedAt: number;
+};
+
+type BufferedUpdateCheckEvents = {
+  progress: UpdateCheckProgressPayload[];
+  terminal: UpdateCheckProgressPayload | null;
+  updatedAt: number;
+};
+
+export const pendingJobLimit = 32;
+export const activeJobOwnershipLimit = 128;
+const pendingJobTTLMS = 5 * 60 * 1000;
+export const jobTombstoneLimit = 512;
+export const jobTombstoneTTLMS = 30 * 60 * 1000;
+
+// Backend job IDs are cryptographically random. Retaining a bounded TTL/LRU
+// tombstone window fails closed for delayed events and accidental ID reuse
+// without allowing an attacker or broken backend to grow process memory
+// forever. The residual risk after expiry is therefore a cryptographic-ID
+// collision, not routine counter reuse.
+export class BoundedJobTombstones {
+  private readonly entries = new Map<string, number>();
+
+  add(jobID: string, now = Date.now()) {
+    this.prune(now);
+    this.entries.delete(jobID);
+    this.entries.set(jobID, now + jobTombstoneTTLMS);
+    while (this.entries.size > jobTombstoneLimit) {
+      const oldest = this.entries.keys().next().value;
+      if (typeof oldest !== "string") {
+        break;
+      }
+      this.entries.delete(oldest);
+    }
+  }
+
+  has(jobID: string, now = Date.now()) {
+    this.prune(now);
+    const expiresAt = this.entries.get(jobID);
+    if (expiresAt === undefined) {
+      return false;
+    }
+    this.entries.delete(jobID);
+    this.entries.set(jobID, expiresAt);
+    return true;
+  }
+
+  private prune(now: number) {
+    for (const [jobID, expiresAt] of this.entries) {
+      if (expiresAt > now) {
+        continue;
+      }
+      this.entries.delete(jobID);
+    }
+  }
+}
+
+function updateCheckEventIsTerminal(payload: UpdateCheckProgressPayload) {
+  return (
+    typeof payload.done === "number" &&
+    typeof payload.total === "number" &&
+    payload.done >= payload.total
+  );
+}
+
+function prunePendingJobs<T extends { updatedAt: number }>(
+  pending: Map<string, T>,
+  tombstones: BoundedJobTombstones,
+  now: number,
+) {
+  for (const [jobID, buffered] of pending) {
+    if (now - buffered.updatedAt <= pendingJobTTLMS) {
+      continue;
+    }
+    pending.delete(jobID);
+    tombstones.add(jobID, now);
+  }
+}
+
+function makePendingJobRoom<T extends { updatedAt: number }>(
+  pending: Map<string, T>,
+  jobID: string,
+  tombstones: BoundedJobTombstones,
+  now: number,
+) {
+  prunePendingJobs(pending, tombstones, now);
+  if (pending.has(jobID) || pending.size < pendingJobLimit) {
+    return;
+  }
+  const oldestJobID = pending.keys().next().value;
+  if (typeof oldestJobID === "string") {
+    pending.delete(oldestJobID);
+    tombstones.add(oldestJobID, now);
+  }
+}
+
+function bufferPendingUpdateCheckEvent(
+  pending: Map<string, BufferedUpdateCheckEvents>,
+  tombstones: BoundedJobTombstones,
+  payload: UpdateCheckProgressPayload,
+) {
+  const jobID = payload.jobID!;
+  const now = Date.now();
+  makePendingJobRoom(pending, jobID, tombstones, now);
+  const buffered = pending.get(jobID) ?? {
+    progress: [],
+    terminal: null,
+    updatedAt: now,
+  };
+  if (buffered.terminal) {
+    return;
+  }
+  if (updateCheckEventIsTerminal(payload)) {
+    buffered.terminal = payload;
+  } else {
+    buffered.progress.push(payload);
+    if (buffered.progress.length > 20) {
+      buffered.progress.shift();
+    }
+  }
+  buffered.updatedAt = now;
+  pending.delete(jobID);
+  pending.set(jobID, buffered);
+}
+
+function bufferPendingProjectJobEvent(
+  pending: Map<string, BufferedProjectJobEvent>,
+  tombstones: BoundedJobTombstones,
+  payload: ProjectJobEvent,
+  done: boolean,
+) {
+  const jobID = payload.jobID!;
+  const now = Date.now();
+  makePendingJobRoom(pending, jobID, tombstones, now);
+  const buffered = pending.get(jobID) ?? {
+    progress: [],
+    terminal: null,
+    updatedAt: now,
+  };
+  if (buffered.terminal) {
+    return;
+  }
+  if (done) {
+    buffered.terminal = payload;
+  } else {
+    buffered.progress.push(payload);
+    if (buffered.progress.length > 50) {
+      buffered.progress.shift();
+    }
+  }
+  buffered.updatedAt = now;
+  pending.delete(jobID);
+  pending.set(jobID, buffered);
+}
+
+function claimBoundedJobOwnership(
+  ownership: Map<string, number>,
+  jobID: string,
+  scopeGeneration: number,
+  tombstones: BoundedJobTombstones,
+) {
+  if (!ownership.has(jobID) && ownership.size >= activeJobOwnershipLimit) {
+    const oldestJobID = ownership.keys().next().value;
+    if (typeof oldestJobID === "string") {
+      ownership.delete(oldestJobID);
+      tombstones.add(oldestJobID);
+    }
+  }
+  ownership.delete(jobID);
+  ownership.set(jobID, scopeGeneration);
+}
 
 type ProjectCommandOutputLine = {
   id: string;
@@ -380,6 +569,7 @@ type ConfirmState = {
   planKind: ConfirmPlanKind;
   targetName: string;
   typedName: string;
+  volumeEpoch?: number;
   busy: boolean;
   error?: string;
 };
@@ -621,12 +811,15 @@ function providerSetupOperationBusy(setup: ProviderSetupState) {
 
 type ExportLogsState = {
   open: boolean;
-  path: string;
   format: "log" | "jsonl";
-  range: "buffer" | "tail";
+  range: "history" | "tail";
   busy: boolean;
   error?: string;
-  result?: ExportResult | null;
+};
+
+type ExportLogsRequestOwner = {
+  draftGeneration: number;
+  requestGeneration: number;
 };
 
 type LogLinesPayload = {
@@ -700,7 +893,19 @@ type SparkPointMap = Record<string, SparkPoint[]>;
 type ProjectMetricSparks = Record<DashboardMetricID, SparkPointMap>;
 
 const maxProjectCommandOutputLines = 300;
+export const maxProjectCommandOutputProjects = 64;
+export const maxProjectLineageProjects = 64;
 const maxImportProjectLogLines = 120;
+export const maxUpdatePlanProgressEntries = 100;
+export const maxProviderInstallProgressEntries = 100;
+export const maxLiveNotifications = 100;
+export const maxSparkSeries = 512;
+export const maxProviderSetupProjects = 256;
+const maxRegistryAccounts = 100;
+
+function appendBoundedEntry<T>(current: T[], entry: T, limit: number) {
+  return current.concat(entry).slice(-limit);
+}
 const importProjectStepOrder: Array<{
   id: ImportProjectStepID;
   label: string;
@@ -1035,9 +1240,16 @@ function numericSetting(value: unknown, fallback: number) {
 }
 
 function stringArraySetting(value: unknown) {
-  return Array.isArray(value)
-    ? value.filter((item): item is string => typeof item === "string")
-    : [];
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return Array.from(
+    new Set(
+      value.filter(
+        (item): item is string => typeof item === "string" && Boolean(item),
+      ),
+    ),
+  ).slice(-maxProviderSetupProjects);
 }
 
 function restoredCommandPlan(value: unknown): CommandPlan | null {
@@ -1068,37 +1280,41 @@ function restoredInstallProgress(
   if (!Array.isArray(value)) {
     return [];
   }
-  return value.filter((item): item is ProviderInstallProgressPayload => {
-    if (!isRecord(item)) {
-      return false;
-    }
-    return (
-      typeof item.planID === "string" &&
-      typeof item.streamID === "string" &&
-      typeof item.step === "number" &&
-      Number.isFinite(item.step) &&
-      typeof item.totalSteps === "number" &&
-      Number.isFinite(item.totalSteps) &&
-      typeof item.message === "string" &&
-      typeof item.done === "boolean"
-    );
-  });
+  return value
+    .filter((item): item is ProviderInstallProgressPayload => {
+      if (!isRecord(item)) {
+        return false;
+      }
+      return (
+        typeof item.planID === "string" &&
+        typeof item.streamID === "string" &&
+        typeof item.step === "number" &&
+        Number.isFinite(item.step) &&
+        typeof item.totalSteps === "number" &&
+        Number.isFinite(item.totalSteps) &&
+        typeof item.message === "string" &&
+        typeof item.done === "boolean"
+      );
+    })
+    .slice(-maxProviderInstallProgressEntries);
 }
 
 function restoredProjectSummaries(value: unknown): ProjectSummary[] {
   if (!Array.isArray(value)) {
     return [];
   }
-  return value.filter((item): item is ProjectSummary => {
-    if (!isRecord(item)) {
-      return false;
-    }
-    return (
-      typeof item.id === "string" &&
-      typeof item.name === "string" &&
-      typeof item.providerID === "string"
-    );
-  });
+  return value
+    .filter((item): item is ProjectSummary => {
+      if (!isRecord(item)) {
+        return false;
+      }
+      return (
+        typeof item.id === "string" &&
+        typeof item.name === "string" &&
+        typeof item.providerID === "string"
+      );
+    })
+    .slice(-maxProviderSetupProjects);
 }
 
 function restoreProviderSetupState(): ProviderSetupState {
@@ -1172,11 +1388,9 @@ function persistProviderSetupState(setup: ProviderSetupState) {
 
 const emptyExportLogs: ExportLogsState = {
   open: false,
-  path: "",
   format: "jsonl",
-  range: "buffer",
+  range: "history",
   busy: false,
-  result: null,
 };
 
 function App() {
@@ -1185,13 +1399,13 @@ function App() {
   const versionError = useAppStore((state) => state.versionError);
   const loadVersion = useAppStore((state) => state.loadVersion);
   const retryVersion = useAppStore((state) => state.retryVersion);
-  const inventoryStatus = useInventoryStore((state) => state.status);
   const inventoryConnection = useInventoryStore((state) => state.connection);
   const setInventoryConnection = useInventoryStore(
     (state) => state.setConnection,
   );
   const inventoryError = useInventoryStore((state) => state.error);
   const lastLoadedAt = useInventoryStore((state) => state.lastLoadedAt);
+  const inventorySlices = useInventoryStore((state) => state.slices);
   const providers = useInventoryStore((state) => state.providers);
   const dockerInfo = useInventoryStore((state) => state.dockerInfo);
   const dockerVersion = useInventoryStore((state) => state.dockerVersion);
@@ -1200,17 +1414,31 @@ function App() {
   const images = useInventoryStore((state) => state.images);
   const volumes = useInventoryStore((state) => state.volumes);
   const networks = useInventoryStore((state) => state.networks);
+  const volumeEpoch = useInventoryStore((state) => state.volumeEpoch);
   const volumeDetails = useInventoryStore((state) => state.volumeDetails);
   const networkDetails = useInventoryStore((state) => state.networkDetails);
   const refreshInventory = useInventoryStore((state) => state.refresh);
+  const refreshInventoryFresh = useInventoryStore(
+    (state) => state.refreshFresh,
+  );
+  const refreshInventoryScopeStore = useInventoryStore(
+    (state) => state.refreshScope,
+  );
   const refreshContainers = useInventoryStore(
     (state) => state.refreshContainers,
   );
   const refreshImages = useInventoryStore((state) => state.refreshImages);
   const refreshVolumes = useInventoryStore((state) => state.refreshVolumes);
   const refreshNetworks = useInventoryStore((state) => state.refreshNetworks);
-  const setNetworkDetail = useInventoryStore((state) => state.setNetworkDetail);
-  const setVolumeDetail = useInventoryStore((state) => state.setVolumeDetail);
+  const loadOwnedNetworkDetail = useInventoryStore(
+    (state) => state.loadNetworkDetail,
+  );
+  const loadOwnedVolumeDetail = useInventoryStore(
+    (state) => state.loadVolumeDetail,
+  );
+  const setContainerStats = useInventoryStore(
+    (state) => state.setContainerStats,
+  );
 
   const [activePage, setActivePage] = useState<PageID>("overview");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
@@ -1221,9 +1449,26 @@ function App() {
     useState<SettingsSectionID>("providers");
   const [search, setSearch] = useState("");
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const dockerScopeGenerationRef = useRef(0);
+  const volumeEpochRef = useRef(volumeEpoch);
+  volumeEpochRef.current = volumeEpoch;
+  const confirmRequestGenerationRef = useRef(0);
+  const inspectRequestGenerationRef = useRef(0);
+  const removeProjectRequestGenerationRef = useRef(0);
+  const runImageRequestGenerationRef = useRef(0);
+  const pushImageRequestGenerationRef = useRef(0);
+  const pendingPushProgressRef = useRef(
+    new Map<string, ImageProgressPayload[]>(),
+  );
+  const backupVolumeRequestGenerationRef = useRef(0);
+  const providerActionRequestGenerationRef = useRef(0);
+  const nextDynamicRequestTokenRef = useRef(0);
+  const actionRequestGenerationsRef = useRef(new Map<string, number>());
+  const mutationRequestGenerationsRef = useRef(new Map<string, number>());
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [projectsStatus, setProjectsStatus] = useState<LoadStatus>("idle");
   const [projectsError, setProjectsError] = useState<string | null>(null);
+  const projectsReadGenerationRef = useRef(0);
   const [activeProjectID, setActiveProjectID] = useState<string | null>(null);
   const [projectDetailState, setProjectDetailState] =
     useState<ProjectDetailState>({
@@ -1255,6 +1500,11 @@ function App() {
   const [imageFilter, setImageFilter] = useState<FilterID>("all");
   const [volumeFilter, setVolumeFilter] = useState<FilterID>("all");
   const [activeNetworkID, setActiveNetworkID] = useState<string | null>(null);
+  const activeNetworkIDRef = useRef<string | null>(null);
+  const networkDetailRequestGenerationRef = useRef(0);
+  const [networkDetailLoadingID, setNetworkDetailLoadingID] = useState<
+    string | null
+  >(null);
   const [networkTab, setNetworkTab] = useState<NetworkTabID>("overview");
   const [inspect, setInspect] = useState<InspectState>(emptyInspect);
   const [confirm, setConfirm] = useState<ConfirmState>(emptyConfirm);
@@ -1272,6 +1522,7 @@ function App() {
   );
   const [registryAccountsStatus, setRegistryAccountsStatus] =
     useState<LoadStatus>("idle");
+  const registryAccountsReadGenerationRef = useRef(0);
   const [registryAccountsError, setRegistryAccountsError] = useState<
     string | null
   >(null);
@@ -1294,40 +1545,59 @@ function App() {
   const [backups, setBackups] = useState<BackupSummary[]>([]);
   const [backupsStatus, setBackupsStatus] = useState<LoadStatus>("idle");
   const [backupsError, setBackupsError] = useState<string | null>(null);
+  const backupsReadGenerationRef = useRef(0);
   const [updates, setUpdates] = useState<ImageUpdate[]>([]);
   const [updatesStatus, setUpdatesStatus] = useState<LoadStatus>("idle");
   const [updatesError, setUpdatesError] = useState<string | null>(null);
+  const updatesReadGenerationRef = useRef(0);
   const [updateHistory, setUpdateHistory] = useState<UpdateHistoryItem[]>([]);
   const [updateHistoryStatus, setUpdateHistoryStatus] =
     useState<LoadStatus>("idle");
   const [updateHistoryError, setUpdateHistoryError] = useState<string | null>(
     null,
   );
+  const updateHistoryReadGenerationRef = useRef(0);
   const [ignoredUpdates, setIgnoredUpdates] = useState<ImageUpdate[]>([]);
   const [ignoredUpdatesStatus, setIgnoredUpdatesStatus] =
     useState<LoadStatus>("idle");
   const [ignoredUpdatesError, setIgnoredUpdatesError] = useState<string | null>(
     null,
   );
+  const ignoredUpdatesReadGenerationRef = useRef(0);
   const [updatesTab, setUpdatesTab] = useState<UpdatesTabID>("current");
   const [updateFilter, setUpdateFilter] = useState<FilterID>("all");
   const [lastUpdateCheckAt, setLastUpdateCheckAt] = useState<number | null>(
     null,
   );
   const [updateCheckJobID, setUpdateCheckJobID] = useState<string | null>(null);
+  const updateCheckRequestGenerationRef = useRef(0);
+  const updateCheckOperationRef = useRef<UpdateCheckOperation | null>(null);
+  const updateCheckJobScopesRef = useRef(new Map<string, number>());
+  const invalidatedUpdateCheckJobIDsRef = useRef(new BoundedJobTombstones());
+  const pendingUpdateCheckEventsRef = useRef(
+    new Map<string, BufferedUpdateCheckEvents>(),
+  );
   const [updateCheckProgress, setUpdateCheckProgress] =
     useState<UpdateProgressEntry | null>(null);
   const updateCheckCompletionTimerRef = useRef<number | null>(null);
   const [updatePlan, setUpdatePlan] =
     useState<UpdatePlanState>(emptyUpdatePlan);
+  const updatePlanRequestGenerationRef = useRef(0);
   const [ignoreUpdate, setIgnoreUpdate] =
     useState<IgnoreUpdateState>(emptyIgnoreUpdate);
+  const ignoreUpdateRequestGenerationRef = useRef(0);
   const [projectLineage, setProjectLineage] = useState<
     Record<string, ImageLineage[]>
   >({});
   const [projectLineageStatus, setProjectLineageStatus] = useState<
     Record<string, LoadStatus>
   >({});
+  const projectLineageRequestGenerationsRef = useRef(new Map<string, number>());
+  const projectJobScopesRef = useRef(new Map<string, number>());
+  const invalidatedProjectJobIDsRef = useRef(new BoundedJobTombstones());
+  const pendingProjectJobEventsRef = useRef(
+    new Map<string, BufferedProjectJobEvent>(),
+  );
   const [createNetwork, setCreateNetwork] =
     useState<CreateNetworkState>(emptyCreateNetwork);
   const [importProject, setImportProject] = useState<ImportProjectState>(
@@ -1403,6 +1673,24 @@ function App() {
   useEffect(() => {
     importProjectOpenRef.current = importProject.open;
   }, [importProject.open]);
+
+  useEffect(() => {
+    const projectIDs = new Set(projects.map((project) => project.id));
+    for (const projectID of projectLineageRequestGenerationsRef.current.keys()) {
+      if (!projectIDs.has(projectID)) {
+        projectLineageRequestGenerationsRef.current.delete(projectID);
+      }
+    }
+    setProjectLineage((current) =>
+      reconcileProjectLineageRecords(current, projects),
+    );
+    setProjectLineageStatus((current) =>
+      reconcileProjectLineageRecords(current, projects),
+    );
+    setProjectCommandOutputs((current) =>
+      reconcileProjectCommandOutputs(current, projects),
+    );
+  }, [projects]);
 
   const [providerActionBusy, setProviderActionBusy] = useState(false);
   const [repairOpen, setRepairOpen] = useState(false);
@@ -1544,15 +1832,301 @@ function App() {
     appSettings["general.theme"],
   );
 
-  const navigate = useCallback((page: PageID) => {
-    setActionError(null);
-    setActivePage(page);
-    setActiveContainerID(null);
-    setContainerDetailTab("overview");
-    setActiveNetworkID(null);
-    setNetworkTab("overview");
-    setSearch("");
+  const dockerScopeMatches = useCallback(
+    (scopeGeneration: number) =>
+      dockerScopeGenerationRef.current === scopeGeneration,
+    [],
+  );
+
+  const beginMutationRequest = useCallback(
+    (key: string): ScopedRequestOwner => {
+      const requestGeneration = ++nextDynamicRequestTokenRef.current;
+      mutationRequestGenerationsRef.current.set(key, requestGeneration);
+      return {
+        scopeGeneration: dockerScopeGenerationRef.current,
+        requestGeneration,
+      };
+    },
+    [],
+  );
+
+  const mutationRequestMatches = useCallback(
+    (key: string, owner: ScopedRequestOwner) =>
+      dockerScopeGenerationRef.current === owner.scopeGeneration &&
+      mutationRequestGenerationsRef.current.get(key) ===
+        owner.requestGeneration,
+    [],
+  );
+
+  const invalidateMutationRequest = useCallback((key: string) => {
+    mutationRequestGenerationsRef.current.delete(key);
   }, []);
+
+  const finishMutationRequest = useCallback(
+    (key: string, owner: ScopedRequestOwner) => {
+      if (mutationRequestMatches(key, owner)) {
+        mutationRequestGenerationsRef.current.delete(key);
+      }
+    },
+    [mutationRequestMatches],
+  );
+
+  const beginActionRequest = useCallback((key: string): ScopedRequestOwner => {
+    const requestGeneration = ++nextDynamicRequestTokenRef.current;
+    actionRequestGenerationsRef.current.set(key, requestGeneration);
+    return {
+      scopeGeneration: dockerScopeGenerationRef.current,
+      requestGeneration,
+    };
+  }, []);
+
+  const actionRequestMatches = useCallback(
+    (key: string, owner: ScopedRequestOwner) =>
+      dockerScopeGenerationRef.current === owner.scopeGeneration &&
+      actionRequestGenerationsRef.current.get(key) === owner.requestGeneration,
+    [],
+  );
+
+  const finishActionRequest = useCallback(
+    (key: string, owner: ScopedRequestOwner) => {
+      if (actionRequestMatches(key, owner)) {
+        actionRequestGenerationsRef.current.delete(key);
+      }
+    },
+    [actionRequestMatches],
+  );
+
+  const beginConfirmPlanRequest = useCallback((): ScopedRequestOwner => {
+    const requestGeneration = confirmRequestGenerationRef.current + 1;
+    confirmRequestGenerationRef.current = requestGeneration;
+    return {
+      scopeGeneration: dockerScopeGenerationRef.current,
+      requestGeneration,
+    };
+  }, []);
+
+  const confirmPlanRequestMatches = useCallback(
+    (owner: ScopedRequestOwner) =>
+      dockerScopeGenerationRef.current === owner.scopeGeneration &&
+      confirmRequestGenerationRef.current === owner.requestGeneration,
+    [],
+  );
+
+  const closeConfirm = useCallback(() => {
+    confirmRequestGenerationRef.current += 1;
+    setConfirm(emptyConfirm);
+  }, []);
+
+  useEffect(() => {
+    if (
+      confirm.open &&
+      confirm.volumeEpoch !== undefined &&
+      confirm.volumeEpoch !== volumeEpoch
+    ) {
+      closeConfirm();
+    }
+  }, [closeConfirm, confirm.open, confirm.volumeEpoch, volumeEpoch]);
+
+  const beginInspectRequest = useCallback((): ScopedRequestOwner => {
+    const requestGeneration = inspectRequestGenerationRef.current + 1;
+    inspectRequestGenerationRef.current = requestGeneration;
+    return {
+      scopeGeneration: dockerScopeGenerationRef.current,
+      requestGeneration,
+    };
+  }, []);
+
+  const inspectRequestMatches = useCallback(
+    (owner: ScopedRequestOwner) =>
+      dockerScopeGenerationRef.current === owner.scopeGeneration &&
+      inspectRequestGenerationRef.current === owner.requestGeneration,
+    [],
+  );
+
+  const closeInspect = useCallback(() => {
+    inspectRequestGenerationRef.current += 1;
+    setInspect(emptyInspect);
+  }, []);
+
+  const closeRemoveProject = useCallback(() => {
+    removeProjectRequestGenerationRef.current += 1;
+    setRemoveProject(emptyRemoveProject);
+  }, []);
+
+  const closeRunImage = useCallback(() => {
+    runImageRequestGenerationRef.current += 1;
+    setRunImage(emptyRunImage);
+  }, []);
+
+  const closePushImage = useCallback(() => {
+    pushImageRequestGenerationRef.current += 1;
+    pendingPushProgressRef.current.clear();
+    setPushImage(emptyPushImage);
+  }, []);
+
+  const closeBackupVolume = useCallback(() => {
+    backupVolumeRequestGenerationRef.current += 1;
+    setBackupVolume(emptyBackupVolume);
+  }, []);
+
+  const updateActiveNetworkID = useCallback((networkID: string | null) => {
+    activeNetworkIDRef.current = networkID;
+    networkDetailRequestGenerationRef.current += 1;
+    setNetworkDetailLoadingID(null);
+    setActiveNetworkID(networkID);
+  }, []);
+
+  const refreshInventoryScope = useCallback(
+    (options: { preserveProviderSetup?: boolean } = {}) => {
+      // Reject any late event from the old metrics stream before scoped Docker
+      // data is cleared. The connection transition also tears the stream down.
+      dockerScopeGenerationRef.current += 1;
+      confirmRequestGenerationRef.current += 1;
+      inspectRequestGenerationRef.current += 1;
+      removeProjectRequestGenerationRef.current += 1;
+      runImageRequestGenerationRef.current += 1;
+      pushImageRequestGenerationRef.current += 1;
+      pendingPushProgressRef.current.clear();
+      backupVolumeRequestGenerationRef.current += 1;
+      providerActionRequestGenerationRef.current += 1;
+      actionRequestGenerationsRef.current.clear();
+      mutationRequestGenerationsRef.current.clear();
+      const projectDetailGeneration = projectDetailGenerationRef.current + 1;
+      projectDetailGenerationRef.current = projectDetailGeneration;
+      projectLineageRequestGenerationsRef.current.clear();
+      updatePlanRequestGenerationRef.current += 1;
+      ignoreUpdateRequestGenerationRef.current += 1;
+      updateCheckRequestGenerationRef.current += 1;
+      updateCheckOperationRef.current = null;
+      for (const jobID of updateCheckJobScopesRef.current.keys()) {
+        invalidatedUpdateCheckJobIDsRef.current.add(jobID);
+      }
+      for (const jobID of pendingUpdateCheckEventsRef.current.keys()) {
+        invalidatedUpdateCheckJobIDsRef.current.add(jobID);
+      }
+      updateCheckJobScopesRef.current.clear();
+      pendingUpdateCheckEventsRef.current.clear();
+      for (const jobID of projectJobScopesRef.current.keys()) {
+        invalidatedProjectJobIDsRef.current.add(jobID);
+      }
+      for (const jobID of pendingProjectJobEventsRef.current.keys()) {
+        invalidatedProjectJobIDsRef.current.add(jobID);
+      }
+      projectJobScopesRef.current.clear();
+      pendingProjectJobEventsRef.current.clear();
+      if (updateCheckCompletionTimerRef.current !== null) {
+        window.clearTimeout(updateCheckCompletionTimerRef.current);
+        updateCheckCompletionTimerRef.current = null;
+      }
+      statsStreamIDRef.current = null;
+      lastProjectStatsFrameAtRef.current = 0;
+      latestSamplesRef.current = {};
+      setStatsStreamError(null);
+      setLatestSamples({});
+      setContainerSparks({});
+      setProjectSparks({});
+      setProjectMetricSparks(emptyProjectMetricSparks());
+      setChartPoints([]);
+      setLiveGPU(null);
+      setProjects([]);
+      setProjectsStatus("idle");
+      setProjectsError(null);
+      setActiveProjectID(null);
+      setProjectDetailState({
+        requestedID: null,
+        generation: projectDetailGeneration,
+        status: "idle",
+        data: null,
+        error: null,
+      });
+      setProjectCommandOutputs({});
+      setProjectTab("overview");
+      setBackups([]);
+      setBackupsStatus("idle");
+      setBackupsError(null);
+      setUpdates([]);
+      setUpdatesStatus("idle");
+      setUpdatesError(null);
+      setIgnoredUpdates([]);
+      setIgnoredUpdatesStatus("idle");
+      setIgnoredUpdatesError(null);
+      setUpdateHistory([]);
+      setUpdateHistoryStatus("idle");
+      setUpdateHistoryError(null);
+      setLastUpdateCheckAt(null);
+      setUpdateCheckJobID(null);
+      setUpdateCheckProgress(null);
+      setUpdatePlan(emptyUpdatePlan);
+      setIgnoreUpdate(emptyIgnoreUpdate);
+      setProjectLineage({});
+      setProjectLineageStatus({});
+      beginImportProjectSession();
+      setInspect(emptyInspect);
+      setActiveContainerID(null);
+      setActiveContainerFallback(null);
+      setContainerDetailTab("overview");
+      updateActiveNetworkID(null);
+      setNetworkTab("overview");
+      setSelectedContainerIDs(new Set<string>());
+      setBusyActionIDs(new Set<string>());
+      setTerminalInitialSession(null);
+      setQueuedTerminalCommand(null);
+      setProviderActionBusy(false);
+      if (!options.preserveProviderSetup) {
+        providerInstallSessionRef.current = null;
+        providerSetupIdentityRef.current = {
+          open: false,
+          sessionID: "",
+          backend: emptyProviderSetup.backend,
+          busy: false,
+        };
+        window.localStorage.removeItem(providerSetupStorageKey);
+        setSetup(emptyProviderSetup);
+        setRepairOpen(false);
+      }
+      setConfirm(emptyConfirm);
+      setRemoveProject(emptyRemoveProject);
+      setRename(emptyRename);
+      setRunImage(emptyRunImage);
+      setPullImage(emptyPullImage);
+      setTagImage(emptyTagImage);
+      setPushImage(emptyPushImage);
+      setSaveImage(emptySaveImage);
+      setLoadImage(emptyLoadImage);
+      registryAccountsReadGenerationRef.current += 1;
+      setRegistryAccounts([]);
+      setRegistryAccountsStatus("idle");
+      setRegistryAccountsError(null);
+      setRegistryStatuses({});
+      setRegistryLogin(emptyRegistryLogin);
+      setRegistryBusyKeys(new Set<string>());
+      setCreateVolume(emptyCreateVolume);
+      setBackupVolume(emptyBackupVolume);
+      restoreVolumeRequestRef.current += 1;
+      setRestoreVolume(emptyRestoreVolume);
+      setCreateNetwork(emptyCreateNetwork);
+      setActionError(null);
+      return refreshInventoryScopeStore();
+    },
+    [
+      beginImportProjectSession,
+      refreshInventoryScopeStore,
+      updateActiveNetworkID,
+    ],
+  );
+
+  const navigate = useCallback(
+    (page: PageID) => {
+      setActionError(null);
+      setActivePage(page);
+      setActiveContainerID(null);
+      setContainerDetailTab("overview");
+      updateActiveNetworkID(null);
+      setNetworkTab("overview");
+      setSearch("");
+    },
+    [updateActiveNetworkID],
+  );
 
   useEffect(() => {
     window.localStorage.setItem(
@@ -1637,10 +2211,19 @@ function App() {
   );
 
   const refreshProjects = useCallback(async () => {
+    const scopeGeneration = dockerScopeGenerationRef.current;
+    const requestGeneration = projectsReadGenerationRef.current + 1;
+    projectsReadGenerationRef.current = requestGeneration;
     setProjectsStatus("loading");
     setProjectsError(null);
     try {
       const nextProjects = await ProjectService.RefreshProjects();
+      if (
+        dockerScopeGenerationRef.current !== scopeGeneration ||
+        projectsReadGenerationRef.current !== requestGeneration
+      ) {
+        return;
+      }
       setProjects(
         applyStatsSamplesToProjects(
           nextProjects ?? [],
@@ -1649,6 +2232,12 @@ function App() {
       );
       setProjectsStatus("ready");
     } catch (error: unknown) {
+      if (
+        dockerScopeGenerationRef.current !== scopeGeneration ||
+        projectsReadGenerationRef.current !== requestGeneration
+      ) {
+        return;
+      }
       setProjectsError(
         error instanceof Error ? error.message : "Unable to refresh projects",
       );
@@ -1657,6 +2246,7 @@ function App() {
   }, []);
 
   const refreshProjectDetail = useCallback(async (projectID: string) => {
+    const scopeGeneration = dockerScopeGenerationRef.current;
     const generation = projectDetailGenerationRef.current + 1;
     projectDetailGenerationRef.current = generation;
     setProjectDetailState({
@@ -1675,7 +2265,9 @@ function App() {
         throw new Error("Project detail did not match the requested project");
       }
       setProjectDetailState((current) =>
-        current.generation === generation && current.requestedID === projectID
+        dockerScopeGenerationRef.current === scopeGeneration &&
+        current.generation === generation &&
+        current.requestedID === projectID
           ? {
               ...current,
               status: "ready",
@@ -1688,7 +2280,9 @@ function App() {
       );
     } catch (error: unknown) {
       setProjectDetailState((current) =>
-        current.generation === generation && current.requestedID === projectID
+        dockerScopeGenerationRef.current === scopeGeneration &&
+        current.generation === generation &&
+        current.requestedID === projectID
           ? {
               ...current,
               status: "error",
@@ -1704,13 +2298,28 @@ function App() {
   }, []);
 
   const refreshBackups = useCallback(async () => {
+    const scopeGeneration = dockerScopeGenerationRef.current;
+    const requestGeneration = backupsReadGenerationRef.current + 1;
+    backupsReadGenerationRef.current = requestGeneration;
     setBackupsStatus("loading");
     setBackupsError(null);
     try {
       const nextBackups = await BackupService.ListBackups({ limit: 500 });
+      if (
+        dockerScopeGenerationRef.current !== scopeGeneration ||
+        backupsReadGenerationRef.current !== requestGeneration
+      ) {
+        return;
+      }
       setBackups(nextBackups ?? []);
       setBackupsStatus("ready");
     } catch (error: unknown) {
+      if (
+        dockerScopeGenerationRef.current !== scopeGeneration ||
+        backupsReadGenerationRef.current !== requestGeneration
+      ) {
+        return;
+      }
       setBackupsError(
         error instanceof Error ? error.message : "Unable to load backups",
       );
@@ -1719,13 +2328,28 @@ function App() {
   }, []);
 
   const refreshUpdates = useCallback(async () => {
+    const scopeGeneration = dockerScopeGenerationRef.current;
+    const requestGeneration = updatesReadGenerationRef.current + 1;
+    updatesReadGenerationRef.current = requestGeneration;
     setUpdatesStatus("loading");
     setUpdatesError(null);
     try {
       const nextUpdates = await UpdateService.ListCurrentUpdates({});
+      if (
+        dockerScopeGenerationRef.current !== scopeGeneration ||
+        updatesReadGenerationRef.current !== requestGeneration
+      ) {
+        return;
+      }
       setUpdates(nextUpdates ?? []);
       setUpdatesStatus("ready");
     } catch (error: unknown) {
+      if (
+        dockerScopeGenerationRef.current !== scopeGeneration ||
+        updatesReadGenerationRef.current !== requestGeneration
+      ) {
+        return;
+      }
       if (isProviderReadinessError(error)) {
         setUpdatesStatus("ready");
         return;
@@ -1738,15 +2362,30 @@ function App() {
   }, []);
 
   const refreshIgnoredUpdates = useCallback(async () => {
+    const scopeGeneration = dockerScopeGenerationRef.current;
+    const requestGeneration = ignoredUpdatesReadGenerationRef.current + 1;
+    ignoredUpdatesReadGenerationRef.current = requestGeneration;
     setIgnoredUpdatesStatus("loading");
     setIgnoredUpdatesError(null);
     try {
       const nextUpdates = await UpdateService.ListCurrentUpdates({
         status: [UpdateStatus.UpdateStatusIgnored],
       });
+      if (
+        dockerScopeGenerationRef.current !== scopeGeneration ||
+        ignoredUpdatesReadGenerationRef.current !== requestGeneration
+      ) {
+        return;
+      }
       setIgnoredUpdates(nextUpdates ?? []);
       setIgnoredUpdatesStatus("ready");
     } catch (error: unknown) {
+      if (
+        dockerScopeGenerationRef.current !== scopeGeneration ||
+        ignoredUpdatesReadGenerationRef.current !== requestGeneration
+      ) {
+        return;
+      }
       if (isProviderReadinessError(error)) {
         setIgnoredUpdatesStatus("ready");
         return;
@@ -1761,13 +2400,28 @@ function App() {
   }, []);
 
   const refreshUpdateHistory = useCallback(async () => {
+    const scopeGeneration = dockerScopeGenerationRef.current;
+    const requestGeneration = updateHistoryReadGenerationRef.current + 1;
+    updateHistoryReadGenerationRef.current = requestGeneration;
     setUpdateHistoryStatus("loading");
     setUpdateHistoryError(null);
     try {
       const nextHistory = await UpdateService.ListUpdateHistory({ limit: 200 });
+      if (
+        dockerScopeGenerationRef.current !== scopeGeneration ||
+        updateHistoryReadGenerationRef.current !== requestGeneration
+      ) {
+        return;
+      }
       setUpdateHistory(nextHistory ?? []);
       setUpdateHistoryStatus("ready");
     } catch (error: unknown) {
+      if (
+        dockerScopeGenerationRef.current !== scopeGeneration ||
+        updateHistoryReadGenerationRef.current !== requestGeneration
+      ) {
+        return;
+      }
       if (isProviderReadinessError(error)) {
         setUpdateHistoryStatus("ready");
         return;
@@ -1790,23 +2444,51 @@ function App() {
   }, [refreshIgnoredUpdates, refreshUpdateHistory, refreshUpdates]);
 
   const refreshProjectLineage = useCallback(async (projectID: string) => {
-    setProjectLineageStatus((current) => ({
-      ...current,
-      [projectID]: "loading",
-    }));
+    const scopeGeneration = dockerScopeGenerationRef.current;
+    const requestGeneration = ++nextDynamicRequestTokenRef.current;
+    projectLineageRequestGenerationsRef.current.set(
+      projectID,
+      requestGeneration,
+    );
+    setProjectLineageStatus((current) =>
+      upsertBoundedProjectLineageRecord(current, projectID, "loading"),
+    );
     try {
       const rows = await ImageLineageService.GetProjectLineage(projectID);
-      setProjectLineage((current) => ({ ...current, [projectID]: rows ?? [] }));
-      setProjectLineageStatus((current) => ({
-        ...current,
-        [projectID]: "ready",
-      }));
+      if (
+        dockerScopeGenerationRef.current !== scopeGeneration ||
+        projectLineageRequestGenerationsRef.current.get(projectID) !==
+          requestGeneration
+      ) {
+        return;
+      }
+      setProjectLineage((current) =>
+        upsertBoundedProjectLineageRecord(current, projectID, rows ?? []),
+      );
+      setProjectLineageStatus((current) =>
+        upsertBoundedProjectLineageRecord(current, projectID, "ready"),
+      );
     } catch {
-      setProjectLineage((current) => ({ ...current, [projectID]: [] }));
-      setProjectLineageStatus((current) => ({
-        ...current,
-        [projectID]: "error",
-      }));
+      if (
+        dockerScopeGenerationRef.current !== scopeGeneration ||
+        projectLineageRequestGenerationsRef.current.get(projectID) !==
+          requestGeneration
+      ) {
+        return;
+      }
+      setProjectLineage((current) =>
+        upsertBoundedProjectLineageRecord(current, projectID, []),
+      );
+      setProjectLineageStatus((current) =>
+        upsertBoundedProjectLineageRecord(current, projectID, "error"),
+      );
+    } finally {
+      if (
+        projectLineageRequestGenerationsRef.current.get(projectID) ===
+        requestGeneration
+      ) {
+        projectLineageRequestGenerationsRef.current.delete(projectID);
+      }
     }
   }, []);
 
@@ -1970,7 +2652,11 @@ function App() {
           error: current.error,
           progress: alreadyRecorded
             ? current.progress
-            : current.progress.concat(payload),
+            : appendBoundedEntry(
+                current.progress,
+                payload,
+                maxProviderInstallProgressEntries,
+              ),
         };
       });
 
@@ -2021,13 +2707,13 @@ function App() {
           providerSetupIdentityRef.current.sessionID === session.sessionID &&
           providerSetupIdentityRef.current.backend === session.backend
         ) {
-          void refreshInventory();
+          void refreshInventoryScope({ preserveProviderSetup: true });
           void refreshProjects();
         }
       }
     });
     return () => off();
-  }, [refreshInventory, refreshProjects]);
+  }, [refreshInventoryScope, refreshProjects]);
 
   const updateNotifications = useCallback(
     (update: (current: Notification[]) => Notification[]) => {
@@ -2068,8 +2754,9 @@ function App() {
     setNotificationsReadLoading(true);
     setNotificationsReadError(null);
     try {
-      const nextNotifications =
-        (await SettingsService.GetNotifications(false)) ?? [];
+      const nextNotifications = (
+        (await SettingsService.GetNotifications(false)) ?? []
+      ).slice(0, maxLiveNotifications);
       if (readGeneration !== notificationReadGenerationRef.current) {
         return;
       }
@@ -2180,10 +2867,14 @@ function App() {
         notificationReadOverridesRef.current.has(notification.id)
           ? { ...notification, read: true }
           : notification;
-      updateNotifications((current) => [
+      const nextNotifications = [
         effectiveNotification,
-        ...current.filter((item) => item.id !== notification.id),
-      ]);
+        ...notificationsRef.current.filter(
+          (item) => item.id !== notification.id,
+        ),
+      ].slice(0, maxLiveNotifications);
+      updateNotifications(() => nextNotifications);
+      pruneNotificationReadTracking(nextNotifications);
       scheduleNotificationEventRefresh();
     });
     return () => {
@@ -2194,7 +2885,11 @@ function App() {
         notificationEventRefreshTimerRef.current = null;
       }
     };
-  }, [scheduleNotificationEventRefresh, updateNotifications]);
+  }, [
+    pruneNotificationReadTracking,
+    scheduleNotificationEventRefresh,
+    updateNotifications,
+  ]);
 
   const markAllNotificationsRead = useCallback(async () => {
     const mutationGeneration = ++notificationMutationGenerationRef.current;
@@ -2564,54 +3259,55 @@ function App() {
     500,
     refreshRuntimeSurfacesForObjects,
   );
-  const handleProviderChanged = useCallback(() => {
-    // A provider rebind tears down the old health loop without emitting a
-    // terminal docker event, so reset the heartbeat. Otherwise a stale
-    // "reconnecting"/"disconnected" banner from the previous provider could
-    // linger and mislabel the new provider's state.
-    setInventoryConnection("connecting");
-    refreshRuntimeSurfaces();
-  }, [refreshRuntimeSurfaces, setInventoryConnection]);
-  useDebouncedRuntimeEvent("provider:changed", 250, handleProviderChanged);
-
-  // Track the Docker engine heartbeat from the backend. The health loop only
-  // emits "disconnected" after its grace period, so these events let the UI
-  // show a calm "reconnecting" state for transient blips instead of an error.
   useEffect(() => {
-    const offConnected = Events.On("docker:connected", () => {
-      setInventoryConnection("connected");
-      void refreshInventory();
-    });
-    const offReconnecting = Events.On("docker:reconnecting", () => {
-      setInventoryConnection("reconnecting");
-    });
-    const offDisconnected = Events.On("docker:disconnected", () => {
-      setInventoryConnection("disconnected");
+    let ancillaryRefreshTimer: number | null = null;
+    const off = Events.On("provider:changed", () => {
+      // The backend has already rebound by the time this event arrives. Clear
+      // the old scope synchronously so its resources cannot remain actionable
+      // during the debounce window. Fresh inventory requests coalesce and
+      // trail in flight work in the store.
+      void refreshInventoryScope();
+
+      if (ancillaryRefreshTimer !== null) {
+        window.clearTimeout(ancillaryRefreshTimer);
+      }
+      ancillaryRefreshTimer = window.setTimeout(() => {
+        ancillaryRefreshTimer = null;
+        void refreshProjects();
+        void refreshBackups();
+        void refreshUpdateSurfaces();
+        setDashboardRefreshToken((current) => current + 1);
+      }, 250);
     });
     return () => {
-      offConnected();
-      offReconnecting();
-      offDisconnected();
+      off();
+      if (ancillaryRefreshTimer !== null) {
+        window.clearTimeout(ancillaryRefreshTimer);
+      }
     };
-  }, [refreshInventory, setInventoryConnection]);
+  }, [
+    refreshBackups,
+    refreshInventoryScope,
+    refreshProjects,
+    refreshUpdateSurfaces,
+  ]);
 
-  useEffect(() => {
-    const offCheck = Events.On("updates:check:progress", (event) => {
-      const payload = eventPayload<
-        UpdateProgressEntry & {
-          done?: number;
-          total?: number;
-          current?: string;
-        }
-      >(event);
-      if (!payload) {
+  const applyOwnedUpdateCheckProgress = useCallback(
+    (payload: UpdateCheckProgressPayload) => {
+      const operation = updateCheckOperationRef.current;
+      if (
+        !payload.jobID ||
+        !operation ||
+        operation.jobID !== payload.jobID ||
+        operation.scopeGeneration !== dockerScopeGenerationRef.current
+      ) {
         return;
       }
       if (updateCheckCompletionTimerRef.current !== null) {
         window.clearTimeout(updateCheckCompletionTimerRef.current);
         updateCheckCompletionTimerRef.current = null;
       }
-      setUpdateCheckJobID(payload.jobID ?? null);
+      setUpdateCheckJobID(payload.jobID);
       setUpdateCheckProgress({
         jobID: payload.jobID,
         phase: "check",
@@ -2631,6 +3327,9 @@ function App() {
         payload.done >= payload.total
       ) {
         const completedJobID = payload.jobID;
+        updateCheckOperationRef.current = null;
+        updateCheckJobScopesRef.current.delete(completedJobID);
+        invalidatedUpdateCheckJobIDsRef.current.add(completedJobID);
         setUpdateCheckJobID(null);
         setLastUpdateCheckAt(Date.now());
         updateCheckCompletionTimerRef.current = window.setTimeout(() => {
@@ -2641,6 +3340,181 @@ function App() {
         }, 1200);
         void refreshUpdateSurfaces();
       }
+    },
+    [refreshUpdateSurfaces],
+  );
+
+  const registerUpdateCheckJobOwnership = useCallback(
+    (jobID: string, scopeGeneration: number) => {
+      if (invalidatedUpdateCheckJobIDsRef.current.has(jobID)) {
+        pendingUpdateCheckEventsRef.current.delete(jobID);
+        return false;
+      }
+      if (dockerScopeGenerationRef.current !== scopeGeneration) {
+        invalidatedUpdateCheckJobIDsRef.current.add(jobID);
+        pendingUpdateCheckEventsRef.current.delete(jobID);
+        return false;
+      }
+      claimBoundedJobOwnership(
+        updateCheckJobScopesRef.current,
+        jobID,
+        scopeGeneration,
+        invalidatedUpdateCheckJobIDsRef.current,
+      );
+      const pending = pendingUpdateCheckEventsRef.current.get(jobID);
+      pendingUpdateCheckEventsRef.current.delete(jobID);
+      if (pending) {
+        for (const payload of pending.progress) {
+          applyOwnedUpdateCheckProgress(payload);
+        }
+        if (pending.terminal) {
+          applyOwnedUpdateCheckProgress(pending.terminal);
+        }
+      }
+      return true;
+    },
+    [applyOwnedUpdateCheckProgress],
+  );
+
+  const applyOwnedProjectJobEvent = useCallback(
+    (payload: ProjectJobEvent, done: boolean) => {
+      if (payload.projectID) {
+        setProjectCommandOutputs((current) =>
+          done
+            ? appendProjectCommandDone(current, payload)
+            : appendProjectCommandProgress(current, payload),
+        );
+      }
+      setImportProject((current) =>
+        done
+          ? appendImportProjectDoneFromJob(current, payload)
+          : appendImportProjectProgressFromJob(current, payload),
+      );
+      setUpdatePlan((current) => {
+        if (!current.jobID || current.jobID !== payload.jobID) {
+          return current;
+        }
+        if (!done) {
+          return {
+            ...current,
+            progress: appendBoundedEntry(
+              current.progress,
+              payload,
+              maxUpdatePlanProgressEntries,
+            ),
+          };
+        }
+        const result = payload.result ?? payload.message ?? "done";
+        return {
+          ...current,
+          jobID: undefined,
+          applying: false,
+          busy: false,
+          result,
+          error: payload.error,
+          progress: appendBoundedEntry(
+            current.progress,
+            payload,
+            maxUpdatePlanProgressEntries,
+          ),
+        };
+      });
+      if (!done) {
+        return;
+      }
+      void refreshUpdateSurfaces();
+      void refreshProjects();
+      if (activeProjectID) {
+        void refreshProjectDetail(activeProjectID);
+        void refreshProjectLineage(activeProjectID);
+      }
+    },
+    [
+      activeProjectID,
+      refreshProjectDetail,
+      refreshProjectLineage,
+      refreshProjects,
+      refreshUpdateSurfaces,
+    ],
+  );
+
+  const registerProjectJobOwnership = useCallback(
+    (jobID: string, scopeGeneration: number) => {
+      if (invalidatedProjectJobIDsRef.current.has(jobID)) {
+        pendingProjectJobEventsRef.current.delete(jobID);
+        return false;
+      }
+      if (dockerScopeGenerationRef.current !== scopeGeneration) {
+        invalidatedProjectJobIDsRef.current.add(jobID);
+        pendingProjectJobEventsRef.current.delete(jobID);
+        return false;
+      }
+      claimBoundedJobOwnership(
+        projectJobScopesRef.current,
+        jobID,
+        scopeGeneration,
+        invalidatedProjectJobIDsRef.current,
+      );
+      const pending = pendingProjectJobEventsRef.current.get(jobID);
+      pendingProjectJobEventsRef.current.delete(jobID);
+      if (pending) {
+        for (const payload of pending.progress) {
+          applyOwnedProjectJobEvent(payload, false);
+        }
+        if (pending.terminal) {
+          applyOwnedProjectJobEvent(pending.terminal, true);
+          projectJobScopesRef.current.delete(jobID);
+          invalidatedProjectJobIDsRef.current.add(jobID);
+        }
+      }
+      return true;
+    },
+    [applyOwnedProjectJobEvent],
+  );
+
+  // Track the Docker engine heartbeat from the backend. The health loop only
+  // emits "disconnected" after its grace period, so these events let the UI
+  // show a calm "reconnecting" state for transient blips instead of an error.
+  useEffect(() => {
+    const offConnected = Events.On("docker:connected", () => {
+      setInventoryConnection("connected");
+      void refreshInventoryFresh();
+    });
+    const offReconnecting = Events.On("docker:reconnecting", () => {
+      setInventoryConnection("reconnecting");
+    });
+    const offDisconnected = Events.On("docker:disconnected", () => {
+      setInventoryConnection("disconnected");
+    });
+    return () => {
+      offConnected();
+      offReconnecting();
+      offDisconnected();
+    };
+  }, [refreshInventoryFresh, setInventoryConnection]);
+
+  useEffect(() => {
+    const offCheck = Events.On("updates:check:progress", (event) => {
+      const payload = eventPayload<UpdateCheckProgressPayload>(event);
+      if (
+        !payload?.jobID ||
+        invalidatedUpdateCheckJobIDsRef.current.has(payload.jobID)
+      ) {
+        return;
+      }
+      const knownScope = updateCheckJobScopesRef.current.get(payload.jobID);
+      if (typeof knownScope !== "number") {
+        bufferPendingUpdateCheckEvent(
+          pendingUpdateCheckEventsRef.current,
+          invalidatedUpdateCheckJobIDsRef.current,
+          payload,
+        );
+        return;
+      }
+      if (knownScope !== dockerScopeGenerationRef.current) {
+        return;
+      }
+      applyOwnedUpdateCheckProgress(payload);
     });
     const offApplied = Events.On("updates:applied", () => {
       void refreshUpdateSurfaces();
@@ -2655,57 +3529,48 @@ function App() {
       if (!payload?.jobID) {
         return;
       }
-      if (payload.projectID) {
-        setProjectCommandOutputs((current) =>
-          appendProjectCommandProgress(current, payload),
-        );
+      if (invalidatedProjectJobIDsRef.current.has(payload.jobID)) {
+        return;
       }
-      setImportProject((current) =>
-        appendImportProjectProgressFromJob(current, payload),
-      );
-      setUpdatePlan((current) => {
-        if (!current.jobID || current.jobID !== payload.jobID) {
-          return current;
-        }
-        return {
-          ...current,
-          progress: current.progress.concat(payload),
-        };
-      });
+      const knownScope = projectJobScopesRef.current.get(payload.jobID);
+      if (typeof knownScope !== "number") {
+        bufferPendingProjectJobEvent(
+          pendingProjectJobEventsRef.current,
+          invalidatedProjectJobIDsRef.current,
+          payload,
+          false,
+        );
+        return;
+      }
+      if (knownScope !== dockerScopeGenerationRef.current) {
+        return;
+      }
+      applyOwnedProjectJobEvent(payload, false);
     });
     const offJobDone = Events.On("job:done", (event) => {
       const payload = eventPayload<ProjectJobEvent>(event);
       if (!payload?.jobID) {
         return;
       }
-      if (payload.projectID) {
-        setProjectCommandOutputs((current) =>
-          appendProjectCommandDone(current, payload),
+      if (invalidatedProjectJobIDsRef.current.has(payload.jobID)) {
+        return;
+      }
+      const knownScope = projectJobScopesRef.current.get(payload.jobID);
+      if (typeof knownScope !== "number") {
+        bufferPendingProjectJobEvent(
+          pendingProjectJobEventsRef.current,
+          invalidatedProjectJobIDsRef.current,
+          payload,
+          true,
         );
+        return;
       }
-      setImportProject((current) =>
-        appendImportProjectDoneFromJob(current, payload),
-      );
-      setUpdatePlan((current) => {
-        if (!current.jobID || current.jobID !== payload.jobID) {
-          return current;
-        }
-        const result = payload.result ?? payload.message ?? "done";
-        return {
-          ...current,
-          applying: false,
-          busy: false,
-          result,
-          error: payload.error,
-          progress: current.progress.concat(payload),
-        };
-      });
-      void refreshUpdateSurfaces();
-      void refreshProjects();
-      if (activeProjectID) {
-        void refreshProjectDetail(activeProjectID);
-        void refreshProjectLineage(activeProjectID);
+      if (knownScope !== dockerScopeGenerationRef.current) {
+        return;
       }
+      applyOwnedProjectJobEvent(payload, true);
+      projectJobScopesRef.current.delete(payload.jobID);
+      invalidatedProjectJobIDsRef.current.add(payload.jobID);
     });
     return () => {
       offCheck();
@@ -2715,6 +3580,8 @@ function App() {
     };
   }, [
     activeProjectID,
+    applyOwnedProjectJobEvent,
+    applyOwnedUpdateCheckProgress,
     refreshProjectDetail,
     refreshProjectLineage,
     refreshProjects,
@@ -2797,15 +3664,34 @@ function App() {
         return;
       }
       setPushImage((current) => {
-        if (current.streamID && current.streamID !== payload.streamID) {
+        if (!current.streamID && current.busy) {
+          if (
+            !pendingPushProgressRef.current.has(payload.streamID) &&
+            pendingPushProgressRef.current.size >= 16
+          ) {
+            const oldestStreamID = pendingPushProgressRef.current
+              .keys()
+              .next().value;
+            if (oldestStreamID) {
+              pendingPushProgressRef.current.delete(oldestStreamID);
+            }
+          }
+          const pending = pendingPushProgressRef.current.get(payload.streamID);
+          if (pending) {
+            pending.push(payload);
+            if (pending.length > 100) {
+              pending.shift();
+            }
+          } else {
+            pendingPushProgressRef.current.set(payload.streamID, [payload]);
+          }
           return current;
         }
-        if (!current.streamID && !current.busy) {
+        if (current.streamID !== payload.streamID) {
           return current;
         }
         return {
           ...current,
-          streamID: current.streamID ?? payload.streamID,
           progress: mergeImageProgress(current.progress, payload),
           success: current.success || payload.status === "done",
         };
@@ -2908,10 +3794,22 @@ function App() {
     providerProblems.find((problem) => problem.code === "PERM_SOCKET") ?? null;
   const providerRepairNeeded = providerProblems.length > 0;
   const dockerRunning =
-    !inventoryError &&
+    inventoryConnection === "connected" &&
     Boolean(dockerInfo || dockerVersion || providerStatus?.dockerRunning);
+  const inventoryStale = Object.values(inventorySlices).some(
+    (slice) => slice.stale,
+  );
+  const inventoryLoading = Object.values(inventorySlices).some(
+    (slice) => slice.loading,
+  );
+  const containersLoading = inventorySlices.containers.loading;
+  const imagesLoading = inventorySlices.images.loading;
+  const volumesLoading = inventorySlices.volumes.loading;
+  const networksLoading = inventorySlices.networks.loading;
   const noProviderConfigured =
-    inventoryStatus !== "loading" && providers.length === 0;
+    !inventorySlices.providers.loading &&
+    !inventorySlices.providers.error &&
+    providers.length === 0;
   const dockerStopped =
     Boolean(activeProvider && providerStatus?.installed) &&
     !dockerRunning &&
@@ -2982,12 +3880,7 @@ function App() {
       const sampleMap = statsSamplesByID(samples);
       const allSamples = Object.values(sampleMap);
       latestSamplesRef.current = sampleMap;
-      useInventoryStore.setState((current) => ({
-        containers: applyStatsSamplesToContainers(
-          current.containers,
-          allSamples,
-        ),
-      }));
+      setContainerStats(allSamples);
       setLatestSamples(sampleMap);
       setContainerSparks((current) =>
         appendSparkEntries(
@@ -3031,7 +3924,7 @@ function App() {
       }
     });
     return () => off();
-  }, []);
+  }, [setContainerStats]);
 
   useEffect(() => {
     if (!dockerRunning) {
@@ -3040,6 +3933,13 @@ function App() {
       setStatsStreamError(null);
       latestSamplesRef.current = {};
       setLatestSamples({});
+      const inventory = useInventoryStore.getState();
+      if (
+        inventory.containers.length > 0 ||
+        Object.keys(inventory.containerStats).length > 0
+      ) {
+        setContainerStats([]);
+      }
       setContainerSparks({});
       setProjectSparks({});
       setProjectMetricSparks(emptyProjectMetricSparks());
@@ -3073,7 +3973,7 @@ function App() {
         stopMetricsStreamSafely(activeStreamID);
       }
     };
-  }, [dockerRunning]);
+  }, [dockerRunning, setContainerStats]);
 
   const appUpdateNotification = useMemo<Notification | null>(() => {
     if (!appUpdateNotice || appUpdateNotificationRead) {
@@ -3134,8 +4034,8 @@ function App() {
   }, []);
 
   const refreshAfterAction = useCallback(async () => {
-    await refreshInventory();
-  }, [refreshInventory]);
+    await refreshInventoryFresh();
+  }, [refreshInventoryFresh]);
 
   const changeProjectView = useCallback((view: ProjectViewMode) => {
     setProjectView(view);
@@ -3143,53 +4043,100 @@ function App() {
   }, []);
 
   const retryProviderDetection = useCallback(async () => {
+    const scopeGeneration = dockerScopeGenerationRef.current;
+    const requestGeneration = providerActionRequestGenerationRef.current + 1;
+    providerActionRequestGenerationRef.current = requestGeneration;
+    const requestMatches = () =>
+      dockerScopeGenerationRef.current === scopeGeneration &&
+      providerActionRequestGenerationRef.current === requestGeneration;
     setProviderActionBusy(true);
     setActionError(null);
     try {
       if (activeProvider?.id) {
         await ProviderService.Detect(activeProvider.id);
+        if (!requestMatches()) {
+          return;
+        }
       }
-      await refreshInventory();
+      await refreshInventoryFresh();
+      if (!requestMatches()) {
+        return;
+      }
       await refreshProjects();
     } catch (error: unknown) {
-      setActionError(
-        error instanceof Error ? error.message : "Provider detection failed",
-      );
+      if (requestMatches()) {
+        setActionError(
+          error instanceof Error ? error.message : "Provider detection failed",
+        );
+      }
     } finally {
-      setProviderActionBusy(false);
+      if (requestMatches()) {
+        setProviderActionBusy(false);
+      }
     }
-  }, [activeProvider?.id, refreshInventory, refreshProjects]);
+  }, [activeProvider?.id, refreshInventoryFresh, refreshProjects]);
 
   const startProvider = useCallback(async () => {
     if (!activeProvider?.id) {
       setRepairOpen(true);
       return;
     }
+    const scopeGeneration = dockerScopeGenerationRef.current;
+    const requestGeneration = providerActionRequestGenerationRef.current + 1;
+    providerActionRequestGenerationRef.current = requestGeneration;
+    const requestMatches = () =>
+      dockerScopeGenerationRef.current === scopeGeneration &&
+      providerActionRequestGenerationRef.current === requestGeneration;
     setProviderActionBusy(true);
     setActionError(null);
     try {
       await ProviderService.Start(activeProvider.id);
+      if (!requestMatches()) {
+        return;
+      }
       await ProviderService.Detect(activeProvider.id);
-      await refreshInventory();
+      if (!requestMatches()) {
+        return;
+      }
+      await refreshInventoryFresh();
+      if (!requestMatches()) {
+        return;
+      }
       await refreshProjects();
     } catch (error: unknown) {
-      setActionError(
-        error instanceof Error ? error.message : "Unable to start Docker",
-      );
+      if (requestMatches()) {
+        setActionError(
+          error instanceof Error ? error.message : "Unable to start Docker",
+        );
+      }
     } finally {
-      setProviderActionBusy(false);
+      if (requestMatches()) {
+        setProviderActionBusy(false);
+      }
     }
-  }, [activeProvider?.id, refreshInventory, refreshProjects]);
+  }, [activeProvider?.id, refreshInventoryFresh, refreshProjects]);
 
   const restartProvider = useCallback(async () => {
     if (!activeProvider?.id) {
       setRepairOpen(true);
       return;
     }
+    const confirmOwner = beginConfirmPlanRequest();
+    const requestGeneration = providerActionRequestGenerationRef.current + 1;
+    providerActionRequestGenerationRef.current = requestGeneration;
+    const actionRequestMatches = () =>
+      dockerScopeGenerationRef.current === confirmOwner.scopeGeneration &&
+      providerActionRequestGenerationRef.current === requestGeneration;
     setProviderActionBusy(true);
     setActionError(null);
     try {
       const plan = await ProviderService.PlanRestart(activeProvider.id);
+      if (!confirmPlanRequestMatches(confirmOwner)) {
+        return;
+      }
+      if (!plan) {
+        throw new Error("Provider restart plan was empty");
+      }
       setConfirm({
         ...emptyConfirm,
         open: true,
@@ -3198,18 +4145,31 @@ function App() {
         targetName: activeProvider.name,
       });
     } catch (error: unknown) {
-      setActionError(
-        error instanceof Error
-          ? error.message
-          : "Unable to plan Docker restart",
-      );
+      if (actionRequestMatches() && confirmPlanRequestMatches(confirmOwner)) {
+        setActionError(
+          error instanceof Error
+            ? error.message
+            : "Unable to plan Docker restart",
+        );
+      }
     } finally {
-      setProviderActionBusy(false);
+      if (actionRequestMatches()) {
+        setProviderActionBusy(false);
+      }
     }
-  }, [activeProvider?.id, activeProvider?.name]);
+  }, [
+    activeProvider?.id,
+    activeProvider?.name,
+    beginConfirmPlanRequest,
+    confirmPlanRequestMatches,
+  ]);
 
   const saveSetting = useCallback(
-    async (key: string, value: unknown) => {
+    async (
+      key: string,
+      value: unknown,
+      options: { preserveProviderSetup?: boolean } = {},
+    ) => {
       if (settingsStatusRef.current !== "ready") {
         setSettingsError(
           "Settings must load successfully before changes can be saved.",
@@ -3267,7 +4227,9 @@ function App() {
         try {
           if (context.isLatestForKey() && key === "windows.wsl_distro") {
             await ProviderService.SetActiveProvider(windowsWSLProviderID);
-            await refreshInventory();
+            await refreshInventoryScope({
+              preserveProviderSetup: options.preserveProviderSetup,
+            });
             await refreshProjects();
             await refreshUpdateSurfaces();
           }
@@ -3282,7 +4244,9 @@ function App() {
                 () => null,
               );
             }
-            await refreshInventory();
+            await refreshInventoryScope({
+              preserveProviderSetup: options.preserveProviderSetup,
+            });
             await refreshProjects();
             await refreshUpdateSurfaces();
           }
@@ -3297,7 +4261,9 @@ function App() {
                 () => null,
               );
             }
-            await refreshInventory();
+            await refreshInventoryScope({
+              preserveProviderSetup: options.preserveProviderSetup,
+            });
             await refreshProjects();
             await refreshUpdateSurfaces();
           }
@@ -3335,7 +4301,7 @@ function App() {
     [
       activeProvider?.id,
       pushToast,
-      refreshInventory,
+      refreshInventoryScope,
       refreshProjects,
       refreshSettings,
       refreshUpdateSurfaces,
@@ -3438,15 +4404,40 @@ function App() {
   }, []);
 
   const refreshRegistryAccounts = useCallback(async () => {
+    const scopeGeneration = dockerScopeGenerationRef.current;
+    const requestGeneration = registryAccountsReadGenerationRef.current + 1;
+    registryAccountsReadGenerationRef.current = requestGeneration;
+    const requestMatches = () =>
+      dockerScopeGenerationRef.current === scopeGeneration &&
+      registryAccountsReadGenerationRef.current === requestGeneration;
     setRegistryAccountsStatus((current) =>
       current === "ready" ? current : "loading",
     );
     setRegistryAccountsError(null);
     try {
       const accounts = await RegistryService.ListRegistryAccounts();
-      setRegistryAccounts(accounts ?? []);
+      if (!requestMatches()) {
+        return;
+      }
+      const boundedAccounts = (accounts ?? []).slice(0, maxRegistryAccounts);
+      const activeRegistries = new Set(
+        boundedAccounts.map((account) =>
+          normalizeRegistryHostForUI(account.registry),
+        ),
+      );
+      setRegistryAccounts(boundedAccounts);
+      setRegistryStatuses((current) =>
+        Object.fromEntries(
+          Object.entries(current).filter(([registry]) =>
+            activeRegistries.has(normalizeRegistryHostForUI(registry)),
+          ),
+        ),
+      );
       setRegistryAccountsStatus("ready");
     } catch (error: unknown) {
+      if (!requestMatches()) {
+        return;
+      }
       setRegistryAccounts([]);
       setRegistryAccountsStatus("error");
       setRegistryAccountsError(
@@ -3457,15 +4448,26 @@ function App() {
     }
   }, []);
 
-  const openRegistryLogin = useCallback((registry = "docker.io") => {
-    setRegistryLogin({
-      ...emptyRegistryLogin,
-      open: true,
-      registry: registry.trim() || "docker.io",
-    });
-  }, []);
+  const openRegistryLogin = useCallback(
+    (registry = "docker.io") => {
+      invalidateMutationRequest("registry-login");
+      setRegistryLogin({
+        ...emptyRegistryLogin,
+        open: true,
+        registry: registry.trim() || "docker.io",
+      });
+    },
+    [invalidateMutationRequest],
+  );
+
+  const closeRegistryLogin = useCallback(() => {
+    invalidateMutationRequest("registry-login");
+    setRegistryLogin(emptyRegistryLogin);
+  }, [invalidateMutationRequest]);
 
   const submitRegistryLogin = useCallback(async () => {
+    const requestKey = "registry-login";
+    const owner = beginMutationRequest(requestKey);
     setRegistryLogin((current) => ({
       ...current,
       busy: true,
@@ -3478,17 +4480,33 @@ function App() {
         secret: registryLogin.secret,
         secretKind: registryLogin.secretKind,
       });
-      setRegistryLogin(emptyRegistryLogin);
+      if (!mutationRequestMatches(requestKey, owner)) {
+        return;
+      }
       await refreshRegistryAccounts();
+      if (!mutationRequestMatches(requestKey, owner)) {
+        return;
+      }
+      closeRegistryLogin();
     } catch (error: unknown) {
-      setRegistryLogin((current) => ({
-        ...current,
-        busy: false,
-        error:
-          error instanceof Error ? error.message : "Unable to log in registry",
-      }));
+      if (mutationRequestMatches(requestKey, owner)) {
+        setRegistryLogin((current) => ({
+          ...current,
+          busy: false,
+          error:
+            error instanceof Error
+              ? error.message
+              : "Unable to log in registry",
+        }));
+      }
+    } finally {
+      finishMutationRequest(requestKey, owner);
     }
   }, [
+    beginMutationRequest,
+    closeRegistryLogin,
+    finishMutationRequest,
+    mutationRequestMatches,
     refreshRegistryAccounts,
     registryLogin.registry,
     registryLogin.secret,
@@ -3499,9 +4517,15 @@ function App() {
   const testRegistryAuth = useCallback(
     async (registry: string) => {
       const key = `test:${registry}`;
+      const requestKey = `registry:${registry}`;
+      const owner = beginMutationRequest(requestKey);
+      const requestMatches = () => mutationRequestMatches(requestKey, owner);
       setRegistryBusy(key, true);
       try {
         const status = await RegistryService.TestAuth(registry);
+        if (!requestMatches()) {
+          return;
+        }
         if (status) {
           setRegistryStatuses((current) => ({
             ...current,
@@ -3509,28 +4533,44 @@ function App() {
           }));
         }
       } catch (error: unknown) {
-        setRegistryStatuses((current) => ({
-          ...current,
-          [normalizeRegistryHostForUI(registry)]: {
-            registry,
-            loggedIn: false,
-            error:
-              error instanceof Error ? error.message : "Registry auth failed",
-          },
-        }));
+        if (requestMatches()) {
+          setRegistryStatuses((current) => ({
+            ...current,
+            [normalizeRegistryHostForUI(registry)]: {
+              registry,
+              loggedIn: false,
+              error:
+                error instanceof Error ? error.message : "Registry auth failed",
+            },
+          }));
+        }
       } finally {
+        // Busy ownership belongs to this exact operation, even if a newer
+        // action superseded its authority to publish registry data.
         setRegistryBusy(key, false);
+        finishMutationRequest(requestKey, owner);
       }
     },
-    [setRegistryBusy],
+    [
+      beginMutationRequest,
+      finishMutationRequest,
+      mutationRequestMatches,
+      setRegistryBusy,
+    ],
   );
 
   const logoutRegistry = useCallback(
     async (registry: string) => {
       const key = `logout:${registry}`;
+      const requestKey = `registry:${registry}`;
+      const owner = beginMutationRequest(requestKey);
+      const requestMatches = () => mutationRequestMatches(requestKey, owner);
       setRegistryBusy(key, true);
       try {
         await RegistryService.Logout(registry);
+        if (!requestMatches()) {
+          return;
+        }
         setRegistryStatuses((current) => {
           const next = { ...current };
           delete next[normalizeRegistryHostForUI(registry)];
@@ -3538,14 +4578,25 @@ function App() {
         });
         await refreshRegistryAccounts();
       } catch (error: unknown) {
-        setRegistryAccountsError(
-          error instanceof Error ? error.message : "Unable to log out registry",
-        );
+        if (requestMatches()) {
+          setRegistryAccountsError(
+            error instanceof Error
+              ? error.message
+              : "Unable to log out registry",
+          );
+        }
       } finally {
         setRegistryBusy(key, false);
+        finishMutationRequest(requestKey, owner);
       }
     },
-    [refreshRegistryAccounts, setRegistryBusy],
+    [
+      beginMutationRequest,
+      finishMutationRequest,
+      mutationRequestMatches,
+      refreshRegistryAccounts,
+      setRegistryBusy,
+    ],
   );
 
   const activateDockerContext = useCallback(
@@ -3557,16 +4608,24 @@ function App() {
       setSettingsMessage(null);
       try {
         await ProviderService.SetDockerContext(name);
-        if (settingsFeedbackIntentRef.current === feedbackIntent) {
-          setSettingsMessage(`Using Docker context ${name}`);
-          pushToast({
-            body: `Using Docker context ${name}.`,
-            level: "ok",
-            title: "Docker context saved",
-          });
+        if (settingsFeedbackIntentRef.current !== feedbackIntent) {
+          return;
         }
+        setSettingsMessage(`Using Docker context ${name}`);
+        pushToast({
+          body: `Using Docker context ${name}.`,
+          level: "ok",
+          title: "Docker context saved",
+        });
+        const inventoryRefresh = refreshInventoryScope();
         await refreshDockerContexts();
-        await refreshInventory();
+        if (settingsFeedbackIntentRef.current !== feedbackIntent) {
+          return;
+        }
+        await inventoryRefresh;
+        if (settingsFeedbackIntentRef.current !== feedbackIntent) {
+          return;
+        }
         await refreshProjects();
       } catch (error: unknown) {
         const message =
@@ -3587,7 +4646,7 @@ function App() {
         }
       }
     },
-    [pushToast, refreshDockerContexts, refreshInventory, refreshProjects],
+    [pushToast, refreshDockerContexts, refreshInventoryScope, refreshProjects],
   );
 
   const changeProviderAutostart = useCallback(
@@ -3718,6 +4777,7 @@ function App() {
     const distro = wslDistro.trim() || "Ubuntu";
     const profile = colimaProfile.trim() || "default";
     const sessionID = beginProviderSetupSession(backend);
+    const scopeGeneration = dockerScopeGenerationRef.current;
     setRepairOpen(false);
     setSetup({
       ...emptyProviderSetup,
@@ -3762,6 +4822,9 @@ function App() {
         backend: providerID,
         extra,
       });
+      if (dockerScopeGenerationRef.current !== scopeGeneration) {
+        return;
+      }
       if (!plan) {
         throw new Error("Install plan was empty");
       }
@@ -3778,6 +4841,9 @@ function App() {
           : current,
       );
     } catch (error: unknown) {
+      if (dockerScopeGenerationRef.current !== scopeGeneration) {
+        return;
+      }
       setSetup((current) =>
         current.open &&
         current.sessionID === sessionID &&
@@ -3994,7 +5060,7 @@ function App() {
             }
           : current,
       );
-      await refreshInventory();
+      await refreshInventoryScope({ preserveProviderSetup: true });
     } catch (error: unknown) {
       if (!providerSetupSessionMatches(sessionID, backend)) {
         return;
@@ -4015,7 +5081,7 @@ function App() {
       );
     }
   }, [
-    refreshInventory,
+    refreshInventoryScope,
     providerSetupSessionMatches,
     setup.backend,
     setup.colimaCPU,
@@ -4035,6 +5101,7 @@ function App() {
     }
     const distro = setup.distro.trim() || "Ubuntu";
     const profile = setup.colimaProfile.trim() || "default";
+    const scopeGeneration = dockerScopeGenerationRef.current;
     setSetup((current) =>
       current.open &&
       current.sessionID === sessionID &&
@@ -4070,6 +5137,9 @@ function App() {
         backend: providerID,
         extra,
       });
+      if (dockerScopeGenerationRef.current !== scopeGeneration) {
+        return;
+      }
       if (!plan) {
         throw new Error("Install plan was empty");
       }
@@ -4086,6 +5156,9 @@ function App() {
           : current,
       );
     } catch (error: unknown) {
+      if (dockerScopeGenerationRef.current !== scopeGeneration) {
+        return;
+      }
       setSetup((current) =>
         current.open &&
         current.sessionID === sessionID &&
@@ -4119,6 +5192,7 @@ function App() {
     const sessionID = setup.sessionID;
     const planID = setup.plan.planID;
     const backend = setup.backend;
+    const scopeGeneration = dockerScopeGenerationRef.current;
     providerInstallSessionRef.current = { sessionID, planID, backend };
     setSetup((current) =>
       current.open &&
@@ -4145,6 +5219,9 @@ function App() {
     );
     try {
       const handle = await ProviderService.ApplyInstall(planID);
+      if (dockerScopeGenerationRef.current !== scopeGeneration) {
+        return;
+      }
       const currentSession = providerInstallSessionRef.current;
       if (
         currentSession?.sessionID === sessionID &&
@@ -4194,6 +5271,13 @@ function App() {
   const detectSetupProjects = useCallback(async () => {
     const sessionID = setup.sessionID;
     const backend = setup.backend;
+    const scopeGeneration = dockerScopeGenerationRef.current;
+    const requestGeneration = projectsReadGenerationRef.current + 1;
+    projectsReadGenerationRef.current = requestGeneration;
+    const ownsRequest = () =>
+      dockerScopeGenerationRef.current === scopeGeneration &&
+      projectsReadGenerationRef.current === requestGeneration &&
+      providerSetupSessionMatches(sessionID, backend);
     setSetup((current) =>
       current.open &&
       current.sessionID === sessionID &&
@@ -4213,15 +5297,16 @@ function App() {
         detected,
         Object.values(latestSamplesRef.current),
       );
-      if (!providerSetupSessionMatches(sessionID, backend)) {
+      const setupDetected = liveDetected.slice(-maxProviderSetupProjects);
+      if (!ownsRequest()) {
         return;
       }
       setProjects(liveDetected);
-      if (!providerSetupSessionMatches(sessionID, backend)) {
+      if (!ownsRequest()) {
         return;
       }
       setProjectsError(null);
-      if (!providerSetupSessionMatches(sessionID, backend)) {
+      if (!ownsRequest()) {
         return;
       }
       setProjectsStatus("ready");
@@ -4231,20 +5316,20 @@ function App() {
         current.backend === backend
           ? {
               ...current,
-              detectedProjects: liveDetected,
-              selectedProjectIDs: liveDetected.map((project) => project.id),
+              detectedProjects: setupDetected,
+              selectedProjectIDs: setupDetected.map((project) => project.id),
               detectingProjects: false,
             }
           : current,
       );
     } catch (error: unknown) {
-      if (!providerSetupSessionMatches(sessionID, backend)) {
+      if (!ownsRequest()) {
         return;
       }
       const message =
         error instanceof Error ? error.message : "Unable to detect projects";
       setProjectsError(message);
-      if (!providerSetupSessionMatches(sessionID, backend)) {
+      if (!ownsRequest()) {
         return;
       }
       setProjectsStatus("error");
@@ -4296,36 +5381,82 @@ function App() {
   }, [mutationDisabledReason, mutationsDisabled]);
 
   const checkAllUpdates = useCallback(async () => {
-    if (!ensureDockerReady()) {
+    if (updateCheckOperationRef.current || !ensureDockerReady()) {
       return;
     }
+    const scopeGeneration = dockerScopeGenerationRef.current;
+    const requestGeneration = updateCheckRequestGenerationRef.current + 1;
+    updateCheckRequestGenerationRef.current = requestGeneration;
+    const operation: UpdateCheckOperation = {
+      scopeGeneration,
+      requestGeneration,
+    };
+    updateCheckOperationRef.current = operation;
+    const requestMatches = () =>
+      updateCheckOperationRef.current === operation &&
+      dockerScopeGenerationRef.current === scopeGeneration;
+    const reportLaunchFailure = (message: string) => {
+      setUpdatesError(message);
+      pushToast({
+        body: message,
+        level: "error",
+        title: "Update check failed",
+      });
+    };
     setUpdatesError(null);
     setUpdateCheckProgress({
       phase: "check",
       message: "Starting update check",
     });
     try {
-      const jobID = await UpdateService.CheckAllUpdates();
+      const returnedJobID = await UpdateService.CheckAllUpdates();
+      const jobID = returnedJobID?.trim();
+      if (!jobID) {
+        throw new Error("Update check returned an empty job ID");
+      }
+      if (!requestMatches()) {
+        invalidatedUpdateCheckJobIDsRef.current.add(jobID);
+        pendingUpdateCheckEventsRef.current.delete(jobID);
+        return;
+      }
+      operation.jobID = jobID;
       setUpdateCheckJobID(jobID);
       setUpdateCheckProgress({
         jobID,
         phase: "check",
         message: "Checking updates",
       });
+      if (!registerUpdateCheckJobOwnership(jobID, scopeGeneration)) {
+        if (updateCheckOperationRef.current === operation) {
+          updateCheckOperationRef.current = null;
+        }
+        setUpdateCheckJobID(null);
+        setUpdateCheckProgress(null);
+        reportLaunchFailure(
+          "Update check returned a completed or invalidated job ID; start a new check.",
+        );
+      }
     } catch (error: unknown) {
+      if (!requestMatches()) {
+        return;
+      }
+      updateCheckOperationRef.current = null;
       setUpdateCheckJobID(null);
       setUpdateCheckProgress(null);
-      setUpdatesError(
+      reportLaunchFailure(
         error instanceof Error ? error.message : "Unable to check updates",
       );
     }
-  }, [ensureDockerReady]);
+  }, [ensureDockerReady, pushToast, registerUpdateCheckJobOwnership]);
 
   const openUpdatePlan = useCallback(
     async (target: UpdatePlanTarget) => {
       if (!ensureDockerReady()) {
         return;
       }
+      const scopeGeneration = dockerScopeGenerationRef.current;
+      const requestGeneration = updatePlanRequestGenerationRef.current + 1;
+      updatePlanRequestGenerationRef.current = requestGeneration;
       setUpdatePlan({
         ...emptyUpdatePlan,
         open: true,
@@ -4343,6 +5474,12 @@ function App() {
         if (!plan) {
           throw new Error("Update plan was empty");
         }
+        if (
+          dockerScopeGenerationRef.current !== scopeGeneration ||
+          updatePlanRequestGenerationRef.current !== requestGeneration
+        ) {
+          return;
+        }
         setUpdatePlan({
           ...emptyUpdatePlan,
           open: true,
@@ -4350,6 +5487,12 @@ function App() {
           plan,
         });
       } catch (error: unknown) {
+        if (
+          dockerScopeGenerationRef.current !== scopeGeneration ||
+          updatePlanRequestGenerationRef.current !== requestGeneration
+        ) {
+          return;
+        }
         setUpdatePlan((current) => ({
           ...current,
           busy: false,
@@ -4364,9 +5507,12 @@ function App() {
   );
 
   const applyUpdatePlan = useCallback(async () => {
-    if (!updatePlan.plan) {
+    if (!updatePlan.plan || !ensureDockerReady()) {
       return;
     }
+    const scopeGeneration = dockerScopeGenerationRef.current;
+    const requestGeneration = updatePlanRequestGenerationRef.current + 1;
+    updatePlanRequestGenerationRef.current = requestGeneration;
     setUpdatePlan((current) => ({
       ...current,
       busy: true,
@@ -4393,19 +5539,48 @@ function App() {
               watchHealth: updatePlan.watchHealth,
               rollbackOnFailure: updatePlan.rollbackOnFailure,
             });
+      if (
+        dockerScopeGenerationRef.current !== scopeGeneration ||
+        updatePlanRequestGenerationRef.current !== requestGeneration
+      ) {
+        invalidatedProjectJobIDsRef.current.add(jobID);
+        pendingProjectJobEventsRef.current.delete(jobID);
+        return;
+      }
       setUpdatePlan((current) => ({
         ...current,
         jobID,
-        progress: current.progress.concat({
-          jobID,
-          phase: updatePlan.mode === "rollback" ? "rollback" : "apply",
-          message:
-            updatePlan.mode === "rollback"
-              ? "Rollback job started"
-              : "Update job started",
-        }),
+        progress: appendBoundedEntry(
+          current.progress,
+          {
+            jobID,
+            phase: updatePlan.mode === "rollback" ? "rollback" : "apply",
+            message:
+              updatePlan.mode === "rollback"
+                ? "Rollback job started"
+                : "Update job started",
+          },
+          maxUpdatePlanProgressEntries,
+        ),
       }));
+      if (!registerProjectJobOwnership(jobID, scopeGeneration)) {
+        setUpdatePlan((current) => ({
+          ...current,
+          jobID: undefined,
+          applying: false,
+          busy: false,
+          error:
+            "Update returned a completed or invalidated job ID; create a new plan.",
+        }));
+        return;
+      }
     } catch (error: unknown) {
+      if (
+        dockerScopeGenerationRef.current !== scopeGeneration ||
+        updatePlanRequestGenerationRef.current !== requestGeneration
+      ) {
+        return;
+      }
       setUpdatePlan((current) => ({
         ...current,
         busy: false,
@@ -4419,14 +5594,22 @@ function App() {
       }));
     }
   }, [
+    ensureDockerReady,
     updatePlan.backupVolumesFirst,
     updatePlan.mode,
     updatePlan.plan,
     updatePlan.rollbackOnFailure,
     updatePlan.watchHealth,
+    registerProjectJobOwnership,
   ]);
 
+  const closeUpdatePlan = useCallback(() => {
+    updatePlanRequestGenerationRef.current += 1;
+    setUpdatePlan(emptyUpdatePlan);
+  }, []);
+
   const openIgnoreUpdate = useCallback((update: ImageUpdate) => {
+    ignoreUpdateRequestGenerationRef.current += 1;
     setIgnoreUpdate({
       ...emptyIgnoreUpdate,
       open: true,
@@ -4434,10 +5617,18 @@ function App() {
     });
   }, []);
 
+  const closeIgnoreUpdate = useCallback(() => {
+    ignoreUpdateRequestGenerationRef.current += 1;
+    setIgnoreUpdate(emptyIgnoreUpdate);
+  }, []);
+
   const submitIgnoreUpdate = useCallback(async () => {
-    if (!ignoreUpdate.update) {
+    if (!ignoreUpdate.update || !ensureDockerReady()) {
       return;
     }
+    const scopeGeneration = dockerScopeGenerationRef.current;
+    const requestGeneration = ignoreUpdateRequestGenerationRef.current + 1;
+    ignoreUpdateRequestGenerationRef.current = requestGeneration;
     setIgnoreUpdate((current) => ({
       ...current,
       busy: true,
@@ -4448,10 +5639,33 @@ function App() {
         id: ignoreUpdate.update.id,
         reason: ignoreUpdate.reason.trim() || undefined,
       });
-      setIgnoreUpdate(emptyIgnoreUpdate);
+      if (
+        dockerScopeGenerationRef.current !== scopeGeneration ||
+        ignoreUpdateRequestGenerationRef.current !== requestGeneration
+      ) {
+        return;
+      }
       await refreshUpdateSurfaces();
+      if (
+        dockerScopeGenerationRef.current !== scopeGeneration ||
+        ignoreUpdateRequestGenerationRef.current !== requestGeneration
+      ) {
+        return;
+      }
       await refreshProjects();
+      if (
+        dockerScopeGenerationRef.current === scopeGeneration &&
+        ignoreUpdateRequestGenerationRef.current === requestGeneration
+      ) {
+        closeIgnoreUpdate();
+      }
     } catch (error: unknown) {
+      if (
+        dockerScopeGenerationRef.current !== scopeGeneration ||
+        ignoreUpdateRequestGenerationRef.current !== requestGeneration
+      ) {
+        return;
+      }
       setIgnoreUpdate((current) => ({
         ...current,
         busy: false,
@@ -4460,6 +5674,8 @@ function App() {
       }));
     }
   }, [
+    closeIgnoreUpdate,
+    ensureDockerReady,
     ignoreUpdate.reason,
     ignoreUpdate.update,
     refreshProjects,
@@ -4468,17 +5684,41 @@ function App() {
 
   const unignoreUpdate = useCallback(
     async (id: number) => {
+      if (!ensureDockerReady()) {
+        return;
+      }
+      const requestKey = `unignore-update:${id}`;
+      const owner = beginMutationRequest(requestKey);
       try {
         await UpdateService.UnignoreUpdate(id);
+        if (!mutationRequestMatches(requestKey, owner)) {
+          return;
+        }
         await refreshUpdateSurfaces();
+        if (!mutationRequestMatches(requestKey, owner)) {
+          return;
+        }
         await refreshProjects();
       } catch (error: unknown) {
-        setIgnoredUpdatesError(
-          error instanceof Error ? error.message : "Unable to unignore update",
-        );
+        if (mutationRequestMatches(requestKey, owner)) {
+          setIgnoredUpdatesError(
+            error instanceof Error
+              ? error.message
+              : "Unable to unignore update",
+          );
+        }
+      } finally {
+        finishMutationRequest(requestKey, owner);
       }
     },
-    [refreshProjects, refreshUpdateSurfaces],
+    [
+      beginMutationRequest,
+      ensureDockerReady,
+      finishMutationRequest,
+      mutationRequestMatches,
+      refreshProjects,
+      refreshUpdateSurfaces,
+    ],
   );
 
   const rollbackUpdate = useCallback(
@@ -4486,10 +5726,19 @@ function App() {
       if (!ensureDockerReady()) {
         return;
       }
+      const scopeGeneration = dockerScopeGenerationRef.current;
+      const requestGeneration = updatePlanRequestGenerationRef.current + 1;
+      updatePlanRequestGenerationRef.current = requestGeneration;
       try {
         const plan = await UpdateService.PlanRollback(historyID);
         if (!plan) {
           throw new Error("Rollback plan was empty");
+        }
+        if (
+          dockerScopeGenerationRef.current !== scopeGeneration ||
+          updatePlanRequestGenerationRef.current !== requestGeneration
+        ) {
+          return;
         }
         setUpdatePlan({
           ...emptyUpdatePlan,
@@ -4503,6 +5752,12 @@ function App() {
           plan,
         });
       } catch (error: unknown) {
+        if (
+          dockerScopeGenerationRef.current !== scopeGeneration ||
+          updatePlanRequestGenerationRef.current !== requestGeneration
+        ) {
+          return;
+        }
         setUpdateHistoryError(
           error instanceof Error ? error.message : "Unable to roll back update",
         );
@@ -4517,6 +5772,14 @@ function App() {
         return;
       }
       const key = `${action}:${container.id}`;
+      const owner = beginActionRequest(key);
+      const requestMatches = () => actionRequestMatches(key, owner);
+      const confirmOwner =
+        action === "kill" || action === "remove"
+          ? beginConfirmPlanRequest()
+          : null;
+      const planRequestMatches = () =>
+        confirmOwner === null || confirmPlanRequestMatches(confirmOwner);
       setActionError(null);
       setActionBusy(key, true);
       try {
@@ -4528,6 +5791,9 @@ function App() {
           await DockerService.RestartContainer(container.id, 10);
         } else if (action === "kill") {
           const plan = await DockerService.PlanKillContainer(container.id);
+          if (!requestMatches() || !planRequestMatches()) {
+            return;
+          }
           if (!plan) {
             throw new Error("Kill plan was empty");
           }
@@ -4545,6 +5811,9 @@ function App() {
             force: containerCanStop(container),
             removeVolumes: false,
           });
+          if (!requestMatches() || !planRequestMatches()) {
+            return;
+          }
           if (!plan) {
             throw new Error("Remove plan was empty");
           }
@@ -4558,6 +5827,9 @@ function App() {
           });
           return;
         }
+        if (!requestMatches()) {
+          return;
+        }
         setSelectedContainerIDs((current) => {
           const next = new Set(current);
           next.delete(container.id);
@@ -4565,14 +5837,28 @@ function App() {
         });
         await refreshAfterAction();
       } catch (error: unknown) {
-        setActionError(
-          error instanceof Error ? error.message : "Container action failed",
-        );
+        if (requestMatches() && planRequestMatches()) {
+          setActionError(
+            error instanceof Error ? error.message : "Container action failed",
+          );
+        }
       } finally {
-        setActionBusy(key, false);
+        if (requestMatches()) {
+          setActionBusy(key, false);
+        }
+        finishActionRequest(key, owner);
       }
     },
-    [ensureDockerReady, refreshAfterAction, setActionBusy],
+    [
+      beginConfirmPlanRequest,
+      beginActionRequest,
+      actionRequestMatches,
+      confirmPlanRequestMatches,
+      ensureDockerReady,
+      finishActionRequest,
+      refreshAfterAction,
+      setActionBusy,
+    ],
   );
 
   const runBulkContainerAction = useCallback(
@@ -4585,29 +5871,45 @@ function App() {
         return;
       }
       const key = `bulk:${action}`;
+      const owner = beginActionRequest(key);
+      const requestMatches = () => actionRequestMatches(key, owner);
       setActionError(null);
       setActionBusy(key, true);
       try {
         const result = await DockerService.BulkContainerAction(ids, action);
+        if (!requestMatches()) {
+          return;
+        }
         setSelectedContainerIDs(new Set<string>());
         await refreshAfterAction();
+        if (!requestMatches()) {
+          return;
+        }
         if (result && result.failed > 0) {
           setActionError(
             `${result.failed} of ${result.total} container actions failed`,
           );
         }
       } catch (error: unknown) {
-        setActionError(
-          error instanceof Error
-            ? error.message
-            : "Bulk container action failed",
-        );
+        if (requestMatches()) {
+          setActionError(
+            error instanceof Error
+              ? error.message
+              : "Bulk container action failed",
+          );
+        }
       } finally {
-        setActionBusy(key, false);
+        if (requestMatches()) {
+          setActionBusy(key, false);
+        }
+        finishActionRequest(key, owner);
       }
     },
     [
+      actionRequestMatches,
+      beginActionRequest,
       ensureDockerReady,
+      finishActionRequest,
       refreshAfterAction,
       selectedContainerIDs,
       setActionBusy,
@@ -4618,6 +5920,17 @@ function App() {
     if (!confirm.plan) {
       return;
     }
+    if (
+      confirm.volumeEpoch !== undefined &&
+      confirm.volumeEpoch !== volumeEpochRef.current
+    ) {
+      closeConfirm();
+      return;
+    }
+    const owner: ScopedRequestOwner = {
+      scopeGeneration: dockerScopeGenerationRef.current,
+      requestGeneration: confirmRequestGenerationRef.current,
+    };
     setConfirm((current) => ({ ...current, busy: true, error: undefined }));
     try {
       if (confirm.planKind === "project") {
@@ -4644,26 +5957,43 @@ function App() {
           confirm.plan.planID,
           confirm.typedName,
         );
-        setRunImage(emptyRunImage);
       } else {
         await DockerService.ApplyContainerPlan(
           confirm.plan.planID,
           confirm.typedName,
         );
       }
-      setConfirm(emptyConfirm);
+      if (!confirmPlanRequestMatches(owner)) {
+        return;
+      }
       setSelectedContainerIDs(new Set<string>());
       if (confirm.planKind === "project") {
         await refreshProjects();
+        if (!confirmPlanRequestMatches(owner)) {
+          return;
+        }
         if (activeProjectID) {
           await refreshProjectDetail(activeProjectID);
+          if (!confirmPlanRequestMatches(owner)) {
+            return;
+          }
         }
       } else if (confirm.planKind === "provider") {
-        await refreshInventory();
+        await refreshInventoryFresh();
+        if (!confirmPlanRequestMatches(owner)) {
+          return;
+        }
         await refreshProjects();
+        if (!confirmPlanRequestMatches(owner)) {
+          return;
+        }
         await refreshUpdateSurfaces();
       } else if (confirm.planKind === "run-image") {
         await refreshAfterAction();
+        if (!confirmPlanRequestMatches(owner)) {
+          return;
+        }
+        closeRunImage();
         setActivePage("containers");
       } else if (
         confirm.planKind === "backup" ||
@@ -4671,14 +6001,29 @@ function App() {
         confirm.planKind === "restore"
       ) {
         await refreshBackups();
-        await refreshInventory();
+        if (!confirmPlanRequestMatches(owner)) {
+          return;
+        }
+        await refreshInventoryFresh();
+        if (!confirmPlanRequestMatches(owner)) {
+          return;
+        }
         if (activeProjectID) {
           await refreshProjectDetail(activeProjectID);
+          if (!confirmPlanRequestMatches(owner)) {
+            return;
+          }
         }
       } else {
         await refreshAfterAction();
       }
+      if (confirmPlanRequestMatches(owner)) {
+        closeConfirm();
+      }
     } catch (error: unknown) {
+      if (!confirmPlanRequestMatches(owner)) {
+        return;
+      }
       const message =
         error instanceof Error ? error.message : "Unable to apply plan";
       if (
@@ -4686,6 +6031,9 @@ function App() {
         parseAppErrorText(message).partial?.type === "container"
       ) {
         await refreshAfterAction();
+        if (!confirmPlanRequestMatches(owner)) {
+          return;
+        }
       }
       setConfirm((current) => ({
         ...current,
@@ -4697,9 +6045,13 @@ function App() {
     confirm.plan,
     confirm.planKind,
     confirm.typedName,
+    confirm.volumeEpoch,
     activeProjectID,
+    closeConfirm,
+    closeRunImage,
+    confirmPlanRequestMatches,
     refreshBackups,
-    refreshInventory,
+    refreshInventoryFresh,
     refreshAfterAction,
     refreshProjectDetail,
     refreshProjects,
@@ -4709,6 +6061,7 @@ function App() {
   const runProjectAction = useCallback(
     async (action: ProjectAction, project: ProjectSummary) => {
       if (action === "remove") {
+        removeProjectRequestGenerationRef.current += 1;
         setActionError(null);
         setRemoveProject({
           open: true,
@@ -4721,6 +6074,14 @@ function App() {
         return;
       }
       const key = projectActionBusyKey(action, project.id);
+      const owner = beginActionRequest(key);
+      const requestMatches = () => actionRequestMatches(key, owner);
+      const confirmOwner =
+        action === "redeploy" || action === "down" || action === "down-volumes"
+          ? beginConfirmPlanRequest()
+          : null;
+      const planRequestMatches = () =>
+        confirmOwner === null || confirmPlanRequestMatches(confirmOwner);
       setActionError(null);
       setActionBusy(key, true);
       try {
@@ -4740,6 +6101,9 @@ function App() {
                   project.id,
                   action === "down-volumes",
                 );
+          if (!requestMatches() || !planRequestMatches()) {
+            return;
+          }
           if (!plan) {
             throw new Error("Project plan was empty");
           }
@@ -4753,21 +6117,37 @@ function App() {
           });
           return;
         }
+        if (!requestMatches()) {
+          return;
+        }
         await refreshProjects();
+        if (!requestMatches()) {
+          return;
+        }
         if (activeProjectID === project.id) {
           await refreshProjectDetail(project.id);
         }
       } catch (error: unknown) {
-        setActionError(
-          error instanceof Error ? error.message : "Project action failed",
-        );
+        if (requestMatches() && planRequestMatches()) {
+          setActionError(
+            error instanceof Error ? error.message : "Project action failed",
+          );
+        }
       } finally {
-        setActionBusy(key, false);
+        if (requestMatches()) {
+          setActionBusy(key, false);
+        }
+        finishActionRequest(key, owner);
       }
     },
     [
       activeProjectID,
+      actionRequestMatches,
+      beginActionRequest,
+      beginConfirmPlanRequest,
+      confirmPlanRequestMatches,
       ensureDockerReady,
+      finishActionRequest,
       refreshProjectDetail,
       refreshProjects,
       setActionBusy,
@@ -4779,12 +6159,23 @@ function App() {
     if (!project) {
       return;
     }
+    const modalRequestGeneration =
+      removeProjectRequestGenerationRef.current + 1;
+    removeProjectRequestGenerationRef.current = modalRequestGeneration;
     const key = projectActionBusyKey("remove", project.id);
+    const actionOwner = beginActionRequest(key);
+    const ownsActionRequest = () => actionRequestMatches(key, actionOwner);
+    const requestMatches = () =>
+      ownsActionRequest() &&
+      removeProjectRequestGenerationRef.current === modalRequestGeneration;
     setActionError(null);
     setActionBusy(key, true);
     setRemoveProject((current) => ({ ...current, busy: true, error: "" }));
     try {
       await ProjectService.RemoveProjectFromList(project.id);
+      if (!requestMatches()) {
+        return;
+      }
       pushToast({
         body: project.name,
         level: "ok",
@@ -4793,22 +6184,38 @@ function App() {
       if (activeProjectID === project.id) {
         closeProjectDetail();
       }
-      setRemoveProject(emptyRemoveProject);
       await refreshProjects();
+      if (!requestMatches()) {
+        return;
+      }
       await refreshUpdateSurfaces();
-    } catch (error: unknown) {
-      setRemoveProject((current) => ({
-        ...current,
-        busy: false,
-        error:
-          error instanceof Error ? error.message : "Unable to remove project",
-      }));
-    } finally {
+      if (!requestMatches()) {
+        return;
+      }
       setActionBusy(key, false);
+      closeRemoveProject();
+    } catch (error: unknown) {
+      if (requestMatches()) {
+        setRemoveProject((current) => ({
+          ...current,
+          busy: false,
+          error:
+            error instanceof Error ? error.message : "Unable to remove project",
+        }));
+      }
+    } finally {
+      if (ownsActionRequest()) {
+        setActionBusy(key, false);
+      }
+      finishActionRequest(key, actionOwner);
     }
   }, [
     activeProjectID,
+    actionRequestMatches,
+    beginActionRequest,
     closeProjectDetail,
+    closeRemoveProject,
+    finishActionRequest,
     pushToast,
     refreshProjects,
     refreshUpdateSurfaces,
@@ -4817,6 +6224,7 @@ function App() {
   ]);
 
   const openRunImageModal = useCallback((image?: ImageSummary) => {
+    runImageRequestGenerationRef.current += 1;
     const ref = image ? primaryImageRef(image) : "";
     setRunImage({
       ...emptyRunImage,
@@ -4832,17 +6240,35 @@ function App() {
     if (!ensureDockerReady()) {
       return;
     }
+    const scopeGeneration = dockerScopeGenerationRef.current;
+    const requestGeneration = runImageRequestGenerationRef.current + 1;
+    runImageRequestGenerationRef.current = requestGeneration;
+    const requestMatches = () =>
+      dockerScopeGenerationRef.current === scopeGeneration &&
+      runImageRequestGenerationRef.current === requestGeneration;
+    const confirmOwner = beginConfirmPlanRequest();
+    const planRequestMatches = () =>
+      requestMatches() && confirmPlanRequestMatches(confirmOwner);
     setRunImage((current) => ({ ...current, busy: true, error: undefined }));
     try {
       const req = buildRunImageRequest(runImage);
       const plan = await DockerService.PlanRunImage(req);
+      if (!planRequestMatches()) {
+        return;
+      }
       if (!plan) {
         throw new Error("Run image plan was empty");
       }
       if (plan.risk === Risk.RiskSafe) {
         await DockerService.ApplyRunImagePlan(plan.planID, "");
-        setRunImage(emptyRunImage);
+        if (!planRequestMatches()) {
+          return;
+        }
         await refreshAfterAction();
+        if (!planRequestMatches()) {
+          return;
+        }
+        closeRunImage();
         setActivePage("containers");
         return;
       }
@@ -4856,10 +6282,16 @@ function App() {
         busy: false,
       });
     } catch (error: unknown) {
+      if (!planRequestMatches()) {
+        return;
+      }
       const message =
         error instanceof Error ? error.message : "Unable to run image";
       if (parseAppErrorText(message).partial?.type === "container") {
         await refreshAfterAction();
+        if (!planRequestMatches()) {
+          return;
+        }
       }
       setRunImage((current) => ({
         ...current,
@@ -4867,16 +6299,32 @@ function App() {
         error: message,
       }));
     }
-  }, [ensureDockerReady, refreshAfterAction, runImage]);
+  }, [
+    beginConfirmPlanRequest,
+    closeRunImage,
+    confirmPlanRequestMatches,
+    ensureDockerReady,
+    refreshAfterAction,
+    runImage,
+  ]);
 
-  const openRenameModal = useCallback((container: ContainerSummary) => {
-    setRename({
-      ...emptyRename,
-      open: true,
-      container,
-      name: container.name,
-    });
-  }, []);
+  const openRenameModal = useCallback(
+    (container: ContainerSummary) => {
+      invalidateMutationRequest("rename-container");
+      setRename({
+        ...emptyRename,
+        open: true,
+        container,
+        name: container.name,
+      });
+    },
+    [invalidateMutationRequest],
+  );
+
+  const closeRenameModal = useCallback(() => {
+    invalidateMutationRequest("rename-container");
+    setRename(emptyRename);
+  }, [invalidateMutationRequest]);
 
   const submitRename = useCallback(async () => {
     if (!ensureDockerReady()) {
@@ -4885,69 +6333,155 @@ function App() {
     if (!rename.container) {
       return;
     }
+    const requestKey = "rename-container";
+    const owner = beginMutationRequest(requestKey);
     setRename((current) => ({ ...current, busy: true, error: undefined }));
     try {
       await DockerService.RenameContainer(rename.container.id, rename.name);
-      setRename(emptyRename);
+      if (!mutationRequestMatches(requestKey, owner)) {
+        return;
+      }
       await refreshAfterAction();
+      if (!mutationRequestMatches(requestKey, owner)) {
+        return;
+      }
+      closeRenameModal();
     } catch (error: unknown) {
-      setRename((current) => ({
-        ...current,
-        busy: false,
-        error:
-          error instanceof Error ? error.message : "Unable to rename container",
-      }));
+      if (mutationRequestMatches(requestKey, owner)) {
+        setRename((current) => ({
+          ...current,
+          busy: false,
+          error:
+            error instanceof Error
+              ? error.message
+              : "Unable to rename container",
+        }));
+      }
+    } finally {
+      finishMutationRequest(requestKey, owner);
     }
-  }, [ensureDockerReady, refreshAfterAction, rename.container, rename.name]);
+  }, [
+    beginMutationRequest,
+    closeRenameModal,
+    ensureDockerReady,
+    finishMutationRequest,
+    mutationRequestMatches,
+    refreshAfterAction,
+    rename.container,
+    rename.name,
+  ]);
+
+  const openPullImageModal = useCallback(() => {
+    invalidateMutationRequest("pull-image");
+    setPullImage({ ...emptyPullImage, open: true });
+  }, [invalidateMutationRequest]);
+
+  const closePullImageModal = useCallback(() => {
+    invalidateMutationRequest("pull-image");
+    setPullImage(emptyPullImage);
+  }, [invalidateMutationRequest]);
 
   const submitPullImage = useCallback(async () => {
     if (!ensureDockerReady()) {
       return;
     }
+    const requestKey = "pull-image";
+    const owner = beginMutationRequest(requestKey);
     const ref = imageRefWithTag(pullImage.ref, pullImage.tag);
     setPullImage((current) => ({ ...current, busy: true, error: undefined }));
     try {
       await DockerService.PullImage(ref);
-      setPullImage(emptyPullImage);
+      if (!mutationRequestMatches(requestKey, owner)) {
+        return;
+      }
       await refreshAfterAction();
+      if (!mutationRequestMatches(requestKey, owner)) {
+        return;
+      }
+      closePullImageModal();
     } catch (error: unknown) {
-      setPullImage((current) => ({
-        ...current,
-        busy: false,
-        error: error instanceof Error ? error.message : "Unable to pull image",
-      }));
+      if (mutationRequestMatches(requestKey, owner)) {
+        setPullImage((current) => ({
+          ...current,
+          busy: false,
+          error:
+            error instanceof Error ? error.message : "Unable to pull image",
+        }));
+      }
+    } finally {
+      finishMutationRequest(requestKey, owner);
     }
-  }, [ensureDockerReady, pullImage.ref, pullImage.tag, refreshAfterAction]);
+  }, [
+    beginMutationRequest,
+    closePullImageModal,
+    ensureDockerReady,
+    finishMutationRequest,
+    mutationRequestMatches,
+    pullImage.ref,
+    pullImage.tag,
+    refreshAfterAction,
+  ]);
 
-  const openTagImageModal = useCallback((image: ImageSummary) => {
-    const ref = taggableImageRef(image);
-    setTagImage({
-      ...emptyTagImage,
-      open: true,
-      image,
-      newRef: ref,
-    });
-  }, []);
+  const openTagImageModal = useCallback(
+    (image: ImageSummary) => {
+      invalidateMutationRequest("tag-image");
+      const ref = taggableImageRef(image);
+      setTagImage({
+        ...emptyTagImage,
+        open: true,
+        image,
+        newRef: ref,
+      });
+    },
+    [invalidateMutationRequest],
+  );
+
+  const closeTagImageModal = useCallback(() => {
+    invalidateMutationRequest("tag-image");
+    setTagImage(emptyTagImage);
+  }, [invalidateMutationRequest]);
 
   const submitTagImage = useCallback(async () => {
     if (!ensureDockerReady() || !tagImage.image) {
       return;
     }
+    const requestKey = "tag-image";
+    const owner = beginMutationRequest(requestKey);
     setTagImage((current) => ({ ...current, busy: true, error: undefined }));
     try {
       await DockerService.TagImage(tagImage.image.id, tagImage.newRef);
-      setTagImage(emptyTagImage);
+      if (!mutationRequestMatches(requestKey, owner)) {
+        return;
+      }
       await refreshAfterAction();
+      if (!mutationRequestMatches(requestKey, owner)) {
+        return;
+      }
+      closeTagImageModal();
     } catch (error: unknown) {
-      setTagImage((current) => ({
-        ...current,
-        busy: false,
-        error: error instanceof Error ? error.message : "Unable to tag image",
-      }));
+      if (mutationRequestMatches(requestKey, owner)) {
+        setTagImage((current) => ({
+          ...current,
+          busy: false,
+          error: error instanceof Error ? error.message : "Unable to tag image",
+        }));
+      }
+    } finally {
+      finishMutationRequest(requestKey, owner);
     }
-  }, [ensureDockerReady, refreshAfterAction, tagImage.image, tagImage.newRef]);
+  }, [
+    beginMutationRequest,
+    closeTagImageModal,
+    ensureDockerReady,
+    finishMutationRequest,
+    mutationRequestMatches,
+    refreshAfterAction,
+    tagImage.image,
+    tagImage.newRef,
+  ]);
 
   const openPushImageModal = useCallback((image: ImageSummary) => {
+    pushImageRequestGenerationRef.current += 1;
     const ref = pushableImageRef(image);
     setPushImage({
       ...emptyPushImage,
@@ -4962,6 +6496,13 @@ function App() {
     if (!ensureDockerReady()) {
       return;
     }
+    const scopeGeneration = dockerScopeGenerationRef.current;
+    const requestGeneration = pushImageRequestGenerationRef.current + 1;
+    pushImageRequestGenerationRef.current = requestGeneration;
+    pendingPushProgressRef.current.clear();
+    const requestMatches = () =>
+      dockerScopeGenerationRef.current === scopeGeneration &&
+      pushImageRequestGenerationRef.current === requestGeneration;
     setPushImage((current) => ({
       ...current,
       busy: true,
@@ -4972,73 +6513,146 @@ function App() {
     }));
     try {
       const plan = await DockerService.PlanPushImage(pushImage.ref);
+      if (!requestMatches()) {
+        return;
+      }
       if (!plan) {
         throw new Error("Push plan was empty");
       }
       const streamID = await DockerService.ApplyPushImagePlan(plan.planID);
+      if (!requestMatches()) {
+        return;
+      }
+      const pendingProgress =
+        pendingPushProgressRef.current.get(streamID) ?? [];
+      pendingPushProgressRef.current.clear();
       setPushImage((current) => ({
         ...current,
         busy: false,
         streamID,
+        progress: pendingProgress.reduce(
+          (progress, payload) => mergeImageProgress(progress, payload),
+          current.progress,
+        ),
         success: true,
       }));
       await refreshAfterAction();
     } catch (error: unknown) {
-      setPushImage((current) => ({
-        ...current,
-        busy: false,
-        error: error instanceof Error ? error.message : "Unable to push image",
-      }));
+      if (requestMatches()) {
+        setPushImage((current) => ({
+          ...current,
+          busy: false,
+          error:
+            error instanceof Error ? error.message : "Unable to push image",
+        }));
+      }
     }
   }, [ensureDockerReady, pushImage.ref, refreshAfterAction]);
 
-  const openSaveImageModal = useCallback((image: ImageSummary) => {
-    const ref = primaryImageRef(image);
-    setSaveImage({
-      ...emptySaveImage,
-      open: true,
-      refsText: ref,
-      destPath: `${ref.replace(/[/:@]/g, "_") || "image"}.tar`,
-    });
-  }, []);
+  const openSaveImageModal = useCallback(
+    (image: ImageSummary) => {
+      invalidateMutationRequest("save-image");
+      const ref = primaryImageRef(image);
+      setSaveImage({
+        ...emptySaveImage,
+        open: true,
+        refsText: ref,
+        destPath: `${ref.replace(/[/:@]/g, "_") || "image"}.tar`,
+      });
+    },
+    [invalidateMutationRequest],
+  );
+
+  const closeSaveImageModal = useCallback(() => {
+    invalidateMutationRequest("save-image");
+    setSaveImage(emptySaveImage);
+  }, [invalidateMutationRequest]);
 
   const submitSaveImage = useCallback(async () => {
     if (!ensureDockerReady()) {
       return;
     }
+    const requestKey = "save-image";
+    const owner = beginMutationRequest(requestKey);
     setSaveImage((current) => ({ ...current, busy: true, error: undefined }));
     try {
       await DockerService.SaveImage(
         splitRefs(saveImage.refsText),
         saveImage.destPath,
       );
-      setSaveImage(emptySaveImage);
+      if (mutationRequestMatches(requestKey, owner)) {
+        closeSaveImageModal();
+      }
     } catch (error: unknown) {
-      setSaveImage((current) => ({
-        ...current,
-        busy: false,
-        error: error instanceof Error ? error.message : "Unable to save image",
-      }));
+      if (mutationRequestMatches(requestKey, owner)) {
+        setSaveImage((current) => ({
+          ...current,
+          busy: false,
+          error:
+            error instanceof Error ? error.message : "Unable to save image",
+        }));
+      }
+    } finally {
+      finishMutationRequest(requestKey, owner);
     }
-  }, [ensureDockerReady, saveImage.destPath, saveImage.refsText]);
+  }, [
+    beginMutationRequest,
+    closeSaveImageModal,
+    ensureDockerReady,
+    finishMutationRequest,
+    mutationRequestMatches,
+    saveImage.destPath,
+    saveImage.refsText,
+  ]);
+
+  const openLoadImageModal = useCallback(() => {
+    invalidateMutationRequest("load-image");
+    setLoadImage({ ...emptyLoadImage, open: true });
+  }, [invalidateMutationRequest]);
+
+  const closeLoadImageModal = useCallback(() => {
+    invalidateMutationRequest("load-image");
+    setLoadImage(emptyLoadImage);
+  }, [invalidateMutationRequest]);
 
   const submitLoadImage = useCallback(async () => {
     if (!ensureDockerReady()) {
       return;
     }
+    const requestKey = "load-image";
+    const owner = beginMutationRequest(requestKey);
     setLoadImage((current) => ({ ...current, busy: true, error: undefined }));
     try {
       await DockerService.LoadImage(loadImage.srcPath);
-      setLoadImage(emptyLoadImage);
+      if (!mutationRequestMatches(requestKey, owner)) {
+        return;
+      }
       await refreshAfterAction();
+      if (!mutationRequestMatches(requestKey, owner)) {
+        return;
+      }
+      closeLoadImageModal();
     } catch (error: unknown) {
-      setLoadImage((current) => ({
-        ...current,
-        busy: false,
-        error: error instanceof Error ? error.message : "Unable to load image",
-      }));
+      if (mutationRequestMatches(requestKey, owner)) {
+        setLoadImage((current) => ({
+          ...current,
+          busy: false,
+          error:
+            error instanceof Error ? error.message : "Unable to load image",
+        }));
+      }
+    } finally {
+      finishMutationRequest(requestKey, owner);
     }
-  }, [ensureDockerReady, loadImage.srcPath, refreshAfterAction]);
+  }, [
+    beginMutationRequest,
+    closeLoadImageModal,
+    ensureDockerReady,
+    finishMutationRequest,
+    loadImage.srcPath,
+    mutationRequestMatches,
+    refreshAfterAction,
+  ]);
 
   const openRemoveImagePlan = useCallback(
     async (image: ImageSummary) => {
@@ -5046,10 +6660,14 @@ function App() {
         return;
       }
       const label = primaryImageRef(image);
+      const owner = beginConfirmPlanRequest();
       setActionError(null);
       try {
         const inUse = image.inUse || (imageUseCounts[image.id] ?? 0) > 0;
         const plan = await DockerService.PlanRemoveImage(image.id, inUse);
+        if (!confirmPlanRequestMatches(owner)) {
+          return;
+        }
         if (!plan) {
           throw new Error("Image removal plan was empty");
         }
@@ -5061,20 +6679,39 @@ function App() {
           targetName: label,
         });
       } catch (error: unknown) {
-        setActionError(
-          error instanceof Error
-            ? error.message
-            : "Unable to plan image removal",
-        );
+        if (confirmPlanRequestMatches(owner)) {
+          setActionError(
+            error instanceof Error
+              ? error.message
+              : "Unable to plan image removal",
+          );
+        }
       }
     },
-    [ensureDockerReady, imageUseCounts],
+    [
+      beginConfirmPlanRequest,
+      confirmPlanRequestMatches,
+      ensureDockerReady,
+      imageUseCounts,
+    ],
   );
+
+  const openCreateVolumeModal = useCallback(() => {
+    invalidateMutationRequest("create-volume");
+    setCreateVolume({ ...emptyCreateVolume, open: true });
+  }, [invalidateMutationRequest]);
+
+  const closeCreateVolumeModal = useCallback(() => {
+    invalidateMutationRequest("create-volume");
+    setCreateVolume(emptyCreateVolume);
+  }, [invalidateMutationRequest]);
 
   const submitCreateVolume = useCallback(async () => {
     if (!ensureDockerReady()) {
       return;
     }
+    const requestKey = "create-volume";
+    const owner = beginMutationRequest(requestKey);
     setCreateVolume((current) => ({
       ...current,
       busy: true,
@@ -5087,22 +6724,36 @@ function App() {
         driverOpts: parseKeyValueLines(createVolume.driverOptsText),
         labels: parseKeyValueLines(createVolume.labelsText),
       });
-      setCreateVolume(emptyCreateVolume);
+      if (!mutationRequestMatches(requestKey, owner)) {
+        return;
+      }
       await refreshAfterAction();
+      if (!mutationRequestMatches(requestKey, owner)) {
+        return;
+      }
+      closeCreateVolumeModal();
     } catch (error: unknown) {
-      setCreateVolume((current) => ({
-        ...current,
-        busy: false,
-        error:
-          error instanceof Error ? error.message : "Unable to create volume",
-      }));
+      if (mutationRequestMatches(requestKey, owner)) {
+        setCreateVolume((current) => ({
+          ...current,
+          busy: false,
+          error:
+            error instanceof Error ? error.message : "Unable to create volume",
+        }));
+      }
+    } finally {
+      finishMutationRequest(requestKey, owner);
     }
   }, [
+    beginMutationRequest,
+    closeCreateVolumeModal,
     createVolume.driver,
     createVolume.driverOptsText,
     createVolume.labelsText,
     createVolume.name,
     ensureDockerReady,
+    finishMutationRequest,
+    mutationRequestMatches,
     refreshAfterAction,
   ]);
 
@@ -5111,9 +6762,17 @@ function App() {
       if (!ensureDockerReady()) {
         return;
       }
+      const owner = beginConfirmPlanRequest();
+      const planVolumeEpoch = volumeEpochRef.current;
       setActionError(null);
       try {
         const plan = await DockerService.PlanRemoveVolume(volume.name, false);
+        if (
+          !confirmPlanRequestMatches(owner) ||
+          volumeEpochRef.current !== planVolumeEpoch
+        ) {
+          return;
+        }
         if (!plan) {
           throw new Error("Volume removal plan was empty");
         }
@@ -5123,20 +6782,27 @@ function App() {
           plan,
           planKind: "container",
           targetName: volume.name,
+          volumeEpoch: planVolumeEpoch,
         });
       } catch (error: unknown) {
-        setActionError(
-          error instanceof Error
-            ? error.message
-            : "Unable to plan volume removal",
-        );
+        if (
+          confirmPlanRequestMatches(owner) &&
+          volumeEpochRef.current === planVolumeEpoch
+        ) {
+          setActionError(
+            error instanceof Error
+              ? error.message
+              : "Unable to plan volume removal",
+          );
+        }
       }
     },
-    [ensureDockerReady],
+    [beginConfirmPlanRequest, confirmPlanRequestMatches, ensureDockerReady],
   );
 
   const openBackupVolume = useCallback(
     (volume: VolumeSummary) => {
+      backupVolumeRequestGenerationRef.current += 1;
       setBackupVolume({
         ...emptyBackupVolume,
         open: true,
@@ -5151,6 +6817,15 @@ function App() {
     if (!backupVolume.volume || !ensureDockerReady()) {
       return;
     }
+    const scopeGeneration = dockerScopeGenerationRef.current;
+    const requestGeneration = backupVolumeRequestGenerationRef.current + 1;
+    backupVolumeRequestGenerationRef.current = requestGeneration;
+    const requestMatches = () =>
+      dockerScopeGenerationRef.current === scopeGeneration &&
+      backupVolumeRequestGenerationRef.current === requestGeneration;
+    const confirmOwner = beginConfirmPlanRequest();
+    const planRequestMatches = () =>
+      requestMatches() && confirmPlanRequestMatches(confirmOwner);
     setBackupVolume((current) => ({
       ...current,
       busy: true,
@@ -5162,10 +6837,13 @@ function App() {
         destPath: backupVolume.destPath,
         projectID: projectIDForVolume(backupVolume.volume, projects),
       });
+      if (!planRequestMatches()) {
+        return;
+      }
       if (!plan) {
         throw new Error("Backup plan was empty");
       }
-      setBackupVolume(emptyBackupVolume);
+      closeBackupVolume();
       setConfirm({
         ...emptyConfirm,
         open: true,
@@ -5174,16 +6852,28 @@ function App() {
         targetName: backupVolume.volume.name,
       });
     } catch (error: unknown) {
-      setBackupVolume((current) => ({
-        ...current,
-        busy: false,
-        error: error instanceof Error ? error.message : "Unable to plan backup",
-      }));
+      if (planRequestMatches()) {
+        setBackupVolume((current) => ({
+          ...current,
+          busy: false,
+          error:
+            error instanceof Error ? error.message : "Unable to plan backup",
+        }));
+      }
     }
-  }, [backupVolume.destPath, backupVolume.volume, ensureDockerReady, projects]);
+  }, [
+    backupVolume.destPath,
+    backupVolume.volume,
+    beginConfirmPlanRequest,
+    closeBackupVolume,
+    confirmPlanRequestMatches,
+    ensureDockerReady,
+    projects,
+  ]);
 
   const openRestoreVolume = useCallback(
     async (volume: VolumeSummary, selectedBackup?: BackupSummary) => {
+      const scopeGeneration = dockerScopeGenerationRef.current;
       const requestID = restoreVolumeRequestRef.current + 1;
       restoreVolumeRequestRef.current = requestID;
       setRestoreVolume({
@@ -5202,6 +6892,12 @@ function App() {
           volumeName: volume.name,
           limit: 100,
         });
+        if (
+          dockerScopeGenerationRef.current !== scopeGeneration ||
+          restoreVolumeRequestRef.current !== requestID
+        ) {
+          return;
+        }
         setRestoreVolume((current) =>
           current.open &&
           current.requestID === requestID &&
@@ -5216,6 +6912,12 @@ function App() {
             : current,
         );
       } catch (error: unknown) {
+        if (
+          dockerScopeGenerationRef.current !== scopeGeneration ||
+          restoreVolumeRequestRef.current !== requestID
+        ) {
+          return;
+        }
         setRestoreVolume((current) =>
           current.open &&
           current.requestID === requestID &&
@@ -5252,10 +6954,24 @@ function App() {
     [openRestoreVolume, volumes],
   );
 
+  const closeRestoreVolume = useCallback(() => {
+    restoreVolumeRequestRef.current += 1;
+    setRestoreVolume(emptyRestoreVolume);
+  }, []);
+
   const submitRestoreVolume = useCallback(async () => {
     if (!restoreVolume.volume || !ensureDockerReady()) {
       return;
     }
+    const scopeGeneration = dockerScopeGenerationRef.current;
+    const requestID = restoreVolumeRequestRef.current + 1;
+    restoreVolumeRequestRef.current = requestID;
+    const requestMatches = () =>
+      dockerScopeGenerationRef.current === scopeGeneration &&
+      restoreVolumeRequestRef.current === requestID;
+    const confirmOwner = beginConfirmPlanRequest();
+    const planRequestMatches = () =>
+      requestMatches() && confirmPlanRequestMatches(confirmOwner);
     setRestoreVolume((current) => ({
       ...current,
       busy: true,
@@ -5268,11 +6984,13 @@ function App() {
         volumeName: restoreVolume.targetName,
         overwrite: restoreVolume.overwrite,
       });
+      if (!planRequestMatches()) {
+        return;
+      }
       if (!plan) {
         throw new Error("Restore plan was empty");
       }
-      restoreVolumeRequestRef.current += 1;
-      setRestoreVolume(emptyRestoreVolume);
+      closeRestoreVolume();
       setConfirm({
         ...emptyConfirm,
         open: true,
@@ -5281,28 +6999,35 @@ function App() {
         targetName: restoreVolume.targetName,
       });
     } catch (error: unknown) {
-      setRestoreVolume((current) => ({
-        ...current,
-        busy: false,
-        error:
-          error instanceof Error ? error.message : "Unable to plan restore",
-      }));
+      if (planRequestMatches()) {
+        setRestoreVolume((current) => ({
+          ...current,
+          busy: false,
+          error:
+            error instanceof Error ? error.message : "Unable to plan restore",
+        }));
+      }
     }
-  }, [ensureDockerReady, restoreVolume]);
-
-  const closeRestoreVolume = useCallback(() => {
-    restoreVolumeRequestRef.current += 1;
-    setRestoreVolume(emptyRestoreVolume);
-  }, []);
+  }, [
+    beginConfirmPlanRequest,
+    closeRestoreVolume,
+    confirmPlanRequestMatches,
+    ensureDockerReady,
+    restoreVolume,
+  ]);
 
   const openDeleteBackupPlan = useCallback(
     async (backup: BackupSummary) => {
       if (!ensureDockerReady()) {
         return;
       }
+      const owner = beginConfirmPlanRequest();
       setActionError(null);
       try {
         const plan = await BackupService.PlanDeleteBackup(backup.id);
+        if (!confirmPlanRequestMatches(owner)) {
+          return;
+        }
         if (!plan) {
           throw new Error("Backup delete plan was empty");
         }
@@ -5314,20 +7039,34 @@ function App() {
           targetName: backup.volumeName,
         });
       } catch (error: unknown) {
-        setActionError(
-          error instanceof Error
-            ? error.message
-            : "Unable to plan backup deletion",
-        );
+        if (confirmPlanRequestMatches(owner)) {
+          setActionError(
+            error instanceof Error
+              ? error.message
+              : "Unable to plan backup deletion",
+          );
+        }
       }
     },
-    [ensureDockerReady],
+    [beginConfirmPlanRequest, confirmPlanRequestMatches, ensureDockerReady],
   );
+
+  const openCreateNetworkModal = useCallback(() => {
+    invalidateMutationRequest("create-network");
+    setCreateNetwork({ ...emptyCreateNetwork, open: true });
+  }, [invalidateMutationRequest]);
+
+  const closeCreateNetworkModal = useCallback(() => {
+    invalidateMutationRequest("create-network");
+    setCreateNetwork(emptyCreateNetwork);
+  }, [invalidateMutationRequest]);
 
   const submitCreateNetwork = useCallback(async () => {
     if (!ensureDockerReady()) {
       return;
     }
+    const requestKey = "create-network";
+    const owner = beginMutationRequest(requestKey);
     setCreateNetwork((current) => ({
       ...current,
       busy: true,
@@ -5346,26 +7085,48 @@ function App() {
         attachable: createNetwork.attachable,
         labels: parseKeyValueLines(createNetwork.labelsText),
       });
-      setCreateNetwork(emptyCreateNetwork);
+      if (!mutationRequestMatches(requestKey, owner)) {
+        return;
+      }
       await refreshAfterAction();
+      if (!mutationRequestMatches(requestKey, owner)) {
+        return;
+      }
+      closeCreateNetworkModal();
     } catch (error: unknown) {
-      setCreateNetwork((current) => ({
-        ...current,
-        busy: false,
-        error:
-          error instanceof Error ? error.message : "Unable to create network",
-      }));
+      if (mutationRequestMatches(requestKey, owner)) {
+        setCreateNetwork((current) => ({
+          ...current,
+          busy: false,
+          error:
+            error instanceof Error ? error.message : "Unable to create network",
+        }));
+      }
+    } finally {
+      finishMutationRequest(requestKey, owner);
     }
-  }, [createNetwork, ensureDockerReady, refreshAfterAction]);
+  }, [
+    beginMutationRequest,
+    closeCreateNetworkModal,
+    createNetwork,
+    ensureDockerReady,
+    finishMutationRequest,
+    mutationRequestMatches,
+    refreshAfterAction,
+  ]);
 
   const openRemoveNetworkPlan = useCallback(
     async (network: NetworkSummary) => {
       if (!ensureDockerReady()) {
         return;
       }
+      const owner = beginConfirmPlanRequest();
       setActionError(null);
       try {
         const plan = await DockerService.PlanRemoveNetwork(network.id);
+        if (!confirmPlanRequestMatches(owner)) {
+          return;
+        }
         if (!plan) {
           throw new Error("Network removal plan was empty");
         }
@@ -5377,14 +7138,16 @@ function App() {
           targetName: network.name,
         });
       } catch (error: unknown) {
-        setActionError(
-          error instanceof Error
-            ? error.message
-            : "Unable to plan network removal",
-        );
+        if (confirmPlanRequestMatches(owner)) {
+          setActionError(
+            error instanceof Error
+              ? error.message
+              : "Unable to plan network removal",
+          );
+        }
       }
     },
-    [ensureDockerReady],
+    [beginConfirmPlanRequest, confirmPlanRequestMatches, ensureDockerReady],
   );
 
   const reviewImportProjectFolder = useCallback(
@@ -5548,6 +7311,15 @@ function App() {
     }
     const sessionID = newImportProjectSessionID();
     const jobID = newImportProjectJobID();
+    const scopeGeneration = dockerScopeGenerationRef.current;
+    if (!registerProjectJobOwnership(jobID, scopeGeneration)) {
+      setImportProject((current) => ({
+        ...current,
+        busy: false,
+        error: "Generated import job ID was already invalidated; try again.",
+      }));
+      return;
+    }
     const submittingState: ImportProjectState = {
       ...importProject,
       sessionID,
@@ -5579,6 +7351,9 @@ function App() {
         jobID,
       });
     } catch (error: unknown) {
+      projectJobScopesRef.current.delete(jobID);
+      invalidatedProjectJobIDsRef.current.add(jobID);
+      pendingProjectJobEventsRef.current.delete(jobID);
       if (!importProjectSessionMatches(sessionID)) {
         return;
       }
@@ -5655,6 +7430,7 @@ function App() {
     importProject,
     importProjectSessionMatches,
     pushToast,
+    registerProjectJobOwnership,
     refreshProjects,
     reviewImportProjectFolder,
   ]);
@@ -5688,72 +7464,68 @@ function App() {
     [],
   );
 
-  const openContainerInspect = useCallback((container: ContainerSummary) => {
-    const subtitle = shortID(container.id);
-    const title = container.name;
-    setInspect({
-      open: true,
-      title,
-      subtitle,
-      rows: containerRows(container),
-      loading: true,
-    });
-    DockerService.InspectContainerRaw(container.id)
-      .then((raw) => {
-        setInspect((current) =>
-          current.open &&
-          current.title === title &&
-          current.subtitle === subtitle
-            ? {
-                ...current,
-                loading: false,
-                rows: containerRows(container),
-                raw: formatJSON(raw),
-                error: undefined,
-              }
-            : current,
-        );
-      })
-      .catch((error: unknown) => {
-        setInspect((current) =>
-          current.open &&
-          current.title === title &&
-          current.subtitle === subtitle
-            ? {
-                ...current,
-                loading: false,
-                rows: containerRows(container),
-                error:
-                  error instanceof Error
-                    ? error.message
-                    : "Unable to inspect container",
-              }
-            : current,
-        );
+  const openContainerInspect = useCallback(
+    (container: ContainerSummary) => {
+      const owner = beginInspectRequest();
+      const subtitle = shortID(container.id);
+      const title = container.name;
+      setInspect({
+        open: true,
+        title,
+        subtitle,
+        rows: containerRows(container),
+        loading: true,
       });
-    ImageLineageService.GetContainerLineage(container.id)
-      .then((lineage) => {
-        setInspect((current) =>
-          current.open &&
-          current.title === title &&
-          current.subtitle === subtitle
-            ? { ...current, lineage }
-            : current,
-        );
-      })
-      .catch(() => {
-        setInspect((current) =>
-          current.open &&
-          current.title === title &&
-          current.subtitle === subtitle
-            ? { ...current, lineage: null }
-            : current,
-        );
-      });
-  }, []);
+      DockerService.InspectContainerRaw(container.id)
+        .then((raw) => {
+          setInspect((current) =>
+            inspectRequestMatches(owner)
+              ? {
+                  ...current,
+                  loading: false,
+                  rows: containerRows(container),
+                  raw: formatJSON(raw),
+                  error: undefined,
+                }
+              : current,
+          );
+        })
+        .catch((error: unknown) => {
+          setInspect((current) =>
+            inspectRequestMatches(owner)
+              ? {
+                  ...current,
+                  loading: false,
+                  rows: containerRows(container),
+                  error:
+                    error instanceof Error
+                      ? error.message
+                      : "Unable to inspect container",
+                }
+              : current,
+          );
+        });
+      ImageLineageService.GetContainerLineage(container.id)
+        .then((lineage) => {
+          setInspect((current) =>
+            inspectRequestMatches(owner) ? { ...current, lineage } : current,
+          );
+        })
+        .catch(() => {
+          setInspect((current) =>
+            inspectRequestMatches(owner)
+              ? { ...current, lineage: null }
+              : current,
+          );
+        });
+    },
+    [beginInspectRequest, inspectRequestMatches],
+  );
 
   const openContainerTerminal = useCallback(
     async (container: ContainerSummary) => {
+      const requestKey = "open-container-terminal";
+      const owner = beginMutationRequest(requestKey);
       try {
         const session = await TerminalService.OpenContainerTerminal(
           container.id,
@@ -5762,6 +7534,9 @@ function App() {
             rows: 30,
           },
         );
+        if (!mutationRequestMatches(requestKey, owner)) {
+          return;
+        }
         setTerminalInitialSession(session ?? null);
         pushToast({
           body: container.service || shortID(container.id),
@@ -5770,14 +7545,24 @@ function App() {
         });
         navigate("terminal");
       } catch (error: unknown) {
-        setActionError(
-          error instanceof Error
-            ? error.message
-            : "Unable to open container terminal",
-        );
+        if (mutationRequestMatches(requestKey, owner)) {
+          setActionError(
+            error instanceof Error
+              ? error.message
+              : "Unable to open container terminal",
+          );
+        }
+      } finally {
+        finishMutationRequest(requestKey, owner);
       }
     },
-    [navigate, pushToast],
+    [
+      beginMutationRequest,
+      finishMutationRequest,
+      mutationRequestMatches,
+      navigate,
+      pushToast,
+    ],
   );
 
   const openProjectFolder = useCallback(
@@ -5829,6 +7614,7 @@ function App() {
 
   const openImageInspect = useCallback(
     (image: ImageSummary) => {
+      const owner = beginInspectRequest();
       const title = primaryImageRef(image);
       const subtitle = shortID(image.id);
       setInspect({
@@ -5844,9 +7630,7 @@ function App() {
             throw new Error("Image detail was empty");
           }
           setInspect((current) =>
-            current.open &&
-            current.title === title &&
-            current.subtitle === subtitle
+            inspectRequestMatches(owner)
               ? {
                   ...current,
                   loading: false,
@@ -5859,9 +7643,7 @@ function App() {
         })
         .catch((error: unknown) => {
           setInspect((current) =>
-            current.open &&
-            current.title === title &&
-            current.subtitle === subtitle
+            inspectRequestMatches(owner)
               ? {
                   ...current,
                   loading: false,
@@ -5875,11 +7657,12 @@ function App() {
           );
         });
     },
-    [imageUseCounts],
+    [beginInspectRequest, imageUseCounts, inspectRequestMatches],
   );
 
   const openVolumeInspect = useCallback(
     (volume: VolumeSummary) => {
+      const owner = beginInspectRequest();
       const detail = volumeDetails[volume.name];
       const title = volume.name;
       const subtitle = volume.driver;
@@ -5894,15 +7677,17 @@ function App() {
       if (detail) {
         return;
       }
-      DockerService.GetVolume(volume.name)
-        .then((nextDetail) => {
-          if (nextDetail) {
-            setVolumeDetail(volume.name, nextDetail);
+      loadOwnedVolumeDetail(volume.name)
+        .then((result) => {
+          if (result.status === "obsolete") {
+            setInspect((current) =>
+              inspectRequestMatches(owner) ? emptyInspect : current,
+            );
+            return;
           }
+          const nextDetail = result.detail;
           setInspect((current) =>
-            current.open &&
-            current.title === title &&
-            current.subtitle === subtitle
+            inspectRequestMatches(owner)
               ? {
                   ...current,
                   loading: false,
@@ -5917,9 +7702,7 @@ function App() {
         })
         .catch((error: unknown) => {
           setInspect((current) =>
-            current.open &&
-            current.title === title &&
-            current.subtitle === subtitle
+            inspectRequestMatches(owner)
               ? {
                   ...current,
                   loading: false,
@@ -5933,7 +7716,12 @@ function App() {
           );
         });
     },
-    [setVolumeDetail, volumeDetails],
+    [
+      beginInspectRequest,
+      inspectRequestMatches,
+      loadOwnedVolumeDetail,
+      volumeDetails,
+    ],
   );
 
   const loadNetworkDetail = useCallback(
@@ -5941,20 +7729,35 @@ function App() {
       if (!networkID) {
         return;
       }
+      const requestGeneration = networkDetailRequestGenerationRef.current + 1;
+      networkDetailRequestGenerationRef.current = requestGeneration;
+      if (activeNetworkIDRef.current === networkID) {
+        setActionError(null);
+        setNetworkDetailLoadingID(networkID);
+      }
       try {
-        const detail = await DockerService.GetNetwork(networkID);
-        if (detail) {
-          setNetworkDetail(networkID, detail);
-        }
+        await loadOwnedNetworkDetail(networkID);
       } catch (error: unknown) {
-        setActionError(
-          error instanceof Error
-            ? error.message
-            : "Unable to load network detail",
-        );
+        if (
+          activeNetworkIDRef.current === networkID &&
+          networkDetailRequestGenerationRef.current === requestGeneration
+        ) {
+          setActionError(
+            error instanceof Error
+              ? error.message
+              : "Unable to load network detail",
+          );
+        }
+      } finally {
+        if (
+          activeNetworkIDRef.current === networkID &&
+          networkDetailRequestGenerationRef.current === requestGeneration
+        ) {
+          setNetworkDetailLoadingID(null);
+        }
       }
     },
-    [setNetworkDetail],
+    [loadOwnedNetworkDetail],
   );
 
   const openNetworkDetail = useCallback(
@@ -5963,12 +7766,12 @@ function App() {
       setActivePage("networks");
       setActiveContainerID(null);
       setContainerDetailTab("overview");
-      setActiveNetworkID(network.id);
+      updateActiveNetworkID(network.id);
       setNetworkTab("overview");
       setSearch("");
       void loadNetworkDetail(network.id);
     },
-    [loadNetworkDetail],
+    [loadNetworkDetail, updateActiveNetworkID],
   );
 
   const openContainerDetail = useCallback(
@@ -5981,10 +7784,10 @@ function App() {
       setActiveContainerID(container.id);
       setActiveContainerFallback(container);
       setContainerDetailTab(tab);
-      setActiveNetworkID(null);
+      updateActiveNetworkID(null);
       setNetworkTab("overview");
     },
-    [],
+    [updateActiveNetworkID],
   );
 
   const closeContainerDetail = useCallback(() => {
@@ -6057,6 +7860,9 @@ function App() {
               }}
               onRestoreBackup={openRestoreBackup}
               onTabChange={setProjectTab}
+              updateCheckRunning={Boolean(
+                updateCheckJobID || updateCheckProgress,
+              )}
               onUpdateProject={() =>
                 void openUpdatePlan({
                   kind: "project",
@@ -6079,7 +7885,7 @@ function App() {
                     projectDetail.summary.id,
               )}
               dockerRunning={dockerRunning}
-              inventoryLoading={inventoryStatus === "loading"}
+              inventoryLoading={containersLoading || volumesLoading}
               onToast={pushToast}
               projectsLoading={projectsStatus === "loading"}
               tab={projectTab}
@@ -6177,7 +7983,7 @@ function App() {
           <LogsPage
             containers={containers}
             dockerRunning={dockerRunning}
-            inventoryLoading={inventoryStatus === "loading"}
+            inventoryLoading={containersLoading}
             onToast={pushToast}
             projects={projects}
             projectsLoading={projectsStatus === "loading"}
@@ -6343,7 +8149,7 @@ function App() {
               actionBusyIDs={busyActionIDs}
               container={activeContainer}
               dockerRunning={dockerRunning}
-              inventoryLoading={inventoryStatus === "loading"}
+              inventoryLoading={containersLoading}
               mutationsDisabled={mutationsDisabled}
               mutationDisabledReason={mutationDisabledReason}
               onAction={runContainerAction}
@@ -6363,7 +8169,7 @@ function App() {
             containers={containers}
             datasetScopeKey={datasetScopeKey}
             filter={containerFilter}
-            loading={inventoryStatus === "loading"}
+            loading={containersLoading}
             mutationsDisabled={mutationsDisabled}
             mutationDisabledReason={mutationDisabledReason}
             onAction={runContainerAction}
@@ -6385,13 +8191,13 @@ function App() {
             filter={imageFilter}
             imageUseCounts={imageUseCounts}
             images={images}
-            loading={inventoryStatus === "loading"}
+            loading={imagesLoading}
             mutationsDisabled={mutationsDisabled}
             mutationDisabledReason={mutationDisabledReason}
             onFilterChange={setImageFilter}
             onInspect={openImageInspect}
-            onLoad={() => setLoadImage({ ...emptyLoadImage, open: true })}
-            onPull={() => setPullImage({ ...emptyPullImage, open: true })}
+            onLoad={openLoadImageModal}
+            onPull={openPullImageModal}
             onPush={openPushImageModal}
             onRemove={openRemoveImagePlan}
             onRun={openRunImageModal}
@@ -6405,13 +8211,11 @@ function App() {
           <VolumesPage
             datasetScopeKey={datasetScopeKey}
             filter={volumeFilter}
-            loading={inventoryStatus === "loading"}
+            loading={volumesLoading}
             mutationsDisabled={mutationsDisabled}
             mutationDisabledReason={mutationDisabledReason}
             onBackup={openBackupVolume}
-            onCreate={() =>
-              setCreateVolume({ ...emptyCreateVolume, open: true })
-            }
+            onCreate={openCreateVolumeModal}
             onFilterChange={setVolumeFilter}
             onInspect={openVolumeInspect}
             onRemove={openRemoveVolumePlan}
@@ -6435,12 +8239,16 @@ function App() {
               detail={
                 activeNetworkID ? networkDetails[activeNetworkID] : undefined
               }
-              loading={inventoryStatus === "loading"}
+              loading={
+                networksLoading ||
+                containersLoading ||
+                networkDetailLoadingID === activeNetworkID
+              }
               mutationsDisabled={mutationsDisabled}
               mutationDisabledReason={mutationDisabledReason}
               network={network}
               onBack={() => {
-                setActiveNetworkID(null);
+                updateActiveNetworkID(null);
                 setNetworkTab("overview");
               }}
               onOpenContainerInspect={openContainerInspect}
@@ -6460,14 +8268,12 @@ function App() {
         return (
           <NetworksPage
             datasetScopeKey={datasetScopeKey}
-            loading={inventoryStatus === "loading"}
+            loading={networksLoading}
             mutationsDisabled={mutationsDisabled}
             mutationDisabledReason={mutationDisabledReason}
             networkDetails={networkDetails}
             networks={networks}
-            onCreate={() =>
-              setCreateNetwork({ ...emptyCreateNetwork, open: true })
-            }
+            onCreate={openCreateNetworkModal}
             onInspect={openNetworkDetail}
             onRemove={openRemoveNetworkPlan}
             search={search}
@@ -6483,7 +8289,10 @@ function App() {
             diskReclaimable={diskReclaimable}
             diskTotal={diskTotal}
             dockerRunning={dockerRunning}
+            dockerScopeGeneration={dockerScopeGenerationRef.current}
             images={images}
+            isDockerScopeCurrent={dockerScopeMatches}
+            key={`overview-${dockerScopeGenerationRef.current}`}
             latestSamples={latestSamples}
             liveGPU={liveGPU}
             metricsStreamError={statsStreamError}
@@ -6493,7 +8302,7 @@ function App() {
             onImportProject={openImportProject}
             onCheckUpdates={checkAllUpdates}
             onCleanupApplied={async () => {
-              await refreshInventory();
+              await refreshInventoryFresh();
               await refreshProjects();
               await refreshUpdateSurfaces();
             }}
@@ -6510,6 +8319,9 @@ function App() {
             refreshToken={dashboardRefreshToken}
             runningContainers={runningContainers}
             unhealthyContainers={unhealthyContainers}
+            updateCheckRunning={Boolean(
+              updateCheckJobID || updateCheckProgress,
+            )}
             volumes={volumes}
           />
         );
@@ -6779,7 +8591,7 @@ function App() {
                         ? updatesStatus === "loading" ||
                           updateHistoryStatus === "loading" ||
                           ignoredUpdatesStatus === "loading"
-                        : inventoryStatus === "loading"
+                        : inventoryLoading
                   }
                   onClick={() => {
                     if (activePage === "projects") {
@@ -6841,6 +8653,7 @@ function App() {
             dockerStopped={dockerStopped}
             dockerUnreachable={dockerUnreachable}
             inventoryError={inventoryError}
+            inventoryStale={inventoryStale}
             noProviderConfigured={noProviderConfigured}
             onOpenAppUpdate={() => {
               void openAppUpdate();
@@ -6850,6 +8663,9 @@ function App() {
             onOpenSetup={openProviderSetup}
             onRetry={() => {
               void retryProviderDetection();
+            }}
+            onRetryInventory={() => {
+              void refreshInventoryFresh();
             }}
             onStart={() => {
               void startProvider();
@@ -6897,10 +8713,7 @@ function App() {
 
       <ToastViewport toasts={toasts} />
 
-      <InspectModal
-        inspect={inspect}
-        onClose={() => setInspect(emptyInspect)}
-      />
+      <InspectModal inspect={inspect} onClose={closeInspect} />
       <CommandPalette
         activePage={activePage}
         onClose={() => setPaletteOpen(false)}
@@ -6917,10 +8730,10 @@ function App() {
         onChangeTypedName={(typedName) =>
           setConfirm((current) => ({ ...current, typedName }))
         }
-        onClose={() => setConfirm(emptyConfirm)}
+        onClose={closeConfirm}
       />
       <RemoveProjectModal
-        onClose={() => setRemoveProject(emptyRemoveProject)}
+        onClose={closeRemoveProject}
         onConfirm={() => {
           void confirmRemoveProject();
         }}
@@ -6933,14 +8746,14 @@ function App() {
         onChange={(patch) =>
           setUpdatePlan((current) => ({ ...current, ...patch }))
         }
-        onClose={() => setUpdatePlan(emptyUpdatePlan)}
+        onClose={closeUpdatePlan}
         state={updatePlan}
       />
       <IgnoreUpdateModal
         onChange={(patch) =>
           setIgnoreUpdate((current) => ({ ...current, ...patch }))
         }
-        onClose={() => setIgnoreUpdate(emptyIgnoreUpdate)}
+        onClose={closeIgnoreUpdate}
         onSubmit={() => {
           void submitIgnoreUpdate();
         }}
@@ -7023,7 +8836,9 @@ function App() {
           void runProviderSetupChecks();
         }}
         onSavePermission={() => {
-          void saveSetting("linux.sudo_mode", permissionMode);
+          void saveSetting("linux.sudo_mode", permissionMode, {
+            preserveProviderSetup: true,
+          });
         }}
         onStep={(step) =>
           setSetup((current) =>
@@ -7042,7 +8857,7 @@ function App() {
       />
       <RenameContainerModal
         onChange={(name) => setRename((current) => ({ ...current, name }))}
-        onClose={() => setRename(emptyRename)}
+        onClose={closeRenameModal}
         onSubmit={() => {
           void submitRename();
         }}
@@ -7060,7 +8875,7 @@ function App() {
         onChange={(patch) =>
           setRunImage((current) => ({ ...current, ...patch }))
         }
-        onClose={() => setRunImage(emptyRunImage)}
+        onClose={closeRunImage}
         onSelectHubResult={(result) =>
           setRunImage((current) => ({
             ...current,
@@ -7089,7 +8904,7 @@ function App() {
         onChange={(patch) =>
           setPullImage((current) => ({ ...current, ...patch }))
         }
-        onClose={() => setPullImage(emptyPullImage)}
+        onClose={closePullImageModal}
         onSelectResult={(result) =>
           setPullImage((current) => ({
             ...current,
@@ -7109,7 +8924,7 @@ function App() {
         onChange={(patch) =>
           setTagImage((current) => ({ ...current, ...patch }))
         }
-        onClose={() => setTagImage(emptyTagImage)}
+        onClose={closeTagImageModal}
         onSubmit={() => {
           void submitTagImage();
         }}
@@ -7121,7 +8936,7 @@ function App() {
         onChange={(patch) =>
           setPushImage((current) => ({ ...current, ...patch }))
         }
-        onClose={() => setPushImage(emptyPushImage)}
+        onClose={closePushImage}
         onCopyPull={(ref) => {
           void copyText(`docker pull ${ref}`, {
             successTitle: "Pull command copied",
@@ -7140,7 +8955,7 @@ function App() {
         onChange={(patch) =>
           setSaveImage((current) => ({ ...current, ...patch }))
         }
-        onClose={() => setSaveImage(emptySaveImage)}
+        onClose={closeSaveImageModal}
         onSubmit={() => {
           void submitSaveImage();
         }}
@@ -7150,7 +8965,7 @@ function App() {
         onChange={(patch) =>
           setLoadImage((current) => ({ ...current, ...patch }))
         }
-        onClose={() => setLoadImage(emptyLoadImage)}
+        onClose={closeLoadImageModal}
         onSubmit={() => {
           void submitLoadImage();
         }}
@@ -7160,7 +8975,7 @@ function App() {
         onChange={(patch) =>
           setRegistryLogin((current) => ({ ...current, ...patch }))
         }
-        onClose={() => setRegistryLogin(emptyRegistryLogin)}
+        onClose={closeRegistryLogin}
         onSubmit={() => {
           void submitRegistryLogin();
         }}
@@ -7171,7 +8986,7 @@ function App() {
         onChange={(patch) =>
           setCreateVolume((current) => ({ ...current, ...patch }))
         }
-        onClose={() => setCreateVolume(emptyCreateVolume)}
+        onClose={closeCreateVolumeModal}
         onSubmit={() => {
           void submitCreateVolume();
         }}
@@ -7181,7 +8996,7 @@ function App() {
         onChange={(patch) =>
           setBackupVolume((current) => ({ ...current, ...patch }))
         }
-        onClose={() => setBackupVolume(emptyBackupVolume)}
+        onClose={closeBackupVolume}
         onSubmit={() => {
           void submitBackupVolume();
         }}
@@ -7201,7 +9016,7 @@ function App() {
         onChange={(patch) =>
           setCreateNetwork((current) => ({ ...current, ...patch }))
         }
-        onClose={() => setCreateNetwork(emptyCreateNetwork)}
+        onClose={closeCreateNetworkModal}
         onSubmit={() => {
           void submitCreateNetwork();
         }}
@@ -7237,12 +9052,14 @@ function GlobalStateBanner({
   dockerStopped,
   dockerUnreachable,
   inventoryError,
+  inventoryStale,
   noProviderConfigured,
   onOpenAppUpdate,
   onOpenProviderUpdate,
   onOpenRepair,
   onOpenSetup,
   onRetry,
+  onRetryInventory,
   onStart,
   permissionProblem,
   providerProblems,
@@ -7256,12 +9073,14 @@ function GlobalStateBanner({
   dockerStopped: boolean;
   dockerUnreachable: boolean;
   inventoryError: string | null;
+  inventoryStale: boolean;
   noProviderConfigured: boolean;
   onOpenAppUpdate: () => void;
   onOpenProviderUpdate: () => void;
   onOpenRepair: () => void;
   onOpenSetup: () => void;
   onRetry: () => void;
+  onRetryInventory: () => void;
   onStart: () => void;
   permissionProblem: ProviderProblem | null;
   providerProblems: ProviderProblem[];
@@ -7316,36 +9135,50 @@ function GlobalStateBanner({
                   "Cached data is visible; Docker actions are disabled until the engine is running.",
                 action: null,
               }
-            : warning
+            : inventoryStale
               ? {
-                  tone: "info" as const,
+                  tone: "warn" as const,
                   icon: <AlertTriangle size={17} />,
-                  title: warning.message,
-                  body: "Provider warning",
+                  title: "Some Docker data is stale",
+                  body:
+                    inventoryError ??
+                    "The last successful data remains visible while Cairn retries.",
                   action: {
-                    label:
-                      warning.code === "DOCKER_PACKAGES_OUTDATED"
-                        ? "Update"
-                        : "Repair / update",
-                    icon: <Wrench size={15} />,
-                    onClick: onOpenProviderUpdate,
+                    label: "Retry",
+                    icon: <RefreshCw size={15} />,
+                    onClick: onRetryInventory,
                   },
                 }
-              : appUpdateNotice
+              : warning
                 ? {
                     tone: "info" as const,
-                    icon: <Download size={17} />,
-                    title: `Cairn ${appUpdateNotice.version} is available`,
-                    body:
-                      appUpdateNotice.name ??
-                      "A new desktop app release is ready to download.",
+                    icon: <AlertTriangle size={17} />,
+                    title: warning.message,
+                    body: "Provider warning",
                     action: {
-                      label: "Download",
-                      icon: <Download size={15} />,
-                      onClick: onOpenAppUpdate,
+                      label:
+                        warning.code === "DOCKER_PACKAGES_OUTDATED"
+                          ? "Update"
+                          : "Repair / update",
+                      icon: <Wrench size={15} />,
+                      onClick: onOpenProviderUpdate,
                     },
                   }
-                : null;
+                : appUpdateNotice
+                  ? {
+                      tone: "info" as const,
+                      icon: <Download size={17} />,
+                      title: `Cairn ${appUpdateNotice.version} is available`,
+                      body:
+                        appUpdateNotice.name ??
+                        "A new desktop app release is ready to download.",
+                      action: {
+                        label: "Download",
+                        icon: <Download size={15} />,
+                        onClick: onOpenAppUpdate,
+                      },
+                    }
+                  : null;
 
   if (!state) {
     return null;
@@ -8544,6 +10377,8 @@ type OverviewProps = {
   chartPaused: boolean;
   chartPoints: DashboardChartPoint[];
   containerSparks: Record<string, SparkPoint[]>;
+  dockerScopeGeneration: number;
+  isDockerScopeCurrent: (scopeGeneration: number) => boolean;
   provider: ProviderSummary | null;
   dockerRunning: boolean;
   mutationsDisabled: boolean;
@@ -8561,6 +10396,7 @@ type OverviewProps = {
   refreshToken: number;
   runningContainers: number;
   unhealthyContainers: number;
+  updateCheckRunning: boolean;
   diskTotal: number;
   diskReclaimable: number;
   onImportProject: () => void;
@@ -8582,7 +10418,9 @@ function OverviewPage({
   diskReclaimable,
   diskTotal,
   dockerRunning,
+  dockerScopeGeneration,
   images,
+  isDockerScopeCurrent,
   latestSamples,
   liveGPU,
   metricsStreamError,
@@ -8605,6 +10443,7 @@ function OverviewPage({
   refreshToken,
   runningContainers,
   unhealthyContainers,
+  updateCheckRunning,
   volumes,
 }: OverviewProps) {
   const [dashboard, setDashboard] = useState<DashboardMetrics | null>(null);
@@ -8615,6 +10454,7 @@ function OverviewPage({
   const [stacked, setStacked] = useState(false);
   const [logPeek, setLogPeek] = useState<LogLine[]>([]);
   const [cleanup, setCleanup] = useState<CleanupState>(emptyCleanup);
+  const cleanupRequestGenerationRef = useRef(0);
   const logStreamIDRef = useRef<string | null>(null);
   const visibleChartPoints = useMemo(
     () => chartPointsForRange(chartPoints, range),
@@ -8622,6 +10462,7 @@ function OverviewPage({
   );
 
   const loadDashboard = useCallback(async () => {
+    const scopeGeneration = dockerScopeGeneration;
     if (!dockerRunning) {
       setDashboardError(null);
       setDashboardStatus("ready");
@@ -8633,18 +10474,30 @@ function OverviewPage({
     setDashboardError(null);
     try {
       const nextDashboard = await MetricsService.GetDashboardMetrics();
+      if (!isDockerScopeCurrent(scopeGeneration)) {
+        return;
+      }
       setDashboard(nextDashboard);
       setDashboardStatus("ready");
     } catch (error: unknown) {
+      if (!isDockerScopeCurrent(scopeGeneration)) {
+        return;
+      }
       setDashboardError(
         error instanceof Error ? error.message : "Unable to load dashboard",
       );
       setDashboardStatus("error");
     }
-  }, [dockerRunning]);
+  }, [dockerRunning, dockerScopeGeneration, isDockerScopeCurrent]);
 
   const applyCleanup = useCallback(
     async (state: CleanupState) => {
+      const scopeGeneration = dockerScopeGeneration;
+      const requestGeneration = cleanupRequestGenerationRef.current + 1;
+      cleanupRequestGenerationRef.current = requestGeneration;
+      const requestMatches = () =>
+        isDockerScopeCurrent(scopeGeneration) &&
+        cleanupRequestGenerationRef.current === requestGeneration;
       const kinds = cleanupKinds(state);
       const initialResults = kinds.map((kind) => ({
         kind,
@@ -8668,6 +10521,9 @@ function OverviewPage({
             ),
           }));
           const plan = await DockerService.PlanPrune(kind);
+          if (!requestMatches()) {
+            return;
+          }
           if (!plan) {
             throw new Error("Cleanup plan was empty");
           }
@@ -8675,6 +10531,9 @@ function OverviewPage({
             plan.planID,
             plan.requiresTypedName ? state.typedName : "",
           );
+          if (!requestMatches()) {
+            return;
+          }
           setCleanup((current) => ({
             ...current,
             results: current.results.map((result) =>
@@ -8685,9 +10544,19 @@ function OverviewPage({
           }));
         }
         await onCleanupApplied();
+        if (!requestMatches()) {
+          return;
+        }
         await loadDashboard();
+        if (!requestMatches()) {
+          return;
+        }
+        cleanupRequestGenerationRef.current += 1;
         setCleanup(emptyCleanup);
       } catch (error: unknown) {
+        if (!requestMatches()) {
+          return;
+        }
         const message =
           error instanceof Error ? error.message : "Unable to clean up Docker";
         setCleanup((current) => {
@@ -8716,14 +10585,32 @@ function OverviewPage({
         });
         try {
           await onCleanupApplied();
+          if (!requestMatches()) {
+            return;
+          }
           await loadDashboard();
         } catch {
           // Keep the prune failure visible; refresh will retry through normal polling.
         }
       }
     },
-    [loadDashboard, onCleanupApplied],
+    [
+      dockerScopeGeneration,
+      isDockerScopeCurrent,
+      loadDashboard,
+      onCleanupApplied,
+    ],
   );
+
+  const openCleanup = useCallback(() => {
+    cleanupRequestGenerationRef.current += 1;
+    setCleanup({ ...emptyCleanup, open: true });
+  }, []);
+
+  const closeCleanup = useCallback(() => {
+    cleanupRequestGenerationRef.current += 1;
+    setCleanup(emptyCleanup);
+  }, []);
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -8855,8 +10742,13 @@ function OverviewPage({
         </Button>
         <Button
           disabled={mutationsDisabled}
-          disabledReason={mutationDisabledReason}
+          disabledReason={
+            updateCheckRunning
+              ? "Update check already running"
+              : mutationDisabledReason
+          }
           icon={<RefreshCw size={15} />}
+          loading={updateCheckRunning}
           onClick={onCheckUpdates}
           size="sm"
         >
@@ -8869,7 +10761,7 @@ function OverviewPage({
           disabled={mutationsDisabled}
           disabledReason={mutationDisabledReason}
           icon={<Trash2 size={15} />}
-          onClick={() => setCleanup({ ...emptyCleanup, open: true })}
+          onClick={openCleanup}
           size="sm"
           variant="danger"
         >
@@ -8911,7 +10803,7 @@ function OverviewPage({
           images={images}
           mutationsDisabled={mutationsDisabled}
           mutationDisabledReason={mutationDisabledReason}
-          onCleanUp={() => setCleanup({ ...emptyCleanup, open: true })}
+          onCleanUp={openCleanup}
           onNavigate={onNavigate}
           onShowContainers={onShowContainers}
           projectCount={projects.length}
@@ -8983,6 +10875,9 @@ function OverviewPage({
             onOpenLogs={() => onNavigate("logs")}
           />
           <UpdatesCard
+            checking={updateCheckRunning}
+            disabled={mutationsDisabled}
+            disabledReason={mutationDisabledReason}
             onCheckNow={onCheckUpdates}
             onOpenProjects={() => onNavigate("projects")}
             projects={projects}
@@ -8996,7 +10891,7 @@ function OverviewPage({
           setCleanup((current) => ({ ...current, ...patch }))
         }
         onConfirm={applyCleanup}
-        onClose={() => setCleanup(emptyCleanup)}
+        onClose={closeCleanup}
         reclaimableLabel={formatBytes(reclaimableBytes)}
         state={cleanup}
       />
@@ -9683,11 +11578,17 @@ function LogsPeekPanel({
 }
 
 function UpdatesCard({
+  checking,
+  disabled,
+  disabledReason,
   onCheckNow,
   onOpenProjects,
   projects,
   summary,
 }: {
+  checking: boolean;
+  disabled: boolean;
+  disabledReason: string;
   projects: ProjectSummary[];
   summary: { image: number; base: number; rebuild: number };
   onCheckNow: () => void;
@@ -9701,7 +11602,16 @@ function UpdatesCard({
     <Card>
       <CardHeader
         actions={
-          <Button icon={<RefreshCw size={15} />} onClick={onCheckNow} size="sm">
+          <Button
+            disabled={disabled}
+            disabledReason={
+              checking ? "Update check already running" : disabledReason
+            }
+            icon={<RefreshCw size={15} />}
+            loading={checking}
+            onClick={onCheckNow}
+            size="sm"
+          >
             Check now
           </Button>
         }
@@ -9786,7 +11696,7 @@ const logLevelOptions: Array<{
   { id: "unknown", label: "unknown", tone: "neutral" },
 ];
 
-const logBufferLimit = 50000;
+export const logBufferLimit = 50000;
 const logRowOverscan = 8;
 
 function stopMetricsStreamSafely(streamID: string) {
@@ -9841,25 +11751,44 @@ function LogsPage({
   projectsLoading,
 }: LogsPageProps) {
   const copyText = useClipboard();
-  const [scope, setScope] = useState<LogScope>(initialScope ?? "all");
-  const [selectedProjectID, setSelectedProjectID] = useState(
+  const [scopeSelection, setScope] = useState<LogScope>(initialScope ?? "all");
+  const [projectIDSelection, setSelectedProjectID] = useState(
     initialProjectID ?? "",
   );
-  const [selectedServiceID, setSelectedServiceID] = useState("");
-  const [selectedContainerIDs, setSelectedContainerIDs] = useState<string[]>(
-    initialContainerIDs ?? [],
+  const [serviceIDSelection, setSelectedServiceID] = useState("");
+  const [containerIDSelection, setSelectedContainerIDs] = useState<string[]>(
+    () => initialContainerIDs ?? [],
   );
-  const [lines, setLines] = useState<BufferedLogLine[]>([]);
-  const [streamID, setStreamID] = useState<string | null>(null);
-  const streamIDRef = useRef<string | null>(null);
-  const [streamStatus, setStreamStatus] = useState<LoadStatus>("idle");
-  const [streamError, setStreamError] = useState<string | null>(null);
-  const [streamEnded, setStreamEnded] = useState(false);
+  const [lineBuffer, setLineBuffer] = useState<{
+    requestKey: string;
+    lines: BufferedLogLine[];
+  }>({ requestKey: "", lines: [] });
+  const [streamView, setStreamView] = useState<{
+    requestKey: string;
+    streamID: string | null;
+    status: LoadStatus;
+    error: string | null;
+    ended: boolean;
+  }>({
+    requestKey: "",
+    streamID: null,
+    status: "idle",
+    error: null,
+    ended: false,
+  });
+  const activeLogStreamRef = useRef<{
+    requestKey: string;
+    streamID: string;
+  } | null>(null);
   const [restartNonce, setRestartNonce] = useState(0);
-  const [paused, setPaused] = useState(false);
-  const [pausedAt, setPausedAt] = useState<number | null>(null);
-  const [follow, setFollow] = useState(true);
-  const [unpinnedAt, setUnpinnedAt] = useState<number | null>(null);
+  const [pauseAnchor, setPauseAnchor] = useState<{
+    requestKey: string;
+    beforeSequence: number;
+  } | null>(null);
+  const [unpinAnchor, setUnpinAnchor] = useState<{
+    requestKey: string;
+    atSequence: number;
+  } | null>(null);
   const [showTimestamps, setShowTimestamps] = useState(true);
   const [wrapLines, setWrapLines] = useState(false);
   const [sourceFilter, setSourceFilter] = useState<string | null>(null);
@@ -9874,11 +11803,21 @@ function LogsPage({
   const [viewportHeight, setViewportHeight] = useState(520);
   const [exportLogs, setExportLogs] =
     useState<ExportLogsState>(emptyExportLogs);
+  const [logLineDetail, setLogLineDetail] = useState<{
+    requestKey: string;
+    line: BufferedLogLine;
+  } | null>(null);
   const viewerRef = useRef<HTMLDivElement>(null);
   const followScrollRAFRef = useRef<number | null>(null);
   const followScrollTimerRef = useRef<number | null>(null);
   const lastFollowScrollAtRef = useRef(0);
   const nextLogSequenceRef = useRef(0);
+  const [nextLogSequence, setNextLogSequence] = useState(0);
+  const exportLogsDraftGenerationRef = useRef(0);
+  const exportLogsRequestGenerationRef = useRef(0);
+  const activeExportLogsRequestRef = useRef<ExportLogsRequestOwner | null>(
+    null,
+  );
 
   const projectOptions = useMemo<LogOption[]>(
     () =>
@@ -9921,35 +11860,23 @@ function LogsPage({
   );
 
   const initialContainerIDsKey = (initialContainerIDs ?? []).join("\u0000");
-
-  useEffect(() => {
-    if (initialScope) {
-      setScope(initialScope);
-    }
-    if (typeof initialProjectID === "string") {
-      setSelectedProjectID(initialProjectID);
-    }
-    if (typeof initialContainerIDsKey === "string") {
-      setSelectedContainerIDs(
-        initialContainerIDsKey ? initialContainerIDsKey.split("\u0000") : [],
-      );
-    }
-  }, [initialContainerIDsKey, initialProjectID, initialScope]);
-
-  useEffect(() => {
-    if (scope === "project" && !selectedProjectID && projectOptions[0]) {
-      setSelectedProjectID(projectOptions[0].id);
-    }
-    if (scope === "service" && !selectedServiceID && serviceOptions[0]) {
-      setSelectedServiceID(serviceOptions[0].id);
-    }
-  }, [
-    projectOptions,
-    scope,
-    selectedProjectID,
-    selectedServiceID,
-    serviceOptions,
-  ]);
+  const lockedContainerIDs = useMemo(
+    () =>
+      initialContainerIDsKey ? initialContainerIDsKey.split("\u0000") : [],
+    [initialContainerIDsKey],
+  );
+  const scope = lockedScope && initialScope ? initialScope : scopeSelection;
+  const selectedProjectID =
+    (lockedScope && typeof initialProjectID === "string"
+      ? initialProjectID
+      : projectIDSelection) ||
+    projectOptions[0]?.id ||
+    "";
+  const selectedServiceID = serviceIDSelection || serviceOptions[0]?.id || "";
+  const selectedContainerIDs =
+    lockedScope && initialContainerIDs !== undefined
+      ? lockedContainerIDs
+      : containerIDSelection;
 
   useEffect(() => {
     const timer = window.setTimeout(() => {
@@ -9978,7 +11905,8 @@ function LogsPage({
   useEffect(() => {
     const offLines = Events.On("logs:lines", (event) => {
       const payload = eventPayload<LogLinesPayload>(event);
-      if (!payload || payload.streamID !== streamIDRef.current) {
+      const activeStream = activeLogStreamRef.current;
+      if (!payload || payload.streamID !== activeStream?.streamID) {
         return;
       }
       const nextLines = (payload.lines ?? []).filter(isLogLine);
@@ -9989,28 +11917,49 @@ function LogsPage({
         ...line,
         bufferSequence: nextLogSequenceRef.current++,
       }));
-      setLines((current) => {
-        const merged = current.concat(bufferedLines);
-        return merged.length > logBufferLimit
-          ? merged.slice(merged.length - logBufferLimit)
-          : merged;
+      setNextLogSequence(nextLogSequenceRef.current);
+      setLineBuffer((current) => {
+        const currentLines =
+          current.requestKey === activeStream.requestKey ? current.lines : [];
+        const merged = currentLines.concat(bufferedLines);
+        return {
+          requestKey: activeStream.requestKey,
+          lines:
+            merged.length > logBufferLimit
+              ? merged.slice(merged.length - logBufferLimit)
+              : merged,
+        };
       });
     });
     const offEOF = Events.On("logs:eof", (event) => {
       const payload = eventPayload<LogErrorPayload>(event);
-      if (!payload || payload.streamID !== streamIDRef.current) {
+      const activeStream = activeLogStreamRef.current;
+      if (!payload || payload.streamID !== activeStream?.streamID) {
         return;
       }
-      setStreamEnded(true);
-      setStreamStatus("ready");
+      setStreamView((current) =>
+        current.requestKey === activeStream.requestKey &&
+        current.streamID === activeStream.streamID
+          ? { ...current, ended: true, status: "ready" }
+          : current,
+      );
     });
     const offError = Events.On("logs:error", (event) => {
       const payload = eventPayload<LogErrorPayload>(event);
-      if (!payload || payload.streamID !== streamIDRef.current) {
+      const activeStream = activeLogStreamRef.current;
+      if (!payload || payload.streamID !== activeStream?.streamID) {
         return;
       }
-      setStreamError(payload.error ?? "Log stream failed");
-      setStreamStatus("error");
+      setStreamView((current) =>
+        current.requestKey === activeStream.requestKey &&
+        current.streamID === activeStream.streamID
+          ? {
+              ...current,
+              error: payload.error ?? "Log stream failed",
+              status: "error",
+            }
+          : current,
+      );
     });
     return () => {
       offLines();
@@ -10032,30 +11981,39 @@ function LogsPage({
     return [];
   }, [scope, selectedContainerIDs, selectedProjectID, selectedServiceID]);
   const canStream = dockerRunning && (scope === "all" || streamIDs.length > 0);
+  const streamRequestKey = JSON.stringify([
+    canStream,
+    scope,
+    streamIDs,
+    restartNonce,
+  ]);
+  const streamViewIsCurrent =
+    streamView.requestKey === streamRequestKey && canStream;
+  const lines = useMemo(
+    () => (lineBuffer.requestKey === streamRequestKey ? lineBuffer.lines : []),
+    [lineBuffer, streamRequestKey],
+  );
+  const streamID = streamViewIsCurrent ? streamView.streamID : null;
+  const streamStatus: LoadStatus = !canStream
+    ? "idle"
+    : streamViewIsCurrent
+      ? streamView.status
+      : "loading";
+  const streamError = streamViewIsCurrent ? streamView.error : null;
+  const streamEnded = streamViewIsCurrent && streamView.ended;
+  const paused = pauseAnchor?.requestKey === streamRequestKey;
+  const pausedBeforeSequence = paused ? pauseAnchor.beforeSequence : null;
+  const follow = unpinAnchor?.requestKey !== streamRequestKey;
+  const unpinnedAtSequence = follow ? null : unpinAnchor.atSequence;
 
   useEffect(() => {
+    activeLogStreamRef.current = null;
     if (!canStream) {
-      streamIDRef.current = null;
-      setLines([]);
-      setStreamID(null);
-      setStreamStatus("idle");
-      setStreamError(null);
-      setStreamEnded(false);
       return undefined;
     }
 
     let cancelled = false;
     let activeStreamID: string | null = null;
-    streamIDRef.current = null;
-    setLines([]);
-    setStreamID(null);
-    setStreamStatus("loading");
-    setStreamError(null);
-    setStreamEnded(false);
-    setPaused(false);
-    setPausedAt(null);
-    setFollow(true);
-    setUnpinnedAt(null);
 
     LogsService.StartLogStream({
       scope,
@@ -10070,38 +12028,53 @@ function LogsPage({
           return;
         }
         activeStreamID = nextStreamID;
-        streamIDRef.current = nextStreamID;
-        setStreamID(nextStreamID);
-        setStreamStatus("ready");
+        activeLogStreamRef.current = {
+          requestKey: streamRequestKey,
+          streamID: nextStreamID,
+        };
+        setLineBuffer({ requestKey: streamRequestKey, lines: [] });
+        setStreamView({
+          requestKey: streamRequestKey,
+          streamID: nextStreamID,
+          status: "ready",
+          error: null,
+          ended: false,
+        });
       })
       .catch((error: unknown) => {
         if (!cancelled) {
-          setStreamError(
-            error instanceof Error ? error.message : "Unable to start logs",
-          );
-          setStreamStatus("error");
+          setStreamView({
+            requestKey: streamRequestKey,
+            streamID: null,
+            status: "error",
+            error:
+              error instanceof Error ? error.message : "Unable to start logs",
+            ended: false,
+          });
         }
       });
 
     return () => {
       cancelled = true;
-      streamIDRef.current = null;
+      if (activeLogStreamRef.current?.requestKey === streamRequestKey) {
+        activeLogStreamRef.current = null;
+      }
       if (activeStreamID) {
         stopLogStreamSafely(activeStreamID);
       }
     };
-  }, [canStream, restartNonce, scope, streamIDs]);
+  }, [canStream, scope, streamIDs, streamRequestKey]);
 
-  const pausedViewLength =
-    paused && pausedAt !== null
-      ? Math.min(pausedAt, lines.length)
-      : lines.length;
-  const pausedNewCount = paused
-    ? Math.max(0, lines.length - pausedViewLength)
-    : 0;
+  const pausedNewCount =
+    paused && pausedBeforeSequence !== null
+      ? Math.max(0, nextLogSequence - pausedBeforeSequence)
+      : 0;
   const visibleSource = useMemo(
-    () => lines.slice(0, pausedViewLength),
-    [lines, pausedViewLength],
+    () =>
+      paused && pausedBeforeSequence !== null
+        ? lines.filter((line) => line.bufferSequence < pausedBeforeSequence)
+        : lines,
+    [lines, paused, pausedBeforeSequence],
   );
   const filteredLines = useMemo(
     () =>
@@ -10154,8 +12127,6 @@ function LogsPage({
       : -1;
   const activeMatchIndex =
     matchRows.length === 0 ? -1 : Math.max(0, selectedMatchIndex);
-  const activeMatchSequence =
-    activeMatchIndex >= 0 ? matchRows[activeMatchIndex].sequence : null;
   const activeMatchRow =
     activeMatchIndex >= 0 ? matchRows[activeMatchIndex].rowIndex : null;
   const rowHeight = wrapLines ? 44 : 26;
@@ -10172,27 +12143,9 @@ function LogsPage({
   );
   const virtualRows = filteredLines.slice(virtualStart, virtualEnd);
   const newLinesWhileUnpinned =
-    !follow && !paused && unpinnedAt !== null
-      ? Math.max(0, filteredLines.length - unpinnedAt)
+    !follow && !paused && unpinnedAtSequence !== null
+      ? Math.max(0, nextLogSequence - unpinnedAtSequence)
       : 0;
-
-  useEffect(() => {
-    setActiveMatch((current) => {
-      if (activeMatchSequence === null) {
-        return current === null ? current : null;
-      }
-      if (
-        current?.selectionKey === matchSelectionKey &&
-        current.sequence === activeMatchSequence
-      ) {
-        return current;
-      }
-      return {
-        selectionKey: matchSelectionKey,
-        sequence: activeMatchSequence,
-      };
-    });
-  }, [activeMatchSequence, matchSelectionKey]);
 
   useEffect(() => {
     if (!follow || paused) {
@@ -10253,8 +12206,7 @@ function LogsPage({
   }, []);
 
   const scrollToBottom = useCallback(() => {
-    setFollow(true);
-    setUnpinnedAt(null);
+    setUnpinAnchor(null);
     window.requestAnimationFrame(() => {
       const node = viewerRef.current;
       if (node) {
@@ -10296,38 +12248,69 @@ function LogsPage({
     [matchRows, matchSelectionKey, rowHeight],
   );
 
-  const browseExportPath = useCallback(async () => {
-    const format = exportLogs.format;
-    const selected = await Dialogs.SaveFile({
-      Title: "Export Logs",
-      Message: "Choose a log export file",
-      ButtonText: "Export",
-      Filename: `cairn-${scope}-logs.${format}`,
-      Filters: [
-        {
-          DisplayName: format === "jsonl" ? "JSON Lines" : "Log file",
-          Pattern: format === "jsonl" ? "*.jsonl" : "*.log",
-        },
-      ],
+  const openExportLogsDraft = useCallback(() => {
+    exportLogsDraftGenerationRef.current += 1;
+    setExportLogs({
+      ...emptyExportLogs,
+      open: true,
+      busy: activeExportLogsRequestRef.current !== null,
     });
-    if (selected) {
-      setExportLogs((current) => ({ ...current, path: selected }));
-    }
-  }, [exportLogs.format, scope]);
+  }, []);
+
+  const changeExportLogsDraft = useCallback(
+    (patch: Partial<ExportLogsState>) => {
+      exportLogsDraftGenerationRef.current += 1;
+      setExportLogs((current) => ({
+        ...current,
+        ...patch,
+        error: undefined,
+      }));
+    },
+    [],
+  );
+
+  const closeExportLogsDraft = useCallback(() => {
+    exportLogsDraftGenerationRef.current += 1;
+    setExportLogs(emptyExportLogs);
+  }, []);
 
   const submitExport = useCallback(async () => {
+    if (activeExportLogsRequestRef.current) {
+      return;
+    }
+    const owner: ExportLogsRequestOwner = {
+      draftGeneration: exportLogsDraftGenerationRef.current,
+      requestGeneration: exportLogsRequestGenerationRef.current + 1,
+    };
+    exportLogsRequestGenerationRef.current = owner.requestGeneration;
+    activeExportLogsRequestRef.current = owner;
+    const request = {
+      scope,
+      ids: [...streamIDs],
+      format: exportLogs.format,
+      tail: exportLogs.range === "tail" ? 5000 : undefined,
+    };
     setExportLogs((current) => ({ ...current, busy: true, error: undefined }));
     try {
-      const result = await LogsService.ExportLogs({
-        scope,
-        ids: streamIDs,
-        path: exportLogs.path,
-        tail: exportLogs.range === "tail" ? 5000 : undefined,
-      });
+      const result = await LogsService.ExportLogs(request);
       if (!result) {
         throw new Error("Log export did not return a result");
       }
-      setExportLogs({ ...emptyExportLogs, result });
+      if (activeExportLogsRequestRef.current === owner) {
+        activeExportLogsRequestRef.current = null;
+        if (exportLogsDraftGenerationRef.current === owner.draftGeneration) {
+          exportLogsDraftGenerationRef.current += 1;
+          setExportLogs(emptyExportLogs);
+        } else {
+          setExportLogs((current) => ({ ...current, busy: false }));
+        }
+      }
+      const warnings = [
+        result.truncated
+          ? "The export reached its safety limit and is incomplete."
+          : "",
+        result.durabilityWarning ?? "",
+      ].filter(Boolean);
       onToast({
         action: (
           <Button
@@ -10343,18 +12326,43 @@ function LogsPage({
             Copy path
           </Button>
         ),
-        body: `${formatCount(result.lineCount)} lines saved`,
-        level: "ok",
-        title: "Logs exported",
+        body: [
+          `${formatCount(result.lineCount)} lines saved.`,
+          ...warnings,
+        ].join(" "),
+        level: warnings.length > 0 ? "warn" : "ok",
+        title:
+          warnings.length > 0 ? "Logs exported with warnings" : "Logs exported",
       });
     } catch (error: unknown) {
-      setExportLogs((current) => ({
-        ...current,
-        busy: false,
-        error: error instanceof Error ? error.message : "Unable to export logs",
-      }));
+      const message =
+        error instanceof Error ? error.message : "Unable to export logs";
+      if (activeExportLogsRequestRef.current === owner) {
+        activeExportLogsRequestRef.current = null;
+        if (exportLogsDraftGenerationRef.current === owner.draftGeneration) {
+          setExportLogs((current) => ({
+            ...current,
+            busy: false,
+            error: message,
+          }));
+        } else {
+          setExportLogs((current) => ({ ...current, busy: false }));
+        }
+      }
+      onToast({
+        body: message,
+        level: "error",
+        title: "Log export failed",
+      });
     }
-  }, [copyText, exportLogs.path, exportLogs.range, onToast, scope, streamIDs]);
+  }, [
+    copyText,
+    exportLogs.format,
+    exportLogs.range,
+    onToast,
+    scope,
+    streamIDs,
+  ]);
 
   const streamLabel =
     lockedScope && scope === "project" && selectedProjectID
@@ -10489,12 +12497,13 @@ function LogsPage({
                 icon={paused ? <Play size={16} /> : <Pause size={16} />}
                 onClick={() => {
                   if (paused) {
-                    setPaused(false);
-                    setPausedAt(null);
+                    setPauseAnchor(null);
                     scrollToBottom();
                   } else {
-                    setPaused(true);
-                    setPausedAt(lines.length);
+                    setPauseAnchor({
+                      requestKey: streamRequestKey,
+                      beforeSequence: nextLogSequence,
+                    });
                   }
                 }}
                 variant={paused ? "primary" : "secondary"}
@@ -10532,13 +12541,7 @@ function LogsPage({
             <Tooltip label="Export logs">
               <Button
                 icon={<Download size={16} />}
-                onClick={() =>
-                  setExportLogs({
-                    ...emptyExportLogs,
-                    open: true,
-                    path: `cairn-${scope}-logs.jsonl`,
-                  })
-                }
+                onClick={openExportLogsDraft}
               >
                 Export
               </Button>
@@ -10580,8 +12583,7 @@ function LogsPage({
           <span>Paused - {formatCount(pausedNewCount)} new lines</span>
           <Button
             onClick={() => {
-              setPaused(false);
-              setPausedAt(null);
+              setPauseAnchor(null);
               scrollToBottom();
             }}
             size="sm"
@@ -10633,12 +12635,13 @@ function LogsPage({
                 node.scrollHeight - node.clientHeight - nextTop;
               if (distanceFromBottom > 48) {
                 if (follow) {
-                  setUnpinnedAt(filteredLines.length);
+                  setUnpinAnchor({
+                    requestKey: streamRequestKey,
+                    atSequence: nextLogSequence,
+                  });
                 }
-                setFollow(false);
               } else if (!paused) {
-                setFollow(true);
-                setUnpinnedAt(null);
+                setUnpinAnchor(null);
               }
             }}
             ref={viewerRef}
@@ -10652,6 +12655,12 @@ function LogsPage({
                     activeSearch={activeMatchRow === rowIndex}
                     key={line.bufferSequence}
                     line={line}
+                    onInspect={(selectedLine) =>
+                      setLogLineDetail({
+                        requestKey: streamRequestKey,
+                        line: selectedLine,
+                      })
+                    }
                     onSourceClick={setSourceFilter}
                     query={debouncedQuery}
                     rowHeight={rowHeight}
@@ -10677,25 +12686,35 @@ function LogsPage({
       ) : null}
 
       <LogsExportModal
-        currentFilters={logFilterSummary(
-          scope,
-          streamIDs,
-          levelFilters,
-          sourceFilter,
-          debouncedQuery,
-        )}
-        onBrowse={() => {
-          void browseExportPath();
-        }}
-        onChange={(patch) =>
-          setExportLogs((current) => ({ ...current, ...patch }))
-        }
-        onClose={() => setExportLogs(emptyExportLogs)}
+        onChange={changeExportLogsDraft}
+        onClose={closeExportLogsDraft}
         onSubmit={() => {
           void submitExport();
         }}
+        scopeSummary={streamLabel}
         state={exportLogs}
       />
+      <Modal
+        onClose={() => setLogLineDetail(null)}
+        open={logLineDetail?.requestKey === streamRequestKey}
+        size="lg"
+        title="Log line details"
+      >
+        {logLineDetail?.requestKey === streamRequestKey ? (
+          <div className="space-y-3">
+            <div className="flex flex-wrap gap-2 text-xs text-text-muted">
+              <span>{formatLogTimestamp(logLineDetail.line.ts)}</span>
+              <span>{logSource(logLineDetail.line)}</span>
+              <span>
+                {normalizeLogLevel(logLineDetail.line.level).toUpperCase()}
+              </span>
+            </div>
+            <pre className="max-h-[60vh] overflow-auto whitespace-pre-wrap break-words rounded-control border border-border bg-bg-inset p-3 font-mono text-xs text-text-primary">
+              {renderAnsiText(logLineDetail.line.text, "")}
+            </pre>
+          </div>
+        ) : null}
+      </Modal>
     </div>
   );
 }
@@ -10965,6 +12984,7 @@ function LogContainerScopeChecklist({
 function LogRow({
   activeSearch,
   line,
+  onInspect,
   onSourceClick,
   query,
   rowHeight,
@@ -10973,7 +12993,8 @@ function LogRow({
   wrap,
 }: {
   activeSearch: boolean;
-  line: LogLine;
+  line: BufferedLogLine;
+  onInspect: (line: BufferedLogLine) => void;
   onSourceClick: (source: string) => void;
   query: string;
   rowHeight: number;
@@ -11029,32 +13050,33 @@ function LogRow({
           </Badge>
         </span>
       </Tooltip>
-      <span
+      <button
+        aria-label={`Open full log line from ${source}`}
         className={[
-          "min-w-0 overflow-hidden text-text-primary",
+          "min-w-0 overflow-hidden text-left text-text-primary",
           wrap ? "whitespace-pre-wrap break-words" : "truncate whitespace-pre",
         ].join(" ")}
-        title={wrap ? line.text : undefined}
+        onClick={() => onInspect(line)}
+        title="Open full log line"
+        type="button"
       >
         {renderAnsiText(line.text, query)}
-      </span>
+      </button>
     </div>
   );
 }
 
 function LogsExportModal({
-  currentFilters,
-  onBrowse,
   onChange,
   onClose,
   onSubmit,
+  scopeSummary,
   state,
 }: {
-  currentFilters: string;
-  onBrowse: () => void;
   onChange: (patch: Partial<ExportLogsState>) => void;
   onClose: () => void;
   onSubmit: () => void;
+  scopeSummary: string;
   state: ExportLogsState;
 }) {
   return (
@@ -11063,7 +13085,7 @@ function LogsExportModal({
       footer={
         <ModalActions
           busy={state.busy}
-          disabled={!state.path.trim()}
+          disabled={state.busy}
           onCancel={onClose}
           onSubmit={onSubmit}
           submitLabel="Export"
@@ -11082,13 +13104,11 @@ function LogsExportModal({
           <select
             className="h-9 rounded-control border border-border bg-bg-inset px-3 text-text-primary"
             id="logs-export-format"
-            onChange={(event) => {
-              const format = event.currentTarget.value as "log" | "jsonl";
+            onChange={(event) =>
               onChange({
-                format,
-                path: state.path.replace(/\.(log|jsonl)$/i, `.${format}`),
-              });
-            }}
+                format: event.currentTarget.value as "log" | "jsonl",
+              })
+            }
             value={state.format}
           >
             <option value="jsonl">.jsonl</option>
@@ -11103,35 +13123,23 @@ function LogsExportModal({
             id="logs-export-range"
             onChange={(event) =>
               onChange({
-                range: event.currentTarget.value as "buffer" | "tail",
+                range: event.currentTarget.value as "history" | "tail",
               })
             }
             value={state.range}
           >
-            <option value="buffer">current buffer</option>
-            <option value="tail">tail</option>
+            <option value="history">available history (bounded)</option>
+            <option value="tail">latest 5,000 per container</option>
           </select>
-
-          <label className="text-text-muted" htmlFor="logs-export-path">
-            Path
-          </label>
-          <div className="flex gap-2">
-            <input
-              className="h-9 min-w-0 flex-1 rounded-control border border-border bg-bg-inset px-3 text-text-primary"
-              id="logs-export-path"
-              onChange={(event) =>
-                onChange({ path: event.currentTarget.value })
-              }
-              value={state.path}
-            />
-            <Button onClick={onBrowse} size="sm" variant="secondary">
-              Browse
-            </Button>
-          </div>
         </div>
 
-        <div className="rounded-control border border-border bg-bg-inset px-3 py-2 text-xs text-text-muted">
-          {currentFilters}
+        <div className="space-y-1 rounded-control border border-border bg-bg-inset px-3 py-2 text-xs text-text-muted">
+          <div>Current scope: {scopeSummary}</div>
+          <div>
+            Search, level, source, pause, and visible-buffer filters are not
+            applied. Exports are generated from bounded Docker history and saved
+            in Cairn&apos;s private export folder.
+          </div>
         </div>
         {state.error ? (
           <div className="text-sm text-error">{state.error}</div>
@@ -11457,7 +13465,9 @@ function UpdatesPage({
         <div className="flex flex-wrap gap-2">
           <Button
             disabled={mutationsDisabled}
-            disabledReason={mutationDisabledReason}
+            disabledReason={
+              checking ? "Update check already running" : mutationDisabledReason
+            }
             icon={<RefreshCw size={15} />}
             loading={checking}
             onClick={onCheckNow}
@@ -12447,6 +14457,7 @@ function ProjectDetailPage({
   projectsLoading,
   projectVolumes,
   tab,
+  updateCheckRunning,
   updates,
 }: {
   detail: ProjectDetail | null;
@@ -12466,6 +14477,7 @@ function ProjectDetailPage({
   mutationDisabledReason: string;
   projectVolumes: VolumeSummary[];
   tab: ProjectTabID;
+  updateCheckRunning: boolean;
   updates: ImageUpdate[];
   onAction: (action: ProjectAction, project: ProjectSummary) => void;
   onBack: () => void;
@@ -12705,12 +14717,15 @@ function ProjectDetailPage({
       {tab === "updates" ? (
         <ProjectUpdatesTab
           detail={detail}
+          mutationsDisabled={mutationsDisabled}
+          mutationDisabledReason={mutationDisabledReason}
           lineage={lineage}
           lineageLoading={lineageLoading}
           onCheckUpdates={onCheckUpdates}
           onIgnoreUpdate={onIgnoreUpdate}
           onUpdateProject={onUpdateProject}
           onUpdateService={onUpdateService}
+          updateCheckRunning={updateCheckRunning}
           updates={updates}
         />
       ) : null}
@@ -13959,20 +15974,26 @@ function ProjectUpdatesTab({
   detail,
   lineage,
   lineageLoading,
+  mutationsDisabled,
+  mutationDisabledReason,
   onCheckUpdates,
   onIgnoreUpdate,
   onUpdateProject,
   onUpdateService,
+  updateCheckRunning,
   updates,
 }: {
   detail: ProjectDetail;
   lineage: ImageLineage[];
   lineageLoading: boolean;
+  mutationsDisabled: boolean;
+  mutationDisabledReason: string;
   updates: ImageUpdate[];
   onCheckUpdates: () => void;
   onIgnoreUpdate: (update: ImageUpdate) => void;
   onUpdateProject: () => void;
   onUpdateService: (service: string) => void;
+  updateCheckRunning: boolean;
 }) {
   const actionable = updates.filter(isActionableUpdate);
   const manualRows = updates.filter((update) => !isActionableUpdate(update));
@@ -14007,7 +16028,17 @@ function ProjectUpdatesTab({
           {lineageLoading ? <Badge tone="info">Lineage loading</Badge> : null}
         </div>
         <div className="flex flex-wrap gap-2">
-          <Button icon={<RefreshCw size={15} />} onClick={onCheckUpdates}>
+          <Button
+            disabled={mutationsDisabled}
+            disabledReason={
+              updateCheckRunning
+                ? "Update check already running"
+                : mutationDisabledReason
+            }
+            icon={<RefreshCw size={15} />}
+            loading={updateCheckRunning}
+            onClick={onCheckUpdates}
+          >
             Check now
           </Button>
           <Button
@@ -16461,7 +18492,7 @@ function formatLogClock(ts: number) {
   });
 }
 
-function appendProjectCommandProgress(
+export function appendProjectCommandProgress(
   current: Record<string, ProjectCommandOutputState>,
   payload: ProjectJobEvent,
 ): Record<string, ProjectCommandOutputState> {
@@ -16493,20 +18524,17 @@ function appendProjectCommandProgress(
         tone: projectCommandLineTone(payload.phase),
       })
     : base.lines;
-  return {
-    ...current,
-    [payload.projectID]: {
-      ...base,
-      action: payload.action || base.action,
-      command: payload.command || base.command,
-      status: "running",
-      updatedAt: now,
-      lines: nextLines.slice(-maxProjectCommandOutputLines),
-    },
-  };
+  return withBoundedProjectCommandOutput(current, payload.projectID, {
+    ...base,
+    action: payload.action || base.action,
+    command: payload.command || base.command,
+    status: "running",
+    updatedAt: now,
+    lines: nextLines.slice(-maxProjectCommandOutputLines),
+  });
 }
 
-function appendProjectCommandDone(
+export function appendProjectCommandDone(
   current: Record<string, ProjectCommandOutputState>,
   payload: ProjectJobEvent,
 ): Record<string, ProjectCommandOutputState> {
@@ -16541,19 +18569,64 @@ function appendProjectCommandDone(
     message,
     tone: failed ? "error" : "ok",
   });
-  return {
-    ...current,
-    [payload.projectID]: {
-      ...base,
-      action: payload.action || base.action,
-      command: payload.command || base.command,
-      status: failed ? "failed" : "success",
-      updatedAt: now,
-      lines: lines.slice(-maxProjectCommandOutputLines),
-      result: payload.result,
-      error: payload.error,
-    },
-  };
+  return withBoundedProjectCommandOutput(current, payload.projectID, {
+    ...base,
+    action: payload.action || base.action,
+    command: payload.command || base.command,
+    status: failed ? "failed" : "success",
+    updatedAt: now,
+    lines: lines.slice(-maxProjectCommandOutputLines),
+    result: payload.result,
+    error: payload.error,
+  });
+}
+
+export function upsertBoundedProjectLineageRecord<Value>(
+  current: Record<string, Value>,
+  projectID: string,
+  value: Value,
+): Record<string, Value> {
+  const retained = Object.entries(current)
+    .filter(([key]) => key !== projectID)
+    .slice(-(maxProjectLineageProjects - 1));
+  return Object.fromEntries([...retained, [projectID, value]]);
+}
+
+export function reconcileProjectLineageRecords<Value>(
+  current: Record<string, Value>,
+  projects: ReadonlyArray<Pick<ProjectSummary, "id">>,
+): Record<string, Value> {
+  const projectIDs = new Set(projects.map((project) => project.id));
+  return Object.fromEntries(
+    Object.entries(current)
+      .filter(([projectID]) => projectIDs.has(projectID))
+      .slice(-maxProjectLineageProjects),
+  );
+}
+
+function withBoundedProjectCommandOutput(
+  current: Record<string, ProjectCommandOutputState>,
+  projectID: string,
+  output: ProjectCommandOutputState,
+) {
+  const retained = Object.entries(current)
+    .filter(([key]) => key !== projectID)
+    .sort(([, left], [, right]) => right.updatedAt - left.updatedAt)
+    .slice(0, maxProjectCommandOutputProjects - 1);
+  return Object.fromEntries([...retained, [projectID, output]]);
+}
+
+export function reconcileProjectCommandOutputs(
+  current: Record<string, ProjectCommandOutputState>,
+  projects: ProjectSummary[],
+) {
+  const projectIDs = new Set(projects.map((project) => project.id));
+  return Object.fromEntries(
+    Object.entries(current)
+      .filter(([projectID]) => projectIDs.has(projectID))
+      .sort(([, left], [, right]) => right.updatedAt - left.updatedAt)
+      .slice(0, maxProjectCommandOutputProjects),
+  );
 }
 
 function projectCommandLineTone(
@@ -16853,31 +18926,6 @@ function renderHighlightedText(text: string, query: string, keyPrefix: number) {
     );
   }
   return parts;
-}
-
-function logFilterSummary(
-  scope: LogScope,
-  ids: string[],
-  levels: Set<LogLevelFilter>,
-  source: string | null,
-  query: string,
-) {
-  const selectedLevels = logLevelOptions
-    .filter((level) => levels.has(level.id))
-    .map((level) => level.label)
-    .join(", ");
-  const parts = [
-    `scope ${scope}`,
-    `selected ${ids.length || "all"}`,
-    `levels ${selectedLevels}`,
-  ];
-  if (source) {
-    parts.push(`source ${source}`);
-  }
-  if (query) {
-    parts.push(`search ${query}`);
-  }
-  return parts.join(" | ");
 }
 
 function ImageLineageCard({ lineage }: { lineage: ImageLineage | null }) {
@@ -20318,24 +22366,36 @@ function trimChartPoints(points: DashboardChartPoint[]) {
     : recent;
 }
 
-function appendSparkEntries(
+export function appendSparkEntries(
   current: Record<string, SparkPoint[]>,
   entries: Array<{ id: string; label: string; value: number }>,
 ) {
   if (entries.length === 0) {
     return current;
   }
-  const next = { ...current };
+  // Treat insertion order as LRU order. Metrics events may briefly mention
+  // containers/projects that disappear before inventory reconciliation, so a
+  // per-series point cap alone is insufficient to bound retained state.
+  const next = new Map(Object.entries(current));
   for (const entry of entries) {
     if (!entry.id) {
       continue;
     }
-    const existing = next[entry.id] ?? [];
-    next[entry.id] = existing
-      .concat({ label: entry.label, value: entry.value })
-      .slice(-60);
+    const existing = next.get(entry.id) ?? [];
+    next.delete(entry.id);
+    next.set(
+      entry.id,
+      existing.concat({ label: entry.label, value: entry.value }).slice(-60),
+    );
   }
-  return next;
+  while (next.size > maxSparkSeries) {
+    const oldestID = next.keys().next().value;
+    if (typeof oldestID !== "string") {
+      break;
+    }
+    next.delete(oldestID);
+  }
+  return Object.fromEntries(next);
 }
 
 type SampleAggregate = {

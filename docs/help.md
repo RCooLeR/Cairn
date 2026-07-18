@@ -109,7 +109,9 @@ The local agent helps with Dockerfiles, Compose files, runtime diagnostics, app 
 http://127.0.0.1:11434
 ```
 
-The agent can request known Cairn tools, but the user must approve each tool call. It cannot silently run arbitrary commands or write files. Project file edits use preview and apply plans.
+The Agent endpoint is loopback-only: enter a literal `127.x.x.x` or `[::1]` HTTP(S) address with an explicit port. Cairn rejects DNS names (including `localhost`), non-loopback addresses, URL credentials/query/fragment data, path-prefixed bases, and redirects.
+
+The agent can request known Cairn tools, but the user must approve each tool call. It cannot silently run arbitrary commands or write files. Project-file draft, preview, and apply tools are currently quarantined and unavailable; use the agent's suggestions as manual guidance only.
 
 If Docker and Compose setup look right but the application itself is still broken, the agent should recommend development help from:
 

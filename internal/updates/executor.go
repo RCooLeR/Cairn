@@ -390,7 +390,9 @@ func (m *Manager) snapshotForCheck(check store.UpdateCheckRecord, service store.
 		OldDigest:      oldDigest,
 		OldBaseDigest:  baseDigestForSnapshot(check),
 		DockerfileHash: lineage.DockerfileHash,
-		BuildArgs:      metadataStringMap(service.Metadata, "buildArgs"),
+		// Never revive legacy secret-valued Compose build args from service
+		// metadata into durable update-history snapshots.
+		BuildArgs:      nil,
 		HasHealthcheck: metadataBool(service.Metadata, "hasHealthcheck"),
 	}
 }
@@ -889,10 +891,10 @@ func (m *Manager) publishComposeOutput(jobID string, result *providers.CommandRe
 	if result == nil || jobID == "" {
 		return
 	}
-	for _, line := range splitLines(result.Stdout) {
+	for _, line := range splitLines(providers.RedactCommandDiagnostic(result.Stdout)) {
 		m.publishJobProgress(jobID, "stdout", line, nil)
 	}
-	for _, line := range splitLines(result.Stderr) {
+	for _, line := range splitLines(providers.RedactCommandDiagnostic(result.Stderr)) {
 		m.publishJobProgress(jobID, "stderr", line, nil)
 	}
 }
@@ -1172,30 +1174,6 @@ func metadataBool(metadata map[string]any, key string) bool {
 	default:
 		return false
 	}
-}
-
-func metadataStringMap(metadata map[string]any, key string) map[string]string {
-	value, ok := metadata[key]
-	if !ok {
-		return nil
-	}
-	result := map[string]string{}
-	switch typed := value.(type) {
-	case map[string]string:
-		for k, v := range typed {
-			result[k] = v
-		}
-	case map[string]any:
-		for k, v := range typed {
-			if s, ok := v.(string); ok {
-				result[k] = s
-			}
-		}
-	}
-	if len(result) == 0 {
-		return nil
-	}
-	return result
 }
 
 func containerRunning(container models.ContainerSummary) bool {

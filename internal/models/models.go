@@ -250,12 +250,13 @@ type StdioConnectionDiagnostic struct {
 }
 
 type LogRuntimeDiagnostics struct {
-	ActiveStreams   int   `json:"activeStreams"`
-	PendingStreams  int   `json:"pendingStreams"`
-	DrainingStreams int   `json:"drainingStreams"`
-	ReservedReaders int   `json:"reservedReaders"`
-	RetainedBytes   int64 `json:"retainedBytes"`
-	ActiveProducers int64 `json:"activeProducers"`
+	ActiveStreams    int   `json:"activeStreams"`
+	PendingStreams   int   `json:"pendingStreams"`
+	DrainingStreams  int   `json:"drainingStreams"`
+	ReservedReaders  int   `json:"reservedReaders"`
+	RetainedBytes    int64 `json:"retainedBytes"`
+	ActiveProducers  int64 `json:"activeProducers"`
+	ActiveOperations int   `json:"activeOperations"`
 }
 
 type MetricsRuntimeDiagnostics struct {
@@ -365,6 +366,10 @@ type VolumeDetail struct {
 	Summary    VolumeSummary      `json:"summary"`
 	Options    map[string]string  `json:"options,omitempty"`
 	Containers []ContainerSummary `json:"containers,omitempty"`
+	// CreatedAt is an internal incarnation signal used to bind destructive
+	// plans to the volume metadata inspected during planning. It is not part
+	// of the renderer DTO.
+	CreatedAt time.Time `json:"-"`
 }
 
 type CreateVolumeRequest struct {
@@ -602,6 +607,7 @@ type LogPageRequest struct {
 type LogPage struct {
 	Lines      []LogLine `json:"lines"`
 	NextCursor string    `json:"nextCursor,omitempty"`
+	Truncated  bool      `json:"truncated,omitempty"`
 }
 
 type LogLine struct {
@@ -617,16 +623,18 @@ type LogLine struct {
 }
 
 type ExportLogsRequest struct {
-	Scope string   `json:"scope"`
-	IDs   []string `json:"ids,omitempty"`
-	Path  string   `json:"path"`
-	Tail  int      `json:"tail,omitempty"`
+	Scope  string   `json:"scope"`
+	IDs    []string `json:"ids,omitempty"`
+	Format string   `json:"format"`
+	Tail   int      `json:"tail,omitempty"`
 }
 
 type ExportResult struct {
-	Path      string `json:"path"`
-	Bytes     int64  `json:"bytes"`
-	LineCount int    `json:"lineCount"`
+	Path              string `json:"path"`
+	Bytes             int64  `json:"bytes"`
+	LineCount         int    `json:"lineCount"`
+	Truncated         bool   `json:"truncated,omitempty"`
+	DurabilityWarning string `json:"durabilityWarning,omitempty"`
 }
 
 type TerminalOptions struct {

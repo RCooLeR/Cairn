@@ -53,6 +53,7 @@ function runtimeDiagnostics(active: number, started = true) {
   return new RuntimeDiagnostics({
     checkedAt: null,
     logs: {
+      activeOperations: 1,
       activeProducers: 3,
       activeStreams: 4,
       drainingStreams: 1,
@@ -202,6 +203,26 @@ describe("SettingsPage diagnostic resources", () => {
     settingsServiceMock.InstallWindowsDockerCLIShim.mockResolvedValue(
       dockerShimStatus(),
     );
+  });
+
+  it("describes project file editing as manual and temporarily unavailable", () => {
+    render(<SettingsPage {...createProps({ section: "help" })} />);
+
+    expect(
+      screen.getByText(
+        "Project file editing is temporarily unavailable; apply project file changes manually outside Cairn.",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText(
+        /Project file edits are previewed and applied through Cairn plans/i,
+      ),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Agent endpoints are restricted to literal IPv4 or IPv6 loopback addresses with an explicit port; DNS names, remote addresses, and redirects are rejected.",
+      ),
+    ).toBeInTheDocument();
   });
 
   it("announces save completion and actionable save failures", () => {

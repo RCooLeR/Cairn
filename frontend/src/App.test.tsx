@@ -17,23 +17,28 @@ import type {
   CommandPlan,
   DashboardMetrics,
   DiskUsageCategory,
+  ExportResult,
   GPUMetrics,
   CheatsheetEntry,
   ContainerDetail,
   ContainerFileListing,
   ImageLineage,
+  ImageDetail,
   ImageSummary,
   ImageUpdate,
   ImportProjectReview,
   LogLine,
+  NetworkDetail,
   NetworkSummary,
   Notification,
   ProjectDetail,
   ProjectSummary,
   ProviderStatus,
+  RegistryAuthStatus,
   TerminalSessionInfo,
   UpdateHistoryItem,
   UpdatePlan,
+  VolumeDetail,
   VolumeSummary,
 } from "../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
 import {
@@ -47,13 +52,30 @@ import {
 } from "../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
 
 import App, {
+  BoundedJobTombstones,
+  appendSparkEntries,
+  appendProjectCommandProgress,
   filterContainers,
   filterImages,
   filterNetworks,
   filterProjects,
   filterVolumes,
   imageRefPreview,
+  jobTombstoneLimit,
+  jobTombstoneTTLMS,
+  logBufferLimit,
+  maxLiveNotifications,
+  maxProjectCommandOutputProjects,
+  maxProjectLineageProjects,
+  maxProviderInstallProgressEntries,
+  maxProviderSetupProjects,
+  maxSparkSeries,
+  maxUpdatePlanProgressEntries,
+  pendingJobLimit,
   parseMounts,
+  reconcileProjectCommandOutputs,
+  reconcileProjectLineageRecords,
+  upsertBoundedProjectLineageRecord,
 } from "./App";
 import { csvCell } from "./settings/SettingsPage";
 import {
@@ -61,7 +83,10 @@ import {
   encodeTerminalInput,
 } from "./components/terminal/terminalEncoding";
 import { resetAppVersionBootstrapForTest } from "./state/appStore";
-import { useInventoryStore } from "./state/inventoryStore";
+import {
+  createInitialInventorySliceStates,
+  useInventoryStore,
+} from "./state/inventoryStore";
 import { resetAgentSessionForTest } from "./agent/AgentPage";
 import { allowConsoleErrorOnce } from "./test/setup";
 
@@ -255,7 +280,8 @@ vi.mock("./api/app", () => ({
   getAppVersion: appApiMock.getAppVersion,
 }));
 
-vi.mock("./api/inventory", () => ({
+vi.mock("./api/inventory", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./api/inventory")>()),
   getInventorySnapshot: inventoryMock.getInventorySnapshot,
 }));
 
@@ -648,14 +674,19 @@ describe("App inventory shell", () => {
       connection: "connecting",
       error: null,
       lastLoadedAt: null,
+      slices: createInitialInventorySliceStates(),
       providers: [],
       dockerInfo: null,
       dockerVersion: null,
       diskUsage: null,
       containers: [],
+      containerStats: {},
+      containerStatsAuthoritative: false,
       images: [],
       volumes: [],
       networks: [],
+      volumeEpoch: 0,
+      networkEpoch: 0,
       volumeDetails: {},
       networkDetails: {},
     });
@@ -698,6 +729,126 @@ describe("App inventory shell", () => {
     expect(useInventoryStore.getState().status).toBe("loading");
     await retry;
     expect(useInventoryStore.getState().status).toBe("ready");
+  });
+
+  it("shows the header refresh spinner for a pending partial refresh", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    render(<App />);
+    await screen.findByText("Docker Engine - Running");
+    const pending = deferred<ImageSummary[]>();
+    dockerServiceMock.ListImages.mockReturnValueOnce(pending.promise);
+
+    let request!: Promise<void>;
+    act(() => {
+      request = useInventoryStore.getState().refreshImages();
+    });
+
+    expect(screen.getByRole("button", { name: "Refresh" })).toHaveAttribute(
+      "aria-busy",
+      "true",
+    );
+
+    await act(async () => {
+      pending.resolve(seededSnapshot().images);
+      await request;
+    });
+    expect(screen.getByRole("button", { name: "Refresh" })).not.toHaveAttribute(
+      "aria-busy",
+    );
+  });
+
+  it("bounds and expires completed-job tombstones", () => {
+    const tombstones = new BoundedJobTombstones();
+    const now = 10_000;
+    for (let index = 0; index < jobTombstoneLimit + 10; index += 1) {
+      tombstones.add(`completed-job-${index}`, now);
+    }
+
+    expect(tombstones.has("completed-job-0", now)).toBe(false);
+    expect(tombstones.has(`completed-job-${jobTombstoneLimit + 9}`, now)).toBe(
+      true,
+    );
+
+    const expiring = new BoundedJobTombstones();
+    expiring.add("expiring-job", now);
+    expect(expiring.has("expiring-job", now + jobTombstoneTTLMS - 1)).toBe(
+      true,
+    );
+    expect(expiring.has("expiring-job", now + jobTombstoneTTLMS)).toBe(false);
+  });
+
+  it("bounds and reconciles project-scoped records under project churn", () => {
+    let outputs = {} as ReturnType<typeof appendProjectCommandProgress>;
+    let lineage: Record<string, string[]> = {};
+    let lineageStatus: Record<string, string> = {};
+    for (
+      let index = 0;
+      index <
+      Math.max(maxProjectCommandOutputProjects, maxProjectLineageProjects) + 40;
+      index += 1
+    ) {
+      outputs = appendProjectCommandProgress(outputs, {
+        jobID: `job-${index}`,
+        projectID: `project-${index}`,
+        phase: "stdout",
+        message: `line ${index}`,
+      });
+      lineage = upsertBoundedProjectLineageRecord(lineage, `project-${index}`, [
+        `lineage-${index}`,
+      ]);
+      lineageStatus = upsertBoundedProjectLineageRecord(
+        lineageStatus,
+        `project-${index}`,
+        "ready",
+      );
+    }
+
+    expect(Object.keys(outputs)).toHaveLength(maxProjectCommandOutputProjects);
+    expect(Object.keys(lineage)).toHaveLength(maxProjectLineageProjects);
+    expect(Object.keys(lineageStatus)).toHaveLength(maxProjectLineageProjects);
+    expect(
+      outputs[`project-${maxProjectCommandOutputProjects + 39}`],
+    ).toBeDefined();
+
+    const retainedProjectID = `project-${maxProjectCommandOutputProjects + 39}`;
+    const reconciled = reconcileProjectCommandOutputs(outputs, [
+      { id: retainedProjectID } as ProjectSummary,
+    ]);
+    expect(Object.keys(reconciled)).toEqual([retainedProjectID]);
+    expect(
+      Object.keys(
+        reconcileProjectLineageRecords(lineage, [{ id: retainedProjectID }]),
+      ),
+    ).toEqual([retainedProjectID]);
+    expect(
+      Object.keys(
+        reconcileProjectLineageRecords(lineageStatus, [
+          { id: retainedProjectID },
+        ]),
+      ),
+    ).toEqual([retainedProjectID]);
+
+    let sparks: Record<string, Array<{ label: string; value: number }>> = {};
+    for (let index = 0; index < maxSparkSeries + 40; index += 1) {
+      sparks = appendSparkEntries(sparks, [
+        { id: `series-${index}`, label: `${index}`, value: index },
+      ]);
+    }
+    expect(Object.keys(sparks)).toHaveLength(maxSparkSeries);
+    expect(sparks["series-0"]).toBeUndefined();
+    expect(sparks[`series-${maxSparkSeries + 39}`]).toBeDefined();
+
+    // Updating the oldest retained series refreshes its LRU ownership.
+    sparks = appendSparkEntries(sparks, [
+      { id: "series-40", label: "latest", value: 999 },
+      { id: "series-extra", label: "extra", value: 1000 },
+    ]);
+    expect(Object.keys(sparks)).toHaveLength(maxSparkSeries);
+    expect(sparks["series-40"]?.slice(-1)[0]).toEqual({
+      label: "latest",
+      value: 999,
+    });
+    expect(sparks["series-41"]).toBeUndefined();
   });
 
   it("renders seeded Docker inventory and subscribes to object refresh events", async () => {
@@ -994,17 +1145,13 @@ describe("App inventory shell", () => {
     expect(await screen.findByText("Current B stack")).toBeInTheDocument();
   });
 
-  it("locks Agent edit targets in flight and invalidates plans on target changes", async () => {
+  it("keeps quarantined Agent file edits unavailable", async () => {
     const projectA = seededProject();
-    const projectB = alternateProject();
-    const planRequest = deferred<CommandPlan>();
-    const projectBAnalysis = deferred<AgentProjectAnalysis>();
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
-    projectServiceMock.RefreshProjects.mockResolvedValue([projectA, projectB]);
-    agentServiceMock.PlanFileEdit.mockReturnValueOnce(planRequest.promise);
-    agentServiceMock.AnalyzeProject.mockResolvedValueOnce(
+    projectServiceMock.RefreshProjects.mockResolvedValue([projectA]);
+    agentServiceMock.AnalyzeProject.mockResolvedValue(
       projectAnalysisFor(projectA, "Project A stack"),
-    ).mockReturnValueOnce(projectBAnalysis.promise);
+    );
 
     render(<App />);
 
@@ -1017,43 +1164,26 @@ describe("App inventory shell", () => {
     const projectSelect = await screen.findByLabelText("Project");
     fireEvent.change(projectSelect, { target: { value: projectA.id } });
     fireEvent.click(await screen.findByText("Project config tools"));
+    expect(
+      screen.getByText(
+        /Draft, preview, and apply are temporarily unavailable.*manually/i,
+      ),
+    ).toBeInTheDocument();
     const content = screen.getByPlaceholderText(
       "Drafted or manually edited file content appears here.",
     );
-    fireEvent.change(content, { target: { value: "APP_PORT=8080\n" } });
-    fireEvent.click(screen.getByRole("button", { name: "Preview edit" }));
-    await waitFor(() =>
-      expect(agentServiceMock.PlanFileEdit).toHaveBeenCalledWith({
-        projectID: projectA.id,
-        path: ".env",
-        content: "APP_PORT=8080\n",
-        reason:
-          "Create/update placeholders for detected app environment variables.",
-      }),
-    );
-    expect(projectSelect).toBeDisabled();
-    expect(screen.getByLabelText("File")).toBeDisabled();
     expect(content).toBeDisabled();
-
-    await act(async () => {
-      planRequest.resolve(agentFileEditPlan());
-      await planRequest.promise;
-    });
-    expect(
-      await screen.findByText(/Preview ready for app-db \/ \.env:/),
-    ).toBeInTheDocument();
-    expect(projectSelect).not.toBeDisabled();
-
-    fireEvent.change(projectSelect, { target: { value: projectB.id } });
-    await act(async () => {
-      projectBAnalysis.resolve(projectAnalysisFor(projectB, "Project B stack"));
-      await projectBAnalysis.promise;
-    });
-    expect(await screen.findByText("Project B stack")).toBeInTheDocument();
-    expect(
-      screen.queryByText(/Preview ready for app-db \/ \.env:/),
-    ).not.toBeInTheDocument();
+    expect(screen.getByLabelText("File")).toBeDisabled();
+    expect(screen.getByLabelText("Instruction")).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Draft" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Preview edit" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Apply edit" })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Draft" }));
+    fireEvent.click(screen.getByRole("button", { name: "Preview edit" }));
+    fireEvent.click(screen.getByRole("button", { name: "Apply edit" }));
+    expect(agentServiceMock.DraftProjectFile).not.toHaveBeenCalled();
+    expect(agentServiceMock.PlanFileEdit).not.toHaveBeenCalled();
     expect(agentServiceMock.ApplyFileEdit).not.toHaveBeenCalled();
   });
 
@@ -1668,6 +1798,63 @@ describe("App inventory shell", () => {
     });
     expect(settingsServiceMock.GetNotifications).toHaveBeenCalledTimes(3);
     expect(screen.getByText("Notification burst 6")).toBeInTheDocument();
+  });
+
+  it("bounds live notification rows while reconciliation is pending", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    settingsServiceMock.GetNotifications.mockResolvedValueOnce([]);
+    const pendingRefresh = deferred<Notification[]>();
+    settingsServiceMock.GetNotifications.mockImplementationOnce(
+      () => pendingRefresh.promise,
+    );
+    const events = Array.from(
+      { length: maxLiveNotifications + 25 },
+      (_, index): Notification => ({
+        id: 10_000 + index,
+        level: "info",
+        title: `Bounded notification ${index}`,
+        body: "Bounded notification payload",
+        topic: "project",
+        read: false,
+        createdAt: "2026-06-13T09:00:00Z",
+      }),
+    );
+
+    render(<App />);
+
+    await waitFor(() =>
+      expect(settingsServiceMock.GetNotifications).toHaveBeenCalledTimes(1),
+    );
+    act(() => {
+      for (const notification of events) {
+        emitRuntimeEvent("notification", notification);
+      }
+    });
+    await waitFor(() =>
+      expect(settingsServiceMock.GetNotifications).toHaveBeenCalledTimes(2),
+    );
+
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: `Notifications ${maxLiveNotifications} unread`,
+      }),
+    );
+    const dialog = await screen.findByRole("dialog", {
+      name: "Notification center",
+    });
+    expect(
+      within(dialog).getByText(
+        `Bounded notification ${maxLiveNotifications + 24}`,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).queryByText("Bounded notification 0"),
+    ).not.toBeInTheDocument();
+
+    await act(async () => {
+      pendingRefresh.resolve([]);
+      await pendingRefresh.promise;
+    });
   });
 
   it("does not let an obsolete notification refresh restore unread state after mark-all", async () => {
@@ -2510,6 +2697,84 @@ describe("App inventory shell", () => {
     );
   });
 
+  it("does not let an old removal completion close a same-ID project modal", async () => {
+    const brokenProject = seededBrokenProject();
+    const oldRemoval = deferred<void>();
+    const newRemoval = deferred<void>();
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValue([brokenProject]);
+    projectServiceMock.RemoveProjectFromList.mockReturnValueOnce(
+      oldRemoval.promise,
+    ).mockReturnValueOnce(newRemoval.promise);
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Projects/ }),
+    );
+    await screen.findByText("Workdir missing");
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: `Remove from list ${brokenProject.name}`,
+      }),
+    );
+    fireEvent.click(
+      within(
+        await screen.findByRole("dialog", {
+          name: "Remove project from list?",
+        }),
+      ).getByRole("button", { name: "Remove" }),
+    );
+    await waitFor(() =>
+      expect(projectServiceMock.RemoveProjectFromList).toHaveBeenCalledTimes(1),
+    );
+
+    vi.useFakeTimers();
+    emitRuntimeEvent("provider:changed", { id: "new-provider" });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+      await Promise.resolve();
+    });
+    vi.useRealTimers();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: `Remove from list ${brokenProject.name}`,
+      }),
+    );
+    const currentDialog = screen.getByRole("dialog", {
+      name: "Remove project from list?",
+    });
+    fireEvent.click(
+      within(currentDialog).getByRole("button", { name: "Remove" }),
+    );
+    await waitFor(() =>
+      expect(projectServiceMock.RemoveProjectFromList).toHaveBeenCalledTimes(2),
+    );
+
+    await act(async () => {
+      oldRemoval.resolve();
+      await oldRemoval.promise;
+      await Promise.resolve();
+    });
+    expect(currentDialog).toBeInTheDocument();
+    expect(
+      screen.queryByText("Project removed from list"),
+    ).not.toBeInTheDocument();
+
+    await act(async () => {
+      newRemoval.resolve();
+      await newRemoval.promise;
+      await Promise.resolve();
+    });
+    expect(
+      screen.queryByRole("dialog", { name: "Remove project from list?" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("Project removed from list")).toBeInTheDocument();
+  });
+
   it("opens project detail tabs with services, containers, and Compose config", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
     projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
@@ -2801,8 +3066,396 @@ describe("App inventory shell", () => {
     expect(updateServiceMock.UnignoreUpdate).toHaveBeenCalledWith(201);
   });
 
-  it("does not let a completed update check clear a newer job's progress", async () => {
+  it("clears project and update state immediately and rejects old-scope reads", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
+    projectServiceMock.GetProject.mockResolvedValue(seededProjectDetail());
+    backupServiceMock.ListBackups.mockResolvedValue([seededBackup()]);
+    updateServiceMock.ListCurrentUpdates.mockImplementation((filter) =>
+      Promise.resolve(
+        filter?.status?.includes(UpdateStatus.UpdateStatusIgnored)
+          ? [ignoredUpdate()]
+          : seededUpdates(),
+      ),
+    );
+    updateServiceMock.ListUpdateHistory.mockResolvedValue([updateHistoryRow()]);
+    imageLineageServiceMock.GetProjectLineage.mockResolvedValue(
+      seededLineage(),
+    );
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Projects/ }),
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "app-db" }));
+    await screen.findByText("linux_native");
+    const projectUpdatesButtons = await waitFor(() => {
+      const buttons = screen.getAllByRole("button", { name: "Updates" });
+      expect(buttons.length).toBeGreaterThan(1);
+      return buttons;
+    });
+    fireEvent.click(projectUpdatesButtons[projectUpdatesButtons.length - 1]);
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Update project" }),
+    );
+    expect(
+      await screen.findByRole("dialog", { name: /Update project/ }),
+    ).toBeInTheDocument();
+
+    const oldProjects = deferred<ProjectSummary[]>();
+    const oldBackups = deferred<BackupSummary[]>();
+    const oldUpdates = deferred<ImageUpdate[]>();
+    const oldIgnoredUpdates = deferred<ImageUpdate[]>();
+    const oldHistory = deferred<UpdateHistoryItem[]>();
+    const oldProjectDetail = deferred<ProjectDetail>();
+    const oldLineage = deferred<ImageLineage[]>();
+    projectServiceMock.RefreshProjects.mockReturnValueOnce(oldProjects.promise);
+    backupServiceMock.ListBackups.mockReturnValueOnce(oldBackups.promise);
+    updateServiceMock.ListCurrentUpdates.mockReturnValueOnce(
+      oldUpdates.promise,
+    ).mockReturnValueOnce(oldIgnoredUpdates.promise);
+    updateServiceMock.ListUpdateHistory.mockReturnValueOnce(oldHistory.promise);
+    projectServiceMock.GetProject.mockReturnValueOnce(oldProjectDetail.promise);
+    imageLineageServiceMock.GetProjectLineage.mockReturnValueOnce(
+      oldLineage.promise,
+    );
+
+    vi.useFakeTimers();
+    emitRuntimeEvent("objects:changed", undefined);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+    expect(projectServiceMock.RefreshProjects).toHaveBeenCalledTimes(2);
+    expect(updateServiceMock.ListCurrentUpdates).toHaveBeenCalledTimes(4);
+
+    emitRuntimeEvent("provider:changed", { id: "new-provider" });
+
+    expect(
+      screen.queryByRole("dialog", { name: /Update project/ }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("app-db")).not.toBeInTheDocument();
+    expect(updateServiceMock.ApplyUpdate).not.toHaveBeenCalled();
+
+    await act(async () => {
+      oldProjects.resolve([
+        {
+          ...seededProject(),
+          id: "old-scope/project",
+          name: "old-scope-project",
+        },
+      ]);
+      oldBackups.resolve([seededBackup()]);
+      oldUpdates.resolve(seededUpdates());
+      oldIgnoredUpdates.resolve([ignoredUpdate()]);
+      oldHistory.resolve([updateHistoryRow()]);
+      oldProjectDetail.resolve(seededProjectDetail());
+      oldLineage.resolve(seededLineage());
+      await Promise.all([
+        oldProjects.promise,
+        oldBackups.promise,
+        oldUpdates.promise,
+        oldIgnoredUpdates.promise,
+        oldHistory.promise,
+        oldProjectDetail.promise,
+        oldLineage.promise,
+      ]);
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByText("old-scope-project")).not.toBeInTheDocument();
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Updates/ }),
+    );
+    expect(
+      screen.queryByText("Image update available"),
+    ).not.toBeInTheDocument();
+    vi.useRealTimers();
+  });
+
+  it("does not reopen an update plan that resolves after a provider change", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
+    updateServiceMock.ListCurrentUpdates.mockImplementation((filter) =>
+      Promise.resolve(
+        filter?.status?.includes(UpdateStatus.UpdateStatusIgnored)
+          ? []
+          : seededUpdates(),
+      ),
+    );
+    const oldPlan = deferred<UpdatePlan>();
+    updateServiceMock.PlanServiceUpdate.mockReturnValueOnce(oldPlan.promise);
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Updates/ }),
+    );
+    fireEvent.click(
+      (await screen.findAllByRole("button", { name: "Update" }))[0],
+    );
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
+
+    vi.useFakeTimers();
+    emitRuntimeEvent("provider:changed", { id: "new-provider" });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    await act(async () => {
+      oldPlan.resolve(updatePlan());
+      await oldPlan.promise;
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(updateServiceMock.ApplyUpdate).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+
+  it("closes an applying update plan and ignores its old-scope completion", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
+    updateServiceMock.ListCurrentUpdates.mockImplementation((filter) =>
+      Promise.resolve(
+        filter?.status?.includes(UpdateStatus.UpdateStatusIgnored)
+          ? []
+          : seededUpdates(),
+      ),
+    );
+    const oldApply = deferred<string>();
+    updateServiceMock.ApplyUpdate.mockReturnValueOnce(oldApply.promise);
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Updates/ }),
+    );
+    fireEvent.click(
+      (await screen.findAllByRole("button", { name: "Update" }))[0],
+    );
+    const dialog = await screen.findByRole("dialog", {
+      name: /Update service/,
+    });
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Update service" }),
+    );
+    await waitFor(() =>
+      expect(updateServiceMock.ApplyUpdate).toHaveBeenCalled(),
+    );
+
+    vi.useFakeTimers();
+    emitRuntimeEvent("provider:changed", { id: "new-provider" });
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    await act(async () => {
+      oldApply.resolve("old-scope-update-job");
+      await oldApply.promise;
+      await Promise.resolve();
+    });
+    emitRuntimeEvent("job:progress", {
+      jobID: "old-scope-update-job",
+      phase: "apply",
+      message: "Old scope still applying",
+    });
+
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Old scope still applying"),
+    ).not.toBeInTheDocument();
+    vi.useRealTimers();
+  });
+
+  it("keeps a new same-name confirmation when an old provider plan resolves", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    const oldPlanRequest = deferred<CommandPlan>();
+    const newPlanRequest = deferred<CommandPlan>();
+    const oldScopePlan: CommandPlan = {
+      ...removeVolumePlan(),
+      planID: "old-scope-volume-plan",
+      title: "Old scope volume plan",
+    };
+    const newScopePlan: CommandPlan = {
+      ...removeVolumePlan(),
+      planID: "new-scope-volume-plan",
+      title: "New scope volume plan",
+    };
+    dockerServiceMock.PlanRemoveVolume.mockReturnValueOnce(
+      oldPlanRequest.promise,
+    ).mockReturnValueOnce(newPlanRequest.promise);
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Volumes/ }),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Remove cairn_data" }),
+    );
+    await waitFor(() =>
+      expect(dockerServiceMock.PlanRemoveVolume).toHaveBeenCalledTimes(1),
+    );
+
+    emitRuntimeEvent("provider:changed", { id: "new-provider" });
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Remove cairn_data" }),
+    );
+    await waitFor(() =>
+      expect(dockerServiceMock.PlanRemoveVolume).toHaveBeenCalledTimes(2),
+    );
+
+    await act(async () => {
+      newPlanRequest.resolve(newScopePlan);
+      await newPlanRequest.promise;
+    });
+    expect(
+      await screen.findByRole("dialog", { name: "New scope volume plan" }),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      oldPlanRequest.resolve(oldScopePlan);
+      await oldPlanRequest.promise;
+      await Promise.resolve();
+    });
+
+    expect(
+      screen.getByRole("dialog", { name: "New scope volume plan" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("dialog", { name: "Old scope volume plan" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not open a volume removal plan after a same-name list incarnation", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    const pendingPlan = deferred<CommandPlan>();
+    dockerServiceMock.PlanRemoveVolume.mockReturnValueOnce(pendingPlan.promise);
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Volumes/ }),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Remove cairn_data" }),
+    );
+    await waitFor(() =>
+      expect(dockerServiceMock.PlanRemoveVolume).toHaveBeenCalledTimes(1),
+    );
+
+    act(() => {
+      useInventoryStore.getState().setVolumes(seededSnapshot().volumes ?? []);
+    });
+    await act(async () => {
+      pendingPlan.resolve(removeVolumePlan());
+      await pendingPlan.promise;
+    });
+
+    expect(
+      screen.queryByRole("dialog", { name: "Delete volume cairn_data" }),
+    ).not.toBeInTheDocument();
+    expect(dockerServiceMock.ApplyContainerPlan).not.toHaveBeenCalled();
+  });
+
+  it("closes an open volume confirmation when the same name is relisted", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Volumes/ }),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Remove cairn_data" }),
+    );
+    const dialog = await screen.findByRole("dialog", {
+      name: "Delete volume cairn_data",
+    });
+
+    act(() => {
+      useInventoryStore.getState().setVolumes(seededSnapshot().volumes ?? []);
+    });
+
+    await waitFor(() => expect(dialog).not.toBeInTheDocument());
+    expect(dockerServiceMock.ApplyContainerPlan).not.toHaveBeenCalled();
+  });
+
+  it("does not let an old rename completion close a new same-container modal", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    const oldRename = deferred<void>();
+    const newRename = deferred<void>();
+    dockerServiceMock.RenameContainer.mockReturnValueOnce(
+      oldRename.promise,
+    ).mockReturnValueOnce(newRename.promise);
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Containers/ }),
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Rename web" }));
+    fireEvent.change(screen.getByLabelText("New name"), {
+      target: { value: "old-scope-name" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Rename" }));
+    await waitFor(() =>
+      expect(dockerServiceMock.RenameContainer).toHaveBeenCalledTimes(1),
+    );
+
+    emitRuntimeEvent("provider:changed", { id: "new-provider" });
+    fireEvent.click(await screen.findByRole("button", { name: "Rename web" }));
+    fireEvent.change(screen.getByLabelText("New name"), {
+      target: { value: "new-scope-name" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Rename" }));
+    await waitFor(() =>
+      expect(dockerServiceMock.RenameContainer).toHaveBeenCalledTimes(2),
+    );
+
+    await act(async () => {
+      oldRename.resolve();
+      await oldRename.promise;
+      await Promise.resolve();
+    });
+    expect(screen.getByLabelText("New name")).toHaveValue("new-scope-name");
+
+    await act(async () => {
+      newRename.resolve();
+      await newRename.promise;
+      await Promise.resolve();
+    });
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: "Rename Container" }),
+      ).not.toBeInTheDocument(),
+    );
+  });
+
+  it("shows buffered progress only after an update-check job is registered", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    const pendingCheck = deferred<string>();
+    updateServiceMock.CheckAllUpdates.mockReturnValueOnce(pendingCheck.promise);
 
     render(<App />);
 
@@ -2814,27 +3467,437 @@ describe("App inventory shell", () => {
     );
     vi.useFakeTimers();
 
+    fireEvent.click(screen.getByRole("button", { name: "Check now" }));
+
     emitRuntimeEvent("updates:check:progress", {
       jobID: "check-a",
       done: 1,
       total: 1,
       current: "Check A complete",
     });
-    expect(screen.getByText("Check A complete")).toBeInTheDocument();
+    expect(screen.queryByText("Check A complete")).not.toBeInTheDocument();
 
     emitRuntimeEvent("updates:check:progress", {
-      jobID: "check-b",
+      jobID: "unowned-check",
       done: 0,
       total: 2,
-      current: "Checking job B",
+      current: "Unowned update check",
     });
-    expect(screen.getByText("Checking job B")).toBeInTheDocument();
+    expect(screen.queryByText("Unowned update check")).not.toBeInTheDocument();
+
+    await act(async () => {
+      pendingCheck.resolve("check-a");
+      await pendingCheck.promise;
+      await Promise.resolve();
+    });
+    expect(screen.getByText("Check A complete")).toBeInTheDocument();
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(1200);
     });
 
-    expect(screen.getByText("Checking job B")).toBeInTheDocument();
+    expect(screen.queryByText("Check A complete")).not.toBeInTheDocument();
+    expect(screen.queryByText("Unowned update check")).not.toBeInTheDocument();
+    vi.useRealTimers();
+  });
+
+  it("keeps update checks single-flight across launch surfaces and rejects late progress", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    const pendingCheck = deferred<string>();
+    updateServiceMock.CheckAllUpdates.mockReturnValueOnce(pendingCheck.promise);
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    const overviewCheck = screen.getByRole("button", {
+      name: "Check updates",
+    });
+    const overviewCardCheck = screen.getByRole("button", {
+      name: "Check now",
+    });
+    fireEvent.click(overviewCheck);
+    await waitFor(() =>
+      expect(updateServiceMock.CheckAllUpdates).toHaveBeenCalledTimes(1),
+    );
+    expect(overviewCheck).toBeDisabled();
+    expect(overviewCardCheck).toBeDisabled();
+    fireEvent.click(overviewCheck);
+    fireEvent.click(overviewCardCheck);
+    expect(updateServiceMock.CheckAllUpdates).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Updates/ }),
+    );
+    const updatesCheck = await screen.findByRole("button", {
+      name: "Check now",
+    });
+    expect(updatesCheck).toBeDisabled();
+    fireEvent.click(updatesCheck);
+    expect(updateServiceMock.CheckAllUpdates).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      pendingCheck.resolve("authoritative-check");
+      await pendingCheck.promise;
+      await Promise.resolve();
+    });
+    act(() => {
+      emitRuntimeEvent("updates:check:progress", {
+        jobID: "authoritative-check",
+        done: 1,
+        total: 2,
+        current: "Authoritative progress",
+      });
+    });
+    expect(screen.getByText("Authoritative progress")).toBeInTheDocument();
+
+    await act(async () => {
+      emitRuntimeEvent("updates:check:progress", {
+        jobID: "authoritative-check",
+        done: 2,
+        total: 2,
+        current: "Authoritative complete",
+      });
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    });
+    expect(screen.getByText("Authoritative complete")).toBeInTheDocument();
+    act(() => {
+      emitRuntimeEvent("updates:check:progress", {
+        jobID: "authoritative-check",
+        done: 1,
+        total: 3,
+        current: "Late obsolete progress",
+      });
+    });
+    expect(
+      screen.queryByText("Late obsolete progress"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows an owned update-check launch failure from the Overview entry point", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    updateServiceMock.CheckAllUpdates.mockRejectedValueOnce(
+      new Error("Update service is offline"),
+    );
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    const checkButton = screen.getByRole("button", {
+      name: "Check updates",
+    });
+    fireEvent.click(checkButton);
+
+    expect(await screen.findByText("Update check failed")).toBeInTheDocument();
+    expect(screen.getByText("Update service is offline")).toBeInTheDocument();
+    await waitFor(() => expect(checkButton).toBeEnabled());
+  });
+
+  it("fails closed when pending-job pressure evicts a returned job ID", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    const pendingCheck = deferred<string>();
+    updateServiceMock.CheckAllUpdates.mockReturnValueOnce(pendingCheck.promise);
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Updates/ }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Check now" }));
+    emitRuntimeEvent("updates:check:progress", {
+      jobID: "evicted-pending-check",
+      done: 0,
+      total: 2,
+      current: "Evicted pending progress",
+    });
+    for (let index = 0; index < pendingJobLimit; index += 1) {
+      emitRuntimeEvent("updates:check:progress", {
+        jobID: `pressure-check-${index}`,
+        done: 0,
+        total: 2,
+        current: `Pressure ${index}`,
+      });
+    }
+
+    await act(async () => {
+      pendingCheck.resolve("evicted-pending-check");
+      await pendingCheck.promise;
+      await Promise.resolve();
+    });
+
+    expect(
+      screen.getAllByText(/completed or invalidated job ID/i).length,
+    ).toBeGreaterThan(0);
+    expect(
+      screen.queryByText("Evicted pending progress"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("retains an early terminal update event across later progress churn", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    const pendingCheck = deferred<string>();
+    updateServiceMock.CheckAllUpdates.mockReturnValueOnce(pendingCheck.promise);
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Updates/ }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Check now" }));
+
+    emitRuntimeEvent("updates:check:progress", {
+      jobID: "early-terminal-check",
+      done: 1,
+      total: 1,
+      current: "Early check complete",
+    });
+    for (let index = 0; index < 55; index += 1) {
+      emitRuntimeEvent("updates:check:progress", {
+        jobID: "early-terminal-check",
+        done: 0,
+        total: 100,
+        current: `Late progress ${index}`,
+      });
+    }
+
+    await act(async () => {
+      pendingCheck.resolve("early-terminal-check");
+      await pendingCheck.promise;
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText("Early check complete")).toBeInTheDocument();
+    expect(screen.queryByText("Late progress 54")).not.toBeInTheDocument();
+  });
+
+  it("keeps an early project-job terminal authoritative across later progress churn", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
+    updateServiceMock.ListCurrentUpdates.mockImplementation((filter) =>
+      Promise.resolve(
+        filter?.status?.includes(UpdateStatus.UpdateStatusIgnored)
+          ? []
+          : seededUpdates(),
+      ),
+    );
+    const pendingApply = deferred<string>();
+    updateServiceMock.ApplyUpdate.mockReturnValueOnce(pendingApply.promise);
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Updates/ }),
+    );
+    fireEvent.click(
+      (await screen.findAllByRole("button", { name: "Update" }))[0],
+    );
+    const dialog = await screen.findByRole("dialog", {
+      name: /Update service/,
+    });
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Update service" }),
+    );
+    await waitFor(() =>
+      expect(updateServiceMock.ApplyUpdate).toHaveBeenCalledTimes(1),
+    );
+
+    emitRuntimeEvent("job:done", {
+      jobID: "early-terminal-project-job",
+      projectID: "linux_native/app-db",
+      action: "update",
+      phase: "done",
+      result: "success",
+      message: "Early project update complete",
+    });
+    for (let index = 0; index < 55; index += 1) {
+      emitRuntimeEvent("job:progress", {
+        jobID: "early-terminal-project-job",
+        projectID: "linux_native/app-db",
+        action: "update",
+        phase: "apply",
+        message: `Late project progress ${index}`,
+      });
+    }
+
+    await act(async () => {
+      pendingApply.resolve("early-terminal-project-job");
+      await pendingApply.promise;
+      await Promise.resolve();
+    });
+
+    expect(within(dialog).getByText("Result: success")).toBeInTheDocument();
+    expect(
+      within(dialog).queryByText("Late project progress 54"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByText("Apply progress"),
+    ).not.toBeInTheDocument();
+    const closeButtons = within(dialog).getAllByRole("button", {
+      name: "Close",
+    });
+    expect(closeButtons[closeButtons.length - 1]).toBeEnabled();
+  });
+
+  it("bounds progress retained for an owned project update job", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
+    updateServiceMock.ListCurrentUpdates.mockImplementation((filter) =>
+      Promise.resolve(
+        filter?.status?.includes(UpdateStatus.UpdateStatusIgnored)
+          ? []
+          : seededUpdates(),
+      ),
+    );
+    updateServiceMock.ApplyUpdate.mockResolvedValueOnce("bounded-update-job");
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Updates/ }),
+    );
+    fireEvent.click(
+      (await screen.findAllByRole("button", { name: "Update" }))[0],
+    );
+    const dialog = await screen.findByRole("dialog", {
+      name: /Update service/,
+    });
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Update service" }),
+    );
+    await waitFor(() =>
+      expect(updateServiceMock.ApplyUpdate).toHaveBeenCalledTimes(1),
+    );
+
+    act(() => {
+      for (
+        let index = 0;
+        index < maxUpdatePlanProgressEntries + 25;
+        index += 1
+      ) {
+        emitRuntimeEvent("job:progress", {
+          jobID: "bounded-update-job",
+          projectID: "linux_native/app-db",
+          action: "update",
+          phase: "apply",
+          message: `Bounded update progress ${index}`,
+        });
+      }
+    });
+
+    expect(
+      within(dialog).queryByText("Bounded update progress 0"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(dialog).getByText(
+        `Bounded update progress ${maxUpdatePlanProgressEntries + 24}`,
+      ),
+    ).toBeInTheDocument();
+    expect(within(dialog).getAllByText(/Bounded update progress/)).toHaveLength(
+      maxUpdatePlanProgressEntries,
+    );
+  });
+
+  it("fails closed when a completed update job ID is returned again", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    updateServiceMock.CheckAllUpdates.mockResolvedValue("reused-check-job");
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Updates/ }),
+    );
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: "Check now" }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(updateServiceMock.CheckAllUpdates).toHaveBeenCalledTimes(1);
+    emitRuntimeEvent("updates:check:progress", {
+      jobID: "reused-check-job",
+      done: 1,
+      total: 1,
+      current: "First use complete",
+    });
+    expect(screen.getByText("First use complete")).toBeInTheDocument();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1200);
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Check now" }));
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(updateServiceMock.CheckAllUpdates).toHaveBeenCalledTimes(2);
+    expect(
+      screen.getAllByText(/completed or invalidated job ID/i).length,
+    ).toBeGreaterThan(0);
+    emitRuntimeEvent("updates:check:progress", {
+      jobID: "reused-check-job",
+      done: 0,
+      total: 2,
+      current: "Reused ID progress",
+    });
+    expect(screen.queryByText("Reused ID progress")).not.toBeInTheDocument();
+  });
+
+  it("invalidates an update-check job ID returned after its provider scope clears", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    const pendingCheck = deferred<string>();
+    updateServiceMock.CheckAllUpdates.mockReturnValueOnce(pendingCheck.promise);
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Updates/ }),
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Check now" }));
+      await Promise.resolve();
+    });
+    expect(updateServiceMock.CheckAllUpdates).toHaveBeenCalledTimes(1);
+
+    vi.useFakeTimers();
+    await act(async () => {
+      runtimeEventCallback("provider:changed")({
+        name: "provider:changed",
+        data: { id: "new-provider" },
+      });
+      await useInventoryStore.getState().refresh();
+      pendingCheck.resolve("updates-check-job");
+      await pendingCheck.promise;
+      await Promise.resolve();
+    });
+    emitRuntimeEvent("updates:check:progress", {
+      jobID: "updates-check-job",
+      done: 1,
+      total: 2,
+      current: "Old provider update check",
+    });
+
+    expect(
+      screen.queryByText("Old provider update check"),
+    ).not.toBeInTheDocument();
+    vi.useRealTimers();
   });
 
   it("shows project Updates tab grouping and lineage wording", async () => {
@@ -2982,6 +4045,35 @@ describe("App inventory shell", () => {
       await vi.advanceTimersByTimeAsync(200);
     });
     expect(screen.getByText("1/1")).toBeInTheDocument();
+  });
+
+  it("makes complete wrapped log records reachable through a bounded detail view", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    const completeLine = `first line\n${"diagnostic ".repeat(80)}last line`;
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Logs/ }),
+    );
+    await waitFor(() =>
+      expect(logsServiceMock.StartLogStream).toHaveBeenCalled(),
+    );
+    emitRuntimeEvent("logs:lines", {
+      streamID: "stream-1",
+      lines: [logLine({ text: completeLine })],
+    });
+
+    fireEvent.click(screen.getByLabelText("Toggle line wrap"));
+    fireEvent.click(
+      await screen.findByRole("button", { name: /Open full log line from/ }),
+    );
+
+    const dialog = screen.getByRole("dialog", { name: "Log line details" });
+    expect(dialog.querySelector("pre")?.textContent).toBe(completeLine);
   });
 
   it("remaps the selected log match when live-buffer eviction shifts its index", async () => {
@@ -3256,6 +4348,54 @@ describe("App inventory shell", () => {
     expect(await screen.findByText(/buffered line/)).toBeInTheDocument();
   });
 
+  it("keeps pause and unpinned counters sequence-anchored at the log buffer cap", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Logs/ }),
+    );
+    await waitFor(() =>
+      expect(logsServiceMock.StartLogStream).toHaveBeenCalled(),
+    );
+    emitRuntimeEvent("logs:lines", {
+      streamID: "stream-1",
+      lines: Array.from({ length: logBufferLimit }, (_, index) =>
+        logLine({ text: `INFO capped line ${index}` }),
+      ),
+    });
+
+    const viewer = screen.getByRole("log");
+    Object.defineProperties(viewer, {
+      clientHeight: { configurable: true, value: 100 },
+      scrollHeight: { configurable: true, value: 1_000 },
+      scrollTop: { configurable: true, value: 0, writable: true },
+    });
+    fireEvent.scroll(viewer);
+    emitRuntimeEvent("logs:lines", {
+      streamID: "stream-1",
+      lines: [logLine({ text: "INFO unpinned rollover" })],
+    });
+    expect(
+      await screen.findByRole("button", { name: "1 new lines" }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Follow" }));
+    fireEvent.click(screen.getByRole("button", { name: "Pause" }));
+    emitRuntimeEvent("logs:lines", {
+      streamID: "stream-1",
+      lines: [logLine({ text: "INFO paused rollover" })],
+    });
+
+    expect(await screen.findByText("Paused - 1 new lines")).toBeInTheDocument();
+    expect(screen.getByText(/49\D999 visible lines/)).toBeInTheDocument();
+    expect(screen.getByText(/50\D000 buffered/)).toBeInTheDocument();
+  });
+
   it("exports logs through the current stream scope", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
 
@@ -3275,19 +4415,23 @@ describe("App inventory shell", () => {
     fireEvent.click(screen.getByRole("button", { name: "Export" }));
 
     const dialog = await screen.findByRole("dialog", { name: "Export Logs" });
-    fireEvent.click(within(dialog).getByRole("button", { name: "Browse" }));
-    await waitFor(() =>
-      expect(runtimeMock.saveFile).toHaveBeenCalledWith(
-        expect.objectContaining({ ButtonText: "Export" }),
-      ),
-    );
+    expect(
+      within(dialog).getByText(/visible-buffer filters are not applied/i),
+    ).toBeInTheDocument();
+    expect(within(dialog).queryByLabelText("Path")).not.toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("option", {
+        name: "available history (bounded)",
+      }),
+    ).toBeInTheDocument();
+    expect(runtimeMock.saveFile).not.toHaveBeenCalled();
     fireEvent.click(within(dialog).getByRole("button", { name: "Export" }));
 
     await waitFor(() =>
       expect(logsServiceMock.ExportLogs).toHaveBeenCalledWith({
         scope: "all",
         ids: [],
-        path: "/tmp/cairn-logs.jsonl",
+        format: "jsonl",
       }),
     );
     expect(await screen.findByText("Logs exported")).toBeInTheDocument();
@@ -3298,6 +4442,144 @@ describe("App inventory shell", () => {
       ),
     );
     expect(await screen.findByText("Log path copied")).toBeInTheDocument();
+  });
+
+  it("warns when a bounded log export is incomplete", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    logsServiceMock.ExportLogs.mockResolvedValueOnce({
+      path: "/tmp/cairn-logs.jsonl",
+      bytes: 42,
+      lineCount: 2,
+      truncated: true,
+      durabilityWarning: "Directory metadata was not synchronized.",
+    });
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Logs/ }),
+    );
+    await waitFor(() =>
+      expect(logsServiceMock.StartLogStream).toHaveBeenCalled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Export" }));
+    fireEvent.click(
+      within(
+        await screen.findByRole("dialog", { name: "Export Logs" }),
+      ).getByRole("button", { name: "Export" }),
+    );
+
+    expect(
+      await screen.findByText("Logs exported with warnings"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/safety limit and is incomplete/i),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/Directory metadata was not synchronized/i),
+    ).toBeInTheDocument();
+  });
+
+  it("preserves a newer log export draft when an older export completes", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    const pendingExport = deferred<ExportResult>();
+    logsServiceMock.ExportLogs.mockReturnValueOnce(pendingExport.promise);
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Logs/ }),
+    );
+    await waitFor(() =>
+      expect(logsServiceMock.StartLogStream).toHaveBeenCalled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Export" }));
+    const dialog = await screen.findByRole("dialog", { name: "Export Logs" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Export" }));
+    await waitFor(() =>
+      expect(logsServiceMock.ExportLogs).toHaveBeenCalledWith({
+        scope: "all",
+        ids: [],
+        format: "jsonl",
+      }),
+    );
+
+    fireEvent.change(within(dialog).getByLabelText("Format"), {
+      target: { value: "log" },
+    });
+    expect(within(dialog).getByLabelText("Format")).toHaveValue("log");
+
+    await act(async () => {
+      pendingExport.resolve({
+        path: "/tmp/older-export.jsonl",
+        bytes: 42,
+        lineCount: 2,
+      } as ExportResult);
+      await pendingExport.promise;
+      await Promise.resolve();
+    });
+
+    expect(
+      screen.getByRole("dialog", { name: "Export Logs" }),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByLabelText("Format")).toHaveValue("log");
+    expect(
+      within(dialog).getByRole("button", { name: "Export" }),
+    ).toBeEnabled();
+    expect(await screen.findByText("Logs exported")).toBeInTheDocument();
+  });
+
+  it("reports an obsolete log export failure without poisoning a newer draft", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    const pendingExport = deferred<ExportResult>();
+    logsServiceMock.ExportLogs.mockReturnValueOnce(pendingExport.promise);
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Logs/ }),
+    );
+    await waitFor(() =>
+      expect(logsServiceMock.StartLogStream).toHaveBeenCalled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Export" }));
+    const dialog = await screen.findByRole("dialog", { name: "Export Logs" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Export" }));
+    await waitFor(() =>
+      expect(logsServiceMock.ExportLogs).toHaveBeenCalledTimes(1),
+    );
+    fireEvent.change(within(dialog).getByLabelText("Range"), {
+      target: { value: "tail" },
+    });
+
+    await act(async () => {
+      pendingExport.reject(new Error("Older export failed"));
+      try {
+        await pendingExport.promise;
+      } catch {
+        // The component owns the expected rejection.
+      }
+      await Promise.resolve();
+    });
+
+    expect(
+      screen.getByRole("dialog", { name: "Export Logs" }),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByLabelText("Range")).toHaveValue("tail");
+    expect(
+      within(dialog).queryByText("Older export failed"),
+    ).not.toBeInTheDocument();
+    expect(await screen.findByText("Log export failed")).toBeInTheDocument();
+    expect(screen.getByText("Older export failed")).toBeInTheDocument();
   });
 
   it("confirms dangerous project plans through the project apply endpoint", async () => {
@@ -3341,7 +4623,7 @@ describe("App inventory shell", () => {
     );
   });
 
-  it("shows Compose command output for project jobs", async () => {
+  it("ignores Compose command output from unregistered project jobs", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
     projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
     projectServiceMock.GetProject.mockResolvedValue(seededProjectDetail());
@@ -3364,37 +4646,16 @@ describe("App inventory shell", () => {
       projectID: "linux_native/app-db",
       action: "redeploy",
       command: "docker compose up -d --force-recreate",
-      phase: "running",
-      message: "docker compose up -d --force-recreate",
-    });
-    emitRuntimeEvent("job:progress", {
-      jobID: "project-job",
-      projectID: "linux_native/app-db",
-      action: "redeploy",
-      command: "docker compose up -d --force-recreate",
       phase: "stdout",
       message: "Container app Recreated",
     });
-    emitRuntimeEvent("job:done", {
-      jobID: "project-job",
-      projectID: "linux_native/app-db",
-      action: "redeploy",
-      command: "docker compose up -d --force-recreate",
-      result: "success",
-    });
 
-    const output = await screen.findByRole("region", {
-      name: "Compose command output",
-    });
-    expect(within(output).getByText("Redeploy output")).toBeInTheDocument();
     expect(
-      within(output).getAllByText("docker compose up -d --force-recreate")
-        .length,
-    ).toBeGreaterThan(0);
+      screen.queryByRole("region", { name: "Compose command output" }),
+    ).not.toBeInTheDocument();
     expect(
-      within(output).getByText("Container app Recreated"),
-    ).toBeInTheDocument();
-    expect(within(output).getByText("success")).toBeInTheDocument();
+      screen.queryByText("Container app Recreated"),
+    ).not.toBeInTheDocument();
   });
 
   it("imports a Compose project through the folder picker", async () => {
@@ -3793,12 +5054,24 @@ describe("App inventory shell", () => {
     ).toBeInTheDocument();
   });
 
-  it("runs safe container actions directly and refreshes inventory", async () => {
+  it("trails an in-flight snapshot with fresh inventory after a safe action", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
 
     render(<App />);
 
     await screen.findByText("Docker Engine - Running");
+    const stop = deferred<void>();
+    const oldFull = deferred<InventorySnapshot>();
+    const freshFull = deferred<InventorySnapshot>();
+    const freshSnapshot = seededSnapshot();
+    freshSnapshot.containers = [
+      { ...freshSnapshot.containers[0], name: "fresh-action-web" },
+    ];
+    dockerServiceMock.StopContainer.mockReturnValueOnce(stop.promise);
+    inventoryMock.getInventorySnapshot
+      .mockReturnValueOnce(oldFull.promise)
+      .mockReturnValueOnce(freshFull.promise);
+
     fireEvent.click(
       within(
         screen.getByRole("navigation", { name: "Main navigation" }),
@@ -3807,13 +5080,42 @@ describe("App inventory shell", () => {
       }),
     );
     fireEvent.click(screen.getByRole("button", { name: "Stop web" }));
-
-    expect(dockerServiceMock.StopContainer).toHaveBeenCalledWith(
-      "container-1",
-      10,
-    );
     await waitFor(() =>
-      expect(inventoryMock.getInventorySnapshot).toHaveBeenCalledTimes(2),
+      expect(dockerServiceMock.StopContainer).toHaveBeenCalledWith(
+        "container-1",
+        10,
+      ),
+    );
+
+    let ordinary!: Promise<void>;
+    act(() => {
+      ordinary = useInventoryStore.getState().refresh();
+    });
+    await act(async () => {
+      stop.resolve();
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      oldFull.resolve({
+        ...seededSnapshot(),
+        containers: [
+          { ...seededSnapshot().containers[0], name: "obsolete-action-web" },
+        ],
+      });
+      await ordinary;
+    });
+
+    await waitFor(() =>
+      expect(inventoryMock.getInventorySnapshot).toHaveBeenCalledTimes(3),
+    );
+    const trailing = useInventoryStore.getState().refresh();
+    await act(async () => {
+      freshFull.resolve(freshSnapshot);
+      await trailing;
+    });
+    expect(useInventoryStore.getState().containers[0]?.name).toBe(
+      "fresh-action-web",
     );
   });
 
@@ -4053,6 +5355,260 @@ describe("App inventory shell", () => {
     );
   });
 
+  it("keeps same-image inspect data owned by the current provider request", async () => {
+    const snapshot = seededSnapshot();
+    const image = snapshot.images[0]!;
+    const oldDetail = deferred<ImageDetail | null>();
+    const newDetail = deferred<ImageDetail | null>();
+    dockerServiceMock.GetImage.mockReturnValueOnce(
+      oldDetail.promise,
+    ).mockReturnValueOnce(newDetail.promise);
+    inventoryMock.getInventorySnapshot.mockResolvedValue(snapshot);
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Images/ }),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Inspect cairn/web:latest" }),
+    );
+    await waitFor(() =>
+      expect(dockerServiceMock.GetImage).toHaveBeenCalledTimes(1),
+    );
+
+    emitRuntimeEvent("provider:changed", { id: "new-provider" });
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Inspect cairn/web:latest" }),
+    );
+    await waitFor(() =>
+      expect(dockerServiceMock.GetImage).toHaveBeenCalledTimes(2),
+    );
+
+    await act(async () => {
+      newDetail.resolve({
+        summary: image,
+        author: "new-provider-author",
+        architecture: "amd64",
+        os: "linux",
+      } as ImageDetail);
+      await newDetail.promise;
+    });
+    const currentDialog = await screen.findByRole("dialog", {
+      name: "cairn/web:latest",
+    });
+    expect(
+      within(currentDialog).getByText("new-provider-author"),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      oldDetail.resolve({
+        summary: image,
+        author: "old-provider-author",
+        architecture: "arm64",
+        os: "linux",
+      } as ImageDetail);
+      await oldDetail.promise;
+      await Promise.resolve();
+    });
+
+    expect(
+      within(currentDialog).getByText("new-provider-author"),
+    ).toBeInTheDocument();
+    expect(
+      within(currentDialog).queryByText("old-provider-author"),
+    ).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ["successful", false],
+    ["failed", true],
+  ] as const)(
+    "handles a pending volume inspect after a %s parent-list refresh",
+    async (caseName, listFails) => {
+      const initial = seededSnapshot();
+      initial.volumeDetails = {};
+      const detailRequest = deferred<VolumeDetail | null>();
+      const detailMarker = `${caseName}-parent-list-detail`;
+      const detail = {
+        summary: initial.volumes[0],
+        options: { source: detailMarker },
+        containers: [],
+      } as VolumeDetail;
+      inventoryMock.getInventorySnapshot.mockResolvedValue(initial);
+      dockerServiceMock.GetVolume.mockReturnValueOnce(detailRequest.promise);
+
+      render(<App />);
+
+      await screen.findByText("Docker Engine - Running");
+      fireEvent.click(
+        within(
+          screen.getByRole("navigation", { name: "Main navigation" }),
+        ).getByRole("button", { name: /Volumes/ }),
+      );
+      fireEvent.click(
+        screen.getByRole("button", { name: "Inspect cairn_data" }),
+      );
+      const dialog = await screen.findByRole("dialog", {
+        name: "cairn_data",
+      });
+      await waitFor(() =>
+        expect(dockerServiceMock.GetVolume).toHaveBeenCalledWith("cairn_data"),
+      );
+
+      if (listFails) {
+        dockerServiceMock.ListVolumes.mockRejectedValueOnce(
+          new Error("volume list failed"),
+        );
+      } else {
+        dockerServiceMock.ListVolumes.mockResolvedValueOnce(initial.volumes);
+      }
+      await act(async () => {
+        await useInventoryStore.getState().refreshVolumes();
+      });
+
+      await act(async () => {
+        detailRequest.resolve(detail);
+        await detailRequest.promise;
+      });
+
+      if (listFails) {
+        expect(
+          await within(dialog).findByText(new RegExp(detailMarker)),
+        ).toBeInTheDocument();
+        expect(useInventoryStore.getState().volumeDetails.cairn_data).toEqual(
+          detail,
+        );
+        expect(useInventoryStore.getState().slices.volumes.error).toBe(
+          "volume list failed",
+        );
+      } else {
+        expect(
+          within(dialog).queryByText(new RegExp(detailMarker)),
+        ).not.toBeInTheDocument();
+        expect(
+          useInventoryStore.getState().volumeDetails.cairn_data,
+        ).toBeUndefined();
+      }
+    },
+  );
+
+  it("closes a pending volume inspect when its volume is removed and recreated", async () => {
+    const initial = seededSnapshot();
+    initial.volumeDetails = {};
+    const pendingDetail = deferred<VolumeDetail | null>();
+    inventoryMock.getInventorySnapshot.mockResolvedValue(initial);
+    dockerServiceMock.GetVolume.mockReturnValueOnce(pendingDetail.promise);
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Volumes/ }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Inspect cairn_data" }));
+    expect(
+      await screen.findByRole("dialog", { name: "cairn_data" }),
+    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(dockerServiceMock.GetVolume).toHaveBeenCalledWith("cairn_data"),
+    );
+
+    dockerServiceMock.ListVolumes.mockResolvedValueOnce(
+      [],
+    ).mockResolvedValueOnce(initial.volumes);
+    await act(async () => {
+      await useInventoryStore.getState().refreshVolumes();
+      await useInventoryStore.getState().refreshVolumes();
+      pendingDetail.resolve({
+        summary: initial.volumes[0],
+        options: { source: "removed-incarnation" },
+        containers: [],
+      } as VolumeDetail);
+      await pendingDetail.promise;
+      await Promise.resolve();
+    });
+
+    expect(
+      screen.queryByRole("dialog", { name: "cairn_data" }),
+    ).not.toBeInTheDocument();
+    expect(useInventoryStore.getState().volumeDetails).toEqual({});
+  });
+
+  it("does not let an obsolete volume request settle a reopened same-name modal", async () => {
+    const initial = seededSnapshot();
+    initial.volumeDetails = {};
+    const oldDetail = deferred<VolumeDetail | null>();
+    const newDetail = deferred<VolumeDetail | null>();
+    dockerServiceMock.GetVolume.mockReturnValueOnce(
+      oldDetail.promise,
+    ).mockReturnValueOnce(newDetail.promise);
+    inventoryMock.getInventorySnapshot.mockResolvedValue(initial);
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Volumes/ }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Inspect cairn_data" }));
+    const oldDialog = await screen.findByRole("dialog", {
+      name: "cairn_data",
+    });
+    await waitFor(() =>
+      expect(dockerServiceMock.GetVolume).toHaveBeenCalledTimes(1),
+    );
+
+    dockerServiceMock.ListVolumes.mockResolvedValueOnce(
+      [],
+    ).mockResolvedValueOnce(initial.volumes);
+    await act(async () => {
+      await useInventoryStore.getState().refreshVolumes();
+      await useInventoryStore.getState().refreshVolumes();
+    });
+    fireEvent.click(within(oldDialog).getByRole("button", { name: "Close" }));
+    fireEvent.click(screen.getByRole("button", { name: "Inspect cairn_data" }));
+    const currentDialog = await screen.findByRole("dialog", {
+      name: "cairn_data",
+    });
+    await waitFor(() =>
+      expect(dockerServiceMock.GetVolume).toHaveBeenCalledTimes(2),
+    );
+
+    await act(async () => {
+      oldDetail.resolve({
+        summary: initial.volumes[0]!,
+        options: { source: "obsolete-volume-detail" },
+        containers: [],
+      } as VolumeDetail);
+      await oldDetail.promise;
+      await Promise.resolve();
+    });
+    expect(currentDialog).toBeInTheDocument();
+    expect(
+      within(currentDialog).queryByText(/obsolete-volume-detail/),
+    ).not.toBeInTheDocument();
+
+    await act(async () => {
+      newDetail.resolve({
+        summary: initial.volumes[0]!,
+        options: { source: "current-volume-detail" },
+        containers: [],
+      } as VolumeDetail);
+      await newDetail.promise;
+    });
+    expect(
+      await within(currentDialog).findByText(/current-volume-detail/),
+    ).toBeInTheDocument();
+  });
+
   it("opens a network detail view with attached container endpoint data", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
 
@@ -4072,6 +5628,13 @@ describe("App inventory shell", () => {
       screen.getByRole("heading", { name: "cairn_default" }),
     ).toBeInTheDocument();
     expect(screen.getByText("172.19.0.0/16")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(
+        screen
+          .getAllByRole("button", { name: "Refresh" })
+          .find((button) => !button.hasAttribute("aria-label")),
+      ).toBeEnabled(),
+    );
 
     fireEvent.click(screen.getAllByRole("button", { name: /Containers/ })[1]);
 
@@ -4080,6 +5643,174 @@ describe("App inventory shell", () => {
     ).toBeInTheDocument();
     expect(screen.getByText("172.19.0.2/16")).toBeInTheDocument();
     expect(screen.getByText("02:42:ac:13:00:02")).toBeInTheDocument();
+  });
+
+  it("owns network-detail retry loading and clears the stale request error", async () => {
+    const initial = seededSnapshot();
+    const network = initial.networks[0];
+    const retry = deferred<NetworkDetail | null>();
+    initial.networkDetails = {};
+    inventoryMock.getInventorySnapshot.mockResolvedValue(initial);
+    dockerServiceMock.GetNetwork.mockRejectedValueOnce(
+      new Error("network detail temporarily unavailable"),
+    );
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Networks/ }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: network.name }));
+    expect(
+      await screen.findByText("network detail temporarily unavailable"),
+    ).toBeInTheDocument();
+
+    dockerServiceMock.GetNetwork.mockReturnValueOnce(retry.promise);
+    const refresh = screen
+      .getAllByRole("button", { name: "Refresh" })
+      .find((button) => !button.hasAttribute("aria-label"))!;
+    await act(async () => {
+      fireEvent.click(refresh);
+      await Promise.resolve();
+    });
+
+    expect(
+      screen.queryByText("network detail temporarily unavailable"),
+    ).not.toBeInTheDocument();
+    expect(refresh).toBeDisabled();
+
+    await act(async () => {
+      retry.resolve({
+        summary: network,
+        subnet: "10.42.0.0/16",
+        containers: [],
+      } as NetworkDetail);
+      await retry.promise;
+    });
+    await waitFor(() => expect(refresh).toBeEnabled());
+    expect(screen.getByText("10.42.0.0/16")).toBeInTheDocument();
+  });
+
+  it("ignores a late network error after the user opens another network", async () => {
+    const initial = seededSnapshot();
+    const firstNetwork = initial.networks[0];
+    const secondNetwork = {
+      ...firstNetwork,
+      id: "network-2",
+      name: "second_network",
+    };
+    initial.networks = [firstNetwork, secondNetwork];
+    initial.networkDetails = {};
+    const firstRequest = deferred<NetworkDetail | null>();
+    const secondRequest = deferred<NetworkDetail | null>();
+    inventoryMock.getInventorySnapshot.mockResolvedValue(initial);
+    dockerServiceMock.GetNetwork.mockImplementation((networkID: string) =>
+      networkID === firstNetwork.id
+        ? firstRequest.promise
+        : secondRequest.promise,
+    );
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Networks/ }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: firstNetwork.name }));
+    await waitFor(() =>
+      expect(dockerServiceMock.GetNetwork).toHaveBeenCalledWith(
+        firstNetwork.id,
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    fireEvent.click(screen.getByRole("button", { name: secondNetwork.name }));
+    expect(
+      await screen.findByRole("heading", { name: secondNetwork.name }),
+    ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(dockerServiceMock.GetNetwork).toHaveBeenCalledWith(
+        secondNetwork.id,
+      ),
+    );
+
+    await act(async () => {
+      firstRequest.reject(new Error("first network failed late"));
+      await firstRequest.promise.catch(() => undefined);
+      await Promise.resolve();
+    });
+    expect(
+      screen.queryByText("first network failed late"),
+    ).not.toBeInTheDocument();
+
+    await act(async () => {
+      secondRequest.reject(new Error("current network failed"));
+      await secondRequest.promise.catch(() => undefined);
+      await Promise.resolve();
+    });
+    expect(
+      await screen.findByText("current network failed"),
+    ).toBeInTheDocument();
+  });
+
+  it("still caches a late network success after the user opens another network", async () => {
+    const initial = seededSnapshot();
+    const firstNetwork = initial.networks[0];
+    const secondNetwork = {
+      ...firstNetwork,
+      id: "network-cache-2",
+      name: "cache_second_network",
+    };
+    const firstDetail = {
+      summary: firstNetwork,
+      options: { source: "late-first-success" },
+      containers: [],
+    } as NetworkDetail;
+    initial.networks = [firstNetwork, secondNetwork];
+    initial.networkDetails = {};
+    const firstRequest = deferred<NetworkDetail | null>();
+    inventoryMock.getInventorySnapshot.mockResolvedValue(initial);
+    dockerServiceMock.GetNetwork.mockImplementation((networkID: string) =>
+      networkID === firstNetwork.id
+        ? firstRequest.promise
+        : Promise.resolve(null),
+    );
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Networks/ }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: firstNetwork.name }));
+    await waitFor(() =>
+      expect(dockerServiceMock.GetNetwork).toHaveBeenCalledWith(
+        firstNetwork.id,
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    fireEvent.click(screen.getByRole("button", { name: secondNetwork.name }));
+    expect(
+      await screen.findByRole("heading", { name: secondNetwork.name }),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      firstRequest.resolve(firstDetail);
+      await firstRequest.promise;
+      await Promise.resolve();
+    });
+    expect(
+      useInventoryStore.getState().networkDetails[firstNetwork.id],
+    ).toEqual(firstDetail);
+    expect(
+      screen.getByRole("heading", { name: secondNetwork.name }),
+    ).toBeInTheDocument();
   });
 
   it("plans volume backup and restore actions behind confirmation", async () => {
@@ -4265,6 +5996,10 @@ describe("App inventory shell", () => {
     expect(screen.getByText("Docker is not reachable")).toBeInTheDocument();
     expect(logsServiceMock.StartLogStream).not.toHaveBeenCalled();
     expect(metricsServiceMock.StartStatsStream).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("button", { name: "Check updates" }),
+    ).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Check now" })).toBeDisabled();
 
     fireEvent.click(
       within(
@@ -4498,6 +6233,232 @@ describe("App inventory shell", () => {
       within(firstDialog).getByRole("button", { name: "Close" }),
     ).not.toBeDisabled();
   });
+
+  it("resets deferred provider planning when the provider scope changes", async () => {
+    const planRequest = deferred<CommandPlan>();
+    inventoryMock.getInventorySnapshot.mockResolvedValue(noProviderSnapshot());
+    providerServiceMock.Detect.mockResolvedValueOnce({
+      ...healthyProviderStatus(),
+      installed: false,
+      running: false,
+      healthy: false,
+      dockerInstalled: false,
+      dockerRunning: false,
+      problems: [
+        {
+          code: "WSL_MISSING",
+          message: "WSL is not installed.",
+          repairHint: "Install WSL 2 with an Ubuntu distribution.",
+          recoverable: true,
+        },
+      ],
+    });
+    providerServiceMock.PlanInstall.mockReturnValueOnce(planRequest.promise);
+
+    render(<App />);
+
+    expect(
+      await screen.findByText("No Docker provider configured"),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole("button", { name: "Set up" })[0]);
+    const dialog = await screen.findByRole("dialog", {
+      name: "Set Up Docker Backend",
+    });
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Get started" }),
+    );
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: /Ubuntu on WSL2/ }),
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: "Run checks" }));
+    expect(
+      await within(dialog).findByText(
+        "Install WSL 2 with an Ubuntu distribution.",
+      ),
+    ).toBeInTheDocument();
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Review auto repair" }),
+    );
+    await waitFor(() =>
+      expect(providerServiceMock.PlanInstall).toHaveBeenCalledTimes(1),
+    );
+
+    vi.useFakeTimers();
+    act(() => emitRuntimeEvent("provider:changed", { id: "replacement" }));
+    expect(dialog).not.toBeInTheDocument();
+    await act(async () => {
+      planRequest.resolve(wslInstallPlan());
+      await planRequest.promise;
+      await vi.advanceTimersByTimeAsync(250);
+    });
+    vi.useRealTimers();
+
+    expect(
+      screen.queryByText("wsl.exe --install Ubuntu --name cairn-dev"),
+    ).not.toBeInTheDocument();
+    fireEvent.click(screen.getAllByRole("button", { name: "Set up" })[0]);
+    expect(
+      await screen.findByRole("dialog", { name: "Set Up Docker Backend" }),
+    ).toBeInTheDocument();
+  });
+
+  it("resets a provider install session when the provider scope changes", async () => {
+    const applyRequest = deferred<{ planID: string; streamID: string }>();
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    providerServiceMock.ApplyInstall.mockReturnValueOnce(applyRequest.promise);
+    window.localStorage.setItem(
+      "cairn.providerSetup.v1",
+      JSON.stringify({
+        open: true,
+        step: "install",
+        platform: "windows",
+        backend: "windows_wsl_ubuntu",
+        distro: "Ubuntu",
+        plan: wslInstallPlan(),
+      }),
+    );
+
+    render(<App />);
+
+    const dialog = await screen.findByRole("dialog", {
+      name: "Set Up Docker Backend",
+    });
+    fireEvent.click(
+      within(dialog).getByRole("button", { name: "Run auto repair" }),
+    );
+    await waitFor(() =>
+      expect(providerServiceMock.ApplyInstall).toHaveBeenCalledTimes(1),
+    );
+
+    vi.useFakeTimers();
+    act(() => emitRuntimeEvent("provider:changed", { id: "replacement" }));
+    expect(dialog).not.toBeInTheDocument();
+    await act(async () => {
+      applyRequest.resolve({
+        planID: "plan-wsl-install",
+        streamID: "stale-install-stream",
+      });
+      await applyRequest.promise;
+      emitRuntimeEvent("provider:install:progress", {
+        planID: "plan-wsl-install",
+        streamID: "stale-install-stream",
+        step: 1,
+        totalSteps: 1,
+        message: "Stale install complete",
+        done: true,
+      });
+      await vi.advanceTimersByTimeAsync(250);
+    });
+    vi.useRealTimers();
+
+    expect(
+      screen.queryByRole("dialog", { name: "Set Up Docker Backend" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByText("Stale install complete"),
+    ).not.toBeInTheDocument();
+  });
+
+  it.each(["test-then-logout", "logout-then-test"] as const)(
+    "releases both registry busy indicators for %s completion order",
+    async (order) => {
+      inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+      registryServiceMock.ListRegistryAccounts.mockResolvedValue([
+        {
+          registry: "docker.io",
+          username: "ada",
+          source: "credentialHelper",
+          loggedIn: true,
+        },
+      ]);
+      const testRequest = deferred<RegistryAuthStatus>();
+      const logoutRequest = deferred<void>();
+      registryServiceMock.TestAuth.mockReturnValueOnce(testRequest.promise);
+      registryServiceMock.Logout.mockReturnValueOnce(logoutRequest.promise);
+
+      render(<App />);
+
+      await screen.findByText("Docker Engine - Running");
+      fireEvent.click(
+        within(
+          screen.getByRole("navigation", { name: "Main navigation" }),
+        ).getByRole("button", { name: /Settings/ }),
+      );
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Registries" }),
+      );
+      const testButton = await screen.findByRole("button", {
+        name: "Test docker.io",
+      });
+      const logoutButton = screen.getByRole("button", {
+        name: "Log out docker.io",
+      });
+
+      const firstButton =
+        order === "test-then-logout" ? testButton : logoutButton;
+      const secondButton =
+        order === "test-then-logout" ? logoutButton : testButton;
+      fireEvent.click(firstButton);
+      await waitFor(() =>
+        expect(
+          order === "test-then-logout"
+            ? registryServiceMock.TestAuth
+            : registryServiceMock.Logout,
+        ).toHaveBeenCalledTimes(1),
+      );
+      fireEvent.click(secondButton);
+      await waitFor(() =>
+        expect(
+          order === "test-then-logout"
+            ? registryServiceMock.Logout
+            : registryServiceMock.TestAuth,
+        ).toHaveBeenCalledTimes(1),
+      );
+
+      const firstCompletedButton =
+        order === "test-then-logout" ? logoutButton : testButton;
+      const stillPendingButton =
+        order === "test-then-logout" ? testButton : logoutButton;
+      await act(async () => {
+        if (order === "test-then-logout") {
+          logoutRequest.resolve();
+          await logoutRequest.promise;
+        } else {
+          testRequest.resolve({
+            registry: "docker.io",
+            loggedIn: true,
+            username: "ada",
+          } as RegistryAuthStatus);
+          await testRequest.promise;
+        }
+        await Promise.resolve();
+      });
+      await waitFor(() => {
+        expect(firstCompletedButton).not.toBeDisabled();
+        expect(stillPendingButton).toBeDisabled();
+      });
+
+      await act(async () => {
+        if (order === "test-then-logout") {
+          testRequest.resolve({
+            registry: "docker.io",
+            loggedIn: true,
+            username: "ada",
+          } as RegistryAuthStatus);
+          await testRequest.promise;
+        } else {
+          logoutRequest.resolve();
+          await logoutRequest.promise;
+        }
+        await Promise.resolve();
+      });
+
+      await waitFor(() => {
+        expect(testButton).not.toBeDisabled();
+        expect(logoutButton).not.toBeDisabled();
+      });
+    },
+  );
 
   it("locks setup and commits project detection only for the active session", async () => {
     const currentProject = seededProject();
@@ -4898,6 +6859,61 @@ describe("App inventory shell", () => {
     expect(
       within(dialog).getByText("wsl.exe --install Ubuntu --name cairn-dev"),
     ).toBeInTheDocument();
+  });
+
+  it("bounds restored provider-setup progress and project state", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    const progress = Array.from(
+      { length: maxProviderInstallProgressEntries + 25 },
+      (_, index) => ({
+        planID: "stored-provider-plan",
+        streamID: "stored-provider-stream",
+        step: index,
+        totalSteps: maxProviderInstallProgressEntries + 25,
+        message: `Stored progress ${index}`,
+        done: false,
+      }),
+    );
+    const detectedProjects = Array.from(
+      { length: maxProviderSetupProjects + 25 },
+      (_, index) => ({
+        id: `linux_native/project-${index}`,
+        name: `project-${index}`,
+        providerID: "linux_native",
+      }),
+    );
+    window.localStorage.setItem(
+      "cairn.providerSetup.v1",
+      JSON.stringify({
+        open: true,
+        sessionID: "bounded-restored-setup",
+        step: "install",
+        platform: "windows",
+        backend: "windows_wsl_ubuntu",
+        distro: "Ubuntu",
+        progress,
+        detectedProjects,
+        selectedProjectIDs: detectedProjects.map((project) => project.id),
+      }),
+    );
+
+    render(<App />);
+
+    await screen.findByRole("dialog", { name: "Set Up Docker Backend" });
+    await waitFor(() => {
+      const restored = JSON.parse(
+        window.localStorage.getItem("cairn.providerSetup.v1") ?? "{}",
+      ) as {
+        progress?: unknown[];
+        detectedProjects?: unknown[];
+        selectedProjectIDs?: unknown[];
+      };
+      expect(restored.progress).toHaveLength(maxProviderInstallProgressEntries);
+      expect(restored.detectedProjects).toHaveLength(maxProviderSetupProjects);
+      expect(restored.selectedProjectIDs).toHaveLength(
+        maxProviderSetupProjects,
+      );
+    });
   });
 
   it("handles provider install progress before ApplyInstall returns a stream handle", async () => {
@@ -5506,7 +7522,10 @@ describe("App inventory shell", () => {
         screen.getByRole("navigation", { name: "Main navigation" }),
       ).getByRole("button", { name: /Agent/ }),
     );
-    const endpointInput = await screen.findByLabelText("Endpoint");
+    await screen.findByText("Local Agent");
+    const endpointInput = await screen.findByRole("textbox", {
+      name: /Endpoint \(loopback only\)/,
+    });
     fireEvent.change(endpointInput, {
       target: { value: "http://127.0.0.1:11435" },
     });
@@ -5769,8 +7788,7 @@ describe("App inventory shell", () => {
   });
 
   it("saves macOS Colima settings and switches existing Docker contexts", async () => {
-    inventoryMock.getInventorySnapshot.mockResolvedValue(macOSColimaSnapshot());
-    providerServiceMock.ListDockerContexts.mockResolvedValue([
+    const dockerContexts = [
       {
         name: "colima",
         description: "Colima",
@@ -5783,7 +7801,9 @@ describe("App inventory shell", () => {
         current: false,
         dockerHost: "tcp://192.0.2.10:2375",
       },
-    ]);
+    ];
+    inventoryMock.getInventorySnapshot.mockResolvedValue(macOSColimaSnapshot());
+    providerServiceMock.ListDockerContexts.mockResolvedValue(dockerContexts);
 
     render(<App />);
 
@@ -5822,6 +7842,14 @@ describe("App inventory shell", () => {
     clickSettingsSection("Docker contexts");
     expect(await screen.findByText("remote-prod")).toBeInTheDocument();
     expect(screen.getByText("unencrypted tcp://")).toBeInTheDocument();
+    const contextRefresh = deferred<typeof dockerContexts>();
+    const scopeInventory = deferred<InventorySnapshot>();
+    providerServiceMock.ListDockerContexts.mockReturnValueOnce(
+      contextRefresh.promise,
+    );
+    inventoryMock.getInventorySnapshot.mockReturnValueOnce(
+      scopeInventory.promise,
+    );
     fireEvent.click(
       screen.getAllByRole("button", { name: "Use this context" })[1],
     );
@@ -5829,6 +7857,30 @@ describe("App inventory shell", () => {
       expect(providerServiceMock.SetDockerContext).toHaveBeenCalledWith(
         "remote-prod",
       ),
+    );
+    await waitFor(() =>
+      expect(providerServiceMock.ListDockerContexts).toHaveBeenCalledTimes(2),
+    );
+
+    // The old context is invalidated before the context-list request settles,
+    // so no old provider or resource remains actionable during the switch.
+    expect(useInventoryStore.getState()).toMatchObject({
+      connection: "connecting",
+      providers: [],
+      dockerInfo: null,
+      containers: [],
+      images: [],
+      volumes: [],
+      networks: [],
+    });
+
+    await act(async () => {
+      contextRefresh.resolve(dockerContexts);
+      scopeInventory.resolve(macOSColimaSnapshot());
+      await Promise.all([contextRefresh.promise, scopeInventory.promise]);
+    });
+    await waitFor(() =>
+      expect(useInventoryStore.getState().connection).toBe("connected"),
     );
   });
 
@@ -5928,6 +7980,7 @@ describe("App inventory shell", () => {
     // that clears the connection state.
     inventoryMock.getInventorySnapshot.mockResolvedValue({
       ...seededSnapshot(),
+      failures: { containers: "transient blip" },
       degradedReason: "transient blip",
     });
     emitRuntimeEvent("docker:connected", {
@@ -5940,6 +7993,65 @@ describe("App inventory shell", () => {
         screen.queryByText("Docker is not reachable"),
       ).not.toBeInTheDocument(),
     );
+  });
+
+  it("trails an in-flight old snapshot after docker:connected", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+    await screen.findByText("Docker Engine - Running");
+
+    emitRuntimeEvent("docker:disconnected", { reason: "daemon stopped" });
+    expect(screen.getByText("Docker is not reachable")).toBeInTheDocument();
+
+    const oldFull = deferred<InventorySnapshot>();
+    const freshFull = deferred<InventorySnapshot>();
+    const freshSnapshot = seededSnapshot();
+    freshSnapshot.containers = [
+      { ...freshSnapshot.containers[0], name: "fresh-reconnect-web" },
+    ];
+    inventoryMock.getInventorySnapshot
+      .mockReturnValueOnce(oldFull.promise)
+      .mockReturnValueOnce(freshFull.promise);
+
+    let ordinary!: Promise<void>;
+    act(() => {
+      ordinary = useInventoryStore.getState().refresh();
+    });
+    emitRuntimeEvent("docker:connected", {
+      host: "unix:///var/run/docker.sock",
+      context: "default",
+    });
+    expect(useInventoryStore.getState().connection).toBe("connected");
+
+    await act(async () => {
+      oldFull.resolve({
+        ...seededSnapshot(),
+        containers: [
+          {
+            ...seededSnapshot().containers[0],
+            name: "obsolete-reconnect-web",
+          },
+        ],
+      });
+      await ordinary;
+    });
+    await waitFor(() =>
+      expect(inventoryMock.getInventorySnapshot).toHaveBeenCalledTimes(3),
+    );
+
+    const trailing = useInventoryStore.getState().refresh();
+    await act(async () => {
+      freshFull.resolve(freshSnapshot);
+      await trailing;
+    });
+
+    expect(useInventoryStore.getState().containers[0]?.name).toBe(
+      "fresh-reconnect-web",
+    );
+    expect(
+      screen.queryByText("Docker is not reachable"),
+    ).not.toBeInTheDocument();
   });
 
   it("keeps the error banner hidden while connected despite a transient inventory error", async () => {
@@ -5962,7 +8074,190 @@ describe("App inventory shell", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("resets the stale connection banner when the provider changes", async () => {
+  it("keeps healthy slices usable while naming stale partial inventory data", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+    await screen.findByText("Docker Engine - Running");
+
+    const oldFull = deferred<InventorySnapshot>();
+    const freshFull = deferred<InventorySnapshot>();
+    const freshSnapshot = seededSnapshot();
+    freshSnapshot.containers = [
+      { ...freshSnapshot.containers[0], name: "fresh-retry-web" },
+    ];
+    inventoryMock.getInventorySnapshot
+      .mockReturnValueOnce(oldFull.promise)
+      .mockReturnValueOnce(freshFull.promise);
+    let ordinary!: Promise<void>;
+    act(() => {
+      ordinary = useInventoryStore.getState().refresh();
+    });
+
+    dockerServiceMock.ListContainers.mockRejectedValueOnce(
+      new Error("container list timed out"),
+    );
+    await act(async () => {
+      await useInventoryStore.getState().refreshContainers();
+    });
+
+    expect(screen.getByText("Some Docker data is stale")).toBeInTheDocument();
+    expect(
+      screen.getByText("containers: container list timed out"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Docker Engine - Running")).toBeInTheDocument();
+    expect(useInventoryStore.getState().containers).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await act(async () => {
+      oldFull.resolve({
+        ...seededSnapshot(),
+        containers: [
+          {
+            ...seededSnapshot().containers[0],
+            name: "obsolete-retry-web",
+          },
+        ],
+      });
+      await ordinary;
+    });
+    await waitFor(() =>
+      expect(inventoryMock.getInventorySnapshot).toHaveBeenCalledTimes(3),
+    );
+
+    const trailing = useInventoryStore.getState().refresh();
+    await act(async () => {
+      freshFull.resolve(freshSnapshot);
+      await trailing;
+    });
+
+    expect(useInventoryStore.getState().containers[0]?.name).toBe(
+      "fresh-retry-web",
+    );
+    expect(
+      screen.queryByText("Some Docker data is stale"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("reports a provider-list failure instead of claiming no provider is configured", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue({
+      ...seededSnapshot(),
+      providers: [],
+      failures: { providers: "provider table is locked" },
+      degradedReason: "providers: provider table is locked",
+    });
+
+    render(<App />);
+
+    expect(
+      await screen.findByText("Some Docker data is stale"),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("providers: provider table is locked"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByText("No Docker provider configured"),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("Docker Engine - Running")).toBeInTheDocument();
+  });
+
+  it("removes old-scope resources and container actions when the new scope fails", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Containers/ }),
+    );
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select web" }));
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "Open web container details",
+      }),
+    );
+    expect(
+      await screen.findByRole("heading", { name: "web" }),
+    ).toBeInTheDocument();
+    act(() => {
+      useInventoryStore.getState().setContainerStats([
+        {
+          containerID: "container-1",
+          cpuPercent: 42,
+          memoryBytes: 420,
+          networkRxRate: 1,
+          networkTxRate: 2,
+        },
+      ]);
+    });
+
+    inventoryMock.getInventorySnapshot.mockRejectedValueOnce(
+      new Error("new scope unavailable"),
+    );
+    vi.useFakeTimers();
+    emitRuntimeEvent("provider:changed", { id: "linux_native" });
+
+    // Scope invalidation is synchronous with the backend event; old actions
+    // disappear before the ancillary refresh debounce elapses.
+    expect(useInventoryStore.getState().connection).toBe("connecting");
+    expect(useInventoryStore.getState().containers).toEqual([]);
+    expect(
+      screen.queryByRole("heading", { name: "web" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Stop web" }),
+    ).not.toBeInTheDocument();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+    });
+    vi.useRealTimers();
+
+    await waitFor(() =>
+      expect(useInventoryStore.getState().error).toContain(
+        "new scope unavailable",
+      ),
+    );
+    expect(useInventoryStore.getState()).toMatchObject({
+      providers: [],
+      dockerInfo: null,
+      dockerVersion: null,
+      diskUsage: null,
+      containerStats: {},
+      containers: [],
+      images: [],
+      volumes: [],
+      networks: [],
+      volumeDetails: {},
+      networkDetails: {},
+    });
+    expect(
+      screen.queryByRole("heading", { name: "web" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Stop web" }),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText("No containers match")).toBeInTheDocument();
+
+    act(() => {
+      useInventoryStore
+        .getState()
+        .setContainers([
+          { ...seededSnapshot().containers[0], name: "new-scope-web" },
+        ]);
+    });
+    const newScopeSelection = await screen.findByRole("checkbox", {
+      name: "Select new-scope-web",
+    });
+    expect(newScopeSelection).not.toBeChecked();
+    expect(
+      screen.queryByRole("heading", { name: "new-scope-web" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("resets connection state and trails an old snapshot when the provider changes", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
 
     render(<App />);
@@ -5973,14 +8268,70 @@ describe("App inventory shell", () => {
 
     // Switching providers tears down the old heartbeat with no terminal event;
     // the stale "disconnected" banner must not linger for the new provider.
-    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    const oldFull = deferred<InventorySnapshot>();
+    const freshFull = deferred<InventorySnapshot>();
+    const freshSnapshot = seededSnapshot();
+    freshSnapshot.containers = [
+      { ...freshSnapshot.containers[0], name: "fresh-provider-web" },
+    ];
+    inventoryMock.getInventorySnapshot
+      .mockReturnValueOnce(oldFull.promise)
+      .mockReturnValueOnce(freshFull.promise);
+    let ordinary!: Promise<void>;
+    act(() => {
+      ordinary = useInventoryStore.getState().refresh();
+    });
+    vi.useFakeTimers();
+    const projectRefreshesBefore =
+      projectServiceMock.RefreshProjects.mock.calls.length;
     emitRuntimeEvent("provider:changed", { id: "linux_native" });
 
-    await waitFor(() =>
-      expect(
-        screen.queryByText("Docker is not reachable"),
-      ).not.toBeInTheDocument(),
+    expect(useInventoryStore.getState().connection).toBe("connecting");
+    expect(useInventoryStore.getState().containers).toEqual([]);
+    expect(useInventoryStore.getState().volumeDetails).toEqual({});
+    expect(projectServiceMock.RefreshProjects).toHaveBeenCalledTimes(
+      projectRefreshesBefore,
     );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(249);
+    });
+    expect(projectServiceMock.RefreshProjects).toHaveBeenCalledTimes(
+      projectRefreshesBefore,
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+    expect(
+      projectServiceMock.RefreshProjects.mock.calls.length,
+    ).toBeGreaterThan(projectRefreshesBefore);
+    vi.useRealTimers();
+
+    await act(async () => {
+      oldFull.resolve({
+        ...seededSnapshot(),
+        containers: [
+          {
+            ...seededSnapshot().containers[0],
+            name: "obsolete-provider-web",
+          },
+        ],
+      });
+      await ordinary;
+    });
+    await waitFor(() =>
+      expect(inventoryMock.getInventorySnapshot).toHaveBeenCalledTimes(3),
+    );
+    const trailing = useInventoryStore.getState().refresh();
+    await act(async () => {
+      freshFull.resolve(freshSnapshot);
+      await trailing;
+    });
+    expect(useInventoryStore.getState().containers[0]?.name).toBe(
+      "fresh-provider-web",
+    );
+    expect(
+      screen.queryByText("Docker is not reachable"),
+    ).not.toBeInTheDocument();
   });
 });
 
@@ -6218,6 +8569,7 @@ function seededSnapshot(): InventorySnapshot {
         ],
       },
     },
+    failures: {},
     degradedReason: null,
   };
 }
@@ -7295,6 +9647,7 @@ function noProviderSnapshot(): InventorySnapshot {
     dockerInfo: null,
     dockerVersion: null,
     diskUsage: null,
+    failures: dockerUnavailableFailures("No Docker provider configured"),
     degradedReason: "No Docker provider configured",
   };
 }
@@ -7306,6 +9659,7 @@ function stoppedDaemonSnapshot(): InventorySnapshot {
     ...snapshot,
     dockerInfo: null,
     dockerVersion: null,
+    failures: dockerUnavailableFailures("Docker daemon ping failed"),
     degradedReason: "Docker daemon ping failed",
     providers: [
       {
@@ -7332,6 +9686,9 @@ function permissionDeniedSnapshot(): InventorySnapshot {
   const provider = snapshot.providers[0]!;
   return {
     ...snapshot,
+    failures: dockerUnavailableFailures(
+      "permission denied while connecting to Docker socket",
+    ),
     degradedReason: "permission denied while connecting to Docker socket",
     providers: [
       {
@@ -7354,6 +9711,13 @@ function permissionDeniedSnapshot(): InventorySnapshot {
         },
       },
     ],
+  };
+}
+
+function dockerUnavailableFailures(message: string) {
+  return {
+    dockerInfo: message,
+    dockerVersion: message,
   };
 }
 

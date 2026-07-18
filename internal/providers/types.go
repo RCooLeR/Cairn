@@ -49,12 +49,14 @@ const (
 )
 
 type CommandResult struct {
-	Command  []string
-	Workdir  string
-	Stdout   string
-	Stderr   string
-	ExitCode int
-	Duration time.Duration
+	Command         []string
+	Workdir         string
+	Stdout          string
+	Stderr          string
+	StdoutTruncated bool
+	StderrTruncated bool
+	ExitCode        int
+	Duration        time.Duration
 }
 
 type InstallProgress struct {

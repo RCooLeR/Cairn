@@ -820,8 +820,10 @@ export function SettingsPage({
                 value={settingString(settings, "agent.provider", "ollama")}
               />
               <SettingsTextSetting
+                description="Use a literal 127.x.x.x or [::1] HTTP(S) address with an explicit port. DNS names, remote addresses, URL credentials, and redirects are blocked."
                 disabled={saving}
-                label="Endpoint"
+                label="Endpoint (loopback only)"
+                maxLength={2048}
                 onSave={(value) => onSettingChange("agent.endpoint", value)}
                 placeholder="http://127.0.0.1:11434"
                 value={settingString(
@@ -1201,8 +1203,9 @@ export function SettingsPage({
                     icon={<Bot size={18} />}
                     items={[
                       "The local agent defaults to Ollama at http://127.0.0.1:11434.",
+                      "Agent endpoints are restricted to literal IPv4 or IPv6 loopback addresses with an explicit port; DNS names, remote addresses, and redirects are rejected.",
                       "Agent tools can inspect Docker inventory, logs, project files, and request approved Docker actions.",
-                      "Project file edits are previewed and applied through Cairn plans, not silent writes.",
+                      "Project file editing is temporarily unavailable; apply project file changes manually outside Cairn.",
                     ]}
                     title="Local Agent"
                   />
@@ -2048,14 +2051,18 @@ function SettingsCheckboxField({
 }
 
 function SettingsTextSetting({
+  description,
   disabled,
   label,
+  maxLength,
   onSave,
   placeholder,
   value,
 }: {
+  description?: string;
   disabled?: boolean;
   label: string;
+  maxLength?: number;
   onSave: (value: string) => Promise<boolean>;
   placeholder?: string;
   value: string;
@@ -2112,6 +2119,7 @@ function SettingsTextSetting({
         className="mt-1 h-9 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
         defaultValue={value}
         disabled={disabled}
+        maxLength={maxLength}
         onChange={() => {
           dirtyRef.current = true;
         }}
@@ -2128,6 +2136,11 @@ function SettingsTextSetting({
         placeholder={placeholder}
         ref={inputRef}
       />
+      {description ? (
+        <span className="mt-1 block text-xs text-text-muted">
+          {description}
+        </span>
+      ) : null}
     </label>
   );
 }

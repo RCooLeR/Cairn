@@ -13,6 +13,19 @@ import type {
 
 import { DockerService, ProviderService } from "./services";
 
+export const inventorySliceNames = [
+  "providers",
+  "dockerInfo",
+  "dockerVersion",
+  "diskUsage",
+  "containers",
+  "images",
+  "volumes",
+  "networks",
+] as const;
+
+export type InventorySliceName = (typeof inventorySliceNames)[number];
+
 export type InventorySnapshot = {
   providers: ProviderSummary[];
   dockerInfo: DockerInfo | null;
@@ -24,6 +37,12 @@ export type InventorySnapshot = {
   networks: NetworkSummary[];
   volumeDetails: Record<string, VolumeDetail>;
   networkDetails: Record<string, NetworkDetail>;
+  /**
+   * Named failures let consumers distinguish an unavailable slice from a
+   * legitimate empty/null response. Optional for compatibility with snapshots
+   * produced by older callers and test fixtures.
+   */
+  failures?: Partial<Record<InventorySliceName, string>>;
   degradedReason: string | null;
 };
 
@@ -41,6 +60,16 @@ export async function getInventorySnapshot(): Promise<InventorySnapshot> {
 
   const volumeSummaries = valueOr(volumes, []);
   const networkSummaries = valueOr(networks, []);
+  const failures = collectFailures({
+    providers: providerResult,
+    dockerInfo: info,
+    dockerVersion: version,
+    diskUsage,
+    containers,
+    images,
+    volumes,
+    networks,
+  });
 
   return {
     providers: valueOr(providerResult, []),
@@ -53,16 +82,8 @@ export async function getInventorySnapshot(): Promise<InventorySnapshot> {
     networks: networkSummaries,
     volumeDetails: {},
     networkDetails: {},
-    degradedReason: firstError([
-      providerResult,
-      info,
-      version,
-      diskUsage,
-      containers,
-      images,
-      volumes,
-      networks,
-    ]),
+    failures,
+    degradedReason: formatFailures(failures),
   };
 }
 
@@ -78,19 +99,35 @@ function valueOr<T>(result: Settled<T>, fallback: T): T {
   return result.status === "fulfilled" ? result.value : fallback;
 }
 
-function firstError(results: Array<Settled<unknown>>): string | null {
-  const rejected = results.find(
-    (result): result is PromiseRejectedResult => result.status === "rejected",
-  );
-  if (!rejected) {
-    return null;
+function collectFailures(
+  results: Record<InventorySliceName, Settled<unknown>>,
+): Partial<Record<InventorySliceName, string>> {
+  const failures: Partial<Record<InventorySliceName, string>> = {};
+  for (const slice of inventorySliceNames) {
+    const result = results[slice];
+    if (result.status === "rejected") {
+      failures[slice] = errorMessage(result.reason);
+    }
   }
-  const reason = rejected.reason;
-  if (reason instanceof Error && reason.message) {
-    return reason.message;
-  }
-  if (typeof reason === "string") {
-    return reason;
-  }
-  return "Docker is not reachable";
+  return failures;
+}
+
+function errorMessage(reason: unknown): string {
+  const message =
+    reason instanceof Error
+      ? reason.message.trim()
+      : typeof reason === "string"
+        ? reason.trim()
+        : "";
+  return message || "Docker is not reachable";
+}
+
+function formatFailures(
+  failures: Partial<Record<InventorySliceName, string>>,
+): string | null {
+  const messages = inventorySliceNames.flatMap((slice) => {
+    const message = failures[slice];
+    return message ? [`${slice}: ${message}`] : [];
+  });
+  return messages.length > 0 ? messages.join("; ") : null;
 }

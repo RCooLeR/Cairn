@@ -1,11 +1,16 @@
 package security
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 )
 
 const (
@@ -18,13 +23,15 @@ const (
 )
 
 type DockerObjectPlan struct {
-	Plan      models.CommandPlan
-	Action    string
-	Kind      string
-	TargetID  string
-	Force     bool
-	PruneKind string
-	RunImage  models.RunImageRequest
+	Plan              models.CommandPlan
+	Action            string
+	Kind              string
+	TargetID          string
+	TargetFingerprint string             `json:"-"`
+	TargetScope       runtimescope.Scope `json:"-"`
+	Force             bool
+	PruneKind         string
+	RunImage          models.RunImageRequest
 }
 
 type DockerObjectPlanStore struct {
@@ -140,10 +147,17 @@ func NewRunImagePlan(req models.RunImageRequest, risk models.Risk, command strin
 	}, nil
 }
 
-func NewRemoveVolumePlan(volume models.VolumeSummary, force bool, now time.Time, sources ...*IDSource) (DockerObjectPlan, error) {
-	name := strings.TrimSpace(volume.Name)
+func NewRemoveVolumePlan(volume models.VolumeDetail, scope runtimescope.Scope, force bool, now time.Time, sources ...*IDSource) (DockerObjectPlan, error) {
+	name := strings.TrimSpace(volume.Summary.Name)
 	if name == "" {
 		return DockerObjectPlan{}, apperror.New(apperror.Conflict, "Volume name is required")
+	}
+	if !scope.Valid() {
+		return DockerObjectPlan{}, apperror.New(apperror.Conflict, "Volume runtime scope could not be verified")
+	}
+	fingerprint, err := VolumeIncarnationFingerprint(volume)
+	if err != nil {
+		return DockerObjectPlan{}, err
 	}
 	command := "docker volume rm " + quotePlanArg(name)
 	if force {
@@ -156,17 +170,79 @@ func NewRemoveVolumePlan(volume models.VolumeSummary, force bool, now time.Time,
 	plan.RequiresTypedName = name
 	plan.Effects = []string{
 		"Volume " + name + " and its data will be deleted from the active Docker backend.",
+		"The volume identity will be revalidated immediately before deletion.",
 	}
-	if volume.InUse {
+	if volume.Summary.InUse {
 		plan.Effects = append(plan.Effects, "The volume appears to be in use; Docker may reject deletion unless force is supported by the backend.")
 	}
 	return DockerObjectPlan{
-		Plan:     plan,
-		Action:   DockerActionRemoveVolume,
-		Kind:     "volume",
-		TargetID: name,
-		Force:    force,
+		Plan:              plan,
+		Action:            DockerActionRemoveVolume,
+		Kind:              "volume",
+		TargetID:          name,
+		TargetFingerprint: fingerprint,
+		TargetScope:       scope,
+		Force:             force,
 	}, nil
+}
+
+type volumeFingerprintValue struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+type volumeFingerprintDocument struct {
+	Version    int                      `json:"version"`
+	Name       string                   `json:"name"`
+	CreatedAt  string                   `json:"createdAt"`
+	Driver     string                   `json:"driver"`
+	Mountpoint string                   `json:"mountpoint"`
+	Labels     []volumeFingerprintValue `json:"labels"`
+	Options    []volumeFingerprintValue `json:"options"`
+}
+
+// VolumeIncarnationFingerprint derives an opaque, deterministic identity from
+// stable Docker inspect metadata. Driver options and labels participate in the
+// digest but are never copied into a command plan or user-facing effect.
+// Ordinary local Docker volumes have no daemon object ID, so this fingerprint
+// is a stale-plan guard rather than a conditional-delete token: identical
+// metadata within the daemon timestamp's precision cannot be distinguished.
+func VolumeIncarnationFingerprint(volume models.VolumeDetail) (string, error) {
+	name := strings.TrimSpace(volume.Summary.Name)
+	if name == "" {
+		return "", apperror.New(apperror.Conflict, "Volume identity could not be verified", apperror.WithDetail("Docker did not report a volume name. Create a new removal plan after refreshing volumes."))
+	}
+	if volume.CreatedAt.IsZero() {
+		return "", apperror.New(apperror.Conflict, "Volume identity could not be verified", apperror.WithDetail("Docker did not report a volume creation timestamp. Cairn will not create a destructive removal plan without a stable incarnation signal."))
+	}
+	document := volumeFingerprintDocument{
+		Version:    1,
+		Name:       name,
+		CreatedAt:  volume.CreatedAt.UTC().Format(time.RFC3339Nano),
+		Driver:     volume.Summary.Driver,
+		Mountpoint: volume.Summary.Mountpoint,
+		Labels:     sortedVolumeFingerprintValues(volume.Summary.Labels),
+		Options:    sortedVolumeFingerprintValues(volume.Options),
+	}
+	encoded, err := json.Marshal(document)
+	if err != nil {
+		return "", apperror.Wrap(apperror.Internal, "Volume identity could not be encoded", err)
+	}
+	digest := sha256.Sum256(encoded)
+	return "sha256:" + hex.EncodeToString(digest[:]), nil
+}
+
+func sortedVolumeFingerprintValues(values map[string]string) []volumeFingerprintValue {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	result := make([]volumeFingerprintValue, 0, len(keys))
+	for _, key := range keys {
+		result = append(result, volumeFingerprintValue{Key: key, Value: values[key]})
+	}
+	return result
 }
 
 func NewRemoveNetworkPlan(network models.NetworkSummary, now time.Time, sources ...*IDSource) (DockerObjectPlan, error) {

@@ -826,6 +826,9 @@ func TestClientObjectsDTOsRawInspectAndCacheReconcile(t *testing.T) {
 	if len(volumeDetail.Containers) != 1 || volumeDetail.Containers[0].Name != "web" {
 		t.Fatalf("volume detail = %#v", volumeDetail)
 	}
+	if volumeDetail.CreatedAt.IsZero() {
+		t.Fatalf("volume CreatedAt was not mapped from Docker inspect: %#v", volumeDetail)
+	}
 
 	networks, err := client.ListNetworks(ctx)
 	if err != nil {

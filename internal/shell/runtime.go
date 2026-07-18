@@ -305,6 +305,7 @@ func (r *appRuntime) RebindProvider(ctx context.Context, provider providers.Plat
 	r.state = runtimeStateRunning
 
 	r.dockerService.Client = dockerClient
+	r.dockerService.Scope = runtimeScope
 	r.projectService.Detector = projectDetector
 	r.projectService.Docker = dockerClient
 	r.projectService.Client = composeClient
@@ -634,6 +635,7 @@ func (r *appRuntime) metricsManagerOptions(ctx context.Context, provider provide
 
 func (r *appRuntime) clearServicesLocked() {
 	r.dockerService.Client = nil
+	r.dockerService.Scope = runtimescope.Scope{}
 	r.projectService.Detector = nil
 	r.projectService.Docker = nil
 	r.projectService.Client = nil

@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -21,6 +23,8 @@ import (
 	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/store"
 )
+
+const maxCombinedCommandOutputBytes = 64 << 10
 
 func (s *ProjectService) ListProjects(ctx context.Context) ([]models.ProjectSummary, error) {
 	unlock := s.lockRuntime()
@@ -105,7 +109,7 @@ func (s *ProjectService) ReviewImportProject(ctx context.Context, req models.Imp
 	}
 	workdir, files, err := resolveImportFiles(req)
 	if err != nil {
-		return nil, err
+		return nil, safeComposeRendererError(err, nil, "Resolve Compose project files failed")
 	}
 	projectName := composecore.NormalizeProjectName(filepath.Base(workdir))
 	if projectName == "" {
@@ -117,31 +121,31 @@ func (s *ProjectService) ReviewImportProject(ctx context.Context, req models.Imp
 		Files:       files,
 		ProjectName: projectName,
 	}
-	config, err := s.Client.Config(ctx, importOpts)
+	config, composeInputs, err := runVerifiedComposeConfig(ctx, s.Client, importOpts)
 	if config == nil {
-		return nil, err
+		return nil, safeComposeRendererError(err, nil, "Compose project validation failed")
 	}
-	config.API.RawFiles = readComposeRawFiles(store.ProjectRecord{
-		WorkingDir:   workdir,
-		ComposeFiles: files,
-	})
+	previewBudget := newProjectPreviewBudget()
 	if err != nil {
 		config.API.Valid = false
 		if len(config.API.Errors) == 0 {
 			config.API.Errors = []string{err.Error()}
 		}
 	}
-	services := make([]string, 0, len(config.Services))
-	for _, service := range config.Services {
-		services = append(services, service.Name)
+	envFileCandidates := config.EnvFiles
+	sanitizeComposeConfigForDisplayWithBudgetContext(ctx, workdir, &config.API, previewBudget)
+	config.API.RawFiles = composeRawPreviewsFromInputs(ctx, composeInputs, previewBudget)
+	envPreviews := readImportEnvFilesWithBudgetContext(ctx, workdir, envFileCandidates, previewBudget)
+	services := safeComposeServiceNames(ctx, config.Services, previewBudget)
+	if err := contextReadError(ctx); err != nil {
+		return nil, safeComposeRendererError(err, nil, "Compose project review did not complete")
 	}
-	sort.Strings(services)
 	return &models.ImportProjectReview{
 		FolderPath:    workdir,
 		ProjectID:     projectID,
 		ProjectName:   projectName,
 		Compose:       config.API,
-		EnvFiles:      readImportEnvFiles(workdir, config.EnvFiles),
+		EnvFiles:      envPreviews,
 		Services:      services,
 		BuildRequired: false,
 	}, nil
@@ -169,7 +173,7 @@ func (s *ProjectService) ImportProject(ctx context.Context, req models.ImportPro
 	s.publishImportJobProgress(jobID, projectID, "open", "Opening project directory", progressPct(5))
 	workdir, files, err := resolveImportFiles(req)
 	if err != nil {
-		return fail(err)
+		return fail(safeComposeRendererError(err, nil, "Resolve Compose project files failed"))
 	}
 	s.publishImportJobProgress(jobID, projectID, "open", "Found "+strconv.Itoa(len(files))+" Compose file(s)", progressPct(20))
 	projectName := composecore.NormalizeProjectName(filepath.Base(workdir))
@@ -183,13 +187,13 @@ func (s *ProjectService) ImportProject(ctx context.Context, req models.ImportPro
 		ProjectName: projectName,
 	}
 	s.publishImportJobProgress(jobID, projectID, "review", "Reviewing Compose YAML", progressPct(35))
-	config, err := s.Client.Config(ctx, importOpts)
-	if err != nil {
-		detail := err.Error()
-		if config != nil && len(config.Errors) > 0 {
-			detail = strings.Join(config.Errors, "\n")
+	config, _, err := runVerifiedComposeConfig(ctx, s.Client, importOpts)
+	if err != nil || config == nil {
+		var details []string
+		if config != nil {
+			details = config.Errors
 		}
-		return fail(apperror.New(apperror.ComposeInvalid, "Compose project validation failed", apperror.WithDetail(detail)))
+		return fail(safeComposeRendererError(err, details, "Compose project validation failed"))
 	}
 	s.publishImportJobProgress(jobID, projectID, "review", "Compose YAML valid: "+strconv.Itoa(len(config.Services))+" service(s)", progressPct(55))
 
@@ -356,18 +360,26 @@ func (s *ComposeService) Config(ctx context.Context, projectID string) (*models.
 		return nil, mapStoreNotFound(err, "Project was not found")
 	}
 	project = normalizeProjectHostPaths(project, s.PathMapper)
-	config, err := s.Client.Config(ctx, composeOptionsFromProject(project))
+	config, composeInputs, err := runVerifiedComposeConfig(ctx, s.Client, composeOptionsFromProject(project))
 	if config != nil {
-		config.API.RawFiles = readComposeRawFiles(project)
 		if err != nil {
-			return &config.API, nil
+			config.API.Valid = false
+			if len(config.API.Errors) == 0 {
+				config.API.Errors = []string{err.Error()}
+			}
+		}
+		previewBudget := newProjectPreviewBudget()
+		sanitizeComposeConfigForDisplayWithBudgetContext(ctx, project.WorkingDir, &config.API, previewBudget)
+		config.API.RawFiles = composeRawPreviewsFromInputs(ctx, composeInputs, previewBudget)
+		if err := contextReadError(ctx); err != nil {
+			return nil, safeComposeRendererError(err, nil, "Compose config did not complete")
 		}
 		return &config.API, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, safeComposeRendererError(err, nil, "Compose config failed")
 	}
-	return nil, apperror.New(apperror.ComposeInvalid, "Compose config returned no result")
+	return nil, safeComposeRendererError(nil, nil, "Compose config returned no result")
 }
 
 func (s *ComposeService) Ps(ctx context.Context, projectID string) ([]models.ComposeServiceStatus, error) {
@@ -501,10 +513,10 @@ func (s *ComposeService) publishComposeOutput(jobID string, result *providers.Co
 	if result == nil {
 		return
 	}
-	for _, line := range splitOutputLines(result.Stdout) {
+	for _, line := range splitOutputLines(providers.RedactCommandDiagnostic(result.Stdout)) {
 		s.publishJobProgress(jobID, "stdout", line, nil)
 	}
-	for _, line := range splitOutputLines(result.Stderr) {
+	for _, line := range splitOutputLines(providers.RedactCommandDiagnostic(result.Stderr)) {
 		s.publishJobProgress(jobID, "stderr", line, nil)
 	}
 }
@@ -679,16 +691,21 @@ func (s *ProjectService) projectComposeConfig(ctx context.Context, project store
 		return nil
 	}
 	project = normalizeProjectHostPaths(project, s.PathMapper)
-	config, err := s.Client.Config(ctx, composeOptionsFromProject(project))
+	config, composeInputs, err := runVerifiedComposeConfig(ctx, s.Client, composeOptionsFromProject(project))
 	if config == nil {
 		return nil
 	}
-	config.API.RawFiles = readComposeRawFiles(project)
+	previewBudget := newProjectPreviewBudget()
 	if err != nil {
 		config.API.Valid = false
 		if len(config.API.Errors) == 0 {
 			config.API.Errors = []string{err.Error()}
 		}
+	}
+	sanitizeComposeConfigForDisplayWithBudgetContext(ctx, project.WorkingDir, &config.API, previewBudget)
+	config.API.RawFiles = composeRawPreviewsFromInputs(ctx, composeInputs, previewBudget)
+	if contextReadError(ctx) != nil {
+		return nil
 	}
 	return &config.API
 }
@@ -1027,10 +1044,20 @@ func combineCommandResults(first *providers.CommandResult, next *providers.Comma
 	if first == nil {
 		copied := *next
 		copied.Command = append([]string(nil), next.Command...)
+		var stdoutTruncated bool
+		var stderrTruncated bool
+		copied.Stdout, stdoutTruncated = boundCombinedCommandOutput(copied.Stdout)
+		copied.Stderr, stderrTruncated = boundCombinedCommandOutput(copied.Stderr)
+		copied.StdoutTruncated = copied.StdoutTruncated || stdoutTruncated
+		copied.StderrTruncated = copied.StderrTruncated || stderrTruncated
 		return &copied
 	}
-	first.Stdout = appendCommandOutput(first.Stdout, next.Stdout)
-	first.Stderr = appendCommandOutput(first.Stderr, next.Stderr)
+	var stdoutTruncated bool
+	var stderrTruncated bool
+	first.Stdout, stdoutTruncated = appendCommandOutput(first.Stdout, next.Stdout)
+	first.Stderr, stderrTruncated = appendCommandOutput(first.Stderr, next.Stderr)
+	first.StdoutTruncated = first.StdoutTruncated || next.StdoutTruncated || stdoutTruncated
+	first.StderrTruncated = first.StderrTruncated || next.StderrTruncated || stderrTruncated
 	first.Duration += next.Duration
 	first.ExitCode = next.ExitCode
 	first.Command = append([]string(nil), next.Command...)
@@ -1040,17 +1067,31 @@ func combineCommandResults(first *providers.CommandResult, next *providers.Comma
 	return first
 }
 
-func appendCommandOutput(current string, next string) string {
+func appendCommandOutput(current string, next string) (string, bool) {
 	current = strings.TrimRight(current, "\r\n")
 	next = strings.TrimRight(next, "\r\n")
 	switch {
 	case current == "":
-		return next
+		return boundCombinedCommandOutput(next)
 	case next == "":
-		return current
+		return boundCombinedCommandOutput(current)
 	default:
-		return current + "\n" + next
+		return boundCombinedCommandOutput(current + "\n" + next)
 	}
+}
+
+func boundCombinedCommandOutput(value string) (string, bool) {
+	if len(value) <= maxCombinedCommandOutputBytes {
+		return value, false
+	}
+	marker := fmt.Sprintf("\n...[Cairn truncated combined command output from %d bytes]...\n", len(value))
+	payloadLimit := maxCombinedCommandOutputBytes - len(marker)
+	if payloadLimit <= 0 {
+		return marker[:maxCombinedCommandOutputBytes], true
+	}
+	headLimit := payloadLimit / 2
+	tailLimit := payloadLimit - headLimit
+	return value[:headLimit] + marker + value[len(value)-tailLimit:], true
 }
 
 func newProjectCommandPlan(project store.ProjectRecord, action string, removeVolumes bool, now time.Time, source *security.IDSource) (models.CommandPlan, error) {
@@ -1329,10 +1370,10 @@ func (s *ProjectService) publishProjectComposeOutput(jobID string, projectID str
 	if result == nil {
 		return
 	}
-	for _, line := range splitOutputLines(result.Stdout) {
+	for _, line := range splitOutputLines(providers.RedactCommandDiagnostic(result.Stdout)) {
 		s.publishProjectJobProgress(jobID, projectID, action, command, "stdout", line, nil)
 	}
-	for _, line := range splitOutputLines(result.Stderr) {
+	for _, line := range splitOutputLines(providers.RedactCommandDiagnostic(result.Stderr)) {
 		s.publishProjectJobProgress(jobID, projectID, action, command, "stderr", line, nil)
 	}
 }
@@ -1430,72 +1471,313 @@ func splitOutputLines(output string) []string {
 }
 
 func readComposeRawFiles(project store.ProjectRecord) []models.ComposeRawFile {
+	return readComposeRawFilesWithBudget(project, newProjectPreviewBudget())
+}
+
+func readComposeRawFilesWithBudget(project store.ProjectRecord, budget *projectPreviewBudget) []models.ComposeRawFile {
+	return readComposeRawFilesWithBudgetContext(context.Background(), project, budget)
+}
+
+func readComposeRawFilesWithBudgetContext(ctx context.Context, project store.ProjectRecord, budget *projectPreviewBudget) []models.ComposeRawFile {
+	verifiedRoot, err := verifyProjectReadRoot(project.WorkingDir)
+	if err != nil {
+		return nil
+	}
 	files := project.ComposeFiles
 	if len(files) == 0 && project.WorkingDir != "" {
 		for _, name := range []string{"compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml"} {
 			path := filepath.Join(project.WorkingDir, name)
-			if _, err := os.Stat(path); err == nil {
+			if info, err := os.Lstat(path); err == nil && info.Mode().IsRegular() {
 				files = []string{path}
 				break
 			}
 		}
 	}
-	rawFiles := make([]models.ComposeRawFile, 0, len(files))
+	rawFiles := make([]models.ComposeRawFile, 0, maxProjectPreviewFiles)
+	seenLexical := make(map[string]struct{}, maxProjectPreviewAttempts)
+	opened := make([]fs.FileInfo, 0, maxProjectPreviewAttempts)
 	for _, file := range files {
-		path := file
-		if project.WorkingDir != "" && !filepath.IsAbs(path) {
-			path = filepath.Join(project.WorkingDir, path)
+		if contextReadError(ctx) != nil {
+			break
 		}
-		content, err := os.ReadFile(path)
+		if budget.files >= maxProjectPreviewFiles {
+			break
+		}
+		if !budget.allowCandidate() {
+			break
+		}
+		identity, err := lexicalProjectCandidateIdentity(project.WorkingDir, file)
 		if err != nil {
 			continue
 		}
+		if _, exists := seenLexical[identity]; exists {
+			continue
+		}
+		seenLexical[identity] = struct{}{}
+		if !budget.allowAttempt() {
+			break
+		}
+		result, relPath, err := readBoundedRegularProjectFileFromRootOnce(
+			verifiedRoot,
+			file,
+			budget.readLimit(),
+			false,
+			&opened,
+		)
+		budget.recordReadBytes(result.ReadBytes)
+		if err != nil {
+			continue
+		}
+		content := composeStructurePreview(string(result.Content))
+		if !budget.reserveFile(relPath, content) {
+			continue
+		}
 		rawFiles = append(rawFiles, models.ComposeRawFile{
-			Path:    path,
-			Content: string(content),
+			Path:    relPath,
+			Content: content,
 		})
 	}
 	return rawFiles
 }
 
 func readImportEnvFiles(workdir string, envFiles []string) []models.ComposeRawFile {
-	candidates := make([]string, 0, len(envFiles)+1)
-	candidates = append(candidates, filepath.Join(workdir, ".env"))
+	return readImportEnvFilesWithBudget(workdir, envFiles, newProjectPreviewBudget())
+}
+
+func readImportEnvFilesWithBudget(workdir string, envFiles []string, budget *projectPreviewBudget) []models.ComposeRawFile {
+	return readImportEnvFilesWithBudgetContext(context.Background(), workdir, envFiles, budget)
+}
+
+func readImportEnvFilesWithBudgetContext(ctx context.Context, workdir string, envFiles []string, budget *projectPreviewBudget) []models.ComposeRawFile {
+	return readImportEnvFilesWithBudgetContextObserved(ctx, workdir, envFiles, budget, nil)
+}
+
+func readImportEnvFilesWithBudgetContextObserved(ctx context.Context, workdir string, envFiles []string, budget *projectPreviewBudget, afterAttempt func(int)) []models.ComposeRawFile {
+	verifiedRoot, err := verifyProjectReadRoot(workdir)
+	if err != nil {
+		return nil
+	}
+	rawFiles := make([]models.ComposeRawFile, 0, maxProjectPreviewFiles)
+	seenLexical := make(map[string]struct{}, maxProjectPreviewAttempts)
+	opened := make([]fs.FileInfo, 0, maxProjectPreviewAttempts)
+	attempt := 0
+	appendPreview := func(file string) bool {
+		if contextReadError(ctx) != nil {
+			return false
+		}
+		if budget.files >= maxProjectPreviewFiles {
+			return false
+		}
+		if !budget.allowCandidate() {
+			return false
+		}
+		file = strings.TrimSpace(file)
+		if file == "" {
+			return true
+		}
+		identity, err := lexicalProjectCandidateIdentity(workdir, file)
+		if err != nil {
+			return true
+		}
+		if _, exists := seenLexical[identity]; exists {
+			return true
+		}
+		seenLexical[identity] = struct{}{}
+		if !budget.allowAttempt() {
+			return false
+		}
+		result, relPath, err := readBoundedRegularProjectFileFromRootOnce(
+			verifiedRoot,
+			file,
+			budget.readLimit(),
+			false,
+			&opened,
+		)
+		budget.recordReadBytes(result.ReadBytes)
+		attempt++
+		if afterAttempt != nil {
+			afterAttempt(attempt)
+		}
+		if err != nil {
+			return true
+		}
+		content := envStructurePreview(string(result.Content))
+		if !budget.reserveFile(relPath, content) {
+			return true
+		}
+		rawFiles = append(rawFiles, models.ComposeRawFile{
+			Path:    relPath,
+			Content: content,
+		})
+		return true
+	}
+	if !appendPreview(filepath.Join(workdir, ".env")) {
+		return rawFiles
+	}
 	for _, file := range envFiles {
+		if !appendPreview(file) {
+			break
+		}
+	}
+	return rawFiles
+}
+
+func sanitizeComposeConfigForDisplay(workdir string, config *models.ComposeConfigResult) {
+	sanitizeComposeConfigForDisplayWithBudget(workdir, config, newProjectPreviewBudget())
+}
+
+func sanitizeComposeConfigForDisplayWithBudget(workdir string, config *models.ComposeConfigResult, budget *projectPreviewBudget) {
+	sanitizeComposeConfigForDisplayWithBudgetContext(context.Background(), workdir, config, budget)
+}
+
+func sanitizeComposeConfigForDisplayWithBudgetContext(ctx context.Context, workdir string, config *models.ComposeConfigResult, budget *projectPreviewBudget) {
+	sanitizeComposeConfigForDisplayWithBudgetsContext(ctx, workdir, config, budget, newProjectPreviewBudget())
+}
+
+func sanitizeComposeConfigForDisplayWithBudgetsContext(ctx context.Context, workdir string, config *models.ComposeConfigResult, displayBudget *projectPreviewBudget, metadataBudget *projectPreviewBudget) {
+	if config == nil {
+		return
+	}
+	if contextReadError(ctx) != nil {
+		config.RawFiles = nil
+		config.ResolvedYAML = ""
+		config.EnvFiles = nil
+		config.Errors = nil
+		return
+	}
+	errors := safeComposeDisplayErrors(config.Errors)
+	if len(errors) > 0 && displayBudget.reserveString(errors[0]) {
+		config.Errors = errors
+	} else {
+		config.Errors = nil
+	}
+	resolved := composeStructurePreview(config.ResolvedYAML)
+	if displayBudget.reserveString(resolved) {
+		config.ResolvedYAML = resolved
+	} else {
+		config.ResolvedYAML = ""
+	}
+	// File-name metadata has its own limits. It must not consume the actual
+	// raw/env preview file slots or byte allowance returned alongside it.
+	config.EnvFiles = safeProjectFileNamesWithBudgetContext(ctx, workdir, config.EnvFiles, metadataBudget)
+}
+
+func safeComposeRendererError(err error, details []string, message string) error {
+	code := apperror.ComposeInvalid
+	switch {
+	case errors.Is(err, context.Canceled):
+		code = apperror.Cancelled
+	case errors.Is(err, context.DeadlineExceeded):
+		code = apperror.Timeout
+	default:
+		if existing, ok := apperror.CodeOf(err); ok {
+			code = existing
+		}
+	}
+	values := make([]string, 0, maxComposeErrorCandidates)
+	if err != nil {
+		values = append(values, err.Error())
+	}
+	for _, detail := range details {
+		if len(values) >= cap(values) {
+			break
+		}
+		values = append(values, detail)
+	}
+	safeDetails := safeComposeDisplayErrors(values)
+	if len(safeDetails) == 0 {
+		safeDetails = []string{"Compose validation failed. Review the selected project files."}
+	}
+	return apperror.New(code, message, apperror.WithDetail(safeDetails[0]))
+}
+
+func safeProjectFileNames(workdir string, files []string) []string {
+	return safeProjectFileNamesWithBudget(workdir, files, newProjectPreviewBudget())
+}
+
+func safeProjectFileNamesWithBudget(workdir string, files []string, budget *projectPreviewBudget) []string {
+	return safeProjectFileNamesWithBudgetContext(context.Background(), workdir, files, budget)
+}
+
+func safeProjectFileNamesWithBudgetContext(ctx context.Context, workdir string, files []string, budget *projectPreviewBudget) []string {
+	verifiedRoot, err := verifyProjectReadRoot(workdir)
+	if err != nil {
+		return nil
+	}
+	names := make([]string, 0, maxProjectPreviewFiles)
+	seenLexical := make(map[string]struct{}, maxProjectPreviewAttempts)
+	opened := make([]fs.FileInfo, 0, maxProjectPreviewAttempts)
+	for _, file := range files {
+		if contextReadError(ctx) != nil {
+			break
+		}
+		if budget.files >= maxProjectPreviewFiles {
+			break
+		}
+		if !budget.allowCandidate() {
+			break
+		}
 		file = strings.TrimSpace(file)
 		if file == "" {
 			continue
 		}
-		if !filepath.IsAbs(file) {
-			file = filepath.Join(workdir, file)
-		}
-		candidates = append(candidates, file)
-	}
-	seen := map[string]struct{}{}
-	rawFiles := make([]models.ComposeRawFile, 0, len(candidates))
-	for _, file := range candidates {
-		absFile, err := filepath.Abs(file)
+		identity, err := lexicalProjectCandidateIdentity(workdir, file)
 		if err != nil {
 			continue
 		}
-		if _, exists := seen[absFile]; exists {
+		if _, exists := seenLexical[identity]; exists {
 			continue
 		}
-		seen[absFile] = struct{}{}
-		info, err := os.Stat(absFile)
-		if err != nil || info.IsDir() {
-			continue
+		seenLexical[identity] = struct{}{}
+		if !budget.allowAttempt() {
+			break
 		}
-		content, err := os.ReadFile(absFile)
+		result, relPath, err := readBoundedRegularProjectFileFromRootOnce(verifiedRoot, file, 0, true, &opened)
+		budget.recordReadBytes(result.ReadBytes)
 		if err != nil {
 			continue
 		}
-		rawFiles = append(rawFiles, models.ComposeRawFile{
-			Path:    absFile,
-			Content: string(content),
-		})
+		if !budget.reserveFile(relPath, "") {
+			continue
+		}
+		names = append(names, relPath)
 	}
-	return rawFiles
+	return names
+}
+
+func safeComposeServiceNames(ctx context.Context, services []composecore.ServiceConfig, budget *projectPreviewBudget) []string {
+	candidates := make([]string, 0, min(len(services), maxProjectPreviewCandidates))
+	for inspected, service := range services {
+		if contextReadError(ctx) != nil || inspected >= maxProjectPreviewCandidates {
+			break
+		}
+		if len(service.Name) > maxProjectPreviewNameBytes {
+			continue
+		}
+		name := strings.TrimSpace(service.Name)
+		if name == "" || !utf8.ValidString(name) {
+			continue
+		}
+		candidates = append(candidates, name)
+	}
+	sort.Strings(candidates)
+
+	names := make([]string, 0, min(len(candidates), maxProjectPreviewFiles))
+	var previous string
+	for _, name := range candidates {
+		if len(names) >= maxProjectPreviewFiles {
+			break
+		}
+		if len(names) > 0 && name == previous {
+			continue
+		}
+		previous = name
+		if !budget.reserveString(name) {
+			break
+		}
+		names = append(names, name)
+	}
+	return names
 }
 
 func resolveImportFiles(req models.ImportProjectRequest) (string, []string, error) {
@@ -1518,8 +1800,14 @@ func resolveImportFiles(req models.ImportProjectRequest) (string, []string, erro
 	if len(req.ComposeFilePaths) == 0 {
 		return "", nil, apperror.New(apperror.ComposeInvalid, "Choose a project folder or Compose file")
 	}
-	files := make([]string, 0, len(req.ComposeFilePaths))
+	files := make([]string, 0, maxImportComposeFiles)
+	seen := make(map[string]struct{}, maxImportComposeFiles)
+	candidates := 0
 	for _, file := range req.ComposeFilePaths {
+		candidates++
+		if candidates > maxProjectPreviewCandidates {
+			return "", nil, apperror.New(apperror.ComposeInvalid, "Too many Compose file selections")
+		}
 		file = strings.TrimSpace(file)
 		if file == "" {
 			continue
@@ -1528,24 +1816,51 @@ func resolveImportFiles(req models.ImportProjectRequest) (string, []string, erro
 		if err != nil {
 			return "", nil, apperror.Wrap(apperror.ComposeInvalid, "Resolve Compose file failed", err)
 		}
-		info, err := os.Stat(absFile)
-		if err != nil || info.IsDir() {
-			return "", nil, apperror.New(apperror.ComposeInvalid, "Compose file was not found", apperror.WithDetail(absFile))
+		identity := projectPathIdentity(absFile)
+		if _, exists := seen[identity]; exists {
+			continue
+		}
+		seen[identity] = struct{}{}
+		if len(files) >= maxImportComposeFiles {
+			return "", nil, apperror.New(apperror.ComposeInvalid, "Too many Compose files selected")
+		}
+		info, err := os.Lstat(absFile)
+		if err != nil || !info.Mode().IsRegular() {
+			return "", nil, apperror.New(
+				apperror.ComposeInvalid,
+				"Compose file must be a regular file",
+				apperror.WithDetail(filepath.Base(absFile)),
+			)
 		}
 		files = append(files, absFile)
 	}
 	if len(files) == 0 {
 		return "", nil, apperror.New(apperror.ComposeInvalid, "Choose at least one Compose file")
 	}
-	return filepath.Dir(files[0]), files, nil
+	workdir := filepath.Dir(files[0])
+	for _, file := range files[1:] {
+		if !pathWithinRoot(workdir, file) {
+			return "", nil, apperror.New(apperror.ComposeInvalid, "Selected Compose files must share one project folder")
+		}
+	}
+	return workdir, files, nil
 }
 
 func discoverComposeFiles(folder string) []string {
-	names := []string{"compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml"}
-	files := make([]string, 0, len(names))
-	for _, name := range names {
+	files := make([]string, 0, 2)
+	for _, name := range []string{"compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml"} {
 		path := filepath.Join(folder, name)
-		if info, err := os.Stat(path); err == nil && !info.IsDir() {
+		if info, err := os.Lstat(path); err == nil && info.Mode().IsRegular() {
+			files = append(files, path)
+			break
+		}
+	}
+	if len(files) == 0 {
+		return nil
+	}
+	for _, name := range []string{"compose.override.yaml", "compose.override.yml"} {
+		path := filepath.Join(folder, name)
+		if info, err := os.Lstat(path); err == nil && info.Mode().IsRegular() {
 			files = append(files, path)
 		}
 	}
@@ -1554,8 +1869,8 @@ func discoverComposeFiles(folder string) []string {
 
 func serviceConfigMetadata(config composecore.ServiceConfig) map[string]any {
 	metadata := map[string]any{}
-	if len(config.BuildArgs) > 0 {
-		metadata["buildArgs"] = config.BuildArgs
+	if security.BuildArgsPresent(config.BuildArgs) {
+		metadata[security.BuildArgsPresentMetadataKey] = true
 	}
 	if len(config.DependsOn) > 0 {
 		metadata["dependsOn"] = append([]string(nil), config.DependsOn...)

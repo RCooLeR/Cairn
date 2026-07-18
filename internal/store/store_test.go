@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	expectedMigrationCount       = 10
+	expectedMigrationCount       = buildArgPrivacyVersion
 	releaseFixtureMigrationCount = 6
 )
 

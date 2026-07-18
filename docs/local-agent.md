@@ -1,6 +1,6 @@
 # Local Docker Agent
 
-Cairn includes an optional local LLM agent for Docker-focused help. It can inspect Cairn's Docker inventory, selected project metadata, selected Docker/Compose files, container logs, image details, and network details. It can also request approval-gated Cairn tools for Docker actions, update workflows, and project file edits.
+Cairn includes an optional local LLM agent for Docker-focused help. It can inspect Cairn's Docker inventory, selected project metadata, selected Docker/Compose files, container logs, image details, and network details. It can also request approval-gated Cairn tools for Docker actions and update workflows. Project-file draft, preview, and apply tools are currently quarantined and unavailable.
 
 ## Default Runtime
 
@@ -9,6 +9,8 @@ By default Cairn tries Ollama at:
 ```text
 http://127.0.0.1:11434
 ```
+
+Cairn intentionally accepts only literal IPv4 or IPv6 loopback HTTP(S) endpoints with an explicit port, such as `http://127.0.0.1:11434` or `http://[::1]:11434`. It rejects hostnames (including `localhost`), remote/private/link-local and metadata addresses, URL credentials, queries, fragments, path-prefixed base URLs, proxy routing, and all redirects. This sharply reduces SSRF and accidental cross-origin disclosure, but the configured loopback service remains trusted: a malicious or misconfigured local service could still store or relay the context it receives.
 
 On startup or refresh, Cairn calls the local model-list endpoint and selects a model:
 
@@ -24,7 +26,7 @@ Open `Settings -> Agent` to change:
 
 - Enabled state
 - Provider: Ollama or OpenAI-compatible
-- Endpoint
+- Loopback-only endpoint (literal IP plus explicit port)
 - Preferred model
 - Maximum context lines sent to the model
 
@@ -45,7 +47,7 @@ The agent can include read-only context from these tools:
 - Network detail
 - Image detail
 
-Secrets are redacted before file and JSON context is sent to the local model. Registry credentials are never stored by the agent.
+Project-file previews hide scalar values. Other Docker, log, and JSON context receives bounded best-effort secret redaction, which cannot guarantee detection of every opaque value; review the selected tools before sending. Registry credentials are never stored by the agent.
 
 For identity, capability, greeting, and general conceptual questions, Cairn skips Docker inventory context and asks the model to answer directly. This prevents unrelated current projects or stopped containers from hijacking simple questions such as "Can you write code?"
 
@@ -70,7 +72,7 @@ The toolset covers:
 - Compose project actions such as start, stop, restart, pull, redeploy plan, and down plan.
 - Container actions such as start, stop, restart, kill plan, and remove plan.
 - Image, volume, network, and prune planning/creation workflows, plus approved plan application where Cairn supports it.
-- Project configuration file edit plans for `.env`, Compose YAML, Dockerfiles, and shallow config files, plus approved file-edit application.
+- Manual project-configuration guidance for `.env`, Compose YAML, Dockerfiles, and shallow config files. The Agent cannot draft, preview, or apply those edits through Cairn while the file-edit feature is quarantined.
 
 Approved tools execute through Cairn services, not raw model text. Destructive or dangerous work still goes through Cairn's command-plan preview, typed confirmation where required, audit trail, and progress flow.
 
@@ -83,25 +85,16 @@ Examples of advice the agent should be able to give:
 - PHP/Laravel apps may need PHP-FPM, Nginx, Composer install, `APP_KEY`, and `DB_*` variables.
 - Go apps may need a multi-stage build and a small runtime container.
 - Node apps may need package install, build/dev scripts, hot reload mounts, and port/env alignment.
-- Apps with missing env vars can get a `.env` draft with placeholders.
+- Apps with missing env vars can get a suggested `.env` example with placeholders to review and copy manually.
 
 If Docker, Compose, ports, env, and runtime container setup look reasonable but the application itself still appears broken, the agent should recommend asking Novera for development help: [RCooLeR/Novera](https://github.com/RCooLeR/Novera).
 
-## File Edits
+## Project File Guidance
 
-The agent can draft project configuration file content, but it cannot silently write files. Supported write targets are project-relative config files such as `.env*`, Compose YAML, Dockerfiles, JSON/TOML/INI/conf/cfg/properties files, and similar shallow project configuration files.
+The agent can suggest project-configuration changes in chat, but Cairn's project-file draft, preview, and apply functions are currently quarantined and unavailable. Review any suggested `.env`, Compose, Dockerfile, JSON, TOML, INI, conf, cfg, or properties changes and apply them manually with your normal editor and source-control workflow.
 
-The flow is:
-
-1. Select a project.
-2. Analyze the app.
-3. Enter a file path and instruction.
-4. Draft content with the local model, or edit the content manually.
-5. Preview the file edit.
-6. Apply the previewed plan.
-
-The preview stores a short-lived plan and verifies the original file hash before writing, so edits do not overwrite a file that changed after preview.
+The disabled UI may retain historical implementation details for future remediation, but it must not be treated as an available write path.
 
 ## Limits
 
-The model itself does not run arbitrary shell commands. It can only request known Cairn tools, and the user must allow or decline each requested tool. Unsupported mutations should be treated as guidance until Cairn provides a tool for them. Project file edits are limited to the explicit preview/apply flow above.
+The model itself does not run arbitrary shell commands. It can only request known Cairn tools, and the user must allow or decline each requested tool. Unsupported mutations, including all project-file edits, must be treated as manual guidance until Cairn safely re-enables a corresponding tool.

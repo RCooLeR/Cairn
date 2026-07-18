@@ -25,6 +25,7 @@ const (
 	dbFileName                  = "cairn.db"
 	driverName                  = "sqlite"
 	backupKeepCount             = 2
+	buildArgPrivacyVersion      = 11
 	schemaBackupTimestampLayout = "20060102T150405.000000000Z"
 )
 
@@ -97,6 +98,7 @@ func sqliteDSN(path string) string {
 		"busy_timeout=5000",
 		"foreign_keys=ON",
 		"journal_mode=WAL",
+		"secure_delete=ON",
 		"synchronous=NORMAL",
 	} {
 		query.Add("_pragma", pragma)
@@ -183,6 +185,23 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if current > latest {
 		return &NewerSchemaError{Current: current, Latest: latest}
 	}
+	if current > 0 {
+		// Scrub before backup so this upgrade does not create a fresh backup
+		// containing the legacy secret values. All affected tables were present
+		// in schema version 1.
+		if err := s.scrubLegacyBuildArgValues(ctx); err != nil {
+			return err
+		}
+		if _, privacyScrubbed := applied[buildArgPrivacyVersion]; !privacyScrubbed {
+			// VACUUM must precede both the backup and the migration marker. It
+			// rebuilds free pages that can retain values deleted by older builds
+			// that ran with secure_delete disabled. A crash leaves the marker
+			// pending, so the scrub safely runs again on the next startup.
+			if err := s.vacuumLegacyBuildArgResidue(ctx); err != nil {
+				return err
+			}
+		}
+	}
 
 	pending := pendingMigrations(migrations, applied)
 	if len(pending) > 0 {
@@ -202,8 +221,82 @@ func (s *Store) Migrate(ctx context.Context) error {
 			return err
 		}
 	}
+	if err := s.scrubLegacyBuildArgValues(ctx); err != nil {
+		return err
+	}
 
 	return s.Settings().EnsureDefaults(ctx)
+}
+
+// scrubLegacyBuildArgValues removes secret-valued Compose build arguments
+// written by older builds. Existing databases are scrubbed before a pending
+// migration backup and every database is scrubbed again after migrations.
+func (s *Store) scrubLegacyBuildArgValues(ctx context.Context) error {
+	if s == nil || s.writer == nil {
+		return errors.New("store: database is not ready")
+	}
+	tx, err := s.writer.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+	if _, err := tx.ExecContext(ctx, "PRAGMA secure_delete = ON"); err != nil {
+		return fmt.Errorf("store: enable secure build-argument deletion: %w", err)
+	}
+	statements := []string{
+		`UPDATE services
+		 SET metadata_json = CASE
+		     WHEN json_valid(metadata_json) THEN json_remove(metadata_json, '$.buildArgs')
+		     ELSE '{}'
+		 END
+		 WHERE metadata_json IS NOT NULL
+		     AND instr(metadata_json, '"buildArgs"') > 0`,
+		`UPDATE image_lineage
+		 SET build_args_json = '{}'
+		 WHERE COALESCE(build_args_json, '{}') <> '{}'`,
+		`UPDATE update_history
+		 SET build_args_json = '{}'
+		 WHERE COALESCE(build_args_json, '{}') <> '{}'`,
+	}
+	for _, statement := range statements {
+		if _, err := tx.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("store: scrub legacy build arguments: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return s.checkpointWALTruncate(ctx)
+}
+
+// checkpointWALTruncate ensures committed legacy values are removed from the
+// live WAL rather than merely becoming unreachable database rows. SQLite
+// reports a busy checkpoint as a successful query result, so inspect all
+// returned counters instead of relying on QueryRowContext's error alone.
+func (s *Store) checkpointWALTruncate(ctx context.Context) error {
+	var busy, logFrames, checkpointedFrames int
+	if err := s.writer.QueryRowContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)").Scan(&busy, &logFrames, &checkpointedFrames); err != nil {
+		return fmt.Errorf("store: truncate build-argument WAL residue: %w", err)
+	}
+	if busy != 0 {
+		return fmt.Errorf("store: truncate build-argument WAL residue: checkpoint remained busy")
+	}
+	if logFrames >= 0 && checkpointedFrames >= 0 && checkpointedFrames < logFrames {
+		return fmt.Errorf("store: truncate build-argument WAL residue: checkpoint incomplete (%d of %d frames)", checkpointedFrames, logFrames)
+	}
+	return nil
+}
+
+func (s *Store) vacuumLegacyBuildArgResidue(ctx context.Context) error {
+	if _, err := s.writer.ExecContext(ctx, "VACUUM"); err != nil {
+		return fmt.Errorf("store: vacuum legacy build-argument residue: %w", err)
+	}
+	if err := s.checkpointWALTruncate(ctx); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *Store) configure(ctx context.Context) error {
@@ -212,6 +305,7 @@ func (s *Store) configure(ctx context.Context) error {
 			"PRAGMA busy_timeout = 5000",
 			"PRAGMA foreign_keys = ON",
 			"PRAGMA journal_mode = WAL",
+			"PRAGMA secure_delete = ON",
 			"PRAGMA synchronous = NORMAL",
 		} {
 			if _, err := db.ExecContext(ctx, stmt); err != nil {

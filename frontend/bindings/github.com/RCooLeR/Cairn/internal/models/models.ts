@@ -1531,7 +1531,7 @@ export class EnvVar {
 export class ExportLogsRequest {
     "scope": string;
     "ids"?: string[];
-    "path": string;
+    "format": string;
     "tail"?: number;
 
     /** Creates a new ExportLogsRequest instance. */
@@ -1539,8 +1539,8 @@ export class ExportLogsRequest {
         if (!("scope" in $$source)) {
             this["scope"] = "";
         }
-        if (!("path" in $$source)) {
-            this["path"] = "";
+        if (!("format" in $$source)) {
+            this["format"] = "";
         }
 
         Object.assign(this, $$source);
@@ -1563,6 +1563,8 @@ export class ExportResult {
     "path": string;
     "bytes": number;
     "lineCount": number;
+    "truncated"?: boolean;
+    "durabilityWarning"?: string;
 
     /** Creates a new ExportResult instance. */
     constructor($$source: Partial<ExportResult> = {}) {
@@ -2120,6 +2122,7 @@ export class LogLine {
 export class LogPage {
     "lines": LogLine[];
     "nextCursor"?: string;
+    "truncated"?: boolean;
 
     /** Creates a new LogPage instance. */
     constructor($$source: Partial<LogPage> = {}) {
@@ -2181,6 +2184,7 @@ export class LogRuntimeDiagnostics {
     "reservedReaders": number;
     "retainedBytes": number;
     "activeProducers": number;
+    "activeOperations": number;
 
     /** Creates a new LogRuntimeDiagnostics instance. */
     constructor($$source: Partial<LogRuntimeDiagnostics> = {}) {
@@ -2201,6 +2205,9 @@ export class LogRuntimeDiagnostics {
         }
         if (!("activeProducers" in $$source)) {
             this["activeProducers"] = 0;
+        }
+        if (!("activeOperations" in $$source)) {
+            this["activeOperations"] = 0;
         }
 
         Object.assign(this, $$source);

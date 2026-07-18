@@ -2,6 +2,7 @@ package compose
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -11,16 +12,26 @@ import (
 	"github.com/RCooLeR/Cairn/internal/providers"
 )
 
-const commandDetailOutputLimit = 6000
+const (
+	commandDetailOutputLimit     = 6000
+	maxComposeParseOutputBytes   = 64 << 10
+	composeOutputTruncationToken = "...[Cairn truncated "
+)
 
 func (c *Client) Version(ctx context.Context) (*Version, error) {
 	result, err := c.run(ctx, "", nil, "version", "--format", "json")
 	if commandFailed(result, err) {
 		return nil, composeCommandError(apperror.ComposeNotFound, "Docker Compose v2 plugin was not found", result, err)
 	}
+	if err := composeParseOutputError(result); err != nil {
+		return nil, err
+	}
 	version, err := ParseVersionJSON(result.Stdout)
+	if contextErr := composeContextError(ctx, nil); contextErr != nil {
+		return nil, contextErr
+	}
 	if err != nil {
-		return nil, apperror.Wrap(apperror.ComposeInvalid, "Parse Docker Compose version failed", err, apperror.WithDetail(result.Stdout))
+		return nil, apperror.Wrap(apperror.ComposeInvalid, "Parse Docker Compose version failed", err, apperror.WithDetail(providers.SafeCommandDiagnostic(result.Stdout, commandDetailOutputLimit)))
 	}
 	if !VersionAtLeast(version.Version, MinimumVersion) {
 		return nil, apperror.New(
@@ -42,9 +53,15 @@ func (c *Client) Ls(ctx context.Context, opts ListOptions) ([]Project, error) {
 	if commandFailed(result, err) {
 		return nil, composeCommandError(apperror.ComposeInvalid, "List Compose projects failed", result, err)
 	}
+	if err := composeParseOutputError(result); err != nil {
+		return nil, err
+	}
 	projects, err := ParseProjectsJSON(result.Stdout)
+	if contextErr := composeContextError(ctx, nil); contextErr != nil {
+		return nil, contextErr
+	}
 	if err != nil {
-		return nil, apperror.Wrap(apperror.ComposeInvalid, "Parse Compose project list failed", err, apperror.WithDetail(result.Stdout))
+		return nil, apperror.Wrap(apperror.ComposeInvalid, "Parse Compose project list failed", err, apperror.WithDetail(providers.SafeCommandDiagnostic(result.Stdout, commandDetailOutputLimit)))
 	}
 	return projects, nil
 }
@@ -56,17 +73,35 @@ func (c *Client) Ps(ctx context.Context, opts ProjectOptions) ([]models.ComposeS
 	if commandFailed(result, err) {
 		return nil, composeCommandError(apperror.ComposeInvalid, "List Compose service status failed", result, err)
 	}
+	if err := composeParseOutputError(result); err != nil {
+		return nil, err
+	}
 	containers, err := ParsePSJSON(result.Stdout)
+	if contextErr := composeContextError(ctx, nil); contextErr != nil {
+		return nil, contextErr
+	}
 	if err != nil {
-		return nil, apperror.Wrap(apperror.ComposeInvalid, "Parse Compose service status failed", err, apperror.WithDetail(result.Stdout))
+		return nil, apperror.Wrap(apperror.ComposeInvalid, "Parse Compose service status failed", err, apperror.WithDetail(providers.SafeCommandDiagnostic(result.Stdout, commandDetailOutputLimit)))
 	}
 	return ServiceStatuses(containers), nil
 }
 
 func (c *Client) Config(ctx context.Context, opts ProjectOptions) (*ConfigResult, error) {
 	opts = c.backendProjectOptions(opts)
+	return c.configWithBackendProjectOptions(ctx, opts)
+}
+
+func (c *Client) configWithBackendProjectOptions(ctx context.Context, opts ProjectOptions) (*ConfigResult, error) {
+	return c.configWithBackendProjectOptionsFlags(ctx, opts)
+}
+
+func (c *Client) configWithBackendProjectOptionsFlags(ctx context.Context, opts ProjectOptions, configFlags ...string) (*ConfigResult, error) {
 	args := append(projectArgs(opts), "config")
+	args = append(args, configFlags...)
 	result, err := c.run(ctx, opts.Workdir, projectEnv(opts), args...)
+	if contextErr := composeContextError(ctx, err); contextErr != nil {
+		return nil, contextErr
+	}
 	if commandFailed(result, err) {
 		if result == nil {
 			if _, ok := apperror.CodeOf(err); ok {
@@ -86,14 +121,20 @@ func (c *Client) Config(ctx context.Context, opts ProjectOptions) (*ConfigResult
 		}
 		return config, apperror.New(apperror.ComposeInvalid, "Compose config validation failed", apperror.WithDetail(detail))
 	}
+	if err := composeParseOutputError(result); err != nil {
+		return nil, err
+	}
 	config, err := ParseConfigYAML(result.Stdout)
+	if contextErr := composeContextError(ctx, nil); contextErr != nil {
+		return nil, contextErr
+	}
 	if err != nil {
 		config.API = models.ComposeConfigResult{
 			ResolvedYAML: result.Stdout,
 			Valid:        false,
 			Errors:       append([]string(nil), config.Errors...),
 		}
-		return config, apperror.Wrap(apperror.ComposeInvalid, "Parse Compose config failed", err, apperror.WithDetail(result.Stdout))
+		return config, apperror.Wrap(apperror.ComposeInvalid, "Parse Compose config failed", err, apperror.WithDetail(providers.SafeCommandDiagnostic(result.Stdout, commandDetailOutputLimit)))
 	}
 	return config, nil
 }
@@ -103,7 +144,11 @@ func (c *Client) Start(ctx context.Context, opts ProjectOptions) (*providers.Com
 }
 
 func (c *Client) StartServices(ctx context.Context, opts ProjectOptions, services []string) (*providers.CommandResult, error) {
-	args := append([]string{"start"}, nonEmptyServices(services)...)
+	services, err := serviceOperands(services)
+	if err != nil {
+		return nil, err
+	}
+	args := append([]string{"start"}, services...)
 	return c.runProjectCommand(ctx, opts, args...)
 }
 
@@ -112,7 +157,11 @@ func (c *Client) Stop(ctx context.Context, opts ProjectOptions) (*providers.Comm
 }
 
 func (c *Client) StopServices(ctx context.Context, opts ProjectOptions, services []string) (*providers.CommandResult, error) {
-	args := append([]string{"stop"}, nonEmptyServices(services)...)
+	services, err := serviceOperands(services)
+	if err != nil {
+		return nil, err
+	}
+	args := append([]string{"stop"}, services...)
 	return c.runProjectCommand(ctx, opts, args...)
 }
 
@@ -121,7 +170,11 @@ func (c *Client) Restart(ctx context.Context, opts ProjectOptions) (*providers.C
 }
 
 func (c *Client) RestartServices(ctx context.Context, opts ProjectOptions, services []string) (*providers.CommandResult, error) {
-	args := append([]string{"restart"}, nonEmptyServices(services)...)
+	services, err := serviceOperands(services)
+	if err != nil {
+		return nil, err
+	}
+	args := append([]string{"restart"}, services...)
 	return c.runProjectCommand(ctx, opts, args...)
 }
 
@@ -130,11 +183,19 @@ func (c *Client) Pull(ctx context.Context, opts ProjectOptions) (*providers.Comm
 }
 
 func (c *Client) PullServices(ctx context.Context, opts ProjectOptions, services []string) (*providers.CommandResult, error) {
-	args := append([]string{"pull"}, nonEmptyServices(services)...)
+	services, err := serviceOperands(services)
+	if err != nil {
+		return nil, err
+	}
+	args := append([]string{"pull"}, services...)
 	return c.runProjectCommand(ctx, opts, args...)
 }
 
 func (c *Client) Build(ctx context.Context, opts ProjectOptions, build BuildOptions) (*providers.CommandResult, error) {
+	services, err := serviceOperands(build.Services)
+	if err != nil {
+		return nil, err
+	}
 	args := []string{"build"}
 	if build.Pull {
 		args = append(args, "--pull")
@@ -153,7 +214,7 @@ func (c *Client) Build(ctx context.Context, opts ProjectOptions, build BuildOpti
 		}
 		args = append(args, "--label", key+"="+value)
 	}
-	args = append(args, build.Services...)
+	args = append(args, services...)
 	return c.runProjectCommand(ctx, opts, args...)
 }
 
@@ -162,6 +223,10 @@ func (c *Client) Up(ctx context.Context, opts ProjectOptions, forceRecreate bool
 }
 
 func (c *Client) UpServices(ctx context.Context, opts ProjectOptions, up UpOptions) (*providers.CommandResult, error) {
+	services, err := serviceOperands(up.Services)
+	if err != nil {
+		return nil, err
+	}
 	args := []string{"up", "-d"}
 	if up.ForceRecreate {
 		args = append(args, "--force-recreate")
@@ -169,7 +234,7 @@ func (c *Client) UpServices(ctx context.Context, opts ProjectOptions, up UpOptio
 	if up.NoBuild {
 		args = append(args, "--no-build")
 	}
-	args = append(args, nonEmptyServices(up.Services)...)
+	args = append(args, services...)
 	return c.runProjectCommand(ctx, opts, args...)
 }
 
@@ -177,6 +242,9 @@ func (c *Client) ScaleService(ctx context.Context, opts ProjectOptions, service 
 	service = strings.TrimSpace(service)
 	if service == "" {
 		return nil, apperror.New(apperror.Conflict, "Service name is required")
+	}
+	if strings.HasPrefix(service, "-") {
+		return nil, invalidServiceOperandError()
 	}
 	if replicas < 0 {
 		return nil, apperror.New(apperror.Conflict, "Replica count cannot be negative")
@@ -204,6 +272,9 @@ func (c *Client) runProjectCommand(ctx context.Context, opts ProjectOptions, arg
 }
 
 func (c *Client) run(ctx context.Context, workdir string, env []string, args ...string) (*providers.CommandResult, error) {
+	if err := composeContextError(ctx, nil); err != nil {
+		return nil, err
+	}
 	if c == nil || c.runner == nil {
 		return nil, apperror.New(apperror.ProviderNotReady, "Compose runner is not ready")
 	}
@@ -214,6 +285,9 @@ func (c *Client) run(ctx context.Context, workdir string, env []string, args ...
 	if runtimeScope.Valid() {
 		currentScope, err := providers.ResolveRuntimeScope(ctx, scopeProvider)
 		if err != nil {
+			if contextErr := composeContextError(ctx, err); contextErr != nil {
+				return nil, contextErr
+			}
 			return nil, err
 		}
 		if !currentScope.Equal(runtimeScope) {
@@ -222,11 +296,19 @@ func (c *Client) run(ctx context.Context, workdir string, env []string, args ...
 	}
 	if len(env) > 0 {
 		if runner, ok := c.runner.(EnvRunner); ok {
-			return runner.RunComposeEnv(ctx, workdir, env, args...)
+			result, err := runner.RunComposeEnv(ctx, workdir, env, args...)
+			if contextErr := composeContextError(ctx, err); contextErr != nil {
+				return result, contextErr
+			}
+			return result, err
 		}
 		return nil, apperror.New(apperror.Internal, "Compose runner does not support environment passthrough")
 	}
-	return c.runner.RunCompose(ctx, workdir, args...)
+	result, err := c.runner.RunCompose(ctx, workdir, args...)
+	if contextErr := composeContextError(ctx, err); contextErr != nil {
+		return result, contextErr
+	}
+	return result, err
 }
 
 func (c *Client) backendProjectOptions(opts ProjectOptions) ProjectOptions {
@@ -236,6 +318,11 @@ func (c *Client) backendProjectOptions(opts ProjectOptions) ProjectOptions {
 	}
 	if mapped, err := mapper.MapPathToBackend(opts.Workdir); err == nil && strings.TrimSpace(mapped) != "" {
 		opts.Workdir = mapped
+	}
+	if strings.TrimSpace(opts.ProjectDirectory) != "" {
+		if mapped, err := mapper.MapPathToBackend(opts.ProjectDirectory); err == nil && strings.TrimSpace(mapped) != "" {
+			opts.ProjectDirectory = mapped
+		}
 	}
 	if len(opts.Files) > 0 {
 		files := make([]string, 0, len(opts.Files))
@@ -248,11 +335,30 @@ func (c *Client) backendProjectOptions(opts ProjectOptions) ProjectOptions {
 		}
 		opts.Files = files
 	}
+	if len(opts.InterpolationEnvFiles) > 0 {
+		files := make([]string, 0, len(opts.InterpolationEnvFiles))
+		for _, file := range opts.InterpolationEnvFiles {
+			if mapped, err := mapper.MapPathToBackend(file); err == nil && strings.TrimSpace(mapped) != "" {
+				files = append(files, mapped)
+			} else {
+				files = append(files, file)
+			}
+		}
+		opts.InterpolationEnvFiles = files
+	}
 	return opts
 }
 
 func projectArgs(opts ProjectOptions) []string {
-	args := make([]string, 0, len(opts.Files)*2+len(opts.Profiles)*2)
+	args := make([]string, 0, len(opts.Files)*2+len(opts.InterpolationEnvFiles)*2+len(opts.Profiles)*2+2)
+	if projectDirectory := strings.TrimSpace(opts.ProjectDirectory); projectDirectory != "" {
+		args = append(args, "--project-directory", projectDirectory)
+	}
+	for _, file := range opts.InterpolationEnvFiles {
+		if file = strings.TrimSpace(file); file != "" {
+			args = append(args, "--env-file", file)
+		}
+	}
 	for _, file := range opts.Files {
 		file = strings.TrimSpace(file)
 		if file != "" {
@@ -268,15 +374,22 @@ func projectArgs(opts ProjectOptions) []string {
 	return args
 }
 
-func nonEmptyServices(services []string) []string {
+func serviceOperands(services []string) ([]string, error) {
 	result := make([]string, 0, len(services))
 	for _, service := range services {
 		service = strings.TrimSpace(service)
 		if service != "" {
+			if strings.HasPrefix(service, "-") {
+				return nil, invalidServiceOperandError()
+			}
 			result = append(result, service)
 		}
 	}
-	return result
+	return result, nil
+}
+
+func invalidServiceOperandError() error {
+	return apperror.New(apperror.Conflict, "Service names cannot start with a hyphen")
 }
 
 func projectEnv(opts ProjectOptions) []string {
@@ -307,6 +420,9 @@ func commandFailed(result *providers.CommandResult, err error) bool {
 }
 
 func composeCommandError(code apperror.Code, message string, result *providers.CommandResult, err error) error {
+	if contextErr := composeContextError(nil, err); contextErr != nil {
+		return contextErr
+	}
 	// Scope/provider failures happen before a Compose process is started and
 	// must retain their authorization/readiness taxonomy.
 	if result == nil {
@@ -330,6 +446,37 @@ func composeCommandError(code apperror.Code, message string, result *providers.C
 	return apperror.New(code, message, apperror.WithDetail(detail), apperror.WithRepairHints(hints...))
 }
 
+func composeContextError(ctx context.Context, err error) error {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return context.Canceled
+	case errors.Is(err, context.DeadlineExceeded):
+		return context.DeadlineExceeded
+	}
+	if ctx != nil {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+	}
+	return nil
+}
+
+func composeParseOutputError(result *providers.CommandResult) error {
+	if result == nil {
+		return apperror.New(apperror.ComposeInvalid, "Compose returned no output result")
+	}
+	if !result.StdoutTruncated && len(result.Stdout) <= maxComposeParseOutputBytes && !strings.Contains(result.Stdout, composeOutputTruncationToken) {
+		return nil
+	}
+	return apperror.New(
+		apperror.ComposeInvalid,
+		"Compose output exceeded the safe processing limit",
+		apperror.WithDetail("Reduce the resolved Compose configuration size and try again."),
+	)
+}
+
 func composeNVIDIARuntimeUnavailable(detail string) bool {
 	normalized := strings.ToLower(detail)
 	return strings.Contains(normalized, `could not select device driver "nvidia"`) &&
@@ -341,14 +488,14 @@ func commandDetail(result *providers.CommandResult, err error) string {
 	parts := []string{}
 	if result != nil {
 		if stderr := strings.TrimSpace(result.Stderr); stderr != "" {
-			parts = append(parts, trimCommandDetailPart(stderr))
+			parts = append(parts, trimCommandDetailPart(providers.RedactCommandDiagnostic(stderr)))
 		}
 		if stdout := strings.TrimSpace(result.Stdout); stdout != "" {
-			parts = append(parts, trimCommandDetailPart(stdout))
+			parts = append(parts, trimCommandDetailPart(providers.RedactCommandDiagnostic(stdout)))
 		}
 	}
 	if err != nil {
-		parts = append(parts, err.Error())
+		parts = append(parts, trimCommandDetailPart(providers.RedactCommandDiagnostic(err.Error())))
 	}
 	if len(parts) == 0 {
 		return "docker compose exited without output"

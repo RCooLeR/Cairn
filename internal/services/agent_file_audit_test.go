@@ -107,7 +107,7 @@ func TestAgentServiceApplyFileEditFinalizesOneSafeAuditRecord(t *testing.T) {
 	content := "APP_TOKEN=super-secret-agent-content\n"
 	plans, planID := saveAgentFileEditTestPlan(t, root, ".env", content, false, hashAgentFile([]byte("APP_TOKEN=old\n")))
 	audit := newFakeAgentAuditStore()
-	service := &AgentService{Plans: plans, Audit: audit}
+	service := &AgentService{Plans: plans, Audit: audit, writeFile: writeAgentPlanFile}
 
 	result, err := service.ApplyFileEdit(ctx, planID, "")
 	if err != nil {
@@ -209,7 +209,7 @@ func TestAgentServiceApplyFileEditAuditsEveryFailureOutcome(t *testing.T) {
 			plans, planID := saveAgentFileEditTestPlan(t, root, relativePath, content, create, originalHash)
 			audit := newFakeAgentAuditStore()
 			writerCalls := 0
-			service := &AgentService{Plans: plans, Audit: audit}
+			service := &AgentService{Plans: plans, Audit: audit, writeFile: writeAgentPlanFile}
 			service.writeFile = func(_ security.AgentFileEditPlan, _ fs.FileMode) error {
 				writerCalls++
 				if tt.injectWriteError {
@@ -252,7 +252,7 @@ func TestAgentServiceApplyFileEditFailsClosedWhenIntentAuditFails(t *testing.T) 
 	audit.insertErrAt = 1
 	audit.insertErr = errors.New("audit unavailable super-secret-audit-cause")
 	writerCalls := 0
-	service := &AgentService{Plans: plans, Audit: audit}
+	service := &AgentService{Plans: plans, Audit: audit, writeFile: writeAgentPlanFile}
 	service.writeFile = func(_ security.AgentFileEditPlan, _ fs.FileMode) error {
 		writerCalls++
 		return nil
@@ -285,7 +285,7 @@ func TestAgentServiceApplyFileEditReturnsPartialSuccessWhenOutcomeAuditFails(t *
 	audit := newFakeAgentAuditStore()
 	audit.updateErrAt = 1
 	audit.updateErr = errors.New("audit finalize unavailable super-secret-audit-cause")
-	service := &AgentService{Plans: plans, Audit: audit}
+	service := &AgentService{Plans: plans, Audit: audit, writeFile: writeAgentPlanFile}
 
 	result, err := service.ApplyFileEdit(context.Background(), planID, "")
 	if result == nil || !apperror.IsCode(err, apperror.Internal) {
@@ -318,7 +318,7 @@ func TestAgentServiceApplyFileEditSurfacesFailedOutcomeAuditFailure(t *testing.T
 	audit := newFakeAgentAuditStore()
 	audit.updateErrAt = 1
 	audit.updateErr = errors.New("audit finalize unavailable super-secret-audit-cause")
-	service := &AgentService{Plans: plans, Audit: audit}
+	service := &AgentService{Plans: plans, Audit: audit, writeFile: writeAgentPlanFile}
 	service.writeFile = func(_ security.AgentFileEditPlan, _ fs.FileMode) error {
 		return errors.New("writer unavailable super-secret-writer-cause")
 	}
@@ -343,7 +343,7 @@ func TestAgentServiceApplyFileEditAuditsRejectedPlanWithoutPlanIDLeak(t *testing
 	plans := security.NewAgentFileEditPlanStore(nil)
 	t.Cleanup(plans.Close)
 	audit := newFakeAgentAuditStore()
-	service := &AgentService{Plans: plans, Audit: audit}
+	service := &AgentService{Plans: plans, Audit: audit, writeFile: writeAgentPlanFile}
 	secretPlanID := "super-secret-untrusted-plan-id"
 
 	result, err := service.ApplyFileEdit(context.Background(), secretPlanID, "")
@@ -376,7 +376,7 @@ func TestAgentServiceApplyFileEditFinalizesCancellationAfterAuditIntent(t *testi
 	audit := newFakeAgentAuditStore()
 	audit.onInsert = cancel
 	writerCalls := 0
-	service := &AgentService{Plans: plans, Audit: audit}
+	service := &AgentService{Plans: plans, Audit: audit, writeFile: writeAgentPlanFile}
 	service.writeFile = func(_ security.AgentFileEditPlan, _ fs.FileMode) error {
 		writerCalls++
 		return nil
@@ -408,7 +408,7 @@ func TestAgentServiceApplyFileEditRequiresAuditBeforeTakingPlan(t *testing.T) {
 		t.Fatalf("seed target: %v", err)
 	}
 	plans, planID := saveAgentFileEditTestPlan(t, root, ".env", content, false, hashAgentFile(original))
-	service := &AgentService{Plans: plans}
+	service := &AgentService{Plans: plans, writeFile: writeAgentPlanFile}
 
 	if result, err := service.ApplyFileEdit(context.Background(), planID, ""); result != nil || !apperror.IsCode(err, apperror.Internal) {
 		t.Fatalf("ApplyFileEdit() without audit = (%#v, %v), want fail-closed internal error", result, err)
@@ -420,6 +420,30 @@ func TestAgentServiceApplyFileEditRequiresAuditBeforeTakingPlan(t *testing.T) {
 		t.Fatalf("ApplyFileEdit() after configuring audit = (%#v, %v), want retained plan to apply", result, err)
 	}
 	assertFileContent(t, target, content)
+}
+
+func TestAgentServiceApplyFileEditQuarantineDoesNotConsumePlanAuditOrFile(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, ".env")
+	original := []byte("VALUE=old\n")
+	if err := os.WriteFile(target, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	plans, planID := saveAgentFileEditTestPlan(t, root, ".env", "VALUE=new\n", false, hashAgentFile(original))
+	audit := newFakeAgentAuditStore()
+	service := &AgentService{Plans: plans, Audit: audit}
+
+	result, err := service.ApplyFileEdit(context.Background(), planID, "")
+	if result != nil || !apperror.IsCode(err, apperror.Conflict) || !strings.Contains(err.Error(), "temporarily disabled") {
+		t.Fatalf("ApplyFileEdit(quarantined) = (%#v, %v)", result, err)
+	}
+	assertFileContent(t, target, string(original))
+	if _, _, _, insertCalls, updateCalls := audit.snapshot(); insertCalls != 0 || updateCalls != 0 {
+		t.Fatalf("quarantined apply touched audit: insert=%d update=%d", insertCalls, updateCalls)
+	}
+	if _, err := plans.Take(context.Background(), planID, ""); err != nil {
+		t.Fatalf("quarantined apply consumed the plan: %v", err)
+	}
 }
 
 func saveAgentFileEditTestPlan(t *testing.T, root string, relativePath string, content string, create bool, originalHash string) (*security.AgentFileEditPlanStore, string) {

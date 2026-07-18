@@ -107,7 +107,7 @@ func (p backendNVIDIASMIProbe) ProbeGPUs(ctx context.Context) models.GPUMetrics 
 	if errors.Is(probeCtx.Err(), context.DeadlineExceeded) {
 		return unavailableGPUMetrics("GPU probe timed out", now)
 	}
-	if err != nil || result == nil || result.ExitCode != 0 {
+	if err != nil || result == nil || result.ExitCode != 0 || result.StdoutTruncated {
 		return unavailableGPUMetrics("nvidia-smi could not read GPU metrics", now)
 	}
 
@@ -122,7 +122,7 @@ func (p backendNVIDIASMIProbe) ProbeGPUs(ctx context.Context) models.GPUMetrics 
 		nvidiaSMIProcessQuery,
 		"--format=csv,noheader,nounits",
 	)
-	if err == nil && processResult != nil && processResult.ExitCode == 0 {
+	if err == nil && processResult != nil && processResult.ExitCode == 0 && !processResult.StdoutTruncated {
 		if processes := parseNVIDIASMIProcesses([]byte(processResult.Stdout), metrics.Devices); len(processes) > 0 {
 			metrics.Processes = annotateNVIDIAProcessContainers(probeCtx, p.runner, processes)
 		}
@@ -290,7 +290,7 @@ func annotateNVIDIAProcessContainers(ctx context.Context, runner backendCommandR
 		return processes
 	}
 	result, err := runner.RunBackendCommand(ctx, "", args...)
-	if err != nil || result == nil || result.ExitCode != 0 {
+	if err != nil || result == nil || result.ExitCode != 0 || result.StdoutTruncated {
 		return processes
 	}
 	containers := parseNVIDIAProcessContainers(result.Stdout)
@@ -365,7 +365,7 @@ func probeBackendOllamaProcesses(ctx context.Context, runner backendCommandRunne
 		return nil
 	}
 	result, err := runner.RunBackendCommand(ctx, "", "sh", "-lc", ollamaAPICommand)
-	if err != nil || result == nil || result.ExitCode != 0 || strings.TrimSpace(result.Stdout) == "" {
+	if err != nil || result == nil || result.ExitCode != 0 || result.StdoutTruncated || strings.TrimSpace(result.Stdout) == "" {
 		return nil
 	}
 	return parseOllamaPS([]byte(result.Stdout))

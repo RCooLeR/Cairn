@@ -6,8 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -28,6 +26,8 @@ func NewManager(docker DockerClient, events bus.Bus, opts Options) *Manager {
 		sessions:            map[string]*session{},
 		draining:            map[string]*session{},
 		pendingScopeStreams: map[string]int{},
+		pageSnapshots:       map[string]*logPageSnapshot{},
+		pageCursorKey:       newLogPageCursorKey(),
 		rootCtx:             rootCtx,
 		rootCancel:          rootCancel,
 	}
@@ -122,6 +122,13 @@ func normalizeLogStreamRequest(req models.LogStreamRequest, maxIDs int) (models.
 	if maxIDs <= 0 {
 		maxIDs = defaultMaxReadersPerStream
 	}
+	if len(req.IDs) > maxIDs {
+		return models.LogStreamRequest{}, apperror.New(
+			apperror.Conflict,
+			"Log scope contains too many identifiers",
+			apperror.WithDetail(fmt.Sprintf("At most %d identifiers can be requested at once.", maxIDs)),
+		)
+	}
 	seen := make(map[string]struct{}, min(len(req.IDs), maxIDs+1))
 	ids := make([]string, 0, min(len(req.IDs), maxIDs))
 	for _, rawID := range req.IDs {
@@ -146,6 +153,17 @@ func normalizeLogStreamRequest(req models.LogStreamRequest, maxIDs int) (models.
 		ids = append(ids, id)
 	}
 	req.IDs = ids
+	if req.Scope == ScopeService {
+		for _, serviceID := range req.IDs {
+			if _, _, ok := splitServiceID(serviceID); !ok {
+				return models.LogStreamRequest{}, apperror.New(
+					apperror.Conflict,
+					"Log service scope identifier is invalid",
+					apperror.WithDetail("Choose a service from a specific project."),
+				)
+			}
+		}
+	}
 	return req, nil
 }
 
@@ -250,6 +268,10 @@ func (m *Manager) StopAll() {
 	for _, s := range m.draining {
 		sessions = append(sessions, s)
 	}
+	for id := range m.pageSnapshots {
+		m.removePageSnapshotLocked(id)
+	}
+	m.pageSnapshots = map[string]*logPageSnapshot{}
 	m.mu.Unlock()
 	stopCtx, cancel := context.WithTimeout(context.Background(), m.stopTimeout)
 	defer cancel()
@@ -265,6 +287,7 @@ func (m *Manager) StopAll() {
 	}
 	waitGroupUntil(stopCtx, &stopping)
 	waitGroupUntil(stopCtx, &m.pendingStarts)
+	waitGroupUntil(stopCtx, &m.operations)
 }
 
 func (m *Manager) removeSession(streamID string, s *session) {
@@ -298,113 +321,11 @@ func waitGroupUntil(ctx context.Context, group *sync.WaitGroup) bool {
 }
 
 func (m *Manager) FetchLogPage(ctx context.Context, req models.LogPageRequest) (*models.LogPage, error) {
-	m.ensureReady()
-	if err := m.requireDocker(); err != nil {
-		return nil, err
-	}
-	limit := req.Limit
-	if limit <= 0 {
-		limit = 200
-	}
-	lines, err := m.collectLogs(ctx, models.LogStreamRequest{
-		Scope:      req.Scope,
-		IDs:        req.IDs,
-		Follow:     false,
-		Tail:       defaultFetchTail,
-		Timestamps: true,
-	})
-	if err != nil {
-		return nil, err
-	}
-	page := pageLines(lines, req.Cursor, limit)
-	return &page, nil
+	return m.fetchLogPage(ctx, req)
 }
 
 func (m *Manager) ExportLogs(ctx context.Context, req models.ExportLogsRequest) (*models.ExportResult, error) {
-	m.ensureReady()
-	if err := m.requireDocker(); err != nil {
-		return nil, err
-	}
-	path := strings.TrimSpace(req.Path)
-	if path == "" {
-		return nil, apperror.New(apperror.Internal, "Export path is required")
-	}
-	tail := -1
-	if req.Tail > 0 {
-		tail = req.Tail
-	}
-	lines, err := m.collectLogs(ctx, models.LogStreamRequest{
-		Scope:      req.Scope,
-		IDs:        req.IDs,
-		Follow:     false,
-		Tail:       tail,
-		Timestamps: true,
-	})
-	if err != nil {
-		return nil, err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, apperror.Wrap(apperror.Internal, "Create log export directory failed", err)
-	}
-	file, err := os.Create(path)
-	if err != nil {
-		return nil, apperror.Wrap(apperror.Internal, "Create log export failed", err)
-	}
-	defer func() {
-		_ = file.Close()
-	}()
-	var bytesWritten int64
-	for _, line := range lines {
-		var text string
-		if strings.EqualFold(filepath.Ext(path), ".jsonl") {
-			raw, err := json.Marshal(line)
-			if err != nil {
-				return nil, apperror.Wrap(apperror.Internal, "Encode log export failed", err)
-			}
-			text = string(raw) + "\n"
-		} else {
-			text = fmt.Sprintf("%s %s %s\n", line.TS.Format(time.RFC3339Nano), line.Stream, line.Text)
-		}
-		n, err := io.WriteString(file, text)
-		bytesWritten += int64(n)
-		if err != nil {
-			return nil, apperror.Wrap(apperror.Internal, "Write log export failed", err)
-		}
-	}
-	return &models.ExportResult{Path: path, Bytes: bytesWritten, LineCount: len(lines)}, nil
-}
-
-func (m *Manager) collectLogs(ctx context.Context, req models.LogStreamRequest) ([]models.LogLine, error) {
-	containers, err := m.resolveContainers(ctx, req, false)
-	if err != nil {
-		return nil, err
-	}
-	var lines []models.LogLine
-	for _, container := range containers {
-		source := sourceFromContainer(container)
-		reader, err := m.Docker.ContainerLogs(ctx, container.ID, dockercore.LogOptions{
-			Follow:     false,
-			Tail:       req.Tail,
-			Since:      req.Since,
-			Timestamps: true,
-		})
-		if err != nil {
-			return nil, err
-		}
-		err = ReadDockerLogStream(ctx, reader, source, m.now, func(line models.LogLine) bool {
-			lines = append(lines, line)
-			return true
-		})
-		closeErr := reader.Close()
-		if err != nil {
-			return nil, err
-		}
-		if closeErr != nil {
-			return nil, apperror.Wrap(apperror.Internal, "Close log stream failed", closeErr)
-		}
-	}
-	SortLines(lines)
-	return lines, nil
+	return m.exportLogs(ctx, req)
 }
 
 func (m *Manager) resolveContainers(ctx context.Context, req models.LogStreamRequest, allowEmpty bool) ([]models.ContainerSummary, error) {
@@ -463,7 +384,10 @@ func (m *Manager) resolveContainers(ctx context.Context, req models.LogStreamReq
 		}
 	case ScopeService:
 		for _, serviceID := range req.IDs {
-			projectID, serviceName := splitServiceID(serviceID)
+			projectID, serviceName, ok := splitServiceID(serviceID)
+			if !ok {
+				return nil, apperror.New(apperror.Conflict, "Log service scope identifier is invalid")
+			}
 			listed, err := m.Docker.ListContainers(ctx, models.ContainerListOptions{All: true, ProjectID: projectID, Service: serviceName})
 			if err != nil {
 				return nil, err
@@ -537,20 +461,24 @@ func (c *containerCollector) full() bool {
 	return len(c.containers) >= c.limit
 }
 
-func splitServiceID(value string) (string, string) {
+func splitServiceID(value string) (string, string, bool) {
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return "", ""
+		return "", "", false
 	}
 	projectID, service, ok := strings.Cut(value, "::")
 	if ok {
-		return projectID, service
+		projectID = strings.TrimSpace(projectID)
+		service = strings.TrimSpace(service)
+		return projectID, service, projectID != "" && service != "" && !strings.Contains(service, "::")
 	}
 	index := strings.LastIndex(value, "/")
-	if index <= 0 {
-		return "", value
+	if index <= 0 || index == len(value)-1 {
+		return "", "", false
 	}
-	return value[:index], value[index+1:]
+	projectID = strings.TrimSpace(value[:index])
+	service = strings.TrimSpace(value[index+1:])
+	return projectID, service, projectID != "" && service != ""
 }
 
 func sourceFromContainer(container models.ContainerSummary) sourceInfo {
@@ -577,6 +505,12 @@ func (m *Manager) ensureReady() {
 	}
 	if m.pendingScopeStreams == nil {
 		m.pendingScopeStreams = map[string]int{}
+	}
+	if m.pageSnapshots == nil {
+		m.pageSnapshots = map[string]*logPageSnapshot{}
+	}
+	if m.pageCursorKey == ([32]byte{}) {
+		m.pageCursorKey = newLogPageCursorKey()
 	}
 	if m.rootCtx == nil {
 		m.rootCtx, m.rootCancel = context.WithCancel(context.Background())
@@ -642,6 +576,39 @@ func (m *Manager) ensureReady() {
 			m.batchBytes = defaultBatchBytes
 		}
 	}
+	if m.maxOperations <= 0 {
+		m.maxOperations = defaultMaxOperations
+	}
+	if m.fetchTimeout <= 0 {
+		m.fetchTimeout = defaultFetchTimeout
+	}
+	if m.pageSnapshotTTL <= 0 {
+		m.pageSnapshotTTL = defaultPageSnapshotTTL
+	}
+	if m.maxPageSnapshots <= 0 {
+		m.maxPageSnapshots = defaultMaxPageSnapshots
+	}
+	if m.pageSnapshotLines <= 0 {
+		m.pageSnapshotLines = defaultPageSnapshotLines
+	}
+	if m.pageSnapshotBytes <= 0 {
+		m.pageSnapshotBytes = defaultPageSnapshotBytes
+	}
+	if m.pageSnapshotsBytes <= 0 {
+		m.pageSnapshotsBytes = defaultPageSnapshotsBytes
+	}
+	if m.pageSnapshotBytes > m.pageSnapshotsBytes {
+		m.pageSnapshotBytes = m.pageSnapshotsBytes
+	}
+	if m.exportTimeout <= 0 {
+		m.exportTimeout = defaultExportTimeout
+	}
+	if m.exportLines <= 0 {
+		m.exportLines = defaultExportLines
+	}
+	if m.exportBytes <= 0 {
+		m.exportBytes = defaultExportBytes
+	}
 	if m.now == nil {
 		m.now = func() time.Time { return time.Now().UTC() }
 	}
@@ -664,6 +631,17 @@ func (m *Manager) applyOptions(opts Options) {
 	m.ringBytes = opts.RingBytes
 	m.inputBytes = opts.InputBytes
 	m.batchBytes = opts.BatchBytes
+	m.maxOperations = opts.MaxOperations
+	m.fetchTimeout = opts.FetchTimeout
+	m.pageSnapshotTTL = opts.PageSnapshotTTL
+	m.maxPageSnapshots = opts.MaxPageSnapshots
+	m.pageSnapshotLines = opts.PageSnapshotLines
+	m.pageSnapshotBytes = opts.PageSnapshotBytes
+	m.pageSnapshotsBytes = opts.PageSnapshotsBytes
+	m.exportTimeout = opts.ExportTimeout
+	m.exportLines = opts.ExportLines
+	m.exportBytes = opts.ExportBytes
+	m.exportDirectory = opts.ExportDirectory
 	m.now = opts.Now
 	m.ensureReady()
 }
@@ -1391,8 +1369,8 @@ func (s *session) beginDrain() {
 
 func (s *session) stop(ctx context.Context) error {
 	s.beginDrain()
-	// A repeated stop retries Close on any reader that ignored the first call
-	// while the session remains addressable in the manager's draining set.
+	// Close is requested once per reader. Repeated stops only wait again while
+	// the session remains addressable in the manager's draining set.
 	s.closeReaders()
 	select {
 	case <-s.drainDone:
@@ -1415,7 +1393,7 @@ func (m *Manager) Diagnostics() models.LogRuntimeDiagnostics {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var producers int64
-	var retainedBytes int64
+	retainedBytes := m.pageSnapshotBytesInUse
 	for _, s := range m.sessions {
 		producers += s.activeProducers.Load()
 		retainedBytes += s.retainedBytes.Load()
@@ -1425,11 +1403,12 @@ func (m *Manager) Diagnostics() models.LogRuntimeDiagnostics {
 		retainedBytes += s.retainedBytes.Load()
 	}
 	return models.LogRuntimeDiagnostics{
-		ActiveStreams:   len(m.sessions),
-		PendingStreams:  m.pendingStreams,
-		DrainingStreams: len(m.draining),
-		ReservedReaders: m.reservedReaders,
-		RetainedBytes:   retainedBytes,
-		ActiveProducers: producers,
+		ActiveStreams:    len(m.sessions),
+		PendingStreams:   m.pendingStreams,
+		DrainingStreams:  len(m.draining),
+		ReservedReaders:  m.reservedReaders,
+		RetainedBytes:    retainedBytes,
+		ActiveProducers:  producers,
+		ActiveOperations: m.activeOperations,
 	}
 }

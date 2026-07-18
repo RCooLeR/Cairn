@@ -2,6 +2,7 @@ package compose
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/runtimescope"
+	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/store"
 )
 
@@ -22,6 +24,9 @@ const (
 	defaultConfigEnrichTimeout  = 10 * time.Second
 	defaultConfigEnrichParallel = 4
 	maxConfigEnrichParallel     = 8
+	maxConfigEnrichProjects     = 128
+	defaultConfigEnrichTotal    = 30 * time.Second
+	maxConfigEnrichTotal        = 2 * time.Minute
 )
 
 type DockerInventory interface {
@@ -37,8 +42,12 @@ type ProjectDetector struct {
 	Objects    *store.ObjectCacheRepository
 	Now        func() time.Time
 
-	ConfigTimeout     time.Duration
-	ConfigConcurrency int
+	ConfigTimeout      time.Duration
+	ConfigTotalTimeout time.Duration
+	ConfigConcurrency  int
+
+	configAdmissionMu sync.Mutex
+	configAdmission   chan struct{}
 }
 
 func (d *ProjectDetector) Reconcile(ctx context.Context) ([]models.ProjectSummary, error) {
@@ -211,40 +220,109 @@ func (d *ProjectDetector) mergeImported(project store.ProjectRecord, detected ma
 	imported.record.LastSeenAt = now
 }
 
+type configEnrichmentInput struct {
+	name         string
+	workingDir   string
+	composeFiles []string
+	projectName  string
+}
+
+type configEnrichmentResult struct {
+	name      string
+	envFiles  []string
+	services  []ServiceConfig
+	errorCode apperror.Code
+	errorText string
+	noop      bool
+}
+
 func (d *ProjectDetector) enrichFromConfig(ctx context.Context, project *detectedProject) {
 	if project == nil || d.Compose == nil {
 		return
 	}
+	input := d.prepareConfigEnrichmentInput("direct", project)
+	result := d.readConfigEnrichment(ctx, input)
+	d.applyConfigEnrichment(project, result)
+}
+
+func (d *ProjectDetector) prepareConfigEnrichmentInput(name string, project *detectedProject) configEnrichmentInput {
+	if project == nil {
+		return configEnrichmentInput{name: name}
+	}
 	project.record.WorkingDir = d.hostPath(project.record.WorkingDir)
 	project.record.ComposeFiles = d.hostPaths(project.record.ComposeFiles)
-	if project.record.WorkingDir != "" {
-		if info, err := os.Stat(project.record.WorkingDir); err != nil || !info.IsDir() {
-			project.metadata()["errorCode"] = string(apperror.WorkdirMissing)
-			project.record.Status = models.ProjectStatusError
-			return
+	return configEnrichmentInput{
+		name:         name,
+		workingDir:   project.record.WorkingDir,
+		composeFiles: append([]string(nil), project.record.ComposeFiles...),
+		projectName:  project.record.Name,
+	}
+}
+
+func (d *ProjectDetector) readConfigEnrichment(ctx context.Context, input configEnrichmentInput) configEnrichmentResult {
+	result := configEnrichmentResult{name: input.name}
+	if input.workingDir != "" {
+		if info, err := os.Stat(input.workingDir); err != nil || !info.IsDir() {
+			result.errorCode = apperror.WorkdirMissing
+			return result
 		}
 	}
-	if project.record.WorkingDir == "" && len(project.record.ComposeFiles) == 0 {
-		return
+	if input.workingDir == "" && len(input.composeFiles) == 0 {
+		result.noop = true
+		return result
 	}
-
 	configCtx, cancel := context.WithTimeout(ctx, d.configTimeout())
 	defer cancel()
-	config, err := d.Compose.Config(configCtx, ProjectOptions{
-		Workdir:     project.record.WorkingDir,
-		Files:       project.record.ComposeFiles,
-		ProjectName: project.record.Name,
+	config, _, err := d.Compose.ConfigVerified(configCtx, ProjectOptions{
+		Workdir:     input.workingDir,
+		Files:       input.composeFiles,
+		ProjectName: input.projectName,
 	})
 	if err != nil {
-		project.metadata()["errorCode"] = string(apperror.ComposeInvalid)
-		project.metadata()["error"] = err.Error()
+		result.errorCode = composeEnrichmentErrorCode(err)
+		result.errorText = "Compose project configuration could not be read safely"
+		return result
+	}
+	if config == nil {
+		result.errorCode = apperror.ComposeInvalid
+		result.errorText = "Compose project configuration returned no result"
+		return result
+	}
+	result.envFiles = append([]string(nil), config.EnvFiles...)
+	result.services = append([]ServiceConfig(nil), config.Services...)
+	return result
+}
+
+func composeEnrichmentErrorCode(err error) apperror.Code {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return apperror.Cancelled
+	case errors.Is(err, context.DeadlineExceeded):
+		return apperror.Timeout
+	default:
+		if existing, ok := apperror.CodeOf(err); ok {
+			return existing
+		}
+		return apperror.ComposeInvalid
+	}
+}
+
+func (d *ProjectDetector) applyConfigEnrichment(project *detectedProject, result configEnrichmentResult) {
+	if project == nil || result.noop {
+		return
+	}
+	if result.errorCode != "" {
+		project.metadata()["errorCode"] = string(result.errorCode)
+		if result.errorText != "" {
+			project.metadata()["error"] = result.errorText
+		}
 		project.record.Status = models.ProjectStatusError
 		return
 	}
-	if len(config.EnvFiles) > 0 {
-		project.metadata()["envFiles"] = append([]string(nil), config.EnvFiles...)
+	if len(result.envFiles) > 0 {
+		project.metadata()["envFiles"] = append([]string(nil), result.envFiles...)
 	}
-	for _, serviceConfig := range config.Services {
+	for _, serviceConfig := range result.services {
 		service := project.ensureService(serviceConfig.Name, d.now())
 		if service.record.ImageRef == "" {
 			service.record.ImageRef = serviceConfig.Image
@@ -260,28 +338,91 @@ func (d *ProjectDetector) enrichProjectsFromConfig(ctx context.Context, detected
 	if len(detected) == 0 {
 		return
 	}
-	workers := d.configConcurrency()
-	jobs := make(chan *detectedProject)
-	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for project := range jobs {
-				d.enrichFromConfig(ctx, project)
-			}
-		}()
+	names := make([]string, 0, len(detected))
+	for name := range detected {
+		names = append(names, name)
 	}
-sendProjects:
-	for _, project := range detected {
+	sort.Strings(names)
+	if len(names) > maxConfigEnrichProjects {
+		for _, name := range names[maxConfigEnrichProjects:] {
+			project := detected[name]
+			if project != nil {
+				project.metadata()["warnings"] = appendStringMeta(project.metadata()["warnings"], "CONFIG_ENRICH_SKIPPED_LIMIT")
+			}
+		}
+		names = names[:maxConfigEnrichProjects]
+	}
+	if d.Compose == nil {
+		return
+	}
+	enrichCtx, cancel := context.WithTimeout(ctx, d.configTotalTimeout())
+	defer cancel()
+	inputs := make([]configEnrichmentInput, 0, len(names))
+	for _, name := range names {
+		inputs = append(inputs, d.prepareConfigEnrichmentInput(name, detected[name]))
+	}
+	results := make(chan configEnrichmentResult, len(inputs))
+	admission := d.configAdmissionSlots()
+	applied := make(map[string]struct{}, len(inputs))
+	nextInput := 0
+	inFlight := 0
+	for nextInput < len(inputs) || inFlight > 0 {
+		var acquire chan struct{}
+		if nextInput < len(inputs) {
+			acquire = admission
+		}
 		select {
-		case <-ctx.Done():
-			break sendProjects
-		case jobs <- project:
+		case acquire <- struct{}{}:
+			input := inputs[nextInput]
+			nextInput++
+			inFlight++
+			go func() {
+				result := d.readConfigEnrichment(enrichCtx, input)
+				<-admission
+				select {
+				case results <- result:
+				case <-enrichCtx.Done():
+				}
+			}()
+		case result := <-results:
+			inFlight--
+			if enrichCtx.Err() == nil {
+				d.applyConfigEnrichment(detected[result.name], result)
+				applied[result.name] = struct{}{}
+			}
+		case <-enrichCtx.Done():
+			for _, input := range inputs {
+				if _, ok := applied[input.name]; ok {
+					continue
+				}
+				project := detected[input.name]
+				if project != nil {
+					project.metadata()["warnings"] = appendStringMeta(project.metadata()["warnings"], "CONFIG_ENRICH_SKIPPED_TIMEOUT")
+				}
+			}
+			return
 		}
 	}
-	close(jobs)
-	wg.Wait()
+}
+
+func (d *ProjectDetector) configAdmissionSlots() chan struct{} {
+	d.configAdmissionMu.Lock()
+	defer d.configAdmissionMu.Unlock()
+	if d.configAdmission == nil {
+		d.configAdmission = make(chan struct{}, d.configConcurrency())
+	}
+	return d.configAdmission
+}
+
+func (d *ProjectDetector) configTotalTimeout() time.Duration {
+	timeout := d.ConfigTotalTimeout
+	if timeout <= 0 {
+		timeout = defaultConfigEnrichTotal
+	}
+	if timeout > maxConfigEnrichTotal {
+		return maxConfigEnrichTotal
+	}
+	return timeout
 }
 
 func (d *ProjectDetector) configTimeout() time.Duration {
@@ -489,8 +630,8 @@ func omitDetectedProjects(detected map[string]*detectedProject, projectIDs []str
 
 func serviceConfigMetadata(config ServiceConfig) map[string]any {
 	metadata := map[string]any{}
-	if len(config.BuildArgs) > 0 {
-		metadata["buildArgs"] = config.BuildArgs
+	if security.BuildArgsPresent(config.BuildArgs) {
+		metadata[security.BuildArgsPresentMetadataKey] = true
 	}
 	if len(config.DependsOn) > 0 {
 		metadata["dependsOn"] = append([]string(nil), config.DependsOn...)

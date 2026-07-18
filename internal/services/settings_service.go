@@ -41,14 +41,50 @@ func (s *SettingsService) GetSettings(ctx context.Context) (map[string]any, erro
 				settings[generalAutostartAppSetting] = enabled
 			}
 		}
+		sanitizeAgentEndpointForDisplay(settings)
 		return settings, nil
 	}
 	return map[string]any{}, nil
 }
 
+func sanitizeAgentEndpointForDisplay(settings map[string]any) {
+	if settings == nil {
+		return
+	}
+	endpoint, ok := settings["agent.endpoint"].(string)
+	if !ok {
+		// Treat malformed legacy values as sensitive and do not echo their
+		// structure across the native-to-renderer boundary.
+		settings["agent.endpoint"] = ""
+		return
+	}
+	canonicalEndpoint, err := canonicalAgentEndpoint(endpoint)
+	if err != nil {
+		// Legacy or externally modified settings may predate endpoint
+		// containment. Never echo a credential-bearing or otherwise invalid
+		// URL across the native-to-renderer boundary.
+		settings["agent.endpoint"] = ""
+		return
+	}
+	settings["agent.endpoint"] = canonicalEndpoint
+}
+
 func (s *SettingsService) SetSetting(ctx context.Context, key string, value any) error {
 	if s.Settings != nil {
-		if strings.TrimSpace(strings.ToLower(key)) == generalAutostartAppSetting && s.Autostart != nil {
+		normalizedKey := strings.TrimSpace(strings.ToLower(key))
+		if normalizedKey == "agent.endpoint" {
+			endpoint, ok := value.(string)
+			if !ok {
+				return invalidAgentEndpointError("The configured local Agent endpoint must be a string URL.")
+			}
+			canonicalEndpoint, err := canonicalAgentEndpoint(endpoint)
+			if err != nil {
+				return err
+			}
+			key = "agent.endpoint"
+			value = canonicalEndpoint
+		}
+		if normalizedKey == generalAutostartAppSetting && s.Autostart != nil {
 			enabled, ok := value.(bool)
 			if ok {
 				if err := s.Autostart.SetEnabled(ctx, enabled); err != nil {

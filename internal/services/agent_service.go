@@ -9,14 +9,18 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/models"
@@ -30,8 +34,32 @@ const (
 	agentDefaultEndpoint          = "http://127.0.0.1:11434"
 	agentDefaultModel             = "gemma4:12b-it-q8_0"
 	maxAgentFileEditBytes         = 256 * 1024
+	maxAgentProjectFiles          = 28
+	maxAgentToolIDBytes           = 256
+	maxAgentToolArgumentsBytes    = 256 * 1024
+	maxAgentScopeIDBytes          = 4 * 1024
+	maxAgentToolTitleBytes        = 4 * 1024
+	maxAgentToolSummaryBytes      = 32 * 1024
+	maxAgentToolErrorBytes        = 32 * 1024
+	maxAgentToolDataBytes         = 512 * 1024
+	maxAgentContextBytes          = 512 * 1024
+	maxAgentEndpointBytes         = 2 * 1024
+	maxAgentPromptBytes           = 64 * 1024
+	maxAgentToolIDs               = 128
+	maxAgentHTTPRequestBytes      = 1024 * 1024
+	maxAgentHTTPResponseBytes     = 4 * 1024 * 1024
+	agentHTTPTimeout              = 120 * time.Second
+	agentResponseHeaderTimeout    = 120 * time.Second
 	agentFileEditAuditTimeout     = 5 * time.Second
+	agentFileTruncationMarker     = "\n... file truncated ..."
+	agentContextTruncationMarker  = "... context truncated ..."
+	agentToolTextTruncationMarker = "... tool text truncated ..."
+	agentToolDataTruncationJSON   = `{"truncated":true,"message":"Agent tool output exceeded its safe display limit."}`
+	agentToolDataEncodingJSON     = `{"error":"Agent tool output could not be encoded safely."}`
+	agentProjectValuesHidden      = "# File values hidden by Cairn Agent context.\n"
 )
+
+var agentProductionHTTPClient = newAgentProductionHTTPClient()
 
 type agentAuditStore interface {
 	Insert(context.Context, store.AuditRecord) (int64, error)
@@ -90,8 +118,21 @@ func (s *AgentService) ToolCatalog(_ context.Context) ([]models.AgentToolSpec, e
 	return agentToolCatalog(), nil
 }
 
-func (s *AgentService) ExecuteTool(ctx context.Context, req models.AgentToolExecutionRequest) (*models.AgentToolResult, error) {
+func (s *AgentService) ExecuteTool(ctx context.Context, req models.AgentToolExecutionRequest) (toolResult *models.AgentToolResult, resultErr error) {
+	defer func() {
+		if toolResult == nil {
+			return
+		}
+		sanitized := sanitizeAgentToolResult(*toolResult)
+		toolResult = &sanitized
+	}()
 	toolID := strings.TrimSpace(req.ToolID)
+	if err := validateAgentToolID(toolID); err != nil {
+		return nil, err
+	}
+	if err := validateAgentScope(req.Scope); err != nil {
+		return nil, err
+	}
 	spec, ok := agentToolSpecByID(toolID)
 	if !ok {
 		return nil, apperror.New(apperror.Conflict, "Unknown agent tool", apperror.WithDetail(toolID))
@@ -108,6 +149,9 @@ func (s *AgentService) ExecuteTool(ctx context.Context, req models.AgentToolExec
 		return nil, err
 	}
 	scope := agentScopeFromToolArgs(req.Scope, args)
+	if err := validateAgentScope(scope); err != nil {
+		return nil, err
+	}
 	if spec.ReadOnly {
 		result := s.runTool(ctx, toolID, scope, args)
 		return &result, nil
@@ -375,14 +419,6 @@ func (s *AgentService) ExecuteTool(ctx context.Context, req models.AgentToolExec
 		}
 		result.Summary = "Prune command plan created"
 		result.Data = marshalAgentData(plan)
-	case "project.file_edit.plan":
-		plan, err := s.PlanFileEdit(ctx, models.AgentFileEditRequest{ProjectID: requiredAgentArg(args, "projectID", scope.ProjectID), Path: requiredAgentArg(args, "path", ""), Content: requiredAgentArg(args, "content", ""), Reason: agentArgString(args, "reason", req.Reason)})
-		if err != nil {
-			result.Error = err.Error()
-			return &result, nil
-		}
-		result.Summary = "File edit plan created"
-		result.Data = marshalAgentData(plan)
 	case "updates.apply":
 		if s.Update == nil {
 			result.Error = "Update service is not available"
@@ -444,14 +480,6 @@ func (s *AgentService) ExecuteTool(ctx context.Context, req models.AgentToolExec
 		}
 		result.Summary = "Container created"
 		result.Data = marshalAgentData(map[string]string{"containerID": containerID})
-	case "project.file_edit.apply":
-		applied, err := s.ApplyFileEdit(ctx, requiredAgentArg(args, "planID", ""), agentArgString(args, "typedName", ""))
-		if err != nil {
-			result.Error = err.Error()
-			return &result, nil
-		}
-		result.Summary = "File edit applied"
-		result.Data = marshalAgentData(applied)
 	default:
 		result.Error = "Tool is not executable"
 	}
@@ -463,7 +491,7 @@ func (s *AgentService) AnalyzeProject(ctx context.Context, projectID string) (*m
 	if err != nil {
 		return nil, err
 	}
-	files, err := readAgentProjectFiles(project.Summary.WorkingDir)
+	files, err := readAgentProjectFilesContext(ctx, project.Summary.WorkingDir)
 	if err != nil {
 		return nil, err
 	}
@@ -472,9 +500,15 @@ func (s *AgentService) AnalyzeProject(ctx context.Context, projectID string) (*m
 }
 
 func (s *AgentService) Chat(ctx context.Context, req models.AgentChatRequest) (*models.AgentChatResponse, error) {
-	prompt := strings.TrimSpace(req.Prompt)
-	if prompt == "" {
-		return nil, apperror.New(apperror.Conflict, "Agent prompt is required")
+	prompt, err := validateAgentPrompt(req.Prompt, "Agent prompt")
+	if err != nil {
+		return nil, err
+	}
+	if err := validateAgentToolIDs(req.ToolIDs); err != nil {
+		return nil, err
+	}
+	if err := validateAgentScope(req.Scope); err != nil {
+		return nil, err
 	}
 	cfg := s.config(ctx)
 	if !cfg.Enabled {
@@ -519,9 +553,12 @@ func (s *AgentService) Chat(ctx context.Context, req models.AgentChatRequest) (*
 }
 
 func (s *AgentService) DraftProjectFile(ctx context.Context, req models.AgentDraftFileRequest) (*models.AgentDraftFileResponse, error) {
-	instruction := strings.TrimSpace(req.Instruction)
-	if instruction == "" {
-		return nil, apperror.New(apperror.Conflict, "Draft instruction is required")
+	if s == nil || s.writeFile == nil {
+		return nil, agentFileEditQuarantinedError()
+	}
+	instruction, err := validateAgentPrompt(req.Instruction, "Draft instruction")
+	if err != nil {
+		return nil, err
 	}
 	project, relPath, absPath, err := s.agentEditablePath(ctx, req.ProjectID, req.Path)
 	if err != nil {
@@ -537,7 +574,7 @@ func (s *AgentService) DraftProjectFile(ctx context.Context, req models.AgentDra
 		return nil, apperror.New(apperror.ProviderNotReady, "No local LLM models are installed")
 	}
 
-	current, err := readAgentDraftCurrent(absPath)
+	current, err := readAgentDraftCurrentInProject(project.Summary.WorkingDir, absPath)
 	if err != nil {
 		return nil, err
 	}
@@ -574,6 +611,9 @@ func (s *AgentService) DraftProjectFile(ctx context.Context, req models.AgentDra
 }
 
 func (s *AgentService) PlanFileEdit(ctx context.Context, req models.AgentFileEditRequest) (*models.CommandPlan, error) {
+	if s == nil || s.writeFile == nil {
+		return nil, agentFileEditQuarantinedError()
+	}
 	project, relPath, absPath, err := s.agentEditablePath(ctx, req.ProjectID, req.Path)
 	if err != nil {
 		return nil, err
@@ -584,12 +624,12 @@ func (s *AgentService) PlanFileEdit(ctx context.Context, req models.AgentFileEdi
 	}
 	var originalHash string
 	createFile := false
-	if raw, err := os.ReadFile(absPath); err == nil {
-		originalHash = hashAgentFile(raw)
+	if existing, _, err := readBoundedRegularProjectFile(project.Summary.WorkingDir, absPath, maxAgentFileEditBytes, false); err == nil {
+		originalHash = hashAgentFile(existing.Content)
 	} else if os.IsNotExist(err) {
 		createFile = true
 	} else {
-		return nil, err
+		return nil, agentEditableFileReadError(err)
 	}
 	planID, err := s.IDs.NewTypedPlanID("agent-file")
 	if err != nil {
@@ -639,6 +679,13 @@ func (s *AgentService) PlanFileEdit(ctx context.Context, req models.AgentFileEdi
 }
 
 func (s *AgentService) ApplyFileEdit(ctx context.Context, planID string, typedName string) (*models.AgentFileEditResult, error) {
+	// Atomic publication cannot currently couple an expected file identity with
+	// a handle-relative replace on every supported OS. Keep the production path
+	// quarantined until that CAS primitive exists. writeFile is an unexported
+	// test seam used only to retain coverage of the audited legacy workflow.
+	if s == nil || s.writeFile == nil {
+		return nil, agentFileEditQuarantinedError()
+	}
 	if s.Audit == nil {
 		return nil, apperror.New(
 			apperror.Internal,
@@ -689,14 +736,14 @@ func (s *AgentService) ApplyFileEdit(ctx context.Context, planID string, typedNa
 	plan.AbsolutePath = absPath
 	perm, err := agentFileEditPermission(plan)
 	if err != nil {
-		return fail(err)
+		return fail(safeAgentFilesystemError(err, "File edit target could not be inspected safely"))
 	}
 	if plan.OriginalHash != "" {
-		raw, err := os.ReadFile(plan.AbsolutePath)
+		existing, _, err := readBoundedRegularProjectFile(plan.WorkingDir, plan.AbsolutePath, maxAgentFileEditBytes, false)
 		if err != nil {
-			return fail(err)
+			return fail(agentEditableFileReadError(err))
 		}
-		if hashAgentFile(raw) != plan.OriginalHash {
+		if hashAgentFile(existing.Content) != plan.OriginalHash {
 			return fail(apperror.New(
 				apperror.Conflict,
 				"File changed after preview",
@@ -705,7 +752,7 @@ func (s *AgentService) ApplyFileEdit(ctx context.Context, planID string, typedNa
 		}
 	}
 	if err := os.MkdirAll(filepath.Dir(plan.AbsolutePath), 0o755); err != nil {
-		return fail(err)
+		return fail(safeAgentFilesystemError(err, "File edit directory could not be prepared safely"))
 	}
 	relPath, absPath, err = resolveAgentProjectPath(plan.WorkingDir, plan.RelativePath)
 	if err != nil {
@@ -713,12 +760,8 @@ func (s *AgentService) ApplyFileEdit(ctx context.Context, planID string, typedNa
 	}
 	plan.RelativePath = relPath
 	plan.AbsolutePath = absPath
-	writer := s.writeFile
-	if writer == nil {
-		writer = writeAgentPlanFile
-	}
-	if err := writer(plan, perm); err != nil {
-		return fail(err)
+	if err := s.writeFile(plan, perm); err != nil {
+		return fail(safeAgentFilesystemError(err, "File edit could not be applied safely"))
 	}
 	appliedAt := time.Now().UTC()
 	result := &models.AgentFileEditResult{
@@ -738,6 +781,14 @@ func (s *AgentService) ApplyFileEdit(ctx context.Context, planID string, typedNa
 		)
 	}
 	return result, nil
+}
+
+func agentFileEditQuarantinedError() error {
+	return apperror.New(
+		apperror.Conflict,
+		"Agent file editing is temporarily disabled",
+		apperror.WithDetail("The file was not changed. Review and apply edits manually."),
+	)
 }
 
 func agentToolCatalog() []models.AgentToolSpec {
@@ -785,8 +836,6 @@ func agentToolCatalog() []models.AgentToolSpec {
 		{ID: "network.create", Name: "Create network", Description: "Create a Docker network.", RequiresApproval: true, ArgumentSchema: `{"name":"network name","driver?":"bridge","internal?":false,"labels?":{}}`},
 		{ID: "network.remove_plan", Name: "Plan remove network", Description: "Create Cairn's remove-network command plan.", RequiresApproval: true, ArgumentSchema: `{"networkID":"network id or name"}`},
 		{ID: "docker.prune_plan", Name: "Plan prune", Description: "Create Cairn's prune command plan for images, containers, networks, volumes, build-cache, or system.", RequiresApproval: true, ArgumentSchema: `{"kind":"images|containers|networks|volumes|build-cache|system"}`},
-		{ID: "project.file_edit.plan", Name: "Plan project file edit", Description: "Create Cairn's previewed project config file edit plan.", RequiresApproval: true, ArgumentSchema: `{"projectID":"project id","path":"relative file path","content":"full replacement content","reason?":"why"}`},
-		{ID: "project.file_edit.apply", Name: "Apply project file edit", Description: "Apply a previously previewed project configuration file edit.", RequiresApproval: true, ArgumentSchema: `{"planID":"agent file edit plan id","typedName?":"required typed confirmation"}`},
 	}
 }
 
@@ -798,23 +847,29 @@ func (s *AgentService) config(ctx context.Context) agentConfig {
 		Model:           agentDefaultModel,
 		MaxContextLines: 400,
 	}
-	if s.Settings == nil {
-		return cfg
+	if s.Settings != nil {
+		if value, err := s.Settings.GetBool(ctx, "agent.enabled"); err == nil {
+			cfg.Enabled = value
+		}
+		if value, err := s.Settings.GetString(ctx, "agent.provider"); err == nil && strings.TrimSpace(value) != "" {
+			cfg.Provider = strings.TrimSpace(value)
+		}
+		if value, err := s.Settings.GetString(ctx, "agent.endpoint"); err == nil && strings.TrimSpace(value) != "" {
+			cfg.Endpoint = strings.TrimSpace(value)
+		}
+		if value, err := s.Settings.GetString(ctx, "agent.model"); err == nil && strings.TrimSpace(value) != "" {
+			cfg.Model = strings.TrimSpace(value)
+		}
+		if value, err := s.Settings.GetInt(ctx, "agent.max_context_lines"); err == nil && value > 0 {
+			cfg.MaxContextLines = value
+		}
 	}
-	if value, err := s.Settings.GetBool(ctx, "agent.enabled"); err == nil {
-		cfg.Enabled = value
-	}
-	if value, err := s.Settings.GetString(ctx, "agent.provider"); err == nil && strings.TrimSpace(value) != "" {
-		cfg.Provider = strings.TrimSpace(value)
-	}
-	if value, err := s.Settings.GetString(ctx, "agent.endpoint"); err == nil && strings.TrimSpace(value) != "" {
-		cfg.Endpoint = strings.TrimRight(strings.TrimSpace(value), "/")
-	}
-	if value, err := s.Settings.GetString(ctx, "agent.model"); err == nil && strings.TrimSpace(value) != "" {
-		cfg.Model = strings.TrimSpace(value)
-	}
-	if value, err := s.Settings.GetInt(ctx, "agent.max_context_lines"); err == nil && value > 0 {
-		cfg.MaxContextLines = value
+	if endpoint, err := canonicalAgentEndpoint(cfg.Endpoint); err == nil {
+		cfg.Endpoint = endpoint
+	} else {
+		// Legacy settings may predate write-time validation. Never echo a raw
+		// credential-bearing or otherwise invalid endpoint through Status.
+		cfg.Endpoint = ""
 	}
 	return cfg
 }
@@ -891,7 +946,11 @@ func (s *AgentService) listOllamaModels(ctx context.Context, cfg agentConfig) ([
 			Name string `json:"name"`
 		} `json:"models"`
 	}
-	if err := s.getJSON(ctx, endpointURL(cfg.Endpoint, "/api/tags"), &decoded); err != nil {
+	target, err := endpointURL(cfg.Endpoint, "/api/tags")
+	if err != nil {
+		return nil, err
+	}
+	if err := s.getJSON(ctx, target, &decoded); err != nil {
 		return nil, err
 	}
 	models := make([]string, 0, len(decoded.Models))
@@ -907,7 +966,11 @@ func (s *AgentService) listOpenAICompatibleModels(ctx context.Context, cfg agent
 			ID string `json:"id"`
 		} `json:"data"`
 	}
-	if err := s.getJSON(ctx, endpointURL(cfg.Endpoint, "/v1/models"), &decoded); err != nil {
+	target, err := endpointURL(cfg.Endpoint, "/v1/models")
+	if err != nil {
+		return nil, err
+	}
+	if err := s.getJSON(ctx, target, &decoded); err != nil {
 		return nil, err
 	}
 	models := make([]string, 0, len(decoded.Data))
@@ -957,7 +1020,11 @@ func (s *AgentService) chatOllama(ctx context.Context, cfg agentConfig, system s
 		} `json:"message"`
 		Error string `json:"error"`
 	}
-	if err := s.postJSON(ctx, endpointURL(cfg.Endpoint, "/api/chat"), body, &decoded); err != nil {
+	target, err := endpointURL(cfg.Endpoint, "/api/chat")
+	if err != nil {
+		return "", err
+	}
+	if err := s.postJSON(ctx, target, body, &decoded); err != nil {
 		return "", err
 	}
 	if decoded.Error != "" {
@@ -983,7 +1050,11 @@ func (s *AgentService) chatOpenAICompatible(ctx context.Context, cfg agentConfig
 		} `json:"choices"`
 		Error any `json:"error"`
 	}
-	if err := s.postJSON(ctx, endpointURL(cfg.Endpoint, "/v1/chat/completions"), body, &decoded); err != nil {
+	target, err := endpointURL(cfg.Endpoint, "/v1/chat/completions")
+	if err != nil {
+		return "", err
+	}
+	if err := s.postJSON(ctx, target, body, &decoded); err != nil {
 		return "", err
 	}
 	if decoded.Error != nil {
@@ -997,11 +1068,29 @@ func (s *AgentService) chatOpenAICompatible(ctx context.Context, cfg agentConfig
 }
 
 func (s *AgentService) postJSON(ctx context.Context, target string, body any, out any) error {
+	canonicalTarget, err := canonicalAgentRequestTarget(target)
+	if err != nil {
+		return err
+	}
+	if !agentJSONWithinMarshalBudget(body, maxAgentHTTPRequestBytes) {
+		return apperror.New(
+			apperror.Conflict,
+			"Local agent request exceeds the safe size limit",
+			apperror.WithDetail(fmt.Sprintf("Request bodies are limited to %d encoded bytes.", maxAgentHTTPRequestBytes)),
+		)
+	}
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, target, bytes.NewReader(raw))
+	if len(raw) > maxAgentHTTPRequestBytes {
+		return apperror.New(
+			apperror.Conflict,
+			"Local agent request exceeds the safe size limit",
+			apperror.WithDetail(fmt.Sprintf("Request body is %d bytes; the limit is %d bytes.", len(raw), maxAgentHTTPRequestBytes)),
+		)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, canonicalTarget, bytes.NewReader(raw))
 	if err != nil {
 		return err
 	}
@@ -1013,22 +1102,25 @@ func (s *AgentService) postJSON(ctx context.Context, target string, body any, ou
 	defer func() {
 		_ = resp.Body.Close()
 	}()
-	limited := io.LimitReader(resp.Body, 4<<20)
-	payload, err := io.ReadAll(limited)
+	payload, err := readAgentHTTPPayload(resp.Body)
 	if err != nil {
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return apperror.New(apperror.ProviderNotReady, "Local agent request failed", apperror.WithDetail(fmt.Sprintf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(payload)))))
+		return apperror.New(apperror.ProviderNotReady, "Local agent request failed", apperror.WithDetail(agentHTTPStatusDetail(resp.StatusCode, payload)))
 	}
-	if err := json.Unmarshal(payload, out); err != nil {
+	if err := decodeSingleAgentJSON(payload, out); err != nil {
 		return apperror.Wrap(apperror.Internal, "Decode local agent response failed", err)
 	}
 	return nil
 }
 
 func (s *AgentService) getJSON(ctx context.Context, target string, out any) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	canonicalTarget, err := canonicalAgentRequestTarget(target)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, canonicalTarget, nil)
 	if err != nil {
 		return err
 	}
@@ -1039,14 +1131,14 @@ func (s *AgentService) getJSON(ctx context.Context, target string, out any) erro
 	defer func() {
 		_ = resp.Body.Close()
 	}()
-	payload, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	payload, err := readAgentHTTPPayload(resp.Body)
 	if err != nil {
 		return err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return apperror.New(apperror.ProviderNotReady, "Local agent endpoint returned an error", apperror.WithDetail(fmt.Sprintf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(payload)))))
+		return apperror.New(apperror.ProviderNotReady, "Local agent endpoint returned an error", apperror.WithDetail(agentHTTPStatusDetail(resp.StatusCode, payload)))
 	}
-	if err := json.Unmarshal(payload, out); err != nil {
+	if err := decodeSingleAgentJSON(payload, out); err != nil {
 		return apperror.Wrap(apperror.Internal, "Decode local agent model list failed", err)
 	}
 	return nil
@@ -1054,20 +1146,345 @@ func (s *AgentService) getJSON(ctx context.Context, target string, out any) erro
 
 func (s *AgentService) httpClient() *http.Client {
 	if s.Client != nil {
-		return s.Client
+		return cloneAgentHTTPClient(s.Client)
 	}
-	return &http.Client{Timeout: 120 * time.Second}
+	return agentProductionHTTPClient
 }
 
-func endpointURL(base string, path string) string {
-	parsed, err := url.Parse(strings.TrimRight(base, "/"))
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
-		return strings.TrimRight(base, "/") + path
+func endpointURL(base string, route string) (string, error) {
+	canonicalBase, err := canonicalAgentEndpoint(base)
+	if err != nil {
+		return "", err
 	}
-	parsed.Path = strings.TrimRight(parsed.Path, "/") + path
+	if !strings.HasPrefix(route, "/") || strings.ContainsAny(route, "?#") {
+		return "", apperror.New(apperror.Internal, "Local agent endpoint route is invalid")
+	}
+	parsed, err := url.Parse(canonicalBase)
+	if err != nil {
+		return "", apperror.Wrap(apperror.Internal, "Canonical local agent endpoint could not be parsed", err)
+	}
+	parsed.Path = route
+	return parsed.String(), nil
+}
+
+func validateAgentPrompt(raw string, label string) (string, error) {
+	if len(raw) > maxAgentPromptBytes {
+		return "", apperror.New(
+			apperror.Conflict,
+			label+" exceeds the safe size limit",
+			apperror.WithDetail(fmt.Sprintf("The limit is %d UTF-8 bytes.", maxAgentPromptBytes)),
+		)
+	}
+	if !utf8.ValidString(raw) {
+		return "", apperror.New(apperror.Conflict, label+" must be valid UTF-8")
+	}
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return "", apperror.New(apperror.Conflict, label+" is required")
+	}
+	return value, nil
+}
+
+func validateAgentToolIDs(ids []string) error {
+	if len(ids) > maxAgentToolIDs {
+		return apperror.New(
+			apperror.Conflict,
+			"Agent tool selection exceeds the safe item limit",
+			apperror.WithDetail(fmt.Sprintf("At most %d tool IDs are allowed.", maxAgentToolIDs)),
+		)
+	}
+	for _, id := range ids {
+		if len(id) > maxAgentToolIDBytes {
+			return apperror.New(
+				apperror.Conflict,
+				"Agent tool ID exceeds the safe size limit",
+				apperror.WithDetail(fmt.Sprintf("Each tool ID is limited to %d UTF-8 bytes.", maxAgentToolIDBytes)),
+			)
+		}
+		if !utf8.ValidString(id) {
+			return apperror.New(apperror.Conflict, "Agent tool IDs must be valid UTF-8")
+		}
+	}
+	return nil
+}
+
+func validateAgentToolID(id string) error {
+	if id == "" {
+		return apperror.New(apperror.Conflict, "Agent tool ID is required")
+	}
+	if len(id) > maxAgentToolIDBytes {
+		return apperror.New(
+			apperror.Conflict,
+			"Agent tool ID exceeds the safe size limit",
+			apperror.WithDetail(fmt.Sprintf("Tool IDs are limited to %d UTF-8 bytes.", maxAgentToolIDBytes)),
+		)
+	}
+	if !utf8.ValidString(id) {
+		return apperror.New(apperror.Conflict, "Agent tool ID must be valid UTF-8")
+	}
+	return nil
+}
+
+func validateAgentScope(scope models.AgentScope) error {
+	for _, field := range []struct {
+		label string
+		value string
+	}{
+		{label: "project", value: scope.ProjectID},
+		{label: "container", value: scope.ContainerID},
+		{label: "network", value: scope.NetworkID},
+		{label: "image", value: scope.ImageID},
+	} {
+		if len(field.value) > maxAgentScopeIDBytes {
+			return apperror.New(
+				apperror.Conflict,
+				"Agent "+field.label+" scope identifier exceeds the safe size limit",
+				apperror.WithDetail(fmt.Sprintf("Scope identifiers are limited to %d UTF-8 bytes.", maxAgentScopeIDBytes)),
+			)
+		}
+		if !utf8.ValidString(field.value) {
+			return apperror.New(apperror.Conflict, "Agent "+field.label+" scope identifier must be valid UTF-8")
+		}
+	}
+	return nil
+}
+
+func canonicalAgentEndpoint(raw string) (string, error) {
+	parsed, err := parseAgentLoopbackURL(raw, true)
+	if err != nil {
+		return "", err
+	}
+	parsed.Path = ""
+	return parsed.String(), nil
+}
+
+func canonicalAgentRequestTarget(raw string) (string, error) {
+	parsed, err := parseAgentLoopbackURL(raw, false)
+	if err != nil {
+		return "", err
+	}
+	if !agentEndpointRouteAllowed(parsed.Path) {
+		return "", invalidAgentEndpointError("The requested local Agent API route is not approved.")
+	}
+	return parsed.String(), nil
+}
+
+func parseAgentLoopbackURL(raw string, requireRootPath bool) (*url.URL, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return nil, invalidAgentEndpointError("Configure an absolute loopback URL with an explicit port.")
+	}
+	if len(value) > maxAgentEndpointBytes {
+		return nil, invalidAgentEndpointError(fmt.Sprintf("Endpoint URLs are limited to %d bytes.", maxAgentEndpointBytes))
+	}
+	if strings.ContainsAny(value, "?#") {
+		return nil, invalidAgentEndpointError("Queries and fragments are not allowed in a local Agent endpoint.")
+	}
+	parsed, err := url.Parse(value)
+	if err != nil {
+		return nil, invalidAgentEndpointError("The endpoint is not a valid absolute URL.")
+	}
+	if !parsed.IsAbs() || parsed.Opaque != "" || parsed.Host == "" {
+		return nil, invalidAgentEndpointError("The endpoint must be an absolute HTTP(S) URL.")
+	}
+	scheme := strings.ToLower(parsed.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return nil, invalidAgentEndpointError("Only HTTP and HTTPS local Agent endpoints are allowed.")
+	}
+	if parsed.User != nil {
+		return nil, invalidAgentEndpointError("Credentials are not allowed in a local Agent endpoint URL.")
+	}
+	if parsed.RawQuery != "" || parsed.ForceQuery || parsed.Fragment != "" || parsed.RawFragment != "" {
+		return nil, invalidAgentEndpointError("Queries and fragments are not allowed in a local Agent endpoint.")
+	}
+	if parsed.RawPath != "" {
+		return nil, invalidAgentEndpointError("Encoded endpoint paths are not allowed.")
+	}
+	escapedPath := parsed.EscapedPath()
+	if requireRootPath {
+		if escapedPath != "" && escapedPath != "/" {
+			return nil, invalidAgentEndpointError("The configured endpoint must not include an API path.")
+		}
+	} else if escapedPath == "" || !strings.HasPrefix(escapedPath, "/") {
+		return nil, invalidAgentEndpointError("The local Agent request path is invalid.")
+	}
+
+	host, port, err := net.SplitHostPort(parsed.Host)
+	if err != nil || host == "" || port == "" {
+		return nil, invalidAgentEndpointError("The endpoint must include one explicit numeric port.")
+	}
+	address, err := netip.ParseAddr(host)
+	if err != nil || address.Zone() != "" || address.Is4In6() || !address.IsLoopback() {
+		return nil, invalidAgentEndpointError("The endpoint host must be a literal IPv4 or IPv6 loopback address; DNS names and non-loopback addresses are rejected.")
+	}
+	canonicalPort, err := canonicalAgentPort(port)
+	if err != nil {
+		return nil, err
+	}
+
+	parsed.Scheme = scheme
+	parsed.Host = net.JoinHostPort(address.String(), canonicalPort)
+	parsed.RawPath = ""
 	parsed.RawQuery = ""
+	parsed.ForceQuery = false
 	parsed.Fragment = ""
-	return parsed.String()
+	parsed.RawFragment = ""
+	if requireRootPath {
+		parsed.Path = ""
+	}
+	return parsed, nil
+}
+
+func canonicalAgentPort(raw string) (string, error) {
+	port, err := strconv.Atoi(raw)
+	if err != nil || port < 1 || port > 65535 || strconv.Itoa(port) != raw {
+		return "", invalidAgentEndpointError("The endpoint port must be a canonical integer from 1 through 65535.")
+	}
+	return raw, nil
+}
+
+func agentEndpointRouteAllowed(route string) bool {
+	switch route {
+	case "/api/tags", "/api/chat", "/v1/models", "/v1/chat/completions":
+		return true
+	default:
+		return false
+	}
+}
+
+func invalidAgentEndpointError(detail string) error {
+	return apperror.New(
+		apperror.ProviderNotReady,
+		"Local agent endpoint is not allowed",
+		apperror.WithDetail(detail),
+		apperror.WithRepairHints("Use a literal loopback endpoint with an explicit port, such as http://127.0.0.1:11434 or http://[::1]:11434."),
+	)
+}
+
+func readAgentHTTPPayload(body io.Reader) ([]byte, error) {
+	payload, err := io.ReadAll(io.LimitReader(body, maxAgentHTTPResponseBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(payload) > maxAgentHTTPResponseBytes {
+		return nil, apperror.New(
+			apperror.ProviderNotReady,
+			"Local agent response exceeds the safe size limit",
+			apperror.WithDetail(fmt.Sprintf("Responses are limited to %d bytes.", maxAgentHTTPResponseBytes)),
+		)
+	}
+	return payload, nil
+}
+
+func decodeSingleAgentJSON(payload []byte, out any) error {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	if err := decoder.Decode(out); err != nil {
+		return err
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return errors.New("response contains more than one JSON value")
+		}
+		return fmt.Errorf("response contains invalid trailing data: %w", err)
+	}
+	return nil
+}
+
+func agentHTTPStatusDetail(statusCode int, payload []byte) string {
+	const maxDetailBytes = 8 * 1024
+	detail := strings.TrimSpace(strings.ToValidUTF8(string(payload), "\uFFFD"))
+	if len(detail) > maxDetailBytes {
+		detail = truncateUTF8Bytes(detail, maxDetailBytes) + "... response detail truncated ..."
+	}
+	return fmt.Sprintf("HTTP %d: %s", statusCode, detail)
+}
+
+func cloneAgentHTTPClient(base *http.Client) *http.Client {
+	cloned := *base
+	if cloned.Timeout <= 0 || cloned.Timeout > agentHTTPTimeout {
+		cloned.Timeout = agentHTTPTimeout
+	}
+	cloned.CheckRedirect = rejectAgentRedirect
+	cloned.Jar = nil
+	switch transport := base.Transport.(type) {
+	case *http.Transport:
+		securedTransport := newAgentProductionTransport()
+		if transport.TLSClientConfig != nil {
+			// Preserve explicit local test/runtime certificate trust without
+			// retaining injected proxy, protocol, dial, or TLS-dial hooks.
+			securedTransport.TLSClientConfig = transport.TLSClientConfig.Clone()
+		}
+		cloned.Transport = securedTransport
+	default:
+		// A custom RoundTripper can ignore the validated request URL and send
+		// Agent context anywhere. Keep Client injectable for tests that use a
+		// standard *http.Transport, but fail closed to the production transport
+		// for every other implementation.
+		cloned.Transport = newAgentProductionTransport()
+	}
+	return &cloned
+}
+
+func newAgentProductionHTTPClient() *http.Client {
+	return &http.Client{
+		Transport:     newAgentProductionTransport(),
+		Timeout:       agentHTTPTimeout,
+		CheckRedirect: rejectAgentRedirect,
+	}
+}
+
+func newAgentProductionTransport() *http.Transport {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	hardenAgentTransport(transport)
+	return transport
+}
+
+func hardenAgentTransport(transport *http.Transport) {
+	transport.Proxy = nil
+	transport.Dial = nil
+	transport.DialTLS = nil
+	transport.DialTLSContext = nil
+	enforceAgentTransportLimits(transport)
+	transport.DialContext = newAgentLoopbackDialContext()
+}
+
+func newAgentLoopbackDialContext() func(context.Context, string, string) (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+	return func(ctx context.Context, network string, address string) (net.Conn, error) {
+		if network != "tcp" && network != "tcp4" && network != "tcp6" {
+			return nil, fmt.Errorf("local agent transport rejected network %q", network)
+		}
+		host, port, err := net.SplitHostPort(address)
+		if err != nil {
+			return nil, fmt.Errorf("local agent transport rejected address: %w", err)
+		}
+		ip, err := netip.ParseAddr(host)
+		if err != nil || ip.Zone() != "" || ip.Is4In6() || !ip.IsLoopback() {
+			return nil, errors.New("local agent transport rejected non-loopback address")
+		}
+		canonicalPort, err := canonicalAgentPort(port)
+		if err != nil {
+			return nil, err
+		}
+		return dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), canonicalPort))
+	}
+}
+
+func enforceAgentTransportLimits(transport *http.Transport) {
+	if transport.ResponseHeaderTimeout <= 0 || transport.ResponseHeaderTimeout > agentResponseHeaderTimeout {
+		transport.ResponseHeaderTimeout = agentResponseHeaderTimeout
+	}
+	if transport.TLSHandshakeTimeout <= 0 || transport.TLSHandshakeTimeout > 10*time.Second {
+		transport.TLSHandshakeTimeout = 10 * time.Second
+	}
+	if transport.MaxResponseHeaderBytes <= 0 || transport.MaxResponseHeaderBytes > 64*1024 {
+		transport.MaxResponseHeaderBytes = 64 * 1024
+	}
+}
+
+func rejectAgentRedirect(_ *http.Request, _ []*http.Request) error {
+	return http.ErrUseLastResponse
 }
 
 func agentSystemPrompt() string {
@@ -1081,13 +1498,13 @@ func agentSystemPrompt() string {
 		"Also understand ordinary application projects: infer runtimes, ports, services, build steps, and required environment variables from manifests and config files.",
 		"When useful, offer configuration next steps as questions, such as whether to set up PHP/Nginx, Go build containers, or missing env vars.",
 		"If Docker, Compose, ports, env, and runtime container setup look reasonable but the application itself appears broken, recommend asking Novera for development help: https://github.com/RCooLeR/Novera.",
-		"You may suggest edits to .env, Compose YAML, Dockerfiles, and config files, but actual writes must use Cairn's file-edit preview and confirmation flow.",
+		"Project file changes are manual because file-edit tools are unavailable. You may suggest edits to .env, Compose YAML, Dockerfiles, and config files, but do not request or claim that Cairn changed them.",
 		"When you need Cairn to inspect, plan, or change local Docker state, request exactly one tool call and wait for the result.",
 		"Tool request format: output a fenced code block with language cairn-tool containing JSON: {\"toolID\":\"tool.id\",\"reason\":\"why this is needed\",\"arguments\":{}}.",
 		"Use available Cairn tools for Docker management instead of telling the user to run commands manually when a tool can do it.",
 		"Never claim that a command has been executed until a Cairn tool result says it completed. Destructive or mutating work must go through Cairn approval and command-plan confirmation UI.",
 		"Redact or avoid secrets. Do not ask the user to paste passwords, tokens, private keys, or registry credentials into chat.",
-		"When proposing file changes, provide concise patch-style snippets and explain risk.",
+		"When proposing manual file changes, provide concise patch-style snippets and explain risk.",
 	}, "\n")
 }
 
@@ -1099,23 +1516,56 @@ func promptWithContext(prompt string, contextText string) string {
 }
 
 func agentContextText(results []models.AgentToolResult, maxLines int) string {
-	lines := []string{}
+	capacity := len(results) * 4
+	if maxLines > 0 {
+		capacity = min(capacity, maxLines)
+	}
+	lines := make([]string, 0, capacity)
+	textBytes := 0
+	truncated := false
+	appendLine := func(line string) bool {
+		lineBytes := len(line)
+		if len(lines) > 0 {
+			lineBytes++
+		}
+		if (maxLines > 0 && len(lines) >= maxLines) || textBytes+lineBytes > maxAgentContextBytes {
+			truncated = true
+			return false
+		}
+		lines = append(lines, line)
+		textBytes += lineBytes
+		return true
+	}
+outer:
 	for _, result := range results {
-		lines = append(lines, "## "+result.Title+" ["+result.ToolID+"]")
-		if result.Summary != "" {
-			lines = append(lines, result.Summary)
+		result = sanitizeAgentToolResult(result)
+		if !appendLine("## " + result.Title + " [" + result.ToolID + "]") {
+			break
 		}
-		if result.Error != "" {
-			lines = append(lines, "Error: "+result.Error)
+		if result.Summary != "" && !appendLine(result.Summary) {
+			break
 		}
-		if result.Data != "" {
-			lines = append(lines, strings.Split(result.Data, "\n")...)
+		if result.Error != "" && !appendLine("Error: "+result.Error) {
+			break
+		}
+		for _, line := range strings.Split(result.Data, "\n") {
+			if result.Data != "" && !appendLine(line) {
+				break outer
+			}
 		}
 	}
-	if maxLines <= 0 || len(lines) <= maxLines {
-		return strings.Join(lines, "\n")
+	text := strings.Join(lines, "\n")
+	if !truncated {
+		return text
 	}
-	return strings.Join(lines[:maxLines], "\n") + "\n... context truncated ..."
+	if text == "" {
+		return agentContextTruncationMarker
+	}
+	marker := "\n" + agentContextTruncationMarker
+	if len(text)+len(marker) <= maxAgentContextBytes {
+		return text + marker
+	}
+	return truncateUTF8Bytes(text, maxAgentContextBytes-len(marker)) + marker
 }
 
 func (s *AgentService) collectToolResults(ctx context.Context, req models.AgentChatRequest, _ agentConfig) []models.AgentToolResult {
@@ -1125,7 +1575,7 @@ func (s *AgentService) collectToolResults(ctx context.Context, req models.AgentC
 	toolIDs := requestedAgentTools(req)
 	results := make([]models.AgentToolResult, 0, len(toolIDs))
 	for _, toolID := range toolIDs {
-		results = append(results, s.runTool(ctx, toolID, req.Scope, nil))
+		results = append(results, sanitizeAgentToolResult(s.runTool(ctx, toolID, req.Scope, nil)))
 	}
 	return results
 }
@@ -1392,7 +1842,7 @@ func (s *AgentService) toolProjectFiles(ctx context.Context, projectID string) m
 		result.Error = err.Error()
 		return result
 	}
-	files, err := readAgentProjectFiles(project.Summary.WorkingDir)
+	files, err := readAgentProjectFilesContext(ctx, project.Summary.WorkingDir)
 	if err != nil {
 		result.Error = err.Error()
 		return result
@@ -1565,68 +2015,315 @@ func (s *AgentService) agentEditablePath(ctx context.Context, projectID string, 
 }
 
 func readAgentProjectFiles(root string) ([]models.AgentProjectFile, error) {
+	return readAgentProjectFilesContext(context.Background(), root)
+}
+
+func readAgentProjectFilesContext(ctx context.Context, root string) ([]models.AgentProjectFile, error) {
+	if err := contextReadError(ctx); err != nil {
+		return nil, safeAgentProjectReadError(err)
+	}
 	root = strings.TrimSpace(root)
 	if root == "" {
-		return nil, fmt.Errorf("project working directory is empty")
+		return nil, safeAgentProjectReadError(fs.ErrInvalid)
 	}
-	absRoot, err := filepath.Abs(root)
+	verifiedRoot, err := verifyProjectReadRoot(root)
 	if err != nil {
-		return nil, err
+		return nil, safeAgentProjectReadError(err)
 	}
-	info, err := os.Stat(absRoot)
-	if err != nil || !info.IsDir() {
-		return nil, fmt.Errorf("project working directory is not readable: %s", root)
-	}
-	realRoot, err := filepath.EvalSymlinks(absRoot)
+	paths, err := boundedAgentProjectCandidatesContext(ctx, verifiedRoot)
 	if err != nil {
-		return nil, err
+		return nil, safeAgentProjectReadError(err)
 	}
-	var paths []string
-	err = filepath.WalkDir(absRoot, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return nil
-		}
-		if path != absRoot && entry.IsDir() {
-			name := entry.Name()
-			if name == ".git" || name == "node_modules" || name == "vendor" || name == ".venv" || name == "dist" || name == "build" {
-				return filepath.SkipDir
-			}
-			rel, _ := filepath.Rel(absRoot, path)
-			if strings.Count(rel, string(os.PathSeparator)) >= 2 {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		rel, _ := filepath.Rel(absRoot, path)
-		if entry.IsDir() || !agentFileCandidate(rel) {
-			return nil
-		}
-		if err := ensureAgentPathWithinRoot(realRoot, path); err != nil {
-			return nil
-		}
-		paths = append(paths, path)
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	sort.Strings(paths)
-	if len(paths) > 28 {
-		paths = paths[:28]
-	}
-	files := make([]models.AgentProjectFile, 0, len(paths))
+	files := make([]models.AgentProjectFile, 0, min(len(paths), maxAgentProjectFiles))
+	opened := make([]fs.FileInfo, 0, maxAgentProjectFiles)
+	var totalReadBytes int64
+	var totalOutputBytes int64
 	for _, path := range paths {
-		raw, err := os.ReadFile(path)
+		if err := contextReadError(ctx); err != nil {
+			return nil, safeAgentProjectReadError(err)
+		}
+		if err := verifiedRoot.verifyCurrent(); err != nil {
+			return nil, safeAgentProjectReadError(err)
+		}
+		if len(files) >= maxAgentProjectFiles {
+			break
+		}
+		readRemaining := maxAgentProjectAggregateBytes - totalReadBytes
+		outputRemaining := maxAgentProjectAggregateBytes - totalOutputBytes
+		if readRemaining <= 0 || outputRemaining <= int64(len(agentFileTruncationMarker)) {
+			break
+		}
+		readLimit := min(maxAgentProjectFileBytes, readRemaining, outputRemaining)
+		result, rel, err := readBoundedRegularProjectFileFromRootOnce(verifiedRoot, path, readLimit, true, &opened)
+		totalReadBytes += result.ReadBytes
 		if err != nil {
+			if rootErr := verifiedRoot.verifyCurrent(); rootErr != nil {
+				return nil, safeAgentProjectReadError(rootErr)
+			}
 			continue
 		}
-		if len(raw) > 64*1024 {
-			raw = append(raw[:64*1024], []byte("\n... file truncated ...")...)
+		pathBytes := int64(len(rel))
+		if outputRemaining-pathBytes <= int64(len(agentFileTruncationMarker)) {
+			continue
 		}
-		rel, _ := filepath.Rel(absRoot, path)
-		files = append(files, models.AgentProjectFile{Path: filepath.ToSlash(rel), Content: redactText(string(raw))})
+		previewLimit := min(maxAgentProjectFileBytes, outputRemaining-pathBytes)
+		content := redactAgentProjectContent(rel, string(result.Content))
+		if result.Truncated {
+			contentLimit := int(previewLimit) - len(agentFileTruncationMarker)
+			if len(content) > contentLimit {
+				content = truncateUTF8Bytes(content, contentLimit)
+			}
+			content += agentFileTruncationMarker
+		}
+		if int64(len(content)) > previewLimit {
+			content = truncateUTF8Bytes(content, int(previewLimit)-len(agentFileTruncationMarker)) + agentFileTruncationMarker
+		}
+		totalOutputBytes += pathBytes + int64(len(content))
+		files = append(files, models.AgentProjectFile{Path: rel, Content: content})
+	}
+	if err := contextReadError(ctx); err != nil {
+		return nil, safeAgentProjectReadError(err)
+	}
+	if err := verifiedRoot.verifyCurrent(); err != nil {
+		return nil, safeAgentProjectReadError(err)
 	}
 	return files, nil
+}
+
+type agentWalkDirectory struct {
+	path     string
+	depth    int
+	expected fs.FileInfo
+}
+
+type agentPathCandidate struct {
+	path string
+	key  string
+}
+
+var agentPriorityRelativePaths = []string{
+	".env", ".env.local", ".env.development", ".env.production", ".env.test",
+	"compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml",
+	"Dockerfile", "Dockerfile.dev", "Dockerfile.prod", ".dockerignore",
+	"package.json", "package-lock.json", "pnpm-lock.yaml", "yarn.lock",
+	"go.mod", "go.sum", "requirements.txt", "pyproject.toml", "poetry.lock", "Pipfile",
+	"composer.json", "composer.lock", "Cargo.toml", "Makefile", "tsconfig.json", "appsettings.json",
+	"config/appsettings.json", "config/nginx.conf", "config/apache.conf",
+	"docker/compose.yaml", "docker/compose.yml", "deploy/compose.yaml", "deploy/compose.yml", "infra/compose.yaml", "infra/compose.yml",
+}
+
+func boundedAgentProjectCandidatesContext(ctx context.Context, root verifiedProjectRoot) ([]string, error) {
+	paths, _, err := boundedAgentProjectCandidatesWithLimitContext(ctx, root, maxAgentProjectVisitedEntries)
+	return paths, err
+}
+
+func boundedAgentProjectCandidatesWithLimit(realRoot string, visitedLimit int) ([]string, int, error) {
+	root, err := verifyProjectReadRoot(realRoot)
+	if err != nil {
+		return nil, 0, err
+	}
+	return boundedAgentProjectCandidatesWithLimitContext(context.Background(), root, visitedLimit)
+}
+
+func boundedAgentProjectCandidatesWithLimitContext(ctx context.Context, root verifiedProjectRoot, visitedLimit int) ([]string, int, error) {
+	if visitedLimit <= 0 {
+		return []string{}, 0, nil
+	}
+	visitedLimit = min(visitedLimit, maxAgentProjectVisitedEntries)
+	directories := make([]agentWalkDirectory, 1, visitedLimit)
+	directories[0] = agentWalkDirectory{path: root.realPath, expected: root.info}
+	priorityCandidates := make([]agentPathCandidate, 0, len(agentPriorityRelativePaths))
+	priorityKeys := make(map[string]struct{}, len(agentPriorityRelativePaths))
+	for _, relPath := range agentPriorityRelativePaths {
+		if err := contextReadError(ctx); err != nil {
+			return nil, 0, err
+		}
+		path := filepath.Join(root.realPath, filepath.FromSlash(relPath))
+		if info, err := os.Lstat(path); err == nil && info.Mode().IsRegular() {
+			key := projectPathIdentity(path)
+			if _, duplicate := priorityKeys[key]; !duplicate {
+				priorityKeys[key] = struct{}{}
+				priorityCandidates = append(priorityCandidates, agentPathCandidate{path: path, key: key})
+			}
+		}
+	}
+	ordinaryLimit := maxAgentProjectCandidates - len(priorityCandidates)
+	candidates := make([]agentPathCandidate, 0, max(ordinaryLimit, 0))
+	visited := 0
+	for directoryIndex := 0; directoryIndex < len(directories) && visited < visitedLimit; directoryIndex++ {
+		if err := contextReadError(ctx); err != nil {
+			return nil, visited, err
+		}
+		directory := directories[directoryIndex]
+		handle, err := openVerifiedAgentDirectory(root, directory)
+		if err != nil {
+			if directoryIndex == 0 {
+				return nil, visited, err
+			}
+			continue
+		}
+		localCandidates := make([]string, 0, min(128, visitedLimit-visited))
+		localDirectories := make([]agentWalkDirectory, 0, min(128, visitedLimit-visited))
+		complete := false
+		for {
+			if err := contextReadError(ctx); err != nil {
+				_ = handle.Close()
+				return nil, visited, err
+			}
+			remaining := visitedLimit - visited
+			if remaining <= 0 {
+				entries, readErr := handle.ReadDir(1)
+				complete = len(entries) == 0 && errors.Is(readErr, io.EOF)
+				break
+			}
+			chunkSize := min(128, remaining)
+			entries, readErr := handle.ReadDir(chunkSize)
+			if len(entries) == 0 && readErr == nil {
+				break
+			}
+			for _, entry := range entries {
+				visited++
+				path := filepath.Join(directory.path, entry.Name())
+				if entry.Type()&os.ModeSymlink != 0 {
+					continue
+				}
+				info, infoErr := entry.Info()
+				if infoErr != nil {
+					continue
+				}
+				if info.IsDir() {
+					if directory.depth < 2 && !agentSkippedDirectory(entry.Name()) && pinFileIdentity(info) == nil {
+						localDirectories = append(localDirectories, agentWalkDirectory{path: path, depth: directory.depth + 1, expected: info})
+					}
+					continue
+				}
+				rel, relErr := filepath.Rel(root.realPath, path)
+				if relErr == nil && agentFileCandidate(rel) {
+					localCandidates = append(localCandidates, path)
+				}
+			}
+			if errors.Is(readErr, io.EOF) {
+				complete = true
+				break
+			}
+			if readErr != nil {
+				break
+			}
+		}
+		_ = handle.Close()
+		if !complete {
+			continue
+		}
+		for _, path := range localCandidates {
+			if _, priority := priorityKeys[projectPathIdentity(path)]; !priority {
+				candidates = retainAgentPathCandidateWithLimit(candidates, path, ordinaryLimit)
+			}
+		}
+		if len(directories) < visitedLimit {
+			sort.Slice(localDirectories, func(i int, j int) bool {
+				return projectPathIdentity(localDirectories[i].path) < projectPathIdentity(localDirectories[j].path)
+			})
+			remaining := visitedLimit - len(directories)
+			if len(localDirectories) > remaining {
+				localDirectories = localDirectories[:remaining]
+			}
+			directories = append(directories, localDirectories...)
+			sort.Slice(directories[directoryIndex+1:], func(i int, j int) bool {
+				left := directories[directoryIndex+1+i]
+				right := directories[directoryIndex+1+j]
+				return projectPathIdentity(left.path) < projectPathIdentity(right.path)
+			})
+		}
+	}
+	sort.Slice(candidates, func(i int, j int) bool { return candidates[i].key < candidates[j].key })
+	paths := make([]string, 0, len(priorityCandidates)+len(candidates))
+	for _, candidate := range priorityCandidates {
+		paths = append(paths, candidate.path)
+	}
+	for _, candidate := range candidates {
+		paths = append(paths, candidate.path)
+	}
+	return paths, visited, nil
+}
+
+func openVerifiedAgentDirectory(root verifiedProjectRoot, directory agentWalkDirectory) (*os.File, error) {
+	if err := root.verifyCurrent(); err != nil {
+		return nil, err
+	}
+	before, err := os.Lstat(directory.path)
+	if err != nil {
+		return nil, err
+	}
+	if !before.IsDir() || directory.expected == nil || !os.SameFile(before, directory.expected) {
+		return nil, errBoundedFileChanged
+	}
+	handle, err := os.Open(directory.path)
+	if err != nil {
+		return nil, err
+	}
+	opened, err := handle.Stat()
+	if err != nil || !opened.IsDir() || !os.SameFile(before, opened) {
+		_ = handle.Close()
+		return nil, errBoundedFileChanged
+	}
+	realPath, err := filepath.EvalSymlinks(directory.path)
+	if err != nil || !pathWithinRoot(root.realPath, realPath) {
+		_ = handle.Close()
+		return nil, fs.ErrPermission
+	}
+	current, err := os.Stat(realPath)
+	if err != nil || !current.IsDir() || !os.SameFile(opened, current) {
+		_ = handle.Close()
+		return nil, errBoundedFileChanged
+	}
+	return handle, nil
+}
+
+func safeAgentProjectReadError(err error) error {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return apperror.New(apperror.Cancelled, "Project file reading was cancelled")
+	case errors.Is(err, context.DeadlineExceeded):
+		return apperror.New(apperror.Timeout, "Project file reading timed out")
+	default:
+		return apperror.New(apperror.Conflict, "Project files could not be read safely")
+	}
+}
+
+func retainAgentPathCandidate(candidates []agentPathCandidate, path string) []agentPathCandidate {
+	return retainAgentPathCandidateWithLimit(candidates, path, maxAgentProjectCandidates)
+}
+
+func retainAgentPathCandidateWithLimit(candidates []agentPathCandidate, path string, limit int) []agentPathCandidate {
+	if limit <= 0 {
+		return candidates
+	}
+	key := projectPathIdentity(path)
+	position := sort.Search(len(candidates), func(i int) bool { return candidates[i].key >= key })
+	if position < len(candidates) && candidates[position].key == key {
+		return candidates
+	}
+	if len(candidates) < limit {
+		candidates = append(candidates, agentPathCandidate{})
+		copy(candidates[position+1:], candidates[position:])
+		candidates[position] = agentPathCandidate{path: path, key: key}
+		return candidates
+	}
+	if position >= len(candidates) {
+		return candidates
+	}
+	copy(candidates[position+1:], candidates[position:len(candidates)-1])
+	candidates[position] = agentPathCandidate{path: path, key: key}
+	return candidates
+}
+
+func agentSkippedDirectory(name string) bool {
+	switch name {
+	case ".git", "node_modules", "vendor", ".venv", "dist", "build":
+		return true
+	default:
+		return false
+	}
 }
 
 func agentFileCandidate(rel string) bool {
@@ -1694,25 +2391,25 @@ func resolveAgentProjectPath(root string, relPath string) (string, string, error
 	}
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
-		return "", "", err
+		return "", "", safeAgentPathResolutionError(err)
 	}
 	absPath, err := filepath.Abs(filepath.Join(absRoot, rel))
 	if err != nil {
-		return "", "", err
+		return "", "", safeAgentPathResolutionError(err)
 	}
 	back, err := filepath.Rel(absRoot, absPath)
 	if err != nil {
-		return "", "", err
+		return "", "", safeAgentPathResolutionError(err)
 	}
 	if back == ".." || strings.HasPrefix(back, ".."+string(os.PathSeparator)) {
 		return "", "", apperror.New(apperror.Conflict, "File path must stay inside the project")
 	}
 	realRoot, err := filepath.EvalSymlinks(absRoot)
 	if err != nil {
-		return "", "", err
+		return "", "", safeAgentPathResolutionError(err)
 	}
 	if err := ensureAgentPathWithinRoot(realRoot, absPath); err != nil {
-		return "", "", err
+		return "", "", safeAgentPathResolutionError(err)
 	}
 	return filepath.ToSlash(back), absPath, nil
 }
@@ -1761,6 +2458,31 @@ func requireAgentPathWithinRoot(realRoot string, target string) error {
 	return nil
 }
 
+func safeAgentFilesystemError(err error, message string) error {
+	return safeAgentFilesystemErrorWithCode(err, apperror.Internal, message)
+}
+
+func safeAgentPathResolutionError(err error) error {
+	return safeAgentFilesystemErrorWithCode(err, apperror.Conflict, "Agent file path could not be resolved safely")
+}
+
+func safeAgentFilesystemErrorWithCode(err error, fallback apperror.Code, message string) error {
+	if err == nil {
+		return nil
+	}
+	if _, ok := apperror.CodeOf(err); ok {
+		return err
+	}
+	switch {
+	case errors.Is(err, context.Canceled):
+		return apperror.New(apperror.Cancelled, message)
+	case errors.Is(err, context.DeadlineExceeded):
+		return apperror.New(apperror.Timeout, message)
+	default:
+		return apperror.New(fallback, message)
+	}
+}
+
 func pathBase(value string) string {
 	if idx := strings.LastIndex(value, "/"); idx >= 0 {
 		return value[idx+1:]
@@ -1788,9 +2510,9 @@ func analyzeAgentProject(projectID string, name string, workingDir string, files
 			runtimeSet["Composer install"] = struct{}{}
 			if strings.Contains(strings.ToLower(content), "laravel/framework") {
 				stackSet["Laravel"] = struct{}{}
-				analysis.Recommendations = append(analysis.Recommendations, "This looks like a Laravel/PHP app; it may need PHP-FPM, Nginx, Composer install, APP_KEY, and DB_* env vars. Would you like me to draft Compose and .env settings for it?")
+				analysis.Recommendations = append(analysis.Recommendations, "This looks like a Laravel/PHP app; it may need PHP-FPM, Nginx, Composer install, APP_KEY, and DB_* env vars. I can suggest Compose and .env settings for you to apply manually.")
 			} else {
-				analysis.Recommendations = append(analysis.Recommendations, "This looks like a PHP app; it may need PHP-FPM or Apache/Nginx plus Composer dependencies. Would you like me to draft container settings?")
+				analysis.Recommendations = append(analysis.Recommendations, "This looks like a PHP app; it may need PHP-FPM or Apache/Nginx plus Composer dependencies. I can suggest container settings for you to apply manually.")
 			}
 		case strings.HasSuffix(lower, "package.json"):
 			stackSet["Node.js"] = struct{}{}
@@ -1801,15 +2523,15 @@ func analyzeAgentProject(projectID string, name string, workingDir string, files
 			if strings.Contains(content, "\"dev\"") {
 				runtimeSet["hot reload/dev server"] = struct{}{}
 			}
-			analysis.Recommendations = append(analysis.Recommendations, "This looks like a Node.js app; check package scripts, exposed dev ports, bind mounts, and NODE_ENV. Would you like me to draft a development Compose setup?")
+			analysis.Recommendations = append(analysis.Recommendations, "This looks like a Node.js app; check package scripts, exposed dev ports, bind mounts, and NODE_ENV. I can suggest a development Compose setup for you to apply manually.")
 		case strings.HasSuffix(lower, "go.mod") || strings.HasSuffix(lower, "main.go"):
 			stackSet["Go"] = struct{}{}
 			runtimeSet["go build"] = struct{}{}
-			analysis.Recommendations = append(analysis.Recommendations, "This is a Go app; it likely needs a build stage and a small runtime container. Would you like me to draft a multi-stage Dockerfile or Compose service?")
+			analysis.Recommendations = append(analysis.Recommendations, "This is a Go app; it likely needs a build stage and a small runtime container. I can suggest a multi-stage Dockerfile or Compose service for you to apply manually.")
 		case strings.HasSuffix(lower, "requirements.txt") || strings.HasSuffix(lower, "pyproject.toml") || strings.HasSuffix(lower, "pipfile"):
 			stackSet["Python"] = struct{}{}
 			runtimeSet["pip install"] = struct{}{}
-			analysis.Recommendations = append(analysis.Recommendations, "This looks like a Python app; check package install, app server command, and expected env vars. Would you like me to draft Compose settings?")
+			analysis.Recommendations = append(analysis.Recommendations, "This looks like a Python app; check package install, app server command, and expected env vars. I can suggest Compose settings for you to apply manually.")
 		case strings.Contains(lower, "nginx"):
 			stackSet["Nginx"] = struct{}{}
 		case strings.Contains(lower, "dockerfile"):
@@ -1848,7 +2570,7 @@ func analyzeAgentProject(projectID string, name string, workingDir string, files
 	analysis.Recommendations = uniqueStringsPreserveOrder(analysis.Recommendations)
 	analysis.Warnings = uniqueStringsPreserveOrder(analysis.Warnings)
 	if len(analysis.EnvVars) > 0 {
-		analysis.Recommendations = append(analysis.Recommendations, "Your app expects environment variables such as "+joinFirstEnvNames(analysis.EnvVars, 6)+". Would you like me to draft or update a .env file with placeholders?")
+		analysis.Recommendations = append(analysis.Recommendations, "Your app expects environment variables such as "+joinFirstEnvNames(analysis.EnvVars, 6)+". I can suggest a .env example with placeholders for you to apply manually.")
 	}
 	if len(analysis.Ports) > 0 {
 		analysis.Recommendations = append(analysis.Recommendations, "Detected app ports "+joinFirstPortValues(analysis.Ports, 5)+". If the app is not reachable, check Compose port mappings and the process bind address.")
@@ -1957,29 +2679,43 @@ func normalizeAgentFileContent(value string) string {
 	return value
 }
 
-func readAgentDraftCurrent(absPath string) (string, error) {
-	info, err := os.Stat(absPath)
+func readAgentDraftCurrentInProject(root string, absPath string) (string, error) {
+	result, relPath, err := readBoundedRegularProjectFile(root, absPath, maxAgentFileEditBytes, false)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return "", nil
 		}
-		return "", err
+		return "", agentDraftFileReadError(err)
 	}
-	if info.IsDir() {
-		return "", apperror.New(apperror.Conflict, "Draft target is a directory")
-	}
-	if info.Size() > maxAgentFileEditBytes {
-		return "", apperror.New(
+	return redactAgentProjectContent(relPath, string(result.Content)), nil
+}
+
+func agentDraftFileReadError(err error) error {
+	if errors.Is(err, errBoundedFileTooLarge) {
+		return apperror.New(
 			apperror.Conflict,
 			"File is too large to draft",
 			apperror.WithDetail("Agent file drafts are limited to 256 KiB."),
 		)
 	}
-	raw, err := os.ReadFile(absPath)
-	if err != nil {
-		return "", err
+	if errors.Is(err, errBoundedFileNotRegular) || errors.Is(err, errBoundedFileChanged) || errors.Is(err, fs.ErrPermission) {
+		return apperror.New(apperror.Conflict, "Draft target must be a regular file inside the project")
 	}
-	return redactText(string(raw)), nil
+	return apperror.New(apperror.Conflict, "Draft target could not be read safely")
+}
+
+func agentEditableFileReadError(err error) error {
+	if errors.Is(err, errBoundedFileTooLarge) {
+		return apperror.New(
+			apperror.Conflict,
+			"Existing file is too large to edit",
+			apperror.WithDetail("Agent file edits are limited to 256 KiB."),
+		)
+	}
+	if errors.Is(err, errBoundedFileNotRegular) || errors.Is(err, errBoundedFileChanged) || errors.Is(err, fs.ErrPermission) {
+		return apperror.New(apperror.Conflict, "File edit target must be a regular file inside the project")
+	}
+	return apperror.New(apperror.Conflict, "File edit target could not be read safely")
 }
 
 func agentFileEditPermission(plan security.AgentFileEditPlan) (fs.FileMode, error) {
@@ -2240,11 +2976,62 @@ func agentFileEditFailedAuditError(actionErr error, auditErr error) error {
 }
 
 func marshalAgentData(value any) string {
-	raw, err := json.MarshalIndent(value, "", "  ")
-	if err != nil {
-		return redactText(fmt.Sprint(value))
+	if !agentJSONWithinMarshalBudget(value, maxAgentToolDataBytes) {
+		return agentToolDataTruncationJSON
 	}
-	return redactText(string(raw))
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return agentToolDataEncodingJSON
+	}
+	if len(raw) > maxAgentToolDataBytes {
+		return agentToolDataTruncationJSON
+	}
+	output := redactText(string(raw))
+	if len(output) > maxAgentToolDataBytes {
+		return agentToolDataTruncationJSON
+	}
+	return output
+}
+
+func sanitizeAgentToolResult(result models.AgentToolResult) models.AgentToolResult {
+	result.ToolID = sanitizeAgentToolText(result.ToolID, maxAgentToolIDBytes)
+	result.Title = sanitizeAgentToolText(result.Title, maxAgentToolTitleBytes)
+	result.Summary = sanitizeAgentToolText(result.Summary, maxAgentToolSummaryBytes)
+	result.Error = sanitizeAgentToolText(result.Error, maxAgentToolErrorBytes)
+	if len(result.Data) > maxAgentToolDataBytes {
+		result.Data = agentToolDataTruncationJSON
+	} else {
+		result.Data = redactText(result.Data)
+		if len(result.Data) > maxAgentToolDataBytes {
+			result.Data = agentToolDataTruncationJSON
+		}
+	}
+	return result
+}
+
+func sanitizeAgentToolText(value string, limit int) string {
+	if limit <= 0 || len(value) > limit {
+		return agentToolTextTruncationMarker
+	}
+	value = redactText(value)
+	if len(value) > limit {
+		return agentToolTextTruncationMarker
+	}
+	return value
+}
+
+func truncateUTF8Bytes(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(value) <= limit {
+		return value
+	}
+	value = value[:limit]
+	for !utf8.ValidString(value) {
+		value = value[:len(value)-1]
+	}
+	return value
 }
 
 func agentToolSpecByID(toolID string) (models.AgentToolSpec, bool) {
@@ -2257,6 +3044,16 @@ func agentToolSpecByID(toolID string) (models.AgentToolSpec, bool) {
 }
 
 func decodeAgentToolArgs(raw string) (map[string]any, error) {
+	if len(raw) > maxAgentToolArgumentsBytes {
+		return nil, apperror.New(
+			apperror.Conflict,
+			"Agent tool arguments exceed the safe size limit",
+			apperror.WithDetail(fmt.Sprintf("Tool arguments are limited to %d UTF-8 bytes.", maxAgentToolArgumentsBytes)),
+		)
+	}
+	if !utf8.ValidString(raw) {
+		return nil, apperror.New(apperror.Conflict, "Agent tool arguments must be valid UTF-8 JSON")
+	}
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return map[string]any{}, nil
@@ -2266,6 +3063,13 @@ func decodeAgentToolArgs(raw string) (map[string]any, error) {
 	decoder.UseNumber()
 	if err := decoder.Decode(&args); err != nil {
 		return nil, apperror.Wrap(apperror.Conflict, "Agent tool arguments must be a JSON object", err)
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		if err == nil {
+			return nil, apperror.New(apperror.Conflict, "Agent tool arguments must contain exactly one JSON object")
+		}
+		return nil, apperror.Wrap(apperror.Conflict, "Agent tool arguments contain invalid trailing data", err)
 	}
 	if args == nil {
 		return map[string]any{}, nil
@@ -2411,16 +3215,23 @@ func agentRunImageRequest(raw string) (models.RunImageRequest, error) {
 }
 
 var (
-	secretKeyPattern   = regexp.MustCompile(`(?i)(password|passwd|secret|token|apikey|api_key|auth|credential|private[_-]?key)`)
-	secretLinePattern  = regexp.MustCompile(`(?i)^(\s*[-\w.]+\s*[:=]\s*)("?)`)
-	inlineSecretRegexp = regexp.MustCompile(`(?i)(password|passwd|secret|token|apikey|api_key|auth|credential|private[_-]?key)(["'\s:=]+)([^"',\s}]+)`)
-	envKeyRegexp       = regexp.MustCompile(`^[A-Z_][A-Z0-9_]{1,80}$`)
-	envUseRegexp       = regexp.MustCompile(`process\.env\.([A-Z_][A-Z0-9_]+)|os\.Getenv\(["']([A-Z_][A-Z0-9_]+)["']\)|getenv\(["']([A-Z_][A-Z0-9_]+)["']\)|env\(["']([A-Z_][A-Z0-9_]+)["']\)|\$\{([A-Z_][A-Z0-9_]+)(?::-[^}]*)?\}`)
-	portRegexp         = regexp.MustCompile(`(?i)(?:listen|expose|port|target|published|containerPort)\s*[:=]?\s*["']?([1-9][0-9]{1,4})`)
-	composePortRegexp  = regexp.MustCompile(`["']?([1-9][0-9]{1,4})(?::([1-9][0-9]{1,4}))/(?:tcp|udp)["']?|["']?([1-9][0-9]{1,4}):([1-9][0-9]{1,4})["']?`)
+	secretKeyPattern          = regexp.MustCompile(`(?i)(password|passwd|secret|token|apikey|api_key|auth|credential|private[_-]?key|(^|[^A-Za-z0-9])(pass|pwd)($|[^A-Za-z0-9]))`)
+	secretLinePattern         = regexp.MustCompile(`(?i)^(\s*[-\w.]+\s*[:=]\s*)("?)`)
+	inlineSecretRegexp        = regexp.MustCompile(`(?i)(^|[^A-Za-z0-9])(password|passwd|secret|token|apikey|api_key|auth|credential|private[_-]?key|pass|pwd)(["'\s:=]+)(?:"[^"\r\n]*"|'[^'\r\n]*'|[^,}\r\n]+)`)
+	agentPrivateKeyPattern    = regexp.MustCompile(`(?is)-----BEGIN [^\r\n-]*PRIVATE KEY-----.*?(?:-----END [^\r\n-]*PRIVATE KEY-----|$)`)
+	agentURLSecretPattern     = regexp.MustCompile(`(?i)([a-z][a-z0-9+.-]*://[^/\s:@]+:)[^@\s/]+@`)
+	agentAuthorizationPattern = regexp.MustCompile(`(?i)(\b(?:bearer|basic)\s+)[A-Za-z0-9._~+/=-]+`)
+	agentKnownTokenPattern    = regexp.MustCompile(`(?i)\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16})\b`)
+	agentJWTTokenPattern      = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`)
+	agentOpaqueTokenPattern   = regexp.MustCompile(`[A-Za-z0-9_+/=-]{40,}`)
+	envKeyRegexp              = regexp.MustCompile(`^[A-Z_][A-Z0-9_]{1,80}$`)
+	envUseRegexp              = regexp.MustCompile(`process\.env\.([A-Z_][A-Z0-9_]+)|os\.Getenv\(["']([A-Z_][A-Z0-9_]+)["']\)|getenv\(["']([A-Z_][A-Z0-9_]+)["']\)|env\(["']([A-Z_][A-Z0-9_]+)["']\)|\$\{([A-Z_][A-Z0-9_]+)(?::-[^}]*)?\}`)
+	portRegexp                = regexp.MustCompile(`(?i)(?:listen|expose|port|target|published|containerPort)\s*[:=]?\s*["']?([1-9][0-9]{1,4})`)
+	composePortRegexp         = regexp.MustCompile(`["']?([1-9][0-9]{1,4})(?::([1-9][0-9]{1,4}))/(?:tcp|udp)["']?|["']?([1-9][0-9]{1,4}):([1-9][0-9]{1,4})["']?`)
 )
 
 func redactText(value string) string {
+	value = agentPrivateKeyPattern.ReplaceAllString(value, "[REDACTED PRIVATE KEY]")
 	lines := strings.Split(value, "\n")
 	for i, line := range lines {
 		if secretKeyPattern.MatchString(line) {
@@ -2428,10 +3239,64 @@ func redactText(value string) string {
 				lines[i] = line[:match[3]] + "[REDACTED]"
 				continue
 			}
-			lines[i] = inlineSecretRegexp.ReplaceAllString(line, "$1$2[REDACTED]")
+			lines[i] = inlineSecretRegexp.ReplaceAllString(line, "$1$2$3[REDACTED]")
 		}
 	}
-	return strings.Join(lines, "\n")
+	value = strings.Join(lines, "\n")
+	value = agentURLSecretPattern.ReplaceAllString(value, "$1[REDACTED]@")
+	value = agentAuthorizationPattern.ReplaceAllString(value, "$1[REDACTED]")
+	value = agentKnownTokenPattern.ReplaceAllString(value, "[REDACTED]")
+	value = agentJWTTokenPattern.ReplaceAllString(value, "[REDACTED]")
+	return agentOpaqueTokenPattern.ReplaceAllString(value, "[REDACTED]")
+}
+
+func redactAgentProjectContent(relPath string, value string) string {
+	lowerPath := strings.ToLower(filepath.ToSlash(strings.TrimSpace(relPath)))
+	base := pathBase(lowerPath)
+	if base == ".env" || strings.HasPrefix(base, ".env.") {
+		return boundedAgentProjectPreview(envStructurePreview(value))
+	}
+	if base == "dockerfile" || strings.HasPrefix(base, "dockerfile.") || strings.HasSuffix(base, ".dockerfile") {
+		return dockerfileStructurePreview(value)
+	}
+	switch filepath.Ext(base) {
+	case ".yaml", ".yml", ".json":
+		return boundedAgentProjectPreview(composeStructurePreview(value))
+	default:
+		return agentProjectValuesHidden
+	}
+}
+
+func boundedAgentProjectPreview(value string) string {
+	if len(value) > int(maxAgentProjectFileBytes) {
+		return agentProjectValuesHidden
+	}
+	return value
+}
+
+func dockerfileStructurePreview(value string) string {
+	allowed := stringSet(
+		"ADD", "ARG", "CMD", "COPY", "ENTRYPOINT", "ENV", "EXPOSE", "FROM", "HEALTHCHECK",
+		"LABEL", "MAINTAINER", "ONBUILD", "RUN", "SHELL", "STOPSIGNAL", "USER", "VOLUME", "WORKDIR",
+	)
+	var preview strings.Builder
+	preview.WriteString("# Dockerfile values hidden by Cairn Agent context.\n")
+	for _, line := range strings.Split(value, "\n") {
+		line = strings.TrimSpace(strings.TrimPrefix(line, "\ufeff"))
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		directive := strings.ToUpper(strings.Fields(line)[0])
+		if _, ok := allowed[directive]; !ok {
+			continue
+		}
+		entry := directive + " [REDACTED]\n"
+		if preview.Len()+len(entry) > int(maxAgentProjectFileBytes) {
+			return agentProjectValuesHidden
+		}
+		preview.WriteString(entry)
+	}
+	return preview.String()
 }
 
 func uniqueStringsPreserveOrder(values []string) []string {

@@ -304,7 +304,7 @@ export function AgentPage({ projects }: AgentPageProps) {
       setStatus(nextStatus);
       setToolCatalog(nextTools ?? []);
       setProvider(nextStatus?.provider || "ollama");
-      const nextEndpoint = nextStatus?.endpoint || defaultEndpoint;
+      const nextEndpoint = nextStatus ? nextStatus.endpoint : defaultEndpoint;
       endpointCommittedRef.current = nextEndpoint;
       setEndpoint(nextEndpoint);
       setModel(nextStatus?.model || "");
@@ -325,7 +325,7 @@ export function AgentPage({ projects }: AgentPageProps) {
         setStatus(nextStatus);
         setToolCatalog(nextTools ?? []);
         setProvider(nextStatus?.provider || "ollama");
-        const nextEndpoint = nextStatus?.endpoint || defaultEndpoint;
+        const nextEndpoint = nextStatus ? nextStatus.endpoint : defaultEndpoint;
         endpointCommittedRef.current = nextEndpoint;
         setEndpoint(nextEndpoint);
         setModel(nextStatus?.model || "");
@@ -841,11 +841,13 @@ export function AgentPage({ projects }: AgentPageProps) {
             />
             <label className="block min-w-0">
               <span className="text-xs font-medium uppercase text-text-muted">
-                Endpoint
+                Endpoint (loopback only)
               </span>
               <input
+                aria-describedby="agent-endpoint-policy"
                 className="mt-1 h-10 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none focus:border-accent"
                 disabled={settingsSavePendingCount > 0}
+                maxLength={2048}
                 onBlur={saveEndpoint}
                 onChange={(event) => setEndpoint(event.target.value)}
                 onKeyDown={(event) => {
@@ -856,6 +858,13 @@ export function AgentPage({ projects }: AgentPageProps) {
                 }}
                 value={endpoint}
               />
+              <span
+                className="mt-1 block text-xs text-text-muted"
+                id="agent-endpoint-policy"
+              >
+                Use a literal 127.x.x.x or [::1] HTTP(S) address with an
+                explicit port. DNS names and redirects are blocked.
+              </span>
             </label>
             <AgentSelect
               disabled={
@@ -976,6 +985,7 @@ export function AgentPage({ projects }: AgentPageProps) {
                 <textarea
                   className="min-h-16 flex-1 resize-none rounded-control border border-border bg-bg-inset px-3 py-2 text-sm text-text-primary outline-none focus:border-accent"
                   id="agent-prompt"
+                  maxLength={65536}
                   onChange={(event) => setPrompt(event.target.value)}
                   onKeyDown={(event) => {
                     if (event.key === "Enter" && !event.shiftKey) {
@@ -1126,10 +1136,6 @@ function ProjectConfigPanel({
   const recommendations = analysis?.recommendations ?? [];
   const envVars = analysis?.envVars ?? [];
   const ports = analysis?.ports ?? [];
-  const canDraft =
-    Boolean(editPath.trim() && editInstruction.trim()) && !editBusy;
-  const canPreview =
-    Boolean(editPath.trim() && editContent.trim()) && !editBusy;
   return (
     <div className="rounded-card border border-border bg-bg-inset p-3">
       <div className="flex flex-wrap items-center justify-between gap-3">
@@ -1199,6 +1205,11 @@ function ProjectConfigPanel({
         </div>
       ) : null}
 
+      <div className="mt-3 rounded-card border border-info/25 bg-info/10 px-3 py-2 text-sm text-info">
+        Draft, preview, and apply are temporarily unavailable. Edit project
+        files manually.
+      </div>
+
       <div className="mt-3 grid gap-3 lg:grid-cols-[220px_minmax(0,1fr)]">
         <label className="block">
           <span className="text-xs font-medium uppercase text-text-muted">
@@ -1206,7 +1217,7 @@ function ProjectConfigPanel({
           </span>
           <input
             className="mt-1 h-9 w-full rounded-control border border-border bg-bg-card px-3 text-sm text-text-primary outline-none focus:border-accent"
-            disabled={editBusy}
+            disabled
             onChange={(event) => onSetPath(event.target.value)}
             placeholder=".env"
             value={editPath}
@@ -1218,7 +1229,7 @@ function ProjectConfigPanel({
           </span>
           <input
             className="mt-1 h-9 w-full rounded-control border border-border bg-bg-card px-3 text-sm text-text-primary outline-none focus:border-accent"
-            disabled={editBusy}
+            disabled
             onChange={(event) => onSetInstruction(event.target.value)}
             placeholder="Draft Compose env settings with safe placeholders"
             value={editInstruction}
@@ -1228,7 +1239,7 @@ function ProjectConfigPanel({
 
       <textarea
         className="mt-3 min-h-36 w-full resize-y rounded-control border border-border bg-bg-card px-3 py-2 font-mono text-xs text-text-primary outline-none focus:border-accent"
-        disabled={editBusy}
+        disabled
         onChange={(event) => onSetContent(event.target.value)}
         placeholder="Drafted or manually edited file content appears here."
         value={editContent}
@@ -1254,7 +1265,7 @@ function ProjectConfigPanel({
 
       <div className="mt-3 flex flex-wrap justify-end gap-2">
         <Button
-          disabled={!canDraft}
+          disabled
           loading={editBusy}
           onClick={onDraft}
           size="sm"
@@ -1263,7 +1274,7 @@ function ProjectConfigPanel({
           Draft
         </Button>
         <Button
-          disabled={!canPreview}
+          disabled
           loading={editBusy}
           onClick={onPreview}
           size="sm"
@@ -1272,7 +1283,7 @@ function ProjectConfigPanel({
           Preview edit
         </Button>
         <Button
-          disabled={!editPlan || editBusy}
+          disabled
           loading={editBusy}
           onClick={onApply}
           size="sm"

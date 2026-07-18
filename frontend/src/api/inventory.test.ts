@@ -43,7 +43,47 @@ describe("getInventorySnapshot", () => {
     const snapshot = await getInventorySnapshot();
 
     expect(snapshot.providers).toEqual([]);
-    expect(snapshot.degradedReason).toBe("provider table is locked");
+    expect(snapshot.failures).toEqual({
+      providers: "provider table is locked",
+    });
+    expect(snapshot.degradedReason).toBe("providers: provider table is locked");
+  });
+
+  it("reports every failed slice instead of hiding failures after the first", async () => {
+    vi.mocked(DockerService.ListContainers).mockRejectedValue(
+      new Error("container list timed out"),
+    );
+    vi.mocked(DockerService.ListVolumes).mockRejectedValue(
+      new Error("volume socket closed"),
+    );
+
+    const snapshot = await getInventorySnapshot();
+
+    expect(snapshot.failures).toEqual({
+      containers: "container list timed out",
+      volumes: "volume socket closed",
+    });
+    expect(snapshot.degradedReason).toBe(
+      "containers: container list timed out; volumes: volume socket closed",
+    );
+  });
+
+  it("normalizes blank rejection reasons to a useful failure message", async () => {
+    vi.mocked(DockerService.ListContainers).mockRejectedValue("");
+    vi.mocked(DockerService.ListImages).mockRejectedValue(new Error("   "));
+
+    const snapshot = await getInventorySnapshot();
+
+    expect(snapshot.failures).toMatchObject({
+      containers: "Docker is not reachable",
+      images: "Docker is not reachable",
+    });
+    expect(snapshot.degradedReason).toContain(
+      "containers: Docker is not reachable",
+    );
+    expect(snapshot.degradedReason).toContain(
+      "images: Docker is not reachable",
+    );
   });
 
   it("does not eagerly inspect every volume and network during snapshot load", async () => {

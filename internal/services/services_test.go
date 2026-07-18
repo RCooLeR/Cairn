@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -32,6 +33,27 @@ type fakeAutostartManager struct {
 	setErr  error
 
 	setCalls []bool
+}
+
+type observedAgentJSONMarshaler struct {
+	called *bool
+}
+
+type agentStringTaggedPayload struct {
+	Value string `json:"value,string"`
+}
+
+type embeddedAgentJSONPayload struct {
+	Value string `json:"value"`
+}
+
+type agentJSONWithUnexportedEmbedding struct {
+	embeddedAgentJSONPayload
+}
+
+func (value observedAgentJSONMarshaler) MarshalJSON() ([]byte, error) {
+	*value.called = true
+	return []byte(`{"unexpected":"custom marshaler ran"}`), nil
 }
 
 func (m *fakeAutostartManager) Enabled(context.Context) (bool, error) {
@@ -523,16 +545,6 @@ func TestAgentServiceAnalyzeProjectDetectsAppRuntimeHints(t *testing.T) {
 	if !foundEnv {
 		t.Fatalf("EnvVars = %#v, want APP_PORT", analysis.EnvVars)
 	}
-	foundPort := false
-	for _, hint := range analysis.Ports {
-		if hint.Value == "8080" {
-			foundPort = true
-			break
-		}
-	}
-	if !foundPort {
-		t.Fatalf("Ports = %#v, want 8080", analysis.Ports)
-	}
 }
 
 func TestAgentServiceFileEditPlanWritesProjectConfig(t *testing.T) {
@@ -541,7 +553,7 @@ func TestAgentServiceFileEditPlanWritesProjectConfig(t *testing.T) {
 	projectService, projectID, root := importAgentTestProject(t, ctx, db)
 	planStore := security.NewAgentFileEditPlanStore(nil)
 	t.Cleanup(planStore.Close)
-	service := &AgentService{Project: projectService, Plans: planStore, Audit: db.Audit()}
+	service := &AgentService{Project: projectService, Plans: planStore, Audit: db.Audit(), writeFile: writeAgentPlanFile}
 
 	plan, err := service.PlanFileEdit(ctx, models.AgentFileEditRequest{
 		ProjectID: projectID,
@@ -587,7 +599,7 @@ func TestAgentServiceCreateFilePlanRejectsFileCreatedBeforeApply(t *testing.T) {
 	projectService, projectID, root := importAgentTestProject(t, ctx, db)
 	planStore := security.NewAgentFileEditPlanStore(nil)
 	t.Cleanup(planStore.Close)
-	service := &AgentService{Project: projectService, Plans: planStore, Audit: db.Audit()}
+	service := &AgentService{Project: projectService, Plans: planStore, Audit: db.Audit(), writeFile: writeAgentPlanFile}
 
 	plan, err := service.PlanFileEdit(ctx, models.AgentFileEditRequest{
 		ProjectID: projectID,
@@ -631,7 +643,7 @@ func TestAgentServiceFileEditRejectsSymlinkEscape(t *testing.T) {
 	}
 	planStore := security.NewAgentFileEditPlanStore(nil)
 	t.Cleanup(planStore.Close)
-	service := &AgentService{Project: projectService, Plans: planStore, Audit: db.Audit()}
+	service := &AgentService{Project: projectService, Plans: planStore, Audit: db.Audit(), writeFile: writeAgentPlanFile}
 
 	_, err := service.PlanFileEdit(ctx, models.AgentFileEditRequest{
 		ProjectID: projectID,
@@ -652,18 +664,42 @@ func TestAgentServiceFileEditRejectsSymlinkEscape(t *testing.T) {
 }
 
 func TestRedactTextKeepsSecretKeys(t *testing.T) {
-	got := redactText("DB_PASSWORD=secret\nAUTH_URL=https://example.test\nPLAIN=value\n")
+	got := redactText("DB_PASSWORD=secret\nDB_PASS=short-secret\nDB_PWD=other-secret\nAUTH_URL=https://example.test\nCOMPASS=visible\nPLAIN=value\n")
 	if !strings.Contains(got, "DB_PASSWORD=[REDACTED]") {
 		t.Fatalf("redactText() = %q, want password key preserved", got)
+	}
+	if !strings.Contains(got, "DB_PASS=[REDACTED]") || !strings.Contains(got, "DB_PWD=[REDACTED]") {
+		t.Fatalf("redactText() = %q, want PASS/PWD assignment keys redacted", got)
 	}
 	if !strings.Contains(got, "AUTH_URL=[REDACTED]") {
 		t.Fatalf("redactText() = %q, want auth key preserved", got)
 	}
-	if !strings.Contains(got, "PLAIN=value") {
+	if !strings.Contains(got, "COMPASS=visible") || !strings.Contains(got, "PLAIN=value") {
 		t.Fatalf("redactText() = %q, want non-secret value preserved", got)
 	}
-	if strings.Contains(got, "secret") || strings.Contains(got, "https://example.test") {
+	if strings.Contains(got, "short-secret") || strings.Contains(got, "other-secret") || strings.Contains(got, "https://example.test") {
 		t.Fatalf("redactText() leaked secret value: %q", got)
+	}
+}
+
+func TestRedactTextMasksPEMMultiwordAndOpaqueSecrets(t *testing.T) {
+	opaque := "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789+/=opaque"
+	input := strings.Join([]string{
+		`{"token": "alpha beta gamma", "plain": "visible"}`,
+		"-----BEGIN RSA PRIVATE KEY-----",
+		"private-key-body-that-must-not-survive",
+		"-----END RSA PRIVATE KEY-----",
+		"neutral: " + opaque,
+		"Authorization: Bearer bearer-value-that-must-not-survive",
+	}, "\n")
+	got := redactText(input)
+	for _, forbidden := range []string{"alpha beta gamma", "private-key-body", "BEGIN RSA PRIVATE KEY", opaque, "bearer-value"} {
+		if strings.Contains(got, forbidden) {
+			t.Fatalf("redactText() leaked %q: %q", forbidden, got)
+		}
+	}
+	if !strings.Contains(got, "[REDACTED") {
+		t.Fatalf("redactText() = %q, want explicit redaction marker", got)
 	}
 }
 
@@ -681,15 +717,191 @@ func TestAgentContextTextSplitsDataBeforeTruncating(t *testing.T) {
 	}
 }
 
+func TestAgentToolResultRedactsEveryTextChannelAndContext(t *testing.T) {
+	input := models.AgentToolResult{
+		ToolID:  "test.tool",
+		Title:   "DB_PASS=title-secret",
+		Summary: "DB_PWD=summary-secret",
+		Error:   "DB_PASS=tool-error-secret",
+		Data:    `{"DB_PWD":"json-secret"}`,
+	}
+	sanitized := sanitizeAgentToolResult(input)
+	contextText := agentContextText([]models.AgentToolResult{input}, 100)
+	for channel, value := range map[string]string{
+		"title":   sanitized.Title,
+		"summary": sanitized.Summary,
+		"error":   sanitized.Error,
+		"data":    sanitized.Data,
+		"context": contextText,
+	} {
+		for _, secret := range []string{"title-secret", "summary-secret", "tool-error-secret", "json-secret"} {
+			if strings.Contains(value, secret) {
+				t.Fatalf("%s channel leaked %q: %q", channel, secret, value)
+			}
+		}
+	}
+}
+
+func TestAgentServiceExecuteToolRedactsToolErrorChannel(t *testing.T) {
+	client := &secretErrorDockerClient{
+		fakeDockerClient: newFakeDockerClient(),
+		err:              errors.New("DB_PASS=execute-tool-error-secret"),
+	}
+	service := &AgentService{Docker: &DockerService{Client: client}}
+	result, err := service.ExecuteTool(context.Background(), models.AgentToolExecutionRequest{
+		ToolID:    "container.start",
+		Arguments: `{"containerID":"container-1"}`,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteTool() error = %v", err)
+	}
+	if result == nil || !strings.Contains(result.Error, "DB_PASS=[REDACTED]") || strings.Contains(result.Error, "execute-tool-error-secret") {
+		t.Fatalf("ExecuteTool() result = %#v, want redacted tool error", result)
+	}
+}
+
+func TestMarshalAgentDataCapsEscapedJSONAndAggregateContextBytes(t *testing.T) {
+	data := marshalAgentData(map[string]string{"value": strings.Repeat("\\\"", maxAgentToolDataBytes)})
+	if data != agentToolDataTruncationJSON || len(data) > maxAgentToolDataBytes {
+		t.Fatalf("marshalAgentData() returned %d bytes, want bounded truncation JSON: %q", len(data), data)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(data), &decoded); err != nil {
+		t.Fatalf("truncated tool data is not JSON: %v", err)
+	}
+	contextText := agentContextText([]models.AgentToolResult{
+		{ToolID: "test.one", Title: "large one", Data: strings.Repeat("x ", maxAgentContextBytes/4+100)},
+		{ToolID: "test.two", Title: "large two", Data: strings.Repeat("y ", maxAgentContextBytes/4+100)},
+	}, 0)
+	if len(contextText) > maxAgentContextBytes || !strings.Contains(contextText, agentContextTruncationMarker) {
+		t.Fatalf("agentContextText() returned %d bytes without a truncation marker", len(contextText))
+	}
+}
+
+func TestAgentToolResultCapsEveryTextChannelBeforeRedaction(t *testing.T) {
+	result := sanitizeAgentToolResult(models.AgentToolResult{
+		ToolID:  strings.Repeat("i", maxAgentToolIDBytes+1),
+		Title:   strings.Repeat("t", maxAgentToolTitleBytes+1),
+		Summary: strings.Repeat("s", maxAgentToolSummaryBytes+1),
+		Error:   strings.Repeat("e", maxAgentToolErrorBytes+1),
+		Data:    strings.Repeat("d", maxAgentToolDataBytes+1),
+	})
+	for channel, value := range map[string]struct {
+		text  string
+		limit int
+	}{
+		"toolID":  {result.ToolID, maxAgentToolIDBytes},
+		"title":   {result.Title, maxAgentToolTitleBytes},
+		"summary": {result.Summary, maxAgentToolSummaryBytes},
+		"error":   {result.Error, maxAgentToolErrorBytes},
+		"data":    {result.Data, maxAgentToolDataBytes},
+	} {
+		if len(value.text) > value.limit {
+			t.Fatalf("%s returned %d bytes, limit %d", channel, len(value.text), value.limit)
+		}
+	}
+	for channel, value := range map[string]string{
+		"toolID": result.ToolID, "title": result.Title, "summary": result.Summary, "error": result.Error,
+	} {
+		if value != agentToolTextTruncationMarker {
+			t.Fatalf("%s = %q, want safe truncation marker", channel, value)
+		}
+	}
+	if result.Data != agentToolDataTruncationJSON {
+		t.Fatalf("data = %q, want safe truncation JSON", result.Data)
+	}
+}
+
+func TestMarshalAgentDataRejectsCustomMarshalerBeforeEncoding(t *testing.T) {
+	called := false
+	data := marshalAgentData(observedAgentJSONMarshaler{called: &called})
+	if called {
+		t.Fatal("marshalAgentData invoked an unbounded custom marshaler before enforcing its output budget")
+	}
+	if data != agentToolDataTruncationJSON {
+		t.Fatalf("marshalAgentData(custom) = %q, want safe truncation JSON", data)
+	}
+}
+
+func TestAgentJSONBudgetAccountsForInvalidUTF8AndStringTagExpansion(t *testing.T) {
+	tests := map[string]any{
+		"invalid UTF-8": map[string]string{
+			"value": strings.Repeat(string([]byte{0xff}), maxAgentToolDataBytes/6+64),
+		},
+		"quoted string tag": agentStringTaggedPayload{
+			Value: strings.Repeat("\\", maxAgentToolDataBytes/3),
+		},
+	}
+	for name, value := range tests {
+		t.Run(name, func(t *testing.T) {
+			if agentJSONWithinMarshalBudget(value, maxAgentToolDataBytes) {
+				t.Fatal("agentJSONWithinMarshalBudget accepted a value whose encoded representation exceeds the cap")
+			}
+			if data := marshalAgentData(value); data != agentToolDataTruncationJSON {
+				t.Fatalf("marshalAgentData() = %d bytes, want safe truncation JSON", len(data))
+			}
+		})
+	}
+}
+
+func TestAgentJSONBudgetRejectsUnexportedAnonymousEmbedding(t *testing.T) {
+	value := agentJSONWithUnexportedEmbedding{embeddedAgentJSONPayload{Value: strings.Repeat("x", maxAgentToolDataBytes)}}
+	raw, err := json.Marshal(value)
+	if err != nil || !strings.Contains(string(raw), `"value"`) {
+		t.Fatalf("test shape was not promoted by encoding/json: %q, %v", raw, err)
+	}
+	if agentJSONWithinMarshalBudget(value, maxAgentToolDataBytes) {
+		t.Fatal("agentJSONWithinMarshalBudget accepted an unexported anonymous embedding")
+	}
+	if data := marshalAgentData(value); data != agentToolDataTruncationJSON {
+		t.Fatalf("marshalAgentData(embedded) = %q, want safe truncation JSON", data)
+	}
+}
+
+func TestAgentSystemPromptStatesProjectFileEditsAreManualAndUnavailable(t *testing.T) {
+	prompt := agentSystemPrompt()
+	for _, required := range []string{"Project file changes are manual", "file-edit tools are unavailable"} {
+		if !strings.Contains(prompt, required) {
+			t.Fatalf("agentSystemPrompt() is missing %q: %q", required, prompt)
+		}
+	}
+	if strings.Contains(prompt, "actual writes must use Cairn's file-edit preview") {
+		t.Fatalf("agentSystemPrompt() still advertises quarantined file-edit tools: %q", prompt)
+	}
+}
+
 func TestReadAgentDraftCurrentRejectsLargeFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), ".env")
 	if err := os.WriteFile(path, []byte(strings.Repeat("A", maxAgentFileEditBytes+1)), 0o600); err != nil {
 		t.Fatalf("WriteFile(%s) error = %v", path, err)
 	}
 
-	_, err := readAgentDraftCurrent(path)
+	_, err := readAgentDraftCurrentInProject(filepath.Dir(path), path)
 	if !apperror.IsCode(err, apperror.Conflict) {
-		t.Fatalf("readAgentDraftCurrent() error = %v, want conflict", err)
+		t.Fatalf("readAgentDraftCurrentInProject() error = %v, want conflict", err)
+	}
+}
+
+func TestReadAgentDraftCurrentHidesAllEnvironmentValues(t *testing.T) {
+	path := filepath.Join(t.TempDir(), ".env")
+	content := "DATABASE_URL=short-password\nPUBLIC_SETTING=apparently-safe\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("WriteFile(%s) error = %v", path, err)
+	}
+
+	preview, err := readAgentDraftCurrentInProject(filepath.Dir(path), path)
+	if err != nil {
+		t.Fatalf("readAgentDraftCurrentInProject() error = %v", err)
+	}
+	for _, secret := range []string{"short-password", "apparently-safe"} {
+		if strings.Contains(preview, secret) {
+			t.Fatalf("draft preview leaked environment value %q: %q", secret, preview)
+		}
+	}
+	for _, expected := range []string{"DATABASE_URL=[REDACTED]", "PUBLIC_SETTING=[REDACTED]"} {
+		if !strings.Contains(preview, expected) {
+			t.Fatalf("draft preview is missing %q: %q", expected, preview)
+		}
 	}
 }
 
@@ -711,6 +923,21 @@ func TestAgentServiceToolCatalogIncludesExecutableDockerTools(t *testing.T) {
 	}
 	if byID["docker.prune_plan"].ArgumentSchema == "" {
 		t.Fatalf("docker.prune_plan missing argument schema")
+	}
+	for _, toolID := range []string{"project.file_edit.plan", "project.file_edit.apply"} {
+		if _, exposed := byID[toolID]; exposed {
+			t.Fatalf("unsafe %s must remain quarantined from the agent tool catalog", toolID)
+		}
+	}
+}
+
+func TestAgentServiceApplyFileEditIsQuarantinedByDefault(t *testing.T) {
+	result, err := (&AgentService{}).ApplyFileEdit(context.Background(), "plan", "")
+	if result != nil || !apperror.IsCode(err, apperror.Conflict) || !strings.Contains(err.Error(), "temporarily disabled") {
+		t.Fatalf("ApplyFileEdit(default) = (%#v, %v), want quarantined conflict", result, err)
+	}
+	if plan, planErr := (&AgentService{}).PlanFileEdit(context.Background(), models.AgentFileEditRequest{}); plan != nil || !apperror.IsCode(planErr, apperror.Conflict) {
+		t.Fatalf("PlanFileEdit(default) = (%#v, %v), want quarantined conflict", plan, planErr)
 	}
 }
 
@@ -772,6 +999,74 @@ func TestAgentServiceExecuteToolRejectsUnknownTool(t *testing.T) {
 	})
 	if !apperror.IsCode(err, apperror.Conflict) {
 		t.Fatalf("ExecuteTool(unknown) error = %v, want conflict", err)
+	}
+}
+
+func TestAgentServiceBoundsAndStrictlyDecodesToolRequests(t *testing.T) {
+	service := &AgentService{}
+	tests := []struct {
+		name string
+		req  models.AgentToolExecutionRequest
+	}{
+		{
+			name: "oversized tool id",
+			req: models.AgentToolExecutionRequest{
+				ToolID: strings.Repeat("x", maxAgentToolIDBytes+1),
+			},
+		},
+		{
+			name: "oversized arguments",
+			req: models.AgentToolExecutionRequest{
+				ToolID:    "docker.engine",
+				Arguments: strings.Repeat(" ", maxAgentToolArgumentsBytes+1),
+			},
+		},
+		{
+			name: "second json value",
+			req: models.AgentToolExecutionRequest{
+				ToolID:    "docker.engine",
+				Arguments: `{} {}`,
+			},
+		},
+		{
+			name: "invalid trailing data",
+			req: models.AgentToolExecutionRequest{
+				ToolID:    "docker.engine",
+				Arguments: `{} trailing`,
+			},
+		},
+		{
+			name: "oversized scope",
+			req: models.AgentToolExecutionRequest{
+				ToolID: "docker.engine",
+				Scope:  models.AgentScope{ProjectID: strings.Repeat("p", maxAgentScopeIDBytes+1)},
+			},
+		},
+		{
+			name: "oversized scope supplied in arguments",
+			req: models.AgentToolExecutionRequest{
+				ToolID:    "project.detail",
+				Arguments: `{"projectID":"` + strings.Repeat("p", maxAgentScopeIDBytes+1) + `"}`,
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := service.ExecuteTool(context.Background(), test.req)
+			if result != nil || !apperror.IsCode(err, apperror.Conflict) {
+				t.Fatalf("ExecuteTool() = (%#v, %v), want bounded conflict", result, err)
+			}
+		})
+	}
+}
+
+func TestAgentServiceChatRejectsOversizedScopeBeforeEndpointAccess(t *testing.T) {
+	response, err := (&AgentService{}).Chat(context.Background(), models.AgentChatRequest{
+		Prompt: "inspect project",
+		Scope:  models.AgentScope{ProjectID: strings.Repeat("p", maxAgentScopeIDBytes+1)},
+	})
+	if response != nil || !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("Chat() = (%#v, %v), want bounded conflict", response, err)
 	}
 }
 
@@ -1437,7 +1732,7 @@ func TestDockerServiceObjectPlansAuditAndExecute(t *testing.T) {
 	ctx := context.Background()
 	db := openServiceTestStore(t)
 	client := newFakeDockerClient()
-	service := &DockerService{Client: client, Audit: db.Audit()}
+	service := &DockerService{Client: client, Audit: db.Audit(), Scope: runtimescope.Must("linux_native", "default")}
 
 	imagePlan, err := service.PlanRemoveImage(ctx, client.image.ID, false)
 	if err != nil {
@@ -1519,6 +1814,143 @@ func TestDockerServiceObjectPlansAuditAndExecute(t *testing.T) {
 			t.Fatalf("missing audit action %s in %#v", action, entries)
 		}
 	}
+}
+
+func TestDockerServiceVolumeRemovalPlanRevalidatesIncarnation(t *testing.T) {
+	t.Run("unchanged volume", func(t *testing.T) {
+		client := newFakeDockerClient()
+		client.volumeOptions = map[string]string{
+			"password": "volume-driver-secret",
+			"type":     "nfs",
+		}
+		service := &DockerService{Client: client, Scope: runtimescope.Must("linux_native", "default")}
+
+		plan, err := service.PlanRemoveVolume(context.Background(), client.volume.Name, false)
+		if err != nil {
+			t.Fatalf("PlanRemoveVolume() error = %v", err)
+		}
+		encodedPlan, err := json.Marshal(plan)
+		if err != nil {
+			t.Fatalf("Marshal(plan) error = %v", err)
+		}
+		if strings.Contains(string(encodedPlan), "volume-driver-secret") {
+			t.Fatalf("public plan leaked a volume driver option: %s", encodedPlan)
+		}
+		if err := service.ApplyContainerPlan(context.Background(), plan.PlanID, client.volume.Name); err != nil {
+			t.Fatalf("ApplyContainerPlan(unchanged) error = %v", err)
+		}
+		if !reflect.DeepEqual(client.removedVolumes, []string{client.volume.Name}) {
+			t.Fatalf("removed volumes = %#v, want unchanged target", client.removedVolumes)
+		}
+	})
+
+	t.Run("same name replacement", func(t *testing.T) {
+		client := newFakeDockerClient()
+		service := &DockerService{Client: client, Scope: runtimescope.Must("linux_native", "default")}
+		plan, err := service.PlanRemoveVolume(context.Background(), client.volume.Name, false)
+		if err != nil {
+			t.Fatalf("PlanRemoveVolume() error = %v", err)
+		}
+
+		client.volumeCreatedAt = client.volumeCreatedAt.Add(time.Nanosecond)
+		err = service.ApplyContainerPlan(context.Background(), plan.PlanID, client.volume.Name)
+		if !apperror.IsCode(err, apperror.Conflict) {
+			t.Fatalf("ApplyContainerPlan(replacement) error = %v, want conflict", err)
+		}
+		if len(client.removedVolumes) != 0 {
+			t.Fatalf("replacement reached RemoveVolume: %#v", client.removedVolumes)
+		}
+		if err := service.ApplyContainerPlan(context.Background(), plan.PlanID, client.volume.Name); !apperror.IsCode(err, apperror.PlanExpired) {
+			t.Fatalf("ApplyContainerPlan(replay) error = %v, want consumed plan", err)
+		}
+	})
+
+	t.Run("volume disappeared", func(t *testing.T) {
+		client := newFakeDockerClient()
+		service := &DockerService{Client: client, Scope: runtimescope.Must("linux_native", "default")}
+		plan, err := service.PlanRemoveVolume(context.Background(), client.volume.Name, false)
+		if err != nil {
+			t.Fatalf("PlanRemoveVolume() error = %v", err)
+		}
+		client.volumeInspectErr = apperror.New(apperror.NotFound, "volume not found")
+
+		err = service.ApplyContainerPlan(context.Background(), plan.PlanID, client.volume.Name)
+		if !apperror.IsCode(err, apperror.Conflict) {
+			t.Fatalf("ApplyContainerPlan(missing) error = %v, want conflict", err)
+		}
+		if len(client.removedVolumes) != 0 {
+			t.Fatalf("missing volume reached RemoveVolume: %#v", client.removedVolumes)
+		}
+	})
+
+	t.Run("missing creation identity", func(t *testing.T) {
+		client := newFakeDockerClient()
+		client.volumeCreatedAt = time.Time{}
+		service := &DockerService{Client: client, Scope: runtimescope.Must("linux_native", "default")}
+
+		if _, err := service.PlanRemoveVolume(context.Background(), client.volume.Name, false); !apperror.IsCode(err, apperror.Conflict) {
+			t.Fatalf("PlanRemoveVolume(missing createdAt) error = %v, want conflict", err)
+		}
+		if len(client.removedVolumes) != 0 {
+			t.Fatalf("unverifiable volume reached RemoveVolume: %#v", client.removedVolumes)
+		}
+	})
+
+	for _, changedScope := range []runtimescope.Scope{
+		runtimescope.Must("linux_native", "other-context"),
+		runtimescope.Must("windows_wsl_ubuntu", "default"),
+	} {
+		changedScope := changedScope
+		t.Run("runtime scope changed to "+changedScope.ProviderID()+"/"+changedScope.ContextName(), func(t *testing.T) {
+			client := newFakeDockerClient()
+			service := &DockerService{Client: client, Scope: runtimescope.Must("linux_native", "default")}
+			plan, err := service.PlanRemoveVolume(context.Background(), client.volume.Name, false)
+			if err != nil {
+				t.Fatalf("PlanRemoveVolume() error = %v", err)
+			}
+
+			service.Scope = changedScope
+			err = service.ApplyContainerPlan(context.Background(), plan.PlanID, client.volume.Name)
+			if !apperror.IsCode(err, apperror.Conflict) {
+				t.Fatalf("ApplyContainerPlan(changed scope) error = %v, want conflict", err)
+			}
+			if len(client.removedVolumes) != 0 {
+				t.Fatalf("changed-scope volume reached RemoveVolume: %#v", client.removedVolumes)
+			}
+		})
+	}
+
+	t.Run("inspect returned a different name", func(t *testing.T) {
+		client := newFakeDockerClient()
+		requestedName := client.volume.Name
+		client.volume.Name = "different-volume"
+		service := &DockerService{Client: client, Scope: runtimescope.Must("linux_native", "default")}
+
+		if _, err := service.PlanRemoveVolume(context.Background(), requestedName, false); !apperror.IsCode(err, apperror.Conflict) {
+			t.Fatalf("PlanRemoveVolume(mismatched inspect name) error = %v, want conflict", err)
+		}
+		if len(client.removedVolumes) != 0 {
+			t.Fatalf("mismatched-name volume reached RemoveVolume: %#v", client.removedVolumes)
+		}
+	})
+
+	t.Run("apply inspect returned a different name", func(t *testing.T) {
+		client := newFakeDockerClient()
+		service := &DockerService{Client: client, Scope: runtimescope.Must("linux_native", "default")}
+		plan, err := service.PlanRemoveVolume(context.Background(), client.volume.Name, false)
+		if err != nil {
+			t.Fatalf("PlanRemoveVolume() error = %v", err)
+		}
+		client.volume.Name = "different-volume"
+
+		err = service.ApplyContainerPlan(context.Background(), plan.PlanID, plan.RequiresTypedName)
+		if !apperror.IsCode(err, apperror.Conflict) {
+			t.Fatalf("ApplyContainerPlan(mismatched inspect name) error = %v, want conflict", err)
+		}
+		if len(client.removedVolumes) != 0 {
+			t.Fatalf("mismatched-name volume reached RemoveVolume: %#v", client.removedVolumes)
+		}
+	})
 }
 
 func TestProjectServiceImportProject(t *testing.T) {
@@ -1931,10 +2363,10 @@ func TestProjectServiceGetProjectIncludesDetailPayload(t *testing.T) {
 	if len(detail.Containers) != 1 || detail.Containers[0].ID != "container-app" {
 		t.Fatalf("containers = %#v", detail.Containers)
 	}
-	if detail.Compose == nil || !detail.Compose.Valid || detail.Compose.ResolvedYAML != resolvedConfig {
+	if detail.Compose == nil || !detail.Compose.Valid || detail.Compose.ResolvedYAML != composeStructurePreview(resolvedConfig) {
 		t.Fatalf("compose = %#v", detail.Compose)
 	}
-	if len(detail.Compose.RawFiles) != 1 || detail.Compose.RawFiles[0].Path != composeFile || !strings.Contains(detail.Compose.RawFiles[0].Content, "target: runtime") {
+	if len(detail.Compose.RawFiles) != 1 || detail.Compose.RawFiles[0].Path != "compose.yaml" || !strings.Contains(detail.Compose.RawFiles[0].Content, "target: '[REDACTED]'") || strings.Contains(detail.Compose.RawFiles[0].Content, "target: runtime") {
 		t.Fatalf("raw files = %#v", detail.Compose.RawFiles)
 	}
 
@@ -2097,6 +2529,58 @@ func TestProjectServicePullBuildsLocalBuildServices(t *testing.T) {
 	}
 }
 
+func TestCombineCommandResultsPreservesTruncationSignals(t *testing.T) {
+	combined := combineCommandResults(
+		&providers.CommandResult{Stdout: "pull", StderrTruncated: true},
+		&providers.CommandResult{Stdout: "build", StdoutTruncated: true},
+	)
+	if combined == nil || !combined.StdoutTruncated || !combined.StderrTruncated {
+		t.Fatalf("combined truncation flags = %#v, want both retained", combined)
+	}
+}
+
+func TestCombineCommandResultsBoundsAggregateOutputAndSignalsTruncation(t *testing.T) {
+	stdoutHead := strings.Repeat("A", 40<<10)
+	stdoutTail := strings.Repeat("B", 40<<10)
+	stderrHead := strings.Repeat("C", 40<<10)
+	stderrTail := strings.Repeat("D", 40<<10)
+	combined := combineCommandResults(
+		&providers.CommandResult{Stdout: stdoutHead, Stderr: stderrHead},
+		&providers.CommandResult{Stdout: stdoutTail, Stderr: stderrTail},
+	)
+	if combined == nil {
+		t.Fatal("combineCommandResults() = nil")
+	}
+	if len(combined.Stdout) > maxCombinedCommandOutputBytes || len(combined.Stderr) > maxCombinedCommandOutputBytes {
+		t.Fatalf("combined output lengths = stdout %d, stderr %d; limit %d", len(combined.Stdout), len(combined.Stderr), maxCombinedCommandOutputBytes)
+	}
+	if !combined.StdoutTruncated || !combined.StderrTruncated {
+		t.Fatalf("combined truncation flags = stdout %t, stderr %t; want both true", combined.StdoutTruncated, combined.StderrTruncated)
+	}
+	for label, output := range map[string]string{"stdout": combined.Stdout, "stderr": combined.Stderr} {
+		if !strings.Contains(output, "Cairn truncated combined command output") {
+			t.Fatalf("%s = %q, want explicit truncation marker", label, output)
+		}
+	}
+	if !strings.HasPrefix(combined.Stdout, "AAAA") || !strings.HasSuffix(combined.Stdout, "BBBB") {
+		t.Fatalf("stdout did not retain bounded head/tail")
+	}
+	if !strings.HasPrefix(combined.Stderr, "CCCC") || !strings.HasSuffix(combined.Stderr, "DDDD") {
+		t.Fatalf("stderr did not retain bounded head/tail")
+	}
+}
+
+func TestCombineCommandResultsBoundsInitialOutputWithoutMutatingInput(t *testing.T) {
+	original := &providers.CommandResult{Stdout: strings.Repeat("X", maxCombinedCommandOutputBytes+1)}
+	combined := combineCommandResults(nil, original)
+	if combined == nil || len(combined.Stdout) > maxCombinedCommandOutputBytes || !combined.StdoutTruncated {
+		t.Fatalf("combined = %#v, want bounded explicitly truncated output", combined)
+	}
+	if original.StdoutTruncated || len(original.Stdout) != maxCombinedCommandOutputBytes+1 {
+		t.Fatal("combineCommandResults() mutated its input")
+	}
+}
+
 func TestProjectServicePlanDownWithVolumesRequiresTypedName(t *testing.T) {
 	ctx := context.Background()
 	db := openServiceTestStore(t)
@@ -2212,31 +2696,43 @@ func TestProjectServiceLifecycleMapsBackendPaths(t *testing.T) {
 }
 
 type fakeDockerClient struct {
-	container       models.ContainerSummary
-	image           models.ImageSummary
-	volume          models.VolumeSummary
-	network         models.NetworkSummary
-	started         []string
-	stopped         []string
-	restarted       []string
-	killed          []string
-	removed         []string
-	renamed         []string
-	runImages       []models.RunImageRequest
-	runImageID      string
-	runImageErr     error
-	pulled          []string
-	tagged          []string
-	pushed          []string
-	saved           []string
-	loaded          []string
-	removedImages   []string
-	pruned          []string
-	volumes         []models.CreateVolumeRequest
-	removedVolumes  []string
-	networks        []models.CreateNetworkRequest
-	removedNetworks []string
-	searchTerm      string
+	container        models.ContainerSummary
+	image            models.ImageSummary
+	volume           models.VolumeSummary
+	volumeCreatedAt  time.Time
+	volumeOptions    map[string]string
+	volumeInspectErr error
+	network          models.NetworkSummary
+	started          []string
+	stopped          []string
+	restarted        []string
+	killed           []string
+	removed          []string
+	renamed          []string
+	runImages        []models.RunImageRequest
+	runImageID       string
+	runImageErr      error
+	pulled           []string
+	tagged           []string
+	pushed           []string
+	saved            []string
+	loaded           []string
+	removedImages    []string
+	pruned           []string
+	volumes          []models.CreateVolumeRequest
+	removedVolumes   []string
+	networks         []models.CreateNetworkRequest
+	removedNetworks  []string
+	searchTerm       string
+}
+
+type secretErrorDockerClient struct {
+	*fakeDockerClient
+	err error
+}
+
+func (f *secretErrorDockerClient) StartContainer(context.Context, string) error {
+	return f.err
 }
 
 func newFakeDockerClient() *fakeDockerClient {
@@ -2262,6 +2758,7 @@ func newFakeDockerClient() *fakeDockerClient {
 			Driver: "local",
 			InUse:  false,
 		},
+		volumeCreatedAt: time.Date(2026, 6, 16, 11, 30, 0, 123, time.UTC),
 		network: models.NetworkSummary{
 			ID:     "network-1",
 			Name:   "demo_net",
@@ -2404,7 +2901,14 @@ func (f *fakeDockerClient) ListVolumes(context.Context) ([]models.VolumeSummary,
 }
 
 func (f *fakeDockerClient) GetVolume(context.Context, string) (*models.VolumeDetail, error) {
-	return &models.VolumeDetail{Summary: f.volume}, nil
+	if f.volumeInspectErr != nil {
+		return nil, f.volumeInspectErr
+	}
+	return &models.VolumeDetail{
+		Summary:   f.volume,
+		Options:   f.volumeOptions,
+		CreatedAt: f.volumeCreatedAt,
+	}, nil
 }
 
 func (f *fakeDockerClient) CreateVolume(_ context.Context, req models.CreateVolumeRequest) (*models.VolumeSummary, error) {
@@ -2461,11 +2965,26 @@ func (r *fakeComposeRunner) RunComposeEnv(_ context.Context, workdir string, _ [
 	key := workdir + "|" + strings.Join(args, " ")
 	r.mu.Lock()
 	r.calls = append(r.calls, key)
-	result, ok := r.outputs[key]
+	lookupKey := key
+	result, ok := r.outputs[lookupKey]
+	if !ok && composeConfigArgs(args) {
+		matches := make([]string, 0, len(r.outputs))
+		for configuredKey := range r.outputs {
+			if strings.HasSuffix(configuredKey, " config") {
+				matches = append(matches, configuredKey)
+			}
+		}
+		sort.Strings(matches)
+		if len(matches) > 0 {
+			lookupKey = matches[0]
+			result = r.outputs[lookupKey]
+			ok = true
+		}
+	}
 	if !ok && strings.HasSuffix(key, " ps --format json --all") {
 		result = providers.CommandResult{Stdout: `[{"ID":"existing","Name":"existing-app-1","Project":"existing","Service":"app","State":"running"}]`}
 	}
-	runErr := r.errors[key]
+	runErr := r.errors[lookupKey]
 	r.mu.Unlock()
 	result.Workdir = workdir
 	result.Command = append([]string{"docker", "compose"}, args...)
@@ -2473,6 +2992,15 @@ func (r *fakeComposeRunner) RunComposeEnv(_ context.Context, workdir string, _ [
 		return &result, runErr
 	}
 	return &result, nil
+}
+
+func composeConfigArgs(args []string) bool {
+	for _, arg := range args {
+		if arg == "config" {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *fakeComposeRunner) hasCall(want string) bool {

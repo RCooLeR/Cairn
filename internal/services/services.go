@@ -92,6 +92,7 @@ type DockerService struct {
 	ObjectPlans *security.DockerObjectPlanStore
 	IDs         *security.IDSource
 	RuntimeMu   *sync.RWMutex
+	Scope       runtimescope.Scope
 }
 type ProjectDetector interface {
 	Reconcile(context.Context) ([]models.ProjectSummary, error)
@@ -554,6 +555,9 @@ func (s *DockerService) executeDockerObjectPlan(ctx context.Context, plan securi
 	case security.DockerActionRunImage:
 		return apperror.New(apperror.Conflict, "Run image plans must be applied with ApplyRunImagePlan")
 	case security.DockerActionRemoveVolume:
+		if err := s.validateRemoveVolumePlanTarget(ctx, plan); err != nil {
+			return err
+		}
 		return s.Client.RemoveVolume(ctx, plan.TargetID, plan.Force)
 	case security.DockerActionRemoveNetwork:
 		return s.Client.RemoveNetwork(ctx, plan.TargetID)

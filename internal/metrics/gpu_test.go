@@ -104,6 +104,14 @@ func TestProviderGPUProbeRunsNVIDIASMIInBackend(t *testing.T) {
 	}
 }
 
+func TestProviderGPUProbeRejectsTruncatedStructuredOutput(t *testing.T) {
+	provider := &fakeBackendGPUProvider{truncateGPU: true}
+	metrics := NewProviderGPUProbe(provider).ProbeGPUs(context.Background())
+	if metrics.Available {
+		t.Fatalf("GPU metrics = %#v, want unavailable for truncated nvidia-smi output", metrics)
+	}
+}
+
 func TestParseNVIDIAProcessContainers(t *testing.T) {
 	t.Parallel()
 	containers := parseNVIDIAProcessContainers("4242\t" + testGPUContainerID + "\n5555\tbad-value\n")
@@ -142,7 +150,8 @@ func TestParseNVIDIASMIReturnsUnavailableForEmptyOutput(t *testing.T) {
 }
 
 type fakeBackendGPUProvider struct {
-	calls [][]string
+	calls       [][]string
+	truncateGPU bool
 }
 
 const testGPUContainerID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
@@ -161,6 +170,7 @@ func (f *fakeBackendGPUProvider) RunBackendCommand(_ context.Context, _ string, 
 	switch args[1] {
 	case nvidiaSMIGPUQuery:
 		result.Stdout = "0, GPU-0, NVIDIA RTX, 555.85, 52, 70, 4096, 24564\n"
+		result.StdoutTruncated = f.truncateGPU
 	case nvidiaSMIProcessQuery:
 		result.Stdout = "GPU-0, 4242, /usr/bin/ollama, 2048\n"
 	default:

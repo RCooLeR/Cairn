@@ -264,6 +264,7 @@ func mapVolumeDetail(raw volume.Volume, containers []models.ContainerSummary) *m
 		Summary:    summary,
 		Options:    copyStringMap(raw.Options),
 		Containers: containers,
+		CreatedAt:  volumeCreatedAt(raw),
 	}
 }
 

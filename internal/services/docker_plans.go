@@ -166,11 +166,28 @@ func (s *DockerService) planRemoveVolume(ctx context.Context, name string, force
 	if s.Client == nil {
 		return nil, notReady()
 	}
+	if !s.Scope.Valid() {
+		return nil, apperror.New(apperror.Conflict, "Volume runtime scope could not be verified")
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil, apperror.New(apperror.Conflict, "Volume name is required")
+	}
 	detail, err := s.Client.GetVolume(ctx, name)
 	if err != nil {
 		return nil, err
 	}
-	plan, err := security.NewRemoveVolumePlan(detail.Summary, force, time.Now().UTC(), s.IDs)
+	if detail == nil {
+		return nil, apperror.New(apperror.Conflict, "Volume identity could not be verified", apperror.WithDetail("Docker returned an empty volume inspection. Refresh volumes and create a new removal plan."))
+	}
+	if strings.TrimSpace(detail.Summary.Name) != name {
+		return nil, apperror.New(
+			apperror.Conflict,
+			"Volume identity could not be verified",
+			apperror.WithDetail("Docker inspected a different volume name than the requested target. Refresh volumes and try again."),
+		)
+	}
+	plan, err := security.NewRemoveVolumePlan(*detail, s.Scope, force, time.Now().UTC(), s.IDs)
 	if err != nil {
 		return nil, err
 	}
@@ -178,6 +195,61 @@ func (s *DockerService) planRemoveVolume(ctx context.Context, name string, force
 		return nil, err
 	}
 	return &plan.Plan, nil
+}
+
+func (s *DockerService) validateRemoveVolumePlanTarget(ctx context.Context, plan security.DockerObjectPlan) error {
+	if !plan.TargetScope.Valid() || !s.Scope.Equal(plan.TargetScope) {
+		return apperror.New(
+			apperror.Conflict,
+			"Docker runtime changed after the volume removal plan was created",
+			apperror.WithDetail("Return to the intended provider and context, then inspect the volume and create a new removal plan."),
+		)
+	}
+	if strings.TrimSpace(plan.TargetFingerprint) == "" {
+		return apperror.New(
+			apperror.Conflict,
+			"Volume identity could not be verified",
+			apperror.WithDetail("The removal plan has no volume incarnation fingerprint. Create a new plan before deleting the volume."),
+		)
+	}
+	detail, err := s.Client.GetVolume(ctx, plan.TargetID)
+	if err != nil {
+		if apperror.IsCode(err, apperror.NotFound) {
+			return apperror.Wrap(
+				apperror.Conflict,
+				"Volume changed after the removal plan was created",
+				err,
+				apperror.WithDetail("The planned volume no longer exists. Refresh volumes and create a new removal plan."),
+			)
+		}
+		return err
+	}
+	if detail == nil {
+		return apperror.New(
+			apperror.Conflict,
+			"Volume identity could not be verified",
+			apperror.WithDetail("Docker returned an empty volume inspection. Refresh volumes and create a new removal plan."),
+		)
+	}
+	if strings.TrimSpace(detail.Summary.Name) != plan.TargetID {
+		return apperror.New(
+			apperror.Conflict,
+			"Volume changed after the removal plan was created",
+			apperror.WithDetail("Docker inspected a different volume name than the planned target. Refresh volumes and create a new removal plan."),
+		)
+	}
+	fingerprint, err := security.VolumeIncarnationFingerprint(*detail)
+	if err != nil {
+		return err
+	}
+	if fingerprint != plan.TargetFingerprint {
+		return apperror.New(
+			apperror.Conflict,
+			"Volume changed after the removal plan was created",
+			apperror.WithDetail("The volume name now refers to a different Docker volume. Review it and create a new removal plan."),
+		)
+	}
+	return nil
 }
 
 func (s *DockerService) planRemoveNetwork(ctx context.Context, id string) (*models.CommandPlan, error) {

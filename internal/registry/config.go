@@ -104,7 +104,14 @@ func (m *Manager) readDockerConfigRaw(ctx context.Context, provider providers.Pl
 		return "", apperror.New(
 			apperror.ProviderNotReady,
 			"Read Docker config failed",
-			apperror.WithDetail(strings.TrimSpace(result.Stderr)),
+			apperror.WithDetail(providers.SafeCommandDiagnostic(result.Stderr, 8<<10)),
+		)
+	}
+	if result.StdoutTruncated {
+		return "", apperror.New(
+			apperror.ProviderNotReady,
+			"Read Docker config failed",
+			apperror.WithDetail("Backend Docker configuration exceeded the safe output limit."),
 		)
 	}
 	raw := normalizeDockerConfigJSON(result.Stdout)
@@ -142,7 +149,7 @@ func (m *Manager) writeDockerConfigRaw(ctx context.Context, provider providers.P
 		if detail == "" {
 			detail = strings.TrimSpace(result.Stdout)
 		}
-		return apperror.New(apperror.ProviderNotReady, "Write Docker config failed", apperror.WithDetail(detail))
+		return apperror.New(apperror.ProviderNotReady, "Write Docker config failed", apperror.WithDetail(providers.SafeCommandDiagnostic(detail, 8<<10)))
 	}
 	return nil
 }
@@ -382,7 +389,7 @@ func (m *Manager) accountsFromHelpers(ctx context.Context, provider providers.Pl
 	accounts := []models.RegistryAccount{}
 	for helper, source := range helpers {
 		result, err := runner.RunBackendCommand(ctx, "", "docker-credential-"+helper, "list")
-		if err != nil || result == nil || result.ExitCode != 0 || strings.TrimSpace(result.Stdout) == "" {
+		if err != nil || result == nil || result.ExitCode != 0 || result.StdoutTruncated || strings.TrimSpace(result.Stdout) == "" {
 			continue
 		}
 		var listed map[string]string

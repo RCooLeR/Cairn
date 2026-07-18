@@ -287,13 +287,30 @@ func TestManagerPublishesBatchesAndEOF(t *testing.T) {
 	if err != nil {
 		t.Fatalf("StartLogStream() error = %v", err)
 	}
-	lines := receiveLogEvent[LinesPayload](t, linesCh, time.Second)
-	if lines.StreamID != streamID || len(lines.Lines) != 2 || lines.Lines[1].Level != "warn" {
-		t.Fatalf("lines payload = %#v", lines)
+	var lines []models.LogLine
+	eofReceived := false
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	for len(lines) < 2 || !eofReceived {
+		select {
+		case event := <-linesCh:
+			payload, ok := event.Payload.(LinesPayload)
+			if !ok || payload.StreamID != streamID {
+				t.Fatalf("lines event = %#v", event.Payload)
+			}
+			lines = append(lines, payload.Lines...)
+		case event := <-eofCh:
+			payload, ok := event.Payload.(EOFPayload)
+			if !ok || payload.StreamID != streamID {
+				t.Fatalf("EOF event = %#v", event.Payload)
+			}
+			eofReceived = true
+		case <-deadline.C:
+			t.Fatalf("timed out waiting for lines/EOF: lines=%#v eof=%v", lines, eofReceived)
+		}
 	}
-	eof := receiveLogEvent[EOFPayload](t, eofCh, time.Second)
-	if eof.StreamID != streamID {
-		t.Fatalf("eof = %#v", eof)
+	if len(lines) != 2 || lines[1].Level != "warn" {
+		t.Fatalf("lines = %#v", lines)
 	}
 	manager.mu.Lock()
 	sessionCount := len(manager.sessions)
@@ -1298,7 +1315,8 @@ func TestManagerFetchPageAndExport(t *testing.T) {
 	ctx := context.Background()
 	docker := newFakeLogDocker()
 	docker.logs["container-1"] = "2026-06-13T09:00:00Z INFO one\n2026-06-13T09:00:01Z ERROR two\n"
-	manager := NewManager(docker, nil, Options{})
+	exportDirectory := t.TempDir()
+	manager := NewManager(docker, nil, Options{ExportDirectory: exportDirectory})
 
 	page, err := manager.FetchLogPage(ctx, models.LogPageRequest{
 		Scope: ScopeProject,
@@ -1324,16 +1342,15 @@ func TestManagerFetchPageAndExport(t *testing.T) {
 		t.Fatalf("next = %#v", next)
 	}
 
-	exportPath := filepath.Join(t.TempDir(), "logs.jsonl")
 	result, err := manager.ExportLogs(ctx, models.ExportLogsRequest{
-		Scope: ScopeProject,
-		IDs:   []string{"linux_native/app"},
-		Path:  exportPath,
+		Scope:  ScopeProject,
+		IDs:    []string{"linux_native/app"},
+		Format: "jsonl",
 	})
 	if err != nil {
 		t.Fatalf("ExportLogs() error = %v", err)
 	}
-	content, err := os.ReadFile(exportPath)
+	content, err := os.ReadFile(result.Path)
 	if err != nil {
 		t.Fatalf("ReadFile() error = %v", err)
 	}
@@ -1347,14 +1364,17 @@ func TestManagerFetchPageAndExport(t *testing.T) {
 		t.Fatalf("default export tail = %d, want -1", defaultExportTail)
 	}
 
-	tailPath := filepath.Join(t.TempDir(), "tail.log")
-	if _, err := manager.ExportLogs(ctx, models.ExportLogsRequest{
-		Scope: ScopeProject,
-		IDs:   []string{"linux_native/app"},
-		Path:  tailPath,
-		Tail:  17,
-	}); err != nil {
+	tailResult, err := manager.ExportLogs(ctx, models.ExportLogsRequest{
+		Scope:  ScopeProject,
+		IDs:    []string{"linux_native/app"},
+		Format: "log",
+		Tail:   17,
+	})
+	if err != nil {
 		t.Fatalf("ExportLogs(tail) error = %v", err)
+	}
+	if filepath.Ext(tailResult.Path) != ".log" || filepath.Dir(tailResult.Path) != exportDirectory || tailResult.Path == result.Path {
+		t.Fatalf("tail export path = %q, first = %q", tailResult.Path, result.Path)
 	}
 	docker.mu.Lock()
 	tailExportTail := docker.requests[len(docker.requests)-1].Tail

@@ -525,6 +525,9 @@ func (p *ExistingContextProvider) inspectContextTarget(ctx context.Context, capt
 			apperror.WithDetail(commandFailureDetail(result, err)),
 		)
 	}
+	if result.StdoutTruncated {
+		return existingContextTarget{}, apperror.New(apperror.ProviderNotReady, "Docker context configuration exceeded the safe output limit")
+	}
 	var entries []json.RawMessage
 	if err := json.Unmarshal([]byte(strings.TrimSpace(result.Stdout)), &entries); err != nil || len(entries) != 1 {
 		return existingContextTarget{}, apperror.Wrap(apperror.ProviderNotReady, "Docker context configuration is invalid", err)
@@ -754,7 +757,7 @@ func (p *ExistingContextProvider) findContext(ctx context.Context) (models.Docke
 func (p *ExistingContextProvider) runDockerContextText(ctx context.Context, args ...string) (string, bool) {
 	dockerArgs := append([]string{"--context", p.configuredContext()}, args...)
 	result, err := p.runner.Run(ctx, commandTimeout, "docker", dockerArgs...)
-	if err != nil || result == nil || result.ExitCode != 0 {
+	if err != nil || result == nil || result.ExitCode != 0 || result.StdoutTruncated {
 		return "", false
 	}
 	return strings.TrimSpace(result.Stdout), true
@@ -765,7 +768,7 @@ func listDockerContexts(ctx context.Context, runner CommandRunner) ([]models.Doc
 		runner = ExecRunner{}
 	}
 	result, err := runner.Run(ctx, commandTimeout, "docker", "context", "ls", "--format", "json")
-	if err != nil || result == nil || result.ExitCode != 0 {
+	if err != nil || result == nil || result.ExitCode != 0 || result.StdoutTruncated {
 		return nil, false
 	}
 	contexts, err := parseDockerContextList(result.Stdout)

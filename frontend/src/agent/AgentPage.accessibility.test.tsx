@@ -10,21 +10,26 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   AgentChatResponse,
   AgentStatus,
+  ProjectSummary,
 } from "../../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
 
 const agentServiceMock = vi.hoisted(() => ({
+  ApplyFileEdit: vi.fn(),
   Chat: vi.fn(),
+  DraftProjectFile: vi.fn(),
+  PlanFileEdit: vi.fn(),
   Status: vi.fn(),
   ToolCatalog: vi.fn(),
+}));
+const settingsServiceMock = vi.hoisted(() => ({
+  SetSetting: vi.fn(),
 }));
 
 import { AgentPage, resetAgentSessionForTest } from "./AgentPage";
 
 vi.mock("../api/services", () => ({
   AgentService: agentServiceMock,
-  SettingsService: {
-    SetSetting: vi.fn(),
-  },
+  SettingsService: settingsServiceMock,
 }));
 
 describe("AgentPage accessibility", () => {
@@ -114,5 +119,69 @@ describe("AgentPage accessibility", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "Local agent endpoint is unavailable",
     );
+  });
+
+  it("shows and repairs a sanitized invalid legacy endpoint", async () => {
+    agentServiceMock.Status.mockResolvedValueOnce(
+      new AgentStatus({
+        availableModels: [],
+        enabled: true,
+        endpoint: "",
+        error: "Local agent endpoint is not allowed",
+        model: "gemma4:12b-it-q8_0",
+        provider: "ollama",
+        reachable: false,
+      }),
+    );
+    agentServiceMock.ToolCatalog.mockResolvedValueOnce([]);
+    settingsServiceMock.SetSetting.mockResolvedValueOnce(undefined);
+    render(<AgentPage projects={[]} />);
+
+    const endpoint = screen.getByRole("textbox", {
+      name: /Endpoint \(loopback only\)/,
+    });
+    await waitFor(() => expect(endpoint).toHaveValue(""));
+    fireEvent.blur(endpoint);
+
+    await waitFor(() =>
+      expect(settingsServiceMock.SetSetting).toHaveBeenCalledWith(
+        "agent.endpoint",
+        "http://127.0.0.1:11434",
+      ),
+    );
+  });
+
+  it("disables the quarantined project file-edit workflow", () => {
+    render(
+      <AgentPage
+        projects={[new ProjectSummary({ id: "provider/demo", name: "demo" })]}
+      />,
+    );
+
+    fireEvent.change(screen.getByLabelText("Project"), {
+      target: { value: "provider/demo" },
+    });
+
+    expect(
+      screen.getByText(
+        /Draft, preview, and apply are temporarily unavailable.*manually/i,
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Draft" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Preview edit" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Apply edit" })).toBeDisabled();
+    expect(screen.getByPlaceholderText(".env")).toBeDisabled();
+    expect(
+      screen.getByPlaceholderText(
+        "Drafted or manually edited file content appears here.",
+      ),
+    ).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Draft" }));
+    fireEvent.click(screen.getByRole("button", { name: "Preview edit" }));
+    fireEvent.click(screen.getByRole("button", { name: "Apply edit" }));
+    expect(agentServiceMock.DraftProjectFile).not.toHaveBeenCalled();
+    expect(agentServiceMock.PlanFileEdit).not.toHaveBeenCalled();
+    expect(agentServiceMock.ApplyFileEdit).not.toHaveBeenCalled();
   });
 });

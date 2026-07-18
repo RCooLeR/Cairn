@@ -81,6 +81,10 @@ func TestNewAppRuntimeUsesNamedConfigAndStoppedState(t *testing.T) {
 
 func TestAppRuntimeNilProviderClearsServicesAndReturnsStopped(t *testing.T) {
 	runtimeMu := &sync.RWMutex{}
+	dockerService := &services.DockerService{
+		RuntimeMu: runtimeMu,
+		Scope:     runtimescope.Must("old-provider", "old-context"),
+	}
 	projectService := &services.ProjectService{
 		RuntimeMu: runtimeMu,
 		Scope:     runtimescope.Must("old-provider", "old-context"),
@@ -88,7 +92,7 @@ func TestAppRuntimeNilProviderClearsServicesAndReturnsStopped(t *testing.T) {
 	runtimeController := newAppRuntime(appRuntimeConfig{
 		RootCtx:            context.Background(),
 		ServiceMu:          runtimeMu,
-		DockerService:      &services.DockerService{RuntimeMu: runtimeMu},
+		DockerService:      dockerService,
 		ProjectService:     projectService,
 		ComposeService:     &services.ComposeService{RuntimeMu: runtimeMu},
 		MetricsService:     &services.MetricsService{RuntimeMu: runtimeMu},
@@ -112,6 +116,9 @@ func TestAppRuntimeNilProviderClearsServicesAndReturnsStopped(t *testing.T) {
 	}
 	if projectService.Scope.Valid() {
 		t.Fatalf("project service scope was not cleared: %q/%q", projectService.Scope.ProviderID(), projectService.Scope.ContextName())
+	}
+	if dockerService.Scope.Valid() {
+		t.Fatalf("Docker service scope was not cleared: %q/%q", dockerService.Scope.ProviderID(), dockerService.Scope.ContextName())
 	}
 }
 
@@ -325,6 +332,9 @@ func TestAppRuntimeRebindPublishesBridgeDegradationInProviderChanged(t *testing.
 		t.Fatalf("RebindProvider() error = %v", err)
 	}
 	bound = true
+	if !runtimeController.dockerService.Scope.Equal(runtimeController.projectService.Scope) {
+		t.Fatalf("Docker service scope = %q/%q, project scope = %q/%q", runtimeController.dockerService.Scope.ProviderID(), runtimeController.dockerService.Scope.ContextName(), runtimeController.projectService.Scope.ProviderID(), runtimeController.projectService.Scope.ContextName())
+	}
 	if summary == nil || !summary.Active || len(summary.Status.Warnings) == 0 || summary.Status.Warnings[0].Code != providers.WarningDockerBridgeUnavailable {
 		t.Fatalf("RebindProvider() degraded summary = %#v", summary)
 	}

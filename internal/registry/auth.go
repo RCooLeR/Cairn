@@ -252,6 +252,9 @@ func (m *Manager) readCredentialHelper(ctx context.Context, provider providers.P
 			apperror.WithRepairHints("Check that docker-credential-"+helper+" is installed, initialized, and accessible on the active backend."),
 		)
 	}
+	if result.StdoutTruncated {
+		return credentialHelperRecord{}, false, apperror.New(apperror.RegistryAuth, "Docker credential helper output exceeded the safe limit")
+	}
 	var out credentialHelperRecord
 	if err := json.Unmarshal([]byte(strings.TrimSpace(result.Stdout)), &out); err != nil {
 		return credentialHelperRecord{}, false, apperror.Wrap(apperror.RegistryAuth, "Docker credential helper returned invalid data", err)
@@ -267,6 +270,9 @@ func credentialHelperNotFound(result *providers.CommandResult, err error) bool {
 	const notFoundDiagnostic = "credentials not found in native keychain"
 	found := false
 	if result != nil {
+		if result.StdoutTruncated || result.StderrTruncated {
+			return false
+		}
 		for _, output := range []string{result.Stderr, result.Stdout} {
 			if strings.TrimSpace(output) == "" {
 				continue
@@ -578,5 +584,5 @@ func registryCommandError(message string, result *providers.CommandResult, err e
 	if err != nil && detail == "" {
 		detail = err.Error()
 	}
-	return apperror.New(apperror.RegistryAuth, message, apperror.WithDetail(detail))
+	return apperror.New(apperror.RegistryAuth, message, apperror.WithDetail(providers.SafeCommandDiagnostic(detail, 8<<10)))
 }

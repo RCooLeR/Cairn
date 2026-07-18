@@ -70,7 +70,10 @@ func TestPlanConstructorEntropyFailureReturnsBeforePlanCreation(t *testing.T) {
 			return err
 		},
 		"remove volume": func() error {
-			_, err := NewRemoveVolumePlan(models.VolumeSummary{Name: "data"}, false, now, ids)
+			_, err := NewRemoveVolumePlan(models.VolumeDetail{
+				Summary:   models.VolumeSummary{Name: "data"},
+				CreatedAt: now,
+			}, runtimescope.Must("linux_native", "default"), false, now, ids)
 			return err
 		},
 		"remove network": func() error {

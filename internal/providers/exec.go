@@ -93,12 +93,14 @@ func (ExecRunner) RunWithOptions(ctx context.Context, opts CommandRunOptions, na
 
 	err := cmd.Run()
 	result := &CommandResult{
-		Command:  safeCommandResultCommand(name, args),
-		Workdir:  opts.Workdir,
-		Stdout:   stdout.String(),
-		Stderr:   stderr.String(),
-		ExitCode: 0,
-		Duration: time.Since(started),
+		Command:         safeCommandResultCommand(name, args),
+		Workdir:         opts.Workdir,
+		Stdout:          stdout.String(),
+		Stderr:          stderr.String(),
+		StdoutTruncated: stdout.Truncated(),
+		StderrTruncated: stderr.Truncated(),
+		ExitCode:        0,
+		Duration:        time.Since(started),
 	}
 	if err == nil {
 		return result, nil
@@ -179,6 +181,12 @@ func (b *commandOutputBuffer) String() string {
 	return string(b.head) + commandOutputTruncationMarker(b.dropped) + string(b.tail)
 }
 
+func (b *commandOutputBuffer) Truncated() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.dropped > 0
+}
+
 func commandOutputTruncationMarker(dropped int64) string {
 	return fmt.Sprintf("...[Cairn truncated %d bytes]...", dropped)
 }
@@ -235,6 +243,20 @@ func safeCommandFailureText(value string, limit int) string {
 	}
 	value = redactCommandDiagnostic(value)
 	return boundedHeadTailString(value, limit)
+}
+
+// SafeCommandDiagnostic redacts known credential forms and applies a bounded
+// head/tail representation suitable for renderer-visible errors and progress.
+// Structured parsers must continue to use the original CommandResult fields.
+func SafeCommandDiagnostic(value string, limit int) string {
+	return safeCommandFailureText(value, limit)
+}
+
+// RedactCommandDiagnostic removes known credential forms without changing the
+// output's line structure. Callers should use it only for output that is
+// already independently bounded, such as CommandResult stdout and stderr.
+func RedactCommandDiagnostic(value string) string {
+	return redactCommandDiagnostic(value)
 }
 
 func boundedHeadTailString(value string, limit int) string {

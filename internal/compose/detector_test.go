@@ -4,8 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +18,37 @@ import (
 	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/store"
 )
+
+type blockingConfigRunner struct {
+	calls atomic.Int32
+}
+
+func (r *blockingConfigRunner) RunCompose(ctx context.Context, _ string, _ ...string) (*providers.CommandResult, error) {
+	r.calls.Add(1)
+	<-ctx.Done()
+	return &providers.CommandResult{}, ctx.Err()
+}
+
+func (r *blockingConfigRunner) RunComposeEnv(ctx context.Context, workdir string, _ []string, args ...string) (*providers.CommandResult, error) {
+	return r.RunCompose(ctx, workdir, args...)
+}
+
+type nonCooperativeConfigRunner struct {
+	started  atomic.Int32
+	release  chan struct{}
+	finished chan struct{}
+}
+
+func (r *nonCooperativeConfigRunner) RunCompose(context.Context, string, ...string) (*providers.CommandResult, error) {
+	r.started.Add(1)
+	<-r.release
+	r.finished <- struct{}{}
+	return &providers.CommandResult{Stdout: "services:\n  late:\n    image: should-not-apply:latest\n"}, nil
+}
+
+func (r *nonCooperativeConfigRunner) RunComposeEnv(ctx context.Context, workdir string, _ []string, args ...string) (*providers.CommandResult, error) {
+	return r.RunCompose(ctx, workdir, args...)
+}
 
 func TestProjectDetectorLabelsWinOverImported(t *testing.T) {
 	t.Parallel()
@@ -98,6 +132,180 @@ func TestProjectDetectorLabelsWinOverImported(t *testing.T) {
 	if len(services) != 1 || services[0].ID != "linux_native/demo/web" || services[0].ReplicasRunning != 1 {
 		t.Fatalf("services = %#v", services)
 	}
+}
+
+func TestProjectDetectorRejectsOversizedComposeInputBeforeRunner(t *testing.T) {
+	root := t.TempDir()
+	composePath := filepath.Join(root, "compose.yaml")
+	file, err := os.Create(composePath)
+	if err != nil {
+		t.Fatalf("Create(compose): %v", err)
+	}
+	if err := file.Truncate(maxVerifiedConfigFileBytes + 1); err != nil {
+		_ = file.Close()
+		t.Fatalf("Truncate(compose): %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("Close(compose): %v", err)
+	}
+	runner := newFakeRunner()
+	detector := &ProjectDetector{Compose: NewClient(runner)}
+	project := &detectedProject{
+		record: store.ProjectRecord{
+			ID:           "provider/oversized",
+			Name:         "oversized",
+			WorkingDir:   root,
+			ComposeFiles: []string{composePath},
+			Metadata:     map[string]any{},
+		},
+		services: map[string]*detectedService{},
+	}
+
+	detector.enrichFromConfig(context.Background(), project)
+	if got := project.record.Metadata["errorCode"]; got != string(apperror.ComposeInvalid) {
+		t.Fatalf("errorCode = %#v, want %s", got, apperror.ComposeInvalid)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("Compose runner received an oversized detector input: %#v", runner.calls)
+	}
+}
+
+func TestProjectDetectorBoundsAggregateConfigEnrichmentProjects(t *testing.T) {
+	detected := make(map[string]*detectedProject, maxConfigEnrichProjects+3)
+	for index := 0; index < maxConfigEnrichProjects+3; index++ {
+		name := fmt.Sprintf("project-%03d", index)
+		detected[name] = &detectedProject{
+			record:   store.ProjectRecord{Name: name, Metadata: map[string]any{}},
+			services: map[string]*detectedService{},
+		}
+	}
+	(&ProjectDetector{}).enrichProjectsFromConfig(context.Background(), detected)
+	for index := 0; index < maxConfigEnrichProjects+3; index++ {
+		name := fmt.Sprintf("project-%03d", index)
+		warnings, _ := detected[name].record.Metadata["warnings"].([]string)
+		if index < maxConfigEnrichProjects && len(warnings) != 0 {
+			t.Fatalf("%s warnings = %#v, want none", name, warnings)
+		}
+		if index >= maxConfigEnrichProjects && !contains(warnings, "CONFIG_ENRICH_SKIPPED_LIMIT") {
+			t.Fatalf("%s warnings = %#v, want limit warning", name, warnings)
+		}
+	}
+}
+
+func TestProjectDetectorBoundsAggregateConfigEnrichmentTime(t *testing.T) {
+	root := t.TempDir()
+	composePath := filepath.Join(root, "compose.yaml")
+	if err := os.WriteFile(composePath, []byte("services: {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	detected := make(map[string]*detectedProject, 8)
+	for index := 0; index < 8; index++ {
+		name := fmt.Sprintf("project-%02d", index)
+		detected[name] = &detectedProject{
+			record: store.ProjectRecord{
+				Name:         name,
+				WorkingDir:   root,
+				ComposeFiles: []string{composePath},
+				Metadata:     map[string]any{},
+			},
+			services: map[string]*detectedService{},
+		}
+	}
+	runner := &blockingConfigRunner{}
+	detector := &ProjectDetector{
+		Compose:            NewClient(runner),
+		ConfigTimeout:      time.Second,
+		ConfigTotalTimeout: 25 * time.Millisecond,
+		ConfigConcurrency:  1,
+	}
+	started := time.Now()
+	detector.enrichProjectsFromConfig(context.Background(), detected)
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("aggregate enrichment took %v, want bounded cancellation", elapsed)
+	}
+	if calls := runner.calls.Load(); calls > 2 {
+		t.Fatalf("runner calls = %d after aggregate timeout, want at most in-flight work", calls)
+	}
+}
+
+func TestProjectDetectorNonCooperativeConfigWorkIsIsolatedAndPersistentlyAdmissionBounded(t *testing.T) {
+	root := t.TempDir()
+	composePath := filepath.Join(root, "compose.yaml")
+	if err := os.WriteFile(composePath, []byte("services: {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	detected := make(map[string]*detectedProject, 6)
+	for index := 0; index < 6; index++ {
+		name := fmt.Sprintf("project-%02d", index)
+		detected[name] = &detectedProject{
+			record: store.ProjectRecord{
+				ID:           "provider/" + name,
+				Name:         name,
+				WorkingDir:   root,
+				ComposeFiles: []string{composePath},
+				Metadata:     map[string]any{},
+			},
+			services: map[string]*detectedService{},
+		}
+	}
+	runner := &nonCooperativeConfigRunner{
+		release:  make(chan struct{}),
+		finished: make(chan struct{}, 2),
+	}
+	detector := &ProjectDetector{
+		Compose:            NewClient(runner),
+		ConfigTimeout:      time.Second,
+		ConfigTotalTimeout: 80 * time.Millisecond,
+		ConfigConcurrency:  2,
+	}
+	assertBounded := func(label string) {
+		t.Helper()
+		started := time.Now()
+		detector.enrichProjectsFromConfig(context.Background(), detected)
+		if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+			t.Fatalf("%s enrichment took %v with a non-cooperative runner", label, elapsed)
+		}
+	}
+	assertBounded("first")
+	if got := runner.started.Load(); got != 2 {
+		t.Fatalf("first runner starts = %d, want persistent admission cap 2; state=%s", got, detectedProjectsJSON(t, detected))
+	}
+	assertBounded("second")
+	if got := runner.started.Load(); got != 2 {
+		t.Fatalf("later reconcile grew non-cooperative work to %d, want 2", got)
+	}
+	stateBeforeRelease := detectedProjectsJSON(t, detected)
+	close(runner.release)
+	for index := 0; index < 2; index++ {
+		select {
+		case <-runner.finished:
+		case <-time.After(time.Second):
+			t.Fatal("non-cooperative runner did not finish after release")
+		}
+	}
+	deadline := time.Now().Add(time.Second)
+	for len(detector.configAdmissionSlots()) != 0 && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if got := len(detector.configAdmissionSlots()); got != 0 {
+		t.Fatalf("admission slots still occupied after runner release: %d", got)
+	}
+	if stateAfterRelease := detectedProjectsJSON(t, detected); stateAfterRelease != stateBeforeRelease {
+		t.Fatalf("late config work mutated returned detector state\nbefore=%s\nafter=%s", stateBeforeRelease, stateAfterRelease)
+	}
+}
+
+func detectedProjectsJSON(t *testing.T, detected map[string]*detectedProject) string {
+	t.Helper()
+	projects, services := projectStoreRecords(detected)
+	raw, err := json.Marshal(struct {
+		Projects []store.ProjectRecord `json:"projects"`
+		Services []store.ServiceRecord `json:"services"`
+	}{Projects: projects, Services: services})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
 }
 
 func TestProjectDetectorIgnoresObjectCacheWhenLiveDockerIsEmpty(t *testing.T) {
@@ -261,8 +469,32 @@ func TestProjectDetectorMapsBackendLabelPathsToHost(t *testing.T) {
 	if _, ok := record.Metadata["errorCode"]; ok {
 		t.Fatalf("metadata = %#v, want no errorCode", record.Metadata)
 	}
-	if !runner.hasCall(backendWorkdir + "|-f " + backendFile + " config") {
-		t.Fatalf("compose calls = %#v, want backend mapped config call", runner.calls)
+	verifiedConfigCall := false
+	for _, call := range runner.calls {
+		if call.workdir == "" || call.workdir == backendWorkdir || !composeConfigCommand(call.args) || !contains(call.args, "--no-interpolate") {
+			continue
+		}
+		projectDirectory := ""
+		configFile := ""
+		envFile := ""
+		for index := 0; index+1 < len(call.args); index++ {
+			switch call.args[index] {
+			case "--project-directory":
+				projectDirectory = call.args[index+1]
+			case "--env-file":
+				envFile = call.args[index+1]
+			case "-f":
+				configFile = call.args[index+1]
+			}
+		}
+		if projectDirectory == call.workdir && configFile != "" && configFile != backendFile && envFile != "" &&
+			verifiedConfigPathWithin(call.workdir, configFile) && verifiedConfigPathWithin(call.workdir, envFile) {
+			verifiedConfigCall = true
+			break
+		}
+	}
+	if !verifiedConfigCall {
+		t.Fatalf("compose calls = %#v, want mapped workdir/project-directory and private config snapshot", runner.calls)
 	}
 }
 

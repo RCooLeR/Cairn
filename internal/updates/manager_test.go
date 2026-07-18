@@ -1256,15 +1256,6 @@ func TestExecutorHelperBranches(t *testing.T) {
 	if got := serviceNameFromID("linux_native/demo/api/v1", "linux_native/demo"); got != "api/v1" {
 		t.Fatalf("serviceNameFromID project-prefixed = %q, want api/v1", got)
 	}
-	if got := metadataStringMap(map[string]any{"buildArgs": map[string]string{"A": "B"}}, "buildArgs"); got["A"] != "B" {
-		t.Fatalf("metadataStringMap string map = %#v", got)
-	}
-	if got := metadataStringMap(map[string]any{"buildArgs": map[string]any{"A": "B", "N": 1}}, "buildArgs"); got["A"] != "B" || got["N"] != "" {
-		t.Fatalf("metadataStringMap any map = %#v", got)
-	}
-	if metadataStringMap(map[string]any{"buildArgs": 1}, "buildArgs") != nil {
-		t.Fatalf("metadataStringMap invalid should be nil")
-	}
 	if metadataBool(map[string]any{"hasHealthcheck": "true"}, "hasHealthcheck") != true {
 		t.Fatalf("metadataBool string true failed")
 	}

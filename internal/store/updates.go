@@ -831,10 +831,6 @@ func (r *UpdateRepository) insertHistory(ctx context.Context, record UpdateHisto
 	if record.Result == "" {
 		record.Result = "started"
 	}
-	buildArgs := "{}"
-	if len(record.BuildArgs) > 0 {
-		buildArgs = jsonText(record.BuildArgs, "{}")
-	}
 	commands := "[]"
 	if len(record.Commands) > 0 {
 		commands = jsonText(record.Commands, "[]")
@@ -848,12 +844,12 @@ func (r *UpdateRepository) insertHistory(ctx context.Context, record UpdateHisto
 		)
 		VALUES (?, ?, NULLIF(?, ''), NULLIF(?, ''), ?, ?, NULLIF(?, ''),
 			NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''),
-			NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, '{}'), NULLIF(?, '[]'),
+			NULLIF(?, ''), NULLIF(?, ''), '{}', NULLIF(?, '[]'),
 			?, NULLIF(?, ''), NULLIF(?, ''), ?, NULLIF(?, ''), NULLIF(?, ''))
 	`, record.ProviderID, record.ContextName, record.ProjectID, record.ServiceID, string(record.UpdateKind),
 		record.ImageRef, record.BaseImageRef, record.OldImageID, record.OldDigest,
 		record.OldBaseDigest, record.NewImageID, record.NewDigest, record.NewBaseDigest,
-		record.DockerfileHash, buildArgs, commands, record.Result, record.HealthResult,
+		record.DockerfileHash, commands, record.Result, record.HealthResult,
 		record.RollbackStatus, formatTime(record.StartedAt), formatTime(record.FinishedAt),
 		record.Error)
 	if err != nil {
@@ -929,7 +925,7 @@ func (r *UpdateRepository) getHistory(ctx context.Context, scope runtimescope.Sc
 			COALESCE(old_image_id, ''), COALESCE(old_digest, ''),
 			COALESCE(old_base_digest, ''), COALESCE(new_image_id, ''),
 			COALESCE(new_digest, ''), COALESCE(new_base_digest, ''),
-			COALESCE(dockerfile_hash, ''), COALESCE(build_args_json, '{}'),
+			COALESCE(dockerfile_hash, ''), '{}' AS build_args_json,
 			COALESCE(commands_json, '[]'), result, COALESCE(health_result, ''),
 			started_at, COALESCE(finished_at, ''), COALESCE(rollback_status, ''),
 			COALESCE(error, '')
@@ -1022,7 +1018,7 @@ func scanUpdateHistory(scanner updateHistoryScanner) (UpdateHistoryRecord, error
 	var record UpdateHistoryRecord
 	var startedAt string
 	var finishedAt string
-	buildArgsJSON := "{}"
+	ignoredBuildArgsJSON := "{}"
 	commandsJSON := "[]"
 	if err := scanner.Scan(
 		&record.ID,
@@ -1040,7 +1036,7 @@ func scanUpdateHistory(scanner updateHistoryScanner) (UpdateHistoryRecord, error
 		&record.NewDigest,
 		&record.NewBaseDigest,
 		&record.DockerfileHash,
-		&buildArgsJSON,
+		&ignoredBuildArgsJSON,
 		&commandsJSON,
 		&record.Result,
 		&record.HealthResult,
@@ -1053,9 +1049,8 @@ func scanUpdateHistory(scanner updateHistoryScanner) (UpdateHistoryRecord, error
 	}
 	record.StartedAt = parseStoreTime(startedAt)
 	record.FinishedAt = parseStoreTime(finishedAt)
-	if err := json.Unmarshal([]byte(nullJSON(buildArgsJSON, "{}")), &record.BuildArgs); err != nil {
-		return UpdateHistoryRecord{}, err
-	}
+	// Legacy build-argument data is never restored into rollback/history state.
+	record.BuildArgs = nil
 	if err := json.Unmarshal([]byte(nullJSON(commandsJSON, "[]")), &record.Commands); err != nil {
 		return UpdateHistoryRecord{}, err
 	}

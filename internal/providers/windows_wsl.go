@@ -683,7 +683,7 @@ func (p *WindowsWSLProvider) configuredDistro() string {
 
 func (p *WindowsWSLProvider) detectDefaultWSLVersion(ctx context.Context) (int, bool) {
 	result, err := p.runner.Run(ctx, wslCommandTimeout, wslCommandName, "--status")
-	if err != nil || result == nil || result.ExitCode != 0 {
+	if err != nil || result == nil || result.ExitCode != 0 || result.StdoutTruncated {
 		return 0, false
 	}
 	return parseWSLDefaultVersion(result.Stdout)
@@ -699,7 +699,7 @@ func (p *WindowsWSLProvider) listDistrosForDetect(ctx context.Context) ([]wslDis
 	if isWSLInvocationFailure(result, err) {
 		return nil, false, true
 	}
-	if err != nil || result == nil || result.ExitCode != 0 {
+	if err != nil || result == nil || result.ExitCode != 0 || result.StdoutTruncated {
 		return nil, false, false
 	}
 	distros, err := parseWSLListVerbose(result.Stdout)
@@ -713,7 +713,7 @@ func (p *WindowsWSLProvider) runWSLOK(ctx context.Context, distro string, args .
 
 func (p *WindowsWSLProvider) runWSLText(ctx context.Context, distro string, args ...string) (string, bool) {
 	result, err := p.runWSL(ctx, distro, args...)
-	if err != nil || result == nil || result.ExitCode != 0 {
+	if err != nil || result == nil || result.ExitCode != 0 || result.StdoutTruncated {
 		return "", false
 	}
 	return strings.TrimSpace(decodeWSLOutput(result.Stdout)), true

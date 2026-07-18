@@ -75,6 +75,9 @@ func TestExecRunnerBoundsDualStreamOutputAndRedactsFailureDetail(t *testing.T) {
 	if len(result.Stdout) > commandOutputLimitBytes || len(result.Stderr) > commandOutputLimitBytes {
 		t.Fatalf("captured lengths = stdout %d, stderr %d; limit %d", len(result.Stdout), len(result.Stderr), commandOutputLimitBytes)
 	}
+	if !result.StdoutTruncated || !result.StderrTruncated {
+		t.Fatalf("truncation flags = stdout %t, stderr %t; want both true", result.StdoutTruncated, result.StderrTruncated)
+	}
 	for label, output := range map[string]string{"stdout": result.Stdout, "stderr": result.Stderr} {
 		if !strings.Contains(output, label+"-head") || !strings.Contains(output, label+"-tail") {
 			t.Fatalf("%s did not preserve useful head/tail: %q", label, output)
@@ -112,6 +115,9 @@ func TestCommandOutputBufferPreservesSmallOutputExactly(t *testing.T) {
 	}
 	if got, want := buffer.String(), "first line\nsecond line\n"; got != want {
 		t.Fatalf("String() = %q, want %q", got, want)
+	}
+	if buffer.Truncated() {
+		t.Fatal("Truncated() = true for fully retained output")
 	}
 }
 

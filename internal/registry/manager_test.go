@@ -196,6 +196,9 @@ func TestCredentialHelperNotFoundRecognizesOfficialStdoutMarkerOnly(t *testing.T
 	if credentialHelperNotFound(&providers.CommandResult{ExitCode: 1, Stdout: strings.Repeat("x", (4<<10)+1) + " credentials not found"}, errors.New("exit status 1")) {
 		t.Fatal("oversized helper output was used to authorize missing-credential handling")
 	}
+	if credentialHelperNotFound(&providers.CommandResult{ExitCode: 1, Stdout: "credentials not found in native keychain\n", StdoutTruncated: true}, errors.New("exit status 1")) {
+		t.Fatal("truncated helper output was used to authorize missing-credential handling")
+	}
 }
 
 func TestEncodeDockerAuthConfigHandlesBadDockerConfigJSON(t *testing.T) {
@@ -656,6 +659,14 @@ func TestDockerConfigCommandsFailClosedOnNilResult(t *testing.T) {
 	}
 	if err := manager.writeDockerConfigRaw(context.Background(), provider, []byte(`{"label":"Привіт"}`)); !apperror.IsCode(err, apperror.ProviderNotReady) {
 		t.Fatalf("writeDockerConfigRaw() error = %v, want provider not ready", err)
+	}
+}
+
+func TestDockerConfigReadFailsClosedOnTruncatedOutput(t *testing.T) {
+	provider := &fakeRegistryProvider{backendStdout: `{}`, backendStdoutTruncated: true}
+	manager := NewManager(fakeResolver{provider: provider}, nil)
+	if _, err := manager.readDockerConfigRaw(context.Background(), provider); !apperror.IsCode(err, apperror.ProviderNotReady) {
+		t.Fatalf("readDockerConfigRaw() error = %v, want provider-not-ready truncation rejection", err)
 	}
 }
 
@@ -1429,6 +1440,7 @@ type fakeRegistryProvider struct {
 	dockerStartOnce        sync.Once
 	backendLocks           map[string]string
 	backendNilResult       bool
+	backendStdoutTruncated bool
 	providerType           string
 	providerPlatform       string
 }
@@ -1544,7 +1556,7 @@ func (p *fakeRegistryProvider) RunBackendCommand(_ context.Context, input string
 			return &providers.CommandResult{Command: args, Stdout: stdout, ExitCode: 0}, nil
 		}
 	}
-	return &providers.CommandResult{Command: args, Stdout: p.backendStdout, Stderr: p.backendDefaultStderr, ExitCode: p.backendDefaultExitCode}, nil
+	return &providers.CommandResult{Command: args, Stdout: p.backendStdout, Stderr: p.backendDefaultStderr, StdoutTruncated: p.backendStdoutTruncated, ExitCode: p.backendDefaultExitCode}, nil
 }
 
 func backendLockNameForTest(command string) string {

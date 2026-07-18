@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"strings"
 	"testing"
 	"time"
 
@@ -57,8 +56,15 @@ func TestLineageRepositoryReplaceAndLookup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetService() error = %v", err)
 	}
-	if byService.BuildArgs["BASE"] != "alpine:3.20" {
-		t.Fatalf("BuildArgs = %#v", byService.BuildArgs)
+	if len(byService.BuildArgs) != 0 {
+		t.Fatalf("BuildArgs = %#v, want no persisted argument names or values", byService.BuildArgs)
+	}
+	var persistedBuildArgs string
+	if err := db.writer.QueryRowContext(ctx, `SELECT build_args_json FROM image_lineage WHERE service_id = ?`, record.ServiceID).Scan(&persistedBuildArgs); err != nil {
+		t.Fatalf("read persisted build args: %v", err)
+	}
+	if persistedBuildArgs != "{}" {
+		t.Fatalf("persisted BuildArgs = %q, want empty object", persistedBuildArgs)
 	}
 	byContainer, err := repo.GetContainer(ctx, "container-1")
 	if err != nil {
@@ -155,7 +161,7 @@ func TestLineageRepositoryReasons(t *testing.T) {
 	}
 }
 
-func TestLineageRepositoryRejectsMalformedBuildArgs(t *testing.T) {
+func TestLineageRepositoryDoesNotReviveMalformedLegacyBuildArgs(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	db, err := Open(ctx, t.TempDir()+"/cairn.db")
@@ -181,10 +187,10 @@ func TestLineageRepositoryRejectsMalformedBuildArgs(t *testing.T) {
 	}
 
 	records, err := db.Lineage().ListProject(ctx, "linux_native/demo")
-	if err == nil {
-		t.Fatalf("ListProject() records = %#v, want malformed build args error", records)
+	if err != nil {
+		t.Fatalf("ListProject() error = %v", err)
 	}
-	if !strings.Contains(err.Error(), "parse lineage build args") {
-		t.Fatalf("ListProject() error = %v, want build args parse context", err)
+	if len(records) != 1 || len(records[0].BuildArgs) != 0 {
+		t.Fatalf("ListProject() records = %#v, want legacy build args ignored", records)
 	}
 }

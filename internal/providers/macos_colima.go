@@ -497,7 +497,7 @@ func (p *MacOSColimaProvider) profileDockerHost(ctx context.Context) string {
 
 func (p *MacOSColimaProvider) runText(ctx context.Context, name string, args ...string) (string, bool) {
 	result, err := p.runner.Run(ctx, commandTimeout, name, args...)
-	if err != nil || result == nil || result.ExitCode != 0 {
+	if err != nil || result == nil || result.ExitCode != 0 || result.StdoutTruncated {
 		return "", false
 	}
 	return strings.TrimSpace(result.Stdout), true

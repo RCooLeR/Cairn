@@ -55,11 +55,13 @@ func (c *Client) BindRuntimeScope(scope runtimescope.Scope) error {
 }
 
 type ProjectOptions struct {
-	Workdir     string
-	Files       []string
-	ProjectName string
-	Profiles    []string
-	Env         []string
+	Workdir               string
+	ProjectDirectory      string
+	Files                 []string
+	InterpolationEnvFiles []string
+	ProjectName           string
+	Profiles              []string
+	Env                   []string
 }
 
 type BuildOptions struct {

@@ -1039,7 +1039,7 @@ func commandDetail(result *providers.CommandResult) apperror.Option {
 	if detail == "" {
 		detail = strings.TrimSpace(result.Stdout)
 	}
-	return apperror.WithDetail(detail)
+	return apperror.WithDetail(providers.SafeCommandDiagnostic(detail, 8<<10))
 }
 
 func backupCommand(order int, volumeName string, backupDir string, archiveName string, risk models.Risk) models.PlannedCommand {

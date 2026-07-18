@@ -56,6 +56,8 @@ Cairn can use a local Ollama or OpenAI-compatible endpoint for Docker help. The 
 http://127.0.0.1:11434
 ```
 
+For containment, the endpoint must be an `http` or `https` URL using a literal IPv4 or IPv6 loopback address and an explicit port. Hostnames (including `localhost`), remote/private/link-local addresses, URL credentials, queries, fragments, path-prefixed bases, proxies, and redirects are rejected.
+
 Preferred models start with `gemma4:12b-it-q8_0`, then `gemma4:12b`, with other local chat/code models as fallbacks. The agent can inspect Docker inventory, selected project files, logs, networks, images, and can request approval-gated Cairn tools.
 
 More detail: [docs/local-agent.md](docs/local-agent.md).

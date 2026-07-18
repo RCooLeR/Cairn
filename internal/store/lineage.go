@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -351,11 +350,11 @@ func insertLineageRecord(ctx context.Context, tx *sql.Tx, record LineageRecord) 
 		)
 		VALUES (?, ?, ?, NULLIF(?, ''), ?, NULLIF(?, ''), NULLIF(?, ''),
 			NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''),
-			NULLIF(?, ''), NULLIF(?, ''), ?, ?, ?, ?, ?)
+			NULLIF(?, ''), NULLIF(?, ''), '{}', ?, ?, ?, ?)
 	`, record.ProviderID, record.ContextName, record.ProjectID, record.ServiceID, record.ServiceName,
 		record.ContainerID, record.ServiceImageRef, record.ServiceImageID, record.ServiceDigest,
 		record.BuildContext, record.DockerfilePath, record.BuildTarget, record.DockerfileHash,
-		jsonText(record.BuildArgs, "{}"), string(record.Source), string(record.Confidence),
+		string(record.Source), string(record.Confidence),
 		formatTime(record.DiscoveredAt), formatTime(record.UpdatedAt))
 	if err != nil {
 		return err
@@ -446,7 +445,7 @@ func lineageSelectSQL() string {
 			COALESCE(service_image_id, ''), COALESCE(service_digest, ''),
 			COALESCE(build_context, ''), COALESCE(dockerfile_path, ''),
 			COALESCE(build_target, ''), COALESCE(dockerfile_hash, ''),
-			COALESCE(build_args_json, '{}'), source, confidence, discovered_at, updated_at
+			'{}' AS build_args_json, source, confidence, discovered_at, updated_at
 		FROM image_lineage
 	`
 }
@@ -457,7 +456,7 @@ type lineageScanner interface {
 
 func scanLineageRecord(scanner lineageScanner) (LineageRecord, error) {
 	var record LineageRecord
-	var argsJSON string
+	var ignoredBuildArgsJSON string
 	var source string
 	var confidence string
 	var discoveredAt string
@@ -477,7 +476,7 @@ func scanLineageRecord(scanner lineageScanner) (LineageRecord, error) {
 		&record.DockerfilePath,
 		&record.BuildTarget,
 		&record.DockerfileHash,
-		&argsJSON,
+		&ignoredBuildArgsJSON,
 		&source,
 		&confidence,
 		&discoveredAt,
@@ -485,9 +484,10 @@ func scanLineageRecord(scanner lineageScanner) (LineageRecord, error) {
 	); err != nil {
 		return LineageRecord{}, err
 	}
-	if err := json.Unmarshal([]byte(nullJSON(argsJSON, "{}")), &record.BuildArgs); err != nil {
-		return LineageRecord{}, fmt.Errorf("parse lineage build args: %w", err)
-	}
+	// Build-argument names and values are deliberately write-only discard data.
+	// Keep the scan slot for schema compatibility, but never revive legacy
+	// values into an in-memory record.
+	record.BuildArgs = nil
 	record.Source = models.LineageSource(source)
 	record.Confidence = models.Confidence(confidence)
 	record.DiscoveredAt = parseStoreTime(discoveredAt)

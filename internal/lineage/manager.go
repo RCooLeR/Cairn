@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -182,11 +181,15 @@ func (m *Manager) discoverService(ctx context.Context, project store.ProjectReco
 		BuildContext:    service.BuildContext,
 		DockerfilePath:  service.DockerfilePath,
 		BuildTarget:     service.BuildTarget,
-		BuildArgs:       buildArgsFromMetadata(service.Metadata),
-		Source:          models.LineageSourceUnknown,
-		Confidence:      models.ConfidenceUnknown,
-		DiscoveredAt:    now,
-		UpdatedAt:       now,
+		// Compose build-argument values are deliberately not persisted in
+		// service metadata. Re-reading legacy metadata here would copy old
+		// secrets into fresh lineage rows, so unresolved ARG-based bases fail
+		// closed until an ephemeral-input lineage path exists.
+		BuildArgs:    nil,
+		Source:       models.LineageSourceUnknown,
+		Confidence:   models.ConfidenceUnknown,
+		DiscoveredAt: now,
+		UpdatedAt:    now,
 	}
 	if container != nil {
 		record.ContainerID = container.Summary.ID
@@ -430,40 +433,6 @@ func splitImageNameTag(imageRef string) (string, string) {
 		name = imageRef
 	}
 	return name, tag
-}
-
-func buildArgsFromMetadata(metadata map[string]any) map[string]string {
-	args := map[string]string{}
-	raw, ok := metadata["buildArgs"]
-	if !ok {
-		return args
-	}
-	switch values := raw.(type) {
-	case map[string]string:
-		for key, value := range values {
-			args[key] = value
-		}
-	case map[string]any:
-		for key, value := range values {
-			args[key] = strings.TrimSpace(toString(value))
-		}
-	}
-	return args
-}
-
-func toString(value any) string {
-	switch typed := value.(type) {
-	case nil:
-		return ""
-	case string:
-		return typed
-	case []byte:
-		return string(typed)
-	case fmt.Stringer:
-		return typed.String()
-	default:
-		return fmt.Sprint(typed)
-	}
 }
 
 func (m *Manager) now() time.Time {

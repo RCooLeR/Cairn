@@ -47,6 +47,16 @@ func TestExistingContextDetectMissingContext(t *testing.T) {
 	}
 }
 
+func TestExistingContextRejectsTruncatedInspectOutput(t *testing.T) {
+	runner := existingContextRunner("remote-prod", "tcp://192.0.2.10:2375")
+	runner.truncated["docker context inspect remote-prod"] = true
+	provider := NewExistingContext(ExistingContextOptions{ContextName: "remote-prod", Runner: runner})
+
+	if _, err := provider.inspectContextTarget(context.Background(), false); !apperror.IsCode(err, apperror.ProviderNotReady) {
+		t.Fatalf("inspectContextTarget() error = %v, want provider-not-ready truncation rejection", err)
+	}
+}
+
 func TestExistingContextRunComposeUsesContextWorkdirAndEnv(t *testing.T) {
 	t.Parallel()
 	runner := &composeOptionsRunner{}
