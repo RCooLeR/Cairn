@@ -53,6 +53,7 @@ foreach ($directory in @(".github/workflows", "build/docker", "docs", "scripts")
         Where-Object { $_.Extension -in @("", ".json", ".md", ".ps1", ".sh", ".yaml", ".yml") } |
         Where-Object { $_.FullName -notin @(
                 (Join-Path $root "docs/development-server-mode.md"),
+                (Join-Path $root "scripts/check-dockerignore.ps1"),
                 (Join-Path $root "scripts/check-server-mode-containment.ps1")
             ) } |
         ForEach-Object { $stableSurfaceFiles.Add($_.FullName) }
