@@ -35,12 +35,16 @@ func (r *blockingConfigRunner) RunComposeEnv(ctx context.Context, workdir string
 
 type nonCooperativeConfigRunner struct {
 	started  atomic.Int32
+	entered  chan struct{}
 	release  chan struct{}
 	finished chan struct{}
 }
 
 func (r *nonCooperativeConfigRunner) RunCompose(context.Context, string, ...string) (*providers.CommandResult, error) {
 	r.started.Add(1)
+	if r.entered != nil {
+		r.entered <- struct{}{}
+	}
 	<-r.release
 	r.finished <- struct{}{}
 	return &providers.CommandResult{Stdout: "services:\n  late:\n    image: should-not-apply:latest\n"}, nil
@@ -249,33 +253,68 @@ func TestProjectDetectorNonCooperativeConfigWorkIsIsolatedAndPersistentlyAdmissi
 		}
 	}
 	runner := &nonCooperativeConfigRunner{
+		entered:  make(chan struct{}, 2),
 		release:  make(chan struct{}),
 		finished: make(chan struct{}, 2),
 	}
+	released := false
+	releaseRunner := func() {
+		if !released {
+			close(runner.release)
+			released = true
+		}
+	}
+	t.Cleanup(releaseRunner)
 	detector := &ProjectDetector{
 		Compose:            NewClient(runner),
 		ConfigTimeout:      time.Second,
-		ConfigTotalTimeout: 80 * time.Millisecond,
+		ConfigTotalTimeout: 5 * time.Second,
 		ConfigConcurrency:  2,
 	}
-	assertBounded := func(label string) {
-		t.Helper()
-		started := time.Now()
-		detector.enrichProjectsFromConfig(context.Background(), detected)
-		if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
-			t.Fatalf("%s enrichment took %v with a non-cooperative runner", label, elapsed)
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	t.Cleanup(cancelFirst)
+	firstDone := make(chan struct{})
+	go func() {
+		detector.enrichProjectsFromConfig(firstCtx, detected)
+		close(firstDone)
+	}()
+	for index := 0; index < 2; index++ {
+		select {
+		case <-runner.entered:
+		case <-firstDone:
+			t.Fatalf("first enrichment returned after %d runner starts, want 2", runner.started.Load())
+		case <-time.After(2 * time.Second):
+			t.Fatalf("first enrichment reached %d runner starts, want 2", runner.started.Load())
 		}
 	}
-	assertBounded("first")
+	cancelFirst()
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("first enrichment did not return promptly after cancellation")
+	}
 	if got := runner.started.Load(); got != 2 {
 		t.Fatalf("first runner starts = %d, want persistent admission cap 2; state=%s", got, detectedProjectsJSON(t, detected))
 	}
-	assertBounded("second")
+	secondCtx, cancelSecond := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	t.Cleanup(cancelSecond)
+	secondDone := make(chan struct{})
+	go func() {
+		detector.enrichProjectsFromConfig(secondCtx, detected)
+		close(secondDone)
+	}()
+	select {
+	case <-secondDone:
+	case <-time.After(2 * time.Second):
+		cancelSecond()
+		t.Fatal("second enrichment did not respect its context while admission was exhausted")
+	}
+	cancelSecond()
 	if got := runner.started.Load(); got != 2 {
 		t.Fatalf("later reconcile grew non-cooperative work to %d, want 2", got)
 	}
 	stateBeforeRelease := detectedProjectsJSON(t, detected)
-	close(runner.release)
+	releaseRunner()
 	for index := 0; index < 2; index++ {
 		select {
 		case <-runner.finished:

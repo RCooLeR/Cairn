@@ -581,7 +581,7 @@ func TestAgentProjectWalkBoundsHugeBreadthAndSupportsSymlinkRoot(t *testing.T) {
 	if err != nil || visited != 64 || len(first) > maxAgentProjectCandidates {
 		t.Fatalf("bounded candidates=%#v visited=%d err=%v", first, visited, err)
 	}
-	if len(first) != 1 || first[0] != composePath {
+	if len(first) != 1 || !testPathsReferToSameFile(t, first[0], composePath) {
 		t.Fatalf("priority candidates=%#v, want compose.yaml despite incomplete directory enumeration", first)
 	}
 	second, secondVisited, err := boundedAgentProjectCandidatesWithLimit(root, 64)
@@ -600,7 +600,7 @@ func TestAgentProjectWalkBoundsHugeBreadthAndSupportsSymlinkRoot(t *testing.T) {
 	}
 	foundPriority := false
 	for _, candidate := range complete {
-		if candidate == composePath {
+		if testPathsReferToSameFile(t, candidate, composePath) {
 			foundPriority = true
 			break
 		}
@@ -616,6 +616,19 @@ func TestAgentProjectWalkBoundsHugeBreadthAndSupportsSymlinkRoot(t *testing.T) {
 			t.Fatalf("agent files through symlinked root = %#v, %v", files, err)
 		}
 	}
+}
+
+func testPathsReferToSameFile(t *testing.T, left string, right string) bool {
+	t.Helper()
+	leftInfo, err := os.Stat(left)
+	if err != nil {
+		t.Fatalf("Stat(%q): %v", left, err)
+	}
+	rightInfo, err := os.Stat(right)
+	if err != nil {
+		t.Fatalf("Stat(%q): %v", right, err)
+	}
+	return os.SameFile(leftInfo, rightInfo)
 }
 
 func TestAgentProjectReadEmitsPriorityFilesBeforeFinalDTOCap(t *testing.T) {
