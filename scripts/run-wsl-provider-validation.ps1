@@ -88,9 +88,14 @@ function Assert-GoToolchain {
       if ($null -eq $go) {
         throw "go was not found on PATH."
       }
+      $toolchainLine = Select-String -LiteralPath (Join-Path $root "go.mod") -Pattern '^\s*toolchain\s+(go\S+)\s*$'
+      if ($null -eq $toolchainLine -or $toolchainLine.Matches.Count -ne 1) {
+        throw "go.mod must declare exactly one pinned Go toolchain."
+      }
+      $expectedVersion = $toolchainLine.Matches[0].Groups[1].Value
       $version = Invoke-Native "go env GOVERSION" $go.Source @("env", "GOVERSION")
-      if ($version.Trim() -ne "go1.26.4") {
-        throw "Go toolchain is $($version.Trim()), want go1.26.4"
+      if ($version.Trim() -ne $expectedVersion) {
+        throw "Go toolchain is $($version.Trim()), want $expectedVersion"
       }
     }
   }

@@ -20,9 +20,10 @@ tasks:
   env:check:
     summary: Verifies pinned local toolchain versions
     cmds:
-      - go version
-      - node --version
-      - npm --version
+      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/check-toolchain.ps1
+        platforms: [windows]
+      - cmd: pwsh -NoProfile -File scripts/check-toolchain.ps1
+        platforms: [linux, darwin]
 
   assets:sync:
     summary: Syncs Cairn source artwork into Wails build inputs

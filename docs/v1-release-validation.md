@@ -2,6 +2,12 @@
 
 Source of truth: `dev-docs/06-testing.md`, `dev-docs/05-security.md`, and `dev-docs/08-packaging-release.md`.
 
+## Toolchain and Docker build-input policy
+
+`go.mod` is the source of truth for the exact Go patch toolchain. `scripts/check-toolchain.ps1` verifies the installed Go version, the frontend Node/npm minimums, and the cross-image Go base; CI and release jobs run the same contract and inspect each packaged application's Go build information.
+
+`scripts/check-dockerignore.ps1` fails closed if tracked Docker contexts admit representative environment, credential, local-state, review, cache, database, log, or temporary paths. The cross-toolchain context is deny-all except for `Dockerfile.cross`. That image intentionally contains no Node/npm toolchain and refuses to compile unless the host build already produced `frontend/dist/index.html`; a tracked placeholder directory is never accepted as a production frontend.
+
 ## Automated release smoke
 
 Every push to `main` runs the normal CI matrix on Ubuntu 24.04, Windows, and macOS, then package smoke for NSIS, AppImage, deb, and dmg. The Linux package-smoke leg also installs and removes the generated `.deb` on Ubuntu, verifies the installed binary/desktop file/icon, checks that Docker package dependencies and the Docker group are untouched, and repeats the `.deb` install/remove smoke inside `debian:stable-slim`. It installs Chromium for Playwright and also runs:
@@ -26,7 +32,7 @@ On Windows developer machines with the dedicated `cairn-dev` distro, run the loc
 ./scripts/run-release-validation.ps1 -Suite wsl-provider
 ```
 
-This suite is intentionally not part of default CI because hosted Windows runners do not have `cairn-dev`; it preflights WSL2/systemd/Docker/Compose/Buildx, asserts the pinned Go 1.26.4 toolchain, runs the real WSL SDK connection, backup/restore, registry tag/push, and update/rebuild smokes, and fails if the Windows Docker context changes.
+This suite is intentionally not part of default CI because hosted Windows runners do not have `cairn-dev`; it preflights WSL2/systemd/Docker/Compose/Buildx, derives and asserts the pinned Go toolchain from `go.mod`, runs the real WSL SDK connection, backup/restore, registry tag/push, and update/rebuild smokes, and fails if the Windows Docker context changes.
 
 The Debian container package smoke can also be run after building Linux packages:
 

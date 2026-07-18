@@ -1,21 +1,68 @@
-.git
+# Source control and repository automation are not image inputs.
+**/.git
 .github
-.scratch
-.vscode
+
+# Environment files, credentials, and application state must never enter a
+# local or remote builder context. The recursive forms also cover ignored
+# project fixtures and accidentally nested worktrees.
+**/.env
+**/.env.*
+**/*.env
+**/*.env.*
+**/.npmrc
+**/.netrc
+**/.docker
+**/.aws
+**/.ssh
+**/*.pem
+**/*.key
+**/*.pfx
+**/*.p12
+**/.cairn
+**/.release-version.env
+
+# Editor, agent, review, and local-work directories.
+**/.idea
+**/.vscode
+**/.agents
+**/.claude
+**/.codex
+**/.cache
+**/.scratch
+**/.task
+**/.tools
+**/.gocache
+**/.golangci-cache
+**/.gomodcache
+**/.gopath
+**/.gotmp
+**/col-review
+**/claude-review.md
+**/dreview.md
+**/review.md
+
+# Generated binaries, dependencies, coverage, and test output.
 bin
 dist
 frontend/dist
 frontend/node_modules
 node_modules
 coverage
+coverage.out
 playwright-report
 test-results
-*.db
-*.db-*
-*.sqlite
-*.log
-*.tmp
-*.bak
-claude-review.md
-review.md
-dreview.md
+frontend/playwright-report
+frontend/test-results
+**/*.test
+**/*.exe
+
+# Databases, logs, and transient or backup files.
+**/logs
+**/*.db
+**/*.db-*
+**/*.sqlite
+**/*.sqlite3
+**/*.log
+**/*.tmp
+**/*.temp
+**/*.bak

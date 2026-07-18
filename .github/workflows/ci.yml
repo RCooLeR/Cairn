@@ -21,15 +21,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: Validate repository build inputs
+        shell: pwsh
+        run: |
+          ./scripts/check-dockerignore.ps1
+          ./scripts/check-toolchain.ps1 -SkipRuntime
+
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version: "1.26.4"
+          go-version-file: go.mod
           cache: true
-
-      - name: Assert pinned Go version
-        shell: bash
-        run: test "$(go version | awk '{print $3}')" = "go1.26.4"
 
       - name: Setup Node
         uses: actions/setup-node@v5
@@ -37,6 +39,10 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: frontend/package-lock.json
+
+      - name: Assert toolchain contract
+        shell: pwsh
+        run: ./scripts/check-toolchain.ps1
 
       - name: Install Linux Wails dependencies
         if: runner.os == 'Linux'
@@ -191,7 +197,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version: "1.26.4"
+          go-version-file: go.mod
           cache: true
 
       - name: Setup Node
@@ -200,6 +206,10 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: frontend/package-lock.json
+
+      - name: Assert toolchain contract
+        shell: pwsh
+        run: ./scripts/check-toolchain.ps1
 
       - name: Cache Wails CLI
         uses: actions/cache@v4
@@ -264,6 +274,28 @@ jobs:
         run: |
           $env:VITE_CAIRN_VERSION = $env:CAIRN_VERSION
           wails3 task ${{ matrix.task }} APP_VERSION=$env:CAIRN_VERSION GIT_COMMIT=$env:CAIRN_COMMIT BUILD_DATE=$env:CAIRN_BUILD_DATE INSTALL_SCOPE=user
+
+      - name: Verify packaged application Go toolchain
+        shell: pwsh
+        run: |
+          $toolchain = Select-String -LiteralPath go.mod -Pattern '^\s*toolchain\s+(go\S+)\s*$'
+          if ($null -eq $toolchain -or $toolchain.Matches.Count -ne 1) {
+            throw "go.mod must declare exactly one pinned Go toolchain."
+          }
+          $expected = $toolchain.Matches[0].Groups[1].Value
+          $binary = switch ("${{ matrix.platform }}") {
+            "windows" { "bin/cairn.exe" }
+            "linux" { "bin/cairn" }
+            "darwin" { "bin/cairn.app/Contents/MacOS/cairn" }
+            default { throw "Unsupported package platform: ${{ matrix.platform }}" }
+          }
+          if (!(Test-Path -LiteralPath $binary -PathType Leaf)) {
+            throw "Packaged application binary not found: $binary"
+          }
+          $header = & go version -m $binary | Select-Object -First 1
+          if ($LASTEXITCODE -ne 0 -or !$header.EndsWith(": $expected", [StringComparison]::Ordinal)) {
+            throw "Application build info is '$header', want Go toolchain $expected."
+          }
 
       - name: Check package artifacts
         shell: pwsh

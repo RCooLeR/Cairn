@@ -1,0 +1,4 @@
+# The cross-toolchain image is completely defined by Dockerfile.cross. Keep
+# every incidental file out of the actual build/docker context.
+**
+!Dockerfile.cross
