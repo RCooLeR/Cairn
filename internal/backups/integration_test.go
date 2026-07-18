@@ -101,8 +101,12 @@ func TestManagerRealDockerBackupRestoreRoundTrip(t *testing.T) {
 	if len(records) != 1 || records[0].Result != "success" {
 		t.Fatalf("backup records = %#v", records)
 	}
-	if _, err := os.Stat(records[0].Path); err != nil {
+	archiveInfo, err := os.Stat(records[0].Path)
+	if err != nil {
 		t.Fatalf("backup archive missing: %v", err)
+	}
+	if permissions := archiveInfo.Mode().Perm(); permissions != 0o600 {
+		t.Fatalf("backup archive permissions = %04o, want 0600", permissions)
 	}
 	if _, err := os.Stat(records[0].MetadataPath); err != nil {
 		t.Fatalf("backup metadata missing: %v", err)

@@ -1075,11 +1075,24 @@ func dockerRunBackupArgs(volumeName string, backupDir string, archiveName string
 		"-v", volumeName + ":/source:ro",
 		"-v", backupDir + ":/backup",
 		helperImage,
-		"tar", "czf", "/backup/" + archiveName,
-		"--exclude=.cairn-restore-old-*",
-		"-C", "/source", ".",
+		"sh", "-c",
+		backupHelperScript,
+		"cairn-backup",
+		"/backup/" + archiveName,
 	}
 }
+
+// The helper needs root access to read arbitrary volume contents. On native
+// Linux that also makes a newly-created bind-mounted archive owned by root,
+// which protected_hardlinks prevents the Cairn process from publishing with a
+// hard link. Transfer the completed archive to the private staging directory's
+// owner and restore its private mode before the helper exits.
+const backupHelperScript = `set -eu
+archive=$1
+tar czf "$archive" --exclude=.cairn-restore-old-* -C /source .
+owner=$(stat -c '%u:%g' /backup)
+chown "$owner" "$archive"
+chmod 0600 "$archive"`
 
 func dockerRunRestoreArgs(targetName string, backupDir string, archiveName string) []string {
 	return []string{

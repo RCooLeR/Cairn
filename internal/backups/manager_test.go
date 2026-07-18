@@ -912,8 +912,25 @@ func TestRestoreHelperUsesPositionalArchiveAndRollbackStash(t *testing.T) {
 		}
 	}
 	backupArgs := dockerRunBackupArgs("app-db", "/tmp/backups", "app-db.tar.gz")
-	if !slices.Contains(backupArgs, "--exclude=.cairn-restore-old-*") {
-		t.Fatalf("backup args do not exclude restore stash: %#v", backupArgs)
+	if got, want := backupArgs[len(backupArgs)-2], "cairn-backup"; got != want {
+		t.Fatalf("backup argv script name = %q, want %q", got, want)
+	}
+	if got, want := backupArgs[len(backupArgs)-1], "/backup/app-db.tar.gz"; got != want {
+		t.Fatalf("backup archive argv = %q, want %q", got, want)
+	}
+	backupScript := backupArgs[len(backupArgs)-3]
+	if strings.Contains(backupScript, "app-db.tar.gz") {
+		t.Fatalf("archive name was interpolated into backup shell script: %q", backupScript)
+	}
+	for _, want := range []string{
+		`tar czf "$archive" --exclude=.cairn-restore-old-* -C /source .`,
+		`stat -c '%u:%g' /backup`,
+		`chown "$owner" "$archive"`,
+		`chmod 0600 "$archive"`,
+	} {
+		if !strings.Contains(backupScript, want) {
+			t.Fatalf("backup script missing %q: %q", want, backupScript)
+		}
 	}
 }
 
@@ -1261,17 +1278,15 @@ func (p *fakeBackupProvider) RunDocker(ctx context.Context, args ...string) (*pr
 			return &providers.CommandResult{ExitCode: 1, Stderr: ctx.Err().Error()}, ctx.Err()
 		}
 	}
-	if slices.Contains(args, "czf") {
+	if scriptIndex := slices.Index(args, "cairn-backup"); scriptIndex >= 0 && scriptIndex+1 < len(args) {
 		archive := ""
 		backupDir := ""
 		for i, arg := range args {
 			if arg == "-v" && i+1 < len(args) && strings.HasSuffix(args[i+1], ":/backup") {
 				backupDir = strings.TrimSuffix(args[i+1], ":/backup")
 			}
-			if arg == "czf" && i+1 < len(args) {
-				archive = strings.TrimPrefix(args[i+1], "/backup/")
-			}
 		}
+		archive = strings.TrimPrefix(args[scriptIndex+1], "/backup/")
 		if archive != "" && backupDir != "" {
 			if err := os.WriteFile(filepath.Join(backupDir, archive), []byte("backup-data"), 0o600); err != nil {
 				return &providers.CommandResult{ExitCode: 1, Stderr: err.Error()}, err
