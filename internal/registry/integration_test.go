@@ -5,8 +5,8 @@ package registry
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"os"
 	"os/exec"
@@ -67,10 +67,12 @@ func TestManagerRealDockerRegistryAuthRoundTrip(t *testing.T) {
 	})
 
 	registryHost := waitForRegistry(t, ctx, provider, name)
+	installRealRegistryCredentialHelper(t, provider, registryHost, username)
 	manager := NewManager(realRegistryResolver{provider: provider}, nil)
 	if err := manager.Login(ctx, models.RegistryLoginRequest{Registry: registryHost, Username: username, Secret: secret, SecretKind: "password"}); err != nil {
 		t.Fatalf("Login() error = %v", err)
 	}
+	assertRealRegistryCredentialStorage(t, provider, registryHost)
 	accounts, err := manager.ListRegistryAccounts(ctx)
 	if err != nil {
 		t.Fatalf("ListRegistryAccounts() error = %v", err)
@@ -99,6 +101,9 @@ func TestManagerRealDockerRegistryAuthRoundTrip(t *testing.T) {
 
 	if err := manager.Logout(ctx, registryHost); err != nil {
 		t.Fatalf("Logout() error = %v", err)
+	}
+	if _, err := os.Stat(provider.credentialState); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("credential helper state after logout error = %v, want not exist", err)
 	}
 	_, err = manager.ResolveDigest(ctx, imageRef, ResolveOptions{BypassCache: true, Platform: Platform{OS: "linux", Architecture: "amd64"}})
 	if !apperror.IsCode(err, apperror.RegistryAuth) {
@@ -148,11 +153,116 @@ func normalizeDockerPort(stdout string) string {
 
 func hasRegistryAccount(accounts []models.RegistryAccount, registry string, username string) bool {
 	for _, account := range accounts {
-		if normalizeRegistryHost(account.Registry) == normalizeRegistryHost(registry) && account.Username == username && account.Source == "authsFile" {
+		if normalizeRegistryHost(account.Registry) == normalizeRegistryHost(registry) && account.Username == username && account.Source == "credHelper" {
 			return true
 		}
 	}
 	return false
+}
+
+const realRegistryCredentialHelperName = "cairn-test"
+
+const realRegistryCredentialHelperScript = `#!/bin/sh
+set -eu
+
+state=${CAIRN_TEST_CREDENTIAL_STATE:?}
+registry=${CAIRN_TEST_CREDENTIAL_REGISTRY:?}
+username=${CAIRN_TEST_CREDENTIAL_USERNAME:?}
+
+case "${1:-}" in
+store)
+	umask 077
+	tmp="${state}.tmp.$$"
+	trap 'rm -f "$tmp"' 0 1 2 15
+	cat > "$tmp"
+	chmod 0600 "$tmp"
+	mv "$tmp" "$state"
+	trap - 0 1 2 15
+	;;
+get)
+	cat >/dev/null
+	if [ ! -s "$state" ]; then
+		printf '%s\n' 'credentials not found in native keychain' >&2
+		exit 1
+	fi
+	cat "$state"
+	;;
+erase)
+	cat >/dev/null
+	rm -f "$state"
+	;;
+list)
+	if [ -s "$state" ]; then
+		printf '{"%s":"%s"}\n' "$registry" "$username"
+	else
+		printf '{}\n'
+	fi
+	;;
+*)
+	printf '%s\n' 'unsupported credential helper command' >&2
+	exit 64
+	;;
+esac
+`
+
+func installRealRegistryCredentialHelper(t *testing.T, provider *realRegistryProvider, registry string, username string) {
+	t.Helper()
+	helpersDir := t.TempDir()
+	if err := os.Chmod(helpersDir, 0o700); err != nil {
+		t.Fatalf("secure credential helper directory: %v", err)
+	}
+	helperPath := filepath.Join(helpersDir, "docker-credential-"+realRegistryCredentialHelperName)
+	if err := os.WriteFile(helperPath, []byte(realRegistryCredentialHelperScript), 0o700); err != nil {
+		t.Fatalf("write credential helper: %v", err)
+	}
+
+	provider.credentialHelperDir = helpersDir
+	provider.credentialState = filepath.Join(helpersDir, "credentials.json")
+	provider.credentialRegistry = helperServerURL(registry)
+	provider.credentialUsername = username
+
+	config := map[string]map[string]string{
+		"credHelpers": {
+			registryCredentialConfigKey(registry): realRegistryCredentialHelperName,
+		},
+	}
+	raw, err := json.MarshalIndent(config, "", "  ")
+	if err != nil {
+		t.Fatalf("encode Docker credential config: %v", err)
+	}
+	raw = append(raw, '\n')
+	if err := os.WriteFile(filepath.Join(provider.dockerConfig, "config.json"), raw, 0o600); err != nil {
+		t.Fatalf("write Docker credential config: %v", err)
+	}
+}
+
+func assertRealRegistryCredentialStorage(t *testing.T, provider *realRegistryProvider, registry string) {
+	t.Helper()
+	info, err := os.Stat(provider.credentialState)
+	if err != nil {
+		t.Fatalf("stat credential helper state: %v", err)
+	}
+	if got, want := info.Mode().Perm(), os.FileMode(0o600); got != want {
+		t.Fatalf("credential helper state mode = %o, want %o", got, want)
+	}
+
+	raw, err := os.ReadFile(filepath.Join(provider.dockerConfig, "config.json"))
+	if err != nil {
+		t.Fatalf("read Docker credential config: %v", err)
+	}
+	var config dockerConfig
+	if err := json.Unmarshal(raw, &config); err != nil {
+		t.Fatalf("parse Docker credential config: %v", err)
+	}
+	if got, want := helperForRegistry(config, registry), realRegistryCredentialHelperName; got != want {
+		t.Fatalf("credential helper = %q, want %q", got, want)
+	}
+	if key, entry, ok := authEntryForRegistry(config, registry); ok {
+		_, password, identityToken := decodeDockerAuth(entry)
+		if strings.TrimSpace(entry.Auth) != "" || password != "" || identityToken != "" {
+			t.Fatalf("inline credential remained for %q", key)
+		}
+	}
 }
 
 type realRegistryResolver struct {
@@ -164,7 +274,11 @@ func (r realRegistryResolver) ActiveProvider(context.Context) (providers.Platfor
 }
 
 type realRegistryProvider struct {
-	dockerConfig string
+	dockerConfig        string
+	credentialHelperDir string
+	credentialState     string
+	credentialRegistry  string
+	credentialUsername  string
 }
 
 func (p *realRegistryProvider) ID() string          { return "real-registry" }
@@ -199,16 +313,6 @@ func (p *realRegistryProvider) RunBackendCommand(ctx context.Context, input stri
 	if len(args) == 0 {
 		return nil, errors.New("backend command is required")
 	}
-	if len(args) >= 3 && args[0] == "sh" && args[1] == "-lc" && strings.Contains(args[2], "config.json") {
-		raw, err := os.ReadFile(filepath.Join(p.dockerConfig, "config.json"))
-		if errors.Is(err, os.ErrNotExist) {
-			return &providers.CommandResult{Command: args, ExitCode: 0}, nil
-		}
-		if err != nil {
-			return &providers.CommandResult{Command: args, ExitCode: 1, Stderr: err.Error()}, err
-		}
-		return &providers.CommandResult{Command: args, Stdout: string(raw), ExitCode: 0}, nil
-	}
 	return p.run(ctx, input, args[0], args[1:]...)
 }
 func (p *realRegistryProvider) RunCompose(context.Context, string, ...string) (*providers.CommandResult, error) {
@@ -225,8 +329,20 @@ func (p *realRegistryProvider) MapPathToHost(path string) (string, error)    { r
 
 func (p *realRegistryProvider) run(ctx context.Context, input string, name string, args ...string) (*providers.CommandResult, error) {
 	started := time.Now()
+	commandName := name
+	if p.credentialHelperDir != "" && name == "docker-credential-"+realRegistryCredentialHelperName {
+		name = filepath.Join(p.credentialHelperDir, name)
+	}
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Env = append(os.Environ(), "DOCKER_CONFIG="+p.dockerConfig)
+	if p.credentialHelperDir != "" {
+		cmd.Env = append(cmd.Env,
+			"PATH="+p.credentialHelperDir+string(os.PathListSeparator)+os.Getenv("PATH"),
+			"CAIRN_TEST_CREDENTIAL_STATE="+p.credentialState,
+			"CAIRN_TEST_CREDENTIAL_REGISTRY="+p.credentialRegistry,
+			"CAIRN_TEST_CREDENTIAL_USERNAME="+p.credentialUsername,
+		)
+	}
 	if input != "" {
 		cmd.Stdin = strings.NewReader(input)
 	}
@@ -236,7 +352,7 @@ func (p *realRegistryProvider) run(ctx context.Context, input string, name strin
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	result := &providers.CommandResult{
-		Command:  append([]string{name}, args...),
+		Command:  append([]string{commandName}, args...),
 		Stdout:   stdout.String(),
 		Stderr:   stderr.String(),
 		ExitCode: 0,
@@ -251,5 +367,5 @@ func (p *realRegistryProvider) run(ctx context.Context, input string, name strin
 	} else {
 		result.ExitCode = -1
 	}
-	return result, fmt.Errorf("%s %s: %w", name, strings.Join(args, " "), err)
+	return result, err
 }
