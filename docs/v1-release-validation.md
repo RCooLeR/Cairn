@@ -17,6 +17,7 @@ Every push to `main` runs the normal CI matrix on Ubuntu 24.04, Windows, and mac
 ```
 
 That release smoke covers:
+
 - the v1 release checklist evidence ledger mirroring every normative checkbox from `dev-docs/06-testing.md section 9` with an allowed release status;
 - the manual platform TODO ledger retaining every Windows/Linux/macOS condition from `dev-docs/06-testing.md section 2`;
 - synthetic soak-status checker fixtures proving completed runs must be at least 24 h, active, exit 0, and within the goroutine threshold;
@@ -74,6 +75,7 @@ Completed run: the real WSL/Linux 24 h soak `phase10-24h-20260614T071038Z` compl
 ## Performance re-verification
 
 Required evidence before v1.0:
+
 - CI `Release validation smoke` green on Linux for the seed-scale backend target.
 - Frontend Vitest dashboard/search performance assertions green in `frontend/src/App.test.tsx`.
 - Browser-level release UI seeded fixture green for dashboard first meaningful render, page switches, inventory filtering, and 5,000-line virtualized log rendering at the v1 scale target.
@@ -83,6 +85,7 @@ Required evidence before v1.0:
 ## Dependency Refresh Evidence
 
 2026-06-18 local dependency refresh:
+
 - Go modules were tidied and verified after updating Wails to `v3.0.0-alpha2.103` plus current transitive security/runtime modules.
 - CI and release workflows now install the matching Wails CLI `v3.0.0-alpha2.103`; generated TypeScript bindings stayed clean with that CLI.
 - Frontend package ranges were aligned with the resolved lockfile versions while keeping the locked v1 stack constraints: React 18, Tailwind 3, Vite 8, Vitest 4, and `@wailsio/runtime` `3.0.0-alpha.79`.
@@ -90,6 +93,7 @@ Required evidence before v1.0:
 - Local verification after the refresh covered `npm install`, `npm run format:check`, `npm run lint`, `npm test -- --run`, `npm run build`, `npm run audit` with the system CA store, `go mod verify`, `go test -p 1 . ./internal/... -count=1`, `go vet -unsafeptr=false . ./internal/...`, `go build . ./internal/...`, binding generation, and a Windows Wails build.
 
 Manual tester focus after this dependency refresh:
+
 - Launch the Windows build and verify the Settings -> About Wails version shows `v3.0.0-alpha2.103`.
 - Verify provider detection against the intended WSL distro or Docker context.
 - Open a project, drill into a running container, then check logs, files, and terminal.
@@ -114,6 +118,7 @@ Committed golden baselines live under `frontend/e2e/goldens/release-ui/` for Win
 - [x] Provider lifecycle and `needs_confirmation+` actions write audit rows with redacted command details.
 
 Security review evidence on 2026-06-14:
+
 - `./scripts/run-release-validation.ps1 -Suite security` passed on Windows with the pinned Go 1.26.4 toolchain.
 - The same focused suite passed in `cairn-dev` WSL with Linux Go 1.26.4 while the 24 h soak was running.
 - CI run 27502520080 passed on Ubuntu 24.04, Windows, and macOS for commit `0c2a928`; the Ubuntu package-smoke job also passed `Release validation smoke` with the expanded security suite.
@@ -130,6 +135,7 @@ Local Windows WSL evidence on 2026-06-15: `./scripts/run-release-validation.ps1 
 The current item-by-item `dev-docs/06-testing.md section 9` evidence ledger is `docs/v1-release-checklist.md`. It mirrors each v1 release checkbox, records whether evidence is green, in progress, or blocked by unavailable platform VMs, and names the exact remaining proof needed before v1.0. The unresolved platform matrix TODO is `docs/manual-platform-validation.md`; CI now checks that its full-matrix summary retains every Windows/Linux/macOS condition from `dev-docs/06-testing.md section 2`.
 
 Minimum manual evidence to append here before v1.0:
+
 - Windows 11 clean VM onboarding from WSL absent to working WSL2 Docker backend, plus uninstall cleanliness.
 - Clean Windows 11 rerun of the WSL runtime smoke after fresh onboarding, excluding Docker Desktop contexts.
 - macOS Apple Silicon Colima onboarding, existing-context switch, runtime smoke, and uninstall cleanliness.
