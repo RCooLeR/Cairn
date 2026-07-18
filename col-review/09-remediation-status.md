@@ -10,6 +10,7 @@ This ledger tracks implementation work started from the full review in this dire
 - Validated scope/lifecycle checkpoint: `d5adc8c`
 - Local annotated checkpoint tag: `snapshot/review-remediation-scope-lifecycle-2026-07-16`
 - Current validated remediation head: `439535f`
+- Local annotated final checkpoint tag: `snapshot/review-remediation-validated-2026-07-18`
 - Snapshot scope: all reviewed, non-ignored source, generated binding, Fable, and `col-review` files that were present before remediation began
 - Excluded as generated/local state: ignored build output, dependency directories, `.scratch`, and `.task`
 
