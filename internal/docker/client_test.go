@@ -1232,8 +1232,10 @@ func TestClientObjectEventBurstQueuesOnlyOneFollowUpReconcile(t *testing.T) {
 		t.Fatalf("first ContainerList call = %d, want 1", call)
 	}
 
-	// Force twenty separate flush windows containing 2,000 events while the
-	// first inventory call is blocked. Every flush requests reconciliation,
+	// Force at least twenty separate flush windows containing 2,000 events while
+	// the first inventory call is blocked. The fixed one-millisecond window may
+	// split a producer burst across payloads, so wait for each batch's final
+	// sentinel before starting the next one. Every flush requests reconciliation,
 	// but the one-slot dirty queue must collapse all of them into one follow-up.
 	for batch := 0; batch < 20; batch++ {
 		for item := 0; item < 100; item++ {
@@ -1242,10 +1244,8 @@ func TestClientObjectEventBurstQueuesOnlyOneFollowUpReconcile(t *testing.T) {
 				id:   fmt.Sprintf("container-%02d-%03d", batch, item),
 			}
 		}
-		payload = waitObjectsChanged(t, ctx, changed, time.Second)
-		if payload.Kind != objectKindContainer || len(payload.IDs) != 100 {
-			t.Fatalf("burst payload = %#v, want 100 container IDs", payload)
-		}
+		lastID := fmt.Sprintf("container-%02d-099", batch)
+		waitObjectsChangedKind(t, ctx, changed, objectKindContainer, lastID, time.Second)
 	}
 	if calls, active, maximum := api.counts(); calls != 1 || active != 1 || maximum != 1 {
 		t.Fatalf("blocked burst calls=%d active=%d max=%d, want 1/1/1", calls, active, maximum)
