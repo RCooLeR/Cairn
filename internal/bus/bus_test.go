@@ -286,6 +286,9 @@ func TestPublishCriticalSubscriptionCancellationUnblocksCapacityWait(t *testing.
 	if err := receiveError(t, result); !errors.Is(err, ErrSubscriptionClosed) {
 		t.Fatalf("PublishCritical error = %v, want ErrSubscriptionClosed", err)
 	}
+	// The publisher observes cancellation before the subscription worker's
+	// asynchronous output-channel teardown is necessarily complete.
+	waitForSignal(t, sub.stopped, "subscription cleanup after cancellation")
 	assertChannelClosed(t, ch)
 }
 
