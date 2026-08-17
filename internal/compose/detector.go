@@ -29,6 +29,99 @@ const (
 	maxConfigEnrichTotal        = 2 * time.Minute
 )
 
+type projectReconcileScopeKey struct {
+	providerID  string
+	contextName string
+}
+
+type projectReconcileWaiter struct {
+	ready chan struct{}
+}
+
+type projectReconcileGate struct {
+	active  bool
+	waiters []*projectReconcileWaiter
+}
+
+type projectReconcileRegistry struct {
+	mu    sync.Mutex
+	gates map[projectReconcileScopeKey]*projectReconcileGate
+}
+
+var projectReconcileScopes projectReconcileRegistry
+
+func (r *projectReconcileRegistry) acquire(ctx context.Context, scope runtimescope.Scope) (func(), error) {
+	key := projectReconcileScopeKey{
+		providerID:  scope.ProviderID(),
+		contextName: scope.ContextName(),
+	}
+	r.mu.Lock()
+	if r.gates == nil {
+		r.gates = make(map[projectReconcileScopeKey]*projectReconcileGate)
+	}
+	gate := r.gates[key]
+	if gate == nil {
+		gate = &projectReconcileGate{}
+		r.gates[key] = gate
+	}
+	waiter := &projectReconcileWaiter{ready: make(chan struct{})}
+	if !gate.active {
+		gate.active = true
+		close(waiter.ready)
+	} else {
+		gate.waiters = append(gate.waiters, waiter)
+	}
+	r.mu.Unlock()
+
+	select {
+	case <-ctx.Done():
+		r.mu.Lock()
+		queued := false
+		for i, candidate := range gate.waiters {
+			if candidate != waiter {
+				continue
+			}
+			copy(gate.waiters[i:], gate.waiters[i+1:])
+			gate.waiters[len(gate.waiters)-1] = nil
+			gate.waiters = gate.waiters[:len(gate.waiters)-1]
+			queued = true
+			break
+		}
+		r.mu.Unlock()
+		if !queued {
+			// The previous owner admitted this waiter concurrently with
+			// cancellation. Consume that admission and hand it to the next
+			// queued refresh without running a canceled reconciliation.
+			<-waiter.ready
+			r.release(key, gate)
+		}
+		return nil, ctx.Err()
+	case <-waiter.ready:
+	}
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			r.release(key, gate)
+		})
+	}, nil
+}
+
+func (r *projectReconcileRegistry) release(key projectReconcileScopeKey, gate *projectReconcileGate) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(gate.waiters) == 0 {
+		gate.active = false
+		delete(r.gates, key)
+		return
+	}
+	next := gate.waiters[0]
+	copy(gate.waiters, gate.waiters[1:])
+	gate.waiters[len(gate.waiters)-1] = nil
+	gate.waiters = gate.waiters[:len(gate.waiters)-1]
+	close(next.ready)
+}
+
 type DockerInventory interface {
 	ListContainers(context.Context, models.ContainerListOptions) ([]models.ContainerSummary, error)
 }
@@ -54,6 +147,12 @@ func (d *ProjectDetector) Reconcile(ctx context.Context) ([]models.ProjectSummar
 	if !d.Scope.Valid() {
 		return nil, apperror.New(apperror.ProviderNotReady, "Project detector runtime scope is not configured")
 	}
+	release, err := projectReconcileScopes.acquire(ctx, d.Scope)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
 	now := d.now()
 	detected := map[string]*detectedProject{}
 

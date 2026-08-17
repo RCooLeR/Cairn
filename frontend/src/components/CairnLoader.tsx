@@ -22,14 +22,17 @@ import {
 // ready — and a minimum on-screen time — it finishes to 100% and fades. A hard
 // max-wait dismisses anyway if that shared request hangs, so it cannot trap the
 // user (the app then shows its own provider/setup state).
-const RAMP_MS = 2600; // ease up to CAP
-const MIN_MS = 1700; // minimum on-screen time before finishing
+const RAMP_MS = 500; // ease up to CAP
+const MIN_MS = 250; // minimum on-screen time before finishing
 const CAP = 0.9; // ceiling held until the backend is ready
-const FINISH_MS = 700; // CAP → 100% once ready
-const HOLD_MS = 440; // dwell at 100% before fading
-const FADE_MS = 620; // must match the .leaving transition in cairn-loader.css
-const MAX_WAIT_MS = 12000; // give up waiting for the backend and dismiss anyway
-const PROGRESS_TICK_MS = 50;
+const FINISH_MS = 160; // CAP → 100% once ready
+const HOLD_MS = 60; // dwell at 100% before fading
+const FADE_MS = 160; // must match the .leaving transition in cairn-loader.css
+// The loader is presentation, not a readiness gate. Keep its worst-case
+// fallback below the first-meaningful-render budget even when version loading
+// is slow; the application continues to own and report that bootstrap state.
+const MAX_WAIT_MS = 600;
+const PROGRESS_TICK_MS = 25;
 const REDUCED_MOTION_QUERY = "(prefers-reduced-motion: reduce)";
 
 const LOG_LINES = [

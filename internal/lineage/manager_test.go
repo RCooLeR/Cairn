@@ -465,3 +465,40 @@ func TestManagerMissingProject(t *testing.T) {
 		t.Fatalf("DiscoverProjectLineage() error = %v, want E_NOT_FOUND", err)
 	}
 }
+
+func TestReadLineageDockerfileRejectsUnboundedAndSpecialInputs(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	valid := filepath.Join(root, "Dockerfile")
+	content := []byte("FROM alpine:3.20\n")
+	if err := os.WriteFile(valid, content, 0o600); err != nil {
+		t.Fatalf("write valid Dockerfile: %v", err)
+	}
+	got, err := readLineageDockerfile(valid)
+	if err != nil {
+		t.Fatalf("readLineageDockerfile(valid) error = %v", err)
+	}
+	if string(got) != string(content) {
+		t.Fatalf("readLineageDockerfile(valid) = %q, want %q", got, content)
+	}
+
+	oversized := filepath.Join(root, "Dockerfile.oversized")
+	file, err := os.Create(oversized)
+	if err != nil {
+		t.Fatalf("create oversized Dockerfile: %v", err)
+	}
+	if err := file.Truncate(maxLineageDockerfileBytes + 1); err != nil {
+		_ = file.Close()
+		t.Fatalf("truncate oversized Dockerfile: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close oversized Dockerfile: %v", err)
+	}
+	if _, err := readLineageDockerfile(oversized); err == nil {
+		t.Fatal("readLineageDockerfile(oversized) error = nil")
+	}
+
+	if _, err := readLineageDockerfile(root); err == nil {
+		t.Fatal("readLineageDockerfile(directory) error = nil")
+	}
+}

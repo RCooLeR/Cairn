@@ -72,7 +72,10 @@ export function Modal({
 
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !busyRef.current) {
+        event.preventDefault();
+        event.stopPropagation();
         onCloseRef.current();
+        return;
       }
       if (event.key !== "Tab" || !panelRef.current) {
         return;
@@ -89,7 +92,10 @@ export function Modal({
 
       const first = focusable[0];
       const last = focusable[focusable.length - 1];
-      if (event.shiftKey && document.activeElement === first) {
+      if (!panelRef.current.contains(document.activeElement)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      } else if (event.shiftKey && document.activeElement === first) {
         event.preventDefault();
         last.focus();
       } else if (!event.shiftKey && document.activeElement === last) {

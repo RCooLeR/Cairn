@@ -38,6 +38,25 @@ type VerifiedConfigInput struct {
 	Content []byte
 }
 
+// FingerprintConfigInputs returns a bounded digest of the complete
+// statically-addressable Compose input closure, including selected files,
+// includes, extends, interpolation env files, env_file entries, configs,
+// secrets, and label files. It invokes no provider command.
+func FingerprintConfigInputs(ctx context.Context, opts ProjectOptions) (string, error) {
+	prepared, err := prepareVerifiedConfigInputs(ctx, opts)
+	if err != nil {
+		return "", err
+	}
+	fingerprint := prepared.fingerprint
+	if cleanupErr := prepared.cleanup(); cleanupErr != nil {
+		return "", internalVerifiedConfigError(cleanupErr)
+	}
+	if err := verifiedConfigContextError(ctx); err != nil {
+		return "", err
+	}
+	return fingerprint, nil
+}
+
 type verifiedConfigRoot struct {
 	absPath  string
 	realPath string
@@ -74,7 +93,7 @@ func (c *Client) ConfigVerified(ctx context.Context, opts ProjectOptions) (resul
 	verifiedOpts.ProjectDirectory = prepared.snapshotProjectDirectory
 	verifiedOpts.Files = prepared.snapshotFiles
 	verifiedOpts.InterpolationEnvFiles = prepared.snapshotEnvFiles
-	backendOpts, err := c.strictBackendProjectOptions(verifiedOpts)
+	backendOpts, err := c.strictBackendProjectOptions(ctx, verifiedOpts)
 	if err != nil {
 		return nil, prepared.inputs, err
 	}
@@ -95,7 +114,7 @@ func (c *Client) ConfigVerified(ctx context.Context, opts ProjectOptions) (resul
 	return config, prepared.inputs, configErr
 }
 
-func (c *Client) strictBackendProjectOptions(opts ProjectOptions) (ProjectOptions, error) {
+func (c *Client) strictBackendProjectOptions(ctx context.Context, opts ProjectOptions) (ProjectOptions, error) {
 	if c == nil {
 		return ProjectOptions{}, apperror.New(apperror.ProviderNotReady, "Compose client is not ready")
 	}
@@ -108,6 +127,9 @@ func (c *Client) strictBackendProjectOptions(opts ProjectOptions) (ProjectOption
 			return path, nil
 		}
 		mapped, err := mapper.MapPathToBackend(path)
+		if contextErr := composeContextError(ctx, err); contextErr != nil {
+			return "", contextErr
+		}
 		if err != nil || strings.TrimSpace(mapped) == "" {
 			return "", apperror.New(apperror.ProviderNotReady, "Compose input paths could not be mapped to the active backend")
 		}

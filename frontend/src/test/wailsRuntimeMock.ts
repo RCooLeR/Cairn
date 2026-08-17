@@ -969,10 +969,13 @@ const callHandlers: Record<number, (...args: unknown[]) => unknown> = {
     const streamID = "logs-stream-1";
     if (isSeededFixture()) {
       globalThis.setTimeout(() => {
-        Events.Emit("logs:lines", {
-          streamID,
-          lines: seededLogLines(5000),
-        });
+        const lines = seededLogLines(5000);
+        for (let offset = 0; offset < lines.length; offset += 1000) {
+          Events.Emit("logs:lines", {
+            streamID,
+            lines: lines.slice(offset, offset + 1000),
+          });
+        }
       }, 75);
     }
     return streamID;

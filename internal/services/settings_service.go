@@ -1,8 +1,11 @@
 package services
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -27,6 +30,7 @@ const (
 	generalAutostartAppSetting = "general.autostart_app"
 	cairnReleaseOrigin         = "https://github.com"
 	cairnReleasePathPrefix     = "/RCooLeR/Cairn/releases/tag/"
+	maxAppUpdateResponseBytes  = 256 * 1024
 )
 
 func (s *SettingsService) GetSettings(ctx context.Context) (map[string]any, error) {
@@ -153,6 +157,13 @@ func (s *SettingsService) CheckAppUpdate(ctx context.Context, currentVersion str
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return nil, nil
 	}
+	payload, err := io.ReadAll(io.LimitReader(response.Body, maxAppUpdateResponseBytes+1))
+	if err != nil {
+		return nil, apperror.Wrap(apperror.Internal, "Read app update response failed", err)
+	}
+	if len(payload) > maxAppUpdateResponseBytes {
+		return nil, apperror.New(apperror.Internal, "App update response exceeded the safe size limit")
+	}
 	var release struct {
 		Draft       bool   `json:"draft"`
 		Prerelease  bool   `json:"prerelease"`
@@ -161,7 +172,14 @@ func (s *SettingsService) CheckAppUpdate(ctx context.Context, currentVersion str
 		HTMLURL     string `json:"html_url"`
 		PublishedAt string `json:"published_at"`
 	}
-	if err := json.NewDecoder(response.Body).Decode(&release); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	if err := decoder.Decode(&release); err != nil {
+		return nil, apperror.Wrap(apperror.Internal, "Decode app update response failed", err)
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("multiple JSON values")
+		}
 		return nil, apperror.Wrap(apperror.Internal, "Decode app update response failed", err)
 	}
 	canonicalURL, validReleaseURL := canonicalAppReleaseURL(release.HTMLURL, release.TagName)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"strconv"
@@ -469,6 +470,15 @@ func (c *Client) publish(topic bus.Topic, payload any) {
 		return
 	}
 	c.bus.Publish(bus.Event{Topic: topic, TS: c.now(), Payload: payload})
+}
+
+func (c *Client) publishCritical(topic bus.Topic, payload any) {
+	if c.bus == nil {
+		return
+	}
+	if err := bus.PublishCriticalBounded(c.bus, bus.Event{Topic: topic, TS: c.now(), Payload: payload}); err != nil {
+		slog.Warn("publish critical Docker event failed", "topic", topic, "error", err)
+	}
 }
 
 func (c *Client) withTimeout(ctx context.Context) (context.Context, context.CancelFunc) {

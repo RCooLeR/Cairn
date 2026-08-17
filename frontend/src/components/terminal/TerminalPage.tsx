@@ -39,6 +39,7 @@ import { Clipboard, Events } from "@wailsio/runtime";
 
 import { SettingsService, TerminalService } from "../../api/services";
 import { useClipboard } from "../../hooks/useClipboard";
+import { useFocusTrap } from "../../hooks/useFocusTrap";
 import {
   Badge,
   Button,
@@ -92,6 +93,11 @@ type TerminalClosedPayload = {
   exitCode: number;
 };
 
+const maxTerminalSessionIDLength = 4096;
+const maxTerminalOutputBase64Length = 1024 * 1024;
+const terminalOutputBase64Pattern =
+  /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
+
 type PasteGuardState = {
   busy: boolean;
   sessionID: string;
@@ -116,10 +122,7 @@ type TerminalSessionsState = {
 };
 
 type TerminalSessionTabNavigationKey =
-  | "ArrowLeft"
-  | "ArrowRight"
-  | "End"
-  | "Home";
+  "ArrowLeft" | "ArrowRight" | "End" | "Home";
 
 type TerminalOperation = "input" | "resize";
 
@@ -129,8 +132,7 @@ type TerminalOperationFailure = {
 };
 
 type TerminalOperationResult =
-  | { ok: true }
-  | { failure: TerminalOperationFailure; ok: false };
+  { ok: true } | { failure: TerminalOperationFailure; ok: false };
 
 type TerminalInputResult = "failed" | "guarded" | "sent";
 
@@ -200,6 +202,9 @@ export function TerminalPage({
   } | null>(null);
   const [busy, setBusy] = useState(false);
   const mountedRef = useRef(true);
+  const initialSessionsLoadedRef = useRef(false);
+  const sessionsAddedDuringInitialLoadRef = useRef(new Set<string>());
+  const sessionsRemovedDuringInitialLoadRef = useRef(new Set<string>());
   const pendingTimer = useRef<number | null>(null);
   const focusActiveSessionTabAfterUpdateRef = useRef(false);
   const sessionTabRefs = useRef(new Map<string, HTMLButtonElement>());
@@ -305,33 +310,61 @@ export function TerminalPage({
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
     TerminalService.ListTerminalSessions()
       .then((nextSessions) => {
+        if (cancelled) {
+          return;
+        }
         const normalized = nextSessions ?? [];
-        setTerminalSessions((current) => ({
-          activeSessionID: normalized.some(
-            (session) => session.id === current.activeSessionID,
-          )
-            ? current.activeSessionID
-            : (normalized[0]?.id ?? null),
-          sessions: normalized,
-        }));
+        initialSessionsLoadedRef.current = true;
+        setTerminalSessions((current) =>
+          mergeInitialTerminalSessions(
+            current,
+            normalized,
+            sessionsAddedDuringInitialLoadRef.current,
+            sessionsRemovedDuringInitialLoadRef.current,
+          ),
+        );
       })
       .catch((loadError: unknown) => {
-        setError(errorMessage(loadError, "Unable to load terminal sessions"));
+        if (!cancelled) {
+          initialSessionsLoadedRef.current = true;
+          setError(errorMessage(loadError, "Unable to load terminal sessions"));
+        }
       });
     SettingsService.GetCheatsheet()
-      .then((entries) => setCheatsheet(entries ?? []))
+      .then((entries) => {
+        if (!cancelled) {
+          setCheatsheet(entries ?? []);
+        }
+      })
       .catch((loadError: unknown) => {
-        setError(errorMessage(loadError, "Unable to load terminal cheatsheet"));
+        if (!cancelled) {
+          setError(
+            errorMessage(loadError, "Unable to load terminal cheatsheet"),
+          );
+        }
       });
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
     const off = Events.On("terminal:closed", (event) => {
       const payload = eventPayload<TerminalClosedPayload>(event);
-      if (!payload) {
+      if (
+        !payload ||
+        !isBoundedTerminalSessionID(payload.sessionID) ||
+        typeof payload.exitCode !== "number" ||
+        !Number.isFinite(payload.exitCode)
+      ) {
         return;
+      }
+      if (!initialSessionsLoadedRef.current) {
+        sessionsAddedDuringInitialLoadRef.current.delete(payload.sessionID);
+        sessionsRemovedDuringInitialLoadRef.current.add(payload.sessionID);
       }
       restoreSessionTabFocusWhenRemoving(payload.sessionID);
       setTerminalSessions((current) =>
@@ -375,7 +408,11 @@ export function TerminalPage({
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && pendingTimer.current !== null) {
+      if (
+        event.key === "Escape" &&
+        pendingTimer.current !== null &&
+        !document.querySelector('[role="dialog"][aria-modal="true"]')
+      ) {
         window.clearTimeout(pendingTimer.current);
         pendingTimer.current = null;
         setPendingRun(null);
@@ -399,6 +436,10 @@ export function TerminalPage({
     if (!session) {
       return null;
     }
+    if (!initialSessionsLoadedRef.current) {
+      sessionsRemovedDuringInitialLoadRef.current.delete(session.id);
+      sessionsAddedDuringInitialLoadRef.current.add(session.id);
+    }
     setTerminalSessions((current) => {
       const sessions = current.sessions.some((item) => item.id === session.id)
         ? current.sessions
@@ -407,6 +448,32 @@ export function TerminalPage({
     });
     return session;
   }, []);
+
+  const adoptOpenedSession = useCallback(
+    async (session: TerminalSessionInfo | null) => {
+      if (!session) {
+        return null;
+      }
+      if (mountedRef.current) {
+        return addSession(session);
+      }
+
+      // Opening a terminal mutates backend state before the promise resolves.
+      // If navigation unmounted this page, no live component can adopt the
+      // returned session and a remounted page may already have completed its
+      // initial enumeration. Close the late session instead of leaving an
+      // invisible backend PTY behind.
+      try {
+        await TerminalService.CloseTerminal(session.id);
+      } catch {
+        // The page is already gone, so there is no safe local error surface.
+        // A later terminal-page enumeration can still recover a session that
+        // the backend could not close.
+      }
+      return null;
+    },
+    [addSession],
+  );
 
   useEffect(() => {
     if (!initialSession) {
@@ -429,30 +496,38 @@ export function TerminalPage({
     setBusy(true);
     setError(null);
     try {
-      addSession(
+      await adoptOpenedSession(
         await TerminalService.OpenHostTerminal({ cols: 120, rows: 30 }),
       );
     } catch (openError: unknown) {
-      setError(errorMessage(openError, "Unable to open host terminal"));
+      if (mountedRef.current) {
+        setError(errorMessage(openError, "Unable to open host terminal"));
+      }
     } finally {
-      setBusy(false);
+      if (mountedRef.current) {
+        setBusy(false);
+      }
     }
-  }, [addSession]);
+  }, [adoptOpenedSession]);
 
   const openBackend = useCallback(async () => {
     setBusy(true);
     setError(null);
     try {
-      return addSession(
+      return await adoptOpenedSession(
         await TerminalService.OpenBackendTerminal({ cols: 120, rows: 30 }),
       );
     } catch (openError: unknown) {
-      setError(errorMessage(openError, "Unable to open backend terminal"));
+      if (mountedRef.current) {
+        setError(errorMessage(openError, "Unable to open backend terminal"));
+      }
       return null;
     } finally {
-      setBusy(false);
+      if (mountedRef.current) {
+        setBusy(false);
+      }
     }
-  }, [addSession]);
+  }, [adoptOpenedSession]);
 
   const openProject = useCallback(async () => {
     if (!selectedProjectID) {
@@ -461,18 +536,22 @@ export function TerminalPage({
     setBusy(true);
     setError(null);
     try {
-      addSession(
+      await adoptOpenedSession(
         await TerminalService.OpenProjectTerminal(selectedProjectID, {
           cols: 120,
           rows: 30,
         }),
       );
     } catch (openError: unknown) {
-      setError(errorMessage(openError, "Unable to open project terminal"));
+      if (mountedRef.current) {
+        setError(errorMessage(openError, "Unable to open project terminal"));
+      }
     } finally {
-      setBusy(false);
+      if (mountedRef.current) {
+        setBusy(false);
+      }
     }
-  }, [addSession, selectedProjectID]);
+  }, [adoptOpenedSession, selectedProjectID]);
 
   const openContainer = useCallback(async () => {
     if (!selectedTerminalContainerID) {
@@ -481,7 +560,7 @@ export function TerminalPage({
     setBusy(true);
     setError(null);
     try {
-      addSession(
+      await adoptOpenedSession(
         await TerminalService.OpenContainerTerminal(
           selectedTerminalContainerID,
           {
@@ -494,12 +573,16 @@ export function TerminalPage({
         ),
       );
     } catch (openError: unknown) {
-      setError(errorMessage(openError, "Unable to open container terminal"));
+      if (mountedRef.current) {
+        setError(errorMessage(openError, "Unable to open container terminal"));
+      }
     } finally {
-      setBusy(false);
+      if (mountedRef.current) {
+        setBusy(false);
+      }
     }
   }, [
-    addSession,
+    adoptOpenedSession,
     containerShell,
     containerUser,
     containerWorkdir,
@@ -512,6 +595,10 @@ export function TerminalPage({
       focusActiveTabAfterRemoval = false,
     ) => {
       await TerminalService.CloseTerminal(session.id);
+      if (!initialSessionsLoadedRef.current) {
+        sessionsAddedDuringInitialLoadRef.current.delete(session.id);
+        sessionsRemovedDuringInitialLoadRef.current.add(session.id);
+      }
       if (
         focusActiveTabAfterRemoval &&
         sessionTabRefs.current.get(session.id)?.isConnected
@@ -1266,16 +1353,31 @@ export function CommandPalette<T extends string>({
   pages,
 }: CommandPaletteProps<T>) {
   const copyText = useClipboard();
+  const panelRef = useRef<HTMLDivElement | null>(null);
   const [query, setQuery] = useState("");
   const [commands, setCommands] = useState<CheatsheetEntry[]>([]);
 
+  useFocusTrap(open, panelRef, onClose);
+
   useEffect(() => {
     if (!open) {
-      return;
+      return undefined;
     }
+    let active = true;
     SettingsService.GetCheatsheet()
-      .then((entries) => setCommands(entries ?? []))
-      .catch(() => setCommands([]));
+      .then((entries) => {
+        if (active) {
+          setCommands(entries ?? []);
+        }
+      })
+      .catch(() => {
+        if (active) {
+          setCommands([]);
+        }
+      });
+    return () => {
+      active = false;
+    };
   }, [open]);
 
   const filteredPages = pages.filter((page) =>
@@ -1297,20 +1399,16 @@ export function CommandPalette<T extends string>({
       aria-label="Command palette"
       aria-modal="true"
       className="fixed inset-0 z-50 overflow-y-auto bg-black/55 px-4 py-6 sm:py-20"
+      ref={panelRef}
       role="dialog"
+      tabIndex={-1}
     >
       <div className="mx-auto w-full max-w-2xl overflow-hidden rounded-card border border-border bg-bg-panel shadow-2xl">
         <div className="flex h-12 items-center gap-2 border-b border-border px-3">
           <Command size={17} />
           <input
-            autoFocus
             className="h-full flex-1 bg-transparent text-sm outline-none"
             onChange={(event) => setQuery(event.target.value)}
-            onKeyDown={(event) => {
-              if (event.key === "Escape") {
-                onClose();
-              }
-            }}
             placeholder="Search"
             value={query}
           />
@@ -1509,7 +1607,12 @@ const TerminalSurface = forwardRef<TerminalSurfaceHandle, TerminalSurfaceProps>(
     useEffect(() => {
       const off = Events.On("terminal:data", (event) => {
         const payload = eventPayload<TerminalDataPayload>(event);
-        if (!payload || payload.sessionID !== session.id) {
+        if (
+          !payload ||
+          !isBoundedTerminalSessionID(payload.sessionID) ||
+          !isBoundedTerminalOutputBase64(payload.dataBase64) ||
+          payload.sessionID !== session.id
+        ) {
           return;
         }
         terminalRef.current?.write(decodeBase64Bytes(payload.dataBase64));
@@ -1757,6 +1860,27 @@ function removeTerminalSession(
   };
 }
 
+function mergeInitialTerminalSessions(
+  current: TerminalSessionsState,
+  listed: TerminalSessionInfo[],
+  locallyAdded: ReadonlySet<string>,
+  locallyRemoved: ReadonlySet<string>,
+): TerminalSessionsState {
+  const sessions = listed.filter((session) => !locallyRemoved.has(session.id));
+  const knownIDs = new Set(sessions.map((session) => session.id));
+  for (const session of current.sessions) {
+    if (locallyAdded.has(session.id) && !knownIDs.has(session.id)) {
+      sessions.push(session);
+      knownIDs.add(session.id);
+    }
+  }
+  const activeSessionID =
+    current.activeSessionID && knownIDs.has(current.activeSessionID)
+      ? current.activeSessionID
+      : (sessions[0]?.id ?? null);
+  return { activeSessionID, sessions };
+}
+
 function isTerminalSessionTabNavigationKey(
   key: string,
 ): key is TerminalSessionTabNavigationKey {
@@ -1878,11 +2002,30 @@ function eventPayload<T>(event: unknown): T | null {
   if (!isEventRecord(event) || !("data" in event)) {
     return null;
   }
-  return event.data == null ? null : (event.data as T);
+  return isEventRecord(event.data) && !Array.isArray(event.data)
+    ? (event.data as T)
+    : null;
 }
 
 function isEventRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function isBoundedTerminalSessionID(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length <= maxTerminalSessionIDLength &&
+    Boolean(value.trim())
+  );
+}
+
+function isBoundedTerminalOutputBase64(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length <= maxTerminalOutputBase64Length &&
+    value.length % 4 === 0 &&
+    terminalOutputBase64Pattern.test(value)
+  );
 }
 
 function errorMessage(error: unknown, fallback: string) {

@@ -3,10 +3,13 @@ package docker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -31,9 +34,12 @@ import (
 )
 
 const (
-	defaultImageSearchLimit = 25
-	maxImageSearchLimit     = 100
-	restartPolicyNone       = "no"
+	defaultImageSearchLimit      = 25
+	maxImageSearchLimit          = 100
+	maxImageLoadResponseBytes    = 4 * 1024 * 1024
+	maxImageLoadResponseMessages = 4096
+	maxImageLoadResultBytes      = 64 * 1024
+	restartPolicyNone            = "no"
 )
 
 var dockerNamePattern = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
@@ -277,20 +283,31 @@ func (c *Client) SaveImage(ctx context.Context, imageRefs []string, destPath str
 	c.publishJobProgress(jobID, "save", "Starting image save", nil)
 	reader, err := api.ImageSave(ctx, refs)
 	if err != nil {
-		c.publishJobDone(jobID, "", err)
-		return jobID, mapDockerError("save image", err)
+		actionErr := mapDockerError("save image", err)
+		c.publishJobDone(jobID, "", actionErr)
+		return jobID, actionErr
 	}
+	if reader == nil {
+		actionErr := apperror.New(apperror.DockerUnreachable, "Docker returned an empty image save stream")
+		c.publishJobDone(jobID, "", actionErr)
+		return jobID, actionErr
+	}
+	readerClosed := false
 	defer func() {
-		_ = reader.Close()
+		if !readerClosed {
+			_ = reader.Close()
+		}
 	}()
 
-	file, err := os.Create(path)
+	file, err := os.CreateTemp(filepath.Dir(path), ".cairn-image-save-*.tmp")
 	if err != nil {
-		c.publishJobDone(jobID, "", err)
-		return jobID, apperror.Wrap(apperror.Internal, "Create image archive failed", err)
+		actionErr := apperror.Wrap(apperror.Internal, "Create temporary image archive failed", err)
+		c.publishJobDone(jobID, "", actionErr)
+		return jobID, actionErr
 	}
+	temporaryPath := file.Name()
 	defer func() {
-		_ = file.Close()
+		_ = os.Remove(temporaryPath)
 	}()
 
 	counter := &progressWriter{
@@ -299,9 +316,22 @@ func (c *Client) SaveImage(ctx context.Context, imageRefs []string, destPath str
 			c.publishJobProgress(jobID, "save", fmt.Sprintf("Saved %d bytes", bytes), nil)
 		},
 	}
-	if _, err := io.Copy(file, io.TeeReader(reader, counter)); err != nil {
-		c.publishJobDone(jobID, "", err)
-		return jobID, mapDockerError("save image archive", err)
+	_, writeErr := writeSyncedImageArchive(file, io.TeeReader(reader, counter))
+	closeReaderErr := reader.Close()
+	readerClosed = true
+	if err := errors.Join(writeErr, closeReaderErr); err != nil {
+		actionErr := apperror.Wrap(apperror.Internal, "Write image archive failed", err)
+		c.publishJobDone(jobID, "", actionErr)
+		return jobID, actionErr
+	}
+	committed, err := publishImageArchiveNoClobber(temporaryPath, path)
+	if err != nil {
+		result := ""
+		if committed {
+			result = path
+		}
+		c.publishJobDone(jobID, result, err)
+		return jobID, err
 	}
 	c.publishJobProgress(jobID, "save", "Image archive saved", floatPtr(100))
 	c.publishJobDone(jobID, path, nil)
@@ -317,46 +347,375 @@ func (c *Client) LoadImage(ctx context.Context, srcPath string) (string, error) 
 	if path == "" {
 		return "", apperror.New(apperror.Conflict, "Source path is required")
 	}
-	file, err := os.Open(path)
+	file, identity, err := openVerifiedImageArchive(path)
 	if err != nil {
-		return "", apperror.Wrap(apperror.NotFound, "Open image archive failed", err)
+		return "", err
 	}
+	fileClosed := false
 	defer func() {
-		_ = file.Close()
+		if !fileClosed {
+			_ = file.Close()
+		}
 	}()
 
-	var total int64
-	if stat, err := file.Stat(); err == nil {
-		total = stat.Size()
-	}
 	jobID := newJobID("load-image")
 	c.publishJobProgress(jobID, "load", "Starting image load", nil)
 	reader := &progressReader{
 		reader: file,
-		total:  total,
+		total:  identity.Size(),
 		every:  1 << 20,
 		onProgress: func(bytes int64, pct *float64) {
 			c.publishJobProgress(jobID, "load", fmt.Sprintf("Read %d bytes", bytes), pct)
 		},
 	}
-	response, err := api.ImageLoad(ctx, reader)
-	if err != nil {
-		c.publishJobDone(jobID, "", err)
-		return jobID, mapDockerError("load image", err)
-	}
+	// Once ImageLoad is invoked, Docker may have imported one or more images
+	// even when the upload call, local archive verification, response stream, or
+	// response close later fails. Reconcile from a bounded detached context on
+	// every return after this mutation boundary, and notify inventory consumers
+	// only after that reconciliation attempt has completed.
+	reconcileCtx := context.WithoutCancel(ctx)
 	defer func() {
-		_ = response.Body.Close()
+		c.reconcileKind(reconcileCtx, objectKindImage)
+		c.publishImageChanged("")
 	}()
-	body, err := io.ReadAll(response.Body)
-	if err != nil {
-		c.publishJobDone(jobID, "", err)
-		return jobID, mapDockerError("read image load response", err)
+
+	response, loadErr := api.ImageLoad(ctx, reader)
+	verifyErr := verifyOpenedImageArchive(path, file, identity)
+	fileCloseErr := file.Close()
+	fileClosed = true
+
+	var outcome imageLoadResponseOutcome
+	var responseErr error
+	if response.Body != nil {
+		var decodeErr error
+		outcome, decodeErr = decodeImageLoadResponse(response.Body)
+		responseCloseErr := response.Body.Close()
+		if responseCloseErr != nil {
+			responseCloseErr = apperror.Wrap(apperror.Internal, "Close image load response failed", responseCloseErr)
+		}
+		responseErr = errors.Join(decodeErr, responseCloseErr)
+	} else if loadErr == nil {
+		responseErr = apperror.New(apperror.DockerUnreachable, "Docker returned an empty image load response")
 	}
-	result := strings.TrimSpace(string(body))
+
+	var mappedLoadErr error
+	if loadErr != nil {
+		mappedLoadErr = mapDockerError("load image", loadErr)
+	}
+	if fileCloseErr != nil {
+		fileCloseErr = apperror.Wrap(apperror.Internal, "Close image archive failed", fileCloseErr)
+	}
+	if actionCause := errors.Join(mappedLoadErr, verifyErr, fileCloseErr, responseErr); actionCause != nil {
+		actionErr := partialImageLoadError(actionCause, outcome)
+		result := ""
+		if outcome.Completed {
+			result = outcome.Result
+		}
+		c.publishJobDone(jobID, result, actionErr)
+		return jobID, actionErr
+	}
 	c.publishJobProgress(jobID, "load", "Image archive loaded", floatPtr(100))
-	c.publishJobDone(jobID, result, nil)
-	c.publishImageChanged("")
+	c.publishJobDone(jobID, outcome.Result, nil)
 	return jobID, nil
+}
+
+type syncedWriteCloser interface {
+	io.Writer
+	Sync() error
+	Close() error
+}
+
+func writeSyncedImageArchive(destination syncedWriteCloser, source io.Reader) (int64, error) {
+	written, copyErr := io.Copy(destination, source)
+	if copyErr != nil {
+		return written, errors.Join(copyErr, destination.Close())
+	}
+	syncErr := destination.Sync()
+	closeErr := destination.Close()
+	return written, errors.Join(syncErr, closeErr)
+}
+
+func publishImageArchiveNoClobber(temporaryPath string, destinationPath string) (bool, error) {
+	if err := os.Link(temporaryPath, destinationPath); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return false, apperror.New(
+				apperror.Conflict,
+				"Image archive destination already exists",
+				apperror.WithDetail(destinationPath),
+			)
+		}
+		return false, apperror.Wrap(
+			apperror.Internal,
+			"Publish image archive failed",
+			err,
+			apperror.WithDetail("The destination filesystem must support same-directory hard links for atomic no-clobber publication."),
+		)
+	}
+	if err := os.Remove(temporaryPath); err != nil {
+		return true, apperror.Wrap(
+			apperror.Internal,
+			"Image archive was saved but temporary file cleanup failed",
+			err,
+			apperror.WithPartialResource("file", destinationPath, "created", false),
+		)
+	}
+	return true, nil
+}
+
+func openVerifiedImageArchive(path string) (*os.File, fs.FileInfo, error) {
+	before, err := os.Lstat(path)
+	if err != nil {
+		return nil, nil, apperror.Wrap(apperror.NotFound, "Open image archive failed", err)
+	}
+	if err := validateImageArchiveInfo(before); err != nil {
+		return nil, nil, err
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, nil, apperror.Wrap(apperror.NotFound, "Open image archive failed", err)
+	}
+	opened, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, nil, apperror.Wrap(apperror.Internal, "Inspect opened image archive failed", err)
+	}
+	if err := validateImageArchiveInfo(opened); err != nil {
+		_ = file.Close()
+		return nil, nil, err
+	}
+	if !os.SameFile(before, opened) {
+		_ = file.Close()
+		return nil, nil, changedImageArchiveError()
+	}
+	current, err := os.Lstat(path)
+	if err != nil {
+		_ = file.Close()
+		return nil, nil, changedImageArchiveError()
+	}
+	if err := validateImageArchiveInfo(current); err != nil {
+		_ = file.Close()
+		return nil, nil, err
+	}
+	if !os.SameFile(opened, current) {
+		_ = file.Close()
+		return nil, nil, changedImageArchiveError()
+	}
+	return file, opened, nil
+}
+
+func verifyOpenedImageArchive(path string, file *os.File, expected fs.FileInfo) error {
+	opened, err := file.Stat()
+	if err != nil {
+		return apperror.Wrap(apperror.Internal, "Reinspect opened image archive failed", err)
+	}
+	if err := validateImageArchiveInfo(opened); err != nil {
+		return err
+	}
+	if !os.SameFile(expected, opened) ||
+		expected.Size() != opened.Size() ||
+		!expected.ModTime().Equal(opened.ModTime()) {
+		return changedImageArchiveError()
+	}
+	current, err := os.Lstat(path)
+	if err != nil {
+		return changedImageArchiveError()
+	}
+	if err := validateImageArchiveInfo(current); err != nil {
+		return err
+	}
+	if !os.SameFile(opened, current) {
+		return changedImageArchiveError()
+	}
+	return nil
+}
+
+func validateImageArchiveInfo(info fs.FileInfo) error {
+	if info == nil || info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
+		return apperror.New(
+			apperror.Conflict,
+			"Image archive must be a regular file",
+			apperror.WithDetail("Symbolic links, directories, devices, and other non-regular files are rejected."),
+		)
+	}
+	return nil
+}
+
+func changedImageArchiveError() error {
+	return apperror.New(
+		apperror.Conflict,
+		"Image archive changed while it was being opened or loaded",
+		apperror.WithDetail("Choose the archive again after confirming that no other process is replacing or modifying it."),
+	)
+}
+
+type imageLoadResponseMessage struct {
+	Stream       string `json:"stream"`
+	Status       string `json:"status"`
+	ErrorMessage string `json:"error"`
+	ErrorDetail  *struct {
+		Message string `json:"message"`
+	} `json:"errorDetail"`
+}
+
+type imageLoadResponseOutcome struct {
+	Result    string
+	ImageID   string
+	Completed bool
+}
+
+func decodeImageLoadResponse(body io.Reader) (imageLoadResponseOutcome, error) {
+	if body == nil {
+		return imageLoadResponseOutcome{}, apperror.New(apperror.DockerUnreachable, "Docker returned an empty image load response")
+	}
+
+	limited := &io.LimitedReader{R: body, N: maxImageLoadResponseBytes + 1}
+	decoder := json.NewDecoder(limited)
+	messages := make([]string, 0, 8)
+	messageCount := 0
+	loadCompleted := false
+	loadedImageID := ""
+	outcome := func() imageLoadResponseOutcome {
+		return imageLoadResponseOutcome{
+			Result:    providers.SafeCommandDiagnostic(strings.Join(messages, "\n"), maxImageLoadResultBytes),
+			ImageID:   loadedImageID,
+			Completed: loadCompleted,
+		}
+	}
+	for {
+		var raw json.RawMessage
+		err := decoder.Decode(&raw)
+		if limited.N == 0 {
+			return outcome(), apperror.New(
+				apperror.DockerUnreachable,
+				"Docker image load response exceeded the safe size limit",
+				apperror.WithDetail(fmt.Sprintf("Image load responses are limited to %d bytes.", maxImageLoadResponseBytes)),
+			)
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return outcome(), mapDockerError("read image load response", err)
+			}
+			return outcome(), apperror.Wrap(
+				apperror.DockerUnreachable,
+				"Docker returned a malformed image load response",
+				err,
+				apperror.WithDetail("The daemon response was not a complete JSON message stream."),
+			)
+		}
+
+		messageCount++
+		if messageCount > maxImageLoadResponseMessages {
+			return outcome(), apperror.New(
+				apperror.DockerUnreachable,
+				"Docker image load response contained too many messages",
+				apperror.WithDetail(fmt.Sprintf("Image load responses are limited to %d JSON messages.", maxImageLoadResponseMessages)),
+			)
+		}
+
+		var message *imageLoadResponseMessage
+		if err := json.Unmarshal(raw, &message); err != nil {
+			return outcome(), apperror.Wrap(
+				apperror.DockerUnreachable,
+				"Docker returned an invalid image load message",
+				err,
+				apperror.WithDetail("Every image load response entry must be a JSON object."),
+			)
+		}
+		if message == nil {
+			return outcome(), apperror.New(
+				apperror.DockerUnreachable,
+				"Docker returned an invalid image load message",
+				apperror.WithDetail("Every image load response entry must be a JSON object."),
+			)
+		}
+		if message.ErrorMessage != "" || message.ErrorDetail != nil {
+			detail := strings.TrimSpace(message.ErrorMessage)
+			if detail == "" && message.ErrorDetail != nil {
+				detail = strings.TrimSpace(message.ErrorDetail.Message)
+			}
+			if detail == "" {
+				detail = "Docker reported an image load error without additional detail."
+			}
+			return outcome(), apperror.New(
+				apperror.Conflict,
+				"Docker rejected the image archive",
+				apperror.WithDetail(providers.SafeCommandDiagnostic(detail, 8<<10)),
+			)
+		}
+		if text := strings.TrimSpace(message.Stream); text != "" {
+			messages = append(messages, text)
+			if imageID, completed := imageLoadCompletion(text); completed {
+				loadCompleted = true
+				if loadedImageID == "" {
+					loadedImageID = imageID
+				}
+			}
+		} else if text := strings.TrimSpace(message.Status); text != "" {
+			messages = append(messages, text)
+		}
+	}
+	if messageCount == 0 {
+		return outcome(), apperror.New(
+			apperror.DockerUnreachable,
+			"Docker returned an empty image load response",
+			apperror.WithDetail("The daemon did not return any JSON status messages."),
+		)
+	}
+	if !loadCompleted {
+		return outcome(), apperror.New(
+			apperror.DockerUnreachable,
+			"Docker returned an incomplete image load response",
+			apperror.WithDetail("The daemon response ended before confirming that an image was loaded."),
+		)
+	}
+	return outcome(), nil
+}
+
+func imageLoadCompletion(stream string) (string, bool) {
+	for line := range strings.Lines(stream) {
+		line = strings.TrimSpace(line)
+		for _, prefix := range []string{"Loaded image:", "Loaded image ID:"} {
+			if strings.HasPrefix(line, prefix) {
+				imageID := strings.TrimSpace(strings.TrimPrefix(line, prefix))
+				if imageID != "" {
+					return imageID, true
+				}
+			}
+		}
+	}
+	return "", false
+}
+
+func partialImageLoadError(cause error, outcome imageLoadResponseOutcome) error {
+	code, ok := apperror.CodeOf(cause)
+	if !ok {
+		code = apperror.DockerUnreachable
+	}
+	imageID := strings.TrimSpace(outcome.ImageID)
+	state := "unknown"
+	message := "Image load outcome requires reconciliation"
+	detail := "Docker may have loaded one or more images, but Cairn could not confirm a complete response."
+	hint := "Refresh the image inventory before retrying the archive."
+	if outcome.Completed {
+		state = "loaded"
+		message = "Docker reported the image loaded but response finalization was incomplete"
+		detail = "Docker emitted a terminal load record, but Cairn could not finish local verification or response processing."
+		hint = "Treat the reported image as loaded and refresh the image inventory before deciding whether to retry."
+	}
+	if imageID == "" {
+		imageID = "unknown"
+	}
+	return apperror.Wrap(
+		code,
+		message,
+		cause,
+		apperror.WithDetail(detail),
+		apperror.WithRepairHints(hint),
+		apperror.WithPartialResource("image", imageID, state, false),
+	)
 }
 
 func (c *Client) SearchHub(ctx context.Context, query string, limit int) ([]models.HubSearchResult, error) {
@@ -838,7 +1197,7 @@ func (c *Client) publishJobDone(jobID string, result string, actionErr error) {
 	if actionErr != nil {
 		payload.Error = actionErr.Error()
 	}
-	c.publish(bus.TopicJobDone, payload)
+	c.publishCritical(bus.TopicJobDone, payload)
 }
 
 func (c *Client) publishImageChanged(id string) {

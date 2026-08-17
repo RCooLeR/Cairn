@@ -269,7 +269,7 @@ func TestRingCursorPaginatesByteIdenticalLinesExactlyOnce(t *testing.T) {
 
 func TestManagerPublishesBatchesAndEOF(t *testing.T) {
 	ctx := context.Background()
-	eventBus := bus.New()
+	eventBus := newCriticalTrackingBus()
 	defer eventBus.Close()
 	linesCh := eventBus.Subscribe(ctx, bus.TopicLogsLines, 8)
 	eofCh := eventBus.Subscribe(ctx, bus.TopicLogsEOF, 8)
@@ -277,12 +277,14 @@ func TestManagerPublishesBatchesAndEOF(t *testing.T) {
 	docker.logs["container-1"] = string(dockerLogFrame(1, "2026-06-13T09:00:00Z INFO one\n")) +
 		string(dockerLogFrame(1, "2026-06-13T09:00:01Z WARN two\n"))
 	manager := NewManager(docker, eventBus, Options{BatchWindow: time.Millisecond, BatchMaxLines: 2})
+	clientToken := "7fb44358-aafb-44b8-a32a-a6d8a7abaf31"
 
 	streamID, err := manager.StartLogStream(ctx, models.LogStreamRequest{
-		Scope:      ScopeContainer,
-		IDs:        []string{"container-1"},
-		Tail:       10,
-		Timestamps: true,
+		ClientToken: clientToken,
+		Scope:       ScopeContainer,
+		IDs:         []string{"container-1"},
+		Tail:        10,
+		Timestamps:  true,
 	})
 	if err != nil {
 		t.Fatalf("StartLogStream() error = %v", err)
@@ -295,13 +297,13 @@ func TestManagerPublishesBatchesAndEOF(t *testing.T) {
 		select {
 		case event := <-linesCh:
 			payload, ok := event.Payload.(LinesPayload)
-			if !ok || payload.StreamID != streamID {
+			if !ok || payload.StreamID != streamID || payload.ClientToken != clientToken {
 				t.Fatalf("lines event = %#v", event.Payload)
 			}
 			lines = append(lines, payload.Lines...)
 		case event := <-eofCh:
 			payload, ok := event.Payload.(EOFPayload)
-			if !ok || payload.StreamID != streamID {
+			if !ok || payload.StreamID != streamID || payload.ClientToken != clientToken {
 				t.Fatalf("EOF event = %#v", event.Payload)
 			}
 			eofReceived = true
@@ -317,6 +319,14 @@ func TestManagerPublishesBatchesAndEOF(t *testing.T) {
 	manager.mu.Unlock()
 	if sessionCount != 0 {
 		t.Fatalf("sessions still registered = %d", sessionCount)
+	}
+	select {
+	case topic := <-eventBus.criticalTopics:
+		if topic != bus.TopicLogsEOF {
+			t.Fatalf("critical topic = %q, want %q", topic, bus.TopicLogsEOF)
+		}
+	default:
+		t.Fatal("EOF was not published through the critical mailbox")
 	}
 }
 
@@ -1418,6 +1428,23 @@ type fakeLogDocker struct {
 	requests   []dockercore.LogOptions
 	blockLogs  <-chan struct{}
 	logsCalled chan struct{}
+}
+
+type criticalTrackingBus struct {
+	*bus.MemoryBus
+	criticalTopics chan bus.Topic
+}
+
+func newCriticalTrackingBus() *criticalTrackingBus {
+	return &criticalTrackingBus{
+		MemoryBus:      bus.New(),
+		criticalTopics: make(chan bus.Topic, 8),
+	}
+}
+
+func (b *criticalTrackingBus) PublishCritical(ctx context.Context, event bus.Event) error {
+	b.criticalTopics <- event.Topic
+	return b.MemoryBus.PublishCritical(ctx, event)
 }
 
 func newFakeLogDocker() *fakeLogDocker {

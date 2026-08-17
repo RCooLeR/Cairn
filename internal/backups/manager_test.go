@@ -4,10 +4,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -59,6 +61,121 @@ func TestPlanBackupEntropyFailureLeavesNoPlanOrFilesystemMutation(t *testing.T) 
 	provider.mu.Unlock()
 	if providerCalls != 0 {
 		t.Fatalf("provider commands = %d, want 0", providerCalls)
+	}
+}
+
+func TestPendingBackupPlanCapClosesRejectedRestoreHandles(t *testing.T) {
+	now := time.Date(2026, 6, 13, 16, 0, 0, 0, time.UTC)
+	mgr := &Manager{
+		Now:   func() time.Time { return now },
+		plans: map[string]planRecord{},
+		jobs:  map[string]context.CancelFunc{},
+	}
+	t.Cleanup(mgr.StopAll)
+	path := filepath.Join(t.TempDir(), "source.tar.gz")
+	if err := os.WriteFile(path, []byte("backup-data"), 0o600); err != nil {
+		t.Fatalf("write restore source: %v", err)
+	}
+	accepted := make([]*os.File, 0, maxPendingBackupPlans*2)
+	for i := 0; i < maxPendingBackupPlans; i++ {
+		archive, err := os.Open(path)
+		if err != nil {
+			t.Fatalf("open archive handle %d: %v", i, err)
+		}
+		metadata, err := os.Open(path)
+		if err != nil {
+			_ = archive.Close()
+			t.Fatalf("open metadata handle %d: %v", i, err)
+		}
+		identity, err := archive.Stat()
+		if err != nil {
+			_ = archive.Close()
+			_ = metadata.Close()
+			t.Fatalf("stat restore source %d: %v", i, err)
+		}
+		err = mgr.savePlan(planRecord{
+			Plan: models.CommandPlan{
+				PlanID:    fmt.Sprintf("plan-%03d", i),
+				ExpiresAt: now.Add(time.Hour),
+			},
+			Operation:        "restore",
+			ArchiveHandle:    archive,
+			ArchiveIdentity:  identity,
+			MetadataHandle:   metadata,
+			MetadataIdentity: identity,
+		})
+		if err != nil {
+			_ = archive.Close()
+			_ = metadata.Close()
+			t.Fatalf("savePlan(%d) error = %v", i, err)
+		}
+		accepted = append(accepted, archive, metadata)
+	}
+
+	rejectedArchive, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open rejected archive handle: %v", err)
+	}
+	rejectedMetadata, err := os.Open(path)
+	if err != nil {
+		_ = rejectedArchive.Close()
+		t.Fatalf("open rejected metadata handle: %v", err)
+	}
+	identity, err := rejectedArchive.Stat()
+	if err != nil {
+		t.Fatalf("stat rejected restore source: %v", err)
+	}
+	err = mgr.savePlan(planRecord{
+		Plan: models.CommandPlan{
+			PlanID:    "plan-over-cap",
+			ExpiresAt: now.Add(time.Hour),
+		},
+		Operation:        "restore",
+		ArchiveHandle:    rejectedArchive,
+		ArchiveIdentity:  identity,
+		MetadataHandle:   rejectedMetadata,
+		MetadataIdentity: identity,
+	})
+	if !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("savePlan(over cap) error = %v, want Conflict", err)
+	}
+	assertFileHandleClosed(t, rejectedArchive, "rejected archive")
+	assertFileHandleClosed(t, rejectedMetadata, "rejected metadata")
+	mgr.mu.Lock()
+	pending := len(mgr.plans)
+	mgr.mu.Unlock()
+	if pending != maxPendingBackupPlans {
+		t.Fatalf("pending plans = %d, want cap %d", pending, maxPendingBackupPlans)
+	}
+
+	mgr.StopAll()
+	for i, handle := range accepted {
+		assertFileHandleClosed(t, handle, fmt.Sprintf("accepted handle %d after StopAll", i))
+	}
+}
+
+func TestRestorePlanHandlesCloseOnExpiryAndStopAll(t *testing.T) {
+	for _, action := range []string{"expiry", "stop"} {
+		t.Run(action, func(t *testing.T) {
+			ctx := context.Background()
+			mgr, _, _ := newTestManager(t)
+			archivePath := writeTestRestoreArchive(t, "app-db")
+			plan, err := mgr.PlanRestoreVolume(ctx, models.RestoreVolumeRequest{
+				SourcePath: archivePath,
+				VolumeName: "app-db-restored",
+			})
+			if err != nil {
+				t.Fatalf("PlanRestoreVolume() error = %v", err)
+			}
+			record := savedPlanRecord(t, mgr, plan.PlanID)
+			if action == "expiry" {
+				mgr.expirePlan(plan.PlanID, record.generation)
+			} else {
+				mgr.StopAll()
+			}
+			assertFileHandleClosed(t, record.ArchiveHandle, "archive after "+action)
+			assertFileHandleClosed(t, record.MetadataHandle, "metadata after "+action)
+		})
 	}
 }
 
@@ -147,6 +264,135 @@ func TestBackupSidecarAndFilenameCollision(t *testing.T) {
 	if err := verifyArchiveChecksum(path, "bad"); !apperror.IsCode(err, apperror.Conflict) {
 		t.Fatalf("checksum mismatch error = %v", err)
 	}
+}
+
+func TestReadSidecarRejectsOversizedTrailingAndInvalidFields(t *testing.T) {
+	t.Parallel()
+	valid := BackupSidecar{
+		FormatVersion: formatVersion,
+		Volume:        "app-db",
+		SHA256:        strings.Repeat("a", sha256.Size*2),
+	}
+	marshal := func(sidecar BackupSidecar) []byte {
+		t.Helper()
+		payload, err := json.Marshal(sidecar)
+		if err != nil {
+			t.Fatalf("marshal sidecar: %v", err)
+		}
+		return payload
+	}
+	validPayload := marshal(valid)
+	missingVolume := valid
+	missingVolume.Volume = ""
+	oversizedVolume := valid
+	oversizedVolume.Volume = strings.Repeat("v", maxSidecarNameBytes+1)
+	invalidVolume := valid
+	invalidVolume.Volume = "app-db\nforged"
+	missingSHA := valid
+	missingSHA.SHA256 = ""
+	invalidSHA := valid
+	invalidSHA.SHA256 = strings.Repeat("z", sha256.Size*2)
+	oversizedProject := valid
+	oversizedProject.Project = strings.Repeat("p", maxSidecarFieldBytes+1)
+	tooManyContainers := valid
+	tooManyContainers.UsingContainers = make([]string, maxSidecarContainers+1)
+	oversizedContainer := valid
+	oversizedContainer.UsingContainers = []string{strings.Repeat("c", maxSidecarNameBytes+1)}
+	negativeSize := valid
+	negativeSize.CompressedSizeBytes = -1
+
+	tests := []struct {
+		name    string
+		payload []byte
+	}{
+		{name: "oversized file", payload: append(append([]byte(nil), validPayload...), []byte(strings.Repeat(" ", maxSidecarBytes-len(validPayload)+1))...)},
+		{name: "second JSON value", payload: append(append([]byte(nil), validPayload...), []byte("\n{}")...)},
+		{name: "trailing garbage", payload: append(append([]byte(nil), validPayload...), []byte(" trailing")...)},
+		{name: "missing volume", payload: marshal(missingVolume)},
+		{name: "oversized volume", payload: marshal(oversizedVolume)},
+		{name: "invalid volume", payload: marshal(invalidVolume)},
+		{name: "missing sha256", payload: marshal(missingSHA)},
+		{name: "malformed sha256", payload: marshal(invalidSHA)},
+		{name: "oversized project", payload: marshal(oversizedProject)},
+		{name: "too many containers", payload: marshal(tooManyContainers)},
+		{name: "oversized container name", payload: marshal(oversizedContainer)},
+		{name: "negative compressed size", payload: marshal(negativeSize)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "backup.json")
+			if err := os.WriteFile(path, tt.payload, 0o600); err != nil {
+				t.Fatalf("write sidecar: %v", err)
+			}
+			if _, err := readSidecar(path); !apperror.IsCode(err, apperror.Conflict) {
+				t.Fatalf("readSidecar() error = %v, want conflict", err)
+			}
+		})
+	}
+}
+
+func TestReadSidecarRejectsNonRegularAndReplacedMetadata(t *testing.T) {
+	t.Parallel()
+	validPayload, err := json.Marshal(BackupSidecar{
+		FormatVersion: formatVersion,
+		Volume:        "app-db",
+		SHA256:        strings.Repeat("a", sha256.Size*2),
+	})
+	if err != nil {
+		t.Fatalf("marshal sidecar: %v", err)
+	}
+
+	t.Run("directory", func(t *testing.T) {
+		t.Parallel()
+		path := filepath.Join(t.TempDir(), "backup.json")
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatalf("mkdir sidecar path: %v", err)
+		}
+		if _, err := readSidecar(path); !apperror.IsCode(err, apperror.Conflict) {
+			t.Fatalf("readSidecar(directory) error = %v, want conflict", err)
+		}
+	})
+
+	t.Run("symlink", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		target := filepath.Join(dir, "target.json")
+		path := filepath.Join(dir, "backup.json")
+		if err := os.WriteFile(target, validPayload, 0o600); err != nil {
+			t.Fatalf("write symlink target: %v", err)
+		}
+		if err := os.Symlink(target, path); err != nil {
+			t.Skipf("symlinks unavailable: %v", err)
+		}
+		if _, err := readSidecar(path); !apperror.IsCode(err, apperror.Conflict) {
+			t.Fatalf("readSidecar(symlink) error = %v, want conflict", err)
+		}
+	})
+
+	t.Run("replacement during open", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "backup.json")
+		displaced := filepath.Join(dir, "original.json")
+		if err := os.WriteFile(path, validPayload, 0o600); err != nil {
+			t.Fatalf("write sidecar: %v", err)
+		}
+		_, err := readSidecarWithOpen(path, func(candidate string) (*os.File, error) {
+			if err := os.Rename(candidate, displaced); err != nil {
+				return nil, err
+			}
+			if err := os.WriteFile(candidate, validPayload, 0o600); err != nil {
+				return nil, err
+			}
+			return os.Open(candidate)
+		})
+		if !apperror.IsCode(err, apperror.Conflict) {
+			t.Fatalf("readSidecarWithOpen(replacement) error = %v, want conflict", err)
+		}
+		if got, readErr := os.ReadFile(path); readErr != nil || string(got) != string(validPayload) {
+			t.Fatalf("replacement changed: content=%q error=%v", got, readErr)
+		}
+	})
 }
 
 func TestConcurrentBackupPlansAndAppliesKeepArtifactsIndependent(t *testing.T) {
@@ -842,9 +1088,15 @@ func TestPlanDeleteBackupRequiresConfirmationAndRemovesRecord(t *testing.T) {
 	if plan == nil || plan.Risk != models.RiskNeedsConfirmation {
 		t.Fatalf("PlanDeleteBackup() plan = %#v", plan)
 	}
+	planned := savedPlanRecord(t, mgr, plan.PlanID)
+	if planned.ArchiveIdentity == nil || planned.MetadataIdentity == nil || planned.ArchiveHandle == nil || planned.MetadataHandle == nil {
+		t.Fatalf("delete plan did not capture both artifact identities: %#v", planned)
+	}
 	if err := mgr.ApplyDeleteBackup(ctx, plan.PlanID); err != nil {
 		t.Fatalf("ApplyDeleteBackup() error = %v", err)
 	}
+	assertFileHandleClosed(t, planned.ArchiveHandle, "deleted archive")
+	assertFileHandleClosed(t, planned.MetadataHandle, "deleted metadata")
 	if _, err := mgr.Backups.Get(ctx, record.ID); err == nil {
 		t.Fatal("backup record still exists after delete")
 	}
@@ -856,7 +1108,7 @@ func TestPlanDeleteBackupRequiresConfirmationAndRemovesRecord(t *testing.T) {
 	}
 }
 
-func TestApplyDeleteBackupKeepsRecordWhenArtifactRemovalFails(t *testing.T) {
+func TestPlanDeleteBackupRejectsNonRegularArtifactAndKeepsRecord(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	mgr, _, _ := newTestManager(t)
@@ -879,16 +1131,155 @@ func TestApplyDeleteBackupKeepsRecordWhenArtifactRemovalFails(t *testing.T) {
 	if err := mgr.Backups.Insert(ctx, record); err != nil {
 		t.Fatalf("insert backup: %v", err)
 	}
-	plan, err := mgr.PlanDeleteBackup(ctx, record.ID)
-	if err != nil {
-		t.Fatalf("PlanDeleteBackup() error = %v", err)
-	}
-
-	if err := mgr.ApplyDeleteBackup(ctx, plan.PlanID); err == nil {
-		t.Fatal("ApplyDeleteBackup() error = nil, want artifact removal failure")
+	if _, err := mgr.PlanDeleteBackup(ctx, record.ID); !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("PlanDeleteBackup() error = %v, want conflict", err)
 	}
 	if _, err := mgr.Backups.Get(ctx, record.ID); err != nil {
-		t.Fatalf("backup record was removed after artifact failure: %v", err)
+		t.Fatalf("backup record was removed after rejected plan: %v", err)
+	}
+	if _, err := os.Stat(metadataPath); err != nil {
+		t.Fatalf("metadata was removed after rejected plan: %v", err)
+	}
+}
+
+func TestApplyDeleteBackupRejectsReplacementArtifactsAndKeepsRecord(t *testing.T) {
+	tests := []struct {
+		name        string
+		replaceKind string
+	}{
+		{name: "archive replaced", replaceKind: "archive"},
+		{name: "metadata replaced", replaceKind: "metadata"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			mgr, _, _ := newTestManager(t)
+			dir := t.TempDir()
+			archivePath := filepath.Join(dir, "archive.tar.gz")
+			metadataPath := filepath.Join(dir, "archive.json")
+			if err := os.WriteFile(archivePath, []byte("planned-archive"), 0o600); err != nil {
+				t.Fatalf("write archive: %v", err)
+			}
+			if err := os.WriteFile(metadataPath, []byte("planned-metadata"), 0o600); err != nil {
+				t.Fatalf("write metadata: %v", err)
+			}
+			record := store.BackupRecord{
+				ID:           "backup-replaced-" + tt.replaceKind,
+				ProviderID:   "linux_native",
+				VolumeName:   "app-db",
+				BackupPath:   archivePath,
+				MetadataPath: metadataPath,
+				Result:       backupResultOK,
+			}
+			if err := mgr.Backups.Insert(ctx, record); err != nil {
+				t.Fatalf("insert backup: %v", err)
+			}
+			plan, err := mgr.PlanDeleteBackup(ctx, record.ID)
+			if err != nil {
+				t.Fatalf("PlanDeleteBackup() error = %v", err)
+			}
+			planned := savedPlanRecord(t, mgr, plan.PlanID)
+			if planned.ArchiveIdentity == nil || planned.MetadataIdentity == nil {
+				t.Fatalf("delete plan identities = archive:%v metadata:%v, want both", planned.ArchiveIdentity, planned.MetadataIdentity)
+			}
+
+			replacedPath := archivePath
+			otherPath := metadataPath
+			otherPayload := "planned-metadata"
+			if tt.replaceKind == "metadata" {
+				replacedPath = metadataPath
+				otherPath = archivePath
+				otherPayload = "planned-archive"
+			}
+			displacedPath := replacedPath + ".displaced"
+			if err := os.Rename(replacedPath, displacedPath); err != nil {
+				t.Fatalf("displace planned %s: %v", tt.replaceKind, err)
+			}
+			replacementPayload := "replacement-" + tt.replaceKind
+			if err := os.WriteFile(replacedPath, []byte(replacementPayload), 0o600); err != nil {
+				t.Fatalf("write replacement %s: %v", tt.replaceKind, err)
+			}
+
+			if err := mgr.ApplyDeleteBackup(ctx, plan.PlanID); !apperror.IsCode(err, apperror.Conflict) {
+				t.Fatalf("ApplyDeleteBackup() error = %v, want conflict", err)
+			}
+			if got, err := os.ReadFile(replacedPath); err != nil || string(got) != replacementPayload {
+				t.Fatalf("replacement %s changed: content=%q error=%v", tt.replaceKind, got, err)
+			}
+			if got, err := os.ReadFile(otherPath); err != nil || string(got) != otherPayload {
+				t.Fatalf("unreplaced artifact changed: content=%q error=%v", got, err)
+			}
+			if _, err := mgr.Backups.Get(ctx, record.ID); err != nil {
+				t.Fatalf("backup record was removed after replacement conflict: %v", err)
+			}
+		})
+	}
+}
+
+func TestApplyDeleteBackupRejectsSameContentUnlinkRecreate(t *testing.T) {
+	for _, replaceKind := range []string{"archive", "metadata"} {
+		t.Run(replaceKind, func(t *testing.T) {
+			ctx := context.Background()
+			mgr, _, _ := newTestManager(t)
+			dir := t.TempDir()
+			archivePath := filepath.Join(dir, "archive.tar.gz")
+			metadataPath := filepath.Join(dir, "archive.json")
+			if err := os.WriteFile(archivePath, []byte("planned-archive"), 0o600); err != nil {
+				t.Fatalf("write archive: %v", err)
+			}
+			if err := os.WriteFile(metadataPath, []byte("planned-metadata"), 0o600); err != nil {
+				t.Fatalf("write metadata: %v", err)
+			}
+			record := store.BackupRecord{
+				ID:           "backup-same-content-" + replaceKind,
+				ProviderID:   "linux_native",
+				VolumeName:   "app-db",
+				BackupPath:   archivePath,
+				MetadataPath: metadataPath,
+				Result:       backupResultOK,
+			}
+			if err := mgr.Backups.Insert(ctx, record); err != nil {
+				t.Fatalf("insert backup: %v", err)
+			}
+			replacedPath := archivePath
+			otherPath := metadataPath
+			if replaceKind == "metadata" {
+				replacedPath = metadataPath
+				otherPath = archivePath
+			}
+			content, err := os.ReadFile(replacedPath)
+			if err != nil {
+				t.Fatalf("read planned %s: %v", replaceKind, err)
+			}
+			plan, err := mgr.PlanDeleteBackup(ctx, record.ID)
+			if err != nil {
+				t.Fatalf("PlanDeleteBackup() error = %v", err)
+			}
+			displacedPath := replacedPath + ".displaced"
+			if err := os.Rename(replacedPath, displacedPath); err != nil {
+				t.Fatalf("displace planned %s: %v", replaceKind, err)
+			}
+			if err := os.Remove(displacedPath); err != nil {
+				t.Fatalf("unlink displaced planned %s: %v", replaceKind, err)
+			}
+			if err := os.WriteFile(replacedPath, content, 0o600); err != nil {
+				t.Fatalf("recreate same-content %s: %v", replaceKind, err)
+			}
+
+			if err := mgr.ApplyDeleteBackup(ctx, plan.PlanID); !apperror.IsCode(err, apperror.Conflict) {
+				t.Fatalf("ApplyDeleteBackup() error = %v, want conflict", err)
+			}
+			if got, err := os.ReadFile(replacedPath); err != nil || !slices.Equal(got, content) {
+				t.Fatalf("replacement %s changed: content=%q error=%v", replaceKind, got, err)
+			}
+			if _, err := os.Stat(otherPath); err != nil {
+				t.Fatalf("unreplaced artifact changed: %v", err)
+			}
+			if _, err := mgr.Backups.Get(ctx, record.ID); err != nil {
+				t.Fatalf("backup record was removed after replacement conflict: %v", err)
+			}
+		})
 	}
 }
 
@@ -1017,6 +1408,78 @@ func TestApplyBackupStopsWithManager(t *testing.T) {
 	assertPathMissing(t, record.StagingDirHost)
 }
 
+func TestStopAllJoinsCanceledBackupJobsAndRejectsNewWork(t *testing.T) {
+	t.Parallel()
+	mgr, _, _ := newTestManager(t)
+	mgr.Start(context.Background())
+	started := make(chan struct{})
+	canceled := make(chan struct{})
+	release := make(chan struct{})
+	workerDone := make(chan struct{})
+	if !mgr.startJob("backup-lifecycle-test", func(ctx context.Context) {
+		close(started)
+		<-ctx.Done()
+		close(canceled)
+		<-release
+		close(workerDone)
+	}) {
+		t.Fatal("startJob() rejected work before shutdown")
+	}
+	<-started
+
+	stopReturned := make(chan struct{})
+	go func() {
+		mgr.StopAll()
+		close(stopReturned)
+	}()
+	select {
+	case <-canceled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("StopAll() did not cancel the backup worker")
+	}
+	select {
+	case <-stopReturned:
+		t.Fatal("StopAll() returned before the canceled backup worker exited")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case <-workerDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("backup worker did not exit after release")
+	}
+	select {
+	case <-stopReturned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("StopAll() did not return after the backup worker exited")
+	}
+	if mgr.startJob("backup-late-test", func(context.Context) {}) {
+		t.Fatal("startJob() admitted work after StopAll")
+	}
+}
+
+func TestApplyBackupRejectedByCanceledRootReleasesReservation(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	mgr, _, _ := newTestManager(t)
+	rootCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	mgr.Start(rootCtx)
+	dest := t.TempDir()
+	mgr.Docker.(*fakeBackupDocker).volumes["app-db"] = &models.VolumeDetail{Summary: models.VolumeSummary{Name: "app-db"}}
+
+	plan, err := mgr.PlanBackupVolume(ctx, models.BackupVolumeRequest{VolumeName: "app-db", DestPath: dest})
+	if err != nil {
+		t.Fatalf("PlanBackupVolume() error = %v", err)
+	}
+	record := savedPlanRecord(t, mgr, plan.PlanID)
+	if jobID, err := mgr.ApplyBackup(ctx, plan.PlanID); jobID != "" || !apperror.IsCode(err, apperror.ProviderNotReady) {
+		t.Fatalf("ApplyBackup() = %q, %v; want empty/%s", jobID, err, apperror.ProviderNotReady)
+	}
+	assertPathMissing(t, record.ReservationPath)
+	assertPathMissing(t, record.StagingDirHost)
+}
+
 func TestRestoreOverwriteRequiresTypedNameAndRunsHelper(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -1050,6 +1513,7 @@ func TestRestoreOverwriteRequiresTypedNameAndRunsHelper(t *testing.T) {
 	if plan.Risk != models.RiskDangerous || plan.RequiresTypedName != "app-db" {
 		t.Fatalf("plan = %#v", plan)
 	}
+	record := savedPlanRecord(t, mgr, plan.PlanID)
 	if _, err := mgr.ApplyRestore(ctx, plan.PlanID, "wrong"); !apperror.IsCode(err, apperror.ConfirmationRequired) {
 		t.Fatalf("ApplyRestore(wrong) error = %v", err)
 	}
@@ -1058,6 +1522,9 @@ func TestRestoreOverwriteRequiresTypedNameAndRunsHelper(t *testing.T) {
 		t.Fatalf("ApplyRestore() error = %v", err)
 	}
 	waitJobDone(t, done, jobID)
+	mgr.StopAll()
+	assertFileHandleClosed(t, record.ArchiveHandle, "archive after restore worker")
+	assertFileHandleClosed(t, record.MetadataHandle, "metadata after restore worker")
 	if !provider.hasRunArg("tar xzf") {
 		t.Fatalf("provider calls = %#v", provider.calls)
 	}
@@ -1140,10 +1607,239 @@ func TestRestoreIntoNewVolumeRechecksTargetAtApply(t *testing.T) {
 	}
 }
 
-func TestRestoreReverifiesChecksumBeforeRunningHelper(t *testing.T) {
+func TestRestoreIntoNewVolumeRejectsForeignCreateRace(t *testing.T) {
+	ctx := context.Background()
+	mgr, events, provider := newTestManager(t)
+	archivePath := writeTestRestoreArchive(t, "app-db")
+	docker := mgr.Docker.(*fakeBackupDocker)
+	docker.beforeCreate = func(req models.CreateVolumeRequest) {
+		// Simulate another actor winning the gap between Cairn's absence check
+		// and Docker's idempotent named-volume create.
+		docker.volumes[req.Name] = &models.VolumeDetail{
+			Summary: models.VolumeSummary{
+				Name:   req.Name,
+				Driver: "local",
+				Labels: map[string]string{"owner": "foreign"},
+			},
+			CreatedAt: time.Date(2026, 6, 13, 15, 1, 0, 0, time.UTC),
+		}
+	}
+	done := events.Subscribe(ctx, bus.TopicJobDone, 4)
+
+	plan, err := mgr.PlanRestoreVolume(ctx, models.RestoreVolumeRequest{
+		SourcePath: archivePath,
+		VolumeName: "app-db-restored",
+		Overwrite:  false,
+	})
+	if err != nil {
+		t.Fatalf("PlanRestoreVolume() error = %v", err)
+	}
+	jobID, err := mgr.ApplyRestore(ctx, plan.PlanID, "")
+	if err != nil {
+		t.Fatalf("ApplyRestore() error = %v", err)
+	}
+	payload := waitJobDonePayload(t, done, jobID)
+	if payload.Error == "" || !strings.Contains(payload.Error, "not created by this restore operation") {
+		t.Fatalf("job error = %q, want foreign-volume ownership conflict", payload.Error)
+	}
+	if len(docker.createRequests) != 1 {
+		t.Fatalf("create requests = %d, want 1", len(docker.createRequests))
+	}
+	if provider.hasRunArg("cairn-restore") || provider.hasRunArg("volume rm app-db-restored") {
+		t.Fatalf("restore or cleanup touched the foreign volume: %#v", provider.callsSnapshot())
+	}
+}
+
+func TestRestoreIntoNewVolumeRevalidatesSourceAfterCreate(t *testing.T) {
+	ctx := context.Background()
+	mgr, events, provider := newTestManager(t)
+	archivePath := writeTestRestoreArchive(t, "app-db")
+	docker := mgr.Docker.(*fakeBackupDocker)
+	var mutateErr error
+	docker.beforeCreate = func(models.CreateVolumeRequest) {
+		mutateErr = os.WriteFile(archivePath, []byte("changed while target was being created"), 0o600)
+	}
+	done := events.Subscribe(ctx, bus.TopicJobDone, 4)
+
+	plan, err := mgr.PlanRestoreVolume(ctx, models.RestoreVolumeRequest{
+		SourcePath: archivePath,
+		VolumeName: "app-db-restored",
+		Overwrite:  false,
+	})
+	if err != nil {
+		t.Fatalf("PlanRestoreVolume() error = %v", err)
+	}
+	jobID, err := mgr.ApplyRestore(ctx, plan.PlanID, "")
+	if err != nil {
+		t.Fatalf("ApplyRestore() error = %v", err)
+	}
+	payload := waitJobDonePayload(t, done, jobID)
+	if mutateErr != nil {
+		t.Fatalf("mutate restore source during create: %v", mutateErr)
+	}
+	if payload.Error == "" {
+		t.Fatal("restore succeeded after its source changed during target creation")
+	}
+	if provider.hasRunArg("cairn-restore") {
+		t.Fatalf("restore helper ran after source identity changed: %#v", provider.callsSnapshot())
+	}
+	if got := provider.countRunArg("volume rm app-db-restored"); got != 1 {
+		t.Fatalf("owned target cleanup calls = %d, want 1; calls = %#v", got, provider.callsSnapshot())
+	}
+}
+
+func TestRestoreIntoNewVolumeRemovesCreatedTargetWhenHelperFails(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	mgr, events, provider := newTestManager(t)
+	archivePath := writeTestRestoreArchive(t, "app-db")
+	provider.failCommands = map[string]error{
+		"cairn-restore": errors.New("injected restore helper failure"),
+	}
+	done := events.Subscribe(ctx, bus.TopicJobDone, 4)
+
+	plan, err := mgr.PlanRestoreVolume(ctx, models.RestoreVolumeRequest{
+		SourcePath: archivePath,
+		VolumeName: "app-db-restored",
+		Overwrite:  false,
+	})
+	if err != nil {
+		t.Fatalf("PlanRestoreVolume() error = %v", err)
+	}
+	jobID, err := mgr.ApplyRestore(ctx, plan.PlanID, "")
+	if err != nil {
+		t.Fatalf("ApplyRestore() error = %v", err)
+	}
+	payload := waitJobDonePayload(t, done, jobID)
+	if payload.Error == "" {
+		t.Fatal("restore succeeded after injected helper failure")
+	}
+	if got := len(mgr.Docker.(*fakeBackupDocker).createRequests); got != 1 {
+		t.Fatalf("volume create calls = %d, want 1", got)
+	}
+	if got := provider.countRunArg("cairn-restore"); got != 1 {
+		t.Fatalf("restore helper calls = %d, want 1; calls = %#v", got, provider.callsSnapshot())
+	}
+	if got := provider.countRunArg("volume rm app-db-restored"); got != 1 {
+		t.Fatalf("volume cleanup calls = %d, want 1; calls = %#v", got, provider.callsSnapshot())
+	}
+	if !provider.callHadDeadline("volume rm app-db-restored") {
+		t.Fatal("volume cleanup command did not have a bounded deadline")
+	}
+	if strings.Contains(payload.Error, "could not be removed") {
+		t.Fatalf("job error reported cleanup failure after successful compensation: %q", payload.Error)
+	}
+}
+
+func TestRestoreIntoNewVolumeReportsPartialResourceWhenCleanupFails(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	mgr, events, provider := newTestManager(t)
+	archivePath := writeTestRestoreArchive(t, "app-db")
+	provider.failCommands = map[string]error{
+		"cairn-restore":             errors.New("injected restore helper failure"),
+		"volume rm app-db-restored": errors.New("injected cleanup failure"),
+	}
+	done := events.Subscribe(ctx, bus.TopicJobDone, 4)
+
+	plan, err := mgr.PlanRestoreVolume(ctx, models.RestoreVolumeRequest{
+		SourcePath: archivePath,
+		VolumeName: "app-db-restored",
+		Overwrite:  false,
+	})
+	if err != nil {
+		t.Fatalf("PlanRestoreVolume() error = %v", err)
+	}
+	jobID, err := mgr.ApplyRestore(ctx, plan.PlanID, "")
+	if err != nil {
+		t.Fatalf("ApplyRestore() error = %v", err)
+	}
+	payload := waitJobDonePayload(t, done, jobID)
+	if !strings.Contains(payload.Error, `new target volume "app-db-restored" could not be removed`) {
+		t.Fatalf("job error = %q, want explicit partial-resource cleanup failure", payload.Error)
+	}
+	if got := provider.countRunArg("volume rm app-db-restored"); got != 1 {
+		t.Fatalf("volume cleanup calls = %d, want 1; calls = %#v", got, provider.callsSnapshot())
+	}
+	if !provider.callHadDeadline("volume rm app-db-restored") {
+		t.Fatal("failed volume cleanup command did not have a bounded deadline")
+	}
+}
+
+func TestFailedOverwriteRestoreNeverRemovesPreexistingTarget(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	mgr, events, provider := newTestManager(t)
+	archivePath := writeTestRestoreArchive(t, "app-db")
+	mgr.Docker.(*fakeBackupDocker).volumes["app-db"] = &models.VolumeDetail{Summary: models.VolumeSummary{Name: "app-db"}}
+	provider.failCommands = map[string]error{
+		"cairn-restore": errors.New("injected restore helper failure"),
+	}
+	done := events.Subscribe(ctx, bus.TopicJobDone, 4)
+
+	plan, err := mgr.PlanRestoreVolume(ctx, models.RestoreVolumeRequest{
+		SourcePath: archivePath,
+		VolumeName: "app-db",
+		Overwrite:  true,
+	})
+	if err != nil {
+		t.Fatalf("PlanRestoreVolume() error = %v", err)
+	}
+	jobID, err := mgr.ApplyRestore(ctx, plan.PlanID, "app-db")
+	if err != nil {
+		t.Fatalf("ApplyRestore() error = %v", err)
+	}
+	if payload := waitJobDonePayload(t, done, jobID); payload.Error == "" {
+		t.Fatal("overwrite restore succeeded after injected helper failure")
+	}
+	if got := provider.countRunArg("volume rm"); got != 0 {
+		t.Fatalf("pre-existing target cleanup calls = %d, want 0; calls = %#v", got, provider.callsSnapshot())
+	}
+}
+
+func TestCreatedRestoreVolumeCleanupDetachesCancellationAndAddsDeadline(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	mgr, _, provider := newTestManager(t)
+	docker := mgr.Docker.(*fakeBackupDocker)
+	record := planRecord{
+		TargetVolumeName:        "app-db-restored",
+		TargetVolumeFingerprint: "",
+		RestoreOwnerToken:       "owner-token",
+	}
+	docker.volumes[record.TargetVolumeName] = &models.VolumeDetail{
+		Summary: models.VolumeSummary{
+			Name:   record.TargetVolumeName,
+			Driver: "local",
+			Labels: map[string]string{restoreOwnerLabel: record.RestoreOwnerToken},
+		},
+		CreatedAt: time.Date(2026, 6, 13, 15, 0, 0, 0, time.UTC),
+	}
+	var err error
+	record.TargetVolumeFingerprint, err = security.VolumeIncarnationFingerprint(*docker.volumes[record.TargetVolumeName])
+	if err != nil {
+		t.Fatalf("VolumeIncarnationFingerprint() error = %v", err)
+	}
+
+	if err := mgr.cleanupCreatedRestoreVolume(ctx, provider, record); err != nil {
+		t.Fatalf("cleanupCreatedRestoreVolume() error = %v", err)
+	}
+	if got := provider.countRunArg("volume rm app-db-restored"); got != 1 {
+		t.Fatalf("volume cleanup calls = %d, want 1", got)
+	}
+	if !provider.callHadDeadline("volume rm app-db-restored") {
+		t.Fatal("volume cleanup command did not have a bounded deadline")
+	}
+	if contextErr, ok := provider.callContextError("volume rm app-db-restored"); !ok || contextErr != nil {
+		t.Fatalf("volume cleanup context error = %v, found = %t; want detached active context", contextErr, ok)
+	}
+}
+
+func TestRestoreRejectsChangedArchiveBeforeRunningHelper(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	mgr, _, provider := newTestManager(t)
 	dir := t.TempDir()
 	archivePath := filepath.Join(dir, "app-db.tar.gz")
 	payload := []byte("backup-data")
@@ -1159,7 +1855,6 @@ func TestRestoreReverifiesChecksumBeforeRunningHelper(t *testing.T) {
 		t.Fatalf("write sidecar: %v", err)
 	}
 	mgr.Docker.(*fakeBackupDocker).volumes["app-db"] = &models.VolumeDetail{Summary: models.VolumeSummary{Name: "app-db"}}
-	done := events.Subscribe(ctx, bus.TopicJobDone, 4)
 
 	plan, err := mgr.PlanRestoreVolume(ctx, models.RestoreVolumeRequest{
 		SourcePath: archivePath,
@@ -1172,17 +1867,139 @@ func TestRestoreReverifiesChecksumBeforeRunningHelper(t *testing.T) {
 	if err := os.WriteFile(archivePath, []byte("tampered"), 0o600); err != nil {
 		t.Fatalf("tamper archive: %v", err)
 	}
-	jobID, err := mgr.ApplyRestore(ctx, plan.PlanID, "app-db")
-	if err != nil {
-		t.Fatalf("ApplyRestore() error = %v", err)
-	}
-	payloadDone := waitJobDonePayload(t, done, jobID)
-	if payloadDone.Error == "" {
-		t.Fatalf("restore succeeded after checksum mismatch")
+	if jobID, err := mgr.ApplyRestore(ctx, plan.PlanID, "app-db"); jobID != "" || !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("ApplyRestore() = %q, %v; want empty/%s", jobID, err, apperror.Conflict)
 	}
 	if provider.hasRunArg("tar xzf") {
 		t.Fatalf("restore helper ran despite checksum mismatch: %#v", provider.calls)
 	}
+}
+
+func TestRestoreRejectsReplacedSourceArtifactsEvenWhenContentMatches(t *testing.T) {
+	for _, artifact := range []string{"archive", "metadata"} {
+		t.Run(artifact, func(t *testing.T) {
+			ctx := context.Background()
+			mgr, _, provider := newTestManager(t)
+			archivePath := writeTestRestoreArchive(t, "app-db")
+			metadataPath := metadataPathForArchive(archivePath)
+			mgr.Docker.(*fakeBackupDocker).volumes["app-db"] = &models.VolumeDetail{
+				Summary:   models.VolumeSummary{Name: "app-db"},
+				CreatedAt: time.Date(2026, 6, 13, 14, 0, 0, 0, time.UTC),
+			}
+
+			plan, err := mgr.PlanRestoreVolume(ctx, models.RestoreVolumeRequest{
+				SourcePath: archivePath,
+				VolumeName: "app-db",
+				Overwrite:  true,
+			})
+			if err != nil {
+				t.Fatalf("PlanRestoreVolume() error = %v", err)
+			}
+			path := archivePath
+			if artifact == "metadata" {
+				path = metadataPath
+			}
+			content, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read planned %s: %v", artifact, err)
+			}
+			if err := os.Remove(path); err != nil {
+				if runtime.GOOS == "windows" {
+					// Restore handles request delete sharing, but a filesystem or
+					// filter driver may still reject this adversarial replacement.
+					t.Logf("filesystem blocked planned %s replacement despite delete sharing: %v", artifact, err)
+					return
+				}
+				t.Fatalf("remove planned %s: %v", artifact, err)
+			}
+			if err := os.WriteFile(path, content, 0o600); err != nil {
+				t.Fatalf("replace planned %s: %v", artifact, err)
+			}
+
+			if jobID, err := mgr.ApplyRestore(ctx, plan.PlanID, "app-db"); jobID != "" || !apperror.IsCode(err, apperror.Conflict) {
+				t.Fatalf("ApplyRestore() = %q, %v; want empty/%s", jobID, err, apperror.Conflict)
+			}
+			if provider.hasRunArg("tar xzf") {
+				t.Fatalf("restore helper ran after %s replacement: %#v", artifact, provider.calls)
+			}
+		})
+	}
+}
+
+func TestRestoreRejectsRecreatedOverwriteTarget(t *testing.T) {
+	ctx := context.Background()
+	mgr, _, provider := newTestManager(t)
+	archivePath := writeTestRestoreArchive(t, "app-db")
+	docker := mgr.Docker.(*fakeBackupDocker)
+	docker.volumes["app-db"] = &models.VolumeDetail{
+		Summary:   models.VolumeSummary{Name: "app-db", Driver: "local"},
+		CreatedAt: time.Date(2026, 6, 13, 14, 0, 0, 0, time.UTC),
+	}
+	plan, err := mgr.PlanRestoreVolume(ctx, models.RestoreVolumeRequest{
+		SourcePath: archivePath,
+		VolumeName: "app-db",
+		Overwrite:  true,
+	})
+	if err != nil {
+		t.Fatalf("PlanRestoreVolume() error = %v", err)
+	}
+	docker.volumes["app-db"] = &models.VolumeDetail{
+		Summary:   models.VolumeSummary{Name: "app-db", Driver: "local"},
+		CreatedAt: time.Date(2026, 6, 13, 15, 0, 0, 0, time.UTC),
+	}
+
+	if jobID, err := mgr.ApplyRestore(ctx, plan.PlanID, "app-db"); jobID != "" || !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("ApplyRestore() = %q, %v; want empty/%s", jobID, err, apperror.Conflict)
+	}
+	if provider.hasRunArg("tar xzf") {
+		t.Fatalf("restore helper ran for recreated target: %#v", provider.calls)
+	}
+}
+
+func TestRestoreRejectsRuntimeScopeDrift(t *testing.T) {
+	ctx := context.Background()
+	mgr, _, provider := newTestManager(t)
+	archivePath := writeTestRestoreArchive(t, "app-db")
+	mgr.Docker.(*fakeBackupDocker).volumes["app-db"] = &models.VolumeDetail{
+		Summary:   models.VolumeSummary{Name: "app-db"},
+		CreatedAt: time.Date(2026, 6, 13, 14, 0, 0, 0, time.UTC),
+	}
+	plan, err := mgr.PlanRestoreVolume(ctx, models.RestoreVolumeRequest{
+		SourcePath: archivePath,
+		VolumeName: "app-db",
+		Overwrite:  true,
+	})
+	if err != nil {
+		t.Fatalf("PlanRestoreVolume() error = %v", err)
+	}
+	mgr.Providers = fakeProviderResolver{provider: &fakeBackupProvider{contextName: "other"}}
+
+	if jobID, err := mgr.ApplyRestore(ctx, plan.PlanID, "app-db"); jobID != "" || !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("ApplyRestore() = %q, %v; want empty/%s", jobID, err, apperror.Conflict)
+	}
+	if provider.hasRunArg("tar xzf") {
+		t.Fatalf("planned runtime executed after scope drift: %#v", provider.calls)
+	}
+}
+
+func writeTestRestoreArchive(t *testing.T, volumeName string) string {
+	t.Helper()
+	dir := t.TempDir()
+	archivePath := filepath.Join(dir, volumeName+".tar.gz")
+	payload := []byte("backup-data")
+	if err := os.WriteFile(archivePath, payload, 0o600); err != nil {
+		t.Fatalf("write archive: %v", err)
+	}
+	sum := sha256.Sum256(payload)
+	if err := writeSidecar(metadataPathForArchive(archivePath), BackupSidecar{
+		FormatVersion: formatVersion,
+		Volume:        volumeName,
+		Project:       "app",
+		SHA256:        hex.EncodeToString(sum[:]),
+	}); err != nil {
+		t.Fatalf("write sidecar: %v", err)
+	}
+	return archivePath
 }
 
 func newTestManager(t *testing.T) (*Manager, *bus.MemoryBus, *fakeBackupProvider) {
@@ -1228,10 +2045,14 @@ func (r fakeProviderResolver) ActiveProvider(context.Context) (providers.Platfor
 type fakeBackupProvider struct {
 	mu               sync.Mutex
 	calls            [][]string
+	callDeadlines    []bool
+	callContextErrs  []error
+	failCommands     map[string]error
 	blockRun         chan struct{}
 	runStarted       chan struct{}
 	runCanceled      chan error
 	afterBackupWrite func() error
+	contextName      string
 }
 
 func (p *fakeBackupProvider) ID() string          { return "linux_native" }
@@ -1253,14 +2074,27 @@ func (p *fakeBackupProvider) Restart(context.Context) error { return nil }
 func (p *fakeBackupProvider) DockerHost(context.Context) (string, error) {
 	return "unix:///var/run/docker.sock", nil
 }
-func (p *fakeBackupProvider) DockerContext(context.Context) (string, error) { return "default", nil }
+func (p *fakeBackupProvider) DockerContext(context.Context) (string, error) {
+	return firstNonEmpty(p.contextName, "default"), nil
+}
 func (p *fakeBackupProvider) RunDocker(ctx context.Context, args ...string) (*providers.CommandResult, error) {
+	_, hasDeadline := ctx.Deadline()
+	joined := strings.Join(args, " ")
 	p.mu.Lock()
 	p.calls = append(p.calls, append([]string(nil), args...))
+	p.callDeadlines = append(p.callDeadlines, hasDeadline)
+	p.callContextErrs = append(p.callContextErrs, ctx.Err())
 	blockRun := p.blockRun
 	runStarted := p.runStarted
 	runCanceled := p.runCanceled
 	afterBackupWrite := p.afterBackupWrite
+	var commandErr error
+	for needle, injectedErr := range p.failCommands {
+		if strings.Contains(joined, needle) {
+			commandErr = injectedErr
+			break
+		}
+	}
 	p.mu.Unlock()
 	if runStarted != nil {
 		select {
@@ -1277,6 +2111,9 @@ func (p *fakeBackupProvider) RunDocker(ctx context.Context, args ...string) (*pr
 			}
 			return &providers.CommandResult{ExitCode: 1, Stderr: ctx.Err().Error()}, ctx.Err()
 		}
+	}
+	if commandErr != nil {
+		return &providers.CommandResult{ExitCode: 1, Stderr: commandErr.Error()}, commandErr
 	}
 	if scriptIndex := slices.Index(args, "cairn-backup"); scriptIndex >= 0 && scriptIndex+1 < len(args) {
 		archive := ""
@@ -1312,19 +2149,58 @@ func (p *fakeBackupProvider) BackendShellCommand(models.TerminalOptions) ([]stri
 func (p *fakeBackupProvider) MapPathToBackend(path string) (string, error) { return path, nil }
 func (p *fakeBackupProvider) MapPathToHost(path string) (string, error)    { return path, nil }
 func (p *fakeBackupProvider) hasRunArg(value string) bool {
+	return p.countRunArg(value) > 0
+}
+
+func (p *fakeBackupProvider) countRunArg(value string) int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	count := 0
 	for _, call := range p.calls {
 		joined := strings.Join(call, " ")
 		if strings.Contains(joined, value) {
-			return true
+			count++
+		}
+	}
+	return count
+}
+
+func (p *fakeBackupProvider) callsSnapshot() [][]string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	result := make([][]string, len(p.calls))
+	for index, call := range p.calls {
+		result[index] = append([]string(nil), call...)
+	}
+	return result
+}
+
+func (p *fakeBackupProvider) callHadDeadline(value string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for index, call := range p.calls {
+		if strings.Contains(strings.Join(call, " "), value) && index < len(p.callDeadlines) {
+			return p.callDeadlines[index]
 		}
 	}
 	return false
 }
 
+func (p *fakeBackupProvider) callContextError(value string) (error, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for index, call := range p.calls {
+		if strings.Contains(strings.Join(call, " "), value) && index < len(p.callContextErrs) {
+			return p.callContextErrs[index], true
+		}
+	}
+	return nil, false
+}
+
 type fakeBackupDocker struct {
-	volumes map[string]*models.VolumeDetail
+	volumes        map[string]*models.VolumeDetail
+	createRequests []models.CreateVolumeRequest
+	beforeCreate   func(models.CreateVolumeRequest)
 }
 
 func (d *fakeBackupDocker) ProviderID() string { return "linux_native" }
@@ -1333,12 +2209,45 @@ func (d *fakeBackupDocker) GetVolume(_ context.Context, name string) (*models.Vo
 	if !ok {
 		return nil, apperror.New(apperror.NotFound, "Volume was not found")
 	}
-	return volume, nil
+	copy := *volume
+	if copy.CreatedAt.IsZero() {
+		copy.CreatedAt = time.Date(2026, 6, 13, 15, 0, 0, 0, time.UTC)
+	}
+	return &copy, nil
 }
 func (d *fakeBackupDocker) CreateVolume(_ context.Context, req models.CreateVolumeRequest) (*models.VolumeSummary, error) {
-	summary := &models.VolumeSummary{Name: req.Name, Driver: firstNonEmpty(req.Driver, "local")}
-	d.volumes[req.Name] = &models.VolumeDetail{Summary: *summary}
+	requestCopy := req
+	requestCopy.Labels = cloneStringMap(req.Labels)
+	d.createRequests = append(d.createRequests, requestCopy)
+	if d.beforeCreate != nil {
+		d.beforeCreate(requestCopy)
+	}
+	if existing := d.volumes[req.Name]; existing != nil {
+		summary := existing.Summary
+		summary.Labels = cloneStringMap(existing.Summary.Labels)
+		return &summary, nil
+	}
+	summary := &models.VolumeSummary{
+		Name:   req.Name,
+		Driver: firstNonEmpty(req.Driver, "local"),
+		Labels: cloneStringMap(req.Labels),
+	}
+	d.volumes[req.Name] = &models.VolumeDetail{
+		Summary:   *summary,
+		CreatedAt: time.Date(2026, 6, 13, 15, 0, 0, 0, time.UTC),
+	}
 	return summary, nil
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+	cloned := make(map[string]string, len(values))
+	for key, value := range values {
+		cloned[key] = value
+	}
+	return cloned
 }
 
 func waitJobDone(t *testing.T, events <-chan bus.Event, jobID string) {
@@ -1397,6 +2306,16 @@ func savedPlanRecord(t *testing.T, mgr *Manager, planID string) planRecord {
 		t.Fatalf("plan %s is not saved", planID)
 	}
 	return record
+}
+
+func assertFileHandleClosed(t *testing.T, handle *os.File, label string) {
+	t.Helper()
+	if handle == nil {
+		t.Fatalf("%s handle is nil", label)
+	}
+	if _, err := handle.Stat(); err == nil {
+		t.Fatalf("%s handle remains open", label)
+	}
 }
 
 func assertPathMissing(t *testing.T, path string) {

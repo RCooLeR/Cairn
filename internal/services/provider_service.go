@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
@@ -26,11 +27,62 @@ type providerInstallProgressPayload struct {
 }
 
 type ProviderService struct {
-	Manager *providers.Manager
-	Events  bus.Bus
-	Audit   *store.AuditRepository
-	Plans   *security.ProviderPlanStore
-	Runtime ProviderRuntime
+	Manager          *providers.Manager
+	Events           bus.Bus
+	Audit            *store.AuditRepository
+	Plans            *security.ProviderPlanStore
+	Runtime          ProviderRuntime
+	InstallLifecycle *ProviderInstallLifecycle
+
+	installLifecycleMu sync.Mutex
+}
+
+// ProviderInstallLifecycle owns install jobs independently of short-lived RPC
+// request contexts while still making application shutdown cancel-and-join
+// every privileged installer before the event bus and database are closed.
+type ProviderInstallLifecycle struct {
+	mu      sync.Mutex
+	ctx     context.Context
+	cancel  context.CancelFunc
+	stopped bool
+	jobs    sync.WaitGroup
+}
+
+func NewProviderInstallLifecycle(parent context.Context) *ProviderInstallLifecycle {
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithCancel(parent)
+	return &ProviderInstallLifecycle{ctx: ctx, cancel: cancel}
+}
+
+func (l *ProviderInstallLifecycle) begin() (context.Context, func(), error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.stopped || l.ctx == nil || l.ctx.Err() != nil {
+		return nil, nil, apperror.New(
+			apperror.ProviderNotReady,
+			"Provider installer is shutting down",
+			apperror.WithRepairHints("Restart Cairn before starting another provider installation."),
+		)
+	}
+	l.jobs.Add(1)
+	return l.ctx, l.jobs.Done, nil
+}
+
+func (l *ProviderInstallLifecycle) StopAll() {
+	if l == nil {
+		return
+	}
+	l.mu.Lock()
+	if !l.stopped {
+		l.stopped = true
+		if l.cancel != nil {
+			l.cancel()
+		}
+	}
+	l.mu.Unlock()
+	l.jobs.Wait()
 }
 
 type ProviderRuntime interface {
@@ -79,15 +131,21 @@ func (s *ProviderService) ApplyInstall(ctx context.Context, planID string) (*mod
 	if s.Manager == nil {
 		return nil, notReady()
 	}
+	jobCtx, jobDone, err := s.providerInstallLifecycle().begin()
+	if err != nil {
+		return nil, err
+	}
 	streamID := uuid.NewString()
 	progress := make(chan providers.InstallProgress, 8)
 	providerID, command, risk := s.Manager.InstallPlanAuditContext(planID)
-	go s.runProviderInstall(context.WithoutCancel(ctx), planID, streamID, providerID, command, risk, progress)
+	go func() {
+		defer jobDone()
+		s.runProviderInstall(jobCtx, planID, streamID, providerID, command, risk, progress)
+	}()
 	return &models.InstallProgressHandle{PlanID: planID, StreamID: streamID}, nil
 }
 
 func (s *ProviderService) runProviderInstall(ctx context.Context, planID string, streamID string, providerID string, command string, risk models.Risk, progress chan providers.InstallProgress) {
-	auditCtx := context.WithoutCancel(ctx)
 	done := make(chan error, 1)
 	started := time.Now()
 	go func() {
@@ -99,7 +157,11 @@ func (s *ProviderService) runProviderInstall(ctx context.Context, planID string,
 		last = item
 		s.publishProviderInstallProgress(planID, streamID, item, "")
 	}
-	if err := <-done; err != nil {
+	installErr := <-done
+	auditCtx, cancelAudit := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancelAudit()
+	if installErr != nil {
+		err := installErr
 		if auditErr := s.recordProviderInstallAudit(auditCtx, planID, providerID, command, risk, "failed", time.Since(started), err); auditErr != nil {
 			err = errors.Join(err, auditErr)
 		}
@@ -128,6 +190,15 @@ func (s *ProviderService) runProviderInstall(ctx context.Context, planID string,
 	}
 }
 
+func (s *ProviderService) providerInstallLifecycle() *ProviderInstallLifecycle {
+	s.installLifecycleMu.Lock()
+	defer s.installLifecycleMu.Unlock()
+	if s.InstallLifecycle == nil {
+		s.InstallLifecycle = NewProviderInstallLifecycle(context.Background())
+	}
+	return s.InstallLifecycle
+}
+
 func providerInstallErrorText(err error) string {
 	if err == nil {
 		return ""
@@ -150,7 +221,7 @@ func (s *ProviderService) publishProviderInstallProgress(planID string, streamID
 	if s.Events == nil {
 		return
 	}
-	s.Events.Publish(bus.Event{
+	event := bus.Event{
 		Topic: bus.TopicProviderInstallProgress,
 		Payload: providerInstallProgressPayload{
 			PlanID:     planID,
@@ -161,7 +232,10 @@ func (s *ProviderService) publishProviderInstallProgress(planID string, streamID
 			Done:       progress.Done,
 			Error:      errText,
 		},
-	})
+	}
+	// Provider installation has few, security-relevant steps. Keep the full
+	// sequence reliable so its terminal event cannot overtake lossy progress.
+	publishCriticalEvent(s.Events, event)
 }
 
 func (s *ProviderService) recordProviderInstallAudit(ctx context.Context, planID string, providerID string, command string, risk models.Risk, status string, duration time.Duration, actionErr error) error {

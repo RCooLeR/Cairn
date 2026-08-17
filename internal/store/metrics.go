@@ -143,8 +143,11 @@ func metricsSeriesSegments(filter MetricsSeriesFilter, from time.Time, to time.T
 	if rawRetention <= 0 {
 		rawRetention = DefaultMetricsRawRetention
 	}
-	rawStart := now.Add(-rawRetention)
-	minuteStart := now.Add(-24 * time.Hour)
+	// Retention only compacts complete target buckets. Use the same aligned
+	// boundaries when stitching tiers so a partially elapsed minute or
+	// 15-minute window remains wholly owned by the finer resolution.
+	rawStart := completeMetricsCutoff(now, rawRetention, time.Minute)
+	minuteStart := completeMetricsCutoff(now, 24*time.Hour, 15*time.Minute)
 	oldestFineStart := rawStart
 	if minuteStart.Before(oldestFineStart) {
 		oldestFineStart = minuteStart
@@ -281,10 +284,12 @@ func (r *MetricsRepository) RetainAndDownsampleWithRawRetention(ctx context.Cont
 		_ = tx.Rollback()
 	}()
 
-	if err := downsampleMetrics(ctx, tx, MetricsResolutionRaw, MetricsResolution1m, now.Add(-rawRetention), time.Minute); err != nil {
+	rawCutoff := completeMetricsCutoff(now, rawRetention, time.Minute)
+	minuteCutoff := completeMetricsCutoff(now, 24*time.Hour, 15*time.Minute)
+	if err := downsampleMetrics(ctx, tx, MetricsResolutionRaw, MetricsResolution1m, rawCutoff, time.Minute); err != nil {
 		return err
 	}
-	if err := downsampleMetrics(ctx, tx, MetricsResolution1m, MetricsResolution15m, now.Add(-24*time.Hour), 15*time.Minute); err != nil {
+	if err := downsampleMetrics(ctx, tx, MetricsResolution1m, MetricsResolution15m, minuteCutoff, 15*time.Minute); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `
@@ -294,6 +299,10 @@ func (r *MetricsRepository) RetainAndDownsampleWithRawRetention(ctx context.Cont
 		return err
 	}
 	return tx.Commit()
+}
+
+func completeMetricsCutoff(now time.Time, retention time.Duration, bucketSize time.Duration) time.Time {
+	return now.UTC().Add(-retention).Truncate(bucketSize)
 }
 
 func ResolutionForRange(from time.Time, to time.Time) string {

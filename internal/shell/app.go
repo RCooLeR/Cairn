@@ -26,8 +26,9 @@ import (
 )
 
 const (
-	appName        = "Cairn"
-	appDescription = "A clean Compose-first Docker manager for Windows, macOS, and Linux."
+	appName             = "Cairn"
+	appDescription      = "A clean Compose-first Docker manager for Windows, macOS, and Linux."
+	appSingleInstanceID = "app.cairn.desktop"
 )
 
 // Run owns all Wails-specific bootstrapping so the domain core stays free of
@@ -75,7 +76,14 @@ func Run(assets fs.FS) error {
 	defer closePlanStores()
 	registryManager := registrycore.NewManager(providerManager, auditRepo)
 	registryManager.Settings = db.Settings()
-	providerService := &services.ProviderService{Manager: providerManager, Events: eventBus, Audit: auditRepo, Plans: providerPlans}
+	providerInstallLifecycle := services.NewProviderInstallLifecycle(ctx)
+	providerService := &services.ProviderService{
+		Manager:          providerManager,
+		Events:           eventBus,
+		Audit:            auditRepo,
+		Plans:            providerPlans,
+		InstallLifecycle: providerInstallLifecycle,
+	}
 	runtimeMu := &sync.RWMutex{}
 	dockerService := &services.DockerService{Audit: auditRepo, Plans: containerPlans, ObjectPlans: objectPlans, RuntimeMu: runtimeMu}
 	projectService := &services.ProjectService{
@@ -133,26 +141,27 @@ func Run(assets fs.FS) error {
 		PortForwardService: portForwardService,
 	})
 	providerService.Runtime = runtimeController
-	if len(providerSet) > 0 {
-		runtimeProvider := providerSet[0]
-		if activeProvider, err := providerManager.ActiveProvider(ctx); err == nil && activeProvider != nil {
-			runtimeProvider = activeProvider
-		}
-		maybeAutoInstallWindowsDockerCLIShim(ctx, db.Settings(), runtimeProvider)
-		if _, err := runtimeController.RebindProvider(ctx, runtimeProvider); err != nil {
-			// A saved provider can be temporarily unavailable or have been
-			// removed outside Cairn. Keep the runtime stopped and let the app
-			// open so the user can select, configure, or repair a provider.
-			slog.Warn("initial provider runtime is unavailable; starting in setup-only mode", "provider", runtimeProvider.ID(), "error", err)
-		}
-	}
 
 	notificationService := wailsnotifications.New()
+	var instanceWindowMu sync.RWMutex
+	var instanceWindow application.Window
+	restoreInstanceWindow := func() {
+		instanceWindowMu.RLock()
+		window := instanceWindow
+		instanceWindowMu.RUnlock()
+		restoreMainWindow(window)
+	}
 	app := application.New(application.Options{
 		Name:         appName,
 		Description:  appDescription,
 		Icon:         icon,
 		MarshalError: apperror.Marshal,
+		SingleInstance: &application.SingleInstanceOptions{
+			UniqueID: appSingleInstanceID,
+			OnSecondInstanceLaunch: func(application.SecondInstanceData) {
+				restoreInstanceWindow()
+			},
+		},
 		Services: []application.Service{
 			application.NewService(notificationService),
 			application.NewService(providerService),
@@ -178,6 +187,7 @@ func Run(assets fs.FS) error {
 		},
 		OnShutdown: func() {
 			cancel()
+			providerInstallLifecycle.StopAll()
 			runtimeController.StopAll()
 			closePlanStores()
 			eventBus.Close()
@@ -199,6 +209,24 @@ func Run(assets fs.FS) error {
 		},
 	})
 
+	// Wails acquires its process-wide single-instance lock in application.New.
+	// Bind the provider runtime only after that point so a second launcher exits
+	// before it can contend for Cairn's private bridge or other provider-owned
+	// resources.
+	if len(providerSet) > 0 {
+		runtimeProvider := providerSet[0]
+		if activeProvider, err := providerManager.ActiveProvider(ctx); err == nil && activeProvider != nil {
+			runtimeProvider = activeProvider
+		}
+		maybeAutoInstallWindowsDockerCLIShim(ctx, db.Settings(), runtimeProvider)
+		if _, err := runtimeController.RebindProvider(ctx, runtimeProvider); err != nil {
+			// A saved provider can be temporarily unavailable or have been
+			// removed outside Cairn. Keep the runtime stopped and let the app
+			// open so the user can select, configure, or repair a provider.
+			slog.Warn("initial provider runtime is unavailable; starting in setup-only mode", "provider", runtimeProvider.ID(), "error", err)
+		}
+	}
+
 	mainWindow := app.Window.NewWithOptions(application.WebviewWindowOptions{
 		Name:             "main",
 		Title:            appName,
@@ -219,6 +247,9 @@ func Run(assets fs.FS) error {
 			Theme: application.Dark,
 		},
 	})
+	instanceWindowMu.Lock()
+	instanceWindow = mainWindow
+	instanceWindowMu.Unlock()
 	quitRequested := &atomic.Bool{}
 	trayNoticeShown := &atomic.Bool{}
 	configureSystemTray(app, mainWindow, icon, notificationService, quitRequested, trayNoticeShown)
@@ -226,6 +257,24 @@ func Run(assets fs.FS) error {
 	forwardBusEvents(ctx, eventBus, mainWindow, bus.FrontendEventRoutes())
 
 	return app.Run()
+}
+
+type restorableMainWindow interface {
+	Show() application.Window
+	IsMinimised() bool
+	UnMinimise()
+	Focus()
+}
+
+func restoreMainWindow(window restorableMainWindow) {
+	if window == nil {
+		return
+	}
+	window.Show()
+	if window.IsMinimised() {
+		window.UnMinimise()
+	}
+	window.Focus()
 }
 
 func maybeAutoInstallWindowsDockerCLIShim(ctx context.Context, settings *store.SettingsRepository, provider providers.PlatformProvider) {
@@ -254,11 +303,7 @@ func configureSystemTray(
 		return
 	}
 	showWindow := func() {
-		window.Show()
-		if window.IsMinimised() {
-			window.UnMinimise()
-		}
-		window.Focus()
+		restoreMainWindow(window)
 	}
 	hideWindow := func() {
 		window.Hide()

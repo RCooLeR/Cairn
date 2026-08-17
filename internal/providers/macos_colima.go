@@ -316,6 +316,12 @@ func (p *MacOSColimaProvider) pruneExpiredInstallPlansLocked(now time.Time) {
 	}
 }
 
+func (p *MacOSColimaProvider) DiscardInstallPlan(planID string) {
+	p.installMu.Lock()
+	delete(p.installPlans, planID)
+	p.installMu.Unlock()
+}
+
 func (p *MacOSColimaProvider) Start(ctx context.Context) error {
 	_, err := p.runner.Run(ctx, colimaInstallTimeout, colimaCommandName, p.colimaStartArgs()...)
 	return err

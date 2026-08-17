@@ -26,8 +26,8 @@
     sans-serif;
   opacity: 1;
   transition:
-    opacity 0.62s ease,
-    filter 0.62s ease;
+    opacity 0.16s ease,
+    filter 0.16s ease;
 }
 
 .cairn-loader .progress-semantics {

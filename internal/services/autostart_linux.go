@@ -24,7 +24,7 @@ func (linuxAutostartManager) Enabled(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	raw, err := os.ReadFile(path)
+	raw, err := readAutostartFile(path)
 	if os.IsNotExist(err) {
 		return false, nil
 	}

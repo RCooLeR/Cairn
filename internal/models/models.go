@@ -589,12 +589,13 @@ type StatsScope struct {
 }
 
 type LogStreamRequest struct {
-	Scope      string   `json:"scope"`
-	IDs        []string `json:"ids,omitempty"`
-	Follow     bool     `json:"follow"`
-	Tail       int      `json:"tail"`
-	Since      string   `json:"since,omitempty"`
-	Timestamps bool     `json:"timestamps"`
+	ClientToken string   `json:"clientToken,omitempty"`
+	Scope       string   `json:"scope"`
+	IDs         []string `json:"ids,omitempty"`
+	Follow      bool     `json:"follow"`
+	Tail        int      `json:"tail"`
+	Since       string   `json:"since,omitempty"`
+	Timestamps  bool     `json:"timestamps"`
 }
 
 type LogPageRequest struct {

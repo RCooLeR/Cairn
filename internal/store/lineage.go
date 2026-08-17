@@ -68,6 +68,9 @@ func (r *LineageRepository) ReplaceProject(ctx context.Context, projectID string
 	defer func() {
 		_ = tx.Rollback()
 	}()
+	if err := detachUpdateCheckLineageReferences(ctx, tx, `project_id = ?`, projectID); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM image_lineage WHERE project_id = ?`, projectID); err != nil {
 		return err
 	}
@@ -99,6 +102,16 @@ func (r *LineageRepository) ReplaceProjectInScope(ctx context.Context, scope run
 			return fmt.Errorf("lineage record for project %q does not belong to the runtime scope", projectID)
 		}
 	}
+	if err := detachUpdateCheckLineageReferences(
+		ctx,
+		tx,
+		`project_id = ? AND provider_id = ? AND context_name = ?`,
+		projectID,
+		scope.ProviderID(),
+		scope.ContextName(),
+	); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM image_lineage WHERE project_id = ? AND provider_id = ? AND context_name = ?`, projectID, scope.ProviderID(), scope.ContextName()); err != nil {
 		return err
 	}
@@ -119,6 +132,9 @@ func (r *LineageRepository) ReplaceService(ctx context.Context, projectID string
 	defer func() {
 		_ = tx.Rollback()
 	}()
+	if err := detachUpdateCheckLineageReferences(ctx, tx, `project_id = ? AND service_name = ?`, projectID, service); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM image_lineage
 		WHERE project_id = ? AND service_name = ?
@@ -151,6 +167,17 @@ func (r *LineageRepository) ReplaceServiceInScope(ctx context.Context, scope run
 	if !scope.Matches(record.ProviderID, record.ContextName) {
 		return fmt.Errorf("lineage record for project %q does not belong to the runtime scope", projectID)
 	}
+	if err := detachUpdateCheckLineageReferences(
+		ctx,
+		tx,
+		`project_id = ? AND service_name = ? AND provider_id = ? AND context_name = ?`,
+		projectID,
+		service,
+		scope.ProviderID(),
+		scope.ContextName(),
+	); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM image_lineage
 		WHERE project_id = ? AND service_name = ? AND provider_id = ? AND context_name = ?
@@ -163,6 +190,36 @@ func (r *LineageRepository) ReplaceServiceInScope(ctx context.Context, scope run
 		return err
 	}
 	return tx.Commit()
+}
+
+// detachUpdateCheckLineageReferences preserves published update-check history
+// before replacing its mutable lineage snapshot. Reattaching historical checks
+// to newly discovered rows would misrepresent what those checks evaluated, so
+// both optional links are cleared in the same transaction as the replacement.
+// lineagePredicate is always an internal SQL fragment supplied by the callers
+// above; values remain parameterized.
+func detachUpdateCheckLineageReferences(ctx context.Context, tx *sql.Tx, lineagePredicate string, args ...any) error {
+	query := fmt.Sprintf(`
+		WITH target_lineage AS (
+			SELECT id
+			FROM image_lineage
+			WHERE %s
+		),
+		target_base_refs AS (
+			SELECT id
+			FROM base_image_refs
+			WHERE lineage_id IN (SELECT id FROM target_lineage)
+		)
+		UPDATE image_update_checks
+		SET lineage_id = NULL,
+			base_image_ref_id = NULL
+		WHERE lineage_id IN (SELECT id FROM target_lineage)
+			OR base_image_ref_id IN (SELECT id FROM target_base_refs)
+	`, lineagePredicate)
+	if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+		return fmt.Errorf("detach update checks from replaced lineage: %w", err)
+	}
+	return nil
 }
 
 func requireLineageProjectScope(ctx context.Context, tx *sql.Tx, scope runtimescope.Scope, projectID string) error {

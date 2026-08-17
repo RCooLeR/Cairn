@@ -8,11 +8,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/bus"
 	"github.com/RCooLeR/Cairn/internal/dockerbridge"
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
 	"github.com/RCooLeR/Cairn/internal/runtimescope"
+	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/services"
 	"github.com/RCooLeR/Cairn/internal/store"
 )
@@ -81,13 +83,42 @@ func TestNewAppRuntimeUsesNamedConfigAndStoppedState(t *testing.T) {
 
 func TestAppRuntimeNilProviderClearsServicesAndReturnsStopped(t *testing.T) {
 	runtimeMu := &sync.RWMutex{}
+	oldScope := runtimescope.Must("old-provider", "old-context")
+	containerPlans := security.NewPlanStore(nil)
+	objectPlans := security.NewDockerObjectPlanStore(nil)
+	t.Cleanup(containerPlans.Close)
+	t.Cleanup(objectPlans.Close)
+	containerPlan, err := security.NewContainerActionPlan(
+		security.ContainerActionKill,
+		[]models.ContainerSummary{{ID: "container-1", Name: "web"}},
+		0,
+		models.RemoveContainerOptions{},
+		time.Now().UTC(),
+	)
+	if err != nil {
+		t.Fatalf("NewContainerActionPlan() error = %v", err)
+	}
+	containerPlan.Scope = oldScope
+	if err := containerPlans.Save(containerPlan); err != nil {
+		t.Fatalf("Save(container plan) error = %v", err)
+	}
+	objectPlan, err := security.NewPrunePlan("images", time.Now().UTC())
+	if err != nil {
+		t.Fatalf("NewPrunePlan() error = %v", err)
+	}
+	objectPlan.TargetScope = oldScope
+	if err := objectPlans.Save(objectPlan); err != nil {
+		t.Fatalf("Save(object plan) error = %v", err)
+	}
 	dockerService := &services.DockerService{
-		RuntimeMu: runtimeMu,
-		Scope:     runtimescope.Must("old-provider", "old-context"),
+		RuntimeMu:   runtimeMu,
+		Scope:       oldScope,
+		Plans:       containerPlans,
+		ObjectPlans: objectPlans,
 	}
 	projectService := &services.ProjectService{
 		RuntimeMu: runtimeMu,
-		Scope:     runtimescope.Must("old-provider", "old-context"),
+		Scope:     oldScope,
 	}
 	runtimeController := newAppRuntime(appRuntimeConfig{
 		RootCtx:            context.Background(),
@@ -119,6 +150,12 @@ func TestAppRuntimeNilProviderClearsServicesAndReturnsStopped(t *testing.T) {
 	}
 	if dockerService.Scope.Valid() {
 		t.Fatalf("Docker service scope was not cleared: %q/%q", dockerService.Scope.ProviderID(), dockerService.Scope.ContextName())
+	}
+	if _, err := containerPlans.Take(context.Background(), containerPlan.Plan.PlanID, ""); !apperror.IsCode(err, apperror.PlanExpired) {
+		t.Fatalf("container plan survived runtime rebind: %v", err)
+	}
+	if _, err := objectPlans.Take(context.Background(), objectPlan.Plan.PlanID, "prune"); !apperror.IsCode(err, apperror.PlanExpired) {
+		t.Fatalf("object plan survived runtime rebind: %v", err)
 	}
 }
 

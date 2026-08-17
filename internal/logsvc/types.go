@@ -137,17 +137,20 @@ type Manager struct {
 }
 
 type LinesPayload struct {
-	StreamID string           `json:"streamID"`
-	Lines    []models.LogLine `json:"lines"`
+	StreamID    string           `json:"streamID"`
+	ClientToken string           `json:"clientToken,omitempty"`
+	Lines       []models.LogLine `json:"lines"`
 }
 
 type EOFPayload struct {
-	StreamID string `json:"streamID"`
+	StreamID    string `json:"streamID"`
+	ClientToken string `json:"clientToken,omitempty"`
 }
 
 type ErrorPayload struct {
-	StreamID string `json:"streamID"`
-	Error    string `json:"error"`
+	StreamID    string `json:"streamID"`
+	ClientToken string `json:"clientToken,omitempty"`
+	Error       string `json:"error"`
 }
 
 type sourceInfo struct {

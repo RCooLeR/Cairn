@@ -64,8 +64,12 @@ describe("NotificationCenter", () => {
       screen.getByRole("button", { name: /Updates checked/ }),
     ).toHaveFocus();
 
+    const escapedToWindow = vi.fn();
+    window.addEventListener("keydown", escapedToWindow);
     fireEvent.keyDown(document, { key: "Escape" });
+    window.removeEventListener("keydown", escapedToWindow);
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(escapedToWindow).not.toHaveBeenCalled();
     expect(opener).toHaveFocus();
 
     vi.useRealTimers();

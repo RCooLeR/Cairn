@@ -20,3 +20,22 @@ func TestScopeRequiresBothComponentsAndIsExact(t *testing.T) {
 		t.Fatal("Matches() did not enforce exact scope")
 	}
 }
+
+func TestWindowsWSLContextV1MatchesPersistedCanonicalization(t *testing.T) {
+	t.Parallel()
+
+	fromDistro, ok := WindowsWSLContextV1("  ÜBUNTU  ")
+	if !ok || fromDistro != "wsl:übuntu" {
+		t.Fatalf("WindowsWSLContextV1() = %q, %v; want wsl:übuntu, true", fromDistro, ok)
+	}
+	fromContext, ok := CanonicalizeWindowsWSLContextV1("  WSL:ÜBUNTU  ")
+	if !ok || fromContext != fromDistro {
+		t.Fatalf("CanonicalizeWindowsWSLContextV1() = %q, %v; want %q, true", fromContext, ok, fromDistro)
+	}
+
+	for _, invalid := range []string{"", "wsl:", "docker:ubuntu"} {
+		if got, valid := CanonicalizeWindowsWSLContextV1(invalid); valid || got != "" {
+			t.Fatalf("CanonicalizeWindowsWSLContextV1(%q) = %q, %v; want empty, false", invalid, got, valid)
+		}
+	}
+}

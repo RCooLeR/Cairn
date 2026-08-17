@@ -159,6 +159,7 @@ export const Components = () => {
       <Toast
         body="The Docker provider is currently unavailable."
         level="warn"
+        onDismiss={() => undefined}
         title="Provider degraded"
       />
 

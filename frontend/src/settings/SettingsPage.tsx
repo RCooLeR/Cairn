@@ -74,19 +74,10 @@ export type SettingsSectionID =
   | "about";
 
 export type SettingsReadStatus =
-  | "error"
-  | "loading"
-  | "ready"
-  | "refreshing"
-  | "stale";
+  "error" | "loading" | "ready" | "refreshing" | "stale";
 
 type DiagnosticResourceStatus =
-  | "error"
-  | "loading"
-  | "ready"
-  | "refreshing"
-  | "stale"
-  | "unknown";
+  "error" | "loading" | "ready" | "refreshing" | "stale" | "unknown";
 
 type DiagnosticResource<T> = {
   data: T | null;
@@ -220,10 +211,6 @@ export function SettingsPage({
   error,
   message,
   onAutostartChange,
-  onColimaCPUChange,
-  onColimaDiskGBChange,
-  onColimaMemoryGBChange,
-  onColimaProfileChange,
   onDetect,
   onOpenSetup,
   onRefreshDockerContexts,
@@ -278,10 +265,6 @@ export function SettingsPage({
   error: string | null;
   message: string | null;
   onAutostartChange: (enabled: boolean) => void;
-  onColimaCPUChange: (value: number) => void;
-  onColimaDiskGBChange: (value: number) => void;
-  onColimaMemoryGBChange: (value: number) => void;
-  onColimaProfileChange: (profile: string) => void;
   onDetect: () => void;
   onOpenSetup: () => void;
   onRefreshDockerContexts: () => void;
@@ -293,10 +276,10 @@ export function SettingsPage({
   onRegistryTest: (registry: string) => void;
   onAuditFilterChange: (patch: Partial<AuditFilterState>) => void;
   onSettingChange: (key: string, value: unknown) => Promise<boolean>;
-  onSaveColimaCPU: () => void;
-  onSaveColimaDiskGB: () => void;
-  onSaveColimaMemoryGB: () => void;
-  onSaveColimaProfile: () => void;
+  onSaveColimaCPU: (value: number) => Promise<boolean>;
+  onSaveColimaDiskGB: (value: number) => Promise<boolean>;
+  onSaveColimaMemoryGB: (value: number) => Promise<boolean>;
+  onSaveColimaProfile: (value: string) => Promise<boolean>;
   onSaveWSLDistro: () => Promise<boolean>;
   onUseDockerContext: (name: string) => void;
   onUseWSLDistro: (distro: string) => void;
@@ -381,7 +364,7 @@ export function SettingsPage({
   );
   const registryLoginDisabled = registryCredentialMode === "none";
   const registryLoginDisabledReason =
-    "Switch Credential mode to Prefer Docker credential helper before logging in from Cairn.";
+    "Switch Credential mode to Require Docker credential helper before logging in from Cairn.";
   const hasUnencryptedRegistryCredentials = registryAccounts.some(
     (account) => account.source === "authsFile",
   );
@@ -1766,40 +1749,31 @@ export function SettingsPage({
                   </p>
                 </div>
                 <div className="grid gap-3 sm:grid-cols-4">
-                  <label className="block">
-                    <span className="text-xs font-medium uppercase text-text-muted">
-                      Profile
-                    </span>
-                    <input
-                      className="mt-1 h-9 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
-                      onBlur={onSaveColimaProfile}
-                      onChange={(event) =>
-                        onColimaProfileChange(event.target.value)
-                      }
-                      onKeyDown={(event) => {
-                        if (event.key === "Enter") {
-                          onSaveColimaProfile();
-                        }
-                      }}
-                      value={colimaProfile}
-                    />
-                  </label>
-                  <SettingsNumberField
+                  <SettingsTextSetting
+                    disabled={saving}
+                    label="Profile"
+                    onSave={onSaveColimaProfile}
+                    value={colimaProfile}
+                  />
+                  <SettingsNumberSetting
+                    disabled={saving}
                     label="CPU"
-                    onBlur={onSaveColimaCPU}
-                    onChange={onColimaCPUChange}
+                    min={1}
+                    onSave={onSaveColimaCPU}
                     value={colimaCPU}
                   />
-                  <SettingsNumberField
+                  <SettingsNumberSetting
+                    disabled={saving}
                     label="RAM GB"
-                    onBlur={onSaveColimaMemoryGB}
-                    onChange={onColimaMemoryGBChange}
+                    min={1}
+                    onSave={onSaveColimaMemoryGB}
                     value={colimaMemoryGB}
                   />
-                  <SettingsNumberField
+                  <SettingsNumberSetting
+                    disabled={saving}
                     label="Disk GB"
-                    onBlur={onSaveColimaDiskGB}
-                    onChange={onColimaDiskGBChange}
+                    min={1}
+                    onSave={onSaveColimaDiskGB}
                     value={colimaDiskGB}
                   />
                 </div>
@@ -1893,9 +1867,10 @@ export function SettingsPage({
             />
             <CardBody className="space-y-3">
               <div className="text-sm text-text-muted">
-                Cairn sends secrets to `docker login` via stdin. Docker stores
-                them with a backend credential helper when one is available;
-                otherwise Docker may use config.json.
+                Cairn sends secrets to `docker login` via stdin only after a
+                working backend credential helper is available. Cairn does not
+                intentionally fall back to storing new secrets inline in
+                config.json.
               </div>
               <SettingsSelectField
                 disabled={saving}
@@ -1904,7 +1879,7 @@ export function SettingsPage({
                   onSettingChange("registry.credentials_mode", value)
                 }
                 options={[
-                  ["docker_helper", "Prefer Docker credential helper"],
+                  ["docker_helper", "Require Docker credential helper"],
                   ["none", "No Cairn-managed credentials"],
                 ]}
                 value={settingString(
@@ -1956,39 +1931,6 @@ export function SettingsPage({
         ) : null}
       </div>
     </div>
-  );
-}
-
-function SettingsNumberField({
-  label,
-  onBlur,
-  onChange,
-  value,
-}: {
-  label: string;
-  onBlur: () => void;
-  onChange: (value: number) => void;
-  value: number;
-}) {
-  return (
-    <label className="block">
-      <span className="text-xs font-medium uppercase text-text-muted">
-        {label}
-      </span>
-      <input
-        className="mt-1 h-9 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none"
-        min={1}
-        onBlur={onBlur}
-        onChange={(event) => onChange(Number(event.target.value))}
-        onKeyDown={(event) => {
-          if (event.key === "Enter") {
-            onBlur();
-          }
-        }}
-        type="number"
-        value={value}
-      />
-    </label>
   );
 }
 

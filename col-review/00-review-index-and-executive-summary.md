@@ -1,9 +1,14 @@
 # Cairn Full Project Review — Index and Executive Summary
 
 - Review date: 2026-07-15
-- Workspace: `E:\Development\projects\apps\rcooler\Cairn`
+- Workspace: repository root
 - Branch: `feat/port-forwarding-ui`
 - Reviewed HEAD: `92230977c065476a74dbb64f8133d8cddff88cfd`
+- Re-review delta: 2026-07-24 on `codex/review-remediation`, base `a223bfb462037969d42277ef20dcae28468e5f8e`
+- Registry/helper/single-instance and standalone acceptance follow-up: 2026-07-28 on the same remediation working tree
+- Previous full delta report: [11-2026-07-24-full-rereview-and-fix-status.md](./11-2026-07-24-full-rereview-and-fix-status.md)
+- Current acceptance report: [12-2026-07-28-registry-credential-helper-and-final-acceptance.md](./12-2026-07-28-registry-credential-helper-and-final-acceptance.md)
+- Current dependency/security review: [13-2026-08-17-full-project-review-and-dependency-refresh.md](./13-2026-08-17-full-project-review-and-dependency-refresh.md)
 
 ## Executive decision
 
@@ -16,6 +21,36 @@ The current project is **not ready for an unrestricted production release**.
 - Frontend compile-time health is good, but the current tests do not cover the most dangerous reordered async responses, native Wails boundary, accessibility contracts, or long-lived stream ownership.
 
 The fastest safe path is to quarantine server mode, fix credential and wrong-target defects, establish a single scoped identity/operation protocol, and make release publication fail closed before continuing feature work.
+
+### 2026-07-24 re-review update
+
+Substantial remediation has occurred since the original decision. The latest delta fixes the Windows WSL scope-casing defect that could show Docker containers while hiding projects; fail-open ordinary Compose path mapping; same-scope reconciliation ordering; zero-service snapshot clearing; atomic import/forget/delete and project-incarnation cleanup; lineage/update-check reference replacement; non-aligned metrics tier cutoffs; provider/update/backup/terminal lifecycle defects; failed-new-volume restore compensation; image save/load filesystem and response safety; critical terminal/job delivery; pre-ID log ownership; hidden bulk selection; last-known lineage retention; terminal startup enumeration; and the remaining Critical Agent chat/tool-approval cross-project ownership gap.
+
+At the pre-final source-remediation checkpoint, a complete uncached native Windows Go test run passed, as did 4 focused frontend files / 171 tests, TypeScript, ESLint, and Prettier. After the final backup-lifecycle and image-load success-contract changes, the complete Go suite, targeted race-enabled backend tests, and Go vet also passed. An intermediate production Wails binary then reached the exact-WebView launch smoke, which correctly exposed a blank-window runtime failure (`Uncaught TypeError: r is not a function`) caused by Rolldown vendor max-size splitting changing execution order. The strict-execution-order correction now passes TypeScript, release-validation and production builds, targeted real-Chromium boot, the full release-UI suite (16 passed, 1 opt-in golden skipped), ESLint, and Prettier in a clean staged frontend copy; output measures 498.84 KiB for the main chunk and 287.26 KiB for the largest vendor chunk. Final-tree full frontend tests, corrected Wails Windows resource build, PE/build-info inspection, and successful native launch smoke remain pending. The project therefore has a strong source-remediation checkpoint but is **not yet certified as a final rebuilt release binary**, and the original architectural/supply-chain residuals remain unless the delta explicitly closes them.
+
+The delta assigns `RR-2026-001` through `RR-2026-030` for traceability. Those records include newly isolated defects, incomplete earlier remediations, build-acceptance gaps, and confirmed residuals; they must not be added mechanically to the original 190-entry count as 30 independent root causes.
+
+### 2026-07-28 registry, single-instance, and final acceptance update
+
+The latest follow-up traces Cairn's registry login from settings policy and secret collection through provider/helper probing, Docker login, authenticated verification, helper-only finalization, rollback, audit, Wails error decoding, and account-status presentation. Host probes confirmed that the active WSL 2 backend was running and had a Docker config, but none of Cairn's bounded credential-helper candidates was installed and responsive. That is a real registry-login prerequisite failure, not an IPv6, WLAN, project-detection, or general Docker-provider failure.
+
+The working tree now classifies missing helpers as `E_REGISTRY_AUTH`, preserves true WSL/provider failures as `E_PROVIDER_NOT_READY`, preserves cancellation/deadline codes, renders bounded structured repair hints instead of raw Wails JSON, audits pre-command failures, computes one terminal login outcome only after verification/finalization/rollback, rolls back a successful login if its success audit cannot be recorded, disables secret collection under disabled/unknown policy, exposes Test Auth diagnostics, and clears credentials when registry identity changes.
+
+Native acceptance exposed one additional High lifecycle defect: relaunching a tray-resident app started a second Cairn runtime, which then failed private named-pipe ownership with Access denied. Wails single-instance ownership now precedes provider/bridge startup, and a second launch safely restores, unminimizes, and focuses the mutex-protected existing window. A final release audit then found that native Linux/macOS tasks still ran build-time `go mod tidy`, omitted `-mod=readonly`, and could generate icons before canonical asset synchronization, while hosted/local vet still omitted repository tooling. The shared task graph now enforces readonly modules and asset synchronization on every platform, and CI/local lint vet the full root module.
+
+A final adversarial lifecycle pass found that project deletion, stale cleanup, update, and rollback did not share a per-project cancellation/join/revision gate; multiple confirmed plans could mutate one project concurrently; and apply did not bind the stored Compose/service configuration reviewed by the user. The working tree now cancels and joins project-owned mutations before exact leased deletion, admits one scoped mutation at a time, expires pre-mutation plans by lifecycle revision, and revalidates a deterministic stored-configuration fingerprint. Image load now reconciles every error after the daemon mutation boundary and reports confirmed-versus-unknown partial state; late terminal-open results are closed after navigation instead of leaking invisible PTYs. A live dependency audit also exposed five newly published advisories. The supported ESLint 10 parent upgrade removes the legacy minimatch/js-yaml chain, DOMPurify and PostCSS are patched, and the final lock resolves minimatch 10.2.6 plus brace-expansion 5.0.8 without an incompatible override. These additions extend the follow-up through `RR-2026-047`.
+
+Final validation passed complete Go tests/vet, `golangci-lint` with 0 issues, `govulncheck` with no reachable vulnerabilities, race-enabled stateful backend suites, 28 frontend files / 343 tests, TypeScript, ESLint 10, Prettier, production build, and Playwright release UI (16 passed, 1 opt-in golden skipped). A real clean `npm ci` ran the nested Go-module postinstall hook; `npm audit --json` reports zero vulnerabilities; and root `go list ./...` returned 24 packages with zero beneath `frontend/node_modules`, closing OPS-014 for the final tree. The final main chunk is 501.66 kB (124.82 kB gzip) and retains its size warning. The exact rebuilt Windows executable must still receive the final PE/resource/build-info and native WebView/provider/project/registry/relaunch acceptance recorded in report 12. No NSIS installer is claimed, and the original architectural, supply-chain, installer, platform, bundle-budget, external-file-fingerprint, and external-writer residuals remain unless an individual record says otherwise.
+
+Across the two re-review deltas, `RR-2026-001` through `RR-2026-047` are traceability records. They overlap original catalog risks and must not be added mechanically to the original 190-entry count as 47 independent root causes.
+
+### 2026-08-17 dependency, plan-integrity, and accessibility update
+
+The latest full-tree pass updates the Go compiler/toolchain and safe Go/npm dependency lines, moves vulnerability and lint tooling to current pinned releases, removes the newly published reachable Go standard-library and npm findings, and hardens CI/release inputs and publication behavior. It also closes cross-runtime Docker plan replay, mutable Docker image/network aliases, the SQLite busy-WAL migration-backup gap, missing project/Compose mutation exclusion, stale project-plan configuration, backup sidecar/delete identity, multi-replica update-health verification, loader/modal/toast/table accessibility, and the known malformed event-array crash paths.
+
+Current frontend source and browser validation is green: 30 files / 350 unit tests, production and Ladle builds, and 16 Playwright scenarios with one intentional golden skip. Exact backend and tool evidence plus deliberate major-version deferrals are recorded in report 13. The decision remains source-acceptance rather than unrestricted production certification because Wails beta migration, signed/installed artifacts, and three-OS native package acceptance remain separate gates.
+
+`RR-2026-048` through `RR-2026-063` are delta traceability records and overlap the original catalog; they do not increase the normalized 190-entry root-cause count mechanically.
 
 ## Finding count
 
@@ -45,6 +80,11 @@ The architecture (`ARCH-*`) and security (`SEC-*`) documents are synthesis lense
 | [06-remediation-roadmap.md](./06-remediation-roadmap.md)                                                             | P0–P3 implementation sequence, finding mapping, exit criteria, release gates, and ownership suggestions.                           |
 | [07-validation-and-review-method.md](./07-validation-and-review-method.md)                                           | Exact commands/results, coverage, limitations, review method, and interpretation rules.                                            |
 | [08-complete-finding-register.md](./08-complete-finding-register.md)                                                 | Compact table of all 190 `BE-*`, `FE-*`, and `OPS-*` entries with normalized severity.                                             |
+| [09-remediation-status.md](./09-remediation-status.md)                                                               | Append-only remediation commits, validated fixes, current delta, and residual findings.                                            |
+| [10-project-identity-migration-design.md](./10-project-identity-migration-design.md)                                 | Target design for canonical project/import-origin identity, migration, compatibility, and rollback.                               |
+| [11-2026-07-24-full-rereview-and-fix-status.md](./11-2026-07-24-full-rereview-and-fix-status.md)                     | 2026-07-24 flow-by-flow re-review, `RR-2026-*` delta findings, fixes, evidence, pending gates, and residual risks.                  |
+| [12-2026-07-28-registry-credential-helper-and-final-acceptance.md](./12-2026-07-28-registry-credential-helper-and-final-acceptance.md) | 2026-07-28 registry helper/login/audit/UI, single-instance, project-mutation lifecycle, image-load reconciliation, terminal late-open, dependency-security, and cross-platform build/CI follow-up, `RR-2026-031` through `RR-2026-047`, host evidence, and exact standalone-binary acceptance record. |
+| [13-2026-08-17-full-project-review-and-dependency-refresh.md](./13-2026-08-17-full-project-review-and-dependency-refresh.md) | 2026-08-17 full-tree dependency/security refresh, Docker/project/backup/update integrity fixes, frontend accessibility/runtime hardening, CI supply-chain controls, validation, and remaining release gates. |
 
 ## Immediate release blockers
 
@@ -111,7 +151,7 @@ Replace narrative “release-ready” evidence with exact-SHA machine-readable g
 - Go formatting and `git diff --check` passed.
 - Windows `go vet -unsafeptr=false . ./internal/...`, desktop `go build .`, and compilation of every internal Windows test package passed.
 - Linux headless server cross-build passed.
-- Under Ubuntu WSL, all non-shell internal Go tests passed; the non-shell race suite passed; server-tag shell tests passed.
+- Under WSL, all non-shell internal Go tests passed; the non-shell race suite passed; server-tag shell tests passed.
 - Measured non-shell Go statement coverage was 68.1%; `internal/services` was 46.4% and server-tag shell coverage was 15.9%.
 
 ### Failed or exposed a real project issue

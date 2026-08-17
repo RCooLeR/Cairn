@@ -75,6 +75,19 @@ type AgentToolCall = {
   toolID: string;
 };
 
+type AgentConversationOwner = {
+  conversationGeneration: number;
+  projectID: string;
+};
+
+type AgentRequestOwner = AgentConversationOwner & {
+  requestID: string;
+};
+
+type PendingAgentToolCall = AgentToolCall & {
+  owner: AgentRequestOwner;
+};
+
 type AgentChatRequest = ReturnType<typeof AgentService.Chat>;
 
 type AgentEditTarget = {
@@ -93,42 +106,47 @@ const defaultEndpoint = "http://127.0.0.1:11434";
 
 type AgentSessionState = {
   activeRequest: AgentChatRequest | null;
-  activeRequestID: string | null;
+  activeRequestOwner: AgentRequestOwner | null;
   chatError: string | null;
+  conversationGeneration: number;
+  inFlightToolCall: PendingAgentToolCall | null;
   lastToolResults: AgentToolResult[];
   messages: ChatMessage[];
   mode: AgentMode;
-  pendingToolCall: AgentToolCall | null;
+  pendingToolCall: PendingAgentToolCall | null;
   projectID: string;
   prompt: string;
   sending: boolean;
-  attachRequest: (requestID: string, request: AgentChatRequest) => void;
-  beginRequest: (requestID: string) => boolean;
+  attachRequest: (owner: AgentRequestOwner, request: AgentChatRequest) => void;
+  beginRequest: (owner: AgentRequestOwner) => boolean;
+  claimPendingToolCall: (call: PendingAgentToolCall) => boolean;
   clearConversation: () => void;
-  finishRequest: (requestID: string) => void;
+  finishToolCall: (call: PendingAgentToolCall) => void;
+  finishRequest: (owner: AgentRequestOwner) => void;
   setLastToolResults: (
     next:
-      | AgentToolResult[]
-      | ((current: AgentToolResult[]) => AgentToolResult[]),
+      AgentToolResult[] | ((current: AgentToolResult[]) => AgentToolResult[]),
   ) => void;
   setMessages: (
     next: ChatMessage[] | ((current: ChatMessage[]) => ChatMessage[]),
   ) => void;
   setMode: (mode: AgentMode) => void;
-  setPendingToolCall: (call: AgentToolCall | null) => void;
-  setProjectID: (projectID: string) => void;
+  setPendingToolCall: (call: PendingAgentToolCall | null) => void;
+  setProjectID: (projectID: string) => boolean;
   setPrompt: (prompt: string) => void;
   setChatError: (error: string | null) => void;
 };
 
 const initialAgentSession = {
   activeRequest: null as AgentChatRequest | null,
-  activeRequestID: null as string | null,
+  activeRequestOwner: null as AgentRequestOwner | null,
   chatError: null as string | null,
+  conversationGeneration: 0,
+  inFlightToolCall: null as PendingAgentToolCall | null,
   lastToolResults: [] as AgentToolResult[],
   messages: [] as ChatMessage[],
   mode: "ask" as AgentMode,
-  pendingToolCall: null as AgentToolCall | null,
+  pendingToolCall: null as PendingAgentToolCall | null,
   projectID: "",
   prompt: "",
   sending: false,
@@ -136,33 +154,59 @@ const initialAgentSession = {
 
 const useAgentSessionStore = create<AgentSessionState>((set, get) => ({
   ...initialAgentSession,
-  attachRequest: (requestID, activeRequest) => {
-    if (get().activeRequestID === requestID) {
+  attachRequest: (owner, activeRequest) => {
+    if (sameRequestOwner(get().activeRequestOwner, owner)) {
       set({ activeRequest });
     }
   },
-  beginRequest: (activeRequestID) => {
-    if (get().activeRequestID) {
+  beginRequest: (activeRequestOwner) => {
+    const state = get();
+    if (
+      state.activeRequestOwner ||
+      state.pendingToolCall ||
+      !conversationOwnerMatches(state, activeRequestOwner)
+    ) {
       return false;
     }
     set({
       activeRequest: null,
-      activeRequestID,
+      activeRequestOwner,
       chatError: null,
       sending: true,
     });
     return true;
   },
+  claimPendingToolCall: (call) => {
+    let claimed = false;
+    set((state) => {
+      if (
+        state.inFlightToolCall ||
+        state.pendingToolCall !== call ||
+        !conversationOwnerMatches(state, call.owner)
+      ) {
+        return state;
+      }
+      claimed = true;
+      return { inFlightToolCall: call };
+    });
+    return claimed;
+  },
   clearConversation: () =>
     set({
       chatError: null,
+      inFlightToolCall: null,
       lastToolResults: [],
       messages: [],
       pendingToolCall: null,
+      conversationGeneration: get().conversationGeneration + 1,
     }),
-  finishRequest: (requestID) => {
-    if (get().activeRequestID === requestID) {
-      set({ activeRequest: null, activeRequestID: null, sending: false });
+  finishToolCall: (call) =>
+    set((state) =>
+      state.inFlightToolCall === call ? { inFlightToolCall: null } : state,
+    ),
+  finishRequest: (owner) => {
+    if (sameRequestOwner(get().activeRequestOwner, owner)) {
+      set({ activeRequest: null, activeRequestOwner: null, sending: false });
     }
   },
   setLastToolResults: (next) =>
@@ -176,10 +220,67 @@ const useAgentSessionStore = create<AgentSessionState>((set, get) => ({
     })),
   setMode: (mode) => set({ mode }),
   setPendingToolCall: (pendingToolCall) => set({ pendingToolCall }),
-  setProjectID: (projectID) => set({ projectID }),
+  setProjectID: (projectID) => {
+    const state = get();
+    if (
+      state.activeRequestOwner ||
+      state.inFlightToolCall ||
+      state.pendingToolCall ||
+      state.projectID === projectID
+    ) {
+      return state.projectID === projectID;
+    }
+    set({
+      chatError: null,
+      conversationGeneration: state.conversationGeneration + 1,
+      inFlightToolCall: null,
+      lastToolResults: [],
+      messages: [],
+      pendingToolCall: null,
+      projectID,
+    });
+    return true;
+  },
   setPrompt: (prompt) => set({ prompt }),
   setChatError: (chatError) => set({ chatError }),
 }));
+
+function sameRequestOwner(
+  current: AgentRequestOwner | null,
+  expected: AgentRequestOwner,
+) {
+  return (
+    current?.requestID === expected.requestID &&
+    current.projectID === expected.projectID &&
+    current.conversationGeneration === expected.conversationGeneration
+  );
+}
+
+function conversationOwnerMatches(
+  state: Pick<AgentSessionState, "conversationGeneration" | "projectID">,
+  owner: AgentConversationOwner,
+) {
+  return (
+    state.projectID === owner.projectID &&
+    state.conversationGeneration === owner.conversationGeneration
+  );
+}
+
+function requestOwnerIsCurrent(owner: AgentRequestOwner) {
+  const state = useAgentSessionStore.getState();
+  return (
+    sameRequestOwner(state.activeRequestOwner, owner) &&
+    conversationOwnerMatches(state, owner)
+  );
+}
+
+function pendingToolCallIsCurrent(call: PendingAgentToolCall) {
+  const state = useAgentSessionStore.getState();
+  return (
+    state.pendingToolCall === call &&
+    conversationOwnerMatches(state, call.owner)
+  );
+}
 
 export function resetAgentSessionForTest() {
   void useAgentSessionStore
@@ -190,13 +291,19 @@ export function resetAgentSessionForTest() {
   });
 }
 
+export function invalidateAgentConversationForTest(projectID?: string) {
+  useAgentSessionStore.setState((state) => ({
+    conversationGeneration: state.conversationGeneration + 1,
+    projectID: projectID ?? state.projectID,
+  }));
+}
+
 export function AgentPage({ projects }: AgentPageProps) {
   const [status, setStatus] = useState<AgentStatus | null>(null);
   const [provider, setProvider] = useState("ollama");
   const [endpoint, setEndpoint] = useState(defaultEndpoint);
   const [model, setModel] = useState("");
   const [toolCatalog, setToolCatalog] = useState<AgentToolSpec[]>([]);
-  const [toolBusy, setToolBusy] = useState(false);
   const [toolError, setToolError] = useState<string | null>(null);
   const [analysis, setAnalysis] = useState<AgentProjectAnalysis | null>(null);
   const [loadingStatus, setLoadingStatus] = useState(true);
@@ -220,6 +327,7 @@ export function AgentPage({ projects }: AgentPageProps) {
   const [settingsSaver] = useState(() => new SerializedSettingsSaver());
   const endpointCommittedRef = useRef(defaultEndpoint);
   const autoLoadedAnalysisProjectRef = useRef<string | null>(null);
+  const statusRefreshGenerationRef = useRef(0);
   const analysisGenerationRef = useRef(0);
   const editOperationGenerationRef = useRef(0);
   const editPathRef = useRef(editPath);
@@ -227,7 +335,10 @@ export function AgentPage({ projects }: AgentPageProps) {
     attachRequest,
     beginRequest,
     chatError,
+    claimPendingToolCall,
     clearConversation,
+    finishToolCall,
+    inFlightToolCall,
     finishRequest,
     lastToolResults,
     messages,
@@ -240,10 +351,10 @@ export function AgentPage({ projects }: AgentPageProps) {
     setMessages,
     setMode,
     setPendingToolCall,
-    setProjectID,
     setPrompt,
     setChatError,
   } = useAgentSessionStore();
+  const toolBusy = Boolean(inFlightToolCall);
 
   const selectedProject = projects.find((project) => project.id === projectID);
   const availableModels = useMemo(
@@ -256,7 +367,11 @@ export function AgentPage({ projects }: AgentPageProps) {
     Boolean(status?.enabled) &&
     Boolean(status?.reachable) &&
     availableModels.length > 0 &&
-    !sending;
+    !sending &&
+    !pendingToolCall &&
+    !toolBusy;
+  const projectSelectionLocked =
+    editBusy || sending || Boolean(pendingToolCall) || toolBusy;
 
   const llmPlanItems = useMemo(
     () => extractLatestPlanItems(messages),
@@ -292,6 +407,13 @@ export function AgentPage({ projects }: AgentPageProps) {
   }, [settingsSaver]);
 
   const refreshAgent = useCallback(async (showSpinner = true) => {
+    if (!mountedRef.current) {
+      return;
+    }
+    const generation = statusRefreshGenerationRef.current + 1;
+    statusRefreshGenerationRef.current = generation;
+    const isCurrent = () =>
+      mountedRef.current && statusRefreshGenerationRef.current === generation;
     if (showSpinner) {
       setLoadingStatus(true);
     }
@@ -301,6 +423,9 @@ export function AgentPage({ projects }: AgentPageProps) {
         AgentService.Status(),
         AgentService.ToolCatalog(),
       ]);
+      if (!isCurrent()) {
+        return;
+      }
       setStatus(nextStatus);
       setToolCatalog(nextTools ?? []);
       setProvider(nextStatus?.provider || "ollama");
@@ -309,41 +434,25 @@ export function AgentPage({ projects }: AgentPageProps) {
       setEndpoint(nextEndpoint);
       setModel(nextStatus?.model || "");
     } catch (nextError) {
-      setError(errorMessage(nextError, "Unable to load local agent"));
+      if (isCurrent()) {
+        setError(errorMessage(nextError, "Unable to load local agent"));
+      }
     } finally {
-      setLoadingStatus(false);
+      if (isCurrent()) {
+        setLoadingStatus(false);
+      }
     }
   }, []);
 
   useEffect(() => {
-    let cancelled = false;
-    Promise.all([AgentService.Status(), AgentService.ToolCatalog()])
-      .then(([nextStatus, nextTools]) => {
-        if (cancelled) {
-          return;
-        }
-        setStatus(nextStatus);
-        setToolCatalog(nextTools ?? []);
-        setProvider(nextStatus?.provider || "ollama");
-        const nextEndpoint = nextStatus ? nextStatus.endpoint : defaultEndpoint;
-        endpointCommittedRef.current = nextEndpoint;
-        setEndpoint(nextEndpoint);
-        setModel(nextStatus?.model || "");
-      })
-      .catch((nextError) => {
-        if (!cancelled) {
-          setError(errorMessage(nextError, "Unable to load local agent"));
-        }
-      })
-      .finally(() => {
-        if (!cancelled) {
-          setLoadingStatus(false);
-        }
-      });
+    const timer = window.setTimeout(() => {
+      void refreshAgent();
+    }, 0);
     return () => {
-      cancelled = true;
+      window.clearTimeout(timer);
+      statusRefreshGenerationRef.current += 1;
     };
-  }, []);
+  }, [refreshAgent]);
 
   const saveAgentSetting = async (key: string, value: string) => {
     setError(null);
@@ -426,15 +535,26 @@ export function AgentPage({ projects }: AgentPageProps) {
   );
 
   const changeProject = (nextProjectID: string) => {
+    const session = useAgentSessionStore.getState();
+    if (
+      editBusy ||
+      toolBusy ||
+      session.activeRequestOwner ||
+      session.pendingToolCall ||
+      !session.setProjectID(nextProjectID)
+    ) {
+      return;
+    }
     analysisGenerationRef.current += 1;
     editOperationGenerationRef.current += 1;
-    setProjectID(nextProjectID);
     setAnalysis(null);
     setAnalysisLoading(false);
     setEditBusy(false);
     setEditPlan(null);
     setEditResult(null);
     setEditError(null);
+    setToolError(null);
+    setRequestStatusAnnouncement("");
     autoLoadedAnalysisProjectRef.current = nextProjectID || null;
     if (nextProjectID) {
       void loadProjectAnalysis(nextProjectID);
@@ -615,7 +735,13 @@ export function AgentPage({ projects }: AgentPageProps) {
       return;
     }
     const requestID = crypto.randomUUID();
-    if (!beginRequest(requestID)) {
+    const session = useAgentSessionStore.getState();
+    const requestOwner: AgentRequestOwner = {
+      conversationGeneration: session.conversationGeneration,
+      projectID: session.projectID,
+      requestID,
+    };
+    if (!beginRequest(requestOwner)) {
       return;
     }
     setPendingToolCall(null);
@@ -634,12 +760,12 @@ export function AgentPage({ projects }: AgentPageProps) {
     try {
       const request = AgentService.Chat({
         prompt: buildAgentPrompt(mode, messages, text, toolCatalog),
-        scope: { projectID: projectID || undefined },
+        scope: { projectID: requestOwner.projectID || undefined },
         toolIDs: shouldUseAgentToolContext(text) ? undefined : [],
       });
-      attachRequest(requestID, request);
+      attachRequest(requestOwner, request);
       const response = await request;
-      if (useAgentSessionStore.getState().activeRequestID !== requestID) {
+      if (!requestOwnerIsCurrent(requestOwner)) {
         return;
       }
       setLastToolResults(response?.toolResults ?? []);
@@ -649,7 +775,7 @@ export function AgentPage({ projects }: AgentPageProps) {
         setRequestStatusAnnouncement("Cairn Agent response complete.");
       }
       if (parsed.call) {
-        setPendingToolCall(parsed.call);
+        setPendingToolCall({ ...parsed.call, owner: requestOwner });
       }
       if (response?.model && mountedRef.current) {
         setModel(response.model);
@@ -660,34 +786,36 @@ export function AgentPage({ projects }: AgentPageProps) {
         );
       }
     } catch (nextError) {
-      if (useAgentSessionStore.getState().activeRequestID === requestID) {
+      if (requestOwnerIsCurrent(requestOwner)) {
         setChatError(errorMessage(nextError, "Local agent request failed"));
         if (mountedRef.current) {
           setRequestStatusAnnouncement("");
         }
       }
     } finally {
-      finishRequest(requestID);
+      finishRequest(requestOwner);
     }
   };
 
   const stopPrompt = () => {
     const session = useAgentSessionStore.getState();
-    if (!session.activeRequestID) {
+    if (!session.activeRequestOwner) {
       return;
     }
-    const requestID = session.activeRequestID;
+    const requestOwner = session.activeRequestOwner;
     void session.activeRequest?.cancel?.("Stopped by user");
-    session.finishRequest(requestID);
+    session.finishRequest(requestOwner);
     setRequestStatusAnnouncement("Cairn Agent request stopped.");
-    session.setMessages((current) => [
-      ...current,
-      {
-        id: crypto.randomUUID(),
-        role: "system",
-        content: "Stopped.",
-      },
-    ]);
+    if (conversationOwnerMatches(session, requestOwner)) {
+      session.setMessages((current) => [
+        ...current,
+        {
+          id: crypto.randomUUID(),
+          role: "system",
+          content: "Stopped.",
+        },
+      ]);
+    }
   };
 
   const appendAssistantResponse = (
@@ -710,20 +838,27 @@ export function AgentPage({ projects }: AgentPageProps) {
   };
 
   const approveToolCall = async () => {
-    if (!pendingToolCall) {
+    if (!pendingToolCall || !pendingToolCallIsCurrent(pendingToolCall)) {
+      setPendingToolCall(null);
       return;
     }
     const call = pendingToolCall;
-    let followupRequestID: string | null = null;
-    setToolBusy(true);
+    if (!claimPendingToolCall(call)) {
+      return;
+    }
+    const conversationOwner = call.owner;
+    let followupRequestOwner: AgentRequestOwner | null = null;
     setToolError(null);
     try {
       const result = await AgentService.ExecuteTool({
         arguments: call.arguments,
         reason: call.reason,
-        scope: { projectID: projectID || undefined },
+        scope: { projectID: conversationOwner.projectID || undefined },
         toolID: call.toolID,
       });
+      if (!pendingToolCallIsCurrent(call)) {
+        return;
+      }
       const safeResult: AgentToolResult = result ?? {
         toolID: call.toolID,
         title: call.toolID,
@@ -738,10 +873,14 @@ export function AgentPage({ projects }: AgentPageProps) {
       const nextMessages = [...messages, toolMessage];
       setMessages(nextMessages);
       setPendingToolCall(null);
-      followupRequestID = crypto.randomUUID();
-      if (!beginRequest(followupRequestID)) {
+      const nextRequestOwner: AgentRequestOwner = {
+        ...conversationOwner,
+        requestID: crypto.randomUUID(),
+      };
+      if (!beginRequest(nextRequestOwner)) {
         throw new Error("Another Agent request is already running");
       }
+      followupRequestOwner = nextRequestOwner;
       const request = AgentService.Chat({
         prompt: buildAgentPrompt(
           mode,
@@ -749,38 +888,36 @@ export function AgentPage({ projects }: AgentPageProps) {
           "Use the approved Cairn tool result above to continue answering the user's latest request. If another tool is required, request exactly one next tool.",
           toolCatalog,
         ),
-        scope: { projectID: projectID || undefined },
+        scope: { projectID: conversationOwner.projectID || undefined },
         toolIDs: [],
       });
-      attachRequest(followupRequestID, request);
+      attachRequest(followupRequestOwner, request);
       const response = await request;
-      if (
-        useAgentSessionStore.getState().activeRequestID !== followupRequestID
-      ) {
+      if (!requestOwnerIsCurrent(followupRequestOwner)) {
         return;
       }
       const parsed = parseAgentToolRequest(response?.message ?? "");
       appendAssistantResponse(response, parsed.cleanedMessage);
       if (parsed.call) {
-        setPendingToolCall(parsed.call);
+        setPendingToolCall({ ...parsed.call, owner: followupRequestOwner });
       }
       if (response?.model && mountedRef.current) {
         setModel(response.model);
       }
     } catch (nextError) {
+      const session = useAgentSessionStore.getState();
       if (
-        !followupRequestID ||
-        useAgentSessionStore.getState().activeRequestID === followupRequestID
+        (!followupRequestOwner &&
+          conversationOwnerMatches(session, conversationOwner)) ||
+        (followupRequestOwner && requestOwnerIsCurrent(followupRequestOwner))
       ) {
         setToolError(errorMessage(nextError, "Agent tool failed"));
       }
     } finally {
-      if (followupRequestID) {
-        finishRequest(followupRequestID);
+      if (followupRequestOwner) {
+        finishRequest(followupRequestOwner);
       }
-      if (mountedRef.current) {
-        setToolBusy(false);
-      }
+      finishToolCall(call);
     }
   };
 
@@ -789,6 +926,10 @@ export function AgentPage({ projects }: AgentPageProps) {
       return;
     }
     const call = pendingToolCall;
+    if (!pendingToolCallIsCurrent(call)) {
+      setPendingToolCall(null);
+      return;
+    }
     setPendingToolCall(null);
     setToolError(null);
     setMessages((current) => [
@@ -879,7 +1020,7 @@ export function AgentPage({ projects }: AgentPageProps) {
               value={model}
             />
             <AgentSelect
-              disabled={editBusy}
+              disabled={projectSelectionLocked}
               label="Project"
               onChange={changeProject}
               options={[
@@ -915,7 +1056,12 @@ export function AgentPage({ projects }: AgentPageProps) {
           <div className="flex items-center justify-between gap-3 border-b border-border px-4 py-3">
             <div className="text-sm font-semibold">Conversation</div>
             <Button
-              disabled={messages.length === 0 || sending}
+              disabled={
+                messages.length === 0 ||
+                sending ||
+                Boolean(pendingToolCall) ||
+                toolBusy
+              }
               icon={<Trash2 size={15} />}
               onClick={() => {
                 clearConversation();

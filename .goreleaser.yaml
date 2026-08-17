@@ -11,7 +11,7 @@ checksum:
   name_template: "cairn_{{ .Version }}_checksums.txt"
   algorithm: sha256
   extra_files:
-    - glob: ./release-artifacts/*.exe
+    - glob: ./release-artifacts/*-installer*.exe
     - glob: ./release-artifacts/*.AppImage
     - glob: ./release-artifacts/*.deb
     - glob: ./release-artifacts/*.dmg
@@ -30,8 +30,8 @@ release:
     owner: RCooLeR
     name: Cairn
   name_template: "Cairn {{ .Tag }}"
-  replace_existing_artifacts: true
-  mode: replace
+  replace_existing_artifacts: false
+  mode: keep-existing
   header: |
     Cairn is a Compose-first Docker management desktop app for Windows, macOS, and Linux.
 
@@ -45,7 +45,7 @@ release:
     - Files ending in `-unsigned` were built without code-signing secrets configured in CI.
     - Verify downloads with the attached `cairn_{{ .Version }}_checksums.txt` file.
   extra_files:
-    - glob: ./release-artifacts/*.exe
+    - glob: ./release-artifacts/*-installer*.exe
     - glob: ./release-artifacts/*.AppImage
     - glob: ./release-artifacts/*.deb
     - glob: ./release-artifacts/*.dmg

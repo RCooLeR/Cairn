@@ -466,6 +466,9 @@ func TestPublishCriticalValidationAndCompatibilityHelper(t *testing.T) {
 	if err := PublishCritical(context.Background(), legacy, Event{Topic: TopicJobDone}); !errors.Is(err, ErrCriticalPublishUnsupported) {
 		t.Fatalf("legacy helper error = %v, want ErrCriticalPublishUnsupported", err)
 	}
+	if err := PublishCriticalBounded(legacy, Event{Topic: TopicJobDone}); !errors.Is(err, ErrCriticalPublishUnsupported) {
+		t.Fatalf("bounded legacy helper error = %v, want ErrCriticalPublishUnsupported", err)
+	}
 }
 
 func TestConcurrentPublishSubscribeAndCloseAreRaceSafe(t *testing.T) {

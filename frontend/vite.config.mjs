@@ -44,6 +44,25 @@ export default defineConfig(({ mode }) => {
     mode === "release-validation" || process.env.CAIRN_BROWSER_MOCKS === "1";
 
   return {
+    build: {
+      rolldownOptions: {
+        output: {
+          // Vendor max-size splitting can create circular chunks (React and
+          // scheduler are a real example). Preserve source execution order so
+          // those chunks cannot observe partially initialised CommonJS shims.
+          strictExecutionOrder: true,
+          codeSplitting: {
+            groups: [
+              {
+                name: "vendor",
+                test: /node_modules[\\/]/,
+                maxSize: 400 * 1024,
+              },
+            ],
+          },
+        },
+      },
+    },
     server: {
       host: "127.0.0.1",
       port: Number(process.env.WAILS_VITE_PORT) || 9245,

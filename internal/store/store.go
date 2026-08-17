@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"embed"
 	"errors"
 	"fmt"
@@ -18,7 +19,8 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
+	"modernc.org/sqlite"
 )
 
 const (
@@ -26,7 +28,9 @@ const (
 	driverName                  = "sqlite"
 	backupKeepCount             = 2
 	buildArgPrivacyVersion      = 11
+	latestSchemaVersion         = 12
 	schemaBackupTimestampLayout = "20060102T150405.000000000Z"
+	sqliteWSLContextV1Function  = "cairn_wsl_context_v1"
 )
 
 var (
@@ -34,6 +38,12 @@ var (
 	migrationFiles embed.FS
 
 	migrationFilePattern = regexp.MustCompile(`^(\d{4})_.+\.sql$`)
+
+	sqliteFunctionRegistrationErr = sqlite.RegisterDeterministicScalarFunction(
+		sqliteWSLContextV1Function,
+		1,
+		sqliteCanonicalWSLContextV1,
+	)
 
 	ErrNewerSchema = errors.New("database schema is newer than this Cairn build")
 )
@@ -52,9 +62,10 @@ func (e *NewerSchemaError) Unwrap() error {
 }
 
 type Store struct {
-	path   string
-	writer *sql.DB
-	reader *sql.DB
+	path              string
+	writer            *sql.DB
+	reader            *sql.DB
+	projectOperations *projectOperationGate
 }
 
 func DefaultPath() (string, error) {
@@ -112,6 +123,9 @@ func sqliteDSN(path string) string {
 }
 
 func Open(ctx context.Context, path string) (*Store, error) {
+	if sqliteFunctionRegistrationErr != nil {
+		return nil, fmt.Errorf("store: register SQLite functions: %w", sqliteFunctionRegistrationErr)
+	}
 	if path == "" {
 		defaultPath, err := DefaultPath()
 		if err != nil {
@@ -139,13 +153,42 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	}
 	reader.SetMaxOpenConns(max(2, runtime.NumCPU()))
 
-	s := &Store{path: path, writer: writer, reader: reader}
+	s := &Store{
+		path:              path,
+		writer:            writer,
+		reader:            reader,
+		projectOperations: newProjectOperationGate(),
+	}
 	if err := s.configure(ctx); err != nil {
 		_ = s.Close()
 		return nil, err
 	}
 
 	return s, nil
+}
+
+func sqliteCanonicalWSLContextV1(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+	if len(args) != 1 {
+		return nil, fmt.Errorf("%s requires one argument", sqliteWSLContextV1Function)
+	}
+	if args[0] == nil {
+		return nil, nil
+	}
+
+	var contextName string
+	switch value := args[0].(type) {
+	case string:
+		contextName = value
+	case []byte:
+		contextName = string(value)
+	default:
+		return nil, fmt.Errorf("%s requires text", sqliteWSLContextV1Function)
+	}
+	canonical, ok := runtimescope.CanonicalizeWindowsWSLContextV1(contextName)
+	if !ok {
+		return nil, nil
+	}
+	return canonical, nil
 }
 
 func (s *Store) Close() error {
@@ -181,7 +224,11 @@ func (s *Store) Migrate(ctx context.Context) error {
 		return err
 	}
 
-	latest := migrations[len(migrations)-1].version
+	embeddedLatest := migrations[len(migrations)-1].version
+	if embeddedLatest != latestSchemaVersion {
+		return fmt.Errorf("store: embedded latest migration is %d, want %d", embeddedLatest, latestSchemaVersion)
+	}
+	latest := latestSchemaVersion
 	if current > latest {
 		return &NewerSchemaError{Current: current, Latest: latest}
 	}
@@ -349,7 +396,7 @@ func (s *Store) backupBeforeMigration(ctx context.Context) error {
 		return err
 	}
 
-	if _, err := s.writer.ExecContext(ctx, "PRAGMA wal_checkpoint(FULL)"); err != nil {
+	if err := s.checkpointWALForMigrationBackup(ctx); err != nil {
 		return err
 	}
 
@@ -360,6 +407,42 @@ func (s *Store) backupBeforeMigration(ctx context.Context) error {
 	}
 
 	return retainBackups(s.path, backupKeepCount)
+}
+
+func (s *Store) checkpointWALForMigrationBackup(ctx context.Context) error {
+	// SQLite returns checkpoint contention in this result row rather than as a
+	// query error. Copying only the main database is safe only when every WAL
+	// frame is proven to have reached it.
+	var busy, logFrames, checkpointedFrames int
+	if err := s.writer.QueryRowContext(ctx, "PRAGMA wal_checkpoint(FULL)").Scan(&busy, &logFrames, &checkpointedFrames); err != nil {
+		return fmt.Errorf("store: checkpoint WAL before migration backup: %w", err)
+	}
+	return validateMigrationBackupCheckpoint(busy, logFrames, checkpointedFrames)
+}
+
+func validateMigrationBackupCheckpoint(busy int, logFrames int, checkpointedFrames int) error {
+	if busy != 0 {
+		return fmt.Errorf(
+			"store: checkpoint WAL before migration backup: checkpoint remained busy (%d of %d frames checkpointed)",
+			checkpointedFrames,
+			logFrames,
+		)
+	}
+	if logFrames < 0 || checkpointedFrames < 0 {
+		return fmt.Errorf(
+			"store: checkpoint WAL before migration backup: checkpoint did not report valid frame counts (log=%d checkpointed=%d)",
+			logFrames,
+			checkpointedFrames,
+		)
+	}
+	if checkpointedFrames != logFrames {
+		return fmt.Errorf(
+			"store: checkpoint WAL before migration backup: checkpoint incomplete (%d of %d frames checkpointed)",
+			checkpointedFrames,
+			logFrames,
+		)
+	}
+	return nil
 }
 
 type migration struct {

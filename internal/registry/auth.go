@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -35,48 +36,135 @@ func (m *Manager) Login(ctx context.Context, req models.RegistryLoginRequest) er
 	if err != nil {
 		return err
 	}
+	started := m.now()
+	auditCommand := registryLoginAuditCommand(registry, username)
 	runner, ok := provider.(DockerInputRunner)
 	if !ok {
-		return apperror.New(apperror.ProviderNotReady, "Provider cannot pass registry secrets via stdin")
+		primary := apperror.New(apperror.ProviderNotReady, "Provider cannot pass registry secrets via stdin")
+		return m.recordRegistryLoginPreparationFailure(ctx, registry, provider.ID(), auditCommand, started, primary)
 	}
 	transactionLock, err := acquireDockerConfigLock(ctx, provider)
 	if err != nil {
-		return err
+		return m.recordRegistryLoginPreparationFailure(ctx, registry, provider.ID(), auditCommand, started, err)
 	}
 	defer releaseDockerConfigLock(provider, transactionLock)
 	ctx = withDockerConfigLockHeld(ctx)
 	tx, err := m.prepareRegistryLoginStorage(ctx, provider, registry)
 	if err != nil {
-		return err
+		return m.recordRegistryLoginPreparationFailure(ctx, registry, provider.ID(), auditCommand, started, err)
 	}
 
-	started := m.now()
 	result, runErr := runner.RunDockerWithInput(ctx, registryLoginInput(secret), "login", registry, "-u", username, "--password-stdin")
-	commandErr := runErr
-	if auditErr := m.recordAudit(ctx, "registry.login", registry, provider.ID(), "docker login "+registry+" -u "+username+" --password-stdin", runErr, result, started); auditErr != nil && runErr == nil {
-		runErr = auditErr
-	}
-	if commandErr != nil || result == nil || result.ExitCode != 0 {
-		return m.restoreRegistryLogin(tx, registryCommandError("Registry login failed", result, commandErr))
-	}
-	if runErr != nil {
-		return m.restoreRegistryLogin(tx, registryCommandError("Registry login failed", result, runErr))
+	var outcomeErr error
+	if runErr != nil || result == nil || result.ExitCode != 0 {
+		outcomeErr = registryLoginCommandError(result, runErr, secret)
+	} else {
+		status, verifyErr := m.testAuthWithCredential(ctx, registry, credential{
+			Username: username,
+			Password: secret,
+		})
+		switch {
+		case verifyErr != nil:
+			outcomeErr = verifyErr
+		case status == nil:
+			outcomeErr = apperror.New(apperror.Internal, "Registry login verification returned no result")
+		case !status.LoggedIn:
+			outcomeErr = apperror.New(apperror.RegistryAuth, "Registry login verification failed", apperror.WithDetail(status.Error))
+		}
+		if outcomeErr == nil {
+			outcomeErr = m.finalizeRegistryLoginStorage(ctx, tx)
+		}
 	}
 
-	status, err := m.testAuthWithCredential(ctx, registry, credential{
-		Username: username,
-		Password: secret,
-	})
-	if err != nil {
-		return m.restoreRegistryLogin(tx, err)
+	if outcomeErr != nil {
+		primary := outcomeErr
+		outcomeErr = m.restoreRegistryLogin(tx, primary)
+		restoreFailed := outcomeErr != primary
+		if auditErr := m.recordRegistryLoginOutcome(ctx, registry, provider.ID(), auditCommand, outcomeErr, result, started); auditErr != nil {
+			return registryLoginFailedAuditError(registry, outcomeErr, auditErr, restoreFailed)
+		}
+		return outcomeErr
 	}
-	if status != nil && !status.LoggedIn {
-		return m.restoreRegistryLogin(tx, apperror.New(apperror.RegistryAuth, "Registry login verification failed", apperror.WithDetail(status.Error)))
-	}
-	if err := m.finalizeRegistryLoginStorage(ctx, tx); err != nil {
-		return m.restoreRegistryLogin(tx, err)
+	if auditErr := m.recordRegistryLoginOutcome(ctx, registry, provider.ID(), auditCommand, nil, result, started); auditErr != nil {
+		rollbackOutcome := m.restoreRegistryLogin(tx, auditErr)
+		return registryLoginSuccessAuditError(registry, auditErr, rollbackOutcome)
 	}
 	return nil
+}
+
+func registryLoginAuditCommand(registry string, username string) string {
+	return "docker login " + registry + " -u " + username + " --password-stdin"
+}
+
+func (m *Manager) recordRegistryLoginPreparationFailure(ctx context.Context, registry string, providerID string, command string, started time.Time, primary error) error {
+	if auditErr := m.recordRegistryLoginOutcome(ctx, registry, providerID, command, primary, nil, started); auditErr != nil {
+		return apperror.Wrap(
+			apperror.Internal,
+			"Registry login was blocked and its failed audit entry could not be recorded",
+			errors.Join(primary, auditErr),
+			apperror.WithDetail("Docker login was not run. Restore audit database health before retrying."),
+			apperror.WithRepairHints("Check Cairn's audit database health, then retry registry login."),
+		)
+	}
+	return primary
+}
+
+func (m *Manager) recordRegistryLoginOutcome(ctx context.Context, registry string, providerID string, command string, outcomeErr error, result *providers.CommandResult, started time.Time) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	auditCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	return m.recordAudit(auditCtx, "registry.login", registry, providerID, command, outcomeErr, result, started)
+}
+
+func registryLoginFailedAuditError(registry string, outcomeErr error, auditErr error, restoreFailed bool) error {
+	detail := "The registry login failed and the previous credential state was restored, but its final failed audit entry was not recorded."
+	hints := []string{"Check Cairn's audit database health before retrying registry login."}
+	options := []apperror.Option{
+		apperror.WithDetail(detail),
+		apperror.WithRepairHints(hints...),
+	}
+	if restoreFailed {
+		options = []apperror.Option{
+			apperror.WithDetail("The registry login failed, the previous credential state could not be fully restored, and its final failed audit entry was not recorded."),
+			apperror.WithRepairHints(
+				"Review docker login state for "+registry+" on the active backend before retrying.",
+				"Restore Cairn's audit database health before another registry login.",
+			),
+			apperror.WithPartialResource("registryCredential", registry, "restore_incomplete_audit_missing", true),
+		}
+	}
+	return apperror.Wrap(
+		apperror.Internal,
+		"Registry login failed and its audit entry could not be recorded",
+		errors.Join(outcomeErr, auditErr),
+		options...,
+	)
+}
+
+func registryLoginSuccessAuditError(registry string, auditErr error, rollbackOutcome error) error {
+	if rollbackOutcome == auditErr {
+		return apperror.Wrap(
+			apperror.Internal,
+			"Registry login could not be committed because its audit entry was not recorded",
+			auditErr,
+			apperror.WithDetail("Docker accepted and Cairn verified the credential, but Cairn restored the previous credential and configuration state after the audit write failed."),
+			apperror.WithRepairHints("Restore Cairn's audit database health before retrying registry login."),
+			apperror.WithPartialResource("registryCredential", registry, "rolled_back_audit_missing", false),
+		)
+	}
+	return apperror.Wrap(
+		apperror.Internal,
+		"Registry login audit failed and the previous credential state could not be fully restored",
+		errors.Join(rollbackOutcome, auditErr),
+		apperror.WithDetail("Docker accepted and Cairn verified the credential, but the audit write failed and credential rollback did not fully complete."),
+		apperror.WithRepairHints(
+			"Review docker login state for "+registry+" on the active backend before retrying.",
+			"Restore Cairn's audit database health before another registry login.",
+		),
+		apperror.WithPartialResource("registryCredential", registry, "audit_missing_restore_incomplete", true),
+	)
 }
 
 func registryLoginInput(secret string) string {
@@ -86,6 +174,15 @@ func registryLoginInput(secret string) string {
 		return secret + "\r\n"
 	}
 	return secret + "\n"
+}
+
+func registryLoginCommandError(result *providers.CommandResult, err error, secret string) error {
+	commandErr := registryCommandError("Registry login failed", result, err)
+	var appErr *apperror.AppError
+	if secret != "" && errors.As(commandErr, &appErr) {
+		appErr.Detail = strings.ReplaceAll(appErr.Detail, secret, "[redacted]")
+	}
+	return commandErr
 }
 
 func (m *Manager) Logout(ctx context.Context, registry string) error {

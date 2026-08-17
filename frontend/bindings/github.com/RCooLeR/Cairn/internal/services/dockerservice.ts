@@ -79,6 +79,15 @@ export function InspectContainerRaw(id: string): $CancellablePromise<string> {
     return $Call.ByID(978203467, id);
 }
 
+/**
+ * InvalidateRuntimePlans consumes no janitor ownership; it only removes plans
+ * tied to the runtime that is being detached. The runtime controller calls it
+ * while holding the service write lock, before publishing a replacement client.
+ */
+export function InvalidateRuntimePlans(): $CancellablePromise<void> {
+    return $Call.ByID(199321385);
+}
+
 export function KillContainer(id: string): $CancellablePromise<void> {
     return $Call.ByID(1539714983, id);
 }

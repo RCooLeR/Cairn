@@ -75,6 +75,7 @@ import App, {
   parseMounts,
   reconcileProjectCommandOutputs,
   reconcileProjectLineageRecords,
+  updateCheckWatchdogMS,
   upsertBoundedProjectLineageRecord,
 } from "./App";
 import { csvCell } from "./settings/SettingsPage";
@@ -94,15 +95,26 @@ const inventoryMock = vi.hoisted(() => ({
   getInventorySnapshot: vi.fn<() => Promise<InventorySnapshot>>(),
 }));
 
-const runtimeMock = vi.hoisted(() => ({
-  on: vi.fn<
-    (eventName: string, callback: (event?: unknown) => void) => () => void
-  >(() => vi.fn()),
-  openFile: vi.fn(),
-  openURL: vi.fn(),
-  question: vi.fn(),
-  saveFile: vi.fn(),
-  setClipboardText: vi.fn(),
+const runtimeMock = vi.hoisted(() => {
+  const offEvents: string[] = [];
+  return {
+    offEvents,
+    on: vi.fn((...args: [string, (event?: unknown) => void]) => () => {
+      const eventName = args[0];
+      offEvents.push(eventName);
+    }),
+    openFile: vi.fn(),
+    openURL: vi.fn(),
+    question: vi.fn(),
+    saveFile: vi.fn(),
+    setClipboardText: vi.fn(),
+  };
+});
+
+const xtermMock = vi.hoisted(() => ({
+  disposedInstanceIDs: [] as number[],
+  nextInstanceID: 0,
+  writes: [] as Array<{ data: Uint8Array; instanceID: number }>,
 }));
 
 const dockerServiceMock = vi.hoisted(() => ({
@@ -239,6 +251,7 @@ const registryServiceMock = vi.hoisted(() => ({
 }));
 
 const updateServiceMock = vi.hoisted(() => ({
+  CancelJob: vi.fn(),
   CheckAllUpdates: vi.fn(),
   CheckProjectUpdates: vi.fn(),
   CheckServiceUpdate: vi.fn(),
@@ -308,13 +321,16 @@ vi.mock("@monaco-editor/react", () => ({
 
 vi.mock("@xterm/xterm", () => ({
   Terminal: class {
+    readonly instanceID = ++xtermMock.nextInstanceID;
     attachCustomKeyEventHandler = vi.fn();
     focus = vi.fn();
     getSelection = vi.fn(() => "");
     open = vi.fn();
     resize = vi.fn();
-    write = vi.fn();
-    dispose = vi.fn();
+    write = vi.fn((data: Uint8Array) =>
+      xtermMock.writes.push({ data, instanceID: this.instanceID }),
+    );
+    dispose = vi.fn(() => xtermMock.disposedInstanceIDs.push(this.instanceID));
     onData = vi.fn(() => ({ dispose: vi.fn() }));
   },
 }));
@@ -361,6 +377,10 @@ describe("App inventory shell", () => {
   beforeEach(() => {
     vi.useRealTimers();
     vi.clearAllMocks();
+    xtermMock.disposedInstanceIDs.length = 0;
+    xtermMock.nextInstanceID = 0;
+    xtermMock.writes.length = 0;
+    runtimeMock.offEvents.length = 0;
     window.localStorage.clear();
     Object.defineProperty(window.navigator, "platform", {
       configurable: true,
@@ -648,6 +668,7 @@ describe("App inventory shell", () => {
       username: "ada",
     });
     updateServiceMock.CheckAllUpdates.mockResolvedValue("updates-check-job");
+    updateServiceMock.CancelJob.mockResolvedValue(undefined);
     updateServiceMock.CheckProjectUpdates.mockResolvedValue([]);
     updateServiceMock.CheckServiceUpdate.mockResolvedValue(null);
     updateServiceMock.ListCurrentUpdates.mockResolvedValue([]);
@@ -1407,6 +1428,44 @@ describe("App inventory shell", () => {
     );
   });
 
+  it("rejects unbounded or invalid-time notification events", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    emitRuntimeEvent("notification", {
+      id: 91,
+      level: "info",
+      title: "Invalid timestamp notification",
+      body: "Must not be retained",
+      topic: "system",
+      read: false,
+      createdAt: { invalid: true },
+    });
+    emitRuntimeEvent("notification", {
+      id: 92,
+      level: "info",
+      title: "Oversized notification",
+      body: "x".repeat(300_000),
+      topic: "system",
+      read: false,
+      createdAt: "2026-06-13T09:05:00Z",
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Notifications" }));
+    const dialog = await screen.findByRole("dialog", {
+      name: "Notification center",
+    });
+    expect(within(dialog).getByText("No notifications")).toBeInTheDocument();
+    expect(
+      within(dialog).queryByText("Invalid timestamp notification"),
+    ).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByText("Oversized notification"),
+    ).not.toBeInTheDocument();
+  });
+
   it("replaces an in-flight notification snapshot after a payload event without losing unrelated rows", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
     const initialRead = deferred<Notification[]>();
@@ -1744,18 +1803,15 @@ describe("App inventory shell", () => {
     settingsServiceMock.GetNotifications.mockImplementationOnce(
       () => trailingRefresh.promise,
     );
-    const events = Array.from(
-      { length: 6 },
-      (_, index): Notification => ({
-        id: 20 + index,
-        level: "info",
-        title: `Notification burst ${index + 1}`,
-        body: "Burst payload",
-        topic: "project",
-        read: false,
-        createdAt: `2026-06-13T09:${String(10 + index).padStart(2, "0")}:00Z`,
-      }),
-    );
+    const events = Array.from({ length: 6 }, (_, index): Notification => ({
+      id: 20 + index,
+      level: "info",
+      title: `Notification burst ${index + 1}`,
+      body: "Burst payload",
+      topic: "project",
+      read: false,
+      createdAt: `2026-06-13T09:${String(10 + index).padStart(2, "0")}:00Z`,
+    }));
 
     render(<App />);
 
@@ -2156,6 +2212,61 @@ describe("App inventory shell", () => {
 
     expect(await screen.findByText("31.2% CPU")).toBeInTheDocument();
     expect(await screen.findByText("27% / 3.0 GiB")).toBeInTheDocument();
+
+    emitRuntimeEvent("stats:sample", {
+      streamID: "stats-stream-1",
+      gpu: {
+        available: true,
+        deviceCount: 1,
+        devices: { invalid: true },
+        utilizationPercent: "not-a-number",
+      },
+      samples: [
+        statsSample({
+          gpuDeviceIDs: { invalid: true },
+          gpuMemoryBytes: "not-a-number",
+        }),
+      ],
+    });
+
+    expect(screen.getByText("31.2% CPU")).toBeInTheDocument();
+    expect(screen.getByText("27% / 3.0 GiB")).toBeInTheDocument();
+
+    emitRuntimeEvent("stats:sample", {
+      streamID: "stats-stream-1",
+      samples: [
+        statsSample({ cpuPercent: 88, sampledAt: "not-a-runtime-time" }),
+      ],
+    });
+    emitRuntimeEvent("stats:sample", {
+      streamID: "x".repeat(4097),
+      samples: [statsSample({ cpuPercent: 89 })],
+    });
+
+    expect(screen.getByText("31.2% CPU")).toBeInTheDocument();
+
+    emitRuntimeEvent("stats:sample", {
+      streamID: "stats-stream-1",
+      gpu: {
+        ...seededGPUMetrics(),
+        devices: Array.from({ length: 129 }, (_, index) => ({
+          id: String(index),
+          index,
+          name: `GPU ${index}`,
+        })),
+      },
+      samples: [
+        statsSample({
+          cpuPercent: 99,
+          gpuDeviceIDs: Array.from({ length: 257 }, (_, index) =>
+            String(index),
+          ),
+        }),
+      ],
+    });
+
+    expect(screen.getByText("31.2% CPU")).toBeInTheDocument();
+    expect(screen.getByText("27% / 3.0 GiB")).toBeInTheDocument();
     expect(screen.getByText("Resource Usage")).toBeInTheDocument();
     expect(screen.queryByText("Top Containers")).toBeNull();
     expect(screen.queryByText("Recent Events")).toBeNull();
@@ -2357,6 +2468,140 @@ describe("App inventory shell", () => {
     );
   });
 
+  it("keeps terminal surfaces subscribed while navigating elsewhere", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    terminalServiceMock.ListTerminalSessions.mockResolvedValue([
+      seededTerminalSession({ id: "host-kept", title: "Kept host" }),
+    ]);
+
+    render(<App />);
+
+    const nav = await screen.findByRole("navigation", {
+      name: "Main navigation",
+    });
+    fireEvent.click(within(nav).getByRole("button", { name: /Terminal/i }));
+    expect(
+      await screen.findByRole("tab", { name: "Kept host" }),
+    ).toBeInTheDocument();
+
+    fireEvent.click(within(nav).getByRole("button", { name: "Overview" }));
+    emitRuntimeEvent("terminal:data", {
+      dataBase64: btoa("output while hidden"),
+      sessionID: "host-kept",
+    });
+
+    await waitFor(() => expect(xtermMock.writes).toHaveLength(1));
+    expect(new TextDecoder().decode(xtermMock.writes[0]?.data)).toBe(
+      "output while hidden",
+    );
+    expect(terminalServiceMock.ListTerminalSessions).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(within(nav).getByRole("button", { name: /Terminal/i }));
+    expect(
+      await screen.findByRole("tab", { name: "Kept host" }),
+    ).toBeInTheDocument();
+    expect(terminalServiceMock.ListTerminalSessions).toHaveBeenCalledTimes(1);
+  });
+
+  it("disposes hidden terminal surfaces and listeners when provider scope changes", async () => {
+    inventoryMock.getInventorySnapshot
+      .mockResolvedValueOnce(seededSnapshot())
+      .mockResolvedValue(macOSColimaSnapshot());
+    terminalServiceMock.ListTerminalSessions.mockResolvedValueOnce([
+      seededTerminalSession({ id: "old-host", title: "Old host" }),
+    ]).mockResolvedValue([
+      seededTerminalSession({ id: "new-host", title: "New host" }),
+    ]);
+
+    render(<App />);
+
+    const nav = await screen.findByRole("navigation", {
+      name: "Main navigation",
+    });
+    fireEvent.click(within(nav).getByRole("button", { name: /Terminal/i }));
+    expect(
+      await screen.findByRole("tab", { name: "Old host" }),
+    ).toBeInTheDocument();
+    const oldInstanceID = xtermMock.nextInstanceID;
+    const oldDataListenerCleanupCount = runtimeMock.offEvents.filter(
+      (eventName) => eventName === "terminal:data",
+    ).length;
+
+    fireEvent.click(within(nav).getByRole("button", { name: "Overview" }));
+    emitRuntimeEvent("provider:changed", { id: "macos_colima" });
+
+    await waitFor(() =>
+      expect(xtermMock.disposedInstanceIDs).toContain(oldInstanceID),
+    );
+    await waitFor(() =>
+      expect(
+        runtimeMock.offEvents.filter(
+          (eventName) => eventName === "terminal:data",
+        ).length,
+      ).toBeGreaterThan(oldDataListenerCleanupCount),
+    );
+    await waitFor(() =>
+      expect(
+        terminalServiceMock.ListTerminalSessions.mock.calls.length,
+      ).toBeGreaterThan(1),
+    );
+
+    fireEvent.click(within(nav).getByRole("button", { name: /Terminal/i }));
+    expect(
+      await screen.findByRole("tab", { name: "New host" }),
+    ).toBeInTheDocument();
+
+    const writesBeforeOldOutput = xtermMock.writes.length;
+    emitRuntimeEvent("terminal:data", {
+      dataBase64: btoa("obsolete output"),
+      sessionID: "old-host",
+    });
+    expect(xtermMock.writes).toHaveLength(writesBeforeOldOutput);
+
+    emitRuntimeEvent("terminal:data", {
+      dataBase64: btoa("replacement output"),
+      sessionID: "new-host",
+    });
+    await waitFor(() =>
+      expect(xtermMock.writes).toHaveLength(writesBeforeOldOutput + 1),
+    );
+    const replacementWrite = xtermMock.writes[xtermMock.writes.length - 1];
+    expect(replacementWrite?.instanceID).not.toBe(oldInstanceID);
+    expect(new TextDecoder().decode(replacementWrite?.data)).toBe(
+      "replacement output",
+    );
+  });
+
+  it("moves focus out of the hidden terminal after palette navigation", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    terminalServiceMock.ListTerminalSessions.mockResolvedValue([
+      seededTerminalSession({ id: "focus-host", title: "Focus host" }),
+    ]);
+
+    render(<App />);
+
+    const nav = await screen.findByRole("navigation", {
+      name: "Main navigation",
+    });
+    fireEvent.click(within(nav).getByRole("button", { name: /Terminal/i }));
+    const terminalTab = await screen.findByRole("tab", { name: "Focus host" });
+    terminalTab.focus();
+    expect(terminalTab).toHaveFocus();
+
+    fireEvent.keyDown(window, { ctrlKey: true, key: "k" });
+    const palette = await screen.findByRole("dialog", {
+      name: "Command palette",
+    });
+    fireEvent.click(within(palette).getByRole("button", { name: "Overview" }));
+
+    const destinationHeading = await screen.findByRole("heading", {
+      name: "Overview",
+      level: 1,
+    });
+    await waitFor(() => expect(destinationHeading).toHaveFocus());
+    expect(terminalTab).not.toHaveFocus();
+  });
+
   it("command palette navigates and schedules safe terminal commands only", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
 
@@ -2417,6 +2662,72 @@ describe("App inventory shell", () => {
     ).toBeInTheDocument();
     expect(screen.queryByText("Command copied")).not.toBeInTheDocument();
     expect(terminalServiceMock.OpenBackendTerminal).not.toHaveBeenCalled();
+  });
+
+  it("keeps the command palette closed while another modal owns focus", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Projects/ }),
+    );
+    const importProject = await screen.findByRole("button", {
+      name: "Import Project",
+    });
+    importProject.focus();
+    fireEvent.click(importProject);
+
+    const importDialog = await screen.findByRole("dialog", {
+      name: "Import Project",
+    });
+    expect(within(importDialog).getByLabelText("Folder")).toHaveFocus();
+
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+
+    expect(
+      screen.queryByRole("dialog", { name: "Command palette" }),
+    ).not.toBeInTheDocument();
+    expect(importDialog).toBeInTheDocument();
+
+    fireEvent.keyDown(window, { key: "/" });
+    expect(within(importDialog).getByLabelText("Folder")).toHaveFocus();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(
+      screen.queryByRole("dialog", { name: "Import Project" }),
+    ).not.toBeInTheDocument();
+    expect(importProject).toHaveFocus();
+  });
+
+  it("traps command palette focus and restores the shortcut origin on Escape", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    const overview = within(
+      screen.getByRole("navigation", { name: "Main navigation" }),
+    ).getByRole("button", { name: "Overview" });
+    overview.focus();
+
+    fireEvent.keyDown(window, { key: "k", ctrlKey: true });
+
+    const palette = await screen.findByRole("dialog", {
+      name: "Command palette",
+    });
+    const search = within(palette).getByPlaceholderText("Search");
+    await waitFor(() => expect(search).toHaveFocus());
+
+    fireEvent.keyDown(search, { key: "Escape" });
+
+    expect(
+      screen.queryByRole("dialog", { name: "Command palette" }),
+    ).not.toBeInTheDocument();
+    expect(overview).toHaveFocus();
   });
 
   it("requires typed confirmation when cleanup includes volumes", async () => {
@@ -2525,6 +2836,57 @@ describe("App inventory shell", () => {
     expect(screen.getByText("No containers match")).toBeInTheDocument();
   });
 
+  it("prunes hidden container selections before running a bulk action", async () => {
+    const snapshot = seededSnapshot();
+    snapshot.containers = [
+      snapshot.containers[0],
+      {
+        ...snapshot.containers[0],
+        id: "container-2",
+        name: "worker",
+        service: "worker",
+        state: "exited",
+        status: "Exited (0) 2 minutes ago",
+      },
+    ];
+    inventoryMock.getInventorySnapshot.mockResolvedValue(snapshot);
+    dockerServiceMock.ListContainers.mockResolvedValue(snapshot.containers);
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", {
+        name: /Containers/,
+      }),
+    );
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select web" }));
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select worker" }));
+    expect(await screen.findByText("2 selected")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: /Running1/ }));
+
+    const selected = await screen.findByText("1 selected");
+    expect(
+      screen.queryByRole("checkbox", { name: "Select worker" }),
+    ).not.toBeInTheDocument();
+    fireEvent.click(
+      within(selected.parentElement as HTMLElement).getByRole("button", {
+        name: "Start",
+      }),
+    );
+
+    await waitFor(() =>
+      expect(dockerServiceMock.BulkContainerAction).toHaveBeenCalledWith(
+        ["container-1"],
+        "start",
+      ),
+    );
+  });
+
   it("opens a full container detail screen from the containers table", async () => {
     const snapshot = seededSnapshot();
     const container = snapshot.containers[0];
@@ -2629,7 +2991,18 @@ describe("App inventory shell", () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
     projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
     projectServiceMock.StopProject.mockRejectedValueOnce(
-      new Error("Compose project action failed"),
+      new Error(
+        JSON.stringify({
+          message: "E_COMPOSE_INVALID: Compose project action failed",
+          cause: {
+            code: "E_COMPOSE_INVALID",
+            message: "Compose project action failed",
+            detail: "compose.yaml line 12 is invalid",
+            repairHints: ["Correct compose.yaml, then retry."],
+          },
+          kind: "RuntimeError",
+        }),
+      ),
     );
 
     render(<App />);
@@ -2645,9 +3018,10 @@ describe("App inventory shell", () => {
     await screen.findByText("app-db");
     fireEvent.click(screen.getByRole("button", { name: "Stop app-db" }));
 
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Compose project action failed",
-    );
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("Compose project action failed");
+    expect(alert).toHaveTextContent("compose.yaml line 12 is invalid");
+    expect(alert).toHaveTextContent("Correct compose.yaml, then retry.");
     fireEvent.click(screen.getByRole("button", { name: "Dismiss error" }));
 
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
@@ -2813,6 +3187,7 @@ describe("App inventory shell", () => {
     fireEvent.click(logsButtons[logsButtons.length - 1]);
     await waitFor(() =>
       expect(logsServiceMock.StartLogStream).toHaveBeenCalledWith({
+        clientToken: expect.any(String),
         scope: "project",
         ids: ["linux_native/app-db"],
         follow: true,
@@ -2940,6 +3315,7 @@ describe("App inventory shell", () => {
     fireEvent.click(drilldownLogsButtons[drilldownLogsButtons.length - 1]);
     await waitFor(() =>
       expect(logsServiceMock.StartLogStream).toHaveBeenLastCalledWith({
+        clientToken: expect.any(String),
         scope: "container",
         ids: ["container-app"],
         follow: true,
@@ -3594,6 +3970,54 @@ describe("App inventory shell", () => {
     await waitFor(() => expect(checkButton).toBeEnabled());
   });
 
+  it("cancels and releases an update check that never emits terminal progress", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    updateServiceMock.CheckAllUpdates.mockResolvedValueOnce(
+      "stalled-update-check",
+    );
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Updates/ }),
+    );
+    vi.useFakeTimers();
+    const checkButton = screen.getByRole("button", { name: "Check now" });
+    fireEvent.click(checkButton);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(checkButton).toBeDisabled();
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(updateCheckWatchdogMS);
+    });
+
+    expect(updateServiceMock.CancelJob).toHaveBeenCalledWith(
+      "stalled-update-check",
+    );
+    expect(screen.getByText("Update check failed")).toBeInTheDocument();
+    expect(
+      screen.getAllByText(/update check timed out/i).length,
+    ).toBeGreaterThan(0);
+    expect(checkButton).toBeEnabled();
+    act(() => {
+      emitRuntimeEvent("updates:check:progress", {
+        jobID: "stalled-update-check",
+        done: 1,
+        total: 1,
+        current: "Late stalled completion",
+      });
+    });
+    expect(
+      screen.queryByText("Late stalled completion"),
+    ).not.toBeInTheDocument();
+    vi.useRealTimers();
+  });
+
   it("fails closed when pending-job pressure evicts a returned job ID", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
     const pendingCheck = deferred<string>();
@@ -3948,6 +4372,56 @@ describe("App inventory shell", () => {
     );
   });
 
+  it("keeps last-known project lineage visible and reports refresh failure", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
+    projectServiceMock.GetProject.mockResolvedValue(seededProjectDetail());
+    updateServiceMock.ListCurrentUpdates.mockResolvedValue(seededUpdates());
+    imageLineageServiceMock.GetProjectLineage.mockResolvedValueOnce(
+      seededLineage(),
+    ).mockRejectedValueOnce(new Error("lineage backend unavailable"));
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", {
+        name: /Projects/,
+      }),
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "app-db" }));
+    await screen.findByText("linux_native");
+    const updatesButtons = await waitFor(() => {
+      const buttons = screen.getAllByRole("button", { name: "Updates" });
+      expect(buttons.length).toBeGreaterThan(1);
+      return buttons;
+    });
+    fireEvent.click(updatesButtons[updatesButtons.length - 1]);
+
+    expect(
+      await screen.findByText(/node:20-alpine - Confidence: High/),
+    ).toBeInTheDocument();
+    expect(imageLineageServiceMock.GetProjectLineage).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(
+      screen
+        .getAllByRole("button", { name: "Refresh" })
+        .find((button) => !button.hasAttribute("aria-label")) as HTMLElement,
+    );
+
+    expect(
+      await screen.findByText(
+        "Image lineage refresh failed: lineage backend unavailable",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(/node:20-alpine - Confidence: High/),
+    ).toBeInTheDocument();
+    expect(imageLineageServiceMock.GetProjectLineage).toHaveBeenCalledTimes(2);
+  });
+
   it("streams logs, filters search matches, and keeps nonmatching rows hidden", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
     projectServiceMock.RefreshProjects.mockResolvedValue([seededProject()]);
@@ -3984,6 +4458,33 @@ describe("App inventory shell", () => {
     expect(await screen.findByText(/server started/)).toBeInTheDocument();
     expect(screen.getByText(/plain startup/)).toBeInTheDocument();
     expect(screen.getByText(/failed request/)).toBeInTheDocument();
+
+    emitRuntimeEvent("logs:lines", {
+      streamID: "stream-1",
+      lines: [
+        {
+          ...logLine({ text: "malformed runtime line" }),
+          containerName: { invalid: true },
+          level: { invalid: true },
+        },
+      ],
+    });
+    expect(
+      screen.queryByText(/malformed runtime line/),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText(/server started/)).toBeInTheDocument();
+
+    emitRuntimeEvent("logs:lines", {
+      streamID: "stream-1",
+      lines: Array.from({ length: 1001 }, () =>
+        logLine({ text: "oversized runtime batch" }),
+      ),
+    });
+    expect(
+      screen.queryByText(/oversized runtime batch/),
+    ).not.toBeInTheDocument();
+    expect(screen.getByText(/server started/)).toBeInTheDocument();
+
     fireEvent.click(screen.getByRole("button", { name: "LOG" }));
     expect(screen.queryByText(/plain startup/)).not.toBeInTheDocument();
     expect(screen.getByText(/server started/)).toBeInTheDocument();
@@ -4090,9 +4591,9 @@ describe("App inventory shell", () => {
     await waitFor(() =>
       expect(logsServiceMock.StartLogStream).toHaveBeenCalled(),
     );
-    emitRuntimeEvent("logs:lines", {
-      streamID: "stream-1",
-      lines: Array.from({ length: 50_000 }, (_, index) =>
+    emitRuntimeLogLinesInBatches(
+      "stream-1",
+      Array.from({ length: 50_000 }, (_, index) =>
         logLine({
           text:
             index === 0 || index >= 49_998
@@ -4100,7 +4601,7 @@ describe("App inventory shell", () => {
               : `ordinary ${index}`,
         }),
       ),
-    });
+    );
 
     fireEvent.change(screen.getByLabelText("Search logs"), {
       target: { value: "needle" },
@@ -4122,10 +4623,17 @@ describe("App inventory shell", () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
     const logStart = deferred<string>();
     logsServiceMock.StartLogStream.mockImplementation(
-      (request: { tail?: number }) =>
-        request.tail === 500
-          ? logStart.promise
-          : Promise.resolve("overview-stream"),
+      (request: { clientToken?: string; tail?: number }) => {
+        if (request.tail !== 500) {
+          return Promise.resolve("overview-stream");
+        }
+        emitRuntimeEvent("logs:lines", {
+          streamID: "stream-race",
+          clientToken: request.clientToken,
+          lines: [logLine({ text: "INFO first synchronous line" })],
+        });
+        return logStart.promise;
+      },
     );
 
     render(<App />);
@@ -4141,23 +4649,18 @@ describe("App inventory shell", () => {
     );
     await waitFor(() =>
       expect(logsServiceMock.StartLogStream).toHaveBeenCalledWith(
-        expect.objectContaining({ tail: 500 }),
+        expect.objectContaining({
+          clientToken: expect.any(String),
+          tail: 500,
+        }),
       ),
     );
 
-    const onLogLines = runtimeEventCallback("logs:lines");
-    const emitInitialLines = logStart.promise.then((streamID) => {
-      onLogLines({
-        name: "logs:lines",
-        data: {
-          streamID,
-          lines: [logLine({ text: "INFO first synchronous line" })],
-        },
-      });
-    });
+    expect(
+      await screen.findByText(/first synchronous line/),
+    ).toBeInTheDocument();
     await act(async () => {
       logStart.resolve("stream-race");
-      await emitInitialLines;
     });
 
     expect(
@@ -4362,12 +4865,12 @@ describe("App inventory shell", () => {
     await waitFor(() =>
       expect(logsServiceMock.StartLogStream).toHaveBeenCalled(),
     );
-    emitRuntimeEvent("logs:lines", {
-      streamID: "stream-1",
-      lines: Array.from({ length: logBufferLimit }, (_, index) =>
+    emitRuntimeLogLinesInBatches(
+      "stream-1",
+      Array.from({ length: logBufferLimit }, (_, index) =>
         logLine({ text: `INFO capped line ${index}` }),
       ),
-    });
+    );
 
     const viewer = screen.getByRole("log");
     Object.defineProperties(viewer, {
@@ -6460,6 +6963,247 @@ describe("App inventory shell", () => {
     },
   );
 
+  it("renders registry credential-helper failures as actionable guidance", async () => {
+    const runtimeError = JSON.stringify({
+      message: "E_REGISTRY_AUTH: Docker credential helper is not available",
+      cause: {
+        code: "E_REGISTRY_AUTH",
+        message: "Docker credential helper is not available",
+        detail:
+          "Cairn requires a working helper, but none of the configured helpers responded.",
+        repairHints: [
+          "Install and initialize a Docker credential helper for this backend.",
+          "Switch Credential mode to No Cairn-managed credentials if registry login is managed outside Cairn.",
+        ],
+      },
+      kind: "RuntimeError",
+    });
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    registryServiceMock.Login.mockRejectedValueOnce(new Error(runtimeError));
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Settings/ }),
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Registries" }));
+    fireEvent.click(screen.getByRole("button", { name: "Log in" }));
+    const dialog = await screen.findByRole("dialog", {
+      name: "Registry Login",
+    });
+    fireEvent.change(within(dialog).getByLabelText("Username"), {
+      target: { value: "ada" },
+    });
+    fireEvent.change(within(dialog).getByLabelText("Secret"), {
+      target: { value: "opaque-token" },
+    });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Log in" }));
+
+    const alert = await within(dialog).findByRole("alert");
+    expect(
+      within(alert).getByText("Docker credential helper is not available"),
+    ).toBeInTheDocument();
+    expect(
+      within(alert).getByText(/none of the configured helpers responded/),
+    ).toBeInTheDocument();
+    expect(
+      within(alert).getByText(
+        "Install and initialize a Docker credential helper for this backend.",
+      ),
+    ).toBeInTheDocument();
+    expect(within(alert).getByText("E_REGISTRY_AUTH")).toBeInTheDocument();
+    expect(alert).not.toHaveTextContent(runtimeError);
+  });
+
+  it("does not collect registry secrets when Cairn-managed credentials are disabled", async () => {
+    settingsServiceMock.GetSettings.mockResolvedValueOnce({
+      "registry.credentials_mode": "none",
+    });
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Images/ }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Push cairn/web:latest" }),
+    );
+    const pushDialog = await screen.findByRole("dialog", {
+      name: "Push Image",
+    });
+    const pushLogin = within(pushDialog).getByRole("button", {
+      name: "Log in",
+    });
+    expect(pushLogin).toBeDisabled();
+    expect(pushLogin).toHaveAttribute(
+      "title",
+      "Switch Credential mode to Require Docker credential helper before logging in from Cairn.",
+    );
+    fireEvent.click(pushLogin);
+    expect(
+      screen.queryByRole("dialog", { name: "Registry Login" }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Secret")).not.toBeInTheDocument();
+
+    const closeButtons = within(pushDialog).getAllByRole("button", {
+      name: "Close",
+    });
+    fireEvent.click(closeButtons[closeButtons.length - 1]);
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Settings/ }),
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Registries" }));
+    const settingsLogin = screen.getByRole("button", { name: "Log in" });
+    expect(settingsLogin).toBeDisabled();
+    expect(settingsLogin).toHaveAttribute(
+      "title",
+      "Switch Credential mode to Require Docker credential helper before logging in from Cairn.",
+    );
+    expect(registryServiceMock.Login).not.toHaveBeenCalled();
+  });
+
+  it("does not collect registry secrets before credential policy is known", async () => {
+    const settingsRequest = deferred<Record<string, unknown>>();
+    settingsServiceMock.GetSettings.mockReturnValueOnce(
+      settingsRequest.promise,
+    );
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Images/ }),
+    );
+    fireEvent.click(
+      screen.getByRole("button", { name: "Push cairn/web:latest" }),
+    );
+    const pushDialog = await screen.findByRole("dialog", {
+      name: "Push Image",
+    });
+    const pushLogin = within(pushDialog).getByRole("button", {
+      name: "Log in",
+    });
+    expect(pushLogin).toBeDisabled();
+    expect(pushLogin).toHaveAttribute(
+      "title",
+      "Wait for registry credential settings to load before logging in from Cairn.",
+    );
+    expect(screen.queryByLabelText("Secret")).not.toBeInTheDocument();
+    expect(registryServiceMock.Login).not.toHaveBeenCalled();
+  });
+
+  it("clears registry secrets and stale errors when login identity changes", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    registryServiceMock.Login.mockRejectedValueOnce(
+      new Error("Registry rejected the credential"),
+    );
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Settings/ }),
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Registries" }));
+    fireEvent.click(screen.getByRole("button", { name: "Log in" }));
+    const dialog = await screen.findByRole("dialog", {
+      name: "Registry Login",
+    });
+    const registryURL = within(dialog).getByLabelText("Registry URL");
+    const username = within(dialog).getByLabelText("Username");
+    const secretKind = within(dialog).getByLabelText("Secret kind");
+    const secret = within(dialog).getByLabelText("Secret");
+
+    fireEvent.change(username, { target: { value: "ada" } });
+    fireEvent.change(secret, { target: { value: "registry-a-secret" } });
+    fireEvent.change(registryURL, { target: { value: "ghcr.io" } });
+    expect(secret).toHaveValue("");
+
+    fireEvent.change(secret, { target: { value: "ada-secret" } });
+    fireEvent.change(username, { target: { value: "grace" } });
+    expect(secret).toHaveValue("");
+
+    fireEvent.change(secret, { target: { value: "password-secret" } });
+    fireEvent.change(secretKind, { target: { value: "token" } });
+    expect(secret).toHaveValue("");
+
+    fireEvent.change(registryURL, { target: { value: "docker.io" } });
+    fireEvent.change(username, { target: { value: "ada" } });
+    fireEvent.change(secret, { target: { value: "bad-secret" } });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Log in" }));
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent(
+      "Registry rejected the credential",
+    );
+
+    fireEvent.change(secret, { target: { value: "corrected-secret" } });
+    expect(within(dialog).queryByRole("alert")).not.toBeInTheDocument();
+    expect(secret).toHaveValue("corrected-secret");
+
+    fireEvent.change(within(dialog).getByLabelText("Registry"), {
+      target: { value: "custom" },
+    });
+    expect(registryURL).toHaveValue("");
+    expect(secret).toHaveValue("");
+  });
+
+  it("closes and clears registry login when refreshed policy disables it", async () => {
+    settingsServiceMock.GetSettings.mockResolvedValueOnce({
+      "registry.credentials_mode": "docker_helper",
+    }).mockResolvedValueOnce({
+      "registry.credentials_mode": "none",
+    });
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Settings/ }),
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Registries" }));
+    fireEvent.click(screen.getByRole("button", { name: "Log in" }));
+    const dialog = await screen.findByRole("dialog", {
+      name: "Registry Login",
+    });
+    fireEvent.change(within(dialog).getByLabelText("Username"), {
+      target: { value: "ada" },
+    });
+    fireEvent.change(within(dialog).getByLabelText("Secret"), {
+      target: { value: "must-be-cleared" },
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh settings" }));
+
+    await waitFor(() =>
+      expect(
+        screen.queryByRole("dialog", { name: "Registry Login" }),
+      ).not.toBeInTheDocument(),
+    );
+    expect(
+      await screen.findByText("Registry login closed"),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByDisplayValue("must-be-cleared"),
+    ).not.toBeInTheDocument();
+    expect(registryServiceMock.Login).not.toHaveBeenCalled();
+  });
+
   it("locks setup and commits project detection only for the active session", async () => {
     const currentProject = seededProject();
     const detectedProject = alternateProject();
@@ -6919,8 +7663,7 @@ describe("App inventory shell", () => {
   it("handles provider install progress before ApplyInstall returns a stream handle", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
     let resolveApplyInstall:
-      | ((handle: { planID: string; streamID: string }) => void)
-      | undefined;
+      ((handle: { planID: string; streamID: string }) => void) | undefined;
     providerServiceMock.ApplyInstall.mockImplementation(
       () =>
         new Promise<{ planID: string; streamID: string }>((resolve) => {
@@ -7036,6 +7779,12 @@ describe("App inventory shell", () => {
       await within(dialog).findByText(/WSL stderr detail/),
     ).toBeInTheDocument();
     expect(within(dialog).getAllByText(/E_PROVIDER_NOT_READY/)).toHaveLength(1);
+    expect(
+      within(dialog).getByText(/create a new plan before retrying/i),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: "Run auto repair" }),
+    ).toBeDisabled();
   });
 
   it("saves Windows WSL settings and shows the path mapping panel", async () => {
@@ -7937,6 +8686,25 @@ describe("App inventory shell", () => {
     expect(inventoryMock.getInventorySnapshot).toHaveBeenCalledTimes(1);
   });
 
+  it("bounds object event kinds and IDs before normalizing them", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    vi.useFakeTimers();
+
+    emitRuntimeEvent("objects:changed", {
+      kind: `${" ".repeat(65)}image`,
+      ids: ["x".repeat(4097)],
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+
+    expect(inventoryMock.getInventorySnapshot).toHaveBeenCalledTimes(2);
+  });
+
   it("shows a calm reconnecting banner on docker:reconnecting without flashing an error", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
 
@@ -8344,8 +9112,7 @@ function runtimeEventCallback(eventName: string) {
   const callback = [...runtimeMock.on.mock.calls]
     .reverse()
     .find(([name]) => name === eventName)?.[1] as
-    | ((event?: unknown) => void)
-    | undefined;
+    ((event?: unknown) => void) | undefined;
   expect(callback).toEqual(expect.any(Function));
   return callback as (event?: unknown) => void;
 }
@@ -8354,6 +9121,18 @@ function emitRuntimeEvent(eventName: string, data: unknown) {
   const callback = runtimeEventCallback(eventName);
   act(() => {
     callback({ name: eventName, data });
+  });
+}
+
+function emitRuntimeLogLinesInBatches(streamID: string, lines: LogLine[]) {
+  const callback = runtimeEventCallback("logs:lines");
+  act(() => {
+    for (let offset = 0; offset < lines.length; offset += 1000) {
+      callback({
+        name: "logs:lines",
+        data: { streamID, lines: lines.slice(offset, offset + 1000) },
+      });
+    }
   });
 }
 
@@ -8604,49 +9383,40 @@ function seedScaleSnapshot(projects: ProjectSummary[]): InventorySnapshot {
       };
     },
   );
-  const images = Array.from(
-    { length: 500 },
-    (_, index): ImageSummary => ({
-      id: `sha256:image-${index}`,
-      repoTags: [`cairn/repo-${index}:latest`],
-      repoDigests: [`cairn/repo-${index}@sha256:digest-${index}`],
-      sizeBytes: (16 + index) * 1024 * 1024,
-      createdAt: `2026-06-12T${String(index % 24).padStart(2, "0")}:00:00Z`,
-      inUse: index < 150,
-      updateStatus:
-        index % 25 === 0
-          ? UpdateStatus.UpdateStatusServiceImageUpdateAvailable
-          : UpdateStatus.UpdateStatusUnknown,
-    }),
-  );
-  const volumes = Array.from(
-    { length: 200 },
-    (_, index): VolumeSummary => ({
-      name: `volume-${index}`,
-      driver: "local",
-      mountpoint: `/var/lib/docker/volumes/volume-${index}/_data`,
-      labels: {
-        "com.docker.compose.project": projects[index % projects.length].name,
-      },
-      sizeBytes: index * 4096,
-      inUse: index % 2 === 0,
-    }),
-  );
-  const networks = Array.from(
-    { length: 20 },
-    (_, index): NetworkSummary => ({
-      id: `network-${index}`,
-      name: `network-${index}`,
-      driver: "bridge",
-      scope: "local",
-      containerCount: index % 4,
-      internal: index % 5 === 0,
-      attachable: true,
-      labels: {
-        "com.docker.compose.project": projects[index % projects.length].name,
-      },
-    }),
-  );
+  const images = Array.from({ length: 500 }, (_, index): ImageSummary => ({
+    id: `sha256:image-${index}`,
+    repoTags: [`cairn/repo-${index}:latest`],
+    repoDigests: [`cairn/repo-${index}@sha256:digest-${index}`],
+    sizeBytes: (16 + index) * 1024 * 1024,
+    createdAt: `2026-06-12T${String(index % 24).padStart(2, "0")}:00:00Z`,
+    inUse: index < 150,
+    updateStatus:
+      index % 25 === 0
+        ? UpdateStatus.UpdateStatusServiceImageUpdateAvailable
+        : UpdateStatus.UpdateStatusUnknown,
+  }));
+  const volumes = Array.from({ length: 200 }, (_, index): VolumeSummary => ({
+    name: `volume-${index}`,
+    driver: "local",
+    mountpoint: `/var/lib/docker/volumes/volume-${index}/_data`,
+    labels: {
+      "com.docker.compose.project": projects[index % projects.length].name,
+    },
+    sizeBytes: index * 4096,
+    inUse: index % 2 === 0,
+  }));
+  const networks = Array.from({ length: 20 }, (_, index): NetworkSummary => ({
+    id: `network-${index}`,
+    name: `network-${index}`,
+    driver: "bridge",
+    scope: "local",
+    containerCount: index % 4,
+    internal: index % 5 === 0,
+    attachable: true,
+    labels: {
+      "com.docker.compose.project": projects[index % projects.length].name,
+    },
+  }));
 
   return {
     ...base,
@@ -8668,28 +9438,25 @@ function seedScaleSnapshot(projects: ProjectSummary[]): InventorySnapshot {
 }
 
 function seedScaleProjects(): ProjectSummary[] {
-  return Array.from(
-    { length: 10 },
-    (_, index): ProjectSummary => ({
-      ...seededProject(),
-      id: `linux_native/project-${index}`,
-      name: `project-${index}`,
-      status:
-        index % 3 === 0
-          ? ProjectStatus.ProjectStatusPartial
-          : ProjectStatus.ProjectStatusRunning,
-      health:
-        index % 4 === 0
-          ? HealthStatus.HealthStatusUnhealthy
-          : HealthStatus.HealthStatusHealthy,
-      servicesRunning: index % 3 === 0 ? 8 : 12,
-      servicesTotal: 12,
-      cpuPercent: index === 9 ? 92 : 10 + index,
-      memoryBytes: (256 + index * 32) * 1024 * 1024,
-      workingDir: `/home/cairn/projects/project-${index}`,
-      lastChangedAt: `2026-06-13T09:${String(index).padStart(2, "0")}:00Z`,
-    }),
-  );
+  return Array.from({ length: 10 }, (_, index): ProjectSummary => ({
+    ...seededProject(),
+    id: `linux_native/project-${index}`,
+    name: `project-${index}`,
+    status:
+      index % 3 === 0
+        ? ProjectStatus.ProjectStatusPartial
+        : ProjectStatus.ProjectStatusRunning,
+    health:
+      index % 4 === 0
+        ? HealthStatus.HealthStatusUnhealthy
+        : HealthStatus.HealthStatusHealthy,
+    servicesRunning: index % 3 === 0 ? 8 : 12,
+    servicesTotal: 12,
+    cpuPercent: index === 9 ? 92 : 10 + index,
+    memoryBytes: (256 + index * 32) * 1024 * 1024,
+    workingDir: `/home/cairn/projects/project-${index}`,
+    lastChangedAt: `2026-06-13T09:${String(index).padStart(2, "0")}:00Z`,
+  }));
 }
 
 function seedScaleDashboardMetrics(

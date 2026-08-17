@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"math"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,6 +22,17 @@ import (
 )
 
 var testRuntimeScope = runtimescope.Must("linux_native", "default")
+
+func TestDecodeOneShotStatsRejectsOversizedAndTrailingPayloads(t *testing.T) {
+	t.Parallel()
+	oversized := []byte(`{"name":"` + strings.Repeat("x", int(maxDockerStatsResponseBytes)) + `"}`)
+	if _, err := decodeOneShotStats(bytes.NewReader(oversized)); err == nil {
+		t.Fatal("decodeOneShotStats(oversized) error = nil")
+	}
+	if _, err := decodeOneShotStats(strings.NewReader(`{} {}`)); err == nil {
+		t.Fatal("decodeOneShotStats(trailing value) error = nil")
+	}
+}
 
 func TestManagerStreamsPersistsAndRanksSamples(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -558,6 +570,24 @@ func TestStopAllClosesBlockingStatsReader(t *testing.T) {
 	}
 	if got := manager.Diagnostics(); got.Started || got.ActiveWatchers != 0 {
 		t.Fatalf("diagnostics after stop = %#v", got)
+	}
+}
+
+func TestWaitForWatchersUsesOneSharedDeadline(t *testing.T) {
+	t.Parallel()
+	const deadline = 40 * time.Millisecond
+	watchers := []*containerWatcher{
+		{done: make(chan struct{})},
+		{done: make(chan struct{})},
+		{done: make(chan struct{})},
+	}
+
+	started := time.Now()
+	if waitForWatchers(watchers, deadline) {
+		t.Fatal("waitForWatchers() = true for blocked watchers")
+	}
+	if elapsed := time.Since(started); elapsed >= 2*deadline {
+		t.Fatalf("waitForWatchers() elapsed = %s, want one shared deadline", elapsed)
 	}
 }
 

@@ -3,10 +3,11 @@ import { Toast } from "./Toast";
 import type { ToastQueueItem } from "../../hooks/useToastQueue";
 
 type ToastViewportProps = {
+  onDismiss: (id: string) => void;
   toasts: ToastQueueItem[];
 };
 
-export function ToastViewport({ toasts }: ToastViewportProps) {
+export function ToastViewport({ onDismiss, toasts }: ToastViewportProps) {
   if (toasts.length === 0) {
     return null;
   }
@@ -18,6 +19,7 @@ export function ToastViewport({ toasts }: ToastViewportProps) {
           body={toast.body}
           key={toast.id}
           level={toast.level}
+          onDismiss={() => onDismiss(toast.id)}
           title={toast.title}
         />
       ))}

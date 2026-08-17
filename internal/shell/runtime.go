@@ -634,6 +634,7 @@ func (r *appRuntime) metricsManagerOptions(ctx context.Context, provider provide
 }
 
 func (r *appRuntime) clearServicesLocked() {
+	r.dockerService.InvalidateRuntimePlans()
 	r.dockerService.Client = nil
 	r.dockerService.Scope = runtimescope.Scope{}
 	r.projectService.Detector = nil

@@ -13,11 +13,11 @@ on:
 
 permissions:
   actions: read
-  contents: write
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   package:
@@ -39,18 +39,11 @@ jobs:
     env:
       CAIRN_ARTIFACT_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
       RELEASE_INPUT_VERSION: ${{ inputs.version }}
-      WINDOWS_SIGN_PFX_BASE64: ${{ secrets.WINDOWS_SIGN_PFX_BASE64 }}
-      WINDOWS_SIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGN_PFX_PASSWORD }}
-      MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
-      MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-      MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
-      MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
-      MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
-      MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
-      MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Validate repository build inputs
         shell: pwsh
@@ -59,15 +52,15 @@ jobs:
           ./scripts/check-toolchain.ps1 -SkipRuntime
 
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
 
       - name: Setup Node
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version-file: .node-version
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
@@ -76,7 +69,7 @@ jobs:
         run: ./scripts/check-toolchain.ps1
 
       - name: Cache Wails CLI
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/go/bin/wails3
@@ -106,12 +99,45 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install nsis -y --no-progress
+          choco install nsis --version=3.12.0 -y --no-progress
           Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files (x86)\NSIS"
 
       - name: Install frontend dependencies
         working-directory: frontend
         run: npm ci
+
+      - name: Frontend dependency audit
+        working-directory: frontend
+        run: npm run audit
+
+      - name: Frontend lint
+        working-directory: frontend
+        run: npm run lint
+
+      - name: Frontend format check
+        working-directory: frontend
+        run: npm run format:check
+
+      - name: Frontend typecheck
+        working-directory: frontend
+        run: npm run typecheck
+
+      - name: Frontend unit tests
+        working-directory: frontend
+        run: npm test
+
+      - name: Go unit tests
+        run: go test ./...
+
+      - name: Go vet
+        run: go vet -unsafeptr=false ./...
+
+      - name: Go lint
+        run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run --timeout=5m
+
+      - name: Go vulnerability scan
+        shell: pwsh
+        run: ./scripts/run-govulncheck.ps1
 
       - name: Stamp release version and assets
         shell: pwsh
@@ -167,68 +193,161 @@ jobs:
         shell: pwsh
         run: ./scripts/check-server-mode-containment.ps1 -CompileCheck
 
+      - name: Detect Windows signing configuration
+        id: windows-signing
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          WINDOWS_SIGN_PFX_BASE64: ${{ secrets.WINDOWS_SIGN_PFX_BASE64 }}
+          WINDOWS_SIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGN_PFX_PASSWORD }}
+        run: |
+          $configured = -not [string]::IsNullOrWhiteSpace($env:WINDOWS_SIGN_PFX_BASE64) -and -not [string]::IsNullOrWhiteSpace($env:WINDOWS_SIGN_PFX_PASSWORD)
+          "configured=$($configured.ToString().ToLowerInvariant())" | Add-Content -Path $env:GITHUB_OUTPUT
+
       - name: Note unsigned Windows release
-        if: startsWith(github.ref, 'refs/tags/v') && matrix.platform == 'windows' && (env.WINDOWS_SIGN_PFX_BASE64 == '' || env.WINDOWS_SIGN_PFX_PASSWORD == '')
+        if: startsWith(github.ref, 'refs/tags/v') && matrix.platform == 'windows' && steps.windows-signing.outputs.configured != 'true'
         run: echo "Windows signing secrets are not configured. The NSIS installer will be published with an -unsigned suffix."
 
-      - name: Sign Windows installer
-        if: matrix.platform == 'windows' && env.WINDOWS_SIGN_PFX_BASE64 != '' && env.WINDOWS_SIGN_PFX_PASSWORD != ''
+      - name: Sign Windows application
+        if: matrix.platform == 'windows' && steps.windows-signing.outputs.configured == 'true'
         shell: pwsh
+        env:
+          WINDOWS_SIGN_PFX_BASE64: ${{ secrets.WINDOWS_SIGN_PFX_BASE64 }}
+          WINDOWS_SIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGN_PFX_PASSWORD }}
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           $cert = Join-Path $env:RUNNER_TEMP "cairn-signing.pfx"
-          [IO.File]::WriteAllBytes($cert, [Convert]::FromBase64String($env:WINDOWS_SIGN_PFX_BASE64))
-          $installer = Get-ChildItem bin -Filter "cairn-*-installer.exe" | Select-Object -First 1
-          if (!$installer) { throw "NSIS installer not found" }
-          & signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f $cert /p $env:WINDOWS_SIGN_PFX_PASSWORD $installer.FullName
+          try {
+            [IO.File]::WriteAllBytes($cert, [Convert]::FromBase64String($env:WINDOWS_SIGN_PFX_BASE64))
+            $application = Get-Item -LiteralPath "bin/cairn.exe"
+            & signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f $cert /p $env:WINDOWS_SIGN_PFX_PASSWORD $application.FullName
+            & signtool verify /pa /all $application.FullName
+          } finally {
+            Remove-Item -LiteralPath $cert -Force -ErrorAction SilentlyContinue
+          }
 
-      - name: Mark unsigned Windows smoke artifact
-        if: matrix.platform == 'windows' && (env.WINDOWS_SIGN_PFX_BASE64 == '' || env.WINDOWS_SIGN_PFX_PASSWORD == '')
+      # Run repository-controlled packaging without signing secrets or key
+      # material in the environment, after the application itself is signed.
+      - name: Reassemble Windows installer from signed application
+        if: matrix.platform == 'windows' && steps.windows-signing.outputs.configured == 'true'
+        shell: pwsh
+        run: wails3 task windows:assemble:nsis:installer INSTALL_SCOPE=user ARCH=amd64
+
+      - name: Sign Windows installer
+        if: matrix.platform == 'windows' && steps.windows-signing.outputs.configured == 'true'
+        shell: pwsh
+        env:
+          WINDOWS_SIGN_PFX_BASE64: ${{ secrets.WINDOWS_SIGN_PFX_BASE64 }}
+          WINDOWS_SIGN_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGN_PFX_PASSWORD }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $cert = Join-Path $env:RUNNER_TEMP "cairn-signing.pfx"
+          try {
+            [IO.File]::WriteAllBytes($cert, [Convert]::FromBase64String($env:WINDOWS_SIGN_PFX_BASE64))
+            $installers = @(Get-ChildItem bin -Filter "cairn-*-installer.exe" -File)
+            if ($installers.Count -ne 1) {
+              throw "Expected exactly one NSIS installer, found $($installers.Count)."
+            }
+            & signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f $cert /p $env:WINDOWS_SIGN_PFX_PASSWORD $installers[0].FullName
+            & signtool verify /pa /all $installers[0].FullName
+          } finally {
+            Remove-Item -LiteralPath $cert -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Mark unsigned Windows artifact
+        if: matrix.platform == 'windows' && steps.windows-signing.outputs.configured != 'true'
         shell: pwsh
         run: |
           Get-ChildItem bin -Filter "cairn-*-installer.exe" | Rename-Item -NewName { $_.BaseName + "-unsigned" + $_.Extension }
 
+      - name: Detect macOS signing configuration
+        id: macos-signing
+        if: matrix.platform == 'darwin'
+        shell: pwsh
+        env:
+          MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: |
+          $values = @(
+            $env:MACOS_CERTIFICATE_BASE64,
+            $env:MACOS_CERTIFICATE_PASSWORD,
+            $env:MACOS_SIGN_IDENTITY,
+            $env:MACOS_NOTARY_KEY,
+            $env:MACOS_NOTARY_KEY_ID,
+            $env:MACOS_NOTARY_ISSUER_ID
+          )
+          $configured = @($values | Where-Object { [string]::IsNullOrWhiteSpace($_) }).Count -eq 0
+          "configured=$($configured.ToString().ToLowerInvariant())" | Add-Content -Path $env:GITHUB_OUTPUT
+
       - name: Note unsigned macOS release
-        if: startsWith(github.ref, 'refs/tags/v') && matrix.platform == 'darwin' && (env.MACOS_CERTIFICATE_BASE64 == '' || env.MACOS_SIGN_IDENTITY == '' || env.MACOS_NOTARY_KEY == '' || env.MACOS_NOTARY_KEY_ID == '' || env.MACOS_NOTARY_ISSUER_ID == '')
+        if: startsWith(github.ref, 'refs/tags/v') && matrix.platform == 'darwin' && steps.macos-signing.outputs.configured != 'true'
         run: echo "macOS signing/notary secrets are not configured. The DMG will be published with an -unsigned suffix."
 
       - name: Sign and notarize macOS dmg
-        if: matrix.platform == 'darwin' && env.MACOS_CERTIFICATE_BASE64 != ''
+        if: matrix.platform == 'darwin' && steps.macos-signing.outputs.configured == 'true'
         shell: pwsh
+        env:
+          MACOS_CERTIFICATE_BASE64: ${{ secrets.MACOS_CERTIFICATE_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_KEYCHAIN_PASSWORD: ${{ secrets.MACOS_KEYCHAIN_PASSWORD }}
+          MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           $keychainPassword = if ($env:MACOS_KEYCHAIN_PASSWORD) { $env:MACOS_KEYCHAIN_PASSWORD } else { [guid]::NewGuid().ToString("N") }
           $keychain = Join-Path $env:RUNNER_TEMP "cairn-signing.keychain-db"
           $cert = Join-Path $env:RUNNER_TEMP "cairn-signing.p12"
-          [IO.File]::WriteAllBytes($cert, [Convert]::FromBase64String($env:MACOS_CERTIFICATE_BASE64))
-          security create-keychain -p $keychainPassword $keychain
-          security set-keychain-settings -lut 21600 $keychain
-          security unlock-keychain -p $keychainPassword $keychain
-          security import $cert -k $keychain -P $env:MACOS_CERTIFICATE_PASSWORD -T /usr/bin/codesign
-          security list-keychains -d user -s $keychain
-          security default-keychain -s $keychain
-          security set-key-partition-list -S apple-tool:,apple: -s -k $keychainPassword $keychain
-
-          codesign --force --deep --options runtime --timestamp --entitlements build/darwin/entitlements.plist --sign $env:MACOS_SIGN_IDENTITY bin/cairn.app
-          Remove-Item bin/*.dmg -Force
-          hdiutil create -volname cairn -srcfolder bin/cairn.app -ov -format UDZO "bin/cairn-$env:CAIRN_VERSION.dmg"
-          codesign --force --timestamp --sign $env:MACOS_SIGN_IDENTITY "bin/cairn-$env:CAIRN_VERSION.dmg"
-
           $notaryKey = Join-Path $env:RUNNER_TEMP "AuthKey_$($env:MACOS_NOTARY_KEY_ID).p8"
-          Set-Content -Path $notaryKey -Value $env:MACOS_NOTARY_KEY
-          xcrun notarytool submit "bin/cairn-$env:CAIRN_VERSION.dmg" --key $notaryKey --key-id $env:MACOS_NOTARY_KEY_ID --issuer $env:MACOS_NOTARY_ISSUER_ID --wait
-          xcrun stapler staple "bin/cairn-$env:CAIRN_VERSION.dmg"
+          try {
+            [IO.File]::WriteAllBytes($cert, [Convert]::FromBase64String($env:MACOS_CERTIFICATE_BASE64))
+            security create-keychain -p $keychainPassword $keychain
+            security set-keychain-settings -lut 21600 $keychain
+            security unlock-keychain -p $keychainPassword $keychain
+            security import $cert -k $keychain -P $env:MACOS_CERTIFICATE_PASSWORD -T /usr/bin/codesign
+            security set-key-partition-list -S apple-tool:,apple: -s -k $keychainPassword $keychain
 
-      - name: Mark unsigned macOS smoke artifact
-        if: matrix.platform == 'darwin' && env.MACOS_CERTIFICATE_BASE64 == ''
+            codesign --force --deep --options runtime --timestamp --entitlements build/darwin/entitlements.plist --keychain $keychain --sign $env:MACOS_SIGN_IDENTITY bin/cairn.app
+            codesign --verify --deep --strict --verbose=2 bin/cairn.app
+            Remove-Item bin/*.dmg -Force
+            hdiutil create -volname cairn -srcfolder bin/cairn.app -ov -format UDZO "bin/cairn-$env:CAIRN_VERSION.dmg"
+            codesign --force --timestamp --keychain $keychain --sign $env:MACOS_SIGN_IDENTITY "bin/cairn-$env:CAIRN_VERSION.dmg"
+            codesign --verify --strict --verbose=2 "bin/cairn-$env:CAIRN_VERSION.dmg"
+
+            Set-Content -LiteralPath $notaryKey -Value $env:MACOS_NOTARY_KEY
+            xcrun notarytool submit "bin/cairn-$env:CAIRN_VERSION.dmg" --key $notaryKey --key-id $env:MACOS_NOTARY_KEY_ID --issuer $env:MACOS_NOTARY_ISSUER_ID --wait
+            xcrun stapler staple "bin/cairn-$env:CAIRN_VERSION.dmg"
+            xcrun stapler validate "bin/cairn-$env:CAIRN_VERSION.dmg"
+          } finally {
+            try {
+              if (Test-Path -LiteralPath $keychain) {
+                security delete-keychain $keychain
+              }
+            } catch {
+              Write-Warning "Unable to delete the temporary signing keychain: $($_.Exception.Message)"
+            }
+            Remove-Item -LiteralPath $keychain -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $cert -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $notaryKey -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Mark unsigned macOS artifact
+        if: matrix.platform == 'darwin' && steps.macos-signing.outputs.configured != 'true'
         shell: pwsh
         run: |
           Get-ChildItem bin -Filter "*.dmg" | Rename-Item -NewName { $_.BaseName + "-unsigned" + $_.Extension }
 
       - name: Check release artifacts
         shell: pwsh
-        run: ./scripts/check-release-artifacts.ps1 -Platform ${{ matrix.platform }}
+        run: ./scripts/check-release-artifacts.ps1 -Platform ${{ matrix.platform }} -ExpectedVersion $env:CAIRN_VERSION
 
       - name: Generate package SBOM
-        uses: anchore/sbom-action@v0.24.0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
         with:
           path: bin
           format: spdx-json
@@ -249,12 +368,12 @@ jobs:
         run: ./scripts/run-release-validation.ps1 -Suite debian-deb-container
 
       - name: Upload package artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: cairn-${{ matrix.platform }}-${{ env.CAIRN_ARTIFACT_REF }}
           if-no-files-found: error
           path: |
-            bin/*.exe
+            bin/*-installer*.exe
             bin/*.AppImage
             bin/*.deb
             bin/*.dmg
@@ -264,14 +383,18 @@ jobs:
     needs: package
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Download package artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: release-artifacts
           pattern: cairn-*-${{ github.ref_name }}*
@@ -280,16 +403,11 @@ jobs:
       - name: List release artifacts
         run: find release-artifacts -maxdepth 1 -type f -print | sort
 
-      - name: Remove existing release before rerun
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release delete "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" --yes || true
-
       - name: Publish GitHub Release
-        uses: goreleaser/goreleaser-action@v7
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           distribution: goreleaser
-          version: "~> v2"
+          version: "v2.17.1"
           args: release --clean --skip=validate
         env:
           GITHUB_TOKEN: ${{ github.token }}

@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,6 +29,8 @@ const (
 	cairnBaseDigestLabel  = "io.cairn.base.digest"
 	cairnBuildTimeLabel   = "io.cairn.build.time"
 	cairnPlatformLabel    = "io.cairn.build.platform"
+
+	maxLineageDockerfileBytes int64 = 512 * 1024
 )
 
 type ImageInspector interface {
@@ -212,7 +216,7 @@ func (m *Manager) discoverService(ctx context.Context, project store.ProjectReco
 	if record.DockerfilePath == "" {
 		record.DockerfilePath = "Dockerfile"
 	}
-	content, err := os.ReadFile(dockerfilePath)
+	content, err := readLineageDockerfile(dockerfilePath)
 	if err != nil {
 		record.Source = models.LineageSourceComposeDockerfile
 		record.Confidence = models.ConfidenceUnknown
@@ -244,6 +248,58 @@ func (m *Manager) discoverService(ctx context.Context, project store.ProjectReco
 		record.Confidence = models.ConfidenceHigh
 	}
 	return record
+}
+
+// readLineageDockerfile fails closed for special, replaced, or oversized
+// inputs. Imported projects are untrusted local input; reading an arbitrary
+// Dockerfile with os.ReadFile could otherwise block on a device/FIFO or
+// allocate memory proportional to an attacker-controlled file.
+func readLineageDockerfile(path string) (content []byte, err error) {
+	before, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !before.Mode().IsRegular() {
+		return nil, fmt.Errorf("dockerfile is not a regular file")
+	}
+	if before.Size() > maxLineageDockerfileBytes {
+		return nil, fmt.Errorf("dockerfile exceeds %d bytes", maxLineageDockerfileBytes)
+	}
+
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if closeErr := file.Close(); err == nil && closeErr != nil {
+			err = closeErr
+		}
+	}()
+
+	opened, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !opened.Mode().IsRegular() || !os.SameFile(before, opened) {
+		return nil, fmt.Errorf("dockerfile changed before it could be read safely")
+	}
+
+	content, err = io.ReadAll(io.LimitReader(file, maxLineageDockerfileBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(content)) > maxLineageDockerfileBytes {
+		return nil, fmt.Errorf("dockerfile exceeds %d bytes", maxLineageDockerfileBytes)
+	}
+
+	after, err := file.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !os.SameFile(opened, after) || after.Size() != opened.Size() || !after.ModTime().Equal(opened.ModTime()) {
+		return nil, fmt.Errorf("dockerfile changed while it was being read")
+	}
+	return content, nil
 }
 
 func baseRefsFromParse(parsed DockerfileParseResult) []store.BaseImageRefRecord {

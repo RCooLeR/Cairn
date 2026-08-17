@@ -9,6 +9,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   lint-test:
     name: Lint and unit (${{ matrix.os }})
@@ -19,7 +22,9 @@ jobs:
         os: [ubuntu-24.04, windows-2022, macos-14]
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Validate repository build inputs
         shell: pwsh
@@ -28,15 +33,15 @@ jobs:
           ./scripts/check-toolchain.ps1 -SkipRuntime
 
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
 
       - name: Setup Node
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version-file: .node-version
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
@@ -111,7 +116,7 @@ jobs:
         run: go test -tags=server,cairn_server_dev .
 
       - name: Go unit tests
-        run: go test . ./internal/...
+        run: go test ./...
 
       - name: Go vulnerability scan
         shell: pwsh
@@ -119,10 +124,10 @@ jobs:
 
       - name: GoReleaser config check
         if: runner.os == 'Linux'
-        uses: goreleaser/goreleaser-action@v7
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           distribution: goreleaser
-          version: "~> v2"
+          version: "v2.17.1"
           args: check
 
       - name: Docker reconnect integration
@@ -168,10 +173,10 @@ jobs:
         run: go test ./internal/docker -run TestClientRealRegistryTagPushRoundTrip -count=1 -timeout=4m
 
       - name: Go vet
-        run: go vet -unsafeptr=false . ./internal/...
+        run: go vet -unsafeptr=false ./...
 
       - name: golangci-lint
-        run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.6.2 run --timeout=5m
+        run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run --timeout=5m
 
   package-smoke:
     name: Package smoke (${{ matrix.os }})
@@ -192,18 +197,20 @@ jobs:
             task: darwin:package
     steps:
       - name: Checkout
-        uses: actions/checkout@v5
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Setup Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
 
       - name: Setup Node
-        uses: actions/setup-node@v5
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version-file: .node-version
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
@@ -212,7 +219,7 @@ jobs:
         run: ./scripts/check-toolchain.ps1
 
       - name: Cache Wails CLI
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/go/bin/wails3
@@ -242,7 +249,7 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          choco install nsis -y --no-progress
+          choco install nsis --version=3.12.0 -y --no-progress
           Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files (x86)\NSIS"
 
       - name: Install frontend dependencies
@@ -251,7 +258,7 @@ jobs:
 
       - name: Cache Playwright browsers
         if: runner.os == 'Linux'
-        uses: actions/cache@v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/ms-playwright
           key: ${{ runner.os }}-playwright-${{ hashFiles('frontend/package-lock.json') }}
@@ -260,6 +267,11 @@ jobs:
         if: runner.os == 'Linux'
         working-directory: frontend
         run: npx playwright install --with-deps chromium
+
+      - name: Release UI production bundle smoke
+        if: runner.os == 'Linux'
+        working-directory: frontend
+        run: npm run test:release-ui
 
       - name: Stamp smoke version and assets
         shell: pwsh
@@ -305,7 +317,7 @@ jobs:
 
       - name: Check package artifacts
         shell: pwsh
-        run: ./scripts/check-release-artifacts.ps1 -Platform ${{ matrix.platform }}
+        run: ./scripts/check-release-artifacts.ps1 -Platform ${{ matrix.platform }} -ExpectedVersion $env:CAIRN_VERSION
 
       - name: Linux deb install/uninstall smoke
         if: runner.os == 'Linux'
@@ -320,4 +332,4 @@ jobs:
       - name: Release validation smoke
         if: runner.os == 'Linux'
         shell: pwsh
-        run: ./scripts/run-release-validation.ps1 -Suite checklist,manual-matrix,soak-checker,upgrade-fixtures,security,performance,soak-smoke,ui-release -SoakDuration 30s -SoakTimeout 5m
+        run: ./scripts/run-release-validation.ps1 -Suite checklist,manual-matrix,soak-checker,upgrade-fixtures,security,performance,soak-smoke -SoakDuration 30s -SoakTimeout 5m

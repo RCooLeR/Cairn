@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"bytes"
 	"context"
 	"strings"
 	"testing"
@@ -9,6 +10,23 @@ import (
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
 )
+
+func TestBoundedGPUCommandOutputDrainsWithoutGrowingPastLimit(t *testing.T) {
+	t.Parallel()
+	var output boundedGPUCommandOutput
+	payload := bytes.Repeat([]byte("x"), maxNVIDIASMIOutputBytes+1024)
+
+	written, err := output.Write(payload)
+	if err != nil {
+		t.Fatalf("Write() error = %v", err)
+	}
+	if written != len(payload) {
+		t.Fatalf("Write() = %d, want %d", written, len(payload))
+	}
+	if !output.truncated || len(output.data) != maxNVIDIASMIOutputBytes {
+		t.Fatalf("bounded output truncated=%v len=%d", output.truncated, len(output.data))
+	}
+}
 
 func TestParseNVIDIASMIAggregatesGPUDevices(t *testing.T) {
 	t.Parallel()
@@ -134,6 +152,39 @@ func TestParseOllamaPSReturnsSyntheticGPUProcess(t *testing.T) {
 	process := processes[0]
 	if process.PID != 0 || process.ProcessName != "ollama:gemma4:26b" || process.MemoryBytes != 16486770933 {
 		t.Fatalf("ollama process = %#v", process)
+	}
+}
+
+func TestParseOllamaPSRejectsUnboundedOrAmbiguousPayload(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		payload []byte
+	}{
+		{
+			name:    "oversized",
+			payload: []byte(strings.Repeat(" ", maxOllamaPSResponseBytes+1)),
+		},
+		{
+			name:    "trailing document",
+			payload: []byte(`{"models":[]} {"models":[{"name":"hidden","size_vram":1}]}`),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := parseOllamaPS(test.payload); got != nil {
+				t.Fatalf("parseOllamaPS() = %#v, want nil", got)
+			}
+		})
+	}
+}
+
+func TestParseOllamaPSSkipsUnboundedModelName(t *testing.T) {
+	t.Parallel()
+	payload := []byte(`{"models":[{"name":"` + strings.Repeat("x", maxOllamaModelNameBytes+1) + `","size_vram":1}]}`)
+	if got := parseOllamaPS(payload); len(got) != 0 {
+		t.Fatalf("parseOllamaPS() = %#v, want no unbounded process label", got)
 	}
 }
 

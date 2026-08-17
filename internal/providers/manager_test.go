@@ -4,9 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/store"
 )
@@ -159,7 +163,7 @@ func TestManagerSelectsBestDetectedWhenSavedProviderUnhealthy(t *testing.T) {
 	}
 }
 
-func TestManagerApplyInstallKeepsPlanAfterStepFailure(t *testing.T) {
+func TestManagerApplyInstallConsumesPlanAfterStepFailure(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	db := openProviderTestStore(t, ctx)
@@ -173,14 +177,86 @@ func TestManagerApplyInstallKeepsPlanAfterStepFailure(t *testing.T) {
 	if err := manager.ApplyInstall(ctx, plan.PlanID, nil); err == nil {
 		t.Fatal("ApplyInstall() error = nil, want first step failure")
 	}
-	if _, _, risk := manager.InstallPlanAuditContext(plan.PlanID); risk == "" {
-		t.Fatal("install plan was consumed after failed apply")
-	}
-	if err := manager.ApplyInstall(ctx, plan.PlanID, nil); err != nil {
-		t.Fatalf("ApplyInstall() retry error = %v", err)
-	}
 	if _, _, risk := manager.InstallPlanAuditContext(plan.PlanID); risk != "" {
-		t.Fatal("install plan remained after successful apply")
+		t.Fatal("install plan remained available after failed apply")
+	}
+	if err := manager.ApplyInstall(ctx, plan.PlanID, nil); !apperror.IsCode(err, apperror.PlanExpired) {
+		t.Fatalf("ApplyInstall() replay error = %v, want %s", err, apperror.PlanExpired)
+	}
+	if provider.discardCalls.Load() != 1 {
+		t.Fatalf("DiscardInstallPlan() calls = %d, want 1", provider.discardCalls.Load())
+	}
+}
+
+func TestManagerApplyInstallClaimsPlanBeforeConcurrentExecution(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openProviderTestStore(t, ctx)
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	provider := &fakeProvider{
+		id:             "linux_native",
+		kind:           TypeLinuxNative,
+		platform:       PlatformLinux,
+		installStarted: started,
+		installRelease: release,
+	}
+	manager := NewManager(db.Providers(), db.Settings(), []PlatformProvider{provider})
+
+	plan, err := manager.PlanInstall(ctx, provider.ID(), models.InstallOptions{})
+	if err != nil {
+		t.Fatalf("PlanInstall() error = %v", err)
+	}
+	firstDone := make(chan error, 1)
+	go func() {
+		firstDone <- manager.ApplyInstall(ctx, plan.PlanID, nil)
+	}()
+	<-started
+
+	if err := manager.ApplyInstall(ctx, plan.PlanID, nil); !apperror.IsCode(err, apperror.PlanExpired) {
+		t.Fatalf("concurrent ApplyInstall() error = %v, want %s", err, apperror.PlanExpired)
+	}
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first ApplyInstall() error = %v", err)
+	}
+	if provider.installCalls.Load() != 1 {
+		t.Fatalf("ExecuteInstallStep() calls = %d, want 1", provider.installCalls.Load())
+	}
+}
+
+func TestManagerInstallPlansExpireAndAreBounded(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openProviderTestStore(t, ctx)
+	now := time.Date(2026, 7, 24, 9, 0, 0, 0, time.UTC)
+	provider := &fakeProvider{
+		id:          "linux_native",
+		kind:        TypeLinuxNative,
+		platform:    PlatformLinux,
+		planExpiry:  now.Add(time.Minute),
+		uniquePlans: true,
+	}
+	manager := NewManager(db.Providers(), db.Settings(), []PlatformProvider{provider})
+	manager.now = func() time.Time { return now }
+
+	for range maxPendingInstallPlans {
+		if _, err := manager.PlanInstall(ctx, provider.ID(), models.InstallOptions{}); err != nil {
+			t.Fatalf("PlanInstall() before cap error = %v", err)
+		}
+	}
+	if _, err := manager.PlanInstall(ctx, provider.ID(), models.InstallOptions{}); !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("PlanInstall() at cap error = %v, want %s", err, apperror.Conflict)
+	}
+
+	now = now.Add(time.Minute)
+	provider.planExpiry = now.Add(time.Minute)
+	plan, err := manager.PlanInstall(ctx, provider.ID(), models.InstallOptions{})
+	if err != nil {
+		t.Fatalf("PlanInstall() after expiration error = %v", err)
+	}
+	if _, _, risk := manager.InstallPlanAuditContext(plan.PlanID); risk == "" {
+		t.Fatal("fresh install plan missing after expired plans were pruned")
 	}
 }
 
@@ -283,6 +359,13 @@ type fakeProvider struct {
 	colimaMemoryGB  int
 	colimaDiskGB    int
 	installFailures int
+	planExpiry      time.Time
+	uniquePlans     bool
+	planSequence    atomic.Int32
+	installCalls    atomic.Int32
+	discardCalls    atomic.Int32
+	installStarted  chan<- struct{}
+	installRelease  <-chan struct{}
 }
 
 func (p *fakeProvider) ID() string          { return p.id }
@@ -310,9 +393,14 @@ func (p *fakeProvider) SetColimaConfig(profile string, cpu, memoryGB, diskGB int
 	p.colimaDiskGB = diskGB
 }
 func (p *fakeProvider) PlanInstall(context.Context, models.InstallOptions) (*models.CommandPlan, error) {
+	planID := "plan-install-test"
+	if p.uniquePlans {
+		planID = fmt.Sprintf("%s-%d", planID, p.planSequence.Add(1))
+	}
 	return &models.CommandPlan{
-		PlanID: "plan-install-test",
-		Risk:   models.RiskNeedsConfirmation,
+		PlanID:    planID,
+		Risk:      models.RiskNeedsConfirmation,
+		ExpiresAt: p.planExpiry,
 		Commands: []models.PlannedCommand{{
 			Order:   1,
 			Command: "install",
@@ -321,11 +409,21 @@ func (p *fakeProvider) PlanInstall(context.Context, models.InstallOptions) (*mod
 	}, nil
 }
 func (p *fakeProvider) ExecuteInstallStep(context.Context, string, int, chan<- InstallProgress) error {
+	p.installCalls.Add(1)
+	if p.installStarted != nil {
+		p.installStarted <- struct{}{}
+	}
+	if p.installRelease != nil {
+		<-p.installRelease
+	}
 	if p.installFailures > 0 {
 		p.installFailures--
 		return errors.New("install failed")
 	}
 	return nil
+}
+func (p *fakeProvider) DiscardInstallPlan(string) {
+	p.discardCalls.Add(1)
 }
 func (p *fakeProvider) Start(context.Context) error { return nil }
 func (p *fakeProvider) Stop(context.Context) error  { return nil }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -113,6 +114,18 @@ func normalizeLogScope(scope string) string {
 }
 
 func normalizeLogStreamRequest(req models.LogStreamRequest, maxIDs int) (models.LogStreamRequest, error) {
+	req.ClientToken = strings.TrimSpace(req.ClientToken)
+	if req.ClientToken != "" {
+		clientToken, err := uuid.Parse(req.ClientToken)
+		if err != nil {
+			return models.LogStreamRequest{}, apperror.New(
+				apperror.Conflict,
+				"Log stream client token is invalid",
+				apperror.WithDetail("Expected a UUID generated for this stream request."),
+			)
+		}
+		req.ClientToken = clientToken.String()
+	}
 	req.Scope = normalizeLogScope(req.Scope)
 	switch req.Scope {
 	case ScopeContainer, ScopeService, ScopeProject, ScopeAll:
@@ -1223,12 +1236,16 @@ func (s *session) batchLoop() {
 
 	batch := make([]models.LogLine, 0, s.manager.batchMaxLines)
 	var batchBytes int64
-	payloadBaseBytes := serializedLinesPayloadBaseBytes(s.streamID)
+	payloadBaseBytes := serializedLinesPayloadBaseBytes(s.streamID, s.req.ClientToken)
 	flush := func() {
 		if len(batch) == 0 {
 			return
 		}
-		s.manager.publish(bus.TopicLogsLines, LinesPayload{StreamID: s.streamID, Lines: append([]models.LogLine(nil), batch...)})
+		s.manager.publish(bus.TopicLogsLines, LinesPayload{
+			StreamID:    s.streamID,
+			ClientToken: s.req.ClientToken,
+			Lines:       append([]models.LogLine(nil), batch...),
+		})
 		batch = batch[:0]
 		batchBytes = 0
 	}
@@ -1276,7 +1293,7 @@ func (s *session) batchLoop() {
 				appendSkipped()
 				flush()
 				s.manager.removeSession(s.streamID, s)
-				s.manager.publish(bus.TopicLogsEOF, EOFPayload{StreamID: s.streamID})
+				s.manager.publishCritical(bus.TopicLogsEOF, EOFPayload{StreamID: s.streamID, ClientToken: s.req.ClientToken})
 				return
 			}
 			s.queuedBytes.Add(-retainedLogLineBytes(line))
@@ -1289,14 +1306,14 @@ func (s *session) batchLoop() {
 			appendSkipped()
 			flush()
 			s.manager.removeSession(s.streamID, s)
-			s.manager.publish(bus.TopicLogsEOF, EOFPayload{StreamID: s.streamID})
+			s.manager.publishCritical(bus.TopicLogsEOF, EOFPayload{StreamID: s.streamID, ClientToken: s.req.ClientToken})
 			return
 		}
 	}
 }
 
-func serializedLinesPayloadBaseBytes(streamID string) int64 {
-	raw, err := json.Marshal(LinesPayload{StreamID: streamID, Lines: []models.LogLine{}})
+func serializedLinesPayloadBaseBytes(streamID string, clientToken string) int64 {
+	raw, err := json.Marshal(LinesPayload{StreamID: streamID, ClientToken: clientToken, Lines: []models.LogLine{}})
 	if err != nil {
 		return minimumBatchBytes
 	}
@@ -1347,7 +1364,11 @@ func (s *session) publishError(err error) {
 	if err == nil {
 		return
 	}
-	s.manager.publish(bus.TopicLogsError, ErrorPayload{StreamID: s.streamID, Error: err.Error()})
+	s.manager.publish(bus.TopicLogsError, ErrorPayload{
+		StreamID:    s.streamID,
+		ClientToken: s.req.ClientToken,
+		Error:       err.Error(),
+	})
 }
 
 func (s *session) beginDrain() {
@@ -1386,6 +1407,15 @@ func (m *Manager) publish(topic bus.Topic, payload any) {
 		return
 	}
 	m.Events.Publish(bus.Event{Topic: topic, Payload: payload})
+}
+
+func (m *Manager) publishCritical(topic bus.Topic, payload any) {
+	if m.Events == nil {
+		return
+	}
+	if err := bus.PublishCriticalBounded(m.Events, bus.Event{Topic: topic, Payload: payload}); err != nil {
+		slog.Warn("publish critical log event failed", "topic", topic, "error", err)
+	}
 }
 
 func (m *Manager) Diagnostics() models.LogRuntimeDiagnostics {

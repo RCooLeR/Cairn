@@ -2,6 +2,9 @@ package compose
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -17,6 +20,7 @@ import (
 type verifiedConfigPreparation struct {
 	root                     verifiedConfigRoot
 	inputs                   []VerifiedConfigInput
+	fingerprint              string
 	snapshotDir              string
 	snapshotFiles            []string
 	snapshotProjectDirectory string
@@ -38,6 +42,22 @@ type verifiedConfigClosure struct {
 type verifiedConfigParseKey struct {
 	path             string
 	projectDirectory string
+}
+
+const verifiedConfigFingerprintVersion = 1
+
+type verifiedConfigFingerprintPayload struct {
+	Version               int                             `json:"version"`
+	TopFiles              []string                        `json:"topFiles"`
+	ProjectDirectory      string                          `json:"projectDirectory"`
+	InterpolationEnvFiles []string                        `json:"interpolationEnvFiles"`
+	Directories           []string                        `json:"directories"`
+	Files                 []verifiedConfigFingerprintFile `json:"files"`
+}
+
+type verifiedConfigFingerprintFile struct {
+	Path   string `json:"path"`
+	SHA256 string `json:"sha256"`
 }
 
 func prepareVerifiedConfigInputs(ctx context.Context, opts ProjectOptions) (*verifiedConfigPreparation, error) {
@@ -128,6 +148,10 @@ func prepareVerifiedConfigInputs(ctx context.Context, opts ProjectOptions) (*ver
 	}
 	if err := root.verifyCurrent(); err != nil {
 		return nil, verifiedConfigInputError(err)
+	}
+	fingerprint, err := fingerprintVerifiedConfigClosure(closure, topPaths, projectDirectory, envPaths)
+	if err != nil {
+		return nil, internalVerifiedConfigError(err)
 	}
 
 	snapshotDir, err := os.MkdirTemp("", "cairn-compose-input-")
@@ -225,12 +249,81 @@ func prepareVerifiedConfigInputs(ctx context.Context, opts ProjectOptions) (*ver
 	return &verifiedConfigPreparation{
 		root:                     root,
 		inputs:                   inputs,
+		fingerprint:              fingerprint,
 		snapshotDir:              snapshotDir,
 		snapshotFiles:            snapshotFiles,
 		snapshotProjectDirectory: filepath.Join(snapshotDir, projectRel),
 		snapshotEnvFiles:         snapshotEnvFiles,
 		cleanup:                  cleanup,
 	}, nil
+}
+
+func fingerprintVerifiedConfigClosure(
+	closure *verifiedConfigClosure,
+	topPaths []string,
+	projectDirectory string,
+	envPaths []string,
+) (string, error) {
+	relativePaths := func(paths []string) ([]string, error) {
+		result := make([]string, 0, len(paths))
+		for _, path := range paths {
+			rel, err := closure.relativePath(path)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, filepath.ToSlash(rel))
+		}
+		return result, nil
+	}
+	topFiles, err := relativePaths(topPaths)
+	if err != nil {
+		return "", err
+	}
+	interpolationEnvFiles, err := relativePaths(envPaths)
+	if err != nil {
+		return "", err
+	}
+	projectDirectoryAbs, err := filepath.Abs(projectDirectory)
+	if err != nil || !verifiedConfigPathWithin(closure.root.absPath, projectDirectoryAbs) {
+		return "", unsafeComposeDependencyError()
+	}
+	projectDirectoryRel, err := filepath.Rel(closure.root.absPath, projectDirectoryAbs)
+	if err != nil || verifiedConfigPathEscapes(projectDirectoryRel) {
+		return "", unsafeComposeDependencyError()
+	}
+
+	directories := make([]string, 0, len(closure.directories))
+	for rel := range closure.directories {
+		directories = append(directories, filepath.ToSlash(rel))
+	}
+	sort.Strings(directories)
+	filePaths := make([]string, 0, len(closure.entries))
+	for rel := range closure.entries {
+		filePaths = append(filePaths, rel)
+	}
+	sort.Strings(filePaths)
+	files := make([]verifiedConfigFingerprintFile, 0, len(filePaths))
+	for _, rel := range filePaths {
+		contentSum := sha256.Sum256(closure.entries[rel])
+		files = append(files, verifiedConfigFingerprintFile{
+			Path:   filepath.ToSlash(rel),
+			SHA256: hex.EncodeToString(contentSum[:]),
+		})
+	}
+	payload := verifiedConfigFingerprintPayload{
+		Version:               verifiedConfigFingerprintVersion,
+		TopFiles:              topFiles,
+		ProjectDirectory:      filepath.ToSlash(projectDirectoryRel),
+		InterpolationEnvFiles: interpolationEnvFiles,
+		Directories:           directories,
+		Files:                 files,
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func (closure *verifiedConfigClosure) collectTopInterpolationEnvFiles(selected []string) ([]string, error) {

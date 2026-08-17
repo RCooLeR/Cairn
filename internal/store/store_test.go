@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	expectedMigrationCount       = buildArgPrivacyVersion
+	expectedMigrationCount       = latestSchemaVersion
 	releaseFixtureMigrationCount = 6
 )
 
@@ -192,6 +192,114 @@ func TestCopyFilePublishesAtomicallyAndDoesNotOverwrite(t *testing.T) {
 	}
 	if err := copyFile(src, dst); !errors.Is(err, os.ErrExist) {
 		t.Fatalf("copyFile(existing) error = %v, want os.ErrExist", err)
+	}
+}
+
+func TestValidateMigrationBackupCheckpointRequiresCompleteResult(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name          string
+		busy          int
+		logFrames     int
+		checkpointed  int
+		wantErrSubstr string
+	}{
+		{name: "complete", logFrames: 7, checkpointed: 7},
+		{name: "busy", busy: 1, logFrames: 7, checkpointed: 3, wantErrSubstr: "checkpoint remained busy"},
+		{name: "incomplete", logFrames: 7, checkpointed: 6, wantErrSubstr: "checkpoint incomplete"},
+		{name: "unreported counters", logFrames: -1, checkpointed: -1, wantErrSubstr: "did not report valid frame counts"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := validateMigrationBackupCheckpoint(tt.busy, tt.logFrames, tt.checkpointed)
+			if tt.wantErrSubstr == "" {
+				if err != nil {
+					t.Fatalf("validateMigrationBackupCheckpoint() error = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tt.wantErrSubstr) {
+				t.Fatalf("validateMigrationBackupCheckpoint() error = %v, want substring %q", err, tt.wantErrSubstr)
+			}
+		})
+	}
+}
+
+func TestBackupBeforeMigrationRefusesBusyCheckpointAndCopiesCompleteWAL(t *testing.T) {
+	ctx := context.Background()
+	s := openStore(t, ctx)
+	defer closeStore(t, s)
+
+	if _, err := s.writer.ExecContext(ctx, `CREATE TABLE checkpoint_probe (value TEXT NOT NULL)`); err != nil {
+		t.Fatalf("create checkpoint probe: %v", err)
+	}
+	if _, err := s.writer.ExecContext(ctx, `INSERT INTO checkpoint_probe(value) VALUES ('before')`); err != nil {
+		t.Fatalf("seed checkpoint probe: %v", err)
+	}
+	if err := s.checkpointWALTruncate(ctx); err != nil {
+		t.Fatalf("truncate WAL before test: %v", err)
+	}
+
+	readerTx, err := s.reader.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		t.Fatalf("begin blocking read transaction: %v", err)
+	}
+	defer func() { _ = readerTx.Rollback() }()
+	var value string
+	if err := readerTx.QueryRowContext(ctx, `SELECT value FROM checkpoint_probe`).Scan(&value); err != nil {
+		t.Fatalf("establish read snapshot: %v", err)
+	}
+	if value != "before" {
+		t.Fatalf("read snapshot value = %q, want before", value)
+	}
+	if _, err := s.writer.ExecContext(ctx, `UPDATE checkpoint_probe SET value = 'after'`); err != nil {
+		t.Fatalf("write WAL frame after read snapshot: %v", err)
+	}
+	if _, err := s.writer.ExecContext(ctx, `PRAGMA busy_timeout = 1`); err != nil {
+		t.Fatalf("set short checkpoint busy timeout: %v", err)
+	}
+
+	err = s.backupBeforeMigration(ctx)
+	if err == nil || !strings.Contains(err.Error(), "checkpoint remained busy") {
+		t.Fatalf("backupBeforeMigration() error = %v, want busy checkpoint failure", err)
+	}
+	backupPattern := s.path + ".bak-*"
+	backups, globErr := filepath.Glob(backupPattern)
+	if globErr != nil {
+		t.Fatalf("glob migration backups: %v", globErr)
+	}
+	if len(backups) != 0 {
+		t.Fatalf("busy checkpoint published migration backups: %v", backups)
+	}
+
+	if err := readerTx.Rollback(); err != nil {
+		t.Fatalf("release blocking read transaction: %v", err)
+	}
+	if err := s.backupBeforeMigration(ctx); err != nil {
+		t.Fatalf("backupBeforeMigration() after reader release error = %v", err)
+	}
+	backups, globErr = filepath.Glob(backupPattern)
+	if globErr != nil {
+		t.Fatalf("glob completed migration backup: %v", globErr)
+	}
+	if len(backups) != 1 {
+		t.Fatalf("migration backups = %v, want exactly one", backups)
+	}
+
+	backupDB, err := sql.Open(driverName, sqliteDSN(backups[0]))
+	if err != nil {
+		t.Fatalf("open migration backup: %v", err)
+	}
+	defer func() {
+		if err := backupDB.Close(); err != nil {
+			t.Errorf("close migration backup: %v", err)
+		}
+	}()
+	if err := backupDB.QueryRowContext(ctx, `SELECT value FROM checkpoint_probe`).Scan(&value); err != nil {
+		t.Fatalf("read migration backup: %v", err)
+	}
+	if value != "after" {
+		t.Fatalf("migration backup value = %q, want committed WAL value after", value)
 	}
 }
 

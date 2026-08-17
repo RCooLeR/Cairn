@@ -28,10 +28,7 @@ type LoadStatus = "idle" | "loading" | "ready" | "error";
 // by current full-snapshot engine probes. A request may update it only if no
 // newer event has advanced the connection epoch.
 export type ConnectionState =
-  | "connecting"
-  | "connected"
-  | "reconnecting"
-  | "disconnected";
+  "connecting" | "connected" | "reconnecting" | "disconnected";
 
 export type InventorySliceState = {
   loading: boolean;
@@ -59,8 +56,7 @@ export type ContainerStatsSample = {
 };
 
 export type DetailLoadResult<Detail> =
-  | { status: "current"; detail: Detail | null }
-  | { status: "obsolete" };
+  { status: "current"; detail: Detail | null } | { status: "obsolete" };
 
 export type InventoryState = {
   status: LoadStatus;

@@ -148,7 +148,12 @@ export function DataTable<T>({
         : { columnID: column.id, direction: "asc" },
     );
   };
-  const virtualized = visibleRows.length > virtualizeRowThreshold;
+  // Virtual spacers rely on every rendered row matching virtualRowHeight.
+  // Wrapped cells have content-driven heights, so render those datasets in
+  // normal table flow to keep every row reachable and correctly positioned.
+  const hasVariableHeightRows = visibleColumns.some((column) => column.wrap);
+  const virtualized =
+    visibleRows.length > virtualizeRowThreshold && !hasVariableHeightRows;
   const visibleCount = Math.ceil(virtualViewportHeight / virtualRowHeight);
   const virtualWindowSize = visibleCount + virtualOverscanRows * 2;
   const maxVirtualStart = Math.max(0, visibleRows.length - virtualWindowSize);
@@ -163,6 +168,7 @@ export function DataTable<T>({
     rows.length,
     activeSort?.columnID ?? null,
     activeSort?.direction ?? null,
+    virtualized,
   ]);
   const [scrollState, setScrollState] = useState<ScrollState>({
     key: virtualWindowKey,

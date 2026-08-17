@@ -26,7 +26,9 @@ export default defineConfig({
       CAIRN_BROWSER_MOCKS: "1",
       VITE_CAIRN_VERSION: "1.0.0",
     },
-    reuseExistingServer: !process.env.CI,
+    // This suite validates the bundle produced by the current checkout. Reusing
+    // a preview server can silently exercise a stale dist directory.
+    reuseExistingServer: false,
     timeout: 120_000,
     url: baseURL,
   },

@@ -17,6 +17,10 @@ export function ApplyUpdate(req: models$0.ApplyUpdateRequest): $CancellablePromi
     return $Call.ByID(2969046818, req);
 }
 
+export function CancelJob(jobID: string): $CancellablePromise<void> {
+    return $Call.ByID(2112138714, jobID);
+}
+
 export function CheckAllUpdates(): $CancellablePromise<string> {
     return $Call.ByID(3172433760);
 }

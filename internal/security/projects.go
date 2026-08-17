@@ -20,11 +20,17 @@ const (
 )
 
 type ProjectPlan struct {
-	Plan          models.CommandPlan
-	Action        string
-	ProjectID     string
-	RemoveVolumes bool
-	Scope         runtimescope.Scope
+	Plan      models.CommandPlan
+	Action    string
+	ProjectID string
+	// ProjectGeneration fences confirmation to the project incarnation that
+	// was reviewed when the plan was created.
+	ProjectGeneration uint64
+	// ProjectFingerprint binds confirmation to stable stored configuration and
+	// the verified on-disk Compose input closure.
+	ProjectFingerprint string
+	RemoveVolumes      bool
+	Scope              runtimescope.Scope
 }
 
 type ProjectPlanStore struct {

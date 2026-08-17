@@ -5,6 +5,7 @@ import type {
   RegistryAccount,
   RegistryAuthStatus,
 } from "../../../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
+import { parseAppErrorText } from "../../api/errors";
 import {
   normalizeRegistryHostForUI,
   registryStorageLabel,
@@ -190,10 +191,52 @@ function RegistryStatusBadge({
   status?: RegistryAuthStatus;
 }) {
   if (status?.error) {
-    return <Badge tone="error">Auth failed</Badge>;
+    const parsed = parseAppErrorText(status.error);
+    return (
+      <div
+        aria-label={`Authentication failed for ${normalizeRegistryHostForUI(account.registry)}`}
+        className="max-w-[360px] space-y-1.5"
+        role="alert"
+      >
+        <Badge tone="error">Auth failed</Badge>
+        {parsed.code ? (
+          <div className="font-medium text-error">{parsed.title}</div>
+        ) : null}
+        <div className="whitespace-pre-wrap text-xs text-error">
+          {parsed.body}
+        </div>
+        {parsed.detail && parsed.detail !== parsed.body ? (
+          <div className="whitespace-pre-wrap text-xs text-error/90">
+            {parsed.detail}
+          </div>
+        ) : null}
+        {parsed.repairHints?.length ? (
+          <div className="text-xs text-error">
+            <div className="font-medium">How to fix</div>
+            <ul className="mt-1 list-disc space-y-1 pl-4">
+              {parsed.repairHints.map((hint) => (
+                <li key={hint}>{hint}</li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+        {parsed.code ? (
+          <div className="font-mono text-[11px] text-error/80">
+            {parsed.code}
+          </div>
+        ) : null}
+      </div>
+    );
   }
   if (status?.loggedIn) {
-    return <Badge tone="ok">Verified</Badge>;
+    return (
+      <div
+        aria-label={`Authentication verified for ${normalizeRegistryHostForUI(account.registry)}`}
+        role="status"
+      >
+        <Badge tone="ok">Verified</Badge>
+      </div>
+    );
   }
   return <Badge tone={account.loggedIn ? "warn" : "neutral"}>Unverified</Badge>;
 }

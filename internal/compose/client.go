@@ -67,7 +67,11 @@ func (c *Client) Ls(ctx context.Context, opts ListOptions) ([]Project, error) {
 }
 
 func (c *Client) Ps(ctx context.Context, opts ProjectOptions) ([]models.ComposeServiceStatus, error) {
-	opts = c.backendProjectOptions(opts)
+	var err error
+	opts, err = c.strictBackendProjectOptions(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
 	args := append(projectArgs(opts), "ps", "--format", "json", "--all")
 	result, err := c.run(ctx, opts.Workdir, projectEnv(opts), args...)
 	if commandFailed(result, err) {
@@ -87,7 +91,11 @@ func (c *Client) Ps(ctx context.Context, opts ProjectOptions) ([]models.ComposeS
 }
 
 func (c *Client) Config(ctx context.Context, opts ProjectOptions) (*ConfigResult, error) {
-	opts = c.backendProjectOptions(opts)
+	var err error
+	opts, err = c.strictBackendProjectOptions(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
 	return c.configWithBackendProjectOptions(ctx, opts)
 }
 
@@ -262,7 +270,11 @@ func (c *Client) Down(ctx context.Context, opts ProjectOptions, removeVolumes bo
 }
 
 func (c *Client) runProjectCommand(ctx context.Context, opts ProjectOptions, args ...string) (*providers.CommandResult, error) {
-	opts = c.backendProjectOptions(opts)
+	var err error
+	opts, err = c.strictBackendProjectOptions(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
 	fullArgs := append(projectArgs(opts), args...)
 	result, err := c.run(ctx, opts.Workdir, projectEnv(opts), fullArgs...)
 	if commandFailed(result, err) {
@@ -309,44 +321,6 @@ func (c *Client) run(ctx context.Context, workdir string, env []string, args ...
 		return result, contextErr
 	}
 	return result, err
-}
-
-func (c *Client) backendProjectOptions(opts ProjectOptions) ProjectOptions {
-	mapper, ok := c.runner.(PathMapper)
-	if !ok || mapper == nil {
-		return opts
-	}
-	if mapped, err := mapper.MapPathToBackend(opts.Workdir); err == nil && strings.TrimSpace(mapped) != "" {
-		opts.Workdir = mapped
-	}
-	if strings.TrimSpace(opts.ProjectDirectory) != "" {
-		if mapped, err := mapper.MapPathToBackend(opts.ProjectDirectory); err == nil && strings.TrimSpace(mapped) != "" {
-			opts.ProjectDirectory = mapped
-		}
-	}
-	if len(opts.Files) > 0 {
-		files := make([]string, 0, len(opts.Files))
-		for _, file := range opts.Files {
-			if mapped, err := mapper.MapPathToBackend(file); err == nil && strings.TrimSpace(mapped) != "" {
-				files = append(files, mapped)
-				continue
-			}
-			files = append(files, file)
-		}
-		opts.Files = files
-	}
-	if len(opts.InterpolationEnvFiles) > 0 {
-		files := make([]string, 0, len(opts.InterpolationEnvFiles))
-		for _, file := range opts.InterpolationEnvFiles {
-			if mapped, err := mapper.MapPathToBackend(file); err == nil && strings.TrimSpace(mapped) != "" {
-				files = append(files, mapped)
-			} else {
-				files = append(files, file)
-			}
-		}
-		opts.InterpolationEnvFiles = files
-	}
-	return opts
 }
 
 func projectArgs(opts ProjectOptions) []string {

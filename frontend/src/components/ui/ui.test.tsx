@@ -71,7 +71,7 @@ describe("UI kit", () => {
     vi.useFakeTimers();
 
     function ToastHarness() {
-      const { pushToast, toasts } = useToastQueue();
+      const { dismissToast, pushToast, toasts } = useToastQueue();
       return (
         <>
           <button
@@ -86,7 +86,7 @@ describe("UI kit", () => {
           >
             Push
           </button>
-          <ToastViewport toasts={toasts} />
+          <ToastViewport onDismiss={dismissToast} toasts={toasts} />
         </>
       );
     }
@@ -462,6 +462,31 @@ describe("UI kit", () => {
     expect(onClose).not.toHaveBeenCalled();
   });
 
+  it("recaptures focus when it is moved outside an open modal", () => {
+    render(
+      <>
+        <button type="button">Background action</button>
+        <Modal onClose={vi.fn()} open title="Focus owner">
+          <button type="button">First modal action</button>
+          <button type="button">Last modal action</button>
+        </Modal>
+      </>,
+    );
+
+    const background = screen.getByRole("button", {
+      name: "Background action",
+    });
+    background.focus();
+    fireEvent.keyDown(window, { key: "Tab" });
+    expect(screen.getByRole("button", { name: "Close" })).toHaveFocus();
+
+    background.focus();
+    fireEvent.keyDown(window, { key: "Tab", shiftKey: true });
+    expect(
+      screen.getByRole("button", { name: "Last modal action" }),
+    ).toHaveFocus();
+  });
+
   it("maps every contract AppError code to a UI surface", () => {
     expect(APP_ERROR_CODES).toHaveLength(17);
     for (const code of APP_ERROR_CODES) {
@@ -507,6 +532,53 @@ describe("UI kit", () => {
     });
   });
 
+  it("extracts bounded repair guidance from nested runtime errors", () => {
+    const parsed = parseAppErrorText(
+      JSON.stringify({
+        message: "E_REGISTRY_AUTH: Docker credential helper is not available",
+        cause: {
+          code: "E_REGISTRY_AUTH",
+          message: "Docker credential helper is not available",
+          detail: "No configured helper responded.",
+          repairHints: [
+            " Install and initialize a Docker credential helper. ",
+            "Install and initialize a Docker credential helper.",
+            null,
+            42,
+            ...Array.from({ length: 10 }, (_, index) => `Hint ${index}`),
+          ],
+        },
+        kind: "RuntimeError",
+      }),
+    );
+
+    expect(parsed.code).toBe("E_REGISTRY_AUTH");
+    expect(parsed.body).toBe("Docker credential helper is not available");
+    expect(parsed.detail).toBe("No configured helper responded.");
+    expect(parsed.repairHints).toEqual([
+      "Install and initialize a Docker credential helper.",
+      "Hint 0",
+      "Hint 1",
+      "Hint 2",
+      "Hint 3",
+      "Hint 4",
+      "Hint 5",
+      "Hint 6",
+    ]);
+  });
+
+  it("ignores malformed structured repair guidance", () => {
+    const parsed = parseAppErrorText(
+      JSON.stringify({
+        code: "E_INTERNAL",
+        message: "Something failed",
+        repairHints: { unexpected: true },
+      }),
+    );
+
+    expect(parsed.repairHints).toBeUndefined();
+  });
+
   it("parses a directly marshalled app error", () => {
     const parsed = parseAppErrorText(
       JSON.stringify({
@@ -544,6 +616,33 @@ describe("UI kit", () => {
 
     expect(screen.getByText("Row 0")).toBeInTheDocument();
     expect(screen.queryByText("Row 199")).not.toBeInTheDocument();
+  });
+
+  it("keeps every variable-height row reachable when a column wraps", () => {
+    const rows = Array.from({ length: 200 }, (_, index) => ({
+      id: `row-${index}`,
+      label: `Row ${index}`,
+    }));
+
+    render(
+      <DataTable
+        columns={[
+          {
+            id: "label",
+            header: "Label",
+            render: (row) => row.label,
+            wrap: true,
+          },
+        ]}
+        datasetKey="wrapped-inventory"
+        getRowID={(row) => row.id}
+        rows={rows}
+      />,
+    );
+
+    expect(screen.getByText("Row 0")).toBeInTheDocument();
+    expect(screen.getByText("Row 199")).toBeInTheDocument();
+    expect(screen.getAllByRole("row")).toHaveLength(rows.length + 1);
   });
 
   it("reports absolute row positions inside a virtual window", () => {

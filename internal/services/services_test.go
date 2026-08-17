@@ -949,6 +949,7 @@ func TestAgentServiceExecuteToolCreatesCommandPlan(t *testing.T) {
 		Docker: &DockerService{
 			Client:      &fakeDockerClient{},
 			ObjectPlans: plans,
+			Scope:       runtimescope.Must("linux_native", "default"),
 		},
 	}
 
@@ -1215,6 +1216,57 @@ func TestProviderServiceApplyInstallSurvivesRequestContextCancellation(t *testin
 	}
 }
 
+func TestProviderInstallLifecycleCancelsAndJoinsActiveInstall(t *testing.T) {
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer waitCancel()
+	rootCtx, cancelRoot := context.WithCancel(context.Background())
+	defer cancelRoot()
+	eventBus := bus.New()
+	defer eventBus.Close()
+	db := openServiceTestStore(t)
+	provider := &fakeInstallProvider{blockUntilCancel: true, started: make(chan struct{})}
+	manager := providers.NewManager(nil, nil, []providers.PlatformProvider{provider})
+	lifecycle := NewProviderInstallLifecycle(rootCtx)
+	service := &ProviderService{
+		Manager:          manager,
+		Events:           eventBus,
+		Audit:            db.Audit(),
+		InstallLifecycle: lifecycle,
+	}
+
+	plan, err := service.PlanInstall(waitCtx, provider.ID(), models.InstallOptions{})
+	if err != nil {
+		t.Fatalf("PlanInstall() error = %v", err)
+	}
+	if _, err := service.ApplyInstall(waitCtx, plan.PlanID); err != nil {
+		t.Fatalf("ApplyInstall() error = %v", err)
+	}
+	select {
+	case <-provider.started:
+	case <-waitCtx.Done():
+		t.Fatalf("timed out waiting for install to start: %v", waitCtx.Err())
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		lifecycle.StopAll()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-waitCtx.Done():
+		t.Fatalf("StopAll() did not join the canceled install: %v", waitCtx.Err())
+	}
+
+	nextPlan, err := service.PlanInstall(waitCtx, provider.ID(), models.InstallOptions{})
+	if err != nil {
+		t.Fatalf("PlanInstall(after stop) error = %v", err)
+	}
+	if _, err := service.ApplyInstall(waitCtx, nextPlan.PlanID); !apperror.IsCode(err, apperror.ProviderNotReady) {
+		t.Fatalf("ApplyInstall(after stop) error = %v, want %s", err, apperror.ProviderNotReady)
+	}
+}
+
 func TestProviderServiceStopClearsRuntimeForActiveProvider(t *testing.T) {
 	ctx := context.Background()
 	db := openServiceTestStore(t)
@@ -1334,7 +1386,7 @@ func TestDockerServiceLifecycleAuditsAndPlans(t *testing.T) {
 	}
 
 	client := newFakeDockerClient()
-	service := &DockerService{Client: client, Audit: db.Audit()}
+	service := &DockerService{Client: client, Audit: db.Audit(), Scope: runtimescope.Must("linux_native", "default")}
 	if err := service.StartContainer(ctx, "container-1"); err != nil {
 		t.Fatalf("StartContainer() error = %v", err)
 	}
@@ -1482,7 +1534,7 @@ func TestDockerServiceObjectCreationAudits(t *testing.T) {
 	}
 
 	client := newFakeDockerClient()
-	service := &DockerService{Client: client, Audit: db.Audit()}
+	service := &DockerService{Client: client, Audit: db.Audit(), Scope: runtimescope.Must("linux_native", "default")}
 	runRequest := models.RunImageRequest{
 		ImageRef: "alpine:latest",
 		Name:     "demo",
@@ -1575,7 +1627,7 @@ func TestDockerServicePreservesRunImagePartialResourceID(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	client := newFakeDockerClient()
-	service := &DockerService{Client: client}
+	service := &DockerService{Client: client, Scope: runtimescope.Must("linux_native", "default")}
 	req := models.RunImageRequest{ImageRef: "alpine:latest", Name: "partial"}
 	plan, err := service.PlanRunImage(ctx, req)
 	if err != nil {
@@ -1612,7 +1664,7 @@ func TestDockerServiceRunImageRequiresPlan(t *testing.T) {
 		t.Fatalf("Migrate: %v", err)
 	}
 	client := newFakeDockerClient()
-	service := &DockerService{Client: client, Audit: db.Audit()}
+	service := &DockerService{Client: client, Audit: db.Audit(), Scope: runtimescope.Must("linux_native", "default")}
 
 	directRequests := []models.RunImageRequest{
 		{ImageRef: "alpine:latest", Name: "plain", Detach: true},
@@ -1734,7 +1786,7 @@ func TestDockerServiceObjectPlansAuditAndExecute(t *testing.T) {
 	client := newFakeDockerClient()
 	service := &DockerService{Client: client, Audit: db.Audit(), Scope: runtimescope.Must("linux_native", "default")}
 
-	imagePlan, err := service.PlanRemoveImage(ctx, client.image.ID, false)
+	imagePlan, err := service.PlanRemoveImage(ctx, client.image.RepoTags[0], false)
 	if err != nil {
 		t.Fatalf("PlanRemoveImage() error = %v", err)
 	}
@@ -1785,7 +1837,7 @@ func TestDockerServiceObjectPlansAuditAndExecute(t *testing.T) {
 		t.Fatalf("removed volumes = %#v", client.removedVolumes)
 	}
 
-	networkPlan, err := service.PlanRemoveNetwork(ctx, client.network.ID)
+	networkPlan, err := service.PlanRemoveNetwork(ctx, client.network.Name)
 	if err != nil {
 		t.Fatalf("PlanRemoveNetwork() error = %v", err)
 	}
@@ -1813,6 +1865,174 @@ func TestDockerServiceObjectPlansAuditAndExecute(t *testing.T) {
 		if !seen[action] {
 			t.Fatalf("missing audit action %s in %#v", action, entries)
 		}
+	}
+}
+
+func TestDockerServicePlansRejectRuntimeScopeChanges(t *testing.T) {
+	oldScope := runtimescope.Must("linux_native", "default")
+	newScope := runtimescope.Must("windows_wsl_ubuntu", "cairn")
+	newService := func(t *testing.T) (*DockerService, *fakeDockerClient) {
+		t.Helper()
+		client := newFakeDockerClient()
+		containerPlans := security.NewPlanStore(nil)
+		objectPlans := security.NewDockerObjectPlanStore(nil)
+		t.Cleanup(containerPlans.Close)
+		t.Cleanup(objectPlans.Close)
+		return &DockerService{
+			Client:      client,
+			Plans:       containerPlans,
+			ObjectPlans: objectPlans,
+			Scope:       oldScope,
+		}, client
+	}
+	assertConflict := func(t *testing.T, err error) {
+		t.Helper()
+		if !apperror.IsCode(err, apperror.Conflict) {
+			t.Fatalf("Apply plan after runtime scope change error = %v, want %s", err, apperror.Conflict)
+		}
+	}
+
+	t.Run("container action", func(t *testing.T) {
+		service, client := newService(t)
+		plan, err := service.PlanKillContainer(context.Background(), client.container.ID)
+		if err != nil {
+			t.Fatalf("PlanKillContainer() error = %v", err)
+		}
+		service.Scope = newScope
+		assertConflict(t, service.ApplyContainerPlan(context.Background(), plan.PlanID, ""))
+		if len(client.killed) != 0 {
+			t.Fatalf("scope-mismatched plan killed containers: %#v", client.killed)
+		}
+		service.Scope = oldScope
+		if err := service.ApplyContainerPlan(context.Background(), plan.PlanID, ""); !apperror.IsCode(err, apperror.PlanExpired) {
+			t.Fatalf("ApplyContainerPlan(replay after mismatch) error = %v, want consumed plan", err)
+		}
+	})
+
+	t.Run("remove image", func(t *testing.T) {
+		service, client := newService(t)
+		plan, err := service.PlanRemoveImage(context.Background(), client.image.ID, false)
+		if err != nil {
+			t.Fatalf("PlanRemoveImage() error = %v", err)
+		}
+		service.Scope = newScope
+		assertConflict(t, service.ApplyContainerPlan(context.Background(), plan.PlanID, ""))
+		if len(client.removedImages) != 0 {
+			t.Fatalf("scope-mismatched plan removed images: %#v", client.removedImages)
+		}
+	})
+
+	t.Run("prune", func(t *testing.T) {
+		service, client := newService(t)
+		plan, err := service.PlanPrune(context.Background(), "images")
+		if err != nil {
+			t.Fatalf("PlanPrune() error = %v", err)
+		}
+		service.Scope = newScope
+		assertConflict(t, service.ApplyContainerPlan(context.Background(), plan.PlanID, "prune"))
+		if len(client.pruned) != 0 {
+			t.Fatalf("scope-mismatched plan pruned objects: %#v", client.pruned)
+		}
+	})
+
+	t.Run("remove volume", func(t *testing.T) {
+		service, client := newService(t)
+		plan, err := service.PlanRemoveVolume(context.Background(), client.volume.Name, false)
+		if err != nil {
+			t.Fatalf("PlanRemoveVolume() error = %v", err)
+		}
+		service.Scope = newScope
+		assertConflict(t, service.ApplyContainerPlan(context.Background(), plan.PlanID, client.volume.Name))
+		if len(client.removedVolumes) != 0 {
+			t.Fatalf("scope-mismatched plan removed volumes: %#v", client.removedVolumes)
+		}
+	})
+
+	t.Run("remove network", func(t *testing.T) {
+		service, client := newService(t)
+		plan, err := service.PlanRemoveNetwork(context.Background(), client.network.ID)
+		if err != nil {
+			t.Fatalf("PlanRemoveNetwork() error = %v", err)
+		}
+		service.Scope = newScope
+		assertConflict(t, service.ApplyContainerPlan(context.Background(), plan.PlanID, ""))
+		if len(client.removedNetworks) != 0 {
+			t.Fatalf("scope-mismatched plan removed networks: %#v", client.removedNetworks)
+		}
+	})
+
+	t.Run("push image", func(t *testing.T) {
+		service, client := newService(t)
+		plan, err := service.PlanPushImage(context.Background(), "registry.example/app:latest")
+		if err != nil {
+			t.Fatalf("PlanPushImage() error = %v", err)
+		}
+		service.Scope = newScope
+		_, err = service.ApplyPushImagePlan(context.Background(), plan.PlanID)
+		assertConflict(t, err)
+		if len(client.pushed) != 0 {
+			t.Fatalf("scope-mismatched plan pushed images: %#v", client.pushed)
+		}
+	})
+
+	t.Run("run image", func(t *testing.T) {
+		service, client := newService(t)
+		plan, err := service.PlanRunImage(context.Background(), models.RunImageRequest{ImageRef: "alpine:latest", Name: "scoped-run"})
+		if err != nil {
+			t.Fatalf("PlanRunImage() error = %v", err)
+		}
+		service.Scope = newScope
+		_, err = service.ApplyRunImagePlan(context.Background(), plan.PlanID, "")
+		assertConflict(t, err)
+		if len(client.runImages) != 0 {
+			t.Fatalf("scope-mismatched plan ran images: %#v", client.runImages)
+		}
+	})
+}
+
+func TestDockerServicePushPlanRejectsRetargetedImageReference(t *testing.T) {
+	client := newFakeDockerClient()
+	service := &DockerService{
+		Client: client,
+		Scope:  runtimescope.Must("linux_native", "default"),
+	}
+
+	plan, err := service.PlanPushImage(context.Background(), "cairn/web:latest")
+	if err != nil {
+		t.Fatalf("PlanPushImage() error = %v", err)
+	}
+	client.image.ID = "sha256:replacement"
+
+	if _, err := service.ApplyPushImagePlan(context.Background(), plan.PlanID); !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("ApplyPushImagePlan(retargeted) error = %v, want %s", err, apperror.Conflict)
+	}
+	if len(client.pushed) != 0 {
+		t.Fatalf("retargeted plan pushed images: %#v", client.pushed)
+	}
+}
+
+func TestDockerServiceRunPlanRejectsRetargetedLocalImageReference(t *testing.T) {
+	client := newFakeDockerClient()
+	service := &DockerService{
+		Client: client,
+		Scope:  runtimescope.Must("linux_native", "default"),
+	}
+
+	plan, err := service.PlanRunImage(context.Background(), models.RunImageRequest{
+		ImageRef: "cairn/web:latest",
+		Name:     "reviewed-run",
+		Detach:   true,
+	})
+	if err != nil {
+		t.Fatalf("PlanRunImage() error = %v", err)
+	}
+	client.image.ID = "sha256:replacement"
+
+	if _, err := service.ApplyRunImagePlan(context.Background(), plan.PlanID, ""); !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("ApplyRunImagePlan(retargeted) error = %v, want %s", err, apperror.Conflict)
+	}
+	if len(client.runImages) != 0 {
+		t.Fatalf("retargeted plan ran images: %#v", client.runImages)
 	}
 }
 

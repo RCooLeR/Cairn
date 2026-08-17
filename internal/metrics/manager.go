@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -19,6 +20,11 @@ import (
 	"github.com/RCooLeR/Cairn/internal/store"
 	"github.com/docker/docker/api/types/container"
 	"github.com/google/uuid"
+)
+
+const (
+	maxDockerStatsResponseBytes int64 = 2 * 1024 * 1024
+	maxDockerStatsStreamBytes   int64 = 32 * 1024 * 1024
 )
 
 func NewManager(docker DockerClient, repo *store.MetricsRepository, projects *store.ProjectRepository, audit *store.AuditRepository, events bus.Bus, opts Options) *Manager {
@@ -91,9 +97,7 @@ func (m *Manager) StopAll() {
 		watcher.cancel()
 		watcher.closeActiveReader()
 	}
-	for _, watcher := range watchers {
-		waitForWatcher(watcher)
-	}
+	waitForWatchers(watchers, watcherStopTimeout)
 	m.wg.Wait()
 	_ = m.flush(context.Background())
 }
@@ -303,9 +307,7 @@ func (m *Manager) reconcileOnce(ctx context.Context) error {
 		delete(m.lastAccepted, id)
 	}
 	m.mu.Unlock()
-	for _, watcher := range stale {
-		waitForWatcher(watcher)
-	}
+	waitForWatchers(stale, watcherStopTimeout)
 	return nil
 }
 
@@ -381,7 +383,10 @@ func (m *Manager) streamContainer(ctx context.Context, watcher *containerWatcher
 		}
 	}()
 
-	decoder := json.NewDecoder(reader.Body)
+	// Docker stats streams are reopened by the watcher after EOF/error. A
+	// finite session cap bounds a malformed daemon response without changing
+	// normal long-running collection semantics.
+	decoder := json.NewDecoder(io.LimitReader(reader.Body, maxDockerStatsStreamBytes))
 	for ctx.Err() == nil {
 		var raw container.StatsResponse
 		if err := decoder.Decode(&raw); err != nil {
@@ -411,12 +416,34 @@ func (m *Manager) sampleOneShot(ctx context.Context, containerID string) error {
 			_ = reader.Body.Close()
 		}
 	}()
-	var raw container.StatsResponse
-	if err := json.NewDecoder(reader.Body).Decode(&raw); err != nil {
+	raw, err := decodeOneShotStats(reader.Body)
+	if err != nil {
 		return err
 	}
 	m.ingest(containerID, raw)
 	return nil
+}
+
+func decodeOneShotStats(body io.Reader) (container.StatsResponse, error) {
+	var raw container.StatsResponse
+	payload, err := io.ReadAll(io.LimitReader(body, maxDockerStatsResponseBytes+1))
+	if err != nil {
+		return raw, err
+	}
+	if int64(len(payload)) > maxDockerStatsResponseBytes {
+		return raw, errors.New("docker stats response exceeded the safe size limit")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	if err := decoder.Decode(&raw); err != nil {
+		return raw, err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("multiple JSON values")
+		}
+		return raw, err
+	}
+	return raw, nil
 }
 
 func (m *Manager) ingest(containerID string, raw container.StatsResponse) {
@@ -1055,11 +1082,19 @@ func (w *containerWatcher) closeActiveReader() {
 	}
 }
 
-func waitForWatcher(watcher *containerWatcher) bool {
-	if watcher == nil || watcher.done == nil {
-		return true
+func waitForWatchers(watchers []*containerWatcher, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	allStopped := true
+	for _, watcher := range watchers {
+		if watcher == nil || watcher.done == nil {
+			continue
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 || !waitForClosed(watcher.done, remaining) {
+			allStopped = false
+		}
 	}
-	return waitForClosed(watcher.done, watcherStopTimeout)
+	return allStopped
 }
 
 func (m *Manager) ensureReady() {

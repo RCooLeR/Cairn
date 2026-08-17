@@ -16,6 +16,7 @@ import (
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/security"
 )
 
@@ -414,6 +415,12 @@ func (p *WindowsWSLProvider) pruneExpiredInstallPlansLocked(now time.Time) {
 	}
 }
 
+func (p *WindowsWSLProvider) DiscardInstallPlan(planID string) {
+	p.installMu.Lock()
+	delete(p.installPlans, planID)
+	p.installMu.Unlock()
+}
+
 func (p *WindowsWSLProvider) Start(ctx context.Context) error {
 	_, err := p.runWSLAsRoot(ctx, p.configuredDistro(), "systemctl", "start", "docker")
 	return err
@@ -533,7 +540,11 @@ func (p *WindowsWSLProvider) BackendIdentity(context.Context) (string, error) {
 }
 
 func (p *WindowsWSLProvider) backendIdentity() string {
-	return "wsl:" + strings.ToLower(strings.TrimSpace(p.configuredDistro()))
+	identity, ok := runtimescope.WindowsWSLContextV1(p.configuredDistro())
+	if !ok {
+		return ""
+	}
+	return identity
 }
 
 func (p *WindowsWSLProvider) RunDocker(ctx context.Context, args ...string) (*CommandResult, error) {

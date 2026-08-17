@@ -4,10 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -52,6 +54,27 @@ func (r *nonCooperativeConfigRunner) RunCompose(context.Context, string, ...stri
 
 func (r *nonCooperativeConfigRunner) RunComposeEnv(ctx context.Context, workdir string, _ []string, args ...string) (*providers.CommandResult, error) {
 	return r.RunCompose(ctx, workdir, args...)
+}
+
+type gatedDockerInventory struct {
+	containers  []models.ContainerSummary
+	entered     chan struct{}
+	release     <-chan struct{}
+	enteredOnce sync.Once
+}
+
+func (i *gatedDockerInventory) ListContainers(ctx context.Context, _ models.ContainerListOptions) ([]models.ContainerSummary, error) {
+	if i.entered != nil {
+		i.enteredOnce.Do(func() { close(i.entered) })
+	}
+	if i.release != nil {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-i.release:
+		}
+	}
+	return append([]models.ContainerSummary(nil), i.containers...), nil
 }
 
 func TestProjectDetectorLabelsWinOverImported(t *testing.T) {
@@ -136,6 +159,239 @@ func TestProjectDetectorLabelsWinOverImported(t *testing.T) {
 	if len(services) != 1 || services[0].ID != "linux_native/demo/web" || services[0].ReplicasRunning != 1 {
 		t.Fatalf("services = %#v", services)
 	}
+}
+
+func TestProjectDetectorSerializesReconciliationsWithinRuntimeScope(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	db := openProjectTestStore(t)
+	scope := runtimescope.Must("linux_native", "default")
+	projectID := ProjectID(scope.ProviderID(), "ordered")
+	oldEntered := make(chan struct{})
+	oldRelease := make(chan struct{})
+	var releaseOldOnce sync.Once
+	releaseOld := func() {
+		releaseOldOnce.Do(func() { close(oldRelease) })
+	}
+	t.Cleanup(releaseOld)
+	newEntered := make(chan struct{})
+	oldAt := time.Date(2026, 7, 24, 13, 0, 0, 0, time.UTC)
+	newAt := oldAt.Add(time.Minute)
+	oldDetector := &ProjectDetector{
+		Scope: scope,
+		Docker: &gatedDockerInventory{
+			entered: oldEntered,
+			release: oldRelease,
+			containers: []models.ContainerSummary{{
+				ID:        "ordered-old",
+				ProjectID: projectID,
+				Service:   "web",
+				Image:     "example/web:old",
+				State:     "exited",
+				Status:    "Exited",
+			}},
+		},
+		Projects: db.Projects(),
+		Now:      func() time.Time { return oldAt },
+	}
+	newDetector := &ProjectDetector{
+		Scope: scope,
+		Docker: &gatedDockerInventory{
+			entered: newEntered,
+			containers: []models.ContainerSummary{{
+				ID:        "ordered-new",
+				ProjectID: projectID,
+				Service:   "web",
+				Image:     "example/web:new",
+				State:     "running",
+				Status:    "Up",
+				Health:    models.HealthStatusHealthy,
+			}},
+		},
+		Projects: db.Projects(),
+		Now:      func() time.Time { return newAt },
+	}
+
+	oldDone := make(chan error, 1)
+	go func() {
+		_, err := oldDetector.Reconcile(ctx)
+		oldDone <- err
+	}()
+	waitForDetectorSignal(t, oldEntered, "older reconciliation to enter inventory")
+
+	newAttempted := make(chan struct{})
+	newDone := make(chan error, 1)
+	go func() {
+		close(newAttempted)
+		_, err := newDetector.Reconcile(ctx)
+		newDone <- err
+	}()
+	waitForDetectorSignal(t, newAttempted, "newer reconciliation to start")
+	waitForProjectReconcileParticipants(t, scope, 2)
+	select {
+	case <-newEntered:
+		t.Fatal("newer same-scope reconciliation entered inventory before the older reconciliation completed")
+	default:
+	}
+
+	releaseOld()
+	if err := waitForDetectorResult(t, oldDone, "older reconciliation"); err != nil {
+		t.Fatalf("older Reconcile() error = %v", err)
+	}
+	if err := waitForDetectorResult(t, newDone, "newer reconciliation"); err != nil {
+		t.Fatalf("newer Reconcile() error = %v", err)
+	}
+
+	project, err := db.Projects().GetInScope(ctx, scope, projectID)
+	if err != nil {
+		t.Fatalf("GetInScope() error = %v", err)
+	}
+	if !project.LastSeenAt.Equal(newAt) || project.Status != models.ProjectStatusRunning {
+		t.Fatalf("final project = %#v, want newer running snapshot at %s", project, newAt)
+	}
+	services, err := db.Projects().ListServices(ctx, projectID)
+	if err != nil {
+		t.Fatalf("ListServices() error = %v", err)
+	}
+	if len(services) != 1 || services[0].ImageRef != "example/web:new" || services[0].ReplicasRunning != 1 {
+		t.Fatalf("final services = %#v, want newer snapshot", services)
+	}
+	waitForProjectReconcileParticipants(t, scope, 0)
+}
+
+func TestProjectDetectorAllowsDifferentRuntimeScopesToReconcileConcurrently(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	scopeA := runtimescope.Must("linux_native", "socket:a")
+	scopeB := runtimescope.Must("linux_native", "socket:b")
+	aEntered := make(chan struct{})
+	aRelease := make(chan struct{})
+	var releaseAOnce sync.Once
+	releaseA := func() {
+		releaseAOnce.Do(func() { close(aRelease) })
+	}
+	t.Cleanup(releaseA)
+	bEntered := make(chan struct{})
+	detectorA := &ProjectDetector{
+		Scope: scopeA,
+		Docker: &gatedDockerInventory{
+			entered: aEntered,
+			release: aRelease,
+			containers: []models.ContainerSummary{{
+				ID:        "scope-a",
+				ProjectID: ProjectID(scopeA.ProviderID(), "scope-a"),
+				Service:   "web",
+				State:     "running",
+			}},
+		},
+	}
+	detectorB := &ProjectDetector{
+		Scope: scopeB,
+		Docker: &gatedDockerInventory{
+			entered: bEntered,
+			containers: []models.ContainerSummary{{
+				ID:        "scope-b",
+				ProjectID: ProjectID(scopeB.ProviderID(), "scope-b"),
+				Service:   "web",
+				State:     "running",
+			}},
+		},
+	}
+
+	aDone := make(chan error, 1)
+	go func() {
+		_, err := detectorA.Reconcile(ctx)
+		aDone <- err
+	}()
+	waitForDetectorSignal(t, aEntered, "scope A reconciliation to enter inventory")
+
+	bDone := make(chan error, 1)
+	go func() {
+		_, err := detectorB.Reconcile(ctx)
+		bDone <- err
+	}()
+	waitForDetectorSignal(t, bEntered, "scope B reconciliation to enter while scope A is blocked")
+	if err := waitForDetectorResult(t, bDone, "scope B reconciliation"); err != nil {
+		t.Fatalf("scope B Reconcile() error = %v", err)
+	}
+
+	releaseA()
+	if err := waitForDetectorResult(t, aDone, "scope A reconciliation"); err != nil {
+		t.Fatalf("scope A Reconcile() error = %v", err)
+	}
+	waitForProjectReconcileParticipants(t, scopeA, 0)
+	waitForProjectReconcileParticipants(t, scopeB, 0)
+}
+
+func TestProjectDetectorCanceledQueuedReconcileReleasesScopeQueue(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	scope := runtimescope.Must("linux_native", "socket:cancel")
+	firstEntered := make(chan struct{})
+	firstRelease := make(chan struct{})
+	var releaseFirstOnce sync.Once
+	releaseFirst := func() {
+		releaseFirstOnce.Do(func() { close(firstRelease) })
+	}
+	t.Cleanup(releaseFirst)
+	first := &ProjectDetector{
+		Scope: scope,
+		Docker: &gatedDockerInventory{
+			entered: firstEntered,
+			release: firstRelease,
+		},
+	}
+	canceledEntered := make(chan struct{})
+	canceled := &ProjectDetector{
+		Scope:  scope,
+		Docker: &gatedDockerInventory{entered: canceledEntered},
+	}
+	nextEntered := make(chan struct{})
+	next := &ProjectDetector{
+		Scope:  scope,
+		Docker: &gatedDockerInventory{entered: nextEntered},
+	}
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := first.Reconcile(ctx)
+		firstDone <- err
+	}()
+	waitForDetectorSignal(t, firstEntered, "first reconciliation to enter inventory")
+
+	canceledCtx, cancelQueued := context.WithCancel(ctx)
+	canceledDone := make(chan error, 1)
+	go func() {
+		_, err := canceled.Reconcile(canceledCtx)
+		canceledDone <- err
+	}()
+	waitForProjectReconcileParticipants(t, scope, 2)
+	cancelQueued()
+	if err := waitForDetectorResult(t, canceledDone, "canceled queued reconciliation"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled Reconcile() error = %v, want context.Canceled", err)
+	}
+	select {
+	case <-canceledEntered:
+		t.Fatal("canceled queued reconciliation entered inventory")
+	default:
+	}
+	waitForProjectReconcileParticipants(t, scope, 1)
+
+	nextDone := make(chan error, 1)
+	go func() {
+		_, err := next.Reconcile(ctx)
+		nextDone <- err
+	}()
+	waitForProjectReconcileParticipants(t, scope, 2)
+	releaseFirst()
+	if err := waitForDetectorResult(t, firstDone, "first reconciliation"); err != nil {
+		t.Fatalf("first Reconcile() error = %v", err)
+	}
+	waitForDetectorSignal(t, nextEntered, "next reconciliation after canceled waiter")
+	if err := waitForDetectorResult(t, nextDone, "next reconciliation"); err != nil {
+		t.Fatalf("next Reconcile() error = %v", err)
+	}
+	waitForProjectReconcileParticipants(t, scope, 0)
 }
 
 func TestProjectDetectorRejectsOversizedComposeInputBeforeRunner(t *testing.T) {
@@ -698,6 +954,54 @@ func TestSamePathHonorsPlatformCaseSensitivity(t *testing.T) {
 	}
 	if samePathForOS(`/tmp/App`, `/tmp/app`, "linux") {
 		t.Fatalf("linux paths should compare case-sensitively")
+	}
+}
+
+func waitForDetectorSignal(t *testing.T, signal <-chan struct{}, description string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %s", description)
+	}
+}
+
+func waitForDetectorResult(t *testing.T, result <-chan error, description string) error {
+	t.Helper()
+	select {
+	case err := <-result:
+		return err
+	case <-time.After(2 * time.Second):
+		t.Fatalf("timed out waiting for %s", description)
+		return nil
+	}
+}
+
+func waitForProjectReconcileParticipants(t *testing.T, scope runtimescope.Scope, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		key := projectReconcileScopeKey{
+			providerID:  scope.ProviderID(),
+			contextName: scope.ContextName(),
+		}
+		projectReconcileScopes.mu.Lock()
+		gate := projectReconcileScopes.gates[key]
+		got := 0
+		if gate != nil {
+			if gate.active {
+				got++
+			}
+			got += len(gate.waiters)
+		}
+		projectReconcileScopes.mu.Unlock()
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("runtime scope reconcile participants = %d, want %d", got, want)
+		}
+		runtime.Gosched()
 	}
 }
 

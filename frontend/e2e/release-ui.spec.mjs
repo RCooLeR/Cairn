@@ -32,6 +32,24 @@ const goldenDir = path.join(
   "release-ui",
   `chromium-${visualPlatform}-light`,
 );
+const uncaughtRuntimeErrors = new WeakMap();
+
+test.beforeEach(async ({ page }) => {
+  const errors = [];
+  uncaughtRuntimeErrors.set(page, errors);
+  page.on("pageerror", (error) => {
+    errors.push(error.stack || error.message);
+  });
+});
+
+test.afterEach(async ({ page }) => {
+  // Flush errors raised by microtasks scheduled during the final assertion.
+  await page.waitForTimeout(0);
+  expect(
+    uncaughtRuntimeErrors.get(page) ?? [],
+    "production bundle emitted an uncaught page error",
+  ).toEqual([]);
+});
 
 test.describe("release UI validation", () => {
   test.beforeEach(async ({ page }) => {
@@ -41,6 +59,12 @@ test.describe("release UI validation", () => {
     await expect(
       page.getByRole("heading", { name: "Overview", level: 1 }),
     ).toBeVisible();
+  });
+
+  test("production bundle boots without an uncaught runtime error", async ({
+    page,
+  }) => {
+    await expect(page.locator("#root")).not.toBeEmpty();
   });
 
   for (const route of routes) {

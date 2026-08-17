@@ -17,8 +17,9 @@ import (
 )
 
 const (
-	detectBudget    = 5 * time.Second
-	wslDetectBudget = 30 * time.Second
+	detectBudget           = 5 * time.Second
+	wslDetectBudget        = 30 * time.Second
+	maxPendingInstallPlans = 64
 )
 
 type Manager struct {
@@ -42,6 +43,11 @@ type installPlanRecord struct {
 	steps      int
 	command    string
 	risk       models.Risk
+	expiresAt  time.Time
+}
+
+type installPlanDiscarder interface {
+	DiscardInstallPlan(string)
 }
 
 type distroConfigurable interface {
@@ -360,12 +366,24 @@ func (m *Manager) PlanInstall(ctx context.Context, providerID string, opts model
 		return nil, err
 	}
 	if plan != nil {
+		now := m.now()
 		m.mu.Lock()
+		m.pruneExpiredInstallPlansLocked(now)
+		if len(m.installPlans) >= maxPendingInstallPlans {
+			m.mu.Unlock()
+			discardInstallPlan(provider, plan.PlanID)
+			return nil, apperror.New(
+				apperror.Conflict,
+				"Too many pending install plans",
+				apperror.WithRepairHints("Wait for an active installation to finish or create a new plan after an older plan expires."),
+			)
+		}
 		m.installPlans[plan.PlanID] = installPlanRecord{
 			providerID: providerID,
 			steps:      len(plan.Commands),
 			command:    plannedCommandText(plan),
 			risk:       plan.Risk,
+			expiresAt:  plan.ExpiresAt,
 		}
 		m.mu.Unlock()
 	}
@@ -373,9 +391,10 @@ func (m *Manager) PlanInstall(ctx context.Context, providerID string, opts model
 }
 
 func (m *Manager) InstallPlanAuditContext(planID string) (string, string, models.Risk) {
-	m.mu.RLock()
+	m.mu.Lock()
+	m.pruneExpiredInstallPlansLocked(m.now())
 	record, ok := m.installPlans[planID]
-	m.mu.RUnlock()
+	m.mu.Unlock()
 	if !ok {
 		return "", "", ""
 	}
@@ -387,7 +406,14 @@ func (m *Manager) ApplyInstall(ctx context.Context, planID string, progress chan
 		return err
 	}
 	m.mu.Lock()
+	m.pruneExpiredInstallPlansLocked(m.now())
 	record, ok := m.installPlans[planID]
+	if ok {
+		// An approved install plan is a single-use capability. Claim it before
+		// executing any external command so a replay or concurrent caller cannot
+		// run the same privileged sequence twice.
+		delete(m.installPlans, planID)
+	}
 	m.mu.Unlock()
 	if !ok {
 		return apperror.New(apperror.PlanExpired, "Install plan expired or was not found")
@@ -396,16 +422,28 @@ func (m *Manager) ApplyInstall(ctx context.Context, planID string, progress chan
 	if !ok {
 		return apperror.New(apperror.NotFound, "Provider was not found")
 	}
+	defer discardInstallPlan(provider, planID)
 	m.applyProviderSettings(ctx, provider)
 	for step := range record.steps {
 		if err := provider.ExecuteInstallStep(ctx, planID, step, progress); err != nil {
 			return err
 		}
 	}
-	m.mu.Lock()
-	delete(m.installPlans, planID)
-	m.mu.Unlock()
 	return nil
+}
+
+func (m *Manager) pruneExpiredInstallPlansLocked(now time.Time) {
+	for planID, record := range m.installPlans {
+		if !record.expiresAt.IsZero() && !now.Before(record.expiresAt) {
+			delete(m.installPlans, planID)
+		}
+	}
+}
+
+func discardInstallPlan(provider PlatformProvider, planID string) {
+	if discarder, ok := provider.(installPlanDiscarder); ok {
+		discarder.DiscardInstallPlan(planID)
+	}
 }
 
 func (m *Manager) Start(ctx context.Context, providerID string) error {

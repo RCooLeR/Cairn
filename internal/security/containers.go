@@ -9,6 +9,7 @@ import (
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 )
 
 const (
@@ -27,6 +28,7 @@ type ContainerPlan struct {
 	IDs            []string
 	TimeoutSeconds int
 	RemoveOptions  models.RemoveContainerOptions
+	Scope          runtimescope.Scope `json:"-"`
 }
 
 type PlanStore struct {

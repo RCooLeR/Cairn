@@ -47,6 +47,7 @@ const runtimeMock = vi.hoisted(() => {
 const xtermMock = vi.hoisted(() => ({
   dataHandlers: [] as Array<(data: string) => void>,
   selection: "",
+  writes: [] as Uint8Array[],
 }));
 
 vi.mock("../../api/services", () => ({
@@ -71,7 +72,7 @@ vi.mock("@xterm/xterm", () => ({
     getSelection = vi.fn(() => xtermMock.selection);
     open = vi.fn();
     resize = vi.fn();
-    write = vi.fn();
+    write = vi.fn((data: Uint8Array) => xtermMock.writes.push(data));
     onData = vi.fn((callback: (data: string) => void) => {
       xtermMock.dataHandlers.push(callback);
       return { dispose: vi.fn() };
@@ -96,6 +97,7 @@ describe("TerminalPage operation and session lifecycle", () => {
     runtimeMock.listeners.clear();
     xtermMock.dataHandlers.length = 0;
     xtermMock.selection = "";
+    xtermMock.writes.length = 0;
     runtimeMock.clipboardText.mockResolvedValue("");
     runtimeMock.setClipboardText.mockResolvedValue(undefined);
     settingsServiceMock.GetCheatsheet.mockResolvedValue([]);
@@ -147,6 +149,79 @@ describe("TerminalPage operation and session lifecycle", () => {
     for (const key of ["ArrowLeft", "ArrowRight", "Home", "End"]) {
       pressTerminalTabKey(key, "Alpha");
     }
+  });
+
+  it("preserves a session opened while the initial session list is pending", async () => {
+    const pendingSessions = deferred<TerminalSessionInfo[]>();
+    const initialSession = terminalSession({
+      id: "new-session",
+      title: "New session",
+    });
+    terminalServiceMock.ListTerminalSessions.mockReturnValue(
+      pendingSessions.promise,
+    );
+
+    renderTerminalPage({ initialSession });
+    expect(
+      await screen.findByRole("tab", {
+        name: "New session",
+        selected: true,
+      }),
+    ).toBeInTheDocument();
+
+    await act(async () => {
+      pendingSessions.resolve([
+        terminalSession({ id: "older-session", title: "Older session" }),
+      ]);
+      await pendingSessions.promise;
+    });
+
+    expect(
+      screen.getByRole("tab", { name: "New session", selected: true }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("tab", { name: "Older session" }),
+    ).toBeInTheDocument();
+  });
+
+  it("closes a terminal whose open request resolves after navigation", async () => {
+    const pendingOpen = deferred<TerminalSessionInfo | null>();
+    const lateSession = terminalSession({
+      id: "late-host",
+      title: "Late host",
+    });
+    terminalServiceMock.OpenHostTerminal.mockReturnValueOnce(
+      pendingOpen.promise,
+    );
+
+    const firstView = renderTerminalPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Host" }));
+    await waitFor(() =>
+      expect(terminalServiceMock.OpenHostTerminal).toHaveBeenCalledWith({
+        cols: 120,
+        rows: 30,
+      }),
+    );
+    firstView.unmount();
+
+    renderTerminalPage();
+    await waitFor(() =>
+      expect(terminalServiceMock.ListTerminalSessions).toHaveBeenCalledTimes(2),
+    );
+    expect(screen.queryByRole("tab", { name: "Late host" })).toBeNull();
+
+    await act(async () => {
+      pendingOpen.resolve(lateSession);
+      await pendingOpen.promise;
+      await Promise.resolve();
+    });
+
+    await waitFor(() =>
+      expect(terminalServiceMock.CloseTerminal).toHaveBeenCalledWith(
+        "late-host",
+      ),
+    );
+    expect(screen.queryByRole("tab", { name: "Late host" })).toBeNull();
   });
 
   it("restores tab focus after closing non-active and active sessions", async () => {
@@ -437,6 +512,45 @@ describe("TerminalPage operation and session lifecycle", () => {
     expect(
       screen.queryByRole("tab", { name: "Bravo" }),
     ).not.toBeInTheDocument();
+  });
+
+  it("rejects malformed and oversized terminal output and close events", async () => {
+    terminalServiceMock.ListTerminalSessions.mockResolvedValue([
+      terminalSession({ id: "alpha", title: "Alpha" }),
+    ]);
+
+    renderTerminalPage();
+    expect(
+      await screen.findByRole("tab", { name: "Alpha", selected: true }),
+    ).toBeInTheDocument();
+
+    act(() => {
+      emit("terminal:data", {
+        dataBase64: btoa("accepted output"),
+        sessionID: "alpha",
+      });
+      emit("terminal:data", {
+        dataBase64: "%%%%",
+        sessionID: "alpha",
+      });
+      emit("terminal:data", {
+        dataBase64: "A".repeat(1024 * 1024 + 4),
+        sessionID: "alpha",
+      });
+      emit("terminal:closed", {
+        exitCode: 99,
+        sessionID: "x".repeat(4097),
+      });
+    });
+
+    expect(xtermMock.writes).toHaveLength(1);
+    expect(new TextDecoder().decode(xtermMock.writes[0])).toBe(
+      "accepted output",
+    );
+    expect(
+      screen.getByRole("tab", { name: "Alpha", selected: true }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Session exited with code 99")).toBeNull();
   });
 });
 

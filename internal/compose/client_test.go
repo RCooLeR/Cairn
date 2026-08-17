@@ -83,6 +83,84 @@ func TestClientMapsHostProjectPathsBeforeComposeRun(t *testing.T) {
 	}
 }
 
+func TestComposeProjectPathsFailClosedBeforeEveryOrdinaryCommand(t *testing.T) {
+	t.Parallel()
+
+	pathCases := map[string]ProjectOptions{
+		"workdir": {
+			Workdir: `E:\Development\project`,
+		},
+		"project directory": {
+			ProjectDirectory: `E:\Development\project-source`,
+		},
+		"compose file": {
+			Files: []string{`E:\Development\project\compose.yaml`},
+		},
+		"interpolation env file": {
+			InterpolationEnvFiles: []string{`E:\Development\project\.env`},
+		},
+	}
+	commands := map[string]func(context.Context, *Client, ProjectOptions) error{
+		"ps": func(ctx context.Context, client *Client, opts ProjectOptions) error {
+			_, err := client.Ps(ctx, opts)
+			return err
+		},
+		"config": func(ctx context.Context, client *Client, opts ProjectOptions) error {
+			_, err := client.Config(ctx, opts)
+			return err
+		},
+		"start": func(ctx context.Context, client *Client, opts ProjectOptions) error {
+			_, err := client.Start(ctx, opts)
+			return err
+		},
+		"stop": func(ctx context.Context, client *Client, opts ProjectOptions) error {
+			_, err := client.Stop(ctx, opts)
+			return err
+		},
+		"restart": func(ctx context.Context, client *Client, opts ProjectOptions) error {
+			_, err := client.Restart(ctx, opts)
+			return err
+		},
+		"pull": func(ctx context.Context, client *Client, opts ProjectOptions) error {
+			_, err := client.Pull(ctx, opts)
+			return err
+		},
+		"build": func(ctx context.Context, client *Client, opts ProjectOptions) error {
+			_, err := client.Build(ctx, opts, BuildOptions{})
+			return err
+		},
+		"up": func(ctx context.Context, client *Client, opts ProjectOptions) error {
+			_, err := client.Up(ctx, opts, false)
+			return err
+		},
+		"scale": func(ctx context.Context, client *Client, opts ProjectOptions) error {
+			_, err := client.ScaleService(ctx, opts, "web", 2)
+			return err
+		},
+		"down": func(ctx context.Context, client *Client, opts ProjectOptions) error {
+			_, err := client.Down(ctx, opts, false)
+			return err
+		},
+	}
+
+	for pathName, opts := range pathCases {
+		for commandName, command := range commands {
+			t.Run(pathName+"/"+commandName, func(t *testing.T) {
+				runner := newFakeRunner()
+				runner.mapBackendErr = errors.New("mapping failed for a private host path")
+
+				err := command(context.Background(), NewClient(runner), opts)
+				if !apperror.IsCode(err, apperror.ProviderNotReady) {
+					t.Fatalf("%s(%s) error = %v, want ProviderNotReady", commandName, pathName, err)
+				}
+				if len(runner.calls) != 0 {
+					t.Fatalf("%s(%s) invoked Compose after path mapping failed: %#v", commandName, pathName, runner.calls)
+				}
+			})
+		}
+	}
+}
+
 func TestConfigVerifiedFailsClosedWhenBackendPathMappingFails(t *testing.T) {
 	root := t.TempDir()
 	composePath := filepath.Join(root, "compose.yaml")

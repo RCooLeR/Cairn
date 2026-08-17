@@ -144,6 +144,7 @@ import {
   CardHeader,
   DataTable,
   EmptyState,
+  LiveMessage,
   Modal,
   Skeleton,
   StatusDot,
@@ -167,7 +168,6 @@ import {
   TerminalPage,
   type TerminalCommandRequest,
 } from "./components/terminal/TerminalPage";
-import { AgentPage } from "./agent/AgentPage";
 import { useAppStore } from "./state/appStore";
 import { useInventoryStore } from "./state/inventoryStore";
 import {
@@ -216,6 +216,11 @@ import type { NavItem, PageID } from "./types/navigation";
 const logoUrl = "/cairn-logo.png";
 const iconUrl = "/cairn-icon.png";
 const MonacoEditor = lazy(() => import("@monaco-editor/react"));
+const AgentPage = lazy(() =>
+  import("./agent/AgentPage").then((module) => ({
+    default: module.AgentPage,
+  })),
+);
 
 type AppUpdateNotice = {
   version: string;
@@ -249,29 +254,16 @@ type ProjectTabID =
   | "compose"
   | "backups";
 type ContainerDrilldownTabID =
-  | "overview"
-  | "logs"
-  | "files"
-  | "terminal"
-  | "inspect";
+  "overview" | "logs" | "files" | "terminal" | "inspect";
 type NetworkTabID = "overview" | "containers" | "labels" | "raw";
 type ComposeServiceRow = NonNullable<ProjectDetail["services"]>[number];
 type LogScope = "all" | "project" | "service" | "container";
 type LogLevelFilter = "error" | "warn" | "info" | "debug" | "log" | "unknown";
 type SetupStepID =
-  | "welcome"
-  | "backend"
-  | "checks"
-  | "install"
-  | "verify"
-  | "projects"
-  | "done";
+  "welcome" | "backend" | "checks" | "install" | "verify" | "projects" | "done";
 type SetupPlatformID = "windows" | "linux" | "macos";
 type SetupBackendID =
-  | "windows_wsl_ubuntu"
-  | "linux_native"
-  | "macos_colima"
-  | "existing_context";
+  "windows_wsl_ubuntu" | "linux_native" | "macos_colima" | "existing_context";
 
 type InspectState = {
   open: boolean;
@@ -322,6 +314,7 @@ type ScopedRequestOwner = {
 
 type UpdateCheckOperation = ScopedRequestOwner & {
   jobID?: string;
+  cancelLaunch?: (cause?: unknown) => PromiseLike<void> | void;
 };
 
 type BufferedProjectJobEvent = {
@@ -341,6 +334,7 @@ export const activeJobOwnershipLimit = 128;
 const pendingJobTTLMS = 5 * 60 * 1000;
 export const jobTombstoneLimit = 512;
 export const jobTombstoneTTLMS = 30 * 60 * 1000;
+export const updateCheckWatchdogMS = 15 * 60 * 1000;
 
 // Backend job IDs are cryptographically random. Retaining a bounded TTL/LRU
 // tombstone window fails closed for delayed events and accidental ID reuse
@@ -824,11 +818,13 @@ type ExportLogsRequestOwner = {
 
 type LogLinesPayload = {
   streamID: string;
+  clientToken?: string;
   lines?: LogLine[];
 };
 
 type LogErrorPayload = {
   streamID: string;
+  clientToken?: string;
   error?: string;
 };
 
@@ -865,7 +861,7 @@ type StatsSample = {
   memoryLimitBytes?: number;
   networkRxRate: number;
   networkTxRate: number;
-  sampledAt: unknown;
+  sampledAt: string;
 };
 
 type StatsSamplePayload = {
@@ -1441,6 +1437,7 @@ function App() {
   );
 
   const [activePage, setActivePage] = useState<PageID>("overview");
+  const [terminalMounted, setTerminalMounted] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
     return window.localStorage.getItem("cairn.sidebar.collapsed") === "true";
   });
@@ -1449,6 +1446,8 @@ function App() {
     useState<SettingsSectionID>("providers");
   const [search, setSearch] = useState("");
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const pageHeadingRef = useRef<HTMLHeadingElement>(null);
+  const terminalWrapperRef = useRef<HTMLDivElement>(null);
   const dockerScopeGenerationRef = useRef(0);
   const volumeEpochRef = useRef(volumeEpoch);
   volumeEpochRef.current = volumeEpoch;
@@ -1580,6 +1579,7 @@ function App() {
   const [updateCheckProgress, setUpdateCheckProgress] =
     useState<UpdateProgressEntry | null>(null);
   const updateCheckCompletionTimerRef = useRef<number | null>(null);
+  const updateCheckWatchdogTimerRef = useRef<number | null>(null);
   const [updatePlan, setUpdatePlan] =
     useState<UpdatePlanState>(emptyUpdatePlan);
   const updatePlanRequestGenerationRef = useRef(0);
@@ -1591,6 +1591,9 @@ function App() {
   >({});
   const [projectLineageStatus, setProjectLineageStatus] = useState<
     Record<string, LoadStatus>
+  >({});
+  const [projectLineageError, setProjectLineageError] = useState<
+    Record<string, string | null>
   >({});
   const projectLineageRequestGenerationsRef = useRef(new Map<string, number>());
   const projectJobScopesRef = useRef(new Map<string, number>());
@@ -1661,6 +1664,15 @@ function App() {
   const [selectedContainerIDs, setSelectedContainerIDs] = useState(
     () => new Set<string>(),
   );
+  const eligibleContainerSelectionIDs = useMemo(
+    () =>
+      new Set(
+        filterContainers(containers, search, containerFilter).map(
+          (container) => container.id,
+        ),
+      ),
+    [containerFilter, containers, search],
+  );
   const [busyActionIDs, setBusyActionIDs] = useState(() => new Set<string>());
   const [terminalInitialSession, setTerminalInitialSession] =
     useState<TerminalSessionInfo | null>(null);
@@ -1687,10 +1699,29 @@ function App() {
     setProjectLineageStatus((current) =>
       reconcileProjectLineageRecords(current, projects),
     );
+    setProjectLineageError((current) =>
+      reconcileProjectLineageRecords(current, projects),
+    );
     setProjectCommandOutputs((current) =>
       reconcileProjectCommandOutputs(current, projects),
     );
   }, [projects]);
+
+  useEffect(() => {
+    setSelectedContainerIDs((current) => {
+      if (
+        current.size === 0 ||
+        Array.from(current).every((id) => eligibleContainerSelectionIDs.has(id))
+      ) {
+        return current;
+      }
+      return new Set(
+        Array.from(current).filter((id) =>
+          eligibleContainerSelectionIDs.has(id),
+        ),
+      );
+    });
+  }, [eligibleContainerSelectionIDs]);
 
   const [providerActionBusy, setProviderActionBusy] = useState(false);
   const [repairOpen, setRepairOpen] = useState(false);
@@ -1720,7 +1751,7 @@ function App() {
     settingsSavePendingCount > 0 || settingsAuxPendingCount > 0;
   const [settingsMessage, setSettingsMessage] = useState<string | null>(null);
   const [settingsError, setSettingsError] = useState<string | null>(null);
-  const { pushToast, toasts } = useToastQueue();
+  const { dismissToast, pushToast, toasts } = useToastQueue();
   const onClipboardFeedback = useCallback(
     (feedback: ClipboardFeedback) => pushToast(feedback),
     [pushToast],
@@ -1741,6 +1772,18 @@ function App() {
     settingsStatus === "ready" ||
     settingsStatus === "refreshing" ||
     settingsStatus === "stale";
+  const registryCredentialMode = normalizeStringSetting(
+    appSettings["registry.credentials_mode"],
+    "",
+  );
+  const registryLoginDisabledReason = !settingsLoaded
+    ? "Wait for registry credential settings to load before logging in from Cairn."
+    : registryCredentialMode === "none"
+      ? "Switch Credential mode to Require Docker credential helper before logging in from Cairn."
+      : registryCredentialMode !== "docker_helper"
+        ? "Set Credential mode to Require Docker credential helper before logging in from Cairn."
+        : undefined;
+  const registryLoginDisabled = Boolean(registryLoginDisabledReason);
   const [auditEntries, setAuditEntries] = useState<AuditEntry[]>([]);
   const [auditLoading, setAuditLoading] = useState(false);
   const [auditError, setAuditError] = useState<string | null>(null);
@@ -1976,6 +2019,13 @@ function App() {
     setActiveNetworkID(networkID);
   }, []);
 
+  const clearUpdateCheckWatchdog = useCallback(() => {
+    if (updateCheckWatchdogTimerRef.current !== null) {
+      window.clearTimeout(updateCheckWatchdogTimerRef.current);
+      updateCheckWatchdogTimerRef.current = null;
+    }
+  }, []);
+
   const refreshInventoryScope = useCallback(
     (options: { preserveProviderSetup?: boolean } = {}) => {
       // Reject any late event from the old metrics stream before scoped Docker
@@ -1997,7 +2047,24 @@ function App() {
       updatePlanRequestGenerationRef.current += 1;
       ignoreUpdateRequestGenerationRef.current += 1;
       updateCheckRequestGenerationRef.current += 1;
+      const activeUpdateCheck = updateCheckOperationRef.current;
       updateCheckOperationRef.current = null;
+      clearUpdateCheckWatchdog();
+      if (activeUpdateCheck?.jobID) {
+        void UpdateService.CancelJob(activeUpdateCheck.jobID).catch(
+          () => undefined,
+        );
+      } else if (activeUpdateCheck?.cancelLaunch) {
+        try {
+          void Promise.resolve(
+            activeUpdateCheck.cancelLaunch(
+              "Docker provider scope changed during update check",
+            ),
+          ).catch(() => undefined);
+        } catch {
+          // The generation and ownership guards still reject a late result.
+        }
+      }
       for (const jobID of updateCheckJobScopesRef.current.keys()) {
         invalidatedUpdateCheckJobIDsRef.current.add(jobID);
       }
@@ -2060,6 +2127,7 @@ function App() {
       setIgnoreUpdate(emptyIgnoreUpdate);
       setProjectLineage({});
       setProjectLineageStatus({});
+      setProjectLineageError({});
       beginImportProjectSession();
       setInspect(emptyInspect);
       setActiveContainerID(null);
@@ -2110,6 +2178,7 @@ function App() {
     },
     [
       beginImportProjectSession,
+      clearUpdateCheckWatchdog,
       refreshInventoryScopeStore,
       updateActiveNetworkID,
     ],
@@ -2118,6 +2187,9 @@ function App() {
   const navigate = useCallback(
     (page: PageID) => {
       setActionError(null);
+      if (page === "terminal") {
+        setTerminalMounted(true);
+      }
       setActivePage(page);
       setActiveContainerID(null);
       setContainerDetailTab("overview");
@@ -2127,6 +2199,23 @@ function App() {
     },
     [updateActiveNetworkID],
   );
+
+  useEffect(() => {
+    if (activePage === "terminal") {
+      return undefined;
+    }
+    const focusTimer = window.setTimeout(() => {
+      const terminalWrapper = terminalWrapperRef.current;
+      if (
+        terminalWrapper &&
+        document.activeElement instanceof HTMLElement &&
+        terminalWrapper.contains(document.activeElement)
+      ) {
+        pageHeadingRef.current?.focus({ preventScroll: true });
+      }
+    }, 0);
+    return () => window.clearTimeout(focusTimer);
+  }, [activePage]);
 
   useEffect(() => {
     window.localStorage.setItem(
@@ -2172,6 +2261,9 @@ function App() {
     const onKeyDown = (event: KeyboardEvent) => {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
         event.preventDefault();
+        if (hasOpenModalDialog()) {
+          return;
+        }
         setPaletteOpen(true);
         return;
       }
@@ -2180,6 +2272,7 @@ function App() {
         !event.ctrlKey &&
         !event.metaKey &&
         !event.altKey &&
+        !hasOpenModalDialog() &&
         !isEditableElement(event.target)
       ) {
         event.preventDefault();
@@ -2453,6 +2546,9 @@ function App() {
     setProjectLineageStatus((current) =>
       upsertBoundedProjectLineageRecord(current, projectID, "loading"),
     );
+    setProjectLineageError((current) =>
+      upsertBoundedProjectLineageRecord(current, projectID, null),
+    );
     try {
       const rows = await ImageLineageService.GetProjectLineage(projectID);
       if (
@@ -2468,7 +2564,7 @@ function App() {
       setProjectLineageStatus((current) =>
         upsertBoundedProjectLineageRecord(current, projectID, "ready"),
       );
-    } catch {
+    } catch (error: unknown) {
       if (
         dockerScopeGenerationRef.current !== scopeGeneration ||
         projectLineageRequestGenerationsRef.current.get(projectID) !==
@@ -2476,8 +2572,14 @@ function App() {
       ) {
         return;
       }
-      setProjectLineage((current) =>
-        upsertBoundedProjectLineageRecord(current, projectID, []),
+      setProjectLineageError((current) =>
+        upsertBoundedProjectLineageRecord(
+          current,
+          projectID,
+          error instanceof Error
+            ? error.message
+            : "Unable to refresh project image lineage",
+        ),
       );
       setProjectLineageStatus((current) =>
         upsertBoundedProjectLineageRecord(current, projectID, "error"),
@@ -2601,9 +2703,9 @@ function App() {
 
   useEffect(() => {
     const off = Events.On("provider:install:progress", (event) => {
-      const payload = eventPayload<ProviderInstallProgressPayload>(event);
+      const payload = eventPayload<unknown>(event);
       const session = providerInstallSessionRef.current;
-      if (!payload || !session) {
+      if (!isProviderInstallProgressPayload(payload) || !session) {
         return;
       }
       const setupIdentity = providerSetupIdentityRef.current;
@@ -2649,7 +2751,11 @@ function App() {
           installStreamID: payload.streamID || current.installStreamID,
           step: payload.done && !payload.error ? "verify" : current.step,
           installing: !payload.done,
-          error: current.error,
+          plan: payload.done && payload.error ? null : current.plan,
+          error:
+            payload.done && payload.error
+              ? "Install failed. Review the details above, then go Back and create a new plan before retrying."
+              : current.error,
           progress: alreadyRecorded
             ? current.progress
             : appendBoundedEntry(
@@ -2845,8 +2951,8 @@ function App() {
   useEffect(() => {
     const off = Events.On("notification", (event) => {
       notificationReadGenerationRef.current += 1;
-      const notification = eventPayload<Notification>(event);
-      if (!notification?.id) {
+      const notification = eventPayload<unknown>(event);
+      if (!isNotificationPayload(notification)) {
         scheduleNotificationEventRefresh();
         return;
       }
@@ -3192,8 +3298,15 @@ function App() {
   const refreshRuntimeSurfacesForObjects = useCallback(
     (event: unknown) => {
       const payload = eventPayload<ObjectsChangedEventPayload>(event);
-      const kind = payload?.kind?.trim().toLowerCase();
-      const ids = Array.isArray(payload?.ids) ? payload.ids : [];
+      const rawKind = typeof payload?.kind === "string" ? payload.kind : "";
+      const kind =
+        rawKind.length <= maxRuntimeObjectKindLength
+          ? rawKind.trim().toLowerCase()
+          : "";
+      const ids = Array.isArray(payload?.ids)
+        ? payload.ids.slice(0, maxRuntimeObjectIDs)
+        : [];
+      const objectIDs = ids.filter(isNonEmptyString);
       if (!kind) {
         refreshRuntimeSurfaces();
         return;
@@ -3228,7 +3341,7 @@ function App() {
           void refreshUpdateSurfaces();
           if (
             activeProjectID &&
-            (ids.length === 0 || ids.includes(activeProjectID))
+            (objectIDs.length === 0 || objectIDs.includes(activeProjectID))
           ) {
             void refreshProjectDetail(activeProjectID);
             void refreshProjectLineage(activeProjectID);
@@ -3326,6 +3439,7 @@ function App() {
         typeof payload.total === "number" &&
         payload.done >= payload.total
       ) {
+        clearUpdateCheckWatchdog();
         const completedJobID = payload.jobID;
         updateCheckOperationRef.current = null;
         updateCheckJobScopesRef.current.delete(completedJobID);
@@ -3341,7 +3455,7 @@ function App() {
         void refreshUpdateSurfaces();
       }
     },
-    [refreshUpdateSurfaces],
+    [clearUpdateCheckWatchdog, refreshUpdateSurfaces],
   );
 
   const registerUpdateCheckJobOwnership = useCallback(
@@ -3495,9 +3609,9 @@ function App() {
 
   useEffect(() => {
     const offCheck = Events.On("updates:check:progress", (event) => {
-      const payload = eventPayload<UpdateCheckProgressPayload>(event);
+      const payload = eventPayload<unknown>(event);
       if (
-        !payload?.jobID ||
+        !isUpdateCheckProgressPayload(payload) ||
         invalidatedUpdateCheckJobIDsRef.current.has(payload.jobID)
       ) {
         return;
@@ -3525,8 +3639,8 @@ function App() {
       }
     });
     const offJobProgress = Events.On("job:progress", (event) => {
-      const payload = eventPayload<ProjectJobEvent>(event);
-      if (!payload?.jobID) {
+      const payload = eventPayload<unknown>(event);
+      if (!isProjectJobEvent(payload)) {
         return;
       }
       if (invalidatedProjectJobIDsRef.current.has(payload.jobID)) {
@@ -3548,8 +3662,8 @@ function App() {
       applyOwnedProjectJobEvent(payload, false);
     });
     const offJobDone = Events.On("job:done", (event) => {
-      const payload = eventPayload<ProjectJobEvent>(event);
-      if (!payload?.jobID) {
+      const payload = eventPayload<unknown>(event);
+      if (!isProjectJobEvent(payload)) {
         return;
       }
       if (invalidatedProjectJobIDsRef.current.has(payload.jobID)) {
@@ -3590,12 +3704,30 @@ function App() {
 
   useEffect(
     () => () => {
+      const activeUpdateCheck = updateCheckOperationRef.current;
+      updateCheckOperationRef.current = null;
+      clearUpdateCheckWatchdog();
+      if (activeUpdateCheck?.jobID) {
+        void UpdateService.CancelJob(activeUpdateCheck.jobID).catch(
+          () => undefined,
+        );
+      } else if (activeUpdateCheck?.cancelLaunch) {
+        try {
+          void Promise.resolve(
+            activeUpdateCheck.cancelLaunch(
+              "Cairn view closed during update check",
+            ),
+          ).catch(() => undefined);
+        } catch {
+          // Cancellation is best effort during teardown.
+        }
+      }
       if (updateCheckCompletionTimerRef.current !== null) {
         window.clearTimeout(updateCheckCompletionTimerRef.current);
         updateCheckCompletionTimerRef.current = null;
       }
     },
-    [],
+    [clearUpdateCheckWatchdog],
   );
 
   useEffect(() => {
@@ -3659,8 +3791,8 @@ function App() {
 
   useEffect(() => {
     const off = Events.On("image:push:progress", (event) => {
-      const payload = eventPayload<ImageProgressPayload>(event);
-      if (!payload?.streamID) {
+      const payload = eventPayload<unknown>(event);
+      if (!isImageProgressPayload(payload)) {
         return;
       }
       setPushImage((current) => {
@@ -3866,13 +3998,28 @@ function App() {
   useEffect(() => {
     const off = Events.On("stats:sample", (event) => {
       const payload = eventPayload<StatsSamplePayload>(event);
-      if (!payload || payload.streamID !== statsStreamIDRef.current) {
+      if (
+        !payload ||
+        !isNonEmptyString(payload.streamID) ||
+        payload.streamID !== statsStreamIDRef.current ||
+        (payload.samples !== undefined &&
+          (!Array.isArray(payload.samples) ||
+            payload.samples.length > maxRuntimeStatsSamples))
+      ) {
         return;
       }
-      if (payload.gpu) {
-        setLiveGPU(payload.gpu);
+      const gpu = isGPUMetrics(payload.gpu) ? payload.gpu : null;
+      const rawSamples = payload.samples ?? [];
+      const samples = rawSamples.filter(isStatsSample);
+      if (rawSamples.length > 0 && samples.length === 0) {
+        if (gpu) {
+          setLiveGPU(gpu);
+        }
+        return;
       }
-      const samples = (payload.samples ?? []).filter(isStatsSample);
+      if (gpu) {
+        setLiveGPU(gpu);
+      }
       const label = samples.length > 0 ? sampleLabel(samples[0]) : timeLabel();
       const receivedAt = Date.now();
       const shouldUpdateProjectFrame =
@@ -4346,25 +4493,23 @@ function App() {
     [saveSetting],
   );
 
-  const saveColimaProfile = useCallback(async () => {
-    const nextProfile = colimaProfile.trim() || "default";
-    setColimaProfile(nextProfile);
-    await saveSetting("macos.colima_profile", nextProfile);
-  }, [colimaProfile, saveSetting]);
+  const saveColimaProfile = useCallback(
+    async (value: string) => {
+      const nextProfile = value.trim() || "default";
+      return saveSetting("macos.colima_profile", nextProfile);
+    },
+    [saveSetting],
+  );
 
   const saveColimaNumberSetting = useCallback(
     async (
       key:
-        | "macos.colima_cpu"
-        | "macos.colima_memory_gb"
-        | "macos.colima_disk_gb",
+        "macos.colima_cpu" | "macos.colima_memory_gb" | "macos.colima_disk_gb",
       value: number,
-      setter: (value: number) => void,
       fallback: number,
     ) => {
       const nextValue = Number.isFinite(value) && value > 0 ? value : fallback;
-      setter(nextValue);
-      await saveSetting(key, nextValue);
+      return saveSetting(key, nextValue);
     },
     [saveSetting],
   );
@@ -4450,6 +4595,16 @@ function App() {
 
   const openRegistryLogin = useCallback(
     (registry = "docker.io") => {
+      if (registryLoginDisabled) {
+        pushToast({
+          body:
+            registryLoginDisabledReason ??
+            "Registry login is unavailable under the current credential policy.",
+          level: "warn",
+          title: "Registry login unavailable",
+        });
+        return;
+      }
       invalidateMutationRequest("registry-login");
       setRegistryLogin({
         ...emptyRegistryLogin,
@@ -4457,7 +4612,12 @@ function App() {
         registry: registry.trim() || "docker.io",
       });
     },
-    [invalidateMutationRequest],
+    [
+      invalidateMutationRequest,
+      pushToast,
+      registryLoginDisabled,
+      registryLoginDisabledReason,
+    ],
   );
 
   const closeRegistryLogin = useCallback(() => {
@@ -4465,7 +4625,40 @@ function App() {
     setRegistryLogin(emptyRegistryLogin);
   }, [invalidateMutationRequest]);
 
+  useEffect(() => {
+    if (!registryLoginDisabled || !registryLogin.open) {
+      return;
+    }
+    invalidateMutationRequest("registry-login");
+    setRegistryLogin(emptyRegistryLogin);
+    pushToast({
+      body:
+        registryLoginDisabledReason ??
+        "Registry login is unavailable under the current credential policy.",
+      level: "warn",
+      title: "Registry login closed",
+    });
+  }, [
+    invalidateMutationRequest,
+    pushToast,
+    registryLogin.open,
+    registryLoginDisabled,
+    registryLoginDisabledReason,
+  ]);
+
   const submitRegistryLogin = useCallback(async () => {
+    if (registryLoginDisabled) {
+      invalidateMutationRequest("registry-login");
+      setRegistryLogin((current) => ({
+        ...current,
+        busy: false,
+        error:
+          registryLoginDisabledReason ??
+          "Registry login is unavailable under the current credential policy.",
+        secret: "",
+      }));
+      return;
+    }
     const requestKey = "registry-login";
     const owner = beginMutationRequest(requestKey);
     setRegistryLogin((current) => ({
@@ -4506,8 +4699,11 @@ function App() {
     beginMutationRequest,
     closeRegistryLogin,
     finishMutationRequest,
+    invalidateMutationRequest,
     mutationRequestMatches,
     refreshRegistryAccounts,
+    registryLoginDisabled,
+    registryLoginDisabledReason,
     registryLogin.registry,
     registryLogin.secret,
     registryLogin.secretKind,
@@ -5409,7 +5605,41 @@ function App() {
       message: "Starting update check",
     });
     try {
-      const returnedJobID = await UpdateService.CheckAllUpdates();
+      const launchRequest = UpdateService.CheckAllUpdates();
+      if (typeof launchRequest.cancel === "function") {
+        operation.cancelLaunch = (cause?: unknown) =>
+          launchRequest.cancel(cause);
+      }
+      clearUpdateCheckWatchdog();
+      updateCheckWatchdogTimerRef.current = window.setTimeout(() => {
+        updateCheckWatchdogTimerRef.current = null;
+        if (!requestMatches()) {
+          return;
+        }
+        updateCheckOperationRef.current = null;
+        const timedOutJobID = operation.jobID;
+        if (timedOutJobID) {
+          updateCheckJobScopesRef.current.delete(timedOutJobID);
+          pendingUpdateCheckEventsRef.current.delete(timedOutJobID);
+          invalidatedUpdateCheckJobIDsRef.current.add(timedOutJobID);
+          void UpdateService.CancelJob(timedOutJobID).catch(() => undefined);
+        } else {
+          try {
+            void Promise.resolve(
+              operation.cancelLaunch?.("Update check timed out"),
+            ).catch(() => undefined);
+          } catch {
+            // The request generation guard still rejects a late launch result.
+          }
+        }
+        setUpdateCheckJobID(null);
+        setUpdateCheckProgress(null);
+        reportLaunchFailure(
+          "Update check timed out. The job was canceled; retry when the Docker backend is responsive.",
+        );
+      }, updateCheckWatchdogMS);
+
+      const returnedJobID = await launchRequest;
       const jobID = returnedJobID?.trim();
       if (!jobID) {
         throw new Error("Update check returned an empty job ID");
@@ -5427,6 +5657,7 @@ function App() {
         message: "Checking updates",
       });
       if (!registerUpdateCheckJobOwnership(jobID, scopeGeneration)) {
+        clearUpdateCheckWatchdog();
         if (updateCheckOperationRef.current === operation) {
           updateCheckOperationRef.current = null;
         }
@@ -5440,6 +5671,7 @@ function App() {
       if (!requestMatches()) {
         return;
       }
+      clearUpdateCheckWatchdog();
       updateCheckOperationRef.current = null;
       setUpdateCheckJobID(null);
       setUpdateCheckProgress(null);
@@ -5447,7 +5679,12 @@ function App() {
         error instanceof Error ? error.message : "Unable to check updates",
       );
     }
-  }, [ensureDockerReady, pushToast, registerUpdateCheckJobOwnership]);
+  }, [
+    clearUpdateCheckWatchdog,
+    ensureDockerReady,
+    pushToast,
+    registerUpdateCheckJobOwnership,
+  ]);
 
   const openUpdatePlan = useCallback(
     async (target: UpdatePlanTarget) => {
@@ -5866,8 +6103,11 @@ function App() {
       if (!ensureDockerReady()) {
         return;
       }
-      const ids = Array.from(selectedContainerIDs);
+      const ids = Array.from(selectedContainerIDs).filter((id) =>
+        eligibleContainerSelectionIDs.has(id),
+      );
       if (ids.length === 0) {
+        setSelectedContainerIDs(new Set<string>());
         return;
       }
       const key = `bulk:${action}`;
@@ -5908,6 +6148,7 @@ function App() {
     [
       actionRequestMatches,
       beginActionRequest,
+      eligibleContainerSelectionIDs,
       ensureDockerReady,
       finishActionRequest,
       refreshAfterAction,
@@ -7839,6 +8080,7 @@ function App() {
                 projectDetailState.status === "loading"
               }
               lineage={projectLineage[projectID] ?? []}
+              lineageError={projectLineageError[projectID] ?? null}
               lineageLoading={projectLineageStatus[projectID] === "loading"}
               mutationsDisabled={mutationsDisabled}
               mutationDisabledReason={mutationDisabledReason}
@@ -7990,26 +8232,13 @@ function App() {
           />
         );
       case "terminal":
-        return (
-          <TerminalPage
-            containers={containers}
-            initialSession={terminalInitialSession}
-            onCommandConsumed={(id) =>
-              setQueuedTerminalCommand((current) =>
-                current?.id === id ? null : current,
-              )
-            }
-            onInitialSessionConsumed={(id) =>
-              setTerminalInitialSession((current) =>
-                current?.id === id ? null : current,
-              )
-            }
-            projects={projects}
-            queuedCommand={queuedTerminalCommand}
-          />
-        );
+        return null;
       case "agent":
-        return <AgentPage projects={projects} />;
+        return (
+          <Suspense fallback={<TableSkeleton />}>
+            <AgentPage projects={projects} />
+          </Suspense>
+        );
       case "settings":
         return (
           <SettingsPage
@@ -8029,10 +8258,6 @@ function App() {
             error={settingsError}
             message={settingsMessage}
             onAutostartChange={changeProviderAutostart}
-            onColimaCPUChange={setColimaCPU}
-            onColimaDiskGBChange={setColimaDiskGB}
-            onColimaMemoryGBChange={setColimaMemoryGB}
-            onColimaProfileChange={setColimaProfile}
             onDetect={() => {
               void retryProviderDetection();
             }}
@@ -8060,33 +8285,16 @@ function App() {
               void refreshAuditLog();
             }}
             onSettingChange={saveSetting}
-            onSaveColimaCPU={() => {
-              void saveColimaNumberSetting(
-                "macos.colima_cpu",
-                colimaCPU,
-                setColimaCPU,
-                2,
-              );
-            }}
-            onSaveColimaDiskGB={() => {
-              void saveColimaNumberSetting(
-                "macos.colima_disk_gb",
-                colimaDiskGB,
-                setColimaDiskGB,
-                60,
-              );
-            }}
-            onSaveColimaMemoryGB={() => {
-              void saveColimaNumberSetting(
-                "macos.colima_memory_gb",
-                colimaMemoryGB,
-                setColimaMemoryGB,
-                4,
-              );
-            }}
-            onSaveColimaProfile={() => {
-              void saveColimaProfile();
-            }}
+            onSaveColimaCPU={(value) =>
+              saveColimaNumberSetting("macos.colima_cpu", value, 2)
+            }
+            onSaveColimaDiskGB={(value) =>
+              saveColimaNumberSetting("macos.colima_disk_gb", value, 60)
+            }
+            onSaveColimaMemoryGB={(value) =>
+              saveColimaNumberSetting("macos.colima_memory_gb", value, 4)
+            }
+            onSaveColimaProfile={saveColimaProfile}
             onSaveWSLDistro={saveWSLDistro}
             onUseDockerContext={(name) => {
               void activateDockerContext(name);
@@ -8564,7 +8772,11 @@ function App() {
         <section className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden">
           <header className="flex h-auto shrink-0 flex-col items-stretch gap-3 border-b border-border bg-bg-app px-4 py-3 sm:flex-row sm:items-center sm:justify-between lg:h-16 lg:px-6 lg:py-0">
             <div className="min-w-0">
-              <h1 className="truncate text-xl font-semibold tracking-normal">
+              <h1
+                className="truncate text-xl font-semibold tracking-normal outline-none"
+                ref={pageHeadingRef}
+                tabIndex={-1}
+              >
                 {pageTitle}
               </h1>
               <p className="truncate text-sm text-text-muted">
@@ -8689,6 +8901,16 @@ function App() {
                     {parsedActionError.detail}
                   </pre>
                 ) : null}
+                {parsedActionError.repairHints?.length ? (
+                  <div className="mt-2 text-xs">
+                    <div className="font-semibold">How to fix</div>
+                    <ul className="mt-1 list-disc space-y-1 pl-5">
+                      {parsedActionError.repairHints.map((hint) => (
+                        <li key={hint}>{hint}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
               </div>
               <Tooltip label="Dismiss error">
                 <Button
@@ -8706,12 +8928,39 @@ function App() {
             className="min-h-0 flex-1 overflow-auto p-6"
             data-testid="app-scroll-region"
           >
-            <DegradedFrame stale={staleMode}>{content}</DegradedFrame>
+            <DegradedFrame stale={staleMode}>
+              {terminalMounted ? (
+                <div
+                  aria-hidden={activePage === "terminal" ? undefined : true}
+                  hidden={activePage !== "terminal"}
+                  ref={terminalWrapperRef}
+                >
+                  <TerminalPage
+                    containers={containers}
+                    initialSession={terminalInitialSession}
+                    key={datasetScopeKey}
+                    onCommandConsumed={(id) =>
+                      setQueuedTerminalCommand((current) =>
+                        current?.id === id ? null : current,
+                      )
+                    }
+                    onInitialSessionConsumed={(id) =>
+                      setTerminalInitialSession((current) =>
+                        current?.id === id ? null : current,
+                      )
+                    }
+                    projects={projects}
+                    queuedCommand={queuedTerminalCommand}
+                  />
+                </div>
+              ) : null}
+              {activePage === "terminal" ? null : content}
+            </DegradedFrame>
           </div>
         </section>
       </div>
 
-      <ToastViewport toasts={toasts} />
+      <ToastViewport onDismiss={dismissToast} toasts={toasts} />
 
       <InspectModal inspect={inspect} onClose={closeInspect} />
       <CommandPalette
@@ -8933,6 +9182,8 @@ function App() {
       <PushImageModal
         accounts={registryAccounts}
         accountsLoading={registryAccountsStatus === "loading"}
+        loginDisabled={registryLoginDisabled}
+        loginDisabledReason={registryLoginDisabledReason}
         onChange={(patch) =>
           setPushImage((current) => ({ ...current, ...patch }))
         }
@@ -8972,6 +9223,8 @@ function App() {
         state={loadImage}
       />
       <RegistryLoginModal
+        loginDisabled={registryLoginDisabled}
+        loginDisabledReason={registryLoginDisabledReason}
         onChange={(patch) =>
           setRegistryLogin((current) => ({ ...current, ...patch }))
         }
@@ -10453,9 +10706,13 @@ function OverviewPage({
   const [range, setRange] = useState<DashboardRangeID>("5m");
   const [stacked, setStacked] = useState(false);
   const [logPeek, setLogPeek] = useState<LogLine[]>([]);
+  const [logPeekError, setLogPeekError] = useState<string | null>(null);
   const [cleanup, setCleanup] = useState<CleanupState>(emptyCleanup);
   const cleanupRequestGenerationRef = useRef(0);
-  const logStreamIDRef = useRef<string | null>(null);
+  const logStreamOwnerRef = useRef<{
+    clientToken: string;
+    streamID: string | null;
+  } | null>(null);
   const visibleChartPoints = useMemo(
     () => chartPointsForRange(chartPoints, range),
     [chartPoints, range],
@@ -10622,10 +10879,19 @@ function OverviewPage({
   useEffect(() => {
     const offLines = Events.On("logs:lines", (event) => {
       const payload = eventPayload<LogLinesPayload>(event);
-      if (!payload || payload.streamID !== logStreamIDRef.current) {
+      const owner = logStreamOwnerRef.current;
+      if (
+        !payload ||
+        !isLogStreamPayload(payload) ||
+        !owner ||
+        (payload.streamID !== owner.streamID &&
+          payload.clientToken !== owner.clientToken)
+      ) {
         return;
       }
-      const nextLines = (payload.lines ?? []).filter(isLogLine);
+      const nextLines = Array.isArray(payload.lines)
+        ? payload.lines.filter(isLogLine)
+        : [];
       if (nextLines.length === 0) {
         return;
       }
@@ -10640,7 +10906,18 @@ function OverviewPage({
     }
     let cancelled = false;
     let activeStreamID: string | null = null;
+    const clientToken = crypto.randomUUID();
+    logStreamOwnerRef.current = { clientToken, streamID: null };
+    queueMicrotask(() => {
+      if (
+        !cancelled &&
+        logStreamOwnerRef.current?.clientToken === clientToken
+      ) {
+        setLogPeekError(null);
+      }
+    });
     LogsService.StartLogStream({
+      clientToken,
       scope: "all",
       ids: [],
       follow: true,
@@ -10653,14 +10930,28 @@ function OverviewPage({
           return;
         }
         activeStreamID = streamID;
-        logStreamIDRef.current = streamID;
+        if (logStreamOwnerRef.current?.clientToken === clientToken) {
+          logStreamOwnerRef.current = { clientToken, streamID };
+        }
       })
-      .catch(() => {
-        setLogPeek([]);
+      .catch((error: unknown) => {
+        if (
+          !cancelled &&
+          logStreamOwnerRef.current?.clientToken === clientToken
+        ) {
+          logStreamOwnerRef.current = null;
+          setLogPeekError(
+            error instanceof Error
+              ? error.message
+              : "Unable to start the log preview",
+          );
+        }
       });
     return () => {
       cancelled = true;
-      logStreamIDRef.current = null;
+      if (logStreamOwnerRef.current?.clientToken === clientToken) {
+        logStreamOwnerRef.current = null;
+      }
       if (activeStreamID) {
         stopLogStreamSafely(activeStreamID);
       }
@@ -10871,6 +11162,7 @@ function OverviewPage({
         />
         <div className="space-y-4">
           <LogsPeekPanel
+            error={logPeekError}
             lines={logPeek}
             onOpenLogs={() => onNavigate("logs")}
           />
@@ -11532,9 +11824,11 @@ function ContainerHealthPanel({
 }
 
 function LogsPeekPanel({
+  error,
   lines,
   onOpenLogs,
 }: {
+  error: string | null;
   lines: LogLine[];
   onOpenLogs: () => void;
 }) {
@@ -11554,7 +11848,11 @@ function LogsPeekPanel({
           onClick={onOpenLogs}
           type="button"
         >
-          {lines.length === 0 ? (
+          {error ? (
+            <span className="text-error">
+              Log preview unavailable: {error}. Open Logs to retry.
+            </span>
+          ) : lines.length === 0 ? (
             <span className="text-text-muted">No log lines yet</span>
           ) : (
             lines.map((line) => (
@@ -11778,7 +12076,8 @@ function LogsPage({
   });
   const activeLogStreamRef = useRef<{
     requestKey: string;
-    streamID: string;
+    clientToken: string;
+    streamID: string | null;
   } | null>(null);
   const [restartNonce, setRestartNonce] = useState(0);
   const [pauseAnchor, setPauseAnchor] = useState<{
@@ -11906,10 +12205,18 @@ function LogsPage({
     const offLines = Events.On("logs:lines", (event) => {
       const payload = eventPayload<LogLinesPayload>(event);
       const activeStream = activeLogStreamRef.current;
-      if (!payload || payload.streamID !== activeStream?.streamID) {
+      if (
+        !payload ||
+        !isLogStreamPayload(payload) ||
+        !activeStream ||
+        (payload.streamID !== activeStream.streamID &&
+          payload.clientToken !== activeStream.clientToken)
+      ) {
         return;
       }
-      const nextLines = (payload.lines ?? []).filter(isLogLine);
+      const nextLines = Array.isArray(payload.lines)
+        ? payload.lines.filter(isLogLine)
+        : [];
       if (nextLines.length === 0) {
         return;
       }
@@ -11934,31 +12241,59 @@ function LogsPage({
     const offEOF = Events.On("logs:eof", (event) => {
       const payload = eventPayload<LogErrorPayload>(event);
       const activeStream = activeLogStreamRef.current;
-      if (!payload || payload.streamID !== activeStream?.streamID) {
+      if (
+        !payload ||
+        !isLogErrorPayload(payload) ||
+        !activeStream ||
+        (payload.streamID !== activeStream.streamID &&
+          payload.clientToken !== activeStream.clientToken)
+      ) {
         return;
       }
       setStreamView((current) =>
-        current.requestKey === activeStream.requestKey &&
-        current.streamID === activeStream.streamID
-          ? { ...current, ended: true, status: "ready" }
-          : current,
+        current.requestKey === activeStream.requestKey
+          ? {
+              ...current,
+              streamID: payload.streamID || current.streamID,
+              ended: true,
+              status: "ready",
+            }
+          : {
+              requestKey: activeStream.requestKey,
+              streamID: payload.streamID || activeStream.streamID,
+              status: "ready",
+              error: null,
+              ended: true,
+            },
       );
     });
     const offError = Events.On("logs:error", (event) => {
       const payload = eventPayload<LogErrorPayload>(event);
       const activeStream = activeLogStreamRef.current;
-      if (!payload || payload.streamID !== activeStream?.streamID) {
+      if (
+        !payload ||
+        !isLogErrorPayload(payload) ||
+        !activeStream ||
+        (payload.streamID !== activeStream.streamID &&
+          payload.clientToken !== activeStream.clientToken)
+      ) {
         return;
       }
       setStreamView((current) =>
-        current.requestKey === activeStream.requestKey &&
-        current.streamID === activeStream.streamID
+        current.requestKey === activeStream.requestKey
           ? {
               ...current,
+              streamID: payload.streamID || current.streamID,
               error: payload.error ?? "Log stream failed",
               status: "error",
             }
-          : current,
+          : {
+              requestKey: activeStream.requestKey,
+              streamID: payload.streamID || activeStream.streamID,
+              status: "error",
+              error: payload.error ?? "Log stream failed",
+              ended: false,
+            },
       );
     });
     return () => {
@@ -12014,8 +12349,15 @@ function LogsPage({
 
     let cancelled = false;
     let activeStreamID: string | null = null;
+    const clientToken = crypto.randomUUID();
 
+    activeLogStreamRef.current = {
+      requestKey: streamRequestKey,
+      clientToken,
+      streamID: null,
+    };
     LogsService.StartLogStream({
+      clientToken,
       scope,
       ids: streamIDs,
       follow: true,
@@ -12028,21 +12370,41 @@ function LogsPage({
           return;
         }
         activeStreamID = nextStreamID;
+        const activeStream = activeLogStreamRef.current;
+        if (
+          activeStream?.requestKey !== streamRequestKey ||
+          activeStream.clientToken !== clientToken
+        ) {
+          stopLogStreamSafely(nextStreamID);
+          return;
+        }
         activeLogStreamRef.current = {
-          requestKey: streamRequestKey,
+          ...activeStream,
           streamID: nextStreamID,
         };
-        setLineBuffer({ requestKey: streamRequestKey, lines: [] });
-        setStreamView({
-          requestKey: streamRequestKey,
-          streamID: nextStreamID,
-          status: "ready",
-          error: null,
-          ended: false,
-        });
+        setStreamView((current) =>
+          current.requestKey === streamRequestKey
+            ? {
+                ...current,
+                streamID: nextStreamID,
+                status: current.status === "loading" ? "ready" : current.status,
+              }
+            : {
+                requestKey: streamRequestKey,
+                streamID: nextStreamID,
+                status: "ready",
+                error: null,
+                ended: false,
+              },
+        );
       })
       .catch((error: unknown) => {
-        if (!cancelled) {
+        if (
+          !cancelled &&
+          activeLogStreamRef.current?.requestKey === streamRequestKey &&
+          activeLogStreamRef.current.clientToken === clientToken
+        ) {
+          activeLogStreamRef.current = null;
           setStreamView({
             requestKey: streamRequestKey,
             streamID: null,
@@ -12056,7 +12418,10 @@ function LogsPage({
 
     return () => {
       cancelled = true;
-      if (activeLogStreamRef.current?.requestKey === streamRequestKey) {
+      if (
+        activeLogStreamRef.current?.requestKey === streamRequestKey &&
+        activeLogStreamRef.current.clientToken === clientToken
+      ) {
         activeLogStreamRef.current = null;
       }
       if (activeStreamID) {
@@ -14435,6 +14800,7 @@ function ProjectDetailPage({
   inventoryLoading,
   loading,
   lineage,
+  lineageError,
   lineageLoading,
   mutationsDisabled,
   mutationDisabledReason,
@@ -14471,6 +14837,7 @@ function ProjectDetailPage({
   inventoryLoading: boolean;
   loading: boolean;
   lineage: ImageLineage[];
+  lineageError: string | null;
   lineageLoading: boolean;
   error: string | null;
   mutationsDisabled: boolean;
@@ -14720,6 +15087,7 @@ function ProjectDetailPage({
           mutationsDisabled={mutationsDisabled}
           mutationDisabledReason={mutationDisabledReason}
           lineage={lineage}
+          lineageError={lineageError}
           lineageLoading={lineageLoading}
           onCheckUpdates={onCheckUpdates}
           onIgnoreUpdate={onIgnoreUpdate}
@@ -15973,6 +16341,7 @@ function ContainerInspectPanel({ container }: { container: ContainerSummary }) {
 function ProjectUpdatesTab({
   detail,
   lineage,
+  lineageError,
   lineageLoading,
   mutationsDisabled,
   mutationDisabledReason,
@@ -15985,6 +16354,7 @@ function ProjectUpdatesTab({
 }: {
   detail: ProjectDetail;
   lineage: ImageLineage[];
+  lineageError: string | null;
   lineageLoading: boolean;
   mutationsDisabled: boolean;
   mutationDisabledReason: string;
@@ -16052,6 +16422,15 @@ function ProjectUpdatesTab({
           </Button>
         </div>
       </div>
+
+      {lineageError ? (
+        <LiveMessage
+          className="rounded-control border border-error/30 bg-error/10 px-3 py-2 text-sm text-error"
+          level="error"
+        >
+          Image lineage refresh failed: {lineageError}
+        </LiveMessage>
+      ) : null}
 
       {updates.length === 0 ? (
         <EmptyState
@@ -18649,14 +19028,213 @@ function eventPayload<T>(event: unknown): T | null {
   if (!isRecord(event) || !("data" in event)) {
     return null;
   }
-  return event.data == null ? null : (event.data as T);
+  return isRecord(event.data) ? (event.data as T) : null;
+}
+
+const maxRuntimeIDLength = 4096;
+const maxRuntimeTextLength = 256 * 1024;
+const maxRuntimeLogTextLength = 1024 * 1024 + 1024;
+const maxRuntimeLogBatchLines = 1000;
+const maxRuntimeLogBatchTextLength = 8 * 1024 * 1024;
+const maxRuntimeStatsSamples = 20_000;
+const maxRuntimeGPUDevices = 128;
+const maxRuntimeGPUProcesses = 10_000;
+const maxRuntimeGPUDeviceIDs = 256;
+const maxRuntimeObjectKindLength = 64;
+const maxRuntimeObjectIDs = 4096;
+
+function isNonEmptyString(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length <= maxRuntimeIDLength &&
+    Boolean(value.trim())
+  );
+}
+
+function isOptionalString(value: unknown): value is string | undefined {
+  return (
+    value === undefined ||
+    (typeof value === "string" && value.length <= maxRuntimeTextLength)
+  );
+}
+
+function isOptionalIDString(value: unknown): value is string | undefined {
+  return (
+    value === undefined ||
+    (typeof value === "string" && value.length <= maxRuntimeIDLength)
+  );
+}
+
+function isOptionalFiniteNumber(value: unknown): value is number | undefined {
+  return (
+    value === undefined || (typeof value === "number" && Number.isFinite(value))
+  );
+}
+
+function isNotificationPayload(
+  value: unknown,
+): value is Notification & { createdAt: string } {
+  if (!isRecord(value)) {
+    return false;
+  }
+  return (
+    typeof value.id === "number" &&
+    Number.isSafeInteger(value.id) &&
+    value.id > 0 &&
+    typeof value.level === "string" &&
+    value.level.length <= 32 &&
+    typeof value.title === "string" &&
+    value.title.length <= 4096 &&
+    typeof value.body === "string" &&
+    value.body.length <= maxRuntimeTextLength &&
+    typeof value.topic === "string" &&
+    value.topic.length <= 256 &&
+    typeof value.read === "boolean" &&
+    isRuntimeTimeString(value.createdAt)
+  );
+}
+
+function isRuntimeTimeString(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length <= 128 &&
+    Number.isFinite(Date.parse(value))
+  );
+}
+
+function isProviderInstallProgressPayload(
+  value: unknown,
+): value is ProviderInstallProgressPayload {
+  if (!isRecord(value)) {
+    return false;
+  }
+  return (
+    isNonEmptyString(value.planID) &&
+    isNonEmptyString(value.streamID) &&
+    typeof value.step === "number" &&
+    Number.isSafeInteger(value.step) &&
+    value.step >= 0 &&
+    typeof value.totalSteps === "number" &&
+    Number.isSafeInteger(value.totalSteps) &&
+    value.totalSteps >= 0 &&
+    typeof value.message === "string" &&
+    value.message.length <= maxRuntimeTextLength &&
+    typeof value.done === "boolean" &&
+    isOptionalString(value.error)
+  );
+}
+
+function isUpdateCheckProgressPayload(
+  value: unknown,
+): value is UpdateCheckProgressPayload & { jobID: string } {
+  if (!isRecord(value) || !isNonEmptyString(value.jobID)) {
+    return false;
+  }
+  return (
+    isOptionalString(value.phase) &&
+    isOptionalString(value.message) &&
+    isOptionalFiniteNumber(value.pct) &&
+    isOptionalFiniteNumber(value.done) &&
+    isOptionalFiniteNumber(value.total) &&
+    isOptionalString(value.current)
+  );
+}
+
+function isProjectJobEvent(
+  value: unknown,
+): value is ProjectJobEvent & { jobID: string } {
+  if (!isRecord(value) || !isNonEmptyString(value.jobID)) {
+    return false;
+  }
+  return (
+    isOptionalString(value.phase) &&
+    isOptionalString(value.message) &&
+    isOptionalFiniteNumber(value.pct) &&
+    isOptionalString(value.projectID) &&
+    isOptionalString(value.action) &&
+    isOptionalString(value.command) &&
+    isOptionalString(value.result) &&
+    isOptionalString(value.error)
+  );
+}
+
+function isImageProgressPayload(value: unknown): value is ImageProgressPayload {
+  if (!isRecord(value)) {
+    return false;
+  }
+  return (
+    isNonEmptyString(value.streamID) &&
+    isNonEmptyString(value.status) &&
+    isOptionalIDString(value.layerID) &&
+    isOptionalFiniteNumber(value.current) &&
+    isOptionalFiniteNumber(value.total)
+  );
+}
+
+function isLogStreamPayload(value: unknown): value is LogLinesPayload {
+  if (
+    !isRecord(value) ||
+    typeof value.streamID !== "string" ||
+    value.streamID.length > maxRuntimeIDLength
+  ) {
+    return false;
+  }
+  return (
+    isOptionalIDString(value.clientToken) &&
+    (Boolean(value.streamID) || Boolean(value.clientToken)) &&
+    (value.lines === undefined || isBoundedLogLines(value.lines))
+  );
+}
+
+function isLogErrorPayload(value: unknown): value is LogErrorPayload {
+  if (
+    !isRecord(value) ||
+    typeof value.streamID !== "string" ||
+    value.streamID.length > maxRuntimeIDLength
+  ) {
+    return false;
+  }
+  return (
+    isOptionalIDString(value.clientToken) &&
+    (Boolean(value.streamID) || Boolean(value.clientToken)) &&
+    isOptionalString(value.error)
+  );
 }
 
 function isLogLine(value: unknown): value is LogLine {
   if (!isRecord(value)) {
     return false;
   }
-  return typeof value.text === "string" && typeof value.stream === "string";
+  return (
+    typeof value.text === "string" &&
+    value.text.length <= maxRuntimeLogTextLength &&
+    typeof value.stream === "string" &&
+    value.stream.length <= 64 &&
+    isRuntimeTimeString(value.ts) &&
+    isOptionalIDString(value.containerID) &&
+    isOptionalIDString(value.containerName) &&
+    isOptionalIDString(value.service) &&
+    isOptionalIDString(value.level) &&
+    isOptionalFiniteNumber(value.sequence) &&
+    (value.truncated === undefined || typeof value.truncated === "boolean")
+  );
+}
+
+function isBoundedLogLines(value: unknown): value is LogLine[] {
+  if (!Array.isArray(value) || value.length > maxRuntimeLogBatchLines) {
+    return false;
+  }
+  let textLength = 0;
+  for (const line of value) {
+    if (!isLogLine(line)) {
+      return false;
+    }
+    textLength += line.text.length;
+    if (textLength > maxRuntimeLogBatchTextLength) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function normalizeLogLevel(level?: string): LogLevelFilter {
@@ -19922,6 +20500,8 @@ function TagImageModal({
 function PushImageModal({
   accounts,
   accountsLoading,
+  loginDisabled,
+  loginDisabledReason,
   onChange,
   onClose,
   onCopyPull,
@@ -19933,6 +20513,8 @@ function PushImageModal({
   state: PushImageState;
   accounts: RegistryAccount[];
   accountsLoading: boolean;
+  loginDisabled: boolean;
+  loginDisabledReason?: string;
   onChange: (patch: Partial<PushImageState>) => void;
   onClose: () => void;
   onCopyPull: (ref: string) => void;
@@ -19994,6 +20576,8 @@ function PushImageModal({
               <>
                 <Badge tone="error">Not logged in</Badge>
                 <Button
+                  disabled={loginDisabled}
+                  disabledReason={loginDisabledReason}
                   icon={<LogIn size={15} />}
                   onClick={() => onLogin(registry)}
                   size="sm"
@@ -20141,6 +20725,8 @@ function LoadImageModal({
 }
 
 function RegistryLoginModal({
+  loginDisabled,
+  loginDisabledReason,
   onChange,
   onClose,
   onSubmit,
@@ -20149,6 +20735,8 @@ function RegistryLoginModal({
 }: {
   state: RegistryLoginState;
   presets: RegistryPreset[];
+  loginDisabled: boolean;
+  loginDisabledReason?: string;
   onChange: (patch: Partial<RegistryLoginState>) => void;
   onClose: () => void;
   onSubmit: () => void;
@@ -20171,6 +20759,7 @@ function RegistryLoginModal({
         <ModalActions
           busy={state.busy}
           disabled={
+            loginDisabled ||
             !state.registry.trim() ||
             !state.username.trim() ||
             !state.secret.trim()
@@ -20188,27 +20777,35 @@ function RegistryLoginModal({
         <SelectField
           label="Registry"
           onChange={(value) => {
-            if (value !== "custom") {
-              onChange({ registry: value });
-            }
+            onChange({
+              error: undefined,
+              registry: value === "custom" ? "" : value,
+              secret: "",
+            });
           }}
           options={options}
           value={presetValue}
         />
         <TextField
           label="Registry URL"
-          onChange={(registry) => onChange({ registry })}
+          onChange={(registry) =>
+            onChange({ error: undefined, registry, secret: "" })
+          }
           value={state.registry}
         />
         <TextField
           label="Username"
-          onChange={(username) => onChange({ username })}
+          onChange={(username) =>
+            onChange({ error: undefined, secret: "", username })
+          }
           value={state.username}
         />
         <SelectField
           label="Secret kind"
           onChange={(secretKind) =>
             onChange({
+              error: undefined,
+              secret: "",
               secretKind: secretKind === "token" ? "token" : "password",
             })
           }
@@ -20222,7 +20819,9 @@ function RegistryLoginModal({
           <span className="text-sm font-medium text-text-primary">Secret</span>
           <input
             className="mt-2 h-9 w-full rounded-control border border-border bg-bg-inset px-3 text-sm text-text-primary outline-none focus:border-accent"
-            onChange={(event) => onChange({ secret: event.target.value })}
+            onChange={(event) =>
+              onChange({ error: undefined, secret: event.target.value })
+            }
             type="password"
             value={state.secret}
           />
@@ -20230,6 +20829,14 @@ function RegistryLoginModal({
         {normalizeRegistryHostForUI(state.registry) === "docker.io" ? (
           <div className="rounded-control border border-info/30 bg-info/10 p-3 text-sm text-info">
             Docker Hub accounts with 2FA require an access token.
+          </div>
+        ) : null}
+        {loginDisabled && loginDisabledReason ? (
+          <div
+            className="rounded-control border border-warn/30 bg-warn/10 p-3 text-sm text-warn"
+            role="alert"
+          >
+            {loginDisabledReason}
           </div>
         ) : null}
         <FormError error={state.error} />
@@ -21085,11 +21692,41 @@ function PushProgressList({ progress }: { progress: ImageProgressPayload[] }) {
 }
 
 function FormError({ error }: { error?: string }) {
-  return error ? (
-    <div className="rounded-control border border-error/30 bg-error/10 p-3 text-error">
-      {error}
+  if (!error) {
+    return null;
+  }
+  const parsed = parseAppErrorText(error);
+  return (
+    <div
+      className="rounded-control border border-error/30 bg-error/10 p-3 text-error"
+      role="alert"
+    >
+      {parsed.code ? <div className="font-medium">{parsed.title}</div> : null}
+      <div
+        className={`whitespace-pre-wrap ${parsed.code ? "mt-1 text-sm" : ""}`}
+      >
+        {parsed.body}
+      </div>
+      {parsed.detail && parsed.detail !== parsed.body ? (
+        <div className="mt-2 whitespace-pre-wrap text-sm opacity-90">
+          {parsed.detail}
+        </div>
+      ) : null}
+      {parsed.repairHints?.length ? (
+        <div className="mt-3 text-sm">
+          <div className="font-medium">How to fix</div>
+          <ul className="mt-1 list-disc space-y-1 pl-5">
+            {parsed.repairHints.map((hint) => (
+              <li key={hint}>{hint}</li>
+            ))}
+          </ul>
+        </div>
+      ) : null}
+      {parsed.code ? (
+        <div className="mt-2 font-mono text-xs opacity-75">{parsed.code}</div>
+      ) : null}
     </div>
-  ) : null;
+  );
 }
 
 function MetricButton({
@@ -21965,6 +22602,10 @@ function isEditableElement(target: EventTarget | null) {
   );
 }
 
+function hasOpenModalDialog() {
+  return document.querySelector('[role="dialog"][aria-modal="true"]') !== null;
+}
+
 function setupCheckRow(
   label: string,
   status: ProviderStatus | null,
@@ -22293,9 +22934,100 @@ function isStatsSample(value: unknown): value is StatsSample {
     return false;
   }
   return (
-    typeof value.containerID === "string" &&
+    isNonEmptyString(value.containerID) &&
+    isOptionalIDString(value.projectID) &&
+    isOptionalIDString(value.serviceID) &&
+    isOptionalIDString(value.containerName) &&
+    isOptionalIDString(value.health) &&
+    isOptionalFiniteNumber(value.restartCount) &&
+    isOptionalFiniteNumber(value.uptimeSeconds) &&
     typeof value.cpuPercent === "number" &&
-    typeof value.memoryBytes === "number"
+    Number.isFinite(value.cpuPercent) &&
+    (value.gpuDeviceIDs === undefined ||
+      (Array.isArray(value.gpuDeviceIDs) &&
+        value.gpuDeviceIDs.length <= maxRuntimeGPUDeviceIDs &&
+        value.gpuDeviceIDs.every(
+          (id) => typeof id === "string" && id.length <= maxRuntimeIDLength,
+        ))) &&
+    isOptionalFiniteNumber(value.gpuMemoryBytes) &&
+    isOptionalFiniteNumber(value.gpuUtilizationPercent) &&
+    typeof value.memoryBytes === "number" &&
+    Number.isFinite(value.memoryBytes) &&
+    isOptionalFiniteNumber(value.memoryLimitBytes) &&
+    typeof value.networkRxRate === "number" &&
+    Number.isFinite(value.networkRxRate) &&
+    typeof value.networkTxRate === "number" &&
+    Number.isFinite(value.networkTxRate) &&
+    isRuntimeTimeString(value.sampledAt)
+  );
+}
+
+function isGPUMetrics(
+  value: unknown,
+): value is GPUMetrics & { checkedAt: string } {
+  if (!isRecord(value)) {
+    return false;
+  }
+  return (
+    typeof value.available === "boolean" &&
+    typeof value.deviceCount === "number" &&
+    Number.isFinite(value.deviceCount) &&
+    isOptionalString(value.source) &&
+    isOptionalString(value.message) &&
+    isOptionalString(value.driverVersion) &&
+    isOptionalFiniteNumber(value.utilizationPercent) &&
+    isOptionalFiniteNumber(value.memoryUsedBytes) &&
+    isOptionalFiniteNumber(value.memoryTotalBytes) &&
+    isOptionalFiniteNumber(value.temperatureCelsius) &&
+    isRuntimeTimeString(value.checkedAt) &&
+    (value.devices === undefined ||
+      (Array.isArray(value.devices) &&
+        value.devices.length <= maxRuntimeGPUDevices &&
+        value.devices.every(isGPUDeviceMetric))) &&
+    (value.processes === undefined ||
+      (Array.isArray(value.processes) &&
+        value.processes.length <= maxRuntimeGPUProcesses &&
+        value.processes.every(isGPUProcessMetric)))
+  );
+}
+
+function isGPUDeviceMetric(value: unknown) {
+  if (!isRecord(value)) {
+    return false;
+  }
+  return (
+    typeof value.id === "string" &&
+    value.id.length <= maxRuntimeIDLength &&
+    typeof value.index === "number" &&
+    Number.isFinite(value.index) &&
+    typeof value.name === "string" &&
+    value.name.length <= maxRuntimeIDLength &&
+    isOptionalIDString(value.uuid) &&
+    isOptionalIDString(value.driverVersion) &&
+    isOptionalFiniteNumber(value.utilizationPercent) &&
+    isOptionalFiniteNumber(value.memoryUsedBytes) &&
+    isOptionalFiniteNumber(value.memoryTotalBytes) &&
+    isOptionalFiniteNumber(value.temperatureCelsius)
+  );
+}
+
+function isGPUProcessMetric(value: unknown) {
+  if (!isRecord(value)) {
+    return false;
+  }
+  return (
+    typeof value.pid === "number" &&
+    Number.isFinite(value.pid) &&
+    isOptionalIDString(value.deviceID) &&
+    isOptionalIDString(value.deviceUUID) &&
+    isOptionalFiniteNumber(value.deviceIndex) &&
+    isOptionalIDString(value.processName) &&
+    isOptionalFiniteNumber(value.memoryBytes) &&
+    isOptionalFiniteNumber(value.gpuUtilizationPercent) &&
+    isOptionalIDString(value.containerID) &&
+    isOptionalIDString(value.containerName) &&
+    isOptionalIDString(value.projectID) &&
+    isOptionalIDString(value.service)
   );
 }
 

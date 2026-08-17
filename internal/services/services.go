@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -46,6 +47,15 @@ type jobDonePayload struct {
 	ProjectID string `json:"projectID,omitempty"`
 	Action    string `json:"action,omitempty"`
 	Command   string `json:"command,omitempty"`
+}
+
+func publishCriticalEvent(events bus.Bus, event bus.Event) {
+	if events == nil {
+		return
+	}
+	if err := bus.PublishCriticalBounded(events, event); err != nil {
+		slog.Warn("publish critical application event failed", "topic", event.Topic, "error", err)
+	}
 }
 
 type DockerClient interface {

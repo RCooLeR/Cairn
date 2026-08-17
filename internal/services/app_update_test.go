@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/RCooLeR/Cairn/internal/models"
@@ -123,6 +124,45 @@ func TestCheckAppUpdateRejectsUntrustedReleaseMetadata(t *testing.T) {
 			}
 			if got != nil {
 				t.Fatalf("CheckAppUpdate() = %#v, want nil", got)
+			}
+		})
+	}
+}
+
+func TestCheckAppUpdateRejectsOversizedAndTrailingDocuments(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "oversized",
+			body: `{"tag_name":"v1.2.3","padding":"` + strings.Repeat("x", maxAppUpdateResponseBytes) + `"}`,
+		},
+		{
+			name: "trailing JSON document",
+			body: `{"tag_name":"v1.2.3"} {"tag_name":"v9.9.9"}`,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(test.body))
+			}))
+			defer server.Close()
+
+			oldURL := appUpdateURL
+			oldClient := appUpdateHTTPClient
+			appUpdateURL = server.URL
+			appUpdateHTTPClient = server.Client()
+			defer func() {
+				appUpdateURL = oldURL
+				appUpdateHTTPClient = oldClient
+			}()
+
+			got, err := (&SettingsService{}).CheckAppUpdate(context.Background(), "1.2.2")
+			if err == nil {
+				t.Fatalf("CheckAppUpdate() error = nil, got %#v", got)
 			}
 		})
 	}

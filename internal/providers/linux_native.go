@@ -313,6 +313,12 @@ func (p *LinuxNativeProvider) pruneExpiredInstallPlansLocked(now time.Time) {
 	}
 }
 
+func (p *LinuxNativeProvider) DiscardInstallPlan(planID string) {
+	p.installMu.Lock()
+	delete(p.plans, planID)
+	p.installMu.Unlock()
+}
+
 func (p *LinuxNativeProvider) Start(ctx context.Context) error {
 	_, err := p.runner.Run(ctx, commandTimeout, "systemctl", "start", "docker")
 	return err

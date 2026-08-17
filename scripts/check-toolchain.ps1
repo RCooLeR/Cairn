@@ -57,10 +57,16 @@ if ($expectedGo -notmatch ('^go' + [regex]::Escape($goLanguage) + '\.\d+$')) {
 }
 
 $dockerfile = Join-Path $root "build/docker/Dockerfile.cross"
-$dockerGo = Read-SingleCapture $dockerfile '^\s*FROM\s+golang:(\d+\.\d+\.\d+)-bookworm\s*$' "cross-image Go toolchain"
+$dockerGo = Read-SingleCapture $dockerfile '^\s*FROM\s+golang:(\d+\.\d+\.\d+)-bookworm@sha256:[0-9a-f]{64}\s*$' "digest-pinned cross-image Go toolchain"
 if ("go$dockerGo" -ne $expectedGo) {
   throw "Dockerfile.cross pins go$dockerGo, want $expectedGo from go.mod."
 }
+
+$debianSmokeScript = Join-Path $root "scripts/test-debian-container-deb-install.ps1"
+$null = Read-SingleCapture `
+  $debianSmokeScript `
+  '^\s*\[string\]\$Image\s*=\s*"(debian:stable-slim@sha256:[0-9a-f]{64})"\s*$' `
+  "digest-pinned Debian package-smoke image"
 
 $package = Get-Content -LiteralPath (Join-Path $root "frontend/package.json") -Raw | ConvertFrom-Json
 $nodeEngine = [string]$package.engines.node
@@ -73,6 +79,46 @@ if ($npmEngine -notmatch '^>=(\d+\.\d+\.\d+)$') {
   throw "frontend/package.json must declare a simple minimum npm version."
 }
 $minimumNPM = ConvertTo-Version $Matches[1] "npm engine"
+
+$nodeVersionFile = Join-Path $root ".node-version"
+if (!(Test-Path -LiteralPath $nodeVersionFile -PathType Leaf)) {
+  throw ".node-version must pin the hosted Node.js runtime."
+}
+$pinnedNodeRaw = (Get-Content -LiteralPath $nodeVersionFile -Raw).Trim()
+if ($pinnedNodeRaw -notmatch '^\d+\.\d+\.\d+$') {
+  throw ".node-version must contain one exact numeric Node.js version."
+}
+$pinnedNode = ConvertTo-Version $pinnedNodeRaw "Pinned Node"
+if ($pinnedNode -lt $minimumNode) {
+  throw "Pinned Node $pinnedNode is below package.json minimum $minimumNode."
+}
+
+$workflowFiles = @(Get-ChildItem -LiteralPath (Join-Path $root ".github/workflows") -File -Include "*.yml", "*.yaml")
+$nodeVersionFileUses = @($workflowFiles | Select-String -Pattern '^\s*node-version-file:\s*\.node-version\s*$')
+$setupNodeUses = @($workflowFiles | Select-String -Pattern '^\s*uses:\s+actions/setup-node@')
+if ($setupNodeUses.Count -eq 0 -or $nodeVersionFileUses.Count -ne $setupNodeUses.Count) {
+  throw "Every setup-node action must use the checked .node-version pin."
+}
+
+foreach ($actionUse in @($workflowFiles | Select-String -Pattern '^\s*uses:\s+')) {
+  $line = $actionUse.Line
+  if ($line -match '^\s*uses:\s+\./') {
+    continue
+  }
+  if ($line -notmatch '^\s*uses:\s+[^\s@]+@[0-9a-f]{40}\s+#\s+v[0-9][0-9A-Za-z.+-]*\s*$') {
+    throw "$($actionUse.Path):$($actionUse.LineNumber) must pin a remote action to a full commit SHA with its version tag comment."
+  }
+}
+
+$nsisInstalls = @($workflowFiles | Select-String -Pattern '^\s*choco install nsis\b')
+if ($nsisInstalls.Count -eq 0) {
+  throw "At least one hosted Windows package job must install NSIS."
+}
+foreach ($nsisInstall in $nsisInstalls) {
+  if ($nsisInstall.Line -notmatch '^\s*choco install nsis --version=\d+\.\d+\.\d+\s') {
+    throw "$($nsisInstall.Path):$($nsisInstall.LineNumber) must install one exact NSIS version."
+  }
+}
 
 if (-not $SkipRuntime) {
   $go = Get-Command go -ErrorAction SilentlyContinue
@@ -89,5 +135,5 @@ if (-not $SkipRuntime) {
   Assert-MinimumVersion "npm" $minimumNPM "npm"
 }
 
-$runtimeStatus = if ($SkipRuntime) { "static pins" } else { "static pins and installed runtimes" }
-Write-Host "Toolchain policy passed: $runtimeStatus agree with go.mod and frontend/package.json."
+$runtimeStatus = if ($SkipRuntime) { "static pins are consistent" } else { "static pins are consistent and installed runtimes satisfy the declared contract" }
+Write-Host "Toolchain policy passed: $runtimeStatus across go.mod, .node-version, and frontend/package.json."

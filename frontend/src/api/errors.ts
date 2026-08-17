@@ -21,12 +21,7 @@ export const APP_ERROR_CODES = [
 export type AppErrorCode = (typeof APP_ERROR_CODES)[number];
 export type ErrorTone = "error" | "warn" | "info";
 export type ErrorSurface =
-  | "global"
-  | "inline"
-  | "modal"
-  | "permission"
-  | "row"
-  | "toast";
+  "global" | "inline" | "modal" | "permission" | "row" | "toast";
 
 export type AppErrorPresentation = {
   code: AppErrorCode;
@@ -167,6 +162,7 @@ export type ParsedAppError = {
   title: string;
   body: string;
   detail?: string;
+  repairHints?: string[];
   partial?: PartialResourceError;
 };
 
@@ -196,6 +192,7 @@ export function parseAppErrorText(text: string): ParsedAppError {
       title: presentation.title,
       body: cleanAppErrorMessage(structured.message ?? raw, code),
       detail: structured.detail,
+      repairHints: structured.repairHints,
       partial: structured.partial,
     };
   }
@@ -203,6 +200,7 @@ export function parseAppErrorText(text: string): ParsedAppError {
     title: "Action failed",
     body: structured.message ?? raw,
     detail: structured.detail,
+    repairHints: structured.repairHints,
     partial: structured.partial,
   };
 }
@@ -211,6 +209,7 @@ function parseStructuredAppError(text: string): {
   code?: AppErrorCode;
   message?: string;
   detail?: string;
+  repairHints?: string[];
   partial?: PartialResourceError;
 } {
   if (!text.startsWith("{")) {
@@ -237,6 +236,7 @@ function parseStructuredAppError(text: string): {
       code: isAppErrorCode(causeCode) ? causeCode : undefined,
       message,
       detail: detail.trim() || undefined,
+      repairHints: parseRepairHints(payload.repairHints ?? parsed.repairHints),
       partial: parsePartialResource(payload.partial ?? parsed.partial),
     };
   } catch {
@@ -246,6 +246,26 @@ function parseStructuredAppError(text: string): {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseRepairHints(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) {
+    return undefined;
+  }
+  const hints: string[] = [];
+  for (const entry of value) {
+    if (typeof entry !== "string") {
+      continue;
+    }
+    const hint = entry.trim().slice(0, 2048);
+    if (hint && !hints.includes(hint)) {
+      hints.push(hint);
+    }
+    if (hints.length === 8) {
+      break;
+    }
+  }
+  return hints.length > 0 ? hints : undefined;
 }
 
 function parsePartialResource(

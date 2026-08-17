@@ -57,6 +57,10 @@ export function useToastQueue() {
       const existingTimer = timers.current.get(id);
       if (existingTimer !== undefined) {
         window.clearTimeout(existingTimer);
+        timers.current.delete(id);
+      }
+      if (toast.action) {
+        return id;
       }
       timers.current.set(
         id,

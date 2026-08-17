@@ -43,7 +43,7 @@ func (m *Manager) prepareRegistryLoginStorage(ctx context.Context, provider prov
 			apperror.Conflict,
 			"Registry login is disabled",
 			apperror.WithDetail("Credential mode is set to No Cairn-managed credentials."),
-			apperror.WithRepairHints("Switch Settings > Registries > Credential mode to Prefer Docker credential helper before logging in from Cairn."),
+			apperror.WithRepairHints("Switch Settings > Registries > Credential mode to Require Docker credential helper before logging in from Cairn."),
 		)
 	case registryCredentialModeDockerHelper:
 	default:
@@ -448,12 +448,21 @@ func (m *Manager) checkCredentialHelper(ctx context.Context, provider providers.
 	if !ok {
 		return apperror.New(apperror.ProviderNotReady, "Provider cannot check Docker credential helpers")
 	}
+	if err := credentialHelperProbeContextError(ctx); err != nil {
+		return err
+	}
 	result, err := runner.RunBackendCommand(ctx, "", "docker-credential-"+helper, "list")
 	if err == nil && result != nil && result.ExitCode == 0 {
 		return nil
 	}
+	if contextErr := credentialHelperProbeContextError(ctx); contextErr != nil {
+		return contextErr
+	}
+	if credentialHelperBackendUnavailable(provider, result, err) {
+		return credentialHelperBackendUnavailableError(result, err)
+	}
 	return apperror.New(
-		apperror.ProviderNotReady,
+		apperror.RegistryAuth,
 		"Configured Docker credential helper is not available",
 		apperror.WithRepairHints("Install or initialize docker-credential-"+helper+" on the active backend before logging in."),
 	)
@@ -468,15 +477,24 @@ func (m *Manager) detectCredentialHelper(ctx context.Context, provider providers
 			apperror.WithRepairHints("Reconnect the Docker provider and try again."),
 		)
 	}
+	if err := credentialHelperProbeContextError(ctx); err != nil {
+		return "", err
+	}
 	candidates := credentialHelperCandidates(provider)
 	for _, helper := range candidates {
 		result, err := runner.RunBackendCommand(ctx, "", "docker-credential-"+helper, "list")
 		if err == nil && result != nil && result.ExitCode == 0 {
 			return helper, nil
 		}
+		if contextErr := credentialHelperProbeContextError(ctx); contextErr != nil {
+			return "", contextErr
+		}
+		if credentialHelperBackendUnavailable(provider, result, err) {
+			return "", credentialHelperBackendUnavailableError(result, err)
+		}
 	}
 	return "", apperror.New(
-		apperror.ProviderNotReady,
+		apperror.RegistryAuth,
 		"Docker credential helper is not available",
 		apperror.WithDetail("Cairn is set to Docker credential helper mode, but none of these helpers responded: "+strings.Join(candidates, ", ")+"."),
 		apperror.WithRepairHints(
@@ -485,6 +503,62 @@ func (m *Manager) detectCredentialHelper(ctx context.Context, provider providers
 			"Switch Credential mode to No Cairn-managed credentials if you want to manage registry login outside Cairn.",
 		),
 	)
+}
+
+func credentialHelperProbeContextError(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	switch err := ctx.Err(); err {
+	case context.Canceled:
+		return apperror.Wrap(apperror.Cancelled, "Docker credential helper check was cancelled", err)
+	case context.DeadlineExceeded:
+		return apperror.Wrap(apperror.Timeout, "Docker credential helper check timed out", err)
+	default:
+		return nil
+	}
+}
+
+func credentialHelperBackendUnavailable(provider providers.PlatformProvider, result *providers.CommandResult, err error) bool {
+	if provider == nil || provider.Type() != providers.TypeWindowsWSL {
+		return false
+	}
+	if apperror.IsCode(err, apperror.ProviderNotReady) || result == nil || result.ExitCode == -1 {
+		return true
+	}
+	diagnostic := strings.ToLower(strings.ReplaceAll(credentialHelperProbeDiagnostic(result, err), "\x00", ""))
+	return strings.Contains(diagnostic, "wsl/service/") ||
+		strings.Contains(diagnostic, "lacked sufficient buffer space") ||
+		strings.Contains(diagnostic, "queue was full")
+}
+
+func credentialHelperBackendUnavailableError(result *providers.CommandResult, err error) error {
+	detail := providers.SafeCommandDiagnostic(
+		strings.ReplaceAll(credentialHelperProbeDiagnostic(result, err), "\x00", ""),
+		8<<10,
+	)
+	return apperror.New(
+		apperror.ProviderNotReady,
+		"WSL backend is not available for Docker credential helper checks",
+		apperror.WithDetail(detail),
+		apperror.WithRepairHints("Restart WSL and reconnect the active Docker provider before retrying registry login."),
+	)
+}
+
+func credentialHelperProbeDiagnostic(result *providers.CommandResult, err error) string {
+	parts := make([]string, 0, 3)
+	if err != nil {
+		parts = append(parts, err.Error())
+	}
+	if result != nil {
+		if stderr := strings.TrimSpace(result.Stderr); stderr != "" {
+			parts = append(parts, stderr)
+		}
+		if stdout := strings.TrimSpace(result.Stdout); stdout != "" {
+			parts = append(parts, stdout)
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 func credentialHelperCandidates(provider providers.PlatformProvider) []string {

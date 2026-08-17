@@ -6,6 +6,7 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"os/exec"
@@ -33,7 +34,32 @@ done`
 	ollamaProcessName = "ollama"
 	ollamaAPIURL      = "http://127.0.0.1:11434/api/ps"
 	ollamaAPICommand  = `if command -v curl >/dev/null 2>&1; then curl -fsS --max-time 2 http://127.0.0.1:11434/api/ps; elif command -v wget >/dev/null 2>&1; then wget -q -T 2 -O - http://127.0.0.1:11434/api/ps; fi`
+
+	maxOllamaPSResponseBytes = 256 * 1024
+	maxOllamaModels          = 128
+	maxOllamaModelNameBytes  = 256
+	maxNVIDIASMIOutputBytes  = 1024 * 1024
 )
+
+type boundedGPUCommandOutput struct {
+	data      []byte
+	truncated bool
+}
+
+func (b *boundedGPUCommandOutput) Write(p []byte) (int, error) {
+	written := len(p)
+	remaining := maxNVIDIASMIOutputBytes - len(b.data)
+	if remaining > 0 {
+		if remaining > len(p) {
+			remaining = len(p)
+		}
+		b.data = append(b.data, p[:remaining]...)
+	}
+	if remaining < len(p) {
+		b.truncated = true
+	}
+	return written, nil
+}
 
 type nvidiaSMIProbe struct{}
 
@@ -68,14 +94,16 @@ func (nvidiaSMIProbe) ProbeGPUs(ctx context.Context) models.GPUMetrics {
 		"--format=csv,noheader,nounits",
 	)
 	configureBackgroundCommand(cmd)
-	output, err := cmd.Output()
+	var output boundedGPUCommandOutput
+	cmd.Stdout = &output
+	err := cmd.Run()
 	if errors.Is(probeCtx.Err(), context.DeadlineExceeded) {
 		return unavailableGPUMetrics("GPU probe timed out", now)
 	}
-	if err != nil {
+	if err != nil || output.truncated {
 		return unavailableGPUMetrics("nvidia-smi could not read GPU metrics", now)
 	}
-	metrics := parseNVIDIASMI(output, now)
+	metrics := parseNVIDIASMI(output.data, now)
 	if !metrics.Available {
 		return metrics
 	}
@@ -222,11 +250,12 @@ func probeNVIDIAProcesses(ctx context.Context, path string, devices []models.GPU
 		"--format=csv,noheader,nounits",
 	)
 	configureBackgroundCommand(cmd)
-	output, err := cmd.Output()
-	if err != nil {
+	var output boundedGPUCommandOutput
+	cmd.Stdout = &output
+	if err := cmd.Run(); err != nil || output.truncated {
 		return nil
 	}
-	return parseNVIDIASMIProcesses(output, devices)
+	return parseNVIDIASMIProcesses(output.data, devices)
 }
 
 func parseNVIDIASMIProcesses(output []byte, devices []models.GPUDeviceMetric) []models.GPUProcessMetric {
@@ -353,11 +382,11 @@ func probeLocalOllamaProcesses(ctx context.Context) []models.GPUProcessMetric {
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		return nil
 	}
-	var payload ollamaPSPayload
-	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+	payload, err := io.ReadAll(io.LimitReader(response.Body, maxOllamaPSResponseBytes+1))
+	if err != nil || len(payload) > maxOllamaPSResponseBytes {
 		return nil
 	}
-	return ollamaProcessesFromPayload(payload)
+	return parseOllamaPS(payload)
 }
 
 func probeBackendOllamaProcesses(ctx context.Context, runner backendCommandRunner) []models.GPUProcessMetric {
@@ -380,8 +409,18 @@ type ollamaPSPayload struct {
 }
 
 func parseOllamaPS(output []byte) []models.GPUProcessMetric {
+	if len(output) == 0 || len(output) > maxOllamaPSResponseBytes {
+		return nil
+	}
 	var payload ollamaPSPayload
-	if err := json.Unmarshal(output, &payload); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(output))
+	if err := decoder.Decode(&payload); err != nil {
+		return nil
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return nil
+	}
+	if len(payload.Models) > maxOllamaModels {
 		return nil
 	}
 	return ollamaProcessesFromPayload(payload)
@@ -399,6 +438,9 @@ func ollamaProcessesFromPayload(payload ollamaPSPayload) []models.GPUProcessMetr
 		}
 		if name == "" {
 			name = "model"
+		}
+		if len(name) > maxOllamaModelNameBytes {
+			continue
 		}
 		processes = append(processes, models.GPUProcessMetric{
 			ProcessName: ollamaProcessName + ":" + name,

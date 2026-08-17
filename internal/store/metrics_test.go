@@ -225,6 +225,68 @@ func TestMetricsRepositoryQueryAndRetentionDownsample(t *testing.T) {
 	}
 }
 
+func TestMetricsRetentionWaitsForCompleteBucketsAcrossNonAlignedRuns(t *testing.T) {
+	ctx := context.Background()
+	db := openMigratedStore(t, ctx)
+	defer closeStore(t, db)
+
+	repo := db.Metrics()
+	scope := runtimescope.Must("linux_native", "default")
+	firstNow := time.Date(2026, 7, 24, 12, 34, 45, 0, time.UTC)
+	bucket := time.Date(2026, 7, 24, 11, 34, 0, 0, time.UTC)
+	if err := repo.InsertBatch(ctx, []MetricsSampleRecord{
+		{
+			ProviderID: scope.ProviderID(), ContextName: scope.ContextName(), ContainerID: "c1",
+			CPUPercent: 10, SampledAt: bucket.Add(10 * time.Second),
+		},
+		{
+			ProviderID: scope.ProviderID(), ContextName: scope.ContextName(), ContainerID: "c1",
+			CPUPercent: 50, SampledAt: bucket.Add(50 * time.Second),
+		},
+	}); err != nil {
+		t.Fatalf("InsertBatch() error = %v", err)
+	}
+
+	if err := repo.RetainAndDownsampleWithRawRetention(ctx, firstNow, time.Hour); err != nil {
+		t.Fatalf("first RetainAndDownsampleWithRawRetention() error = %v", err)
+	}
+	beforeComplete, err := repo.QuerySeries(ctx, MetricsSeriesFilter{
+		Scope: scope, ContainerID: "c1", Resolution: MetricsResolution1m,
+		From: bucket, To: bucket.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("QuerySeries(before complete) error = %v", err)
+	}
+	if points := beforeComplete.Series[0].Points; len(points) != 0 {
+		t.Fatalf("partial minute was compacted early: %#v", points)
+	}
+
+	secondNow := time.Date(2026, 7, 24, 12, 35, 15, 0, time.UTC)
+	if err := repo.RetainAndDownsampleWithRawRetention(ctx, secondNow, time.Hour); err != nil {
+		t.Fatalf("second RetainAndDownsampleWithRawRetention() error = %v", err)
+	}
+	complete, err := repo.QuerySeries(ctx, MetricsSeriesFilter{
+		Scope: scope, ContainerID: "c1", Resolution: MetricsResolution1m,
+		From: bucket, To: bucket.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("QuerySeries(complete) error = %v", err)
+	}
+	if points := complete.Series[0].Points; len(points) != 1 || points[0].Value != 30 {
+		t.Fatalf("completed minute CPU points = %#v, want one average of 30", points)
+	}
+	raw, err := repo.QuerySeries(ctx, MetricsSeriesFilter{
+		Scope: scope, ContainerID: "c1", Resolution: MetricsResolutionRaw,
+		From: bucket, To: bucket.Add(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("QuerySeries(raw after compaction) error = %v", err)
+	}
+	if points := raw.Series[0].Points; len(points) != 0 {
+		t.Fatalf("completed raw bucket remained after compaction: %#v", points)
+	}
+}
+
 func TestMetricsRepositoryAppliesConfiguredRawRetention(t *testing.T) {
 	ctx := context.Background()
 	db := openMigratedStore(t, ctx)

@@ -128,6 +128,72 @@ func TestManagerSessionLimitAndClose(t *testing.T) {
 	}
 }
 
+func TestManagerTerminalWritesHonorCancellationAndStopJoinsWriter(t *testing.T) {
+	t.Parallel()
+	starter := &fakePTYStarter{}
+	manager := NewManager(fakeProvider{}, nil, nil, nil, Options{PTYStarter: starter})
+	info, err := manager.OpenHostTerminal(context.Background(), models.TerminalOptions{})
+	if err != nil {
+		t.Fatalf("OpenHostTerminal() error = %v", err)
+	}
+	pty := starter.last()
+	pty.writeStarted = make(chan struct{}, 1)
+	pty.writeBlock = make(chan struct{})
+
+	writeCtx, cancelWrite := context.WithCancel(context.Background())
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- manager.WriteTerminal(writeCtx, info.ID, []byte("blocked"))
+	}()
+	select {
+	case <-pty.writeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for terminal write to start")
+	}
+	cancelWrite()
+	select {
+	case err := <-writeDone:
+		if !apperror.IsCode(err, apperror.Cancelled) {
+			t.Fatalf("WriteTerminal() error = %v, want %s", err, apperror.Cancelled)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WriteTerminal() ignored context cancellation")
+	}
+
+	stopped := make(chan struct{})
+	go func() {
+		manager.StopAll()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(time.Second):
+		t.Fatal("StopAll() did not close and join the blocked terminal writer")
+	}
+	if _, err := manager.OpenHostTerminal(context.Background(), models.TerminalOptions{}); !apperror.IsCode(err, apperror.ProviderNotReady) {
+		t.Fatalf("OpenHostTerminal(after stop) error = %v, want %s", err, apperror.ProviderNotReady)
+	}
+}
+
+func TestManagerTerminalWriteRejectsOversizedInput(t *testing.T) {
+	t.Parallel()
+	starter := &fakePTYStarter{}
+	manager := NewManager(fakeProvider{}, nil, nil, nil, Options{PTYStarter: starter})
+	info, err := manager.OpenHostTerminal(context.Background(), models.TerminalOptions{})
+	if err != nil {
+		t.Fatalf("OpenHostTerminal() error = %v", err)
+	}
+	t.Cleanup(manager.StopAll)
+
+	err = manager.WriteTerminal(context.Background(), info.ID, make([]byte, maxTerminalWrite+1))
+	if !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("WriteTerminal(oversized) error = %v, want %s", err, apperror.Conflict)
+	}
+	if got := starter.last().written(); got != "" {
+		t.Fatalf("oversized terminal input reached the PTY: %q", got)
+	}
+}
+
 func TestManagerReservesCapacityBeforeConcurrentPTYStarts(t *testing.T) {
 	t.Parallel()
 	const (
@@ -762,16 +828,18 @@ func (s *fakePTYStarter) last() *fakePTYSession {
 }
 
 type fakePTYSession struct {
-	spec    PTYSpec
-	input   chan []byte
-	exited  chan int
-	closed  chan struct{}
-	once    sync.Once
-	mu      sync.Mutex
-	buf     []byte
-	writes  bytes.Buffer
-	resizes [][2]int
-	waits   int
+	spec         PTYSpec
+	input        chan []byte
+	exited       chan int
+	closed       chan struct{}
+	once         sync.Once
+	mu           sync.Mutex
+	buf          []byte
+	writes       bytes.Buffer
+	resizes      [][2]int
+	waits        int
+	writeBlock   chan struct{}
+	writeStarted chan struct{}
 }
 
 func newFakePTYSession(spec PTYSpec) *fakePTYSession {
@@ -808,6 +876,19 @@ func (s *fakePTYSession) Read(p []byte) (int, error) {
 }
 
 func (s *fakePTYSession) Write(p []byte) (int, error) {
+	if s.writeStarted != nil {
+		select {
+		case s.writeStarted <- struct{}{}:
+		default:
+		}
+	}
+	if s.writeBlock != nil {
+		select {
+		case <-s.writeBlock:
+		case <-s.closed:
+			return 0, io.ErrClosedPipe
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.writes.Write(p)

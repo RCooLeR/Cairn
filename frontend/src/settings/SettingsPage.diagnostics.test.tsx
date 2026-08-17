@@ -137,10 +137,6 @@ function createProps(
     message: null,
     onAuditFilterChange: vi.fn(),
     onAutostartChange: vi.fn(),
-    onColimaCPUChange: vi.fn(),
-    onColimaDiskGBChange: vi.fn(),
-    onColimaMemoryGBChange: vi.fn(),
-    onColimaProfileChange: vi.fn(),
     onDetect: vi.fn(),
     onOpenSetup: vi.fn(),
     onRefreshAudit: vi.fn(),
@@ -151,10 +147,10 @@ function createProps(
     onRegistryLogout: vi.fn(),
     onRegistryTest: vi.fn(),
     onRetrySettings: vi.fn(),
-    onSaveColimaCPU: vi.fn(),
-    onSaveColimaDiskGB: vi.fn(),
-    onSaveColimaMemoryGB: vi.fn(),
-    onSaveColimaProfile: vi.fn(),
+    onSaveColimaCPU: vi.fn(async () => true),
+    onSaveColimaDiskGB: vi.fn(async () => true),
+    onSaveColimaMemoryGB: vi.fn(async () => true),
+    onSaveColimaProfile: vi.fn(async () => true),
     onSaveWSLDistro: vi.fn(async () => true),
     onSectionChange: vi.fn(),
     onSettingChange: vi.fn(async () => true),
@@ -225,6 +221,26 @@ describe("SettingsPage diagnostic resources", () => {
     ).toBeInTheDocument();
   });
 
+  it("describes registry helper mode as fail-closed credential storage", () => {
+    render(<SettingsPage {...createProps({ section: "registries" })} />);
+
+    expect(
+      screen.getByRole("option", {
+        name: "Require Docker credential helper",
+      }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        /does not intentionally fall back to storing new secrets inline in config\.json/i,
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("option", {
+        name: "Prefer Docker credential helper",
+      }),
+    ).not.toBeInTheDocument();
+  });
+
   it("announces save completion and actionable save failures", () => {
     const props = createProps({
       message: "Settings saved successfully",
@@ -249,6 +265,36 @@ describe("SettingsPage diagnostic resources", () => {
       "role",
       "alert",
     );
+  });
+
+  it("deduplicates Colima Enter and blur saves and locks every field while saving", async () => {
+    const save = deferred<boolean>();
+    const onSaveColimaProfile = vi.fn(() => save.promise);
+    const props = createProps({
+      onSaveColimaProfile,
+      section: "providers",
+    });
+    const view = render(<SettingsPage {...props} />);
+    const profile = screen.getByRole("textbox", { name: "Profile" });
+
+    fireEvent.change(profile, { target: { value: "dev" } });
+    fireEvent.keyDown(profile, { key: "Enter" });
+
+    await waitFor(() =>
+      expect(onSaveColimaProfile).toHaveBeenCalledWith("dev"),
+    );
+    expect(onSaveColimaProfile).toHaveBeenCalledTimes(1);
+
+    view.rerender(<SettingsPage {...props} saving />);
+    expect(screen.getByRole("textbox", { name: "Profile" })).toBeDisabled();
+    expect(screen.getByRole("spinbutton", { name: "CPU" })).toBeDisabled();
+    expect(screen.getByRole("spinbutton", { name: "RAM GB" })).toBeDisabled();
+    expect(screen.getByRole("spinbutton", { name: "Disk GB" })).toBeDisabled();
+
+    await act(async () => {
+      save.resolve(true);
+      await save.promise;
+    });
   });
 
   it("preserves the focused setting input and caret when a delayed save normalizes its value", async () => {

@@ -205,6 +205,15 @@ func (s *UpdateService) CheckAllUpdates(ctx context.Context) (string, error) {
 	return s.Manager.CheckAllUpdates(ctx)
 }
 
+func (s *UpdateService) CancelJob(_ context.Context, jobID string) error {
+	unlock := s.lockRuntime()
+	defer unlock()
+	if s.Manager == nil {
+		return notReady()
+	}
+	return s.Manager.CancelJob(jobID)
+}
+
 func (s *UpdateService) CheckProjectUpdates(ctx context.Context, projectID string) ([]models.ImageUpdate, error) {
 	unlock := s.lockRuntime()
 	defer unlock()

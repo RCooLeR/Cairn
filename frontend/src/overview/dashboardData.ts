@@ -49,16 +49,14 @@ export function dashboardTopRows(
   latestSamples: Record<string, DashboardStatsSample>,
 ) {
   const liveRows = Object.values(latestSamples)
-    .map(
-      (sample): MetricRankItem => ({
-        id: sample.containerID,
-        name: sample.containerName || shortID(sample.containerID),
-        kind: "container",
-        cpuPercent: sample.cpuPercent,
-        gpuMemoryBytes: sample.gpuMemoryBytes ?? 0,
-        memoryBytes: sample.memoryBytes,
-      }),
-    )
+    .map((sample): MetricRankItem => ({
+      id: sample.containerID,
+      name: sample.containerName || shortID(sample.containerID),
+      kind: "container",
+      cpuPercent: sample.cpuPercent,
+      gpuMemoryBytes: sample.gpuMemoryBytes ?? 0,
+      memoryBytes: sample.memoryBytes,
+    }))
     .sort(
       (left, right) =>
         (right.gpuMemoryBytes ?? 0) - (left.gpuMemoryBytes ?? 0) ||

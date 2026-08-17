@@ -821,10 +821,47 @@ func (r *UpdateRepository) InsertHistoryInScope(ctx context.Context, scope runti
 	if !scope.Matches(record.ProviderID, record.ContextName) {
 		return 0, errors.New("update history does not belong to the runtime scope")
 	}
-	return r.insertHistory(ctx, record)
+	projectID := strings.TrimSpace(record.ProjectID)
+	if projectID == "" {
+		return 0, sql.ErrNoRows
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var exists int
+	if err := tx.QueryRowContext(ctx, `
+		SELECT 1
+		FROM projects
+		WHERE id = ? AND provider_id = ? AND context_name = ?
+	`, projectID, scope.ProviderID(), scope.ContextName()).Scan(&exists); err != nil {
+		return 0, err
+	}
+	if serviceID := strings.TrimSpace(record.ServiceID); serviceID != "" {
+		if err := tx.QueryRowContext(ctx, `
+			SELECT 1
+			FROM services
+			WHERE id = ? AND project_id = ?
+		`, serviceID, projectID).Scan(&exists); err != nil {
+			return 0, err
+		}
+	}
+	id, err := insertHistoryWithExec(ctx, tx, record)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return id, nil
 }
 
 func (r *UpdateRepository) insertHistory(ctx context.Context, record UpdateHistoryRecord) (int64, error) {
+	return insertHistoryWithExec(ctx, r.db, record)
+}
+
+func insertHistoryWithExec(ctx context.Context, exec projectExecContext, record UpdateHistoryRecord) (int64, error) {
 	if record.StartedAt.IsZero() {
 		record.StartedAt = time.Now().UTC()
 	}
@@ -835,7 +872,7 @@ func (r *UpdateRepository) insertHistory(ctx context.Context, record UpdateHisto
 	if len(record.Commands) > 0 {
 		commands = jsonText(record.Commands, "[]")
 	}
-	result, err := r.db.ExecContext(ctx, `
+	result, err := exec.ExecContext(ctx, `
 		INSERT INTO update_history (
 			provider_id, context_name, project_id, service_id, update_kind, image_ref, base_image_ref,
 			old_image_id, old_digest, old_base_digest, new_image_id, new_digest,
@@ -880,7 +917,10 @@ func (r *UpdateRepository) finishHistory(ctx context.Context, scope runtimescope
 			new_base_digest = COALESCE(NULLIF(?, ''), new_base_digest),
 			result = ?,
 			health_result = NULLIF(?, ''),
-			rollback_status = NULLIF(?, ''),
+			rollback_status = CASE
+				WHEN project_id IS NULL THEN 'unavailable'
+				ELSE NULLIF(?, '')
+			END,
 			finished_at = ?,
 			error = NULLIF(?, '')
 		WHERE id = ?`

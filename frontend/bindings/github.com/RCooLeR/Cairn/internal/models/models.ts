@@ -2223,6 +2223,7 @@ export class LogRuntimeDiagnostics {
 }
 
 export class LogStreamRequest {
+    "clientToken"?: string;
     "scope": string;
     "ids"?: string[];
     "follow": boolean;
@@ -2252,10 +2253,10 @@ export class LogStreamRequest {
      * Creates a new LogStreamRequest instance from a string or object.
      */
     static createFrom($$source: any = {}): LogStreamRequest {
-        const $$createField1_0 = $$createType1;
+        const $$createField2_0 = $$createType1;
         let $$parsedSource = typeof $$source === 'string' ? JSON.parse($$source) : $$source;
         if ("ids" in $$parsedSource) {
-            $$parsedSource["ids"] = $$createField1_0($$parsedSource["ids"]);
+            $$parsedSource["ids"] = $$createField2_0($$parsedSource["ids"]);
         }
         return new LogStreamRequest($$parsedSource as Partial<LogStreamRequest>);
     }

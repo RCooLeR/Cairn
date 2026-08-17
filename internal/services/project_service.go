@@ -19,12 +19,86 @@ import (
 	"github.com/RCooLeR/Cairn/internal/bus"
 	composecore "github.com/RCooLeR/Cairn/internal/compose"
 	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/projectconfig"
 	"github.com/RCooLeR/Cairn/internal/providers"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/store"
 )
 
 const maxCombinedCommandOutputBytes = 64 << 10
+
+// currentProjectMutationGeneration samples the project incarnation before a
+// caller reads project-owned state or constructs a confirmation plan.
+func currentProjectMutationGeneration(projects *store.ProjectRepository, scope runtimescope.Scope, projectID string) (uint64, error) {
+	if projects == nil || !scope.Valid() {
+		return 0, notReady()
+	}
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return 0, apperror.New(apperror.NotFound, "Project was not found")
+	}
+	generation, err := projects.ProjectOperationGeneration(scope, projectID)
+	if err != nil {
+		return 0, mapProjectMutationAdmissionError(err, false)
+	}
+	return generation, nil
+}
+
+// beginProjectMutation converts a generation probe into exclusive ownership.
+// Deletion can cancel the returned context and waits for releaseOperation.
+func beginProjectMutation(
+	ctx context.Context,
+	projects *store.ProjectRepository,
+	scope runtimescope.Scope,
+	projectID string,
+	expectedGeneration *uint64,
+) (context.Context, func(), error) {
+	projectID = strings.TrimSpace(projectID)
+	generation := uint64(0)
+	planned := expectedGeneration != nil
+	if planned {
+		generation = *expectedGeneration
+	} else {
+		var err error
+		generation, err = currentProjectMutationGeneration(projects, scope, projectID)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	operationCtx, releaseOperation, err := projects.BeginProjectOperation(ctx, scope, projectID, generation)
+	if err != nil {
+		return nil, nil, mapProjectMutationAdmissionError(err, planned)
+	}
+	return operationCtx, releaseOperation, nil
+}
+
+func mapProjectMutationAdmissionError(err error, planned bool) error {
+	switch {
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return err
+	case errors.Is(err, store.ErrProjectOperationInProgress):
+		return apperror.New(
+			apperror.Conflict,
+			"Another project mutation is already in progress",
+			apperror.WithRepairHints("Wait for the active project action to finish, then try again."),
+		)
+	case errors.Is(err, store.ErrProjectOperationSuperseded) && planned:
+		return apperror.New(
+			apperror.PlanExpired,
+			"Project plan was superseded by a newer project lifecycle revision",
+			apperror.WithRepairHints("Create and review a fresh plan before retrying."),
+		)
+	case errors.Is(err, store.ErrProjectOperationSuperseded):
+		return apperror.New(
+			apperror.Conflict,
+			"Project removal or another lifecycle change superseded this action",
+			apperror.WithRepairHints("Wait for the active project change to finish, then try again."),
+		)
+	default:
+		return apperror.Wrap(apperror.Internal, "Reserve project mutation failed", err)
+	}
+}
 
 func (s *ProjectService) ListProjects(ctx context.Context) ([]models.ProjectSummary, error) {
 	unlock := s.lockRuntime()
@@ -198,9 +272,6 @@ func (s *ProjectService) ImportProject(ctx context.Context, req models.ImportPro
 	s.publishImportJobProgress(jobID, projectID, "review", "Compose YAML valid: "+strconv.Itoa(len(config.Services))+" service(s)", progressPct(55))
 
 	now := s.now()
-	if err := s.Projects.UnforgetInScope(ctx, s.Scope, projectName, projectID); err != nil {
-		return fail(apperror.Wrap(apperror.Internal, "Import project failed", err))
-	}
 	project := store.ProjectRecord{
 		ID:           projectID,
 		ProviderID:   s.Scope.ProviderID(),
@@ -233,7 +304,7 @@ func (s *ProjectService) ImportProject(ctx context.Context, req models.ImportPro
 			LastSeenAt:     now,
 		})
 	}
-	if err := s.Projects.SaveSnapshot(ctx, s.Scope, []store.ProjectRecord{project}, services, now, time.Time{}); err != nil {
+	if err := s.Projects.SaveImportedSnapshotInScope(ctx, s.Scope, project, services, now); err != nil {
 		if store.IsProjectScopeConflict(err) {
 			return fail(apperror.New(apperror.Conflict, "A project with this legacy ID already belongs to another runtime context", apperror.WithCause(err)))
 		}
@@ -259,11 +330,7 @@ func (s *ProjectService) RemoveProjectFromList(ctx context.Context, projectID st
 		return mapStoreNotFound(err, "Project was not found")
 	}
 	started := time.Now().UTC()
-	if err := s.Projects.Forget(ctx, project, started); err != nil {
-		_ = s.recordProjectAudit(ctx, project, "remove_from_list", "", models.RiskSafe, "failed", time.Since(started), err)
-		return apperror.Wrap(apperror.Internal, "Remove project from list failed", err)
-	}
-	if err := s.Projects.DeleteInScope(ctx, s.Scope, projectID); err != nil {
+	if err := s.Projects.ForgetAndDeleteInScope(ctx, s.Scope, projectID, started); err != nil {
 		_ = s.recordProjectAudit(ctx, project, "remove_from_list", "", models.RiskSafe, "failed", time.Since(started), err)
 		return mapStoreNotFound(err, "Project was not found")
 	}
@@ -296,25 +363,25 @@ func (s *ProjectService) RefreshProjects(ctx context.Context) ([]models.ProjectS
 func (s *ProjectService) StartProject(ctx context.Context, projectID string) error {
 	unlock := s.lockRuntime()
 	defer unlock()
-	return s.runProjectAction(ctx, security.ProjectActionStart, projectID, false, nil, "")
+	return s.runProjectAction(ctx, security.ProjectActionStart, projectID, false, nil, "", nil, "")
 }
 
 func (s *ProjectService) StopProject(ctx context.Context, projectID string) error {
 	unlock := s.lockRuntime()
 	defer unlock()
-	return s.runProjectAction(ctx, security.ProjectActionStop, projectID, false, nil, "")
+	return s.runProjectAction(ctx, security.ProjectActionStop, projectID, false, nil, "", nil, "")
 }
 
 func (s *ProjectService) RestartProject(ctx context.Context, projectID string) error {
 	unlock := s.lockRuntime()
 	defer unlock()
-	return s.runProjectAction(ctx, security.ProjectActionRestart, projectID, false, nil, "")
+	return s.runProjectAction(ctx, security.ProjectActionRestart, projectID, false, nil, "", nil, "")
 }
 
 func (s *ProjectService) PullProject(ctx context.Context, projectID string) error {
 	unlock := s.lockRuntime()
 	defer unlock()
-	return s.runProjectAction(ctx, security.ProjectActionPull, projectID, false, nil, "")
+	return s.runProjectAction(ctx, security.ProjectActionPull, projectID, false, nil, "", nil, "")
 }
 
 func (s *ProjectService) PlanRedeployProject(ctx context.Context, projectID string) (*models.CommandPlan, error) {
@@ -343,10 +410,7 @@ func (s *ProjectService) ApplyProjectPlan(ctx context.Context, planID string, ty
 	if !plan.Scope.Equal(s.Scope) {
 		return apperror.New(apperror.NotFound, "Project plan was not created for the active runtime context")
 	}
-	if _, err := s.projectRecordForCurrentContext(ctx, plan.ProjectID); err != nil {
-		return err
-	}
-	return s.runProjectAction(ctx, plan.Action, plan.ProjectID, plan.RemoveVolumes, &plan.Plan, jobID)
+	return s.runProjectAction(ctx, plan.Action, plan.ProjectID, plan.RemoveVolumes, &plan.Plan, jobID, &plan.ProjectGeneration, plan.ProjectFingerprint)
 }
 
 func (s *ComposeService) Config(ctx context.Context, projectID string) (*models.ComposeConfigResult, error) {
@@ -399,48 +463,61 @@ func (s *ComposeService) Ps(ctx context.Context, projectID string) ([]models.Com
 func (s *ComposeService) StartServices(ctx context.Context, projectID string, services []string) error {
 	unlock := s.lockRuntime()
 	defer unlock()
-	project, serviceNames, err := s.projectForServiceAction(ctx, projectID, services)
-	if err != nil {
-		return err
-	}
-	return s.runComposeServiceAction(ctx, project, "service.start", composeServiceCommandDisplay(project, "start", serviceNames, 0), func() (*providers.CommandResult, error) {
-		return s.Client.StartServices(ctx, composeOptionsFromProject(project), serviceNames)
+	return s.runComposeServiceMutation(ctx, projectID, services, "service.start", "start", 0, func(operationCtx context.Context, project store.ProjectRecord, serviceNames []string) (*providers.CommandResult, error) {
+		return s.Client.StartServices(operationCtx, composeOptionsFromProject(project), serviceNames)
 	})
 }
 
 func (s *ComposeService) StopServices(ctx context.Context, projectID string, services []string) error {
 	unlock := s.lockRuntime()
 	defer unlock()
-	project, serviceNames, err := s.projectForServiceAction(ctx, projectID, services)
-	if err != nil {
-		return err
-	}
-	return s.runComposeServiceAction(ctx, project, "service.stop", composeServiceCommandDisplay(project, "stop", serviceNames, 0), func() (*providers.CommandResult, error) {
-		return s.Client.StopServices(ctx, composeOptionsFromProject(project), serviceNames)
+	return s.runComposeServiceMutation(ctx, projectID, services, "service.stop", "stop", 0, func(operationCtx context.Context, project store.ProjectRecord, serviceNames []string) (*providers.CommandResult, error) {
+		return s.Client.StopServices(operationCtx, composeOptionsFromProject(project), serviceNames)
 	})
 }
 
 func (s *ComposeService) RestartServices(ctx context.Context, projectID string, services []string) error {
 	unlock := s.lockRuntime()
 	defer unlock()
-	project, serviceNames, err := s.projectForServiceAction(ctx, projectID, services)
-	if err != nil {
-		return err
-	}
-	return s.runComposeServiceAction(ctx, project, "service.restart", composeServiceCommandDisplay(project, "restart", serviceNames, 0), func() (*providers.CommandResult, error) {
-		return s.Client.RestartServices(ctx, composeOptionsFromProject(project), serviceNames)
+	return s.runComposeServiceMutation(ctx, projectID, services, "service.restart", "restart", 0, func(operationCtx context.Context, project store.ProjectRecord, serviceNames []string) (*providers.CommandResult, error) {
+		return s.Client.RestartServices(operationCtx, composeOptionsFromProject(project), serviceNames)
 	})
 }
 
 func (s *ComposeService) ScaleService(ctx context.Context, projectID string, service string, replicas int) error {
 	unlock := s.lockRuntime()
 	defer unlock()
-	project, serviceNames, err := s.projectForServiceAction(ctx, projectID, []string{service})
+	return s.runComposeServiceMutation(ctx, projectID, []string{service}, "service.scale", "scale", replicas, func(operationCtx context.Context, project store.ProjectRecord, serviceNames []string) (*providers.CommandResult, error) {
+		return s.Client.ScaleService(operationCtx, composeOptionsFromProject(project), serviceNames[0], replicas)
+	})
+}
+
+func (s *ComposeService) runComposeServiceMutation(
+	ctx context.Context,
+	projectID string,
+	requested []string,
+	action string,
+	composeAction string,
+	replicas int,
+	run func(context.Context, store.ProjectRecord, []string) (*providers.CommandResult, error),
+) error {
+	if s.Client == nil || s.Projects == nil || !s.Scope.Valid() {
+		return notReady()
+	}
+	projectID = strings.TrimSpace(projectID)
+	operationCtx, releaseOperation, err := beginProjectMutation(ctx, s.Projects, s.Scope, projectID, nil)
 	if err != nil {
 		return err
 	}
-	return s.runComposeServiceAction(ctx, project, "service.scale", composeServiceCommandDisplay(project, "scale", serviceNames, replicas), func() (*providers.CommandResult, error) {
-		return s.Client.ScaleService(ctx, composeOptionsFromProject(project), serviceNames[0], replicas)
+	defer releaseOperation()
+
+	project, serviceNames, err := s.projectForServiceAction(operationCtx, projectID, requested)
+	if err != nil {
+		return err
+	}
+	command := composeServiceCommandDisplay(project, composeAction, serviceNames, replicas)
+	return s.runComposeServiceAction(operationCtx, project, action, command, func() (*providers.CommandResult, error) {
+		return run(operationCtx, project, serviceNames)
 	})
 }
 
@@ -536,7 +613,7 @@ func (s *ComposeService) publishJobDone(jobID string, result string, actionErr e
 	if actionErr != nil {
 		payload.Error = actionErr.Error()
 	}
-	s.Events.Publish(bus.Event{Topic: bus.TopicJobDone, Payload: payload})
+	publishCriticalEvent(s.Events, bus.Event{Topic: bus.TopicJobDone, Payload: payload})
 }
 
 func (s *ComposeService) projectForServiceAction(ctx context.Context, projectID string, requested []string) (store.ProjectRecord, []string, error) {
@@ -718,7 +795,73 @@ func composeOptionsFromProject(project store.ProjectRecord) composecore.ProjectO
 	}
 }
 
+func (s *ProjectService) projectActionConfigurationFingerprint(ctx context.Context, project store.ProjectRecord, includeConfigInputs bool) (string, error) {
+	services, err := s.Projects.ListServices(ctx, project.ID)
+	if err != nil {
+		return "", apperror.Wrap(apperror.Internal, "Read project services for action confirmation failed", err)
+	}
+	configInputs := ""
+	if includeConfigInputs {
+		configInputs, err = composecore.FingerprintConfigInputs(ctx, composeOptionsFromProject(project))
+		if err != nil {
+			return "", err
+		}
+	}
+	fingerprint, err := projectconfig.Fingerprint(project, services, configInputs)
+	if err != nil {
+		return "", apperror.Wrap(apperror.Internal, "Fingerprint project action configuration failed", err)
+	}
+	return fingerprint, nil
+}
+
+func (s *ProjectService) validateProjectActionConfigurationFingerprint(
+	ctx context.Context,
+	project store.ProjectRecord,
+	expected string,
+	includeConfigInputs bool,
+) error {
+	if strings.TrimSpace(expected) == "" {
+		return staleProjectActionPlanError(nil)
+	}
+	actual, err := s.projectActionConfigurationFingerprint(ctx, project, includeConfigInputs)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		if apperror.IsCode(err, apperror.Internal) {
+			return err
+		}
+		return staleProjectActionPlanError(err)
+	}
+	if actual != expected {
+		return staleProjectActionPlanError(nil)
+	}
+	return nil
+}
+
+func staleProjectActionPlanError(cause error) error {
+	options := []apperror.Option{
+		apperror.WithRepairHints("Create and review a fresh project plan before retrying."),
+	}
+	if cause != nil {
+		options = append(options, apperror.WithCause(cause))
+	}
+	return apperror.New(
+		apperror.PlanExpired,
+		"Project plan expired because the project configuration or Compose inputs changed",
+		options...,
+	)
+}
+
 func (s *ProjectService) planProjectAction(ctx context.Context, action string, projectID string, removeVolumes bool) (*models.CommandPlan, error) {
+	if s.Projects == nil || !s.Scope.Valid() {
+		return nil, notReady()
+	}
+	projectID = strings.TrimSpace(projectID)
+	projectGeneration, err := currentProjectMutationGeneration(s.Projects, s.Scope, projectID)
+	if err != nil {
+		return nil, err
+	}
 	project, err := s.projectForAction(ctx, projectID)
 	if err != nil {
 		if action != security.ProjectActionDown || !apperror.IsCode(err, apperror.WorkdirMissing) {
@@ -735,6 +878,10 @@ func (s *ProjectService) planProjectAction(ctx context.Context, action string, p
 		if len(containers) == 0 {
 			return nil, apperror.New(apperror.NotFound, "No project containers were found", apperror.WithDetail(project.ID))
 		}
+		projectFingerprint, err := s.projectActionConfigurationFingerprint(ctx, project, false)
+		if err != nil {
+			return nil, err
+		}
 		plan, err := newStaleProjectDownPlan(project, containers, removeVolumes, s.now(), s.IDs)
 		if err != nil {
 			return nil, err
@@ -743,10 +890,16 @@ func (s *ProjectService) planProjectAction(ctx context.Context, action string, p
 		if err != nil {
 			return nil, err
 		}
+		projectPlan.ProjectGeneration = projectGeneration
+		projectPlan.ProjectFingerprint = projectFingerprint
 		if err := s.projectPlanStore().Save(projectPlan); err != nil {
 			return nil, err
 		}
 		return &plan, nil
+	}
+	projectFingerprint, err := s.projectActionConfigurationFingerprint(ctx, project, true)
+	if err != nil {
+		return nil, err
 	}
 	plan, err := newProjectCommandPlan(project, action, removeVolumes, s.now(), s.IDs)
 	if err != nil {
@@ -756,23 +909,45 @@ func (s *ProjectService) planProjectAction(ctx context.Context, action string, p
 	if err != nil {
 		return nil, err
 	}
+	projectPlan.ProjectGeneration = projectGeneration
+	projectPlan.ProjectFingerprint = projectFingerprint
 	if err := s.projectPlanStore().Save(projectPlan); err != nil {
 		return nil, err
 	}
 	return &plan, nil
 }
 
-func (s *ProjectService) runProjectAction(ctx context.Context, action string, projectID string, removeVolumes bool, planned *models.CommandPlan, jobID string) error {
-	project, err := s.projectForAction(ctx, projectID)
+func (s *ProjectService) runProjectAction(ctx context.Context, action string, projectID string, removeVolumes bool, planned *models.CommandPlan, jobID string, expectedGeneration *uint64, expectedFingerprint string) error {
+	if s.Projects == nil || !s.Scope.Valid() {
+		return notReady()
+	}
+	projectID = strings.TrimSpace(projectID)
+	operationCtx, releaseOperation, err := beginProjectMutation(ctx, s.Projects, s.Scope, projectID, expectedGeneration)
+	if err != nil {
+		return err
+	}
+	defer releaseOperation()
+
+	project, err := s.projectForAction(operationCtx, projectID)
 	if err != nil {
 		if !apperror.IsCode(err, apperror.WorkdirMissing) || (action != security.ProjectActionStop && action != security.ProjectActionDown) {
 			return err
 		}
-		project, err = s.projectRecordForCurrentContext(ctx, projectID)
+		project, err = s.projectRecordForCurrentContext(operationCtx, projectID)
 		if err != nil {
 			return err
 		}
-		return s.runStaleProjectContainerAction(ctx, action, project, removeVolumes, planned, jobID)
+		if expectedGeneration != nil {
+			if err := s.validateProjectActionConfigurationFingerprint(operationCtx, project, expectedFingerprint, false); err != nil {
+				return err
+			}
+		}
+		return s.runStaleProjectContainerAction(operationCtx, action, project, removeVolumes, planned, jobID)
+	}
+	if expectedGeneration != nil {
+		if err := s.validateProjectActionConfigurationFingerprint(operationCtx, project, expectedFingerprint, true); err != nil {
+			return err
+		}
 	}
 	plan := planned
 	if plan == nil {
@@ -793,25 +968,25 @@ func (s *ProjectService) runProjectAction(ctx context.Context, action string, pr
 		}
 	}
 	started := time.Now().UTC()
-	if err := s.recordProjectAudit(ctx, project, action, command, plan.Risk, "started", 0, nil); err != nil {
+	if err := s.recordProjectAudit(operationCtx, project, action, command, plan.Risk, "started", 0, nil); err != nil {
 		return err
 	}
 	s.publishProjectJobProgress(jobID, project.ID, action, command, "running", command, nil)
 
-	result, err := s.executeProjectAction(ctx, action, project, removeVolumes)
+	result, err := s.executeProjectAction(operationCtx, action, project, removeVolumes)
 	duration := time.Since(started)
 	s.publishProjectComposeOutput(jobID, project.ID, action, command, result)
 	if err != nil {
-		_ = s.recordProjectAudit(ctx, project, action, command, plan.Risk, "failed", duration, err)
+		_ = s.recordProjectAudit(operationCtx, project, action, command, plan.Risk, "failed", duration, err)
 		s.publishProjectJobDone(jobID, project.ID, action, command, "", err)
 		return err
 	}
-	if err := s.recordProjectAudit(ctx, project, action, command, plan.Risk, "success", duration, nil); err != nil {
+	if err := s.recordProjectAudit(operationCtx, project, action, command, plan.Risk, "success", duration, nil); err != nil {
 		return err
 	}
 	s.publishProjectJobDone(jobID, project.ID, action, command, "success", nil)
 	if s.Detector != nil {
-		_, _ = s.Detector.Reconcile(ctx)
+		_, _ = s.Detector.Reconcile(operationCtx)
 	}
 	if s.Events != nil {
 		s.Events.Publish(bus.Event{Topic: bus.TopicProjectChanged, Payload: map[string]any{"projectID": project.ID, "action": action}})
@@ -1401,7 +1576,7 @@ func (s *ProjectService) publishImportJobDone(jobID string, projectID string, re
 	if actionErr != nil {
 		payload.Error = actionErr.Error()
 	}
-	s.Events.Publish(bus.Event{Topic: bus.TopicJobDone, Payload: payload})
+	publishCriticalEvent(s.Events, bus.Event{Topic: bus.TopicJobDone, Payload: payload})
 }
 
 func (s *ProjectService) publishProjectJobProgress(jobID string, projectID string, action string, command string, phase string, message string, pct *float64) {
@@ -1434,7 +1609,7 @@ func (s *ProjectService) publishProjectJobDone(jobID string, projectID string, a
 	if actionErr != nil {
 		payload.Error = actionErr.Error()
 	}
-	s.Events.Publish(bus.Event{Topic: bus.TopicJobDone, Payload: payload})
+	publishCriticalEvent(s.Events, bus.Event{Topic: bus.TopicJobDone, Payload: payload})
 }
 
 func (s *ProjectService) publishJobDone(jobID string, result string, actionErr error) {
@@ -1445,7 +1620,7 @@ func (s *ProjectService) publishJobDone(jobID string, result string, actionErr e
 	if actionErr != nil {
 		payload.Error = actionErr.Error()
 	}
-	s.Events.Publish(bus.Event{Topic: bus.TopicJobDone, Payload: payload})
+	publishCriticalEvent(s.Events, bus.Event{Topic: bus.TopicJobDone, Payload: payload})
 }
 
 func (s *ProjectService) projectPlanStore() *security.ProjectPlanStore {

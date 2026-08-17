@@ -57,7 +57,7 @@ function ConvertFrom-JsonStream {
     return $objects
 }
 
-$output = & go run golang.org/x/vuln/cmd/govulncheck@v1.3.0 -format json @Pattern 2>&1
+$output = & go run golang.org/x/vuln/cmd/govulncheck@v1.7.0 -format json @Pattern 2>&1
 $govulnExitCode = $LASTEXITCODE
 $outputText = ($output | Out-String)
 

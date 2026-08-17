@@ -4,9 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,11 +36,13 @@ func TestManagerStopAllCancelsManagedJobs(t *testing.T) {
 	manager := NewManager(nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	started := make(chan struct{})
 	done := make(chan error, 1)
-	manager.startJob("updates-test", func(ctx context.Context) {
+	if !manager.startJob("updates-test", func(ctx context.Context) {
 		close(started)
 		<-ctx.Done()
 		done <- ctx.Err()
-	})
+	}) {
+		t.Fatal("startJob() rejected an active manager")
+	}
 	select {
 	case <-started:
 	case <-time.After(2 * time.Second):
@@ -51,6 +56,82 @@ func TestManagerStopAllCancelsManagedJobs(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for managed job cancellation")
+	}
+}
+
+func TestManagerCancelJobCancelsOnlyTheRequestedManagedJob(t *testing.T) {
+	t.Parallel()
+	manager := NewManager(nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	firstStarted := make(chan struct{})
+	firstDone := make(chan error, 1)
+	secondStarted := make(chan struct{})
+	secondDone := make(chan error, 1)
+	if !manager.startJob("updates-first", func(ctx context.Context) {
+		close(firstStarted)
+		<-ctx.Done()
+		firstDone <- ctx.Err()
+	}) {
+		t.Fatal("startJob(first) rejected an active manager")
+	}
+	if !manager.startJob("updates-second", func(ctx context.Context) {
+		close(secondStarted)
+		<-ctx.Done()
+		secondDone <- ctx.Err()
+	}) {
+		t.Fatal("startJob(second) rejected an active manager")
+	}
+	t.Cleanup(manager.StopAll)
+
+	for _, started := range []<-chan struct{}{firstStarted, secondStarted} {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("timed out waiting for managed job to start")
+		}
+	}
+	if err := manager.CancelJob("updates-first"); err != nil {
+		t.Fatalf("CancelJob(first) error = %v", err)
+	}
+	select {
+	case err := <-firstDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("first job context error = %v, want context canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for requested job cancellation")
+	}
+	select {
+	case err := <-secondDone:
+		t.Fatalf("unrequested job was canceled: %v", err)
+	default:
+	}
+	if err := manager.CancelJob("missing"); !apperror.IsCode(err, apperror.NotFound) {
+		t.Fatalf("CancelJob(missing) error = %v, want NotFound", err)
+	}
+}
+
+func TestManagerStopAllJoinsJobsAndRejectsNewAdmission(t *testing.T) {
+	t.Parallel()
+	manager := NewManager(nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	started := make(chan struct{})
+	returned := make(chan struct{})
+	if !manager.startJob("updates-join", func(ctx context.Context) {
+		close(started)
+		<-ctx.Done()
+		close(returned)
+	}) {
+		t.Fatal("startJob() rejected an active manager")
+	}
+	<-started
+
+	manager.StopAll()
+	select {
+	case <-returned:
+	default:
+		t.Fatal("StopAll() returned before the canceled worker exited")
+	}
+	if manager.startJob("updates-late", func(context.Context) {}) {
+		t.Fatal("startJob() admitted work after StopAll")
 	}
 }
 
@@ -798,6 +879,805 @@ func TestManagerApplyUpdateRevalidatesPlanRuntimeScope(t *testing.T) {
 	}
 }
 
+func TestManagerApplyUpdateRejectsPlanFromDeletedProjectIncarnation(t *testing.T) {
+	ctx := context.Background()
+	db := openUpdatesStore(t)
+	scope := runtimescope.Must("linux_native", "default")
+	projectID := "linux_native/reincarnated-plan"
+	service := serviceRecord(projectID, "web", "nginx:1.25", "")
+	seedUpdateProject(t, ctx, db, projectID, []store.ServiceRecord{service})
+	insertCheck(t, ctx, db, store.UpdateCheckRecord{
+		ProviderID:        scope.ProviderID(),
+		ContextName:       scope.ContextName(),
+		ProjectID:         projectID,
+		ServiceID:         service.ID,
+		Kind:              models.UpdateKindServiceImage,
+		ImageRef:          service.ImageRef,
+		LocalDigest:       digestA,
+		RemoteDigest:      digestB,
+		RecommendedAction: models.RecommendedActionPullRecreate,
+		Status:            models.UpdateStatusServiceImageUpdateAvailable,
+	})
+	compose := &fakeUpdateCompose{}
+	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), fakeImages{}, &fakeRegistry{}, db.Settings(), nil, nil)
+	manager.Scope = scope
+	manager.Compose = compose
+	plan, err := manager.PlanProjectUpdate(ctx, projectID)
+	if err != nil {
+		t.Fatalf("PlanProjectUpdate() error = %v", err)
+	}
+	project, err := db.Projects().GetInScope(ctx, scope, projectID)
+	if err != nil {
+		t.Fatalf("GetInScope() error = %v", err)
+	}
+	if err := db.Projects().DeleteInScope(ctx, scope, projectID); err != nil {
+		t.Fatalf("DeleteInScope() error = %v", err)
+	}
+	project.LastSeenAt = project.LastSeenAt.Add(time.Hour)
+	service.LastSeenAt = project.LastSeenAt
+	if err := db.Projects().SaveSnapshot(ctx, scope, []store.ProjectRecord{project}, []store.ServiceRecord{service}, project.LastSeenAt, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot(reimport) error = %v", err)
+	}
+	if _, err := manager.ApplyUpdate(ctx, models.ApplyUpdateRequest{PlanID: plan.PlanID}); !apperror.IsCode(err, apperror.PlanExpired) {
+		t.Fatalf("ApplyUpdate(old incarnation plan) error = %v, want PlanExpired", err)
+	}
+	if len(compose.calls) != 0 {
+		t.Fatalf("Compose ran for old incarnation plan: %#v", compose.calls)
+	}
+}
+
+func TestManagerProjectMutationAdmissionIsExclusiveAndInvalidatesPreexistingPlans(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	db := openUpdatesStore(t)
+	scope := runtimescope.Must("linux_native", "default")
+	projectID := "linux_native/exclusive-update"
+	service := serviceRecord(projectID, "web", "nginx:1.25", "")
+	seedUpdateProject(t, ctx, db, projectID, []store.ServiceRecord{service})
+	insertCheck(t, ctx, db, store.UpdateCheckRecord{
+		ProviderID:        scope.ProviderID(),
+		ContextName:       scope.ContextName(),
+		ProjectID:         projectID,
+		ServiceID:         service.ID,
+		Kind:              models.UpdateKindServiceImage,
+		ImageRef:          service.ImageRef,
+		LocalImageID:      "sha256:old",
+		LocalDigest:       digestA,
+		RemoteDigest:      digestB,
+		RecommendedAction: models.RecommendedActionPullRecreate,
+		Status:            models.UpdateStatusServiceImageUpdateAvailable,
+	})
+	historyID, err := db.Updates().InsertHistoryInScope(ctx, scope, store.UpdateHistoryRecord{
+		ProviderID:     scope.ProviderID(),
+		ContextName:    scope.ContextName(),
+		ProjectID:      projectID,
+		ServiceID:      service.ID,
+		UpdateKind:     models.UpdateKindServiceImage,
+		ImageRef:       service.ImageRef,
+		OldImageID:     "sha256:rollback-old",
+		OldDigest:      digestA,
+		NewImageID:     "sha256:rollback-new",
+		NewDigest:      digestB,
+		Result:         updateResultSuccess,
+		RollbackStatus: rollbackStatusAvailable,
+		StartedAt:      time.Now().UTC().Add(-time.Minute),
+		FinishedAt:     time.Now().UTC().Add(-30 * time.Second),
+	})
+	if err != nil {
+		t.Fatalf("InsertHistoryInScope() error = %v", err)
+	}
+
+	eventBus := bus.New()
+	t.Cleanup(eventBus.Close)
+	doneEvents := eventBus.Subscribe(ctx, bus.TopicJobDone, 4)
+	compose := newBlockingUpdateCompose()
+	docker := &fakeUpdateDocker{images: map[string]*models.ImageDetail{
+		"sha256:rollback-old": imageDetail("sha256:rollback-old", "docker.io/library/nginx@"+digestA),
+	}}
+	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), docker, &fakeRegistry{}, db.Settings(), eventBus, nil)
+	manager.Scope = scope
+	manager.Compose = compose
+	t.Cleanup(manager.StopAll)
+
+	plans := make([]*models.UpdatePlan, 3)
+	for i := range plans {
+		plan, err := manager.PlanProjectUpdate(ctx, projectID)
+		if err != nil {
+			t.Fatalf("PlanProjectUpdate(%d) error = %v", i, err)
+		}
+		plans[i] = plan
+	}
+	rollbackPlan, err := manager.PlanRollback(ctx, historyID)
+	if err != nil {
+		t.Fatalf("PlanRollback() error = %v", err)
+	}
+	jobID, err := manager.ApplyUpdate(ctx, models.ApplyUpdateRequest{PlanID: plans[0].PlanID})
+	if err != nil {
+		t.Fatalf("ApplyUpdate(first) error = %v", err)
+	}
+	select {
+	case <-compose.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first project mutation")
+	}
+
+	if _, err := manager.PlanProjectUpdate(ctx, projectID); !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("PlanProjectUpdate(active mutation) error = %v, want Conflict", err)
+	}
+	if _, err := manager.ApplyUpdate(ctx, models.ApplyUpdateRequest{PlanID: plans[1].PlanID}); !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("ApplyUpdate(concurrent plan) error = %v, want Conflict", err)
+	}
+	if _, err := manager.ApplyRollback(ctx, rollbackPlan.PlanID); !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("ApplyRollback(concurrent plan) error = %v, want Conflict", err)
+	}
+	if err := manager.CancelJob(jobID); err != nil {
+		t.Fatalf("CancelJob(first) error = %v", err)
+	}
+	select {
+	case <-compose.returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for canceled mutation to return")
+	}
+	waitUpdateDone(t, doneEvents, updateResultFailed)
+
+	if _, err := manager.ApplyUpdate(ctx, models.ApplyUpdateRequest{PlanID: plans[2].PlanID}); !apperror.IsCode(err, apperror.PlanExpired) {
+		t.Fatalf("ApplyUpdate(preexisting plan after mutation) error = %v, want PlanExpired", err)
+	}
+	if got := compose.Calls(); strings.Join(got, ",") != "pull:web" {
+		t.Fatalf("Compose calls = %#v, want one admitted mutation", got)
+	}
+}
+
+func TestManagerApplyUpdateRejectsChangedConfirmedConfiguration(t *testing.T) {
+	for _, testCase := range []struct {
+		name   string
+		mutate func(*store.ProjectRecord, []store.ServiceRecord, *testing.T)
+	}{
+		{
+			name: "compose target",
+			mutate: func(project *store.ProjectRecord, _ []store.ServiceRecord, t *testing.T) {
+				project.WorkingDir = t.TempDir()
+				project.ComposeFiles = []string{"compose.changed.yaml"}
+			},
+		},
+		{
+			name: "service configuration",
+			mutate: func(_ *store.ProjectRecord, services []store.ServiceRecord, _ *testing.T) {
+				services[0].ImageRef = "nginx:1.26"
+				services[0].BuildTarget = "changed"
+			},
+		},
+		{
+			name: "compose input closure",
+			mutate: func(project *store.ProjectRecord, _ []store.ServiceRecord, t *testing.T) {
+				path := filepath.Join(project.WorkingDir, "compose.yaml")
+				if err := os.WriteFile(path, []byte("services:\n  web:\n    image: nginx:1.26\n"), 0o600); err != nil {
+					t.Fatalf("mutate Compose input: %v", err)
+				}
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			ctx := context.Background()
+			db := openUpdatesStore(t)
+			scope := runtimescope.Must("linux_native", "default")
+			projectID := "linux_native/fingerprint-" + strings.ReplaceAll(testCase.name, " ", "-")
+			service := serviceRecord(projectID, "web", "nginx:1.25", "")
+			seedUpdateProject(t, ctx, db, projectID, []store.ServiceRecord{service})
+			insertCheck(t, ctx, db, store.UpdateCheckRecord{
+				ProviderID:        scope.ProviderID(),
+				ContextName:       scope.ContextName(),
+				ProjectID:         projectID,
+				ServiceID:         service.ID,
+				Kind:              models.UpdateKindServiceImage,
+				ImageRef:          service.ImageRef,
+				LocalDigest:       digestA,
+				RemoteDigest:      digestB,
+				RecommendedAction: models.RecommendedActionPullRecreate,
+				Status:            models.UpdateStatusServiceImageUpdateAvailable,
+			})
+			compose := &fakeUpdateCompose{}
+			manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), fakeImages{}, &fakeRegistry{}, db.Settings(), nil, nil)
+			manager.Scope = scope
+			manager.Compose = compose
+
+			plan, err := manager.PlanProjectUpdate(ctx, projectID)
+			if err != nil {
+				t.Fatalf("PlanProjectUpdate() error = %v", err)
+			}
+			project, services, err := manager.projectWithServices(ctx, projectID)
+			if err != nil {
+				t.Fatalf("projectWithServices() error = %v", err)
+			}
+			testCase.mutate(&project, services, t)
+			project.LastSeenAt = project.LastSeenAt.Add(time.Minute)
+			for i := range services {
+				services[i].LastSeenAt = project.LastSeenAt
+			}
+			if err := db.Projects().SaveSnapshot(ctx, scope, []store.ProjectRecord{project}, services, project.LastSeenAt, time.Time{}); err != nil {
+				t.Fatalf("SaveSnapshot(changed configuration) error = %v", err)
+			}
+
+			if _, err := manager.ApplyUpdate(ctx, models.ApplyUpdateRequest{PlanID: plan.PlanID}); !apperror.IsCode(err, apperror.PlanExpired) {
+				t.Fatalf("ApplyUpdate(changed configuration) error = %v, want PlanExpired", err)
+			}
+			if len(compose.calls) != 0 {
+				t.Fatalf("Compose ran after configuration changed: %#v", compose.calls)
+			}
+		})
+	}
+}
+
+func TestManagerPlanUpdateClassifiesUnverifiableComposeInputs(t *testing.T) {
+	ctx := context.Background()
+	db := openUpdatesStore(t)
+	scope := runtimescope.Must("linux_native", "default")
+	projectID := "linux_native/unverifiable-compose"
+	seedUpdateProject(t, ctx, db, projectID, []store.ServiceRecord{serviceRecord(projectID, "web", "nginx:1.25", "")})
+	project, err := db.Projects().GetInScope(ctx, scope, projectID)
+	if err != nil {
+		t.Fatalf("GetInScope(project) error = %v", err)
+	}
+	if err := os.Remove(filepath.Join(project.WorkingDir, "compose.yaml")); err != nil {
+		t.Fatalf("remove Compose fixture: %v", err)
+	}
+	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), fakeImages{}, &fakeRegistry{}, db.Settings(), nil, nil)
+	manager.Scope = scope
+
+	_, err = manager.PlanProjectUpdate(ctx, projectID)
+	if !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("PlanProjectUpdate(missing Compose input) error = %v, want Conflict", err)
+	}
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) || len(appErr.RepairHints) == 0 {
+		t.Fatalf("PlanProjectUpdate(missing Compose input) error = %#v, want repair hint", err)
+	}
+	if strings.Contains(err.Error(), project.WorkingDir) {
+		t.Fatalf("public error leaked Compose path: %v", err)
+	}
+}
+
+func TestManagerUpdateWorkerRevalidatesComposeInputsAfterBackup(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	db := openUpdatesStore(t)
+	scope := runtimescope.Must("linux_native", "default")
+	projectID := "linux_native/worker-fingerprint"
+	service := serviceRecord(projectID, "web", "nginx:1.25", "")
+	seedUpdateProject(t, ctx, db, projectID, []store.ServiceRecord{service})
+	insertCheck(t, ctx, db, store.UpdateCheckRecord{
+		ProviderID:        scope.ProviderID(),
+		ContextName:       scope.ContextName(),
+		ProjectID:         projectID,
+		ServiceID:         service.ID,
+		Kind:              models.UpdateKindServiceImage,
+		ImageRef:          service.ImageRef,
+		LocalDigest:       digestA,
+		RemoteDigest:      digestB,
+		RecommendedAction: models.RecommendedActionPullRecreate,
+		Status:            models.UpdateStatusServiceImageUpdateAvailable,
+	})
+	project, err := db.Projects().GetInScope(ctx, scope, projectID)
+	if err != nil {
+		t.Fatalf("GetInScope(project) error = %v", err)
+	}
+	eventBus := bus.New()
+	t.Cleanup(eventBus.Close)
+	doneEvents := eventBus.Subscribe(ctx, bus.TopicJobDone, 2)
+	backups := newBlockingUpdateBackups()
+	compose := &fakeUpdateCompose{}
+	docker := &fakeUpdateDocker{
+		containers: []models.ContainerSummary{{
+			ID:        "container-web",
+			ProjectID: projectID,
+			Service:   "web",
+			State:     "running",
+		}},
+		details: map[string]*models.ContainerDetail{
+			"container-web": {
+				Summary: models.ContainerSummary{ID: "container-web"},
+				Mounts:  []models.MountSpec{{Type: "volume", VolumeName: "web-data", Target: "/data"}},
+			},
+		},
+	}
+	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), docker, &fakeRegistry{}, db.Settings(), eventBus, nil)
+	manager.Scope = scope
+	manager.Compose = compose
+	manager.Backups = backups
+	t.Cleanup(manager.StopAll)
+
+	plan, err := manager.PlanProjectUpdate(ctx, projectID)
+	if err != nil {
+		t.Fatalf("PlanProjectUpdate() error = %v", err)
+	}
+	if _, err := manager.ApplyUpdate(ctx, models.ApplyUpdateRequest{PlanID: plan.PlanID, BackupVolumesFirst: true}); err != nil {
+		t.Fatalf("ApplyUpdate() error = %v", err)
+	}
+	select {
+	case <-backups.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for pre-update backup")
+	}
+	if err := os.WriteFile(filepath.Join(project.WorkingDir, "compose.yaml"), []byte("services:\n  web:\n    image: nginx:1.26\n"), 0o600); err != nil {
+		t.Fatalf("mutate Compose input while worker is blocked: %v", err)
+	}
+	close(backups.release)
+	waitUpdateDone(t, doneEvents, updateResultFailed)
+	if len(compose.calls) != 0 {
+		t.Fatalf("Compose ran after the confirmed input changed while the worker was blocked: %#v", compose.calls)
+	}
+}
+
+func TestManagerApplyUpdateAllowsVolatileSnapshotChanges(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	db := openUpdatesStore(t)
+	scope := runtimescope.Must("linux_native", "default")
+	projectID := "linux_native/fingerprint-volatile"
+	service := serviceRecord(projectID, "web", "nginx:1.25", "")
+	seedUpdateProject(t, ctx, db, projectID, []store.ServiceRecord{service})
+	insertCheck(t, ctx, db, store.UpdateCheckRecord{
+		ProviderID:        scope.ProviderID(),
+		ContextName:       scope.ContextName(),
+		ProjectID:         projectID,
+		ServiceID:         service.ID,
+		Kind:              models.UpdateKindServiceImage,
+		ImageRef:          service.ImageRef,
+		LocalDigest:       digestA,
+		RemoteDigest:      digestB,
+		RecommendedAction: models.RecommendedActionPullRecreate,
+		Status:            models.UpdateStatusServiceImageUpdateAvailable,
+	})
+	eventBus := bus.New()
+	t.Cleanup(eventBus.Close)
+	doneEvents := eventBus.Subscribe(ctx, bus.TopicJobDone, 2)
+	compose := &fakeUpdateCompose{}
+	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), fakeImages{}, &fakeRegistry{}, db.Settings(), eventBus, nil)
+	manager.Scope = scope
+	manager.Compose = compose
+	t.Cleanup(manager.StopAll)
+
+	plan, err := manager.PlanProjectUpdate(ctx, projectID)
+	if err != nil {
+		t.Fatalf("PlanProjectUpdate() error = %v", err)
+	}
+	project, services, err := manager.projectWithServices(ctx, projectID)
+	if err != nil {
+		t.Fatalf("projectWithServices() error = %v", err)
+	}
+	project.Status = models.ProjectStatusRunning
+	project.Health = models.HealthStatusHealthy
+	project.LastSeenAt = project.LastSeenAt.Add(time.Minute)
+	services[0].Status = models.ProjectStatusRunning
+	services[0].Health = models.HealthStatusHealthy
+	services[0].ReplicasRunning = 3
+	services[0].ReplicasTotal = 3
+	services[0].LastSeenAt = project.LastSeenAt
+	if err := db.Projects().SaveSnapshot(ctx, scope, []store.ProjectRecord{project}, services, project.LastSeenAt, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot(volatile changes) error = %v", err)
+	}
+
+	if _, err := manager.ApplyUpdate(ctx, models.ApplyUpdateRequest{PlanID: plan.PlanID}); err != nil {
+		t.Fatalf("ApplyUpdate(volatile changes) error = %v", err)
+	}
+	waitUpdateDone(t, doneEvents, updateResultSuccess)
+	if !containsCall(compose.calls, "pull:web") {
+		t.Fatalf("Compose calls = %#v, want admitted update", compose.calls)
+	}
+}
+
+func TestManagerApplyRollbackRejectsChangedConfirmedConfiguration(t *testing.T) {
+	ctx := context.Background()
+	db := openUpdatesStore(t)
+	scope := runtimescope.Must("linux_native", "default")
+	projectID := "linux_native/rollback-fingerprint"
+	service := serviceRecord(projectID, "web", "rollback-web:local", ".")
+	seedUpdateProject(t, ctx, db, projectID, []store.ServiceRecord{service})
+	historyID, err := db.Updates().InsertHistoryInScope(ctx, scope, store.UpdateHistoryRecord{
+		ProviderID:     scope.ProviderID(),
+		ContextName:    scope.ContextName(),
+		ProjectID:      projectID,
+		ServiceID:      service.ID,
+		UpdateKind:     models.UpdateKindBaseImage,
+		ImageRef:       service.ImageRef,
+		OldImageID:     "sha256:web-old",
+		OldDigest:      digestA,
+		NewImageID:     "sha256:web-new",
+		NewDigest:      digestB,
+		Result:         updateResultSuccess,
+		RollbackStatus: rollbackStatusAvailable,
+		StartedAt:      time.Now().UTC().Add(-time.Minute),
+		FinishedAt:     time.Now().UTC().Add(-30 * time.Second),
+	})
+	if err != nil {
+		t.Fatalf("InsertHistoryInScope() error = %v", err)
+	}
+	compose := &fakeUpdateCompose{}
+	docker := &fakeUpdateDocker{images: map[string]*models.ImageDetail{
+		"sha256:web-old": imageDetail("sha256:web-old", "docker.io/library/rollback-web@"+digestA),
+	}}
+	manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), docker, &fakeRegistry{}, db.Settings(), nil, nil)
+	manager.Scope = scope
+	manager.Compose = compose
+
+	plan, err := manager.PlanRollback(ctx, historyID)
+	if err != nil {
+		t.Fatalf("PlanRollback() error = %v", err)
+	}
+	project, services, err := manager.projectWithServices(ctx, projectID)
+	if err != nil {
+		t.Fatalf("projectWithServices() error = %v", err)
+	}
+	services[0].BuildTarget = "changed-after-confirmation"
+	project.LastSeenAt = project.LastSeenAt.Add(time.Minute)
+	services[0].LastSeenAt = project.LastSeenAt
+	if err := db.Projects().SaveSnapshot(ctx, scope, []store.ProjectRecord{project}, services, project.LastSeenAt, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot(changed rollback configuration) error = %v", err)
+	}
+
+	if _, err := manager.ApplyRollback(ctx, plan.PlanID); !apperror.IsCode(err, apperror.PlanExpired) {
+		t.Fatalf("ApplyRollback(changed configuration) error = %v, want PlanExpired", err)
+	}
+	if len(docker.tags) != 0 || len(compose.calls) != 0 {
+		t.Fatalf("rollback mutated after configuration change: tags=%#v compose=%#v", docker.tags, compose.calls)
+	}
+}
+
+func TestContextWithPeerCancellationObservesAlreadyCanceledPeerSynchronously(t *testing.T) {
+	peer, cancelPeer := context.WithCancel(context.Background())
+	cancelPeer()
+
+	ctx, cleanup := contextWithPeerCancellation(context.Background(), peer)
+	defer cleanup()
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("merged context error = %v, want context canceled", ctx.Err())
+	}
+}
+
+func TestUpdatePlanStorePrunesExpiredAndEnforcesCap(t *testing.T) {
+	now := time.Date(2026, 7, 28, 8, 0, 0, 0, time.UTC)
+	manager := &Manager{
+		Now:   func() time.Time { return now },
+		plans: map[string]updatePlanRecord{},
+	}
+	for i := 0; i < maxPendingUpdatePlans; i++ {
+		planID := fmt.Sprintf("update-plan-%03d", i)
+		if err := manager.saveUpdatePlan(updatePlanRecord{
+			Plan:      models.UpdatePlan{PlanID: planID},
+			ExpiresAt: now.Add(time.Hour),
+		}); err != nil {
+			t.Fatalf("saveUpdatePlan(%d) error = %v", i, err)
+		}
+	}
+	if err := manager.saveUpdatePlan(updatePlanRecord{
+		Plan:      models.UpdatePlan{PlanID: "update-plan-over-cap"},
+		ExpiresAt: now.Add(time.Hour),
+	}); !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("saveUpdatePlan(over cap) error = %v, want Conflict", err)
+	}
+
+	manager.planMu.Lock()
+	expired := manager.plans["update-plan-000"]
+	expired.ExpiresAt = now
+	manager.plans["update-plan-000"] = expired
+	manager.planMu.Unlock()
+	if err := manager.saveUpdatePlan(updatePlanRecord{
+		Plan:      models.UpdatePlan{PlanID: "update-plan-replacement"},
+		ExpiresAt: now.Add(time.Hour),
+	}); err != nil {
+		t.Fatalf("saveUpdatePlan(after prune) error = %v", err)
+	}
+	manager.planMu.Lock()
+	_, expiredStillPresent := manager.plans["update-plan-000"]
+	pending := len(manager.plans)
+	manager.planMu.Unlock()
+	if expiredStillPresent || pending != maxPendingUpdatePlans {
+		t.Fatalf("plans after save prune: expiredPresent=%t pending=%d, want false/%d", expiredStillPresent, pending, maxPendingUpdatePlans)
+	}
+
+	manager.planMu.Lock()
+	expired = manager.plans["update-plan-001"]
+	expired.ExpiresAt = now
+	manager.plans["update-plan-001"] = expired
+	manager.planMu.Unlock()
+	if _, err := manager.takeUpdatePlan(context.Background(), "update-plan-002"); err != nil {
+		t.Fatalf("takeUpdatePlan(valid) error = %v", err)
+	}
+	manager.planMu.Lock()
+	_, expiredStillPresent = manager.plans["update-plan-001"]
+	manager.planMu.Unlock()
+	if expiredStillPresent {
+		t.Fatal("takeUpdatePlan did not prune another expired plan")
+	}
+}
+
+func TestProjectRemovalCancelsAndJoinsInFlightUpdate(t *testing.T) {
+	for _, testCase := range []struct {
+		name  string
+		stale bool
+	}{
+		{name: "explicit removal"},
+		{name: "stale reconciliation", stale: true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			db := openUpdatesStore(t)
+			scope := runtimescope.Must("linux_native", "default")
+			projectID := "linux_native/removal-" + strings.ReplaceAll(testCase.name, " ", "-")
+			seenAt := time.Date(2026, 7, 28, 8, 0, 0, 0, time.UTC)
+			if testCase.stale {
+				seenAt = seenAt.Add(-48 * time.Hour)
+			}
+			project := store.ProjectRecord{
+				ID:           projectID,
+				ProviderID:   scope.ProviderID(),
+				ContextName:  scope.ContextName(),
+				Name:         strings.TrimPrefix(projectID, "linux_native/"),
+				WorkingDir:   t.TempDir(),
+				ComposeFiles: []string{"compose.yaml"},
+				Source:       store.ProjectSourceImported,
+				LastSeenAt:   seenAt,
+			}
+			if err := os.WriteFile(filepath.Join(project.WorkingDir, "compose.yaml"), []byte("services:\n  web:\n    image: nginx:1.25\n"), 0o600); err != nil {
+				t.Fatalf("write Compose fixture: %v", err)
+			}
+			service := serviceRecord(projectID, "web", "nginx:1.25", "")
+			service.LastSeenAt = seenAt
+			if testCase.stale {
+				project.Source = store.ProjectSourceLabels
+				if _, err := db.Projects().SaveDetectedSnapshot(ctx, scope, []store.ProjectRecord{project}, []store.ServiceRecord{service}, seenAt, time.Time{}); err != nil {
+					t.Fatalf("SaveDetectedSnapshot(seed) error = %v", err)
+				}
+			} else if err := db.Projects().SaveSnapshot(ctx, scope, []store.ProjectRecord{project}, []store.ServiceRecord{service}, seenAt, time.Time{}); err != nil {
+				t.Fatalf("SaveSnapshot(seed) error = %v", err)
+			}
+			insertCheck(t, ctx, db, store.UpdateCheckRecord{
+				ProviderID:        scope.ProviderID(),
+				ContextName:       scope.ContextName(),
+				ProjectID:         projectID,
+				ServiceID:         service.ID,
+				Kind:              models.UpdateKindServiceImage,
+				ImageRef:          service.ImageRef,
+				LocalImageID:      "sha256:old",
+				LocalDigest:       digestA,
+				RemoteDigest:      digestB,
+				Confidence:        models.ConfidenceMedium,
+				RecommendedAction: models.RecommendedActionPullRecreate,
+				Status:            models.UpdateStatusServiceImageUpdateAvailable,
+				CheckedAt:         seenAt.Add(time.Minute),
+			})
+
+			eventBus := bus.New()
+			t.Cleanup(eventBus.Close)
+			doneEvents := eventBus.Subscribe(ctx, bus.TopicJobDone, 4)
+			compose := newBlockingUpdateCompose()
+			manager := NewManager(db.Projects(), db.Lineage(), db.Updates(), db.Objects(), fakeImages{}, &fakeRegistry{}, db.Settings(), eventBus, nil)
+			manager.Scope = scope
+			manager.Compose = compose
+			t.Cleanup(manager.StopAll)
+
+			plan, err := manager.PlanProjectUpdate(ctx, projectID)
+			if err != nil {
+				t.Fatalf("PlanProjectUpdate() error = %v", err)
+			}
+			if _, err := manager.ApplyUpdate(ctx, models.ApplyUpdateRequest{PlanID: plan.PlanID}); err != nil {
+				t.Fatalf("ApplyUpdate() error = %v", err)
+			}
+			select {
+			case <-compose.started:
+			case <-time.After(2 * time.Second):
+				t.Fatal("timed out waiting for Compose pull to start")
+			}
+
+			removalDone := make(chan error, 1)
+			go func() {
+				if testCase.stale {
+					_, err := db.Projects().SaveDetectedSnapshot(
+						ctx,
+						scope,
+						nil,
+						nil,
+						seenAt.Add(48*time.Hour),
+						seenAt.Add(24*time.Hour),
+					)
+					removalDone <- err
+					return
+				}
+				removalDone <- db.Projects().ForgetAndDeleteInScope(ctx, scope, projectID, seenAt.Add(2*time.Hour))
+			}()
+			select {
+			case err := <-removalDone:
+				if err != nil {
+					t.Fatalf("project removal error = %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("project removal did not cancel and join the update worker")
+			}
+			select {
+			case <-compose.returned:
+			default:
+				t.Fatal("project removal returned before the Compose call exited")
+			}
+			waitUpdateDone(t, doneEvents, updateResultFailed)
+
+			if _, err := db.Projects().GetInScope(ctx, scope, projectID); !errors.Is(err, sql.ErrNoRows) {
+				t.Fatalf("GetInScope(after removal) error = %v, want sql.ErrNoRows", err)
+			}
+			history, err := db.Updates().ListHistory(ctx, models.UpdateHistoryFilter{})
+			if err != nil {
+				t.Fatalf("ListHistory() error = %v", err)
+			}
+			if len(history) != 1 ||
+				history[0].Result != updateResultFailed ||
+				history[0].RollbackStatus != rollbackStatusUnavailable ||
+				!strings.Contains(history[0].Error, context.Canceled.Error()) {
+				t.Fatalf("history after removal = %#v, want one canceled unavailable row", history)
+			}
+			if got := compose.Calls(); strings.Join(got, ",") != "pull:web" {
+				t.Fatalf("Compose calls after removal = %#v, want only the canceled pull", got)
+			}
+		})
+	}
+}
+
+func TestManagerHealthPassRequiresEveryExpectedReplica(t *testing.T) {
+	projectID := "linux_native/replicas"
+	docker := &fakeUpdateDocker{
+		containers: []models.ContainerSummary{
+			{
+				ID:        "web-1",
+				Name:      "replicas-web-1",
+				ProjectID: projectID,
+				Service:   "web",
+				State:     "running",
+				Health:    models.HealthStatusHealthy,
+			},
+		},
+	}
+	manager := &Manager{Docker: docker}
+	record := updatePlanRecord{
+		Project: store.ProjectRecord{ID: projectID},
+		Up:      []string{"web"},
+		Snapshots: []updateSnapshot{{
+			Service:        store.ServiceRecord{Name: "web"},
+			HasHealthcheck: true,
+		}},
+		HealthBaselines: map[string]updateHealthBaseline{
+			"web": {ExpectedReplicas: 2, Restarts: map[string]int{"id:web-1": 0, "id:web-2": 0}},
+		},
+	}
+
+	result, err := manager.healthPass(context.Background(), record, time.Now().Add(-time.Minute))
+	if err != nil || result != "pending" {
+		t.Fatalf("healthPass(one of two replicas) = %q, %v, want pending", result, err)
+	}
+
+	docker.containers = append(docker.containers, models.ContainerSummary{
+		ID:        "web-2",
+		Name:      "replicas-web-2",
+		ProjectID: projectID,
+		Service:   "web",
+		State:     "running",
+		Health:    models.HealthStatusUnhealthy,
+	})
+	result, err = manager.healthPass(context.Background(), record, time.Now().Add(-time.Minute))
+	if err != nil || result != "pending" {
+		t.Fatalf("healthPass(unhealthy sibling) = %q, %v, want pending", result, err)
+	}
+
+	docker.containers[1].Health = models.HealthStatusHealthy
+	result, err = manager.healthPass(context.Background(), record, time.Now().Add(-time.Minute))
+	if err != nil || result != healthResultSuccess {
+		t.Fatalf("healthPass(all replicas healthy) = %q, %v, want success", result, err)
+	}
+}
+
+func TestManagerHealthPassUsesPostUpdateRestartDelta(t *testing.T) {
+	projectID := "linux_native/restarts"
+	docker := &fakeUpdateDocker{containers: []models.ContainerSummary{{
+		ID:        "web-1",
+		Name:      "restarts-web-1",
+		ProjectID: projectID,
+		Service:   "web",
+		State:     "running",
+		Health:    models.HealthStatusHealthy,
+		Restarts:  12,
+	}}}
+	manager := &Manager{Docker: docker}
+	record := updatePlanRecord{
+		Project: store.ProjectRecord{ID: projectID},
+		Up:      []string{"web"},
+		Snapshots: []updateSnapshot{{
+			Service:        store.ServiceRecord{Name: "web"},
+			HasHealthcheck: true,
+		}},
+		HealthBaselines: map[string]updateHealthBaseline{
+			"web": {ExpectedReplicas: 1, Restarts: map[string]int{"id:web-1": 11}},
+		},
+	}
+
+	result, err := manager.healthPass(context.Background(), record, time.Now().Add(-time.Minute))
+	if err != nil || result != healthResultSuccess {
+		t.Fatalf("healthPass(one new restart) = %q, %v, want success", result, err)
+	}
+
+	docker.containers[0].Restarts = 13
+	if _, err := manager.healthPass(context.Background(), record, time.Now().Add(-time.Minute)); !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("healthPass(two new restarts) error = %v, want Conflict", err)
+	}
+
+	// A recreated container has a new identity, so its counter is entirely
+	// post-update even when Compose reuses the replica name.
+	docker.containers[0].ID = "web-2"
+	docker.containers[0].Restarts = 2
+	if _, err := manager.healthPass(context.Background(), record, time.Now().Add(-time.Minute)); !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("healthPass(recreated container restarts) error = %v, want Conflict", err)
+	}
+}
+
+func TestManagerWatchHealthRequiresContinuousStabilityWithoutHealthcheck(t *testing.T) {
+	projectID := "linux_native/stability"
+	docker := &fakeUpdateDocker{containers: []models.ContainerSummary{{
+		ID:        "web-1",
+		Name:      "stability-web-1",
+		ProjectID: projectID,
+		Service:   "web",
+		State:     "running",
+		Health:    models.HealthStatusUnknown,
+	}}}
+	manager := &Manager{
+		Docker:                  docker,
+		HealthWindow:            100 * time.Millisecond,
+		HealthPollInterval:      time.Millisecond,
+		HealthStabilityInterval: 5 * time.Millisecond,
+	}
+	record := updatePlanRecord{
+		Project: store.ProjectRecord{ID: projectID},
+		Up:      []string{"web"},
+		Snapshots: []updateSnapshot{{
+			Service: store.ServiceRecord{Name: "web"},
+		}},
+		HealthBaselines: map[string]updateHealthBaseline{
+			"web": {ExpectedReplicas: 1, Restarts: map[string]int{"id:web-1": 0}},
+		},
+	}
+
+	result, err := manager.watchHealth(context.Background(), record)
+	if err != nil || result != healthResultSuccessWarn {
+		t.Fatalf("watchHealth() = %q, %v, want success_warn", result, err)
+	}
+	if docker.listCalls < 2 {
+		t.Fatalf("ListContainers calls = %d, want repeated stable observations", docker.listCalls)
+	}
+}
+
+func TestManagerCaptureUpdateHealthBaselinesUsesDesiredReplicaCount(t *testing.T) {
+	projectID := "linux_native/baseline"
+	docker := &fakeUpdateDocker{containers: []models.ContainerSummary{
+		{ID: "web-1", ProjectID: projectID, Service: "web", Restarts: 7},
+		{ID: "web-2", ProjectID: projectID, Service: "web", Restarts: 3},
+	}}
+	manager := &Manager{Docker: docker}
+	record := updatePlanRecord{
+		Project:  store.ProjectRecord{ID: projectID},
+		Services: map[string]store.ServiceRecord{"web": {Name: "web", ReplicasTotal: 3}},
+		Up:       []string{"web"},
+	}
+
+	baselines, err := manager.captureUpdateHealthBaselines(context.Background(), record)
+	if err != nil {
+		t.Fatalf("captureUpdateHealthBaselines() error = %v", err)
+	}
+	baseline := baselines["web"]
+	if baseline.ExpectedReplicas != 3 {
+		t.Fatalf("ExpectedReplicas = %d, want 3", baseline.ExpectedReplicas)
+	}
+	if baseline.Restarts["id:web-1"] != 7 || baseline.Restarts["id:web-2"] != 3 {
+		t.Fatalf("restart baselines = %#v", baseline.Restarts)
+	}
+}
+
 func TestManagerApplyUpdateHealthFailureRollsBack(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -985,6 +1865,9 @@ func TestManagerApplyUpdateBackupFirstSuccessWarn(t *testing.T) {
 	manager.Scope = runtimescope.Must("linux_native", "default")
 	manager.Compose = &fakeUpdateCompose{}
 	manager.Backups = backups
+	manager.HealthWindow = 100 * time.Millisecond
+	manager.HealthPollInterval = time.Millisecond
+	manager.HealthStabilityInterval = 5 * time.Millisecond
 
 	plan, err := manager.PlanServiceUpdate(ctx, projectID, "web")
 	if err != nil {
@@ -1286,6 +2169,19 @@ func TestFatalLogDetected(t *testing.T) {
 		if fatalLogDetected(input) {
 			t.Fatalf("fatalLogDetected(%q) = true", input)
 		}
+	}
+}
+
+func TestContainerHasFatalLogsRejectsOversizedTail(t *testing.T) {
+	logs := strings.Repeat("x", maxUpdateHealthLogBytes) + "\npanic: signature beyond bounded prefix\n"
+	manager := &Manager{Docker: &fakeUpdateDocker{logs: map[string]string{"container-web": logs}}}
+
+	fatal, err := manager.containerHasFatalLogs(context.Background(), "container-web", time.Now().Add(-time.Minute))
+	if fatal {
+		t.Fatal("containerHasFatalLogs(oversized) reported a partial-scan result")
+	}
+	if !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("containerHasFatalLogs(oversized) error = %v, want Conflict", err)
 	}
 }
 
@@ -1639,12 +2535,16 @@ func openUpdatesStore(t *testing.T) *store.Store {
 func seedUpdateProject(t *testing.T, ctx context.Context, db *store.Store, projectID string, services []store.ServiceRecord) {
 	t.Helper()
 	now := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)
+	workdir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workdir, "compose.yaml"), []byte("services:\n  web:\n    image: nginx:1.25\n"), 0o600); err != nil {
+		t.Fatalf("write Compose fixture: %v", err)
+	}
 	if err := db.Projects().SaveSnapshot(ctx, runtimescope.Must("linux_native", "default"), []store.ProjectRecord{{
 		ID:           projectID,
 		ProviderID:   "linux_native",
 		ContextName:  "default",
 		Name:         strings.TrimPrefix(projectID, "linux_native/"),
-		WorkingDir:   t.TempDir(),
+		WorkingDir:   workdir,
 		ComposeFiles: []string{"compose.yaml"},
 		Source:       store.ProjectSourceImported,
 		LastSeenAt:   now,
@@ -1792,6 +2692,55 @@ type fakeUpdateCompose struct {
 	errs  map[string]error
 }
 
+type blockingUpdateCompose struct {
+	started  chan struct{}
+	returned chan struct{}
+	once     sync.Once
+	mu       sync.Mutex
+	calls    []string
+}
+
+func newBlockingUpdateCompose() *blockingUpdateCompose {
+	return &blockingUpdateCompose{
+		started:  make(chan struct{}),
+		returned: make(chan struct{}),
+	}
+}
+
+func (f *blockingUpdateCompose) PullServices(ctx context.Context, _ composecore.ProjectOptions, services []string) (*providers.CommandResult, error) {
+	f.mu.Lock()
+	f.calls = append(f.calls, "pull:"+strings.Join(services, ","))
+	f.mu.Unlock()
+	f.once.Do(func() { close(f.started) })
+	<-ctx.Done()
+	close(f.returned)
+	return nil, ctx.Err()
+}
+
+func (f *blockingUpdateCompose) Build(_ context.Context, _ composecore.ProjectOptions, build composecore.BuildOptions) (*providers.CommandResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "build:"+strings.Join(build.Services, ","))
+	return &providers.CommandResult{}, nil
+}
+
+func (f *blockingUpdateCompose) UpServices(_ context.Context, _ composecore.ProjectOptions, up composecore.UpOptions) (*providers.CommandResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, "up:"+strings.Join(up.Services, ","))
+	return &providers.CommandResult{}, nil
+}
+
+func (f *blockingUpdateCompose) Config(context.Context, composecore.ProjectOptions) (*composecore.ConfigResult, error) {
+	return &composecore.ConfigResult{Valid: true}, nil
+}
+
+func (f *blockingUpdateCompose) Calls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.calls...)
+}
+
 func (f *fakeUpdateCompose) PullServices(_ context.Context, _ composecore.ProjectOptions, services []string) (*providers.CommandResult, error) {
 	call := "pull:" + strings.Join(services, ",")
 	f.calls = append(f.calls, call)
@@ -1826,6 +2775,7 @@ type fakeUpdateDocker struct {
 	logs          map[string]string
 	tags          []string
 	getImageCalls int
+	listCalls     int
 }
 
 func (f *fakeUpdateDocker) ProviderID() string {
@@ -1844,6 +2794,7 @@ func (f *fakeUpdateDocker) GetImage(_ context.Context, id string) (*models.Image
 }
 
 func (f *fakeUpdateDocker) ListContainers(_ context.Context, opts models.ContainerListOptions) ([]models.ContainerSummary, error) {
+	f.listCalls++
 	out := make([]models.ContainerSummary, 0, len(f.containers))
 	for _, container := range f.containers {
 		if opts.ProjectID != "" && container.ProjectID != opts.ProjectID {
@@ -1889,6 +2840,29 @@ type fakeUpdateBackups struct {
 func (f *fakeUpdateBackups) RunBackupVolume(_ context.Context, req models.BackupVolumeRequest) error {
 	f.volumes = append(f.volumes, req.VolumeName)
 	return f.err
+}
+
+type blockingUpdateBackups struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newBlockingUpdateBackups() *blockingUpdateBackups {
+	return &blockingUpdateBackups{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (f *blockingUpdateBackups) RunBackupVolume(ctx context.Context, _ models.BackupVolumeRequest) error {
+	f.once.Do(func() { close(f.started) })
+	select {
+	case <-f.release:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 type failingDiscoverer struct{}

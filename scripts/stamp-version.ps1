@@ -68,10 +68,9 @@ Update-Text "build/config.yml" {
 Update-Text "build/windows/info.json" {
   param($text)
   $text = Replace-Required $text '"file_version": "\d+\.\d+\.\d+(?:\.\d+)?"' "`"file_version`": `"$fileVersion`"" "build/windows/info.json"
+  $text = Replace-Required $text '"product_version": "\d+\.\d+\.\d+(?:\.\d+)?"' "`"product_version`": `"$fileVersion`"" "build/windows/info.json"
   $text = Replace-Required $text '"ProductVersion": "\d+\.\d+\.\d+(?:[+-][0-9A-Za-z.-]+)?"' "`"ProductVersion`": `"$semver`"" "build/windows/info.json"
-  if ([regex]::IsMatch($text, '"FileVersion": "\d+\.\d+\.\d+(?:\.\d+)?"')) {
-    $text = [regex]::Replace($text, '"FileVersion": "\d+\.\d+\.\d+(?:\.\d+)?"', "`"FileVersion`": `"$fileVersion`"")
-  }
+  $text = Replace-Required $text '"FileVersion": "\d+\.\d+\.\d+(?:\.\d+)?"' "`"FileVersion`": `"$fileVersion`"" "build/windows/info.json"
   $text
 }
 

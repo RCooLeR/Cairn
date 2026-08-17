@@ -1,6 +1,7 @@
 package backups
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -8,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -19,6 +21,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/bus"
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/store"
 	"github.com/google/uuid"
@@ -35,6 +38,13 @@ const (
 	stagingOwnerName      = ".cairn-owner"
 	reservationSuffix     = ".cairn-reservation"
 	maxReservationBytes   = 256
+	maxSidecarBytes       = 64 * 1024
+	maxSidecarNameBytes   = 255
+	maxSidecarFieldBytes  = 1024
+	maxSidecarContainers  = 128
+	restoreCleanupTimeout = 15 * time.Second
+	restoreOwnerLabel     = "io.cairn.restore.owner"
+	maxPendingBackupPlans = 128
 )
 
 type ProviderResolver interface {
@@ -74,6 +84,8 @@ type Manager struct {
 	jobsMu  sync.Mutex
 	rootCtx context.Context
 	jobs    map[string]context.CancelFunc
+	jobsWG  sync.WaitGroup
+	stopped bool
 }
 
 type planRecord struct {
@@ -81,14 +93,21 @@ type planRecord struct {
 	Operation               string
 	Provider                providers.PlatformProvider
 	ProviderID              string
+	Scope                   runtimescope.Scope
 	ProjectID               string
 	VolumeName              string
 	TargetVolumeName        string
+	TargetVolumeFingerprint string
+	RestoreOwnerToken       string
 	BackupDirHost           string
 	BackupDirBackend        string
 	ArchiveName             string
 	ArchivePath             string
+	ArchiveIdentity         os.FileInfo
+	ArchiveHandle           *os.File
 	MetadataPath            string
+	MetadataIdentity        os.FileInfo
+	MetadataHandle          *os.File
 	ReservationPath         string
 	ReservationOwner        string
 	ReservationIdentity     os.FileInfo
@@ -158,6 +177,7 @@ type objectsChangedPayload struct {
 }
 
 var safeFilenamePattern = regexp.MustCompile(`[^A-Za-z0-9_.-]+`)
+var sidecarVolumePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]*$`)
 
 var errPreserveBackupReservation = errors.New("preserve backup reservation ownership evidence")
 
@@ -184,8 +204,13 @@ func (m *Manager) Start(ctx context.Context) {
 	if m == nil {
 		return
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	m.jobsMu.Lock()
-	m.rootCtx = ctx
+	if !m.stopped {
+		m.rootCtx = ctx
+	}
 	m.jobsMu.Unlock()
 }
 
@@ -194,17 +219,19 @@ func (m *Manager) StopAll() {
 		return
 	}
 	m.jobsMu.Lock()
+	m.stopped = true
 	cancels := make([]context.CancelFunc, 0, len(m.jobs))
-	for jobID, cancel := range m.jobs {
+	for _, cancel := range m.jobs {
 		cancels = append(cancels, cancel)
-		delete(m.jobs, jobID)
 	}
 	m.jobsMu.Unlock()
 	for _, cancel := range cancels {
 		cancel()
 	}
+	m.jobsWG.Wait()
 	for _, record := range m.discardPlans() {
 		_ = releaseBackupReservation(record)
+		closePlanArtifactHandles(record)
 	}
 }
 
@@ -217,6 +244,10 @@ func (m *Manager) PlanBackupVolume(ctx context.Context, req models.BackupVolumeR
 		return nil, apperror.New(apperror.Conflict, "Volume name is required")
 	}
 	provider, err := m.Providers.ActiveProvider(ctx)
+	if err != nil {
+		return nil, err
+	}
+	scope, err := providers.ResolveRuntimeScope(ctx, provider)
 	if err != nil {
 		return nil, err
 	}
@@ -262,6 +293,7 @@ func (m *Manager) PlanBackupVolume(ctx context.Context, req models.BackupVolumeR
 		Operation:            "backup",
 		Provider:             provider,
 		ProviderID:           provider.ID(),
+		Scope:                scope,
 		ProjectID:            firstNonEmpty(req.ProjectID, detail.Summary.Labels["com.docker.compose.project"]),
 		VolumeName:           volumeName,
 		BackupDirHost:        backupDirHost,
@@ -281,7 +313,9 @@ func (m *Manager) PlanBackupVolume(ctx context.Context, req models.BackupVolumeR
 		StagingOwnerIdentity: reservation.StagingOwnerIdentity,
 		UsingContainers:      containers,
 	}
-	m.savePlan(record)
+	if err := m.savePlan(record); err != nil {
+		return nil, err
+	}
 	return &plan, nil
 }
 
@@ -291,16 +325,18 @@ func (m *Manager) ApplyBackup(ctx context.Context, planID string) (string, error
 		return "", err
 	}
 	if record.Operation != "backup" {
-		m.savePlan(record)
-		return "", apperror.New(apperror.Conflict, "Plan is not a backup plan")
+		operationErr := apperror.New(apperror.Conflict, "Plan is not a backup plan")
+		return "", errors.Join(operationErr, m.savePlan(record))
 	}
 	if err := validateBackupReservation(record); err != nil {
 		return "", errors.Join(err, releaseBackupReservation(record))
 	}
 	jobID := "backup-" + m.newID()
-	m.startJob(jobID, func(jobCtx context.Context) {
+	if !m.startJob(jobID, func(jobCtx context.Context) {
 		_ = m.runBackup(jobCtx, jobID, record)
-	})
+	}) {
+		return "", errors.Join(notReady(), releaseBackupReservation(record))
+	}
 	return jobID, nil
 }
 
@@ -314,8 +350,8 @@ func (m *Manager) RunBackupVolume(ctx context.Context, req models.BackupVolumeRe
 		return err
 	}
 	if record.Operation != "backup" {
-		m.savePlan(record)
-		return apperror.New(apperror.Conflict, "Plan is not a backup plan")
+		operationErr := apperror.New(apperror.Conflict, "Plan is not a backup plan")
+		return errors.Join(operationErr, m.savePlan(record))
 	}
 	return m.runBackup(ctx, "backup-"+m.newID(), record)
 }
@@ -328,15 +364,41 @@ func (m *Manager) PlanRestoreVolume(ctx context.Context, req models.RestoreVolum
 	if err != nil {
 		return nil, err
 	}
+	scope, err := providers.ResolveRuntimeScope(ctx, provider)
+	if err != nil {
+		return nil, err
+	}
 	archivePath, metadataPath, err := m.restoreSource(ctx, req)
 	if err != nil {
 		return nil, err
 	}
+	archiveHandle, archiveIdentity, err := openRequiredRestoreArtifact(archivePath, "archive")
+	if err != nil {
+		return nil, err
+	}
+	keepArtifactHandles := false
+	defer func() {
+		if !keepArtifactHandles {
+			_ = archiveHandle.Close()
+		}
+	}()
+	metadataHandle, metadataIdentity, err := openRequiredRestoreArtifact(metadataPath, "metadata")
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if !keepArtifactHandles {
+			_ = metadataHandle.Close()
+		}
+	}()
 	sidecar, err := readSidecar(metadataPath)
 	if err != nil {
 		return nil, err
 	}
-	if err := verifyArchiveChecksum(archivePath, sidecar.SHA256); err != nil {
+	if err := verifyPathIdentity(metadataPath, metadataIdentity, false); err != nil {
+		return nil, apperror.Wrap(apperror.Conflict, "Backup metadata identity changed while planning restore", err)
+	}
+	if err := verifyArchiveChecksumWithIdentity(archivePath, archiveIdentity, sidecar.SHA256); err != nil {
 		return nil, err
 	}
 	targetName := strings.TrimSpace(req.VolumeName)
@@ -356,6 +418,13 @@ func (m *Manager) PlanRestoreVolume(ctx context.Context, req models.RestoreVolum
 	if !req.Overwrite && exists {
 		return nil, apperror.New(apperror.Conflict, "Target volume already exists", apperror.WithDetail(targetName))
 	}
+	targetFingerprint := ""
+	if req.Overwrite {
+		targetFingerprint, err = security.VolumeIncarnationFingerprint(*target)
+		if err != nil {
+			return nil, err
+		}
+	}
 	backupDirHost := filepath.Dir(archivePath)
 	backupDirBackend, err := provider.MapPathToBackend(backupDirHost)
 	if err != nil {
@@ -367,13 +436,6 @@ func (m *Manager) PlanRestoreVolume(ctx context.Context, req models.RestoreVolum
 		risk = models.RiskDangerous
 		requiresTypedName = targetName
 	}
-	commands := []models.PlannedCommand{}
-	order := 1
-	if !req.Overwrite {
-		commands = append(commands, createVolumeCommand(order, targetName, risk))
-		order++
-	}
-	commands = append(commands, restoreCommand(order, targetName, backupDirBackend, filepath.Base(archivePath), risk))
 	containers := []string{}
 	if target != nil {
 		containers = runningContainerNames(target.Containers)
@@ -383,6 +445,20 @@ func (m *Manager) PlanRestoreVolume(ctx context.Context, req models.RestoreVolum
 	if err != nil {
 		return nil, err
 	}
+	restoreOwnerToken := ""
+	if !req.Overwrite {
+		restoreOwnerToken, err = m.IDs.NewTypedPlanID("restore-owner")
+		if err != nil {
+			return nil, err
+		}
+	}
+	commands := []models.PlannedCommand{}
+	order := 1
+	if !req.Overwrite {
+		commands = append(commands, createVolumeCommand(order, targetName, risk))
+		order++
+	}
+	commands = append(commands, restoreCommand(order, targetName, backupDirBackend, filepath.Base(archivePath), risk))
 	plan := models.CommandPlan{
 		PlanID:            planID,
 		Title:             restoreTitle(targetName, req.Overwrite),
@@ -393,23 +469,33 @@ func (m *Manager) PlanRestoreVolume(ctx context.Context, req models.RestoreVolum
 		ExpiresAt:         now.Add(security.DefaultPlanTTL),
 	}
 	record := planRecord{
-		Plan:              plan,
-		Operation:         "restore",
-		Provider:          provider,
-		ProviderID:        provider.ID(),
-		ProjectID:         sidecar.Project,
-		VolumeName:        sidecar.Volume,
-		TargetVolumeName:  targetName,
-		BackupDirHost:     backupDirHost,
-		BackupDirBackend:  backupDirBackend,
-		ArchiveName:       filepath.Base(archivePath),
-		ArchivePath:       archivePath,
-		MetadataPath:      metadataPath,
-		Overwrite:         req.Overwrite,
-		CreateTargetFirst: !req.Overwrite,
-		Sidecar:           sidecar,
+		Plan:                    plan,
+		Operation:               "restore",
+		Provider:                provider,
+		ProviderID:              provider.ID(),
+		Scope:                   scope,
+		ProjectID:               sidecar.Project,
+		VolumeName:              sidecar.Volume,
+		TargetVolumeName:        targetName,
+		TargetVolumeFingerprint: targetFingerprint,
+		RestoreOwnerToken:       restoreOwnerToken,
+		BackupDirHost:           backupDirHost,
+		BackupDirBackend:        backupDirBackend,
+		ArchiveName:             filepath.Base(archivePath),
+		ArchivePath:             archivePath,
+		ArchiveIdentity:         archiveIdentity,
+		ArchiveHandle:           archiveHandle,
+		MetadataPath:            metadataPath,
+		MetadataIdentity:        metadataIdentity,
+		MetadataHandle:          metadataHandle,
+		Overwrite:               req.Overwrite,
+		CreateTargetFirst:       !req.Overwrite,
+		Sidecar:                 sidecar,
 	}
-	m.savePlan(record)
+	if err := m.savePlan(record); err != nil {
+		return nil, err
+	}
+	keepArtifactHandles = true
 	return &plan, nil
 }
 
@@ -419,13 +505,21 @@ func (m *Manager) ApplyRestore(ctx context.Context, planID string, typedName str
 		return "", err
 	}
 	if record.Operation != "restore" {
-		m.savePlan(record)
-		return "", apperror.New(apperror.Conflict, "Plan is not a restore plan")
+		operationErr := apperror.New(apperror.Conflict, "Plan is not a restore plan")
+		return "", errors.Join(operationErr, m.savePlan(record))
+	}
+	if err := m.validateRestorePlan(ctx, record, record.Overwrite); err != nil {
+		closePlanArtifactHandles(record)
+		return "", err
 	}
 	jobID := "restore-" + m.newID()
-	m.startJob(jobID, func(jobCtx context.Context) {
+	if !m.startJob(jobID, func(jobCtx context.Context) {
+		defer closePlanArtifactHandles(record)
 		m.runRestore(jobCtx, jobID, record)
-	})
+	}) {
+		closePlanArtifactHandles(record)
+		return "", notReady()
+	}
 	return jobID, nil
 }
 
@@ -436,6 +530,32 @@ func (m *Manager) PlanDeleteBackup(ctx context.Context, backupID string) (*model
 	record, err := m.Backups.Get(ctx, backupID)
 	if err != nil {
 		return nil, apperror.Wrap(apperror.NotFound, "Backup was not found", err)
+	}
+	archiveHandle, archiveIdentity, err := openPlannedBackupArtifact(record.BackupPath, "archive")
+	if err != nil {
+		return nil, err
+	}
+	keepArtifactHandles := false
+	defer func() {
+		if !keepArtifactHandles && archiveHandle != nil {
+			_ = archiveHandle.Close()
+		}
+	}()
+	metadataHandle, metadataIdentity, err := openPlannedBackupArtifact(record.MetadataPath, "metadata")
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if !keepArtifactHandles && metadataHandle != nil {
+			_ = metadataHandle.Close()
+		}
+	}()
+	if archiveIdentity != nil && metadataIdentity != nil && os.SameFile(archiveIdentity, metadataIdentity) {
+		return nil, apperror.New(
+			apperror.Conflict,
+			"Backup archive and metadata resolve to the same file",
+			apperror.WithDetail(record.BackupPath),
+		)
 	}
 	now := m.now()
 	planID, err := m.IDs.NewPlanID()
@@ -461,16 +581,23 @@ func (m *Manager) PlanDeleteBackup(ctx context.Context, backupID string) (*model
 			"Metadata: " + record.MetadataPath,
 		},
 	}
-	m.savePlan(planRecord{
-		Plan:         plan,
-		Operation:    "delete",
-		ProviderID:   record.ProviderID,
-		ProjectID:    record.ProjectID,
-		VolumeName:   record.VolumeName,
-		ArchivePath:  record.BackupPath,
-		MetadataPath: record.MetadataPath,
-		BackupID:     record.ID,
-	})
+	if err := m.savePlan(planRecord{
+		Plan:             plan,
+		Operation:        "delete",
+		ProviderID:       record.ProviderID,
+		ProjectID:        record.ProjectID,
+		VolumeName:       record.VolumeName,
+		ArchivePath:      record.BackupPath,
+		ArchiveIdentity:  archiveIdentity,
+		ArchiveHandle:    archiveHandle,
+		MetadataPath:     record.MetadataPath,
+		MetadataIdentity: metadataIdentity,
+		MetadataHandle:   metadataHandle,
+		BackupID:         record.ID,
+	}); err != nil {
+		return nil, err
+	}
+	keepArtifactHandles = true
 	return &plan, nil
 }
 
@@ -480,9 +607,10 @@ func (m *Manager) ApplyDeleteBackup(ctx context.Context, planID string) error {
 		return err
 	}
 	if record.Operation != "delete" {
-		m.savePlan(record)
-		return apperror.New(apperror.Conflict, "Plan is not a backup delete plan")
+		operationErr := apperror.New(apperror.Conflict, "Plan is not a backup delete plan")
+		return errors.Join(operationErr, m.savePlan(record))
 	}
+	defer closePlanArtifactHandles(record)
 	return m.deleteBackupRecord(ctx, record)
 }
 
@@ -521,7 +649,7 @@ func (m *Manager) deleteBackupRecord(ctx context.Context, record planRecord) err
 	if err := m.recordAudit(ctx, "backup.delete", "backup", record.BackupID, record.ProviderID, record.ProjectID, command, models.RiskNeedsConfirmation, "started", 0, nil); err != nil {
 		return err
 	}
-	err := removeBackupArtifacts(record.ArchivePath, record.MetadataPath)
+	err := removePlannedBackupArtifacts(record)
 	duration := time.Since(started)
 	if err != nil {
 		_ = m.recordAudit(ctx, "backup.delete", "backup", record.BackupID, record.ProviderID, record.ProjectID, command, models.RiskNeedsConfirmation, "failed", duration, err)
@@ -556,7 +684,7 @@ func (m *Manager) runBackup(ctx context.Context, jobID string, record planRecord
 	if err != nil {
 		return m.finishBackupFailure(ctx, jobID, started, command, record, 0, err)
 	}
-	sum, size, err := fileSHA256(record.StagingArchivePath)
+	sum, size, err := fileSHA256WithIdentity(record.StagingArchivePath, record.StagingArchiveIdentity)
 	if err != nil {
 		return m.finishBackupFailure(ctx, jobID, started, command, record, 0, err)
 	}
@@ -581,7 +709,7 @@ func (m *Manager) runBackup(ctx context.Context, jobID string, record planRecord
 	if err != nil {
 		return m.finishBackupFailure(ctx, jobID, started, command, record, size, err)
 	}
-	metadataSum, _, err := fileSHA256(record.StagingMetadataPath)
+	metadataSum, _, err := fileSHA256WithIdentity(record.StagingMetadataPath, record.StagingMetadataIdentity)
 	if err != nil {
 		return m.finishBackupFailure(ctx, jobID, started, command, record, size, err)
 	}
@@ -698,56 +826,225 @@ func (m *Manager) runRestore(ctx context.Context, jobID string, record planRecor
 	m.publishProgress(jobID, "restore", "Starting volume restore", nil)
 	provider, err := m.planProvider(ctx, record)
 	if err == nil {
-		err = verifyArchiveChecksum(record.ArchivePath, record.Sidecar.SHA256)
+		err = m.validateRestorePlan(ctx, record, true)
 	}
-	if err == nil && !record.Overwrite {
-		_, exists, existsErr := m.getVolumeIfExists(ctx, record.TargetVolumeName)
-		if existsErr != nil {
-			err = existsErr
-		} else if exists {
-			err = apperror.New(
-				apperror.Conflict,
-				"Target volume already exists",
-				apperror.WithDetail(record.TargetVolumeName),
-			)
-		}
+	targetCreated := false
+	if err == nil && record.CreateTargetFirst {
+		targetCreated, err = m.createOwnedRestoreVolume(ctx, &record)
+	}
+	if err == nil {
+		// Hash the identity-bound source again after a potentially slow volume
+		// create, then bind the target at the final helper boundary. For a new
+		// target this proves both Cairn ownership and the exact incarnation.
+		err = m.validateRestorePlan(ctx, record, false)
 	}
 	if err == nil && record.CreateTargetFirst {
-		err = runProviderDocker(ctx, provider, "volume", "create", record.TargetVolumeName)
+		err = m.validateCreatedRestoreTarget(ctx, record)
+	}
+	if err == nil && !record.CreateTargetFirst {
+		err = m.validateRestoreTarget(ctx, record)
 	}
 	if err == nil {
 		err = runProviderDocker(ctx, provider, dockerRunRestoreArgs(record.TargetVolumeName, record.BackupDirBackend, record.ArchiveName)...)
 	}
-	duration := time.Since(started)
 	if err != nil {
+		if targetCreated {
+			cleanupErr := m.cleanupCreatedRestoreVolume(ctx, provider, record)
+			m.publishVolumeChanged(record.TargetVolumeName)
+			if cleanupErr != nil {
+				err = apperror.Wrap(
+					apperror.Internal,
+					fmt.Sprintf("Volume restore failed and new target volume %q could not be removed", record.TargetVolumeName),
+					errors.Join(err, cleanupErr),
+					apperror.WithDetail("The Cairn-created volume could not be safely identified or removed and may contain partial restore data."),
+					apperror.WithRepairHints("Inspect the current target volume and its labels before removing anything manually."),
+					apperror.WithPartialResource("volume", record.TargetVolumeName, "created_restore_failed", true),
+				)
+			}
+		}
+		duration := time.Since(started)
 		_ = m.recordAudit(ctx, "backup.restore", "volume", record.TargetVolumeName, record.ProviderID, record.ProjectID, command, record.Plan.Risk, "failed", duration, err)
 		m.publishDone(jobID, "", err)
 		return
 	}
+	duration := time.Since(started)
 	m.publishProgress(jobID, "restore", "Volume restore complete", floatPtr(100))
 	m.publishVolumeChanged(record.TargetVolumeName)
 	_ = m.recordAudit(ctx, "backup.restore", "volume", record.TargetVolumeName, record.ProviderID, record.ProjectID, command, record.Plan.Risk, "success", duration, nil)
 	m.publishDone(jobID, record.TargetVolumeName, nil)
 }
 
-func (m *Manager) startJob(jobID string, run func(context.Context)) {
+func (m *Manager) validateRestorePlan(ctx context.Context, record planRecord, validateTarget bool) error {
+	if record.Operation != "restore" {
+		return apperror.New(apperror.Conflict, "Plan is not a restore plan")
+	}
+	if _, err := m.planProvider(ctx, record); err != nil {
+		return err
+	}
+	if err := verifyHeldPlanArtifact(record.MetadataPath, record.MetadataHandle, record.MetadataIdentity); err != nil {
+		return apperror.Wrap(apperror.Conflict, "Backup metadata identity changed after restore planning", err)
+	}
+	if err := verifyHeldPlanArtifact(record.ArchivePath, record.ArchiveHandle, record.ArchiveIdentity); err != nil {
+		return apperror.Wrap(apperror.Conflict, "Backup archive identity changed after restore planning", err)
+	}
+	if err := verifyArchiveChecksumWithIdentity(record.ArchivePath, record.ArchiveIdentity, record.Sidecar.SHA256); err != nil {
+		return err
+	}
+	if validateTarget {
+		return m.validateRestoreTarget(ctx, record)
+	}
+	return nil
+}
+
+func (m *Manager) validateRestoreTarget(ctx context.Context, record planRecord) error {
+	target, exists, err := m.getVolumeIfExists(ctx, record.TargetVolumeName)
+	if err != nil {
+		return err
+	}
+	if !record.Overwrite {
+		if exists {
+			return apperror.New(
+				apperror.Conflict,
+				"Target volume already exists",
+				apperror.WithDetail(record.TargetVolumeName),
+			)
+		}
+		return nil
+	}
+	if !exists || target == nil {
+		return apperror.New(apperror.Conflict, "Restore target volume changed after planning", apperror.WithDetail(record.TargetVolumeName))
+	}
+	expected := strings.TrimSpace(record.TargetVolumeFingerprint)
+	if expected == "" {
+		return apperror.New(apperror.Conflict, "Restore target volume identity is missing")
+	}
+	actual, err := security.VolumeIncarnationFingerprint(*target)
+	if err != nil {
+		return err
+	}
+	if actual != expected {
+		return apperror.New(
+			apperror.Conflict,
+			"Restore target volume changed after planning",
+			apperror.WithDetail("Review the current volume and create a new restore plan."),
+		)
+	}
+	return nil
+}
+
+func (m *Manager) createOwnedRestoreVolume(ctx context.Context, record *planRecord) (bool, error) {
+	if record == nil || strings.TrimSpace(record.RestoreOwnerToken) == "" {
+		return false, apperror.New(apperror.Conflict, "Restore target ownership token is missing")
+	}
+	_, createErr := m.Docker.CreateVolume(ctx, models.CreateVolumeRequest{
+		Name: record.TargetVolumeName,
+		Labels: map[string]string{
+			restoreOwnerLabel: record.RestoreOwnerToken,
+		},
+	})
+	fingerprint, ownershipErr := m.captureCreatedRestoreTarget(ctx, *record)
+	if ownershipErr != nil {
+		if createErr != nil {
+			return false, errors.Join(createErr, ownershipErr)
+		}
+		return false, ownershipErr
+	}
+	record.TargetVolumeFingerprint = fingerprint
+	if createErr != nil {
+		// The daemon may have created the labeled volume before a cache or
+		// transport error was reported. Its verified identity makes cleanup safe.
+		return true, createErr
+	}
+	return true, nil
+}
+
+func (m *Manager) captureCreatedRestoreTarget(ctx context.Context, record planRecord) (string, error) {
+	target, exists, err := m.getVolumeIfExists(ctx, record.TargetVolumeName)
+	if err != nil {
+		return "", err
+	}
+	if !exists || target == nil {
+		return "", apperror.New(apperror.Conflict, "Created restore target could not be inspected", apperror.WithDetail(record.TargetVolumeName))
+	}
+	if strings.TrimSpace(record.RestoreOwnerToken) == "" || target.Summary.Labels[restoreOwnerLabel] != record.RestoreOwnerToken {
+		return "", apperror.New(
+			apperror.Conflict,
+			"Target volume was not created by this restore operation",
+			apperror.WithDetail(record.TargetVolumeName),
+			apperror.WithRepairHints("Review the current target volume and create a new restore plan with another name."),
+		)
+	}
+	fingerprint, err := security.VolumeIncarnationFingerprint(*target)
+	if err != nil {
+		return "", err
+	}
+	return fingerprint, nil
+}
+
+func (m *Manager) validateCreatedRestoreTarget(ctx context.Context, record planRecord) error {
+	expected := strings.TrimSpace(record.TargetVolumeFingerprint)
+	if expected == "" {
+		return apperror.New(apperror.Conflict, "Created restore target identity is missing")
+	}
+	actual, err := m.captureCreatedRestoreTarget(ctx, record)
+	if err != nil {
+		return err
+	}
+	if actual != expected {
+		return apperror.New(
+			apperror.Conflict,
+			"Created restore target changed before use",
+			apperror.WithDetail(record.TargetVolumeName),
+		)
+	}
+	return nil
+}
+
+func (m *Manager) cleanupCreatedRestoreVolume(ctx context.Context, provider providers.PlatformProvider, record planRecord) error {
+	base := context.Background()
+	if ctx != nil {
+		base = context.WithoutCancel(ctx)
+	}
+	cleanupCtx, cancel := context.WithTimeout(base, restoreCleanupTimeout)
+	defer cancel()
+	target, exists, err := m.getVolumeIfExists(cleanupCtx, record.TargetVolumeName)
+	if err != nil {
+		return err
+	}
+	if !exists || target == nil {
+		return nil
+	}
+	if err := m.validateCreatedRestoreTarget(cleanupCtx, record); err != nil {
+		return err
+	}
+	return runProviderDocker(cleanupCtx, provider, "volume", "rm", record.TargetVolumeName)
+}
+
+func (m *Manager) startJob(jobID string, run func(context.Context)) bool {
 	base := context.Background()
 	m.jobsMu.Lock()
 	if m.rootCtx != nil {
 		base = m.rootCtx
+	}
+	if m.stopped || base.Err() != nil {
+		m.jobsMu.Unlock()
+		return false
 	}
 	ctx, cancel := context.WithCancel(base)
 	if m.jobs == nil {
 		m.jobs = map[string]context.CancelFunc{}
 	}
 	m.jobs[jobID] = cancel
+	m.jobsWG.Add(1)
 	m.jobsMu.Unlock()
 
 	go func() {
+		defer m.jobsWG.Done()
 		defer cancel()
 		defer m.forgetJob(jobID)
 		run(ctx)
 	}()
+	return true
 }
 
 func (m *Manager) forgetJob(jobID string) {
@@ -756,14 +1053,52 @@ func (m *Manager) forgetJob(jobID string) {
 	delete(m.jobs, jobID)
 }
 
-func (m *Manager) savePlan(record planRecord) {
+func (m *Manager) savePlan(record planRecord) error {
+	now := m.now()
+	expired := make([]planRecord, 0)
 	m.mu.Lock()
-	if previous, ok := m.plans[record.Plan.PlanID]; ok && previous.expiryTimer != nil {
-		previous.expiryTimer.Stop()
+	if m.plans == nil {
+		m.plans = map[string]planRecord{}
+	}
+	for planID, existing := range m.plans {
+		if now.Before(existing.Plan.ExpiresAt) {
+			continue
+		}
+		delete(m.plans, planID)
+		if existing.expiryTimer != nil {
+			existing.expiryTimer.Stop()
+		}
+		expired = append(expired, existing)
+	}
+	if _, exists := m.plans[record.Plan.PlanID]; exists {
+		m.mu.Unlock()
+		for _, existing := range expired {
+			cleanupDiscardedPlan(existing)
+		}
+		cleanupErr := cleanupDiscardedPlan(record)
+		return errors.Join(
+			apperror.New(apperror.Conflict, "A pending backup plan already uses this identifier"),
+			cleanupErr,
+		)
+	}
+	if len(m.plans) >= maxPendingBackupPlans {
+		m.mu.Unlock()
+		for _, existing := range expired {
+			cleanupDiscardedPlan(existing)
+		}
+		cleanupErr := cleanupDiscardedPlan(record)
+		return errors.Join(
+			apperror.New(
+				apperror.Conflict,
+				"Too many backup plans are pending confirmation",
+				apperror.WithRepairHints("Apply or allow existing plans to expire, then retry."),
+			),
+			cleanupErr,
+		)
 	}
 	m.planGeneration++
 	record.generation = m.planGeneration
-	delay := record.Plan.ExpiresAt.Sub(m.now())
+	delay := record.Plan.ExpiresAt.Sub(now)
 	if delay < 0 {
 		delay = 0
 	}
@@ -774,6 +1109,18 @@ func (m *Manager) savePlan(record planRecord) {
 	})
 	m.plans[record.Plan.PlanID] = record
 	m.mu.Unlock()
+	for _, existing := range expired {
+		cleanupDiscardedPlan(existing)
+	}
+	return nil
+}
+
+func cleanupDiscardedPlan(record planRecord) error {
+	closePlanArtifactHandles(record)
+	if err := releaseBackupReservation(record); err != nil {
+		return apperror.Wrap(apperror.Internal, "Release rejected or expired backup plan resources failed", err)
+	}
+	return nil
 }
 
 func (m *Manager) takePlan(ctx context.Context, planID string, typedName string) (planRecord, error) {
@@ -796,6 +1143,7 @@ func (m *Manager) takePlan(ctx context.Context, planID string, typedName string)
 		if cleanupErr := releaseBackupReservation(record); cleanupErr != nil {
 			err = errors.Join(err, apperror.Wrap(apperror.Internal, "Release expired backup reservation failed", cleanupErr))
 		}
+		closePlanArtifactHandles(record)
 		return planRecord{}, err
 	}
 	if err := security.RequireConfirmation(record.Plan, typedName); err != nil {
@@ -820,6 +1168,7 @@ func (m *Manager) expirePlan(planID string, generation uint64) {
 	delete(m.plans, planID)
 	m.mu.Unlock()
 	_ = releaseBackupReservation(record)
+	closePlanArtifactHandles(record)
 }
 
 func (m *Manager) discardPlans() []planRecord {
@@ -927,13 +1276,36 @@ func (m *Manager) insertBackupRecord(ctx context.Context, record planRecord, res
 }
 
 func (m *Manager) planProvider(ctx context.Context, record planRecord) (providers.PlatformProvider, error) {
-	if record.Provider != nil {
-		return record.Provider, nil
-	}
 	if m.Providers == nil {
 		return nil, notReady()
 	}
-	return m.Providers.ActiveProvider(ctx)
+	active, err := m.Providers.ActiveProvider(ctx)
+	if err != nil {
+		return nil, err
+	}
+	activeScope, err := providers.ResolveRuntimeScope(ctx, active)
+	if err != nil {
+		return nil, err
+	}
+	if !record.Scope.Valid() || !record.Scope.Equal(activeScope) {
+		return nil, apperror.New(
+			apperror.Conflict,
+			"Docker runtime changed after the backup plan was created",
+			apperror.WithRepairHints("Return to the reviewed provider and context, then create a new backup or restore plan."),
+		)
+	}
+	if record.Provider == nil {
+		return active, nil
+	}
+	plannedScope, err := providers.ResolveRuntimeScope(ctx, record.Provider)
+	if err != nil || !record.Scope.Equal(plannedScope) {
+		return nil, apperror.New(
+			apperror.Conflict,
+			"Planned Docker runtime identity can no longer be verified",
+			apperror.WithCause(err),
+		)
+	}
+	return record.Provider, nil
 }
 
 func (m *Manager) recordAudit(ctx context.Context, action string, targetType string, targetID string, providerID string, projectID string, command string, risk models.Risk, status string, duration time.Duration, actionErr error) error {
@@ -986,7 +1358,9 @@ func (m *Manager) publishDone(jobID string, result string, actionErr error) {
 	if actionErr != nil {
 		payload.Error = actionErr.Error()
 	}
-	m.Events.Publish(bus.Event{Topic: bus.TopicJobDone, Payload: payload})
+	if err := bus.PublishCriticalBounded(m.Events, bus.Event{Topic: bus.TopicJobDone, Payload: payload}); err != nil {
+		slog.Warn("publish critical backup completion failed", "jobID", jobID, "error", err)
+	}
 }
 
 func (m *Manager) publishVolumeChanged(name string) {
@@ -1054,9 +1428,9 @@ func backupCommand(order int, volumeName string, backupDir string, archiveName s
 func createVolumeCommand(order int, volumeName string, risk models.Risk) models.PlannedCommand {
 	return models.PlannedCommand{
 		Order:       order,
-		Command:     shellJoin([]string{"docker", "volume", "create", volumeName}),
+		Command:     shellJoin([]string{"docker", "volume", "create", "--label", restoreOwnerLabel + "=<generated-token>", volumeName}),
 		Risk:        risk,
-		Explanation: "Creates the target volume before restoring backup contents.",
+		Explanation: "Creates the target volume with a per-plan Cairn ownership label before restoring backup contents.",
 	}
 }
 
@@ -1304,15 +1678,113 @@ func regularFileIdentity(path string) (os.FileInfo, error) {
 	if !info.Mode().IsRegular() {
 		return nil, apperror.New(apperror.Conflict, "Expected an owned regular file", apperror.WithDetail(path))
 	}
+	if !stabilizeFileIdentity(info) {
+		return nil, apperror.New(apperror.Conflict, "Capture regular file identity failed", apperror.WithDetail(path))
+	}
 	return info, nil
 }
 
 func optionalRegularFileIdentity(path string) (os.FileInfo, error) {
+	if path == "" {
+		return nil, nil
+	}
 	info, err := regularFileIdentity(path)
 	if err != nil && os.IsNotExist(err) {
 		return nil, nil
 	}
 	return info, err
+}
+
+func openPlannedBackupArtifact(path string, kind string) (*os.File, os.FileInfo, error) {
+	identity, err := optionalRegularFileIdentity(path)
+	if err != nil {
+		return nil, nil, apperror.Wrap(
+			apperror.Conflict,
+			"Backup "+kind+" is not a stable regular file",
+			err,
+			apperror.WithDetail(path),
+		)
+	}
+	if identity == nil {
+		return nil, nil, nil
+	}
+	file, err := openStableDeleteFile(path)
+	if err != nil {
+		return nil, nil, apperror.Wrap(apperror.Conflict, "Open backup "+kind+" for stable identity failed", err)
+	}
+	opened, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, nil, apperror.Wrap(apperror.Conflict, "Inspect opened backup "+kind+" failed", err)
+	}
+	if !opened.Mode().IsRegular() || !os.SameFile(identity, opened) {
+		_ = file.Close()
+		return nil, nil, apperror.New(apperror.Conflict, "Backup "+kind+" identity changed while opening")
+	}
+	if err := verifyPathIdentity(path, opened, false); err != nil {
+		_ = file.Close()
+		return nil, nil, apperror.Wrap(apperror.Conflict, "Backup "+kind+" identity changed while opening", err)
+	}
+	return file, opened, nil
+}
+
+func openRequiredRestoreArtifact(path string, kind string) (*os.File, os.FileInfo, error) {
+	expected, err := regularFileIdentity(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil, apperror.Wrap(apperror.NotFound, "Backup "+kind+" was not found", err, apperror.WithDetail(path))
+		}
+		return nil, nil, apperror.Wrap(
+			apperror.Conflict,
+			"Backup "+kind+" is not a stable regular file",
+			err,
+			apperror.WithDetail(path),
+		)
+	}
+	file, err := openStableFile(path)
+	if err != nil {
+		return nil, nil, apperror.Wrap(apperror.Conflict, "Open backup "+kind+" for stable identity failed", err)
+	}
+	opened, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, nil, apperror.Wrap(apperror.Conflict, "Inspect opened backup "+kind+" failed", err)
+	}
+	if !opened.Mode().IsRegular() || !os.SameFile(expected, opened) {
+		_ = file.Close()
+		return nil, nil, apperror.New(apperror.Conflict, "Backup "+kind+" identity changed while opening")
+	}
+	if err := verifyPathIdentity(path, opened, false); err != nil {
+		_ = file.Close()
+		return nil, nil, apperror.Wrap(apperror.Conflict, "Backup "+kind+" identity changed while opening", err)
+	}
+	return file, opened, nil
+}
+
+func verifyHeldPlanArtifact(path string, handle *os.File, expected os.FileInfo) error {
+	if handle == nil || expected == nil {
+		return apperror.New(apperror.Conflict, "Planned file identity handle is missing")
+	}
+	held, err := handle.Stat()
+	if err != nil {
+		return err
+	}
+	if !held.Mode().IsRegular() || !os.SameFile(expected, held) {
+		return apperror.New(apperror.Conflict, "Held planned file identity changed")
+	}
+	if held.Size() != expected.Size() || !held.ModTime().Equal(expected.ModTime()) {
+		return apperror.New(apperror.Conflict, "Held planned file metadata changed")
+	}
+	return verifyPathIdentity(path, held, false)
+}
+
+func closePlanArtifactHandles(record planRecord) {
+	if record.MetadataHandle != nil {
+		_ = record.MetadataHandle.Close()
+	}
+	if record.ArchiveHandle != nil {
+		_ = record.ArchiveHandle.Close()
+	}
 }
 
 func directoryIdentity(path string) (os.FileInfo, error) {
@@ -1323,7 +1795,17 @@ func directoryIdentity(path string) (os.FileInfo, error) {
 	if !info.IsDir() {
 		return nil, apperror.New(apperror.Conflict, "Expected an owned directory", apperror.WithDetail(path))
 	}
+	if !stabilizeFileIdentity(info) {
+		return nil, apperror.New(apperror.Conflict, "Capture directory identity failed", apperror.WithDetail(path))
+	}
 	return info, nil
+}
+
+func stabilizeFileIdentity(info os.FileInfo) bool {
+	// Windows can defer resolving the file ID returned by Lstat until the first
+	// SameFile call. Resolve it at capture time so a later path replacement
+	// cannot become the identity that the plan appears to own.
+	return info != nil && os.SameFile(info, info)
 }
 
 func verifyPathIdentity(path string, expected os.FileInfo, wantDirectory bool) error {
@@ -1642,24 +2124,145 @@ func metadataPathForArchive(archivePath string) string {
 }
 
 func readSidecar(path string) (BackupSidecar, error) {
-	file, err := os.Open(path)
+	return readSidecarWithOpen(path, os.Open)
+}
+
+func readSidecarWithOpen(path string, openFile func(string) (*os.File, error)) (BackupSidecar, error) {
+	expected, err := regularFileIdentity(path)
+	if err != nil {
+		if apperror.IsCode(err, apperror.Conflict) {
+			return BackupSidecar{}, apperror.Wrap(apperror.Conflict, "Backup metadata is not a stable regular file", err)
+		}
+		return BackupSidecar{}, apperror.Wrap(apperror.NotFound, "Open backup metadata failed", err)
+	}
+	if expected.Size() > maxSidecarBytes {
+		return BackupSidecar{}, backupMetadataTooLarge(path)
+	}
+	file, err := openFile(path)
 	if err != nil {
 		return BackupSidecar{}, apperror.Wrap(apperror.NotFound, "Open backup metadata failed", err)
 	}
 	defer func() {
 		_ = file.Close()
 	}()
+	opened, err := file.Stat()
+	if err != nil {
+		return BackupSidecar{}, apperror.Wrap(apperror.Conflict, "Inspect opened backup metadata failed", err)
+	}
+	if !opened.Mode().IsRegular() || !os.SameFile(expected, opened) {
+		return BackupSidecar{}, apperror.New(
+			apperror.Conflict,
+			"Backup metadata identity changed while opening",
+			apperror.WithDetail(path),
+		)
+	}
+	if opened.Size() > maxSidecarBytes {
+		return BackupSidecar{}, backupMetadataTooLarge(path)
+	}
+	payload, err := io.ReadAll(io.LimitReader(file, maxSidecarBytes+1))
+	if err != nil {
+		return BackupSidecar{}, apperror.Wrap(apperror.Conflict, "Read backup metadata failed", err)
+	}
+	if len(payload) > maxSidecarBytes {
+		return BackupSidecar{}, backupMetadataTooLarge(path)
+	}
+	openedAfter, err := file.Stat()
+	if err != nil {
+		return BackupSidecar{}, apperror.Wrap(apperror.Conflict, "Reinspect opened backup metadata failed", err)
+	}
+	if !openedAfter.Mode().IsRegular() || !os.SameFile(opened, openedAfter) || openedAfter.Size() > maxSidecarBytes {
+		return BackupSidecar{}, apperror.New(
+			apperror.Conflict,
+			"Backup metadata changed while reading",
+			apperror.WithDetail(path),
+		)
+	}
+	if err := verifyPathIdentity(path, expected, false); err != nil {
+		return BackupSidecar{}, apperror.Wrap(apperror.Conflict, "Backup metadata identity changed while reading", err)
+	}
+
 	var sidecar BackupSidecar
-	if err := json.NewDecoder(file).Decode(&sidecar); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	if err := decoder.Decode(&sidecar); err != nil {
 		return BackupSidecar{}, apperror.Wrap(apperror.Conflict, "Backup metadata is invalid", err)
 	}
-	if sidecar.FormatVersion != formatVersion {
-		return BackupSidecar{}, apperror.New(apperror.Conflict, "Backup metadata format is unsupported")
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("multiple JSON values are not allowed")
+		}
+		return BackupSidecar{}, apperror.Wrap(apperror.Conflict, "Backup metadata has trailing content", err)
+	}
+	if err := validateBackupSidecar(sidecar); err != nil {
+		return BackupSidecar{}, err
 	}
 	return sidecar, nil
 }
 
+func backupMetadataTooLarge(path string) error {
+	return apperror.New(
+		apperror.Conflict,
+		"Backup metadata exceeds the size limit",
+		apperror.WithDetail(fmt.Sprintf("%s (maximum %d bytes)", path, maxSidecarBytes)),
+	)
+}
+
+func validateBackupSidecar(sidecar BackupSidecar) error {
+	if sidecar.FormatVersion != formatVersion {
+		return apperror.New(apperror.Conflict, "Backup metadata format is unsupported")
+	}
+	if sidecar.Volume == "" || len(sidecar.Volume) > maxSidecarNameBytes || !sidecarVolumePattern.MatchString(sidecar.Volume) {
+		return invalidBackupMetadataField("volume")
+	}
+	if len(sidecar.SHA256) != sha256.Size*2 || strings.TrimSpace(sidecar.SHA256) != sidecar.SHA256 {
+		return invalidBackupMetadataField("sha256")
+	}
+	if _, err := hex.DecodeString(sidecar.SHA256); err != nil {
+		return invalidBackupMetadataField("sha256")
+	}
+	if sidecar.CompressedSizeBytes < 0 {
+		return invalidBackupMetadataField("compressed_size_bytes")
+	}
+	if sidecar.ArchiveFormatVersion != 0 && sidecar.ArchiveFormatVersion != formatVersion {
+		return invalidBackupMetadataField("archive_format_version")
+	}
+	for _, field := range []struct {
+		name  string
+		value string
+		limit int
+	}{
+		{name: "project", value: sidecar.Project, limit: maxSidecarFieldBytes},
+		{name: "docker_context", value: sidecar.DockerContext, limit: maxSidecarNameBytes},
+		{name: "provider", value: sidecar.Provider, limit: maxSidecarNameBytes},
+		{name: "cairn_version", value: sidecar.CairnVersion, limit: maxSidecarNameBytes},
+	} {
+		if len(field.value) > field.limit {
+			return invalidBackupMetadataField(field.name)
+		}
+	}
+	if len(sidecar.UsingContainers) > maxSidecarContainers {
+		return invalidBackupMetadataField("using_containers")
+	}
+	for _, name := range sidecar.UsingContainers {
+		if len(name) > maxSidecarNameBytes {
+			return invalidBackupMetadataField("using_containers")
+		}
+	}
+	return nil
+}
+
+func invalidBackupMetadataField(field string) error {
+	return apperror.New(
+		apperror.Conflict,
+		"Backup metadata contains an invalid field",
+		apperror.WithDetail(field),
+	)
+}
+
 func writeSidecar(path string, sidecar BackupSidecar) error {
+	if err := validateBackupSidecar(sidecar); err != nil {
+		return err
+	}
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return apperror.Wrap(apperror.Internal, "Create backup metadata failed", err)
@@ -1733,6 +2336,17 @@ func verifyArchiveChecksum(path string, want string) error {
 	return nil
 }
 
+func verifyArchiveChecksumWithIdentity(path string, expected os.FileInfo, want string) error {
+	got, _, err := fileSHA256WithIdentity(path, expected)
+	if err != nil {
+		return err
+	}
+	if !strings.EqualFold(got, strings.TrimSpace(want)) {
+		return apperror.New(apperror.Conflict, "Backup archive checksum does not match metadata")
+	}
+	return nil
+}
+
 func fileSHA256(path string) (string, int64, error) {
 	file, err := os.Open(path)
 	if err != nil {
@@ -1764,7 +2378,8 @@ func fileSHA256WithIdentity(path string, expected os.FileInfo) (string, int64, e
 	if err != nil {
 		return "", 0, err
 	}
-	if !openedInfo.Mode().IsRegular() || !os.SameFile(expected, openedInfo) {
+	if !openedInfo.Mode().IsRegular() || !os.SameFile(expected, openedInfo) ||
+		openedInfo.Size() != expected.Size() || !openedInfo.ModTime().Equal(expected.ModTime()) {
 		return "", 0, apperror.New(apperror.Conflict, "Opened backup file identity did not match the published file", apperror.WithDetail(path))
 	}
 	hash := sha256.New()
@@ -1776,7 +2391,8 @@ func fileSHA256WithIdentity(path string, expected os.FileInfo) (string, int64, e
 	if err != nil {
 		return "", 0, err
 	}
-	if !openedAfter.Mode().IsRegular() || !os.SameFile(expected, openedAfter) {
+	if !openedAfter.Mode().IsRegular() || !os.SameFile(expected, openedAfter) ||
+		openedAfter.Size() != openedInfo.Size() || !openedAfter.ModTime().Equal(openedInfo.ModTime()) {
 		return "", 0, apperror.New(apperror.Conflict, "Published backup file identity changed while hashing", apperror.WithDetail(path))
 	}
 	if err := verifyPathIdentity(path, expected, false); err != nil {
@@ -1787,6 +2403,96 @@ func fileSHA256WithIdentity(path string, expected os.FileInfo) (string, int64, e
 
 func removeBackupFiles(record store.BackupRecord) error {
 	return removeBackupArtifacts(record.BackupPath, record.MetadataPath)
+}
+
+func removePlannedBackupArtifacts(record planRecord) error {
+	return removePlannedBackupArtifactsWithRemove(record, removeStableFile)
+}
+
+func removePlannedBackupArtifactsWithRemove(
+	record planRecord,
+	remove func(string, *os.File) error,
+) error {
+	artifacts := []struct {
+		kind     string
+		path     string
+		identity os.FileInfo
+		handle   *os.File
+	}{
+		{kind: "archive", path: record.ArchivePath, identity: record.ArchiveIdentity, handle: record.ArchiveHandle},
+		{kind: "metadata", path: record.MetadataPath, identity: record.MetadataIdentity, handle: record.MetadataHandle},
+	}
+	for _, artifact := range artifacts {
+		if err := verifyPlannedBackupArtifact(artifact.path, artifact.kind, artifact.handle, artifact.identity); err != nil {
+			return err
+		}
+	}
+	for _, artifact := range artifacts {
+		if artifact.identity == nil {
+			continue
+		}
+		if err := verifyPlannedBackupArtifact(artifact.path, artifact.kind, artifact.handle, artifact.identity); err != nil {
+			return err
+		}
+		if err := remove(artifact.path, artifact.handle); err != nil {
+			return apperror.Wrap(
+				apperror.Conflict,
+				"Delete verified backup "+artifact.kind+" failed",
+				err,
+				apperror.WithRepairHints("Check file permissions and retry with a fresh delete plan."),
+			)
+		}
+	}
+	for _, artifact := range artifacts {
+		if artifact.path == "" {
+			continue
+		}
+		if _, err := os.Lstat(artifact.path); !os.IsNotExist(err) {
+			if err != nil {
+				return apperror.Wrap(apperror.Conflict, "Verify backup "+artifact.kind+" removal failed", err)
+			}
+			return apperror.New(
+				apperror.Conflict,
+				"Backup "+artifact.kind+" was replaced during deletion",
+			)
+		}
+	}
+	return nil
+}
+
+func verifyPlannedBackupArtifact(path string, kind string, handle *os.File, expected os.FileInfo) error {
+	if path == "" {
+		if expected == nil && handle == nil {
+			return nil
+		}
+		return apperror.New(apperror.Conflict, "Backup "+kind+" path changed after planning")
+	}
+	if expected == nil {
+		if handle != nil {
+			return apperror.New(apperror.Conflict, "Backup "+kind+" identity handle changed after planning")
+		}
+		_, err := os.Lstat(path)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		if err != nil {
+			return apperror.Wrap(apperror.Conflict, "Recheck backup "+kind+" failed", err, apperror.WithDetail(path))
+		}
+		return apperror.New(
+			apperror.Conflict,
+			"Backup "+kind+" appeared after planning",
+			apperror.WithDetail(path),
+		)
+	}
+	if err := verifyHeldPlanArtifact(path, handle, expected); err != nil {
+		return apperror.Wrap(
+			apperror.Conflict,
+			"Backup "+kind+" identity changed after planning",
+			err,
+			apperror.WithDetail(path),
+		)
+	}
+	return nil
 }
 
 func removeBackupArtifacts(archivePath string, metadataPath string) error {

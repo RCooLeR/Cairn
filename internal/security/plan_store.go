@@ -73,6 +73,18 @@ func (s *commandPlanStore[T]) Take(ctx context.Context, planID string, typedName
 	return plan, nil
 }
 
+// Clear invalidates every outstanding plan without stopping the store's
+// expiry janitor. Runtime rebinding uses this to ensure a confirmation issued
+// for one Docker backend cannot be replayed against the next backend.
+func (s *commandPlanStore[T]) Clear() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	clear(s.plans)
+	s.mu.Unlock()
+}
+
 func (s *commandPlanStore[T]) pruneExpiredLocked(now time.Time) {
 	for id, plan := range s.plans {
 		expiresAt := s.toCommandPlan(plan).ExpiresAt

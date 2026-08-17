@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -33,6 +34,8 @@ const (
 	defaultRows        = 30
 	defaultMaxSessions = 16
 	backendPathListSep = ":"
+	maxTerminalWrite   = 1 << 20
+	terminalWriteQueue = 32
 )
 
 type DataPayload struct {
@@ -86,6 +89,7 @@ type Manager struct {
 	mu           sync.RWMutex
 	sessions     map[string]*session
 	reservations int
+	stopped      bool
 }
 
 // sessionReservation accounts for terminal capacity before any child process,
@@ -105,6 +109,14 @@ type session struct {
 	finishOnce   sync.Once
 	closeDone    chan struct{}
 	closeContext context.Context
+	writeQueue   chan terminalWriteRequest
+	writerDone   chan struct{}
+}
+
+type terminalWriteRequest struct {
+	ctx    context.Context
+	data   []byte
+	result chan error
 }
 
 func NewManager(provider Provider, docker DockerClient, projects ProjectStore, events bus.Bus, opts Options) *Manager {
@@ -385,6 +397,7 @@ func (m *Manager) OpenContainerTerminal(ctx context.Context, containerID string,
 		_ = execSession.Close()
 		return nil, err
 	}
+	m.startSessionWriter(active)
 	go m.pump(active)
 	return &info, nil
 }
@@ -396,16 +409,53 @@ func (m *Manager) DetectContainerShells(ctx context.Context, containerID string)
 	return m.docker.DetectContainerShells(ctx, containerID)
 }
 
-func (m *Manager) WriteTerminal(_ context.Context, sessionID string, data []byte) error {
+func (m *Manager) WriteTerminal(ctx context.Context, sessionID string, data []byte) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return terminalWriteCanceled(err)
+	}
+	if len(data) > maxTerminalWrite {
+		return apperror.New(
+			apperror.Conflict,
+			"Terminal input is too large",
+			apperror.WithDetail(fmt.Sprintf("A single terminal write may contain at most %d bytes.", maxTerminalWrite)),
+		)
+	}
 	active, err := m.lookup(sessionID)
 	if err != nil {
 		return err
 	}
-	_, err = active.stream.Write(data)
-	if err != nil {
-		return apperror.Wrap(apperror.Internal, "Write to terminal failed", err)
+	if len(data) == 0 {
+		return nil
 	}
-	return nil
+	request := terminalWriteRequest{
+		ctx:    ctx,
+		data:   append([]byte(nil), data...),
+		result: make(chan error, 1),
+	}
+	select {
+	case active.writeQueue <- request:
+	case <-ctx.Done():
+		return terminalWriteCanceled(ctx.Err())
+	case <-active.closeDone:
+		return apperror.New(apperror.NotFound, "Terminal session not found")
+	}
+	select {
+	case err := <-request.result:
+		if err != nil {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return terminalWriteCanceled(ctxErr)
+			}
+			return apperror.Wrap(apperror.Internal, "Write to terminal failed", err)
+		}
+		return nil
+	case <-ctx.Done():
+		return terminalWriteCanceled(ctx.Err())
+	case <-active.closeDone:
+		return apperror.New(apperror.NotFound, "Terminal session not found")
+	}
 }
 
 func (m *Manager) ResizeTerminal(_ context.Context, sessionID string, cols int, rows int) error {
@@ -449,14 +499,21 @@ func (m *Manager) Diagnostics() models.TerminalRuntimeDiagnostics {
 
 func (m *Manager) StopAll() {
 	ids := make([]string, 0)
-	m.mu.RLock()
+	m.mu.Lock()
+	m.stopped = true
 	for id := range m.sessions {
 		ids = append(ids, id)
 	}
-	m.mu.RUnlock()
+	m.mu.Unlock()
+	var stopping sync.WaitGroup
 	for _, id := range ids {
-		m.finish(id, -1)
+		stopping.Add(1)
+		go func(sessionID string) {
+			defer stopping.Done()
+			m.finish(sessionID, -1)
+		}(id)
 	}
+	stopping.Wait()
 }
 
 func (m *Manager) addPTYSession(info models.TerminalSessionInfo, ptySession PTYSession, reservation *sessionReservation) (*models.TerminalSessionInfo, error) {
@@ -471,6 +528,7 @@ func (m *Manager) addPTYSession(info models.TerminalSessionInfo, ptySession PTYS
 		closeAndWaitPTY(ptySession)
 		return nil, err
 	}
+	m.startSessionWriter(active)
 	go m.pump(active)
 	go func() {
 		exitCode := ptySession.Wait()
@@ -482,6 +540,9 @@ func (m *Manager) addPTYSession(info models.TerminalSessionInfo, ptySession PTYS
 func (m *Manager) reserveSession() (*sessionReservation, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.stopped {
+		return nil, providerNotReady()
+	}
 	if len(m.sessions)+m.reservations >= m.max {
 		return nil, apperror.New(
 			apperror.Conflict,
@@ -515,6 +576,9 @@ func (m *Manager) registerReserved(active *session, reservation *sessionReservat
 	}
 	reservation.active = false
 	m.reservations--
+	if m.stopped {
+		return providerNotReady()
+	}
 	if _, exists := m.sessions[active.info.ID]; exists {
 		return apperror.New(apperror.Conflict, "Terminal session already exists")
 	}
@@ -558,6 +622,36 @@ func (m *Manager) pump(active *session) {
 	}
 }
 
+func (m *Manager) startSessionWriter(active *session) {
+	active.writeQueue = make(chan terminalWriteRequest, terminalWriteQueue)
+	active.writerDone = make(chan struct{})
+	go func() {
+		defer close(active.writerDone)
+		for {
+			select {
+			case <-active.closeDone:
+				return
+			case request := <-active.writeQueue:
+				select {
+				case <-active.closeDone:
+					request.result <- io.ErrClosedPipe
+					continue
+				default:
+				}
+				if err := request.ctx.Err(); err != nil {
+					request.result <- err
+					continue
+				}
+				written, err := active.stream.Write(request.data)
+				if err == nil && written != len(request.data) {
+					err = io.ErrShortWrite
+				}
+				request.result <- err
+			}
+		}
+	}()
+}
+
 func terminalCloseContext(ctx context.Context) context.Context {
 	if ctx == nil {
 		return context.Background()
@@ -576,10 +670,17 @@ func (m *Manager) finish(sessionID string, exitCode int) {
 		m.mu.Lock()
 		delete(m.sessions, sessionID)
 		m.mu.Unlock()
-		_ = active.stream.Close()
-		m.publishClosed(sessionID, exitCode)
 		close(active.closeDone)
+		_ = active.stream.Close()
+		if active.writerDone != nil {
+			<-active.writerDone
+		}
+		m.publishClosed(sessionID, exitCode)
 	})
+}
+
+func terminalWriteCanceled(cause error) error {
+	return apperror.Wrap(apperror.Cancelled, "Write to terminal canceled", cause)
 }
 
 func (m *Manager) publishData(sessionID string, data []byte) {
@@ -600,14 +701,17 @@ func (m *Manager) publishClosed(sessionID string, exitCode int) {
 	if m.events == nil {
 		return
 	}
-	m.events.Publish(bus.Event{
+	event := bus.Event{
 		Topic: bus.TopicTerminalClosed,
 		TS:    m.now(),
 		Payload: ClosedPayload{
 			SessionID: sessionID,
 			ExitCode:  exitCode,
 		},
-	})
+	}
+	if err := bus.PublishCriticalBounded(m.events, event); err != nil {
+		slog.Warn("publish terminal closed event failed", "session", sessionID, "error", err)
+	}
 }
 
 func (m *Manager) containerUser(ctx context.Context, containerID string, shell string, requested string) (bool, string) {

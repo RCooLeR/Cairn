@@ -145,6 +145,148 @@ func TestLineageRepositoryScopedReplacePreservesForeignRows(t *testing.T) {
 	}
 }
 
+func TestLineageRepositoryScopedReplaceDetachesPublishedCheckReferences(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db := openStoreForProjectTest(t)
+	scope := runtimescope.Must("linux_native", "unix:///var/run/docker.sock")
+	now := time.Date(2026, 7, 24, 10, 0, 0, 0, time.UTC)
+	project := ProjectRecord{
+		ID:          "linux_native/repeated-check",
+		ProviderID:  scope.ProviderID(),
+		ContextName: scope.ContextName(),
+		Name:        "repeated-check",
+		LastSeenAt:  now,
+	}
+	service := ServiceRecord{
+		ID:         project.ID + "/web",
+		ProjectID:  project.ID,
+		Name:       "web",
+		ImageRef:   "example/web:latest",
+		LastSeenAt: now,
+	}
+	if err := db.Projects().SaveSnapshot(ctx, scope, []ProjectRecord{project}, []ServiceRecord{service}, now, time.Time{}); err != nil {
+		t.Fatalf("SaveSnapshot() error = %v", err)
+	}
+
+	lineage := LineageRecord{
+		ProviderID:      scope.ProviderID(),
+		ContextName:     scope.ContextName(),
+		ProjectID:       project.ID,
+		ServiceID:       service.ID,
+		ServiceName:     service.Name,
+		ServiceImageRef: service.ImageRef,
+		DockerfilePath:  "Dockerfile",
+		DockerfileHash:  "sha256:first",
+		Source:          models.LineageSourceComposeDockerfile,
+		Confidence:      models.ConfidenceMedium,
+		DiscoveredAt:    now,
+		UpdatedAt:       now,
+		BaseRefs: []BaseImageRefRecord{{
+			Name:             "alpine",
+			Tag:              "3.20",
+			ImageRef:         "alpine:3.20",
+			IsFinalStageBase: true,
+			Status:           models.UpdateStatusUnknown,
+		}},
+	}
+	if err := db.Lineage().ReplaceProjectInScope(ctx, scope, project.ID, []LineageRecord{lineage}); err != nil {
+		t.Fatalf("initial ReplaceProjectInScope() error = %v", err)
+	}
+	initial, err := db.Lineage().ListProjectInScope(ctx, scope, project.ID)
+	if err != nil {
+		t.Fatalf("initial ListProjectInScope() error = %v", err)
+	}
+	if len(initial) != 1 || len(initial[0].BaseRefs) != 1 {
+		t.Fatalf("initial lineage = %#v", initial)
+	}
+
+	run, err := db.Updates().BeginServiceCheckRunInScope(ctx, scope, project.ID, service.ID, now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("BeginServiceCheckRunInScope() error = %v", err)
+	}
+	published, accepted, err := db.Updates().PublishCheckRunInScope(ctx, scope, run.ID, []UpdateCheckRecord{{
+		ProviderID:     scope.ProviderID(),
+		ContextName:    scope.ContextName(),
+		ProjectID:      project.ID,
+		ServiceID:      service.ID,
+		Kind:           models.UpdateKindBaseImage,
+		ImageRef:       service.ImageRef,
+		BaseImageRef:   initial[0].BaseRefs[0].ImageRef,
+		LineageID:      initial[0].ID,
+		BaseImageRefID: initial[0].BaseRefs[0].ID,
+		Status:         models.UpdateStatusBaseImageUpdateAvailable,
+	}}, now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatalf("PublishCheckRunInScope() error = %v", err)
+	}
+	if !accepted || len(published) != 1 {
+		t.Fatalf("PublishCheckRunInScope() accepted = %v, records = %#v", accepted, published)
+	}
+
+	replacement := lineage
+	replacement.DockerfileHash = "sha256:second"
+	replacement.DiscoveredAt = now.Add(3 * time.Minute)
+	replacement.UpdatedAt = replacement.DiscoveredAt
+	if err := db.Lineage().ReplaceProjectInScope(ctx, scope, project.ID, []LineageRecord{replacement}); err != nil {
+		t.Fatalf("second ReplaceProjectInScope() error = %v", err)
+	}
+
+	var lineageID sql.NullInt64
+	var baseImageRefID sql.NullInt64
+	if err := db.writer.QueryRowContext(ctx, `
+		SELECT lineage_id, base_image_ref_id
+		FROM image_update_checks
+		WHERE id = ?
+	`, published[0].ID).Scan(&lineageID, &baseImageRefID); err != nil {
+		t.Fatalf("read preserved update check: %v", err)
+	}
+	if lineageID.Valid || baseImageRefID.Valid {
+		t.Fatalf("historical check references = lineage %v, base %v; want both detached", lineageID, baseImageRefID)
+	}
+	preserved, err := db.Updates().GetCheckInScope(ctx, scope, published[0].ID)
+	if err != nil {
+		t.Fatalf("GetCheckInScope(preserved) error = %v", err)
+	}
+	if preserved.ImageRef != service.ImageRef || preserved.BaseImageRef != "alpine:3.20" {
+		t.Fatalf("preserved check = %#v", preserved)
+	}
+
+	refreshed, err := db.Lineage().ListProjectInScope(ctx, scope, project.ID)
+	if err != nil {
+		t.Fatalf("refreshed ListProjectInScope() error = %v", err)
+	}
+	if len(refreshed) != 1 || len(refreshed[0].BaseRefs) != 1 {
+		t.Fatalf("refreshed lineage = %#v", refreshed)
+	}
+	if refreshed[0].ID == initial[0].ID || refreshed[0].BaseRefs[0].ID == initial[0].BaseRefs[0].ID {
+		t.Fatalf("refreshed lineage reused deleted IDs: initial=%#v refreshed=%#v", initial, refreshed)
+	}
+
+	secondRun, err := db.Updates().BeginServiceCheckRunInScope(ctx, scope, project.ID, service.ID, now.Add(4*time.Minute))
+	if err != nil {
+		t.Fatalf("second BeginServiceCheckRunInScope() error = %v", err)
+	}
+	secondPublished, accepted, err := db.Updates().PublishCheckRunInScope(ctx, scope, secondRun.ID, []UpdateCheckRecord{{
+		ProviderID:     scope.ProviderID(),
+		ContextName:    scope.ContextName(),
+		ProjectID:      project.ID,
+		ServiceID:      service.ID,
+		Kind:           models.UpdateKindBaseImage,
+		ImageRef:       service.ImageRef,
+		BaseImageRef:   refreshed[0].BaseRefs[0].ImageRef,
+		LineageID:      refreshed[0].ID,
+		BaseImageRefID: refreshed[0].BaseRefs[0].ID,
+		Status:         models.UpdateStatusBaseImageUpdateAvailable,
+	}}, now.Add(5*time.Minute))
+	if err != nil {
+		t.Fatalf("second PublishCheckRunInScope() error = %v", err)
+	}
+	if !accepted || len(secondPublished) != 1 {
+		t.Fatalf("second PublishCheckRunInScope() accepted = %v, records = %#v", accepted, secondPublished)
+	}
+}
+
 func TestLineageRepositoryReasons(t *testing.T) {
 	t.Parallel()
 	unknown := LineageRecord{Source: models.LineageSourceUnknown, Confidence: models.ConfidenceUnknown}

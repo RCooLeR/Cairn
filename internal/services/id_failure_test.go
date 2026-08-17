@@ -7,6 +7,7 @@ import (
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/providers"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/store"
 )
@@ -46,6 +47,7 @@ func TestDockerPlanEntropyFailureDoesNotMutateDocker(t *testing.T) {
 		Client:      client,
 		ObjectPlans: plans,
 		IDs:         security.NewIDSource(failingServiceEntropyReader{}),
+		Scope:       runtimescope.Must("linux_native", "default"),
 	}
 
 	plan, err := service.PlanPrune(context.Background(), "images")

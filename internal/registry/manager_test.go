@@ -516,6 +516,208 @@ func TestLoginRestoresPreexistingHelperCredentialAfterVerificationFailure(t *tes
 	}
 }
 
+func TestLoginAuditsPostCommandVerificationFailureAsSingleFailedOutcome(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer server.Close()
+	registryHost := strings.TrimPrefix(server.URL, "http://")
+	audit := testRegistryAuditRepository(t)
+	const secret = "verification-failure-secret"
+	provider := &fakeRegistryProvider{
+		backendConfig: `{}`,
+		backendResults: map[string]string{
+			"docker-credential-pass list": `{}`,
+		},
+		backendDefaultExitCode: 1,
+		backendDefaultStderr:   "credentials not found in native keychain",
+		dockerResult:           &providers.CommandResult{ExitCode: 0},
+	}
+	manager := NewManager(fakeResolver{provider: provider}, audit)
+
+	err := manager.Login(context.Background(), models.RegistryLoginRequest{
+		Registry: registryHost,
+		Username: "ada",
+		Secret:   secret,
+	})
+	if !apperror.IsCode(err, apperror.RegistryAuth) {
+		t.Fatalf("Login() error = %v, want registry auth", err)
+	}
+	entries := listRegistryLoginAuditEntries(t, audit)
+	if len(entries) != 1 || entries[0].Result != "failed" {
+		t.Fatalf("registry login audit entries = %#v, want one failed outcome", entries)
+	}
+	if !strings.Contains(entries[0].Error, "verification failed") {
+		t.Fatalf("registry login audit error = %q, want verification failure", entries[0].Error)
+	}
+	encoded, marshalErr := json.Marshal(entries[0])
+	if marshalErr != nil {
+		t.Fatalf("Marshal(audit entry) error = %v", marshalErr)
+	}
+	if strings.Contains(string(encoded), secret) {
+		t.Fatalf("registry secret leaked into failed audit entry: %s", encoded)
+	}
+}
+
+func TestLoginAuditsStorageFinalizationFailureAsSingleFailedOutcome(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	registryHost := strings.TrimPrefix(server.URL, "http://")
+	oldAuth := base64.StdEncoding.EncodeToString([]byte("old-user:old-secret"))
+	originalConfig := `{"auths":{"` + registryHost + `":{"auth":"` + oldAuth + `"}},"credHelpers":{"` + registryHost + `":"pass"}}`
+	audit := testRegistryAuditRepository(t)
+	provider := &fakeRegistryProvider{
+		backendConfig: originalConfig,
+		backendResults: map[string]string{
+			"docker-credential-pass list": `{}`,
+		},
+		backendDefaultExitCode: 1,
+		backendDefaultStderr:   "credentials not found in native keychain",
+		backendConfigWriteResult: &providers.CommandResult{
+			ExitCode: 74,
+			Stderr:   "atomic Docker config write failed",
+		},
+		dockerResult: &providers.CommandResult{ExitCode: 0},
+	}
+	manager := NewManager(fakeResolver{provider: provider}, audit)
+
+	err := manager.Login(context.Background(), models.RegistryLoginRequest{
+		Registry: registryHost,
+		Username: "new-user",
+		Secret:   "new-secret",
+	})
+	if !apperror.IsCode(err, apperror.ProviderNotReady) {
+		t.Fatalf("Login() error = %v, want finalization failure", err)
+	}
+	if provider.backendConfig != originalConfig {
+		t.Fatalf("Docker config changed after failed finalization:\ngot  %s\nwant %s", provider.backendConfig, originalConfig)
+	}
+	entries := listRegistryLoginAuditEntries(t, audit)
+	if len(entries) != 1 || entries[0].Result != "failed" {
+		t.Fatalf("registry login audit entries = %#v, want one failed outcome", entries)
+	}
+	if !strings.Contains(entries[0].Error, string(apperror.ProviderNotReady)) {
+		t.Fatalf("registry login audit error = %q, want finalization error code", entries[0].Error)
+	}
+}
+
+func TestLoginCommandFailureAndAuditFailurePreserveBothOutcomes(t *testing.T) {
+	const (
+		registryHost  = "registry.example.test"
+		oldSecret     = "old-helper-secret"
+		attemptSecret = "failed-login-secret"
+	)
+	originalConfig := `{"credHelpers":{"` + registryHost + `":"pass"}}`
+	provider := &fakeRegistryProvider{
+		backendConfig: originalConfig,
+		backendResults: map[string]string{
+			"docker-credential-pass list":  `{}`,
+			"docker-credential-pass get":   `{"Username":"old-user","Secret":"` + oldSecret + `"}`,
+			"docker-credential-pass store": ``,
+		},
+		dockerResult: &providers.CommandResult{ExitCode: 1, Stderr: "denied " + attemptSecret},
+	}
+	manager := NewManager(fakeResolver{provider: provider}, closedTestRegistryAuditRepository(t))
+
+	err := manager.Login(context.Background(), models.RegistryLoginRequest{
+		Registry: registryHost,
+		Username: "new-user",
+		Secret:   attemptSecret,
+	})
+	if !apperror.IsCode(err, apperror.Internal) {
+		t.Fatalf("Login() error = %v, want internal audit failure", err)
+	}
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) || !strings.Contains(appErr.Detail, "previous credential state was restored") {
+		t.Fatalf("Login() error = %#v, want explicit restored-state detail", appErr)
+	}
+	var actionErr *apperror.AppError
+	if !errors.As(appErr.Cause, &actionErr) || actionErr.Code != apperror.RegistryAuth {
+		t.Fatalf("Login() cause = %v, want preserved registry auth failure", appErr.Cause)
+	}
+	if appErr.Partial != nil {
+		t.Fatalf("Login() partial = %#v, want no unresolved external state after successful rollback", appErr.Partial)
+	}
+	if provider.backendConfig != originalConfig {
+		t.Fatalf("Docker config changed after command and audit failure: %s", provider.backendConfig)
+	}
+	storeInput := lastBackendInputForCommand(provider, "docker-credential-pass store")
+	if !strings.Contains(storeInput, `"Secret":"`+oldSecret+`"`) {
+		t.Fatalf("restored helper payload = %q, want previous credential", storeInput)
+	}
+	if encoded := string(apperror.Marshal(err)); strings.Contains(encoded, attemptSecret) || strings.Contains(encoded, oldSecret) {
+		t.Fatalf("registry secret leaked into returned error: %s", encoded)
+	}
+}
+
+func TestLoginSuccessAuditFailureRollsBackCredentialAndConfig(t *testing.T) {
+	var registryHost string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	registryHost = strings.TrimPrefix(server.URL, "http://")
+	const (
+		oldSecret     = "old-helper-secret"
+		attemptSecret = "accepted-login-secret"
+	)
+	oldAuth := base64.StdEncoding.EncodeToString([]byte("old-user:" + oldSecret))
+	originalConfig := `{"auths":{"` + registryHost + `":{"auth":"` + oldAuth + `"}},"credHelpers":{"` + registryHost + `":"pass"}}`
+	provider := &fakeRegistryProvider{
+		backendConfig: originalConfig,
+		backendResults: map[string]string{
+			"docker-credential-pass list":  `{}`,
+			"docker-credential-pass get":   `{"Username":"old-user","Secret":"` + oldSecret + `"}`,
+			"docker-credential-pass store": ``,
+		},
+		dockerResult: &providers.CommandResult{ExitCode: 0},
+	}
+	manager := NewManager(fakeResolver{provider: provider}, closedTestRegistryAuditRepository(t))
+
+	err := manager.Login(context.Background(), models.RegistryLoginRequest{
+		Registry: registryHost,
+		Username: "new-user",
+		Secret:   attemptSecret,
+	})
+	if !apperror.IsCode(err, apperror.Internal) {
+		t.Fatalf("Login() error = %v, want internal audit failure", err)
+	}
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) {
+		t.Fatalf("Login() error = %v, want structured application error", err)
+	}
+	if appErr.Partial == nil ||
+		appErr.Partial.Type != "registryCredential" ||
+		appErr.Partial.ID != registryHost ||
+		appErr.Partial.State != "rolled_back_audit_missing" ||
+		appErr.Partial.CleanupRequired {
+		t.Fatalf("Login() partial = %#v, want explicit completed rollback state", appErr.Partial)
+	}
+	if !strings.Contains(appErr.Detail, "restored the previous credential and configuration state") {
+		t.Fatalf("Login() detail = %q, want explicit rollback result", appErr.Detail)
+	}
+	var gotConfig any
+	var wantConfig any
+	if unmarshalErr := json.Unmarshal([]byte(provider.backendConfig), &gotConfig); unmarshalErr != nil {
+		t.Fatalf("Unmarshal(restored Docker config) error = %v", unmarshalErr)
+	}
+	if unmarshalErr := json.Unmarshal([]byte(originalConfig), &wantConfig); unmarshalErr != nil {
+		t.Fatalf("Unmarshal(original Docker config) error = %v", unmarshalErr)
+	}
+	if !reflect.DeepEqual(gotConfig, wantConfig) {
+		t.Fatalf("Docker config was not restored after success audit failure:\ngot  %s\nwant %s", provider.backendConfig, originalConfig)
+	}
+	storeInput := lastBackendInputForCommand(provider, "docker-credential-pass store")
+	if !strings.Contains(storeInput, `"Username":"old-user"`) || !strings.Contains(storeInput, `"Secret":"`+oldSecret+`"`) {
+		t.Fatalf("restored helper payload = %q, want previous credential", storeInput)
+	}
+	if encoded := string(apperror.Marshal(err)); strings.Contains(encoded, attemptSecret) || strings.Contains(encoded, oldSecret) {
+		t.Fatalf("registry secret leaked into returned error: %s", encoded)
+	}
+}
+
 func TestRegistryTransactionLockSerializesDifferentManagersAndRegistries(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -578,14 +780,306 @@ func TestLoginDefaultsToFailClosedCredentialHelperModeWhenSettingsUnavailable(t 
 		Username: "ada",
 		Secret:   "token",
 	})
-	if !apperror.IsCode(err, apperror.ProviderNotReady) {
-		t.Fatalf("Login() error = %v, want provider not ready", err)
+	if !apperror.IsCode(err, apperror.RegistryAuth) {
+		t.Fatalf("Login() error = %v, want registry auth", err)
 	}
 	if provider.dockerInput != "" || len(provider.dockerArgs) != 0 {
 		t.Fatalf("docker login ran despite missing helper: input=%q args=%#v", provider.dockerInput, provider.dockerArgs)
 	}
 	if provider.backendConfig != "" {
 		t.Fatalf("backend config was rewritten despite missing helper: %s", provider.backendConfig)
+	}
+}
+
+func TestLoginAuditsCredentialHelperPreparationFailureWithoutSecret(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "cairn.db"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if err := db.Migrate(ctx); err != nil {
+		_ = db.Close()
+		t.Fatalf("Migrate() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+
+	provider := &fakeRegistryProvider{
+		backendConfig:          `{}`,
+		backendDefaultExitCode: 127,
+		backendDefaultStderr:   "not found",
+		dockerResult:           &providers.CommandResult{ExitCode: 0},
+	}
+	manager := NewManager(fakeResolver{provider: provider}, db.Audit())
+	const (
+		registryHost = "registry.example.test"
+		username     = "ada"
+		secret       = "super-secret-registry-token"
+	)
+
+	err = manager.Login(ctx, models.RegistryLoginRequest{
+		Registry: registryHost,
+		Username: username,
+		Secret:   secret,
+	})
+	if !apperror.IsCode(err, apperror.RegistryAuth) {
+		t.Fatalf("Login() error = %v, want original registry auth failure", err)
+	}
+	if provider.dockerInput != "" || len(provider.dockerArgs) != 0 {
+		t.Fatalf("docker login ran despite failed helper preflight: input=%q args=%#v", provider.dockerInput, provider.dockerArgs)
+	}
+
+	entries, err := db.Audit().List(ctx, models.AuditFilter{Topic: "registry.login", Limit: 10})
+	if err != nil {
+		t.Fatalf("List(audit) error = %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("registry login audit entries = %d, want 1: %#v", len(entries), entries)
+	}
+	entry := entries[0]
+	if entry.Action != "registry.login" || entry.Target != registryHost || entry.Result != "failed" {
+		t.Fatalf("audit entry = %#v", entry)
+	}
+	command, _ := entry.Metadata["command"].(string)
+	if command != "docker login "+registryHost+" -u "+username+" --password-stdin" {
+		t.Fatalf("audit command = %q", command)
+	}
+	encoded, err := json.Marshal(entry)
+	if err != nil {
+		t.Fatalf("Marshal(audit entry) error = %v", err)
+	}
+	if strings.Contains(string(encoded), secret) {
+		t.Fatalf("registry secret leaked into audit entry: %s", encoded)
+	}
+}
+
+func TestLoginFailsClosedWhenPreparationFailureCannotBeAudited(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "cairn.db"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if err := db.Migrate(ctx); err != nil {
+		_ = db.Close()
+		t.Fatalf("Migrate() error = %v", err)
+	}
+	audit := db.Audit()
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+
+	provider := &fakeRegistryProvider{
+		backendConfig:          `{}`,
+		backendDefaultExitCode: 127,
+		backendDefaultStderr:   "not found",
+		dockerResult:           &providers.CommandResult{ExitCode: 0},
+	}
+	manager := NewManager(fakeResolver{provider: provider}, audit)
+	const secret = "super-secret-registry-token"
+
+	err = manager.Login(ctx, models.RegistryLoginRequest{
+		Registry: "registry.example.test",
+		Username: "ada",
+		Secret:   secret,
+	})
+	if !apperror.IsCode(err, apperror.Internal) {
+		t.Fatalf("Login() error = %v, want internal audit failure", err)
+	}
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) || !strings.Contains(appErr.Detail, "Docker login was not run") {
+		t.Fatalf("Login() error detail = %#v", appErr)
+	}
+	if provider.dockerInput != "" || len(provider.dockerArgs) != 0 {
+		t.Fatalf("docker login ran despite unavailable audit store: input=%q args=%#v", provider.dockerInput, provider.dockerArgs)
+	}
+	if encoded := string(apperror.Marshal(err)); strings.Contains(encoded, secret) {
+		t.Fatalf("registry secret leaked into returned error: %s", encoded)
+	}
+}
+
+func TestRegistryCredentialModeDefaultsToRequiredHelper(t *testing.T) {
+	t.Run("settings unavailable", func(t *testing.T) {
+		manager := NewManager(nil, nil)
+		mode, err := manager.registryCredentialMode(context.Background())
+		if err != nil || mode != registryCredentialModeDockerHelper {
+			t.Fatalf("registryCredentialMode() = %q, %v; want %q, nil", mode, err, registryCredentialModeDockerHelper)
+		}
+	})
+	t.Run("fresh migrated store", func(t *testing.T) {
+		manager := NewManager(nil, nil)
+		manager.Settings = testRegistrySettings(t, "")
+		mode, err := manager.registryCredentialMode(context.Background())
+		if err != nil || mode != registryCredentialModeDockerHelper {
+			t.Fatalf("registryCredentialMode() = %q, %v; want %q, nil", mode, err, registryCredentialModeDockerHelper)
+		}
+	})
+}
+
+func TestCredentialHelperProbeClassifiesStorageFailuresWithoutInvalidatingProvider(t *testing.T) {
+	t.Parallel()
+	provider := &fakeRegistryProvider{
+		backendDefaultExitCode: 127,
+		backendDefaultStderr:   "not found",
+	}
+	manager := NewManager(fakeResolver{provider: provider}, nil)
+
+	if _, err := manager.detectCredentialHelper(context.Background(), provider); !apperror.IsCode(err, apperror.RegistryAuth) {
+		t.Fatalf("detectCredentialHelper() error = %v, want registry auth", err)
+	} else if apperror.IsCode(err, apperror.ProviderNotReady) {
+		t.Fatalf("detectCredentialHelper() incorrectly invalidated the Docker provider: %v", err)
+	}
+	if err := manager.checkCredentialHelper(context.Background(), provider, "pass"); !apperror.IsCode(err, apperror.RegistryAuth) {
+		t.Fatalf("checkCredentialHelper() error = %v, want registry auth", err)
+	} else if apperror.IsCode(err, apperror.ProviderNotReady) {
+		t.Fatalf("checkCredentialHelper() incorrectly invalidated the Docker provider: %v", err)
+	}
+}
+
+func TestCredentialHelperProbeClassifiesMissingWSLHelperWithoutInvalidatingProvider(t *testing.T) {
+	t.Parallel()
+	provider := &fakeRegistryProvider{
+		providerType:           providers.TypeWindowsWSL,
+		backendDefaultExitCode: 127,
+		backendDefaultStderr:   "docker-credential-pass: not found",
+		backendDefaultErr:      errors.New("exit status 127"),
+	}
+	manager := NewManager(fakeResolver{provider: provider}, nil)
+
+	if _, err := manager.detectCredentialHelper(context.Background(), provider); !apperror.IsCode(err, apperror.RegistryAuth) {
+		t.Fatalf("detectCredentialHelper() error = %v, want registry auth", err)
+	} else if apperror.IsCode(err, apperror.ProviderNotReady) {
+		t.Fatalf("detectCredentialHelper() incorrectly invalidated the WSL provider: %v", err)
+	}
+	if got, want := len(provider.backendCalls), len(credentialHelperCandidates(provider)); got != want {
+		t.Fatalf("credential helper probes = %d, want all %d candidates", got, want)
+	}
+	if err := manager.checkCredentialHelper(context.Background(), provider, "pass"); !apperror.IsCode(err, apperror.RegistryAuth) {
+		t.Fatalf("checkCredentialHelper() error = %v, want registry auth", err)
+	} else if apperror.IsCode(err, apperror.ProviderNotReady) {
+		t.Fatalf("checkCredentialHelper() incorrectly invalidated the WSL provider: %v", err)
+	}
+}
+
+func TestCredentialHelperProbeClassifiesWSLInvocationFailuresAsProviderNotReady(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		provider func() *fakeRegistryProvider
+	}{
+		{
+			name: "nil result",
+			provider: func() *fakeRegistryProvider {
+				return &fakeRegistryProvider{
+					providerType:     providers.TypeWindowsWSL,
+					backendNilResult: true,
+				}
+			},
+		},
+		{
+			name: "process launch failure",
+			provider: func() *fakeRegistryProvider {
+				return &fakeRegistryProvider{
+					providerType:           providers.TypeWindowsWSL,
+					backendDefaultExitCode: -1,
+					backendDefaultErr:      errors.New("exec: wsl.exe failed to start"),
+				}
+			},
+		},
+		{
+			name: "WSL service failure",
+			provider: func() *fakeRegistryProvider {
+				return &fakeRegistryProvider{
+					providerType:           providers.TypeWindowsWSL,
+					backendDefaultExitCode: 1,
+					backendDefaultStderr:   "W\x00s\x00l\x00/\x00S\x00e\x00r\x00v\x00i\x00c\x00e\x00/\x000\x00x\x008\x000\x000\x007\x002\x007\x004\x007\x00",
+					backendDefaultErr:      errors.New("exit status 1"),
+				}
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			for _, operation := range []struct {
+				name string
+				run  func(*Manager, *fakeRegistryProvider) error
+			}{
+				{
+					name: "detect",
+					run: func(manager *Manager, provider *fakeRegistryProvider) error {
+						_, err := manager.detectCredentialHelper(context.Background(), provider)
+						return err
+					},
+				},
+				{
+					name: "check",
+					run: func(manager *Manager, provider *fakeRegistryProvider) error {
+						return manager.checkCredentialHelper(context.Background(), provider, "pass")
+					},
+				},
+			} {
+				operation := operation
+				t.Run(operation.name, func(t *testing.T) {
+					t.Parallel()
+					provider := tt.provider()
+					manager := NewManager(fakeResolver{provider: provider}, nil)
+					err := operation.run(manager, provider)
+					if !apperror.IsCode(err, apperror.ProviderNotReady) {
+						t.Fatalf("credential helper %s error = %v, want provider not ready", operation.name, err)
+					}
+					if len(provider.backendCalls) != 1 {
+						t.Fatalf("credential helper %s continued after WSL failure: %#v", operation.name, provider.backendCalls)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestCredentialHelperProbePreservesCallerCancellationAndDeadline(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		ctx  func() context.Context
+		code apperror.Code
+	}{
+		{
+			name: "cancelled",
+			ctx: func() context.Context {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx
+			},
+			code: apperror.Cancelled,
+		},
+		{
+			name: "deadline",
+			ctx: func() context.Context {
+				ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+				t.Cleanup(cancel)
+				return ctx
+			},
+			code: apperror.Timeout,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			provider := &fakeRegistryProvider{
+				backendDefaultExitCode: 127,
+				backendDefaultStderr:   "not found",
+			}
+			manager := NewManager(fakeResolver{provider: provider}, nil)
+			if _, err := manager.detectCredentialHelper(tt.ctx(), provider); !apperror.IsCode(err, tt.code) {
+				t.Fatalf("detectCredentialHelper() error = %v, want %s", err, tt.code)
+			}
+			if len(provider.backendCalls) != 0 {
+				t.Fatalf("credential helper commands ran after caller termination: %#v", provider.backendCalls)
+			}
+		})
 	}
 }
 
@@ -1408,6 +1902,61 @@ func testRegistrySettings(t *testing.T, mode string) *store.SettingsRepository {
 	return settings
 }
 
+func testRegistryAuditRepository(t *testing.T) *store.AuditRepository {
+	t.Helper()
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "cairn.db"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if err := db.Migrate(ctx); err != nil {
+		_ = db.Close()
+		t.Fatalf("Migrate() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+	return db.Audit()
+}
+
+func closedTestRegistryAuditRepository(t *testing.T) *store.AuditRepository {
+	t.Helper()
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "cairn.db"))
+	if err != nil {
+		t.Fatalf("Open() error = %v", err)
+	}
+	if err := db.Migrate(ctx); err != nil {
+		_ = db.Close()
+		t.Fatalf("Migrate() error = %v", err)
+	}
+	audit := db.Audit()
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	return audit
+}
+
+func listRegistryLoginAuditEntries(t *testing.T, audit *store.AuditRepository) []models.AuditEntry {
+	t.Helper()
+	entries, err := audit.List(context.Background(), models.AuditFilter{Topic: "registry.login", Limit: 10})
+	if err != nil {
+		t.Fatalf("List(audit) error = %v", err)
+	}
+	return entries
+}
+
+func lastBackendInputForCommand(provider *fakeRegistryProvider, command string) string {
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	for index := len(provider.backendCalls) - 1; index >= 0; index-- {
+		if provider.backendCalls[index] == command {
+			return provider.backendInputs[index]
+		}
+	}
+	return ""
+}
+
 func isBackendConfigReadForTest(command string) bool {
 	return strings.Contains(command, "config.json") &&
 		(strings.Contains(command, "cat \"") || strings.Contains(command, "Get-Content") || strings.Contains(command, "ReadAllText"))
@@ -1419,30 +1968,33 @@ func isBackendConfigWriteForTest(command string) bool {
 }
 
 type fakeRegistryProvider struct {
-	mu                     sync.Mutex
-	backendStdout          string
-	backendResults         map[string]string
-	backendReadSequence    []string
-	backendReadIndex       int
-	backendDefaultExitCode int
-	backendDefaultStderr   string
-	backendConfig          string
-	backendInput           string
-	backendInputs          []string
-	backendArgs            []string
-	backendCalls           []string
-	dockerInput            string
-	dockerArgs             []string
-	dockerCalls            [][]string
-	dockerResult           *providers.CommandResult
-	dockerInputStarted     chan struct{}
-	dockerInputRelease     chan struct{}
-	dockerStartOnce        sync.Once
-	backendLocks           map[string]string
-	backendNilResult       bool
-	backendStdoutTruncated bool
-	providerType           string
-	providerPlatform       string
+	mu                       sync.Mutex
+	backendStdout            string
+	backendResults           map[string]string
+	backendReadSequence      []string
+	backendReadIndex         int
+	backendDefaultExitCode   int
+	backendDefaultStderr     string
+	backendDefaultErr        error
+	backendConfigWriteResult *providers.CommandResult
+	backendConfigWriteErr    error
+	backendConfig            string
+	backendInput             string
+	backendInputs            []string
+	backendArgs              []string
+	backendCalls             []string
+	dockerInput              string
+	dockerArgs               []string
+	dockerCalls              [][]string
+	dockerResult             *providers.CommandResult
+	dockerInputStarted       chan struct{}
+	dockerInputRelease       chan struct{}
+	dockerStartOnce          sync.Once
+	backendLocks             map[string]string
+	backendNilResult         bool
+	backendStdoutTruncated   bool
+	providerType             string
+	providerPlatform         string
 }
 
 func (p *fakeRegistryProvider) ID() string          { return "fake" }
@@ -1530,7 +2082,7 @@ func (p *fakeRegistryProvider) RunBackendCommand(_ context.Context, input string
 		return &providers.CommandResult{Command: args, ExitCode: 0}, nil
 	}
 	if p.backendNilResult {
-		return nil, nil
+		return nil, p.backendDefaultErr
 	}
 	if isBackendConfigReadForTest(joined) && p.backendReadIndex < len(p.backendReadSequence) {
 		stdout := p.backendReadSequence[p.backendReadIndex]
@@ -1538,6 +2090,14 @@ func (p *fakeRegistryProvider) RunBackendCommand(_ context.Context, input string
 		return &providers.CommandResult{Command: args, Stdout: stdout, ExitCode: 0}, nil
 	}
 	if isBackendConfigWriteForTest(joined) {
+		if p.backendConfigWriteResult != nil || p.backendConfigWriteErr != nil {
+			if p.backendConfigWriteResult == nil {
+				return nil, p.backendConfigWriteErr
+			}
+			result := *p.backendConfigWriteResult
+			result.Command = append([]string(nil), args...)
+			return &result, p.backendConfigWriteErr
+		}
 		p.backendConfig = input
 		return &providers.CommandResult{Command: args, ExitCode: 0}, nil
 	}
@@ -1556,7 +2116,7 @@ func (p *fakeRegistryProvider) RunBackendCommand(_ context.Context, input string
 			return &providers.CommandResult{Command: args, Stdout: stdout, ExitCode: 0}, nil
 		}
 	}
-	return &providers.CommandResult{Command: args, Stdout: p.backendStdout, Stderr: p.backendDefaultStderr, StdoutTruncated: p.backendStdoutTruncated, ExitCode: p.backendDefaultExitCode}, nil
+	return &providers.CommandResult{Command: args, Stdout: p.backendStdout, Stderr: p.backendDefaultStderr, StdoutTruncated: p.backendStdoutTruncated, ExitCode: p.backendDefaultExitCode}, p.backendDefaultErr
 }
 
 func backendLockNameForTest(command string) string {

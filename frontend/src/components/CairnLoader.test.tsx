@@ -146,7 +146,7 @@ describe("CairnLoader", () => {
   it("uses neutral presentation copy while backend readiness is unknown", async () => {
     render(<CairnLoader onDone={vi.fn()} />);
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(3_000);
+      await vi.advanceTimersByTimeAsync(300);
     });
 
     expect(screen.getByText("Preparing runtime integration")).toBeVisible();
@@ -163,17 +163,21 @@ describe("CairnLoader", () => {
     render(<CairnLoader onDone={onDone} />);
 
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(3_000);
+      await vi.advanceTimersByTimeAsync(400);
     });
 
     expect(
-      screen.getByRole("progressbar", { name: "Initializing Cairn" }),
-    ).toHaveAttribute("aria-valuenow", "90");
+      Number(
+        screen
+          .getByRole("progressbar", { name: "Initializing Cairn" })
+          .getAttribute("aria-valuenow"),
+      ),
+    ).toBeLessThan(100);
     expect(onDone).not.toHaveBeenCalled();
 
     markVersionReady();
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(2_500);
+      await vi.advanceTimersByTimeAsync(800);
     });
 
     expect(onDone).toHaveBeenCalledTimes(1);
@@ -184,7 +188,7 @@ describe("CairnLoader", () => {
     const onDone = vi.fn();
     const view = render(<CairnLoader onDone={onDone} />);
 
-    act(() => vi.advanceTimersByTime(3_000));
+    act(() => vi.advanceTimersByTime(400));
     view.unmount();
     markVersionReady();
     act(() => vi.advanceTimersByTime(20_000));

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"regexp"
 	"sort"
@@ -46,6 +47,11 @@ const (
 	healthResultSuccess     = "success"
 	healthResultSuccessWarn = "success_warn"
 	healthResultFailed      = "failed"
+
+	defaultUpdateHealthStabilityInterval = 5 * time.Second
+	updateRestartLoopDelta               = 2
+	maxUpdateHealthLogBytes              = 256 * 1024
+	maxPendingUpdatePlans                = 128
 )
 
 type ComposeRunner interface {
@@ -69,18 +75,21 @@ type BackupRunner interface {
 }
 
 type updatePlanRecord struct {
-	Plan            models.UpdatePlan
-	ExpiresAt       time.Time
-	Operation       string
-	Project         store.ProjectRecord
-	Services        map[string]store.ServiceRecord
-	Snapshots       []updateSnapshot
-	RollbackHistory store.UpdateHistoryRecord
-	Pull            []string
-	Build           []string
-	Up              []string
-	CommandSet      []models.PlannedCommand
-	Scope           runtimescope.Scope
+	Plan               models.UpdatePlan
+	ExpiresAt          time.Time
+	Operation          string
+	Project            store.ProjectRecord
+	ProjectGeneration  uint64
+	ProjectFingerprint string
+	Services           map[string]store.ServiceRecord
+	Snapshots          []updateSnapshot
+	HealthBaselines    map[string]updateHealthBaseline
+	RollbackHistory    store.UpdateHistoryRecord
+	Pull               []string
+	Build              []string
+	Up                 []string
+	CommandSet         []models.PlannedCommand
+	Scope              runtimescope.Scope
 }
 
 type updateSnapshot struct {
@@ -92,6 +101,11 @@ type updateSnapshot struct {
 	DockerfileHash string
 	BuildArgs      map[string]string
 	HasHealthcheck bool
+}
+
+type updateHealthBaseline struct {
+	ExpectedReplicas int
+	Restarts         map[string]int
 }
 
 type jobProgressPayload struct {
@@ -121,41 +135,92 @@ func (m *Manager) ApplyUpdate(ctx context.Context, req models.ApplyUpdateRequest
 		return "", err
 	}
 	if record.Operation == "rollback" {
-		m.saveUpdatePlan(record)
-		return "", apperror.New(apperror.Conflict, "Update plan is a rollback plan")
+		operationErr := apperror.New(apperror.Conflict, "Update plan is a rollback plan")
+		return "", errors.Join(operationErr, m.saveUpdatePlan(record))
 	}
 	if !record.Scope.Equal(m.Scope) {
 		return "", apperror.New(apperror.NotFound, "Update plan was not created for the active runtime context")
 	}
-	project, err := m.projectForCompose(ctx, record.Project.ID)
-	if err != nil {
-		return "", err
-	}
-	record.Project = project
 	if len(record.CommandSet) == 0 {
-		m.saveUpdatePlan(record)
-		return "", apperror.New(apperror.Conflict, "Update plan has no actionable commands")
+		operationErr := apperror.New(apperror.Conflict, "Update plan has no actionable commands")
+		return "", errors.Join(operationErr, m.saveUpdatePlan(record))
 	}
-	if m.Compose == nil || m.Updates == nil {
-		m.saveUpdatePlan(record)
-		return "", notReady()
+	if m.Projects == nil || m.Compose == nil || m.Updates == nil {
+		return "", errors.Join(notReady(), m.saveUpdatePlan(record))
 	}
 	jobID, err := m.newID("updates")
 	if err != nil {
-		m.saveUpdatePlan(record)
+		return "", errors.Join(err, m.saveUpdatePlan(record))
+	}
+
+	operationCtx, releaseOperation, err := m.Projects.BeginProjectOperation(
+		context.Background(),
+		record.Scope,
+		record.Project.ID,
+		record.ProjectGeneration,
+	)
+	if err != nil {
+		return "", mapProjectMutationAdmissionError(err, "Update")
+	}
+	operationOwned := true
+	defer func() {
+		if operationOwned {
+			releaseOperation()
+		}
+	}()
+
+	validationCtx, stopValidation := contextWithPeerCancellation(ctx, operationCtx)
+	defer stopValidation()
+	project, services, err := m.projectWithServicesForCompose(validationCtx, record.Project.ID)
+	if err != nil {
+		if operationCtx.Err() != nil {
+			return "", apperror.New(apperror.PlanExpired, "Update plan was superseded while it was being applied")
+		}
 		return "", err
 	}
-	m.startJob(jobID, func(jobCtx context.Context) {
-		m.runUpdate(jobCtx, jobID, record, req)
-	})
+	if err := validateProjectPlanFingerprint(validationCtx, record.ProjectFingerprint, project, services, "Update"); err != nil {
+		return "", err
+	}
+	record.Project = project
+	record.Services = serviceRecordsByName(services)
+
+	if !m.startJob(jobID, func(jobCtx context.Context) {
+		defer releaseOperation()
+		workerCtx, stopWorker := contextWithPeerCancellation(jobCtx, operationCtx)
+		defer stopWorker()
+		m.runUpdate(workerCtx, jobID, record, req)
+	}) {
+		return "", notReady()
+	}
+	operationOwned = false
 	return jobID, nil
 }
 
 func (m *Manager) PlanRollback(ctx context.Context, historyID int64) (*models.UpdatePlan, error) {
-	if m == nil || m.Updates == nil || m.Compose == nil || m.Docker == nil || !m.Scope.Valid() {
+	if m == nil || m.Projects == nil || m.Updates == nil || m.Compose == nil || m.Docker == nil || !m.Scope.Valid() {
 		return nil, notReady()
 	}
 	history, err := m.Updates.GetHistoryInScope(ctx, m.Scope, historyID)
+	if err != nil {
+		return nil, mapStoreError(err, "Update history item was not found")
+	}
+	if strings.TrimSpace(history.ProjectID) == "" || !m.Scope.Matches(history.ProviderID, history.ContextName) {
+		return nil, apperror.New(apperror.NotFound, "Update history item was not found")
+	}
+	projectGeneration, err := m.Projects.ProjectOperationGeneration(m.Scope, history.ProjectID)
+	if err != nil {
+		if errors.Is(err, store.ErrProjectOperationInProgress) {
+			return nil, apperror.New(apperror.Conflict, "Another project mutation is already in progress")
+		}
+		if errors.Is(err, store.ErrProjectOperationSuperseded) {
+			return nil, apperror.New(apperror.Conflict, "Project removal is already in progress")
+		}
+		return nil, apperror.Wrap(apperror.Internal, "Read project lifecycle failed", err)
+	}
+	// The first history read identifies the project gate. Read it again after
+	// sampling that gate so a delete-and-reimport between those steps cannot
+	// pair old rollback data with the new project's generation.
+	history, err = m.Updates.GetHistoryInScope(ctx, m.Scope, historyID)
 	if err != nil {
 		return nil, mapStoreError(err, "Update history item was not found")
 	}
@@ -175,6 +240,14 @@ func (m *Manager) PlanRollback(ctx context.Context, historyID int64) (*models.Up
 	}
 	if _, err := m.Docker.GetImage(ctx, history.OldImageID); err != nil {
 		return nil, apperror.New(apperror.NotFound, "Previous image is no longer present locally", apperror.WithCause(err), apperror.WithRepairHints("Pull the previous versioned tag manually, then redeploy this service."))
+	}
+	services, err := m.Projects.ListServices(ctx, project.ID)
+	if err != nil {
+		return nil, apperror.Wrap(apperror.Internal, "List project services for rollback planning failed", err)
+	}
+	projectFingerprint, err := projectConfigurationFingerprintWithInputs(ctx, project, services)
+	if err != nil {
+		return nil, planConfigurationFingerprintError("Rollback", err)
 	}
 	service := serviceNameFromID(history.ServiceID, history.ProjectID)
 	composeArgs := []string{"up", "-d"}
@@ -219,14 +292,18 @@ func (m *Manager) PlanRollback(ctx context.Context, historyID int64) (*models.Up
 			Commands: commands,
 			Warnings: []string{"Rollback will retag the previous local image and recreate the service."},
 		},
-		ExpiresAt:       m.now().Add(security.DefaultPlanTTL),
-		Operation:       "rollback",
-		Project:         project,
-		RollbackHistory: history,
-		CommandSet:      commands,
-		Scope:           m.Scope,
+		ExpiresAt:          m.now().Add(security.DefaultPlanTTL),
+		Operation:          "rollback",
+		Project:            project,
+		ProjectGeneration:  projectGeneration,
+		ProjectFingerprint: projectFingerprint,
+		RollbackHistory:    history,
+		CommandSet:         commands,
+		Scope:              m.Scope,
 	}
-	m.saveUpdatePlan(record)
+	if err := m.saveUpdatePlan(record); err != nil {
+		return nil, err
+	}
 	plan := record.Plan
 	return &plan, nil
 }
@@ -237,25 +314,71 @@ func (m *Manager) ApplyRollback(ctx context.Context, planID string) (string, err
 		return "", err
 	}
 	if record.Operation != "rollback" {
-		m.saveUpdatePlan(record)
-		return "", apperror.New(apperror.Conflict, "Update plan is not a rollback plan")
+		operationErr := apperror.New(apperror.Conflict, "Update plan is not a rollback plan")
+		return "", errors.Join(operationErr, m.saveUpdatePlan(record))
 	}
 	if !record.Scope.Equal(m.Scope) {
 		return "", apperror.New(apperror.NotFound, "Rollback plan was not created for the active runtime context")
 	}
-	project, err := m.projectForCompose(ctx, record.Project.ID)
-	if err != nil || record.RollbackHistory.ProjectID != record.Project.ID || !m.Scope.Matches(record.RollbackHistory.ProviderID, record.RollbackHistory.ContextName) {
+	if record.RollbackHistory.ProjectID != record.Project.ID ||
+		!m.Scope.Matches(record.RollbackHistory.ProviderID, record.RollbackHistory.ContextName) {
 		return "", apperror.New(apperror.NotFound, "Update history item was not found")
 	}
-	record.Project = project
+	if m.Projects == nil || m.Updates == nil || m.Compose == nil || m.Docker == nil {
+		return "", errors.Join(notReady(), m.saveUpdatePlan(record))
+	}
 	jobID, err := m.newID("updates")
 	if err != nil {
-		m.saveUpdatePlan(record)
+		return "", errors.Join(err, m.saveUpdatePlan(record))
+	}
+
+	operationCtx, releaseOperation, err := m.Projects.BeginProjectOperation(
+		context.Background(),
+		record.Scope,
+		record.Project.ID,
+		record.ProjectGeneration,
+	)
+	if err != nil {
+		return "", mapProjectMutationAdmissionError(err, "Rollback")
+	}
+	operationOwned := true
+	defer func() {
+		if operationOwned {
+			releaseOperation()
+		}
+	}()
+
+	validationCtx, stopValidation := contextWithPeerCancellation(ctx, operationCtx)
+	defer stopValidation()
+	project, services, err := m.projectWithServicesForCompose(validationCtx, record.Project.ID)
+	if err != nil {
+		if operationCtx.Err() != nil {
+			return "", apperror.New(apperror.PlanExpired, "Rollback plan was superseded while it was being applied")
+		}
 		return "", err
 	}
-	m.startJob(jobID, func(jobCtx context.Context) {
-		m.runManualRollback(jobCtx, jobID, record.Project, record.RollbackHistory)
-	})
+	if err := validateProjectPlanFingerprint(validationCtx, record.ProjectFingerprint, project, services, "Rollback"); err != nil {
+		return "", err
+	}
+	history, err := m.Updates.GetHistoryInScope(validationCtx, record.Scope, record.RollbackHistory.ID)
+	if err != nil ||
+		history.ProjectID != project.ID ||
+		history.RollbackStatus != rollbackStatusAvailable {
+		return "", apperror.New(apperror.PlanExpired, "Rollback plan is no longer available for the confirmed project configuration")
+	}
+	record.Project = project
+	record.Services = serviceRecordsByName(services)
+	record.RollbackHistory = history
+
+	if !m.startJob(jobID, func(jobCtx context.Context) {
+		defer releaseOperation()
+		workerCtx, stopWorker := contextWithPeerCancellation(jobCtx, operationCtx)
+		defer stopWorker()
+		m.runManualRollback(workerCtx, jobID, record)
+	}) {
+		return "", notReady()
+	}
+	operationOwned = false
 	return jobID, nil
 }
 
@@ -272,6 +395,20 @@ func (m *Manager) Rollback(ctx context.Context, historyID int64) (string, error)
 func (m *Manager) planUpdate(ctx context.Context, projectID string, serviceName string) (*models.UpdatePlan, error) {
 	if m == nil || m.Projects == nil || m.Updates == nil {
 		return nil, notReady()
+	}
+	// Sample the incarnation before reading any project-owned state. If the
+	// project is removed while the plan is assembled, ApplyUpdate observes a
+	// different generation and rejects the plan. Sampling after the project
+	// read would admit a delete-and-reimport ABA window.
+	projectGeneration, err := m.Projects.ProjectOperationGeneration(m.Scope, projectID)
+	if err != nil {
+		if errors.Is(err, store.ErrProjectOperationInProgress) {
+			return nil, apperror.New(apperror.Conflict, "Another project mutation is already in progress")
+		}
+		if errors.Is(err, store.ErrProjectOperationSuperseded) {
+			return nil, apperror.New(apperror.Conflict, "Project removal is already in progress")
+		}
+		return nil, apperror.Wrap(apperror.Internal, "Read project lifecycle failed", err)
 	}
 	project, services, err := m.projectWithServices(ctx, projectID)
 	if err != nil {
@@ -308,10 +445,11 @@ func (m *Manager) planUpdate(ctx context.Context, projectID string, serviceName 
 
 	now := m.now()
 	record := updatePlanRecord{
-		ExpiresAt: now.Add(security.DefaultPlanTTL),
-		Project:   project,
-		Services:  serviceByName,
-		Scope:     m.Scope,
+		ExpiresAt:         now.Add(security.DefaultPlanTTL),
+		Project:           project,
+		ProjectGeneration: projectGeneration,
+		Services:          serviceByName,
+		Scope:             m.Scope,
 	}
 	warnings := make([]string, 0)
 	for _, check := range current {
@@ -358,6 +496,11 @@ func (m *Manager) planUpdate(ctx context.Context, projectID string, serviceName 
 		record.Up = appendUnique(record.Up, service)
 	}
 	record.CommandSet = updateCommands(project, record.Pull, record.Build, record.Up)
+	projectFingerprint, err := projectConfigurationFingerprintWithInputs(ctx, project, services)
+	if err != nil {
+		return nil, planConfigurationFingerprintError("Update", err)
+	}
+	record.ProjectFingerprint = projectFingerprint
 	planID, err := m.newID("update")
 	if err != nil {
 		return nil, err
@@ -366,7 +509,9 @@ func (m *Manager) planUpdate(ctx context.Context, projectID string, serviceName 
 	record.Plan.ProjectID = project.ID
 	record.Plan.Commands = record.CommandSet
 	record.Plan.Warnings = uniqueStrings(warnings)
-	m.saveUpdatePlan(record)
+	if err := m.saveUpdatePlan(record); err != nil {
+		return nil, err
+	}
 	plan := record.Plan
 	return &plan, nil
 }
@@ -413,7 +558,7 @@ func (m *Manager) runUpdate(ctx context.Context, jobID string, record updatePlan
 			return
 		}
 	}
-	err = m.executeUpdateCommands(ctx, jobID, record)
+	err = m.executeUpdateCommands(ctx, jobID, &record, req.WatchHealth)
 	healthResult := ""
 	if err == nil && req.WatchHealth {
 		m.publishJobProgress(jobID, "health", "Watching updated services", nil)
@@ -512,33 +657,109 @@ func (m *Manager) affectedVolumes(ctx context.Context, record updatePlanRecord) 
 	return volumes, nil
 }
 
-func (m *Manager) executeUpdateCommands(ctx context.Context, jobID string, record updatePlanRecord) error {
-	opts := composeOptionsFromProject(record.Project)
+func (m *Manager) executeUpdateCommands(ctx context.Context, jobID string, record *updatePlanRecord, captureHealth bool) error {
+	if record == nil {
+		return apperror.New(apperror.Internal, "Update plan is unavailable")
+	}
 	if len(record.Pull) > 0 {
+		if err := m.revalidateProjectPlan(ctx, record, "Update"); err != nil {
+			return err
+		}
 		m.publishJobProgress(jobID, "pull", "Pulling service images", nil)
-		result, err := m.Compose.PullServices(ctx, opts, record.Pull)
+		result, err := m.Compose.PullServices(ctx, composeOptionsFromProject(record.Project), record.Pull)
 		m.publishComposeOutput(jobID, result)
 		if err != nil {
 			return err
 		}
 	}
 	if len(record.Build) > 0 {
+		if err := m.revalidateProjectPlan(ctx, record, "Update"); err != nil {
+			return err
+		}
 		m.publishJobProgress(jobID, "build", "Rebuilding services with pulled bases", nil)
-		result, err := m.Compose.Build(ctx, opts, composecore.BuildOptions{Pull: true, Services: record.Build})
+		result, err := m.Compose.Build(ctx, composeOptionsFromProject(record.Project), composecore.BuildOptions{Pull: true, Services: record.Build})
 		m.publishComposeOutput(jobID, result)
 		if err != nil {
 			return err
 		}
 	}
 	if len(record.Up) > 0 {
+		if captureHealth {
+			baselines, err := m.captureUpdateHealthBaselines(ctx, *record)
+			if err != nil {
+				return err
+			}
+			record.HealthBaselines = baselines
+		}
+		if err := m.revalidateProjectPlan(ctx, record, "Update"); err != nil {
+			return err
+		}
 		m.publishJobProgress(jobID, "up", "Recreating updated services", nil)
-		result, err := m.Compose.UpServices(ctx, opts, composecore.UpOptions{Services: record.Up})
+		result, err := m.Compose.UpServices(ctx, composeOptionsFromProject(record.Project), composecore.UpOptions{Services: record.Up})
 		m.publishComposeOutput(jobID, result)
 		if err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func (m *Manager) captureUpdateHealthBaselines(ctx context.Context, record updatePlanRecord) (map[string]updateHealthBaseline, error) {
+	baselines := make(map[string]updateHealthBaseline, len(record.Up))
+	for _, serviceName := range record.Up {
+		containers, err := m.serviceContainers(ctx, record.Project.ID, serviceName)
+		if err != nil {
+			return nil, err
+		}
+		expected := 0
+		if service, ok := record.Services[serviceName]; ok && service.ReplicasTotal > 0 {
+			expected = service.ReplicasTotal
+		}
+		if len(containers) > expected {
+			expected = len(containers)
+		}
+		// Compose services default to one replica when neither the stored
+		// detector snapshot nor the live runtime has an observed count.
+		if expected == 0 {
+			expected = 1
+		}
+		restarts := make(map[string]int, len(containers))
+		for _, container := range containers {
+			if key := containerRestartBaselineKey(container); key != "" {
+				restarts[key] = max(container.Restarts, 0)
+			}
+		}
+		baselines[serviceName] = updateHealthBaseline{
+			ExpectedReplicas: expected,
+			Restarts:         restarts,
+		}
+	}
+	return baselines, nil
+}
+
+func containerRestartBaselineKey(container models.ContainerSummary) string {
+	if id := strings.TrimSpace(container.ID); id != "" {
+		return "id:" + id
+	}
+	if name := strings.TrimSpace(strings.TrimPrefix(container.Name, "/")); name != "" {
+		return "name:" + name
+	}
+	return ""
+}
+
+func restartDeltaSinceBaseline(container models.ContainerSummary, baseline updateHealthBaseline) int {
+	current := max(container.Restarts, 0)
+	previous := 0
+	if key := containerRestartBaselineKey(container); key != "" {
+		previous = max(baseline.Restarts[key], 0)
+	}
+	if current < previous {
+		// Docker restart counters reset with a new container incarnation (or
+		// daemon state reset). In that case the current value is the complete
+		// post-baseline count and must not be treated as a negative delta.
+		return current
+	}
+	return current - previous
 }
 
 func (m *Manager) watchHealth(ctx context.Context, record updatePlanRecord) (string, error) {
@@ -554,27 +775,57 @@ func (m *Manager) watchHealth(ctx context.Context, record updatePlanRecord) (str
 		poll = time.Second
 	}
 	deadline := m.now().Add(window)
+	stability := m.HealthStabilityInterval
+	if stability <= 0 {
+		stability = defaultUpdateHealthStabilityInterval
+	}
+	if stability >= window {
+		stability = window / 2
+	}
+	if stability <= 0 {
+		stability = time.Millisecond
+	}
+	stableSince := time.Time{}
 	warn := false
 	for {
-		result, err := m.healthPass(ctx, record, m.now().Add(-window))
+		now := m.now()
+		result, err := m.healthPass(ctx, record, now.Add(-window))
 		if err != nil {
 			return healthResultFailed, err
 		}
 		switch result {
 		case healthResultSuccess:
+			if stableSince.IsZero() {
+				stableSince = now
+			}
+		case healthResultSuccessWarn:
+			warn = true
+			if stableSince.IsZero() {
+				stableSince = now
+			}
+		case "pending_warn":
+			warn = true
+			stableSince = time.Time{}
+		default:
+			stableSince = time.Time{}
+		}
+		if now.After(deadline) {
+			return healthResultFailed, apperror.New(apperror.Timeout, "Updated services did not become healthy in time")
+		}
+		if !stableSince.IsZero() && now.Sub(stableSince) >= stability {
 			if warn {
 				return healthResultSuccessWarn, nil
 			}
 			return healthResultSuccess, nil
-		case healthResultSuccessWarn:
-			return healthResultSuccessWarn, nil
-		case "pending_warn":
-			warn = true
 		}
-		if !m.now().Before(deadline) {
-			return healthResultFailed, apperror.New(apperror.Timeout, "Updated services did not become healthy in time")
+		wait := poll
+		if remaining := deadline.Sub(now); remaining < wait {
+			wait = remaining
 		}
-		timer := time.NewTimer(poll)
+		if wait <= 0 {
+			continue
+		}
+		timer := time.NewTimer(wait)
 		select {
 		case <-ctx.Done():
 			timer.Stop()
@@ -592,46 +843,52 @@ func (m *Manager) healthPass(ctx context.Context, record updatePlanRecord, since
 		}
 	}
 	warn := false
+	pending := false
 	for _, service := range record.Up {
 		snapshot, ok := byService[service]
 		if !ok {
-			continue
+			return "", apperror.New(apperror.Internal, "Update health snapshot is unavailable", apperror.WithDetail(service))
+		}
+		baseline, ok := record.HealthBaselines[service]
+		if !ok || baseline.ExpectedReplicas <= 0 {
+			return "", apperror.New(apperror.Internal, "Update health baseline is unavailable", apperror.WithDetail(service))
 		}
 		containers, err := m.serviceContainers(ctx, record.Project.ID, service)
 		if err != nil {
 			return "", err
 		}
-		if len(containers) == 0 {
-			return "pending", nil
-		}
-		serviceOK := false
+		serviceOK := len(containers) >= baseline.ExpectedReplicas
 		for _, container := range containers {
 			if fatal, err := m.containerHasFatalLogs(ctx, container.ID, since); err != nil {
 				return "", err
 			} else if fatal {
 				return "", apperror.New(apperror.Conflict, "Fatal log pattern detected after update", apperror.WithDetail(container.Name))
 			}
-			if container.Restarts >= 2 {
+			if restartDeltaSinceBaseline(container, baseline) >= updateRestartLoopDelta {
 				return "", apperror.New(apperror.Conflict, "Container entered a restart loop after update", apperror.WithDetail(container.Name))
 			}
 			if !containerRunning(container) {
+				serviceOK = false
 				continue
 			}
 			if snapshot.HasHealthcheck {
-				if container.Health == models.HealthStatusHealthy {
-					serviceOK = true
+				if container.Health != models.HealthStatusHealthy {
+					serviceOK = false
 				}
 				continue
 			}
-			serviceOK = true
 			warn = true
 		}
 		if !serviceOK {
-			if !snapshot.HasHealthcheck {
-				return "pending_warn", nil
-			}
-			return "pending", nil
+			pending = true
+			warn = warn || !snapshot.HasHealthcheck
 		}
+	}
+	if pending {
+		if warn {
+			return "pending_warn", nil
+		}
+		return "pending", nil
 	}
 	if warn {
 		return healthResultSuccessWarn, nil
@@ -673,9 +930,17 @@ func (m *Manager) containerHasFatalLogs(ctx context.Context, containerID string,
 	defer func() {
 		_ = reader.Close()
 	}()
-	body, err := io.ReadAll(io.LimitReader(reader, 256*1024))
+	body, err := io.ReadAll(io.LimitReader(reader, maxUpdateHealthLogBytes+1))
 	if err != nil {
 		return false, err
+	}
+	if len(body) > maxUpdateHealthLogBytes {
+		return false, apperror.New(
+			apperror.Conflict,
+			"Container health logs exceeded the safe inspection limit",
+			apperror.WithDetail(containerID),
+			apperror.WithRepairHints("Inspect the container logs manually before retrying the update."),
+		)
 	}
 	return fatalLogDetected(string(body)), nil
 }
@@ -691,7 +956,7 @@ func (m *Manager) rollbackSnapshots(ctx context.Context, jobID string, record up
 			continue
 		}
 		m.publishJobProgress(jobID, "rollback", "Rolling back "+service, nil)
-		if err := m.rollbackHistory(ctx, jobID, record.Project, history); err != nil {
+		if err := m.rollbackHistory(ctx, jobID, &record, history); err != nil {
 			result = updateResultManualNeeded
 			status = rollbackStatusManualNeeded
 		}
@@ -700,12 +965,24 @@ func (m *Manager) rollbackSnapshots(ctx context.Context, jobID string, record up
 	return result, status
 }
 
-func (m *Manager) runManualRollback(ctx context.Context, jobID string, project store.ProjectRecord, history store.UpdateHistoryRecord) {
+func (m *Manager) runManualRollback(ctx context.Context, jobID string, record updatePlanRecord) {
 	started := m.now()
+	project := record.Project
+	history, err := m.Updates.GetHistoryInScope(ctx, m.Scope, record.RollbackHistory.ID)
+	if err != nil ||
+		history.ProjectID != project.ID ||
+		history.RollbackStatus != rollbackStatusAvailable {
+		if err == nil {
+			err = apperror.New(apperror.Conflict, "Rollback is no longer available for this update history item")
+		}
+		m.finishRejectedManualRollback(ctx, jobID, record, started, err)
+		return
+	}
+
 	command := rollbackCommand(project, history)
 	_ = m.recordAudit(ctx, "update.rollback", "project", project.ID, project.ProviderID, project.ID, command, models.RiskNeedsConfirmation, "started", 0, nil)
 	m.publishJobProgress(jobID, "rollback", "Rolling back "+serviceNameFromID(history.ServiceID, history.ProjectID), nil)
-	err := m.rollbackHistory(ctx, jobID, project, history)
+	err = m.rollbackHistory(ctx, jobID, &record, history)
 	result := updateResultRolledBack
 	status := rollbackStatusRolledBack
 	if err != nil {
@@ -733,18 +1010,53 @@ func (m *Manager) runManualRollback(ctx context.Context, jobID string, project s
 	m.publishJobDone(jobID, result, err)
 }
 
-func (m *Manager) rollbackHistory(ctx context.Context, jobID string, project store.ProjectRecord, history store.UpdateHistoryRecord) error {
+func (m *Manager) finishRejectedManualRollback(
+	ctx context.Context,
+	jobID string,
+	record updatePlanRecord,
+	started time.Time,
+	actionErr error,
+) {
+	finishCtx, cancel := m.finishContext(ctx)
+	defer cancel()
+	command := rollbackCommand(record.Project, record.RollbackHistory)
+	_ = m.recordAudit(
+		finishCtx,
+		"update.rollback",
+		"project",
+		record.Project.ID,
+		record.Project.ProviderID,
+		record.Project.ID,
+		command,
+		models.RiskNeedsConfirmation,
+		"failed",
+		time.Since(started),
+		actionErr,
+	)
+	m.publishJobDone(jobID, updateResultFailed, actionErr)
+}
+
+func (m *Manager) rollbackHistory(ctx context.Context, jobID string, record *updatePlanRecord, history store.UpdateHistoryRecord) error {
+	if record == nil {
+		return apperror.New(apperror.Internal, "Rollback plan is unavailable")
+	}
 	if strings.TrimSpace(history.OldImageID) == "" {
 		return apperror.New(apperror.NotFound, "Previous image ID is not available for rollback")
 	}
 	if _, err := m.Docker.GetImage(ctx, history.OldImageID); err != nil {
 		return apperror.New(apperror.NotFound, "Previous image is no longer present locally", apperror.WithCause(err), apperror.WithRepairHints("Pull the previous versioned tag manually, then redeploy this service."))
 	}
+	if err := m.revalidateProjectPlan(ctx, record, "Rollback"); err != nil {
+		return err
+	}
 	if err := m.Docker.TagImage(ctx, history.OldImageID, history.ImageRef); err != nil {
 		return err
 	}
+	if err := m.revalidateProjectPlan(ctx, record, "Rollback"); err != nil {
+		return err
+	}
 	noBuild := history.UpdateKind == models.UpdateKindBaseImage
-	result, err := m.Compose.UpServices(ctx, composeOptionsFromProject(project), composecore.UpOptions{
+	result, err := m.Compose.UpServices(ctx, composeOptionsFromProject(record.Project), composecore.UpOptions{
 		NoBuild:  noBuild,
 		Services: []string{serviceNameFromID(history.ServiceID, history.ProjectID)},
 	})
@@ -818,22 +1130,178 @@ func (m *Manager) projectForCompose(ctx context.Context, projectID string) (stor
 	if err != nil {
 		return store.ProjectRecord{}, err
 	}
-	if strings.TrimSpace(project.WorkingDir) == "" {
-		return store.ProjectRecord{}, apperror.New(apperror.WorkdirMissing, "Project working directory is missing")
-	}
-	if _, err := os.Stat(project.WorkingDir); err != nil {
-		return store.ProjectRecord{}, apperror.New(apperror.WorkdirMissing, "Project working directory was not found", apperror.WithDetail(project.WorkingDir))
+	if err := validateProjectComposeTarget(project); err != nil {
+		return store.ProjectRecord{}, err
 	}
 	return project, nil
 }
 
-func (m *Manager) saveUpdatePlan(record updatePlanRecord) {
+func (m *Manager) projectWithServicesForCompose(ctx context.Context, projectID string) (store.ProjectRecord, []store.ServiceRecord, error) {
+	project, services, err := m.projectWithServices(ctx, projectID)
+	if err != nil {
+		return store.ProjectRecord{}, nil, err
+	}
+	if err := validateProjectComposeTarget(project); err != nil {
+		return store.ProjectRecord{}, nil, err
+	}
+	return project, services, nil
+}
+
+func validateProjectComposeTarget(project store.ProjectRecord) error {
+	if strings.TrimSpace(project.WorkingDir) == "" {
+		return apperror.New(apperror.WorkdirMissing, "Project working directory is missing")
+	}
+	if _, err := os.Stat(project.WorkingDir); err != nil {
+		return apperror.New(apperror.WorkdirMissing, "Project working directory was not found", apperror.WithDetail(project.WorkingDir))
+	}
+	return nil
+}
+
+func serviceRecordsByName(services []store.ServiceRecord) map[string]store.ServiceRecord {
+	records := make(map[string]store.ServiceRecord, len(services))
+	for _, service := range services {
+		records[service.Name] = service
+	}
+	return records
+}
+
+func validateProjectPlanFingerprint(
+	ctx context.Context,
+	expected string,
+	project store.ProjectRecord,
+	services []store.ServiceRecord,
+	operation string,
+) error {
+	actual, err := projectConfigurationFingerprintWithInputs(ctx, project, services)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		return apperror.New(
+			apperror.PlanExpired,
+			operation+" plan expired because the Compose inputs can no longer be verified",
+			apperror.WithCause(err),
+			apperror.WithRepairHints("Restore the intended Compose inputs, then create and review a fresh plan."),
+		)
+	}
+	if expected == "" || actual != expected {
+		return apperror.New(
+			apperror.PlanExpired,
+			operation+" plan expired because the project configuration changed",
+			apperror.WithRepairHints("Create and review a fresh plan before retrying."),
+		)
+	}
+	return nil
+}
+
+func planConfigurationFingerprintError(operation string, cause error) error {
+	if errors.Is(cause, context.Canceled) || errors.Is(cause, context.DeadlineExceeded) {
+		return cause
+	}
+	return apperror.New(
+		apperror.Conflict,
+		operation+" plan cannot be created because the Compose inputs could not be verified",
+		apperror.WithCause(cause),
+		apperror.WithRepairHints("Restore or correct the declared Compose inputs, then create and review a fresh plan."),
+	)
+}
+
+// revalidateProjectPlan reloads both the durable project configuration and
+// the verified on-disk Compose dependency closure. Apply performs the same
+// check before accepting a plan, but workers can be delayed by history writes,
+// backups, or earlier Compose commands, so each mutation must recheck at its
+// own execution boundary.
+func (m *Manager) revalidateProjectPlan(ctx context.Context, record *updatePlanRecord, operation string) error {
+	if record == nil {
+		return apperror.New(apperror.Internal, operation+" plan is unavailable")
+	}
+	project, services, err := m.projectWithServicesForCompose(ctx, record.Project.ID)
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		return apperror.New(
+			apperror.PlanExpired,
+			operation+" plan expired because the project configuration can no longer be verified",
+			apperror.WithCause(err),
+			apperror.WithRepairHints("Restore the intended project configuration, then create and review a fresh plan."),
+		)
+	}
+	if err := validateProjectPlanFingerprint(ctx, record.ProjectFingerprint, project, services, operation); err != nil {
+		return err
+	}
+	record.Project = project
+	record.Services = serviceRecordsByName(services)
+	return nil
+}
+
+func mapProjectMutationAdmissionError(err error, operation string) error {
+	switch {
+	case errors.Is(err, store.ErrProjectOperationInProgress):
+		return apperror.New(
+			apperror.Conflict,
+			"Another project mutation is already in progress",
+			apperror.WithRepairHints("Wait for the active project job to finish, then create a fresh plan."),
+		)
+	case errors.Is(err, store.ErrProjectOperationSuperseded):
+		return apperror.New(
+			apperror.PlanExpired,
+			operation+" plan was superseded by a newer project lifecycle revision",
+			apperror.WithRepairHints("Create and review a fresh plan before retrying."),
+		)
+	default:
+		return apperror.Wrap(apperror.Internal, "Reserve project mutation failed", err)
+	}
+}
+
+// contextWithPeerCancellation preserves values and deadlines from primary
+// while also canceling when peer is canceled. The returned cleanup does not
+// cancel peer.
+func contextWithPeerCancellation(primary context.Context, peer context.Context) (context.Context, func()) {
+	if primary == nil {
+		primary = context.Background()
+	}
+	if peer == nil {
+		peer = context.Background()
+	}
+	ctx, cancel := context.WithCancel(primary)
+	stopPeer := context.AfterFunc(peer, cancel)
+	// AfterFunc runs an already-canceled peer callback asynchronously. Mirror
+	// that state synchronously so a worker cannot begin mutations in the small
+	// interval before the callback goroutine is scheduled.
+	if peer.Err() != nil {
+		cancel()
+	}
+	return ctx, func() {
+		_ = stopPeer()
+		cancel()
+	}
+}
+
+func (m *Manager) saveUpdatePlan(record updatePlanRecord) error {
+	now := m.now()
 	m.planMu.Lock()
 	defer m.planMu.Unlock()
 	if m.plans == nil {
 		m.plans = map[string]updatePlanRecord{}
 	}
+	for planID, existing := range m.plans {
+		if !now.Before(existing.ExpiresAt) {
+			delete(m.plans, planID)
+		}
+	}
+	if _, exists := m.plans[record.Plan.PlanID]; exists {
+		return apperror.New(apperror.Conflict, "A pending update plan already uses this identifier")
+	}
+	if len(m.plans) >= maxPendingUpdatePlans {
+		return apperror.New(
+			apperror.Conflict,
+			"Too many update plans are pending confirmation",
+			apperror.WithRepairHints("Apply or allow existing plans to expire, then retry."),
+		)
+	}
 	m.plans[record.Plan.PlanID] = record
+	return nil
 }
 
 func (m *Manager) takeUpdatePlan(ctx context.Context, planID string) (updatePlanRecord, error) {
@@ -846,13 +1314,23 @@ func (m *Manager) takeUpdatePlan(ctx context.Context, planID string) (updatePlan
 	}
 	m.planMu.Lock()
 	defer m.planMu.Unlock()
+	now := m.now()
+	targetExpired := false
+	for existingID, existing := range m.plans {
+		if now.Before(existing.ExpiresAt) {
+			continue
+		}
+		delete(m.plans, existingID)
+		if existingID == planID {
+			targetExpired = true
+		}
+	}
+	if targetExpired {
+		return updatePlanRecord{}, apperror.New(apperror.PlanExpired, "Update plan expired")
+	}
 	record, ok := m.plans[planID]
 	if !ok {
 		return updatePlanRecord{}, apperror.New(apperror.PlanExpired, "Update plan expired or was not found")
-	}
-	if m.now().After(record.ExpiresAt) {
-		delete(m.plans, planID)
-		return updatePlanRecord{}, apperror.New(apperror.PlanExpired, "Update plan expired")
 	}
 	delete(m.plans, planID)
 	return record, nil
@@ -914,7 +1392,9 @@ func (m *Manager) publishJobDone(jobID string, result string, actionErr error) {
 	if actionErr != nil {
 		payload.Error = actionErr.Error()
 	}
-	m.Events.Publish(bus.Event{Topic: bus.TopicJobDone, Payload: payload})
+	if err := bus.PublishCriticalBounded(m.Events, bus.Event{Topic: bus.TopicJobDone, Payload: payload}); err != nil {
+		slog.Warn("publish update completion event failed", "job", jobID, "error", err)
+	}
 }
 
 func (m *Manager) publishApplied(history store.UpdateHistoryRecord) {

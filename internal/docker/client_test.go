@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -1700,6 +1701,444 @@ func TestClientImagePullSaveLoadAndSearch(t *testing.T) {
 	}
 }
 
+func TestClientSaveImagePreservesExistingDestination(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	eventBus := bus.New()
+	defer eventBus.Close()
+	jobDone := eventBus.Subscribe(ctx, bus.TopicJobDone, 2)
+
+	client := New(fakeDockerProvider{}, eventBus)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "image.tar")
+	const original = "existing archive must survive"
+	if err := os.WriteFile(dest, []byte(original), 0o600); err != nil {
+		t.Fatalf("write existing destination: %v", err)
+	}
+
+	jobID, err := client.SaveImage(ctx, []string{"example/web:latest"}, dest)
+	if !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("SaveImage() error = %v, want %s", err, apperror.Conflict)
+	}
+	if jobID == "" {
+		t.Fatal("SaveImage() returned an empty job ID")
+	}
+	if payload := waitJobDone(t, ctx, jobDone, time.Second); payload.JobID != jobID || payload.Error == "" || payload.Result != "" {
+		t.Fatalf("job done payload = %#v, want failed job %q with no result", payload, jobID)
+	}
+	if data, readErr := os.ReadFile(dest); readErr != nil || string(data) != original {
+		t.Fatalf("existing destination data = %q, error = %v; want %q", data, readErr, original)
+	}
+	assertNoImageSaveTemps(t, dir)
+}
+
+func TestClientSaveImageCleansTemporaryFileAfterStreamFailure(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	streamErr := errors.New("injected image archive read failure")
+	reader := &failingArchiveReadCloser{
+		payload: []byte("partial image archive"),
+		err:     streamErr,
+	}
+	api.saveReaderFactory = func() io.ReadCloser { return reader }
+	eventBus := bus.New()
+	defer eventBus.Close()
+	jobDone := eventBus.Subscribe(ctx, bus.TopicJobDone, 2)
+
+	client := New(fakeDockerProvider{}, eventBus)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "image.tar")
+	jobID, err := client.SaveImage(ctx, []string{"example/web:latest"}, dest)
+	if err == nil || !errors.Is(err, streamErr) {
+		t.Fatalf("SaveImage() error = %v, want injected stream error", err)
+	}
+	if jobID == "" {
+		t.Fatal("SaveImage() returned an empty job ID")
+	}
+	if !reader.closed {
+		t.Fatal("SaveImage() did not close the Docker image stream")
+	}
+	if payload := waitJobDone(t, ctx, jobDone, time.Second); payload.JobID != jobID || payload.Error == "" || payload.Result != "" {
+		t.Fatalf("job done payload = %#v, want failed job %q with no result", payload, jobID)
+	}
+	if _, statErr := os.Lstat(dest); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Fatalf("destination exists after failed save: %v", statErr)
+	}
+	assertNoImageSaveTemps(t, dir)
+}
+
+func TestWriteSyncedImageArchiveChecksSyncAndCloseErrors(t *testing.T) {
+	t.Parallel()
+	syncErr := errors.New("injected sync failure")
+	closeErr := errors.New("injected close failure")
+	destination := &fakeSyncedWriteCloser{
+		syncErr:  syncErr,
+		closeErr: closeErr,
+	}
+
+	written, err := writeSyncedImageArchive(destination, strings.NewReader("archive"))
+	if written != int64(len("archive")) {
+		t.Fatalf("written = %d, want %d", written, len("archive"))
+	}
+	if !errors.Is(err, syncErr) || !errors.Is(err, closeErr) {
+		t.Fatalf("writeSyncedImageArchive() error = %v, want sync and close errors", err)
+	}
+	if destination.syncCalls != 1 || destination.closeCalls != 1 {
+		t.Fatalf("sync calls = %d, close calls = %d; want 1 each", destination.syncCalls, destination.closeCalls)
+	}
+}
+
+func TestWriteSyncedImageArchiveClosesAfterCopyFailure(t *testing.T) {
+	t.Parallel()
+	writeErr := errors.New("injected write failure")
+	closeErr := errors.New("injected close failure")
+	destination := &fakeSyncedWriteCloser{
+		writeErr: writeErr,
+		closeErr: closeErr,
+	}
+
+	_, err := writeSyncedImageArchive(destination, strings.NewReader("archive"))
+	if !errors.Is(err, writeErr) || !errors.Is(err, closeErr) {
+		t.Fatalf("writeSyncedImageArchive() error = %v, want write and close errors", err)
+	}
+	if destination.syncCalls != 0 {
+		t.Fatalf("sync calls after copy failure = %d, want 0", destination.syncCalls)
+	}
+	if destination.closeCalls != 1 {
+		t.Fatalf("close calls after copy failure = %d, want 1", destination.closeCalls)
+	}
+}
+
+func TestClientLoadImageRejectsNonRegularArchives(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		prepare func(*testing.T) string
+	}{
+		{
+			name: "directory",
+			prepare: func(t *testing.T) string {
+				return t.TempDir()
+			},
+		},
+		{
+			name: "symbolic link",
+			prepare: func(t *testing.T) string {
+				dir := t.TempDir()
+				target := filepath.Join(dir, "target.tar")
+				if err := os.WriteFile(target, []byte("archive"), 0o600); err != nil {
+					t.Fatalf("write symlink target: %v", err)
+				}
+				link := filepath.Join(dir, "link.tar")
+				if err := os.Symlink(target, link); err != nil {
+					t.Skipf("symbolic links unavailable on this host: %v", err)
+				}
+				return link
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			api := newFakeAPI()
+			client := New(fakeDockerProvider{}, nil)
+			client.factory = func(string) (APIClient, error) { return api, nil }
+			if err := client.Connect(context.Background()); err != nil {
+				t.Fatalf("Connect() error = %v", err)
+			}
+
+			jobID, err := client.LoadImage(context.Background(), tt.prepare(t))
+			if !apperror.IsCode(err, apperror.Conflict) {
+				t.Fatalf("LoadImage() error = %v, want %s", err, apperror.Conflict)
+			}
+			if jobID != "" {
+				t.Fatalf("LoadImage() job ID = %q, want empty before upload starts", jobID)
+			}
+			if len(api.loadedBytes) != 0 {
+				t.Fatalf("ImageLoad() received rejected archive: %#v", api.loadedBytes)
+			}
+		})
+	}
+}
+
+func TestClientLoadImageRejectsArchiveChangeDuringUpload(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dir := t.TempDir()
+	src := filepath.Join(dir, "load.tar")
+	replacement := filepath.Join(dir, "replacement.tar")
+	if err := os.WriteFile(src, []byte("original archive"), 0o600); err != nil {
+		t.Fatalf("write source archive: %v", err)
+	}
+	if err := os.WriteFile(replacement, []byte("replacement archive"), 0o600); err != nil {
+		t.Fatalf("write replacement archive: %v", err)
+	}
+
+	api := newFakeAPI()
+	var replaceErr error
+	api.afterImageLoadRead = func() {
+		if runtime.GOOS == "windows" {
+			if err := os.WriteFile(src, []byte("replacement archive"), 0o600); err != nil {
+				replaceErr = fmt.Errorf("modify archive in place: %w", err)
+			}
+			return
+		}
+		if err := os.Remove(src); err != nil {
+			replaceErr = fmt.Errorf("remove original archive: %w", err)
+			return
+		}
+		if err := os.Rename(replacement, src); err != nil {
+			replaceErr = fmt.Errorf("replace archive path: %w", err)
+		}
+	}
+	eventBus := bus.New()
+	defer eventBus.Close()
+	jobDone := eventBus.Subscribe(ctx, bus.TopicJobDone, 2)
+	objectsChanged := eventBus.Subscribe(ctx, bus.TopicObjectsChanged, 1)
+
+	client := New(fakeDockerProvider{}, eventBus)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	jobID, err := client.LoadImage(ctx, src)
+	if replaceErr != nil {
+		t.Fatalf("replace archive while loading: %v", replaceErr)
+	}
+	if !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("LoadImage() error = %v, want %s", err, apperror.Conflict)
+	}
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) || appErr.Partial == nil ||
+		appErr.Partial.Type != "image" ||
+		appErr.Partial.ID != "loaded:latest" ||
+		appErr.Partial.State != "loaded" ||
+		appErr.Partial.CleanupRequired {
+		t.Fatalf("LoadImage() error = %#v, want a confirmed loaded partial image", appErr)
+	}
+	if jobID == "" {
+		t.Fatal("LoadImage() returned an empty job ID after upload started")
+	}
+	if payload := waitJobDone(t, ctx, jobDone, time.Second); payload.JobID != jobID || payload.Error == "" || !strings.Contains(payload.Result, "loaded:latest") {
+		t.Fatalf("job done payload = %#v, want partial loaded result for job %q", payload, jobID)
+	}
+	if payload := waitObjectsChangedKind(t, ctx, objectsChanged, objectKindImage, "", time.Second); payload.Kind != objectKindImage {
+		t.Fatalf("objects changed payload = %#v, want image reconciliation", payload)
+	}
+	if api.imageListCalls != 1 {
+		t.Fatalf("ImageList() calls = %d, want one post-mutation reconciliation", api.imageListCalls)
+	}
+}
+
+func TestClientLoadImageRejectsInvalidDaemonResponses(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		body      string
+		code      apperror.Code
+		completed bool
+	}{
+		{
+			name: "error field",
+			body: `{"error":"invalid tar header"}` + "\n",
+			code: apperror.Conflict,
+		},
+		{
+			name: "error detail field",
+			body: `{"errorDetail":{"message":"archive checksum failed"}}` + "\n",
+			code: apperror.Conflict,
+		},
+		{
+			name: "empty error detail still means failure",
+			body: `{"errorDetail":{}}` + "\n",
+			code: apperror.Conflict,
+		},
+		{
+			name:      "malformed trailing data",
+			body:      `{"stream":"Loaded image: example/test:latest"}` + "\nnot-json",
+			code:      apperror.DockerUnreachable,
+			completed: true,
+		},
+		{
+			name: "non-object message",
+			body: "null\n",
+			code: apperror.DockerUnreachable,
+		},
+		{
+			name: "semantically empty message",
+			body: "{}\n",
+			code: apperror.DockerUnreachable,
+		},
+		{
+			name: "progress without terminal confirmation",
+			body: `{"status":"Loading layer","id":"sha256:partial"}` + "\n",
+			code: apperror.DockerUnreachable,
+		},
+		{
+			name: "terminal marker without image identity",
+			body: `{"stream":"Loaded image:   "}` + "\n",
+			code: apperror.DockerUnreachable,
+		},
+		{
+			name: "oversized response",
+			body: `{"stream":"` + strings.Repeat("x", maxImageLoadResponseBytes) + `"}`,
+			code: apperror.DockerUnreachable,
+		},
+		{
+			name: "too many messages",
+			body: strings.Repeat("{}\n", maxImageLoadResponseMessages+1),
+			code: apperror.DockerUnreachable,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			api := newFakeAPI()
+			api.loadBody = tt.body
+			eventBus := bus.New()
+			defer eventBus.Close()
+			jobDone := eventBus.Subscribe(ctx, bus.TopicJobDone, 2)
+			objectsChanged := eventBus.Subscribe(ctx, bus.TopicObjectsChanged, 1)
+
+			client := New(fakeDockerProvider{}, eventBus)
+			client.factory = func(string) (APIClient, error) { return api, nil }
+			if err := client.Connect(ctx); err != nil {
+				t.Fatalf("Connect() error = %v", err)
+			}
+			src := filepath.Join(t.TempDir(), "load.tar")
+			if err := os.WriteFile(src, []byte("load-me"), 0o600); err != nil {
+				t.Fatalf("write load archive: %v", err)
+			}
+
+			jobID, err := client.LoadImage(ctx, src)
+			if !apperror.IsCode(err, tt.code) {
+				t.Fatalf("LoadImage() error = %v, want %s", err, tt.code)
+			}
+			var appErr *apperror.AppError
+			if !errors.As(err, &appErr) || appErr.Partial == nil || appErr.Partial.Type != "image" || appErr.Partial.CleanupRequired {
+				t.Fatalf("LoadImage() error = %#v, want image partial state", appErr)
+			}
+			if tt.completed {
+				if appErr.Partial.ID != "example/test:latest" || appErr.Partial.State != "loaded" {
+					t.Fatalf("LoadImage() partial = %#v, want confirmed loaded image", appErr.Partial)
+				}
+			} else if appErr.Partial.ID != "unknown" || appErr.Partial.State != "unknown" {
+				t.Fatalf("LoadImage() partial = %#v, want unknown mutation outcome", appErr.Partial)
+			}
+			if jobID == "" {
+				t.Fatal("LoadImage() returned an empty job ID")
+			}
+			if payload := waitJobDone(t, ctx, jobDone, time.Second); payload.JobID != jobID ||
+				payload.Error == "" ||
+				(tt.completed && !strings.Contains(payload.Result, "example/test:latest")) ||
+				(!tt.completed && payload.Result != "") {
+				t.Fatalf("job done payload = %#v, want accurate partial result for job %q", payload, jobID)
+			}
+			if payload := waitObjectsChangedKind(t, ctx, objectsChanged, objectKindImage, "", time.Second); payload.Kind != objectKindImage {
+				t.Fatalf("objects changed payload = %#v, want image reconciliation", payload)
+			}
+			if api.imageListCalls != 1 {
+				t.Fatalf("ImageList() calls = %d, want one post-mutation reconciliation", api.imageListCalls)
+			}
+		})
+	}
+}
+
+func TestClientLoadImageReconcilesPostUploadFailures(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name           string
+		configure      func(*fakeAPI, error)
+		code           apperror.Code
+		partialID      string
+		partialState   string
+		resultContains string
+	}{
+		{
+			name: "response close after terminal record",
+			configure: func(api *fakeAPI, injected error) {
+				api.loadBodyCloseErr = injected
+			},
+			code:           apperror.Internal,
+			partialID:      "loaded:latest",
+			partialState:   "loaded",
+			resultContains: "loaded:latest",
+		},
+		{
+			name: "transport response lost after upload",
+			configure: func(api *fakeAPI, injected error) {
+				api.loadErr = injected
+			},
+			code:         apperror.DockerUnreachable,
+			partialID:    "unknown",
+			partialState: "unknown",
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			injected := errors.New("injected post-upload failure")
+			api := newFakeAPI()
+			tt.configure(api, injected)
+			eventBus := bus.New()
+			defer eventBus.Close()
+			jobDone := eventBus.Subscribe(ctx, bus.TopicJobDone, 2)
+			objectsChanged := eventBus.Subscribe(ctx, bus.TopicObjectsChanged, 1)
+
+			client := New(fakeDockerProvider{}, eventBus)
+			client.factory = func(string) (APIClient, error) { return api, nil }
+			if err := client.Connect(ctx); err != nil {
+				t.Fatalf("Connect() error = %v", err)
+			}
+			src := filepath.Join(t.TempDir(), "load.tar")
+			if err := os.WriteFile(src, []byte("load-me"), 0o600); err != nil {
+				t.Fatalf("write load archive: %v", err)
+			}
+
+			jobID, err := client.LoadImage(ctx, src)
+			if !apperror.IsCode(err, tt.code) || !errors.Is(err, injected) {
+				t.Fatalf("LoadImage() error = %v, want %s containing injected failure", err, tt.code)
+			}
+			var appErr *apperror.AppError
+			if !errors.As(err, &appErr) || appErr.Partial == nil ||
+				appErr.Partial.Type != "image" ||
+				appErr.Partial.ID != tt.partialID ||
+				appErr.Partial.State != tt.partialState ||
+				appErr.Partial.CleanupRequired {
+				t.Fatalf("LoadImage() error = %#v, want partial image %s/%s", appErr, tt.partialID, tt.partialState)
+			}
+			payload := waitJobDone(t, ctx, jobDone, time.Second)
+			if payload.JobID != jobID || payload.Error == "" ||
+				(tt.resultContains == "" && payload.Result != "") ||
+				(tt.resultContains != "" && !strings.Contains(payload.Result, tt.resultContains)) {
+				t.Fatalf("job done payload = %#v, want partial result containing %q", payload, tt.resultContains)
+			}
+			waitObjectsChangedKind(t, ctx, objectsChanged, objectKindImage, "", time.Second)
+			if api.imageListCalls != 1 {
+				t.Fatalf("ImageList() calls = %d, want one post-mutation reconciliation", api.imageListCalls)
+			}
+		})
+	}
+}
+
 func TestEnsureImagePresentUsesRegistryAuthForPullBeforeRun(t *testing.T) {
 	t.Parallel()
 	api := newFakeAPI()
@@ -2762,68 +3201,140 @@ func waitContainerListFinished(t *testing.T, finished <-chan int, wanted int, ti
 	}
 }
 
+func assertNoImageSaveTemps(t *testing.T, dir string) {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(dir, ".cairn-image-save-*.tmp"))
+	if err != nil {
+		t.Fatalf("glob temporary image archives: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("temporary image archives remain: %#v", matches)
+	}
+}
+
+type failingArchiveReadCloser struct {
+	payload []byte
+	err     error
+	closed  bool
+}
+
+func (r *failingArchiveReadCloser) Read(buffer []byte) (int, error) {
+	if len(r.payload) == 0 {
+		return 0, r.err
+	}
+	n := copy(buffer, r.payload)
+	r.payload = r.payload[n:]
+	return n, nil
+}
+
+func (r *failingArchiveReadCloser) Close() error {
+	r.closed = true
+	return nil
+}
+
+type errorClosingReadCloser struct {
+	io.Reader
+	err error
+}
+
+func (r *errorClosingReadCloser) Close() error {
+	return r.err
+}
+
+type fakeSyncedWriteCloser struct {
+	buffer     bytes.Buffer
+	writeErr   error
+	syncErr    error
+	closeErr   error
+	syncCalls  int
+	closeCalls int
+}
+
+func (w *fakeSyncedWriteCloser) Write(buffer []byte) (int, error) {
+	if w.writeErr != nil {
+		return 0, w.writeErr
+	}
+	return w.buffer.Write(buffer)
+}
+
+func (w *fakeSyncedWriteCloser) Sync() error {
+	w.syncCalls++
+	return w.syncErr
+}
+
+func (w *fakeSyncedWriteCloser) Close() error {
+	w.closeCalls++
+	return w.closeErr
+}
+
 type fakeAPI struct {
-	mu                sync.Mutex
-	ping              dockertypes.Ping
-	pingErr           error
-	info              system.Info
-	version           dockertypes.Version
-	diskUsage         dockertypes.DiskUsage
-	containers        []container.Summary
-	containerInspects map[string]container.InspectResponse
-	containerRaw      map[string][]byte
-	images            []image.Summary
-	imageListErr      error
-	imageListDeadline time.Duration
-	imageInspects     map[string]image.InspectResponse
-	imageRaw          map[string][]byte
-	volumes           []*volume.Volume
-	volumeInspects    map[string]volume.Volume
-	volumeRaw         map[string][]byte
-	networks          []network.Summary
-	networkInspects   map[string]network.Inspect
-	networkRaw        map[string][]byte
-	events            chan events.Message
-	eventErrs         chan error
-	eventCalls        int
-	stats             map[string][]container.StatsResponse
-	statsCalls        []statsCall
-	tops              map[string]container.TopResponse
-	execCreates       []execCreateCall
-	execAttachCtxs    []context.Context
-	execAttachOpts    []container.ExecAttachOptions
-	execResizes       []execResizeCall
-	execInspects      map[string]container.ExecInspect
-	execOutputs       map[string]string
-	execExitCodes     map[string]int
-	executablePaths   map[string]bool
-	started           []string
-	stopped           []string
-	restarted         []string
-	killed            []string
-	removed           []string
-	unpaused          []string
-	createdContainers []createdContainerCall
-	renamed           []string
-	pulled            []string
-	pullAuth          []string
-	pullBody          string
-	pullErr           error
-	tagged            []string
-	pushed            []string
-	pushAuth          []string
-	pushBody          string
-	pushErr           error
-	saved             [][]string
-	loadedBytes       []int
-	searches          []string
-	removedImages     []string
-	pruned            []string
-	createdVolumes    []volume.CreateOptions
-	removedVolumes    []string
-	createdNetworks   []networkCreateCall
-	removedNetworks   []string
-	closed            bool
+	mu                 sync.Mutex
+	ping               dockertypes.Ping
+	pingErr            error
+	info               system.Info
+	version            dockertypes.Version
+	diskUsage          dockertypes.DiskUsage
+	containers         []container.Summary
+	containerInspects  map[string]container.InspectResponse
+	containerRaw       map[string][]byte
+	images             []image.Summary
+	imageListErr       error
+	imageListDeadline  time.Duration
+	imageListCalls     int
+	imageInspects      map[string]image.InspectResponse
+	imageRaw           map[string][]byte
+	volumes            []*volume.Volume
+	volumeInspects     map[string]volume.Volume
+	volumeRaw          map[string][]byte
+	networks           []network.Summary
+	networkInspects    map[string]network.Inspect
+	networkRaw         map[string][]byte
+	events             chan events.Message
+	eventErrs          chan error
+	eventCalls         int
+	stats              map[string][]container.StatsResponse
+	statsCalls         []statsCall
+	tops               map[string]container.TopResponse
+	execCreates        []execCreateCall
+	execAttachCtxs     []context.Context
+	execAttachOpts     []container.ExecAttachOptions
+	execResizes        []execResizeCall
+	execInspects       map[string]container.ExecInspect
+	execOutputs        map[string]string
+	execExitCodes      map[string]int
+	executablePaths    map[string]bool
+	started            []string
+	stopped            []string
+	restarted          []string
+	killed             []string
+	removed            []string
+	unpaused           []string
+	createdContainers  []createdContainerCall
+	renamed            []string
+	pulled             []string
+	pullAuth           []string
+	pullBody           string
+	pullErr            error
+	tagged             []string
+	pushed             []string
+	pushAuth           []string
+	pushBody           string
+	pushErr            error
+	saved              [][]string
+	saveReaderFactory  func() io.ReadCloser
+	loadedBytes        []int
+	loadBody           string
+	loadBodyCloseErr   error
+	loadErr            error
+	afterImageLoadRead func()
+	searches           []string
+	removedImages      []string
+	pruned             []string
+	createdVolumes     []volume.CreateOptions
+	removedVolumes     []string
+	createdNetworks    []networkCreateCall
+	removedNetworks    []string
+	closed             bool
 }
 
 type createdContainerCall struct {
@@ -3132,10 +3643,11 @@ func (a *fakeAPI) ContainerRename(_ context.Context, id string, name string) err
 }
 
 func (a *fakeAPI) ImageList(ctx context.Context, _ image.ListOptions) ([]image.Summary, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.imageListCalls++
 	if deadline, ok := ctx.Deadline(); ok {
-		a.mu.Lock()
 		a.imageListDeadline = time.Until(deadline)
-		a.mu.Unlock()
 	}
 	return append([]image.Summary(nil), a.images...), a.imageListErr
 }
@@ -3202,8 +3714,12 @@ func (a *fakeAPI) ImagePush(_ context.Context, ref string, opts image.PushOption
 
 func (a *fakeAPI) ImageSave(_ context.Context, imageIDs []string, _ ...dockerclient.ImageSaveOption) (io.ReadCloser, error) {
 	a.mu.Lock()
-	defer a.mu.Unlock()
 	a.saved = append(a.saved, append([]string(nil), imageIDs...))
+	factory := a.saveReaderFactory
+	a.mu.Unlock()
+	if factory != nil {
+		return factory(), nil
+	}
 	return io.NopCloser(bytes.NewReader([]byte("fake image tar"))), nil
 }
 
@@ -3219,8 +3735,27 @@ func (a *fakeAPI) ImageLoad(_ context.Context, input io.Reader, _ ...dockerclien
 		RepoTags: []string{"loaded:latest"},
 		Created:  time.Now().UTC().Format(time.RFC3339Nano),
 	}
+	responseBody := a.loadBody
+	responseCloseErr := a.loadBodyCloseErr
+	loadErr := a.loadErr
+	afterRead := a.afterImageLoadRead
 	a.mu.Unlock()
-	return image.LoadResponse{Body: io.NopCloser(strings.NewReader(`{"stream":"Loaded image: loaded:latest"}`))}, nil
+	if afterRead != nil {
+		afterRead()
+	}
+	if loadErr != nil {
+		return image.LoadResponse{}, loadErr
+	}
+	if responseBody == "" {
+		responseBody = `{"stream":"Loaded image: loaded:latest"}`
+	}
+	if responseCloseErr != nil {
+		return image.LoadResponse{Body: &errorClosingReadCloser{
+			Reader: strings.NewReader(responseBody),
+			err:    responseCloseErr,
+		}}, nil
+	}
+	return image.LoadResponse{Body: io.NopCloser(strings.NewReader(responseBody))}, nil
 }
 
 func (a *fakeAPI) ImageSearch(_ context.Context, term string, _ registry.SearchOptions) ([]registry.SearchResult, error) {

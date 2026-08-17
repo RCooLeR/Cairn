@@ -8,7 +8,7 @@
 # toolchain before entering the cross compiler):
 #   npm --prefix frontend ci
 #   npm --prefix frontend run build
-#   docker build --build-arg GARBLE_VERSION=v0.16.0 -t wails-cross -f build/docker/Dockerfile.cross build/docker/
+#   docker build --build-arg GARBLE_VERSION=v0.17.0 -t wails-cross -f build/docker/Dockerfile.cross build/docker/
 #   docker run --rm -v $(pwd):/app wails-cross darwin arm64
 #   docker run --rm -v $(pwd):/app wails-cross darwin amd64
 #   docker run --rm -v $(pwd):/app wails-cross linux amd64
@@ -16,7 +16,7 @@
 #   docker run --rm -v $(pwd):/app wails-cross windows amd64
 #   docker run --rm -v $(pwd):/app wails-cross windows arm64
 
-FROM golang:1.26.5-bookworm
+FROM golang:1.26.6-bookworm@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36
 
 ARG TARGETARCH
 ARG GARBLE_VERSION
@@ -34,9 +34,14 @@ RUN go install mvdan.cc/garble@${GARBLE_VERSION}
 
 # Install Zig - automatically selects correct binary for host architecture
 ARG ZIG_VERSION=0.14.0
+ARG ZIG_SHA256_X86_64=473ec26806133cf4d1918caf1a410f8403a13d979726a9045b421b685031a982
+ARG ZIG_SHA256_AARCH64=ab64e3ea277f6fc5f3d723dcd95d9ce1ab282c8ed0f431b4de880d30df891e4f
 RUN ZIG_ARCH=$(case "${TARGETARCH}" in arm64) echo "aarch64" ;; *) echo "x86_64" ;; esac) && \
-    curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz" \
-    | tar -xJ -C /opt \
+    ZIG_SHA256=$(case "${ZIG_ARCH}" in aarch64) echo "${ZIG_SHA256_AARCH64}" ;; *) echo "${ZIG_SHA256_X86_64}" ;; esac) && \
+    curl -fsSL -o /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz" && \
+    echo "${ZIG_SHA256}  /tmp/zig.tar.xz" | sha256sum -c - && \
+    tar -xJ -C /opt -f /tmp/zig.tar.xz && \
+    rm /tmp/zig.tar.xz \
     && ln -s /opt/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}/zig /usr/local/bin/zig
 
 # Download macOS SDK (required for darwin targets)
@@ -196,10 +201,16 @@ APP=${APP_NAME:-$(basename $(pwd))}
 mkdir -p bin
 
 EXT=""
-LDFLAGS="-s -w"
+LDFLAGS="-s -w -X github.com/RCooLeR/Cairn/internal/services.Version=${APP_VERSION:-1.0.0}"
+if [ -n "$GIT_COMMIT" ]; then
+    LDFLAGS="$LDFLAGS -X github.com/RCooLeR/Cairn/internal/services.Commit=$GIT_COMMIT"
+fi
+if [ -n "$BUILD_DATE" ]; then
+    LDFLAGS="$LDFLAGS -X github.com/RCooLeR/Cairn/internal/services.BuildDate=$BUILD_DATE"
+fi
 if [ "$GOOS" = "windows" ]; then
     EXT=".exe"
-    LDFLAGS="-s -w -H windowsgui"
+    LDFLAGS="$LDFLAGS -H windowsgui"
 fi
 
 TAGS="production"
@@ -213,7 +224,7 @@ if [ "$OBFUSCATED" = "true" ]; then
     TAGS="${TAGS},wails_obfuscated"
 fi
 
-${COMPILER} -tags "$TAGS" -trimpath -buildvcs=false -ldflags="$LDFLAGS" -o bin/${APP}-${GOOS}-${GOARCH}${EXT} .
+${COMPILER} -mod=readonly -tags "$TAGS" -trimpath -buildvcs=false -ldflags="$LDFLAGS" -o bin/${APP}-${GOOS}-${GOARCH}${EXT} .
 echo "Built: bin/${APP}-${GOOS}-${GOARCH}${EXT}"
 SCRIPT
 RUN chmod +x /usr/local/bin/build.sh

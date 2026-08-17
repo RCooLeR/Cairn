@@ -54,6 +54,8 @@ var (
 	ErrNilContext = errors.New("bus: nil context")
 )
 
+const defaultCriticalPublishTimeout = 2 * time.Second
+
 type Event struct {
 	Topic   Topic
 	TS      time.Time
@@ -84,6 +86,15 @@ func PublishCritical(ctx context.Context, publisher Bus, event Event) error {
 		return ErrCriticalPublishUnsupported
 	}
 	return critical.PublishCritical(ctx, event)
+}
+
+// PublishCriticalBounded gives completion/error producers a process-lifecycle
+// context with a finite admission deadline. It avoids both lossy completion
+// events and an unbounded shutdown wait if a subscriber stops draining.
+func PublishCriticalBounded(publisher Bus, event Event) error {
+	ctx, cancel := context.WithTimeout(context.Background(), defaultCriticalPublishTimeout)
+	defer cancel()
+	return PublishCritical(ctx, publisher, event)
 }
 
 type MemoryBus struct {

@@ -60,11 +60,12 @@ type Manager struct {
 	Now      func() time.Time
 	IDs      *security.IDSource
 	// NewID is retained as a deterministic test seam. Production uses IDs.
-	NewID              func() string
-	JitterFor          func(time.Duration) time.Duration
-	HealthWindow       time.Duration
-	HealthPollInterval time.Duration
-	Scope              runtimescope.Scope
+	NewID                   func() string
+	JitterFor               func(time.Duration) time.Duration
+	HealthWindow            time.Duration
+	HealthPollInterval      time.Duration
+	HealthStabilityInterval time.Duration
+	Scope                   runtimescope.Scope
 
 	startOnce sync.Once
 	planMu    sync.Mutex
@@ -74,7 +75,10 @@ type Manager struct {
 
 	jobsMu  sync.Mutex
 	rootCtx context.Context
+	rootEnd context.CancelFunc
 	jobs    map[string]context.CancelFunc
+	jobsWG  sync.WaitGroup
+	stopped bool
 }
 
 type projectCheckLock struct {
@@ -115,11 +119,20 @@ func (m *Manager) Start(ctx context.Context) {
 	if m == nil {
 		return
 	}
-	m.jobsMu.Lock()
-	m.rootCtx = ctx
-	m.jobsMu.Unlock()
 	m.startOnce.Do(func() {
-		go m.runScheduler(ctx)
+		m.jobsMu.Lock()
+		if m.stopped {
+			m.jobsMu.Unlock()
+			return
+		}
+		m.rootCtx, m.rootEnd = context.WithCancel(ctx)
+		schedulerCtx := m.rootCtx
+		m.jobsWG.Add(1)
+		m.jobsMu.Unlock()
+		go func() {
+			defer m.jobsWG.Done()
+			m.runScheduler(schedulerCtx)
+		}()
 	})
 }
 
@@ -128,15 +141,38 @@ func (m *Manager) StopAll() {
 		return
 	}
 	m.jobsMu.Lock()
+	m.stopped = true
 	cancels := make([]context.CancelFunc, 0, len(m.jobs))
-	for jobID, cancel := range m.jobs {
+	for _, cancel := range m.jobs {
 		cancels = append(cancels, cancel)
-		delete(m.jobs, jobID)
 	}
+	rootEnd := m.rootEnd
 	m.jobsMu.Unlock()
+	if rootEnd != nil {
+		rootEnd()
+	}
 	for _, cancel := range cancels {
 		cancel()
 	}
+	m.jobsWG.Wait()
+}
+
+func (m *Manager) CancelJob(jobID string) error {
+	if m == nil {
+		return notReady()
+	}
+	jobID = strings.TrimSpace(jobID)
+	if jobID == "" {
+		return apperror.New(apperror.NotFound, "Update job was not found")
+	}
+	m.jobsMu.Lock()
+	cancel := m.jobs[jobID]
+	m.jobsMu.Unlock()
+	if cancel == nil {
+		return apperror.New(apperror.NotFound, "Update job was not found")
+	}
+	cancel()
+	return nil
 }
 
 func (m *Manager) CheckAllUpdates(ctx context.Context) (string, error) {
@@ -151,9 +187,11 @@ func (m *Manager) CheckAllUpdates(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	m.startJob(jobID, func(jobCtx context.Context) {
+	if !m.startJob(jobID, func(jobCtx context.Context) {
 		m.runAllChecks(jobCtx, jobID, projects)
-	})
+	}) {
+		return "", notReady()
+	}
 	return jobID, nil
 }
 
@@ -302,24 +340,31 @@ func (m *Manager) currentServiceUpdate(ctx context.Context, projectID string, se
 	return &model, nil
 }
 
-func (m *Manager) startJob(jobID string, run func(context.Context)) {
+func (m *Manager) startJob(jobID string, run func(context.Context)) bool {
 	base := context.Background()
 	m.jobsMu.Lock()
 	if m.rootCtx != nil {
 		base = m.rootCtx
+	}
+	if m.stopped || base.Err() != nil {
+		m.jobsMu.Unlock()
+		return false
 	}
 	ctx, cancel := context.WithCancel(base)
 	if m.jobs == nil {
 		m.jobs = map[string]context.CancelFunc{}
 	}
 	m.jobs[jobID] = cancel
+	m.jobsWG.Add(1)
 	m.jobsMu.Unlock()
 
 	go func() {
+		defer m.jobsWG.Done()
 		defer cancel()
 		defer m.forgetJob(jobID)
 		run(ctx)
 	}()
+	return true
 }
 
 func (m *Manager) forgetJob(jobID string) {

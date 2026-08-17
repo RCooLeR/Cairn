@@ -21,7 +21,12 @@ const (
 )
 
 type ProjectRepository struct {
-	db *sql.DB
+	db         *sql.DB
+	operations *projectOperationGate
+}
+
+type projectExecContext interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
 }
 
 type ProjectRecord struct {
@@ -68,7 +73,42 @@ func IsProjectScopeConflict(err error) bool {
 }
 
 func (s *Store) Projects() *ProjectRepository {
-	return &ProjectRepository{db: s.writer}
+	return &ProjectRepository{db: s.writer, operations: s.projectOperations}
+}
+
+// ProjectOperationGeneration returns the current in-process incarnation fence
+// for a project. Plans capture this value and background work must present it
+// again before touching Compose or mutable project state.
+func (r *ProjectRepository) ProjectOperationGeneration(runtimeScope runtimescope.Scope, projectID string) (uint64, error) {
+	key, ok := projectOperationKeyFromScope(runtimeScope, projectID)
+	if !ok {
+		return 0, errors.New("runtime scope and project ID are required")
+	}
+	return r.operations.generation(key)
+}
+
+// BeginProjectOperation registers cancellable background work for one project
+// incarnation. Project deletion cancels and joins all registered work before
+// it removes the snapshot.
+func (r *ProjectRepository) BeginProjectOperation(
+	ctx context.Context,
+	runtimeScope runtimescope.Scope,
+	projectID string,
+	expectedGeneration uint64,
+) (context.Context, func(), error) {
+	key, ok := projectOperationKeyFromScope(runtimeScope, projectID)
+	if !ok {
+		return nil, nil, errors.New("runtime scope and project ID are required")
+	}
+	return r.operations.beginOperation(ctx, key, expectedGeneration)
+}
+
+type saveSnapshotOptions struct {
+	replaceAllProjectServices bool
+	skipScopeConflicts        bool
+	skippedResult             *[]string
+	unforgetName              string
+	unforgetProjectID         string
 }
 
 // SaveSnapshot atomically updates only one exact runtime scope. It also
@@ -78,22 +118,68 @@ func (r *ProjectRepository) SaveSnapshot(ctx context.Context, runtimeScope runti
 	if err := validateSnapshotScope(runtimeScope, projects); err != nil {
 		return err
 	}
-	return r.saveSnapshot(ctx, runtimeScope.ProviderID(), runtimeScope.ContextName(), projects, services, seenAt, staleCutoff, false, nil)
+	return r.saveSnapshot(ctx, runtimeScope.ProviderID(), runtimeScope.ContextName(), projects, services, seenAt, staleCutoff, saveSnapshotOptions{})
 }
 
 // SaveDetectedSnapshot preserves availability for detector snapshots while
 // keeping legacy global-ID collisions quarantined. Conflicting project IDs and
 // their services are skipped inside the same transaction as the remaining
-// snapshot writes and stale cleanup.
+// snapshot writes and stale cleanup. The service slice is authoritative for
+// every accepted incoming project, including projects with zero services.
 func (r *ProjectRepository) SaveDetectedSnapshot(ctx context.Context, runtimeScope runtimescope.Scope, projects []ProjectRecord, services []ServiceRecord, seenAt time.Time, staleCutoff time.Time) ([]string, error) {
 	if err := validateSnapshotScope(runtimeScope, projects); err != nil {
 		return nil, err
 	}
 	skipped := []string{}
-	if err := r.saveSnapshot(ctx, runtimeScope.ProviderID(), runtimeScope.ContextName(), projects, services, seenAt, staleCutoff, true, &skipped); err != nil {
+	if err := r.saveSnapshot(ctx, runtimeScope.ProviderID(), runtimeScope.ContextName(), projects, services, seenAt, staleCutoff, saveSnapshotOptions{
+		replaceAllProjectServices: true,
+		skipScopeConflicts:        true,
+		skippedResult:             &skipped,
+	}); err != nil {
 		return nil, err
 	}
 	return skipped, nil
+}
+
+// SaveImportedSnapshot derives the runtime scope from project and atomically
+// clears its matching forgotten-project tombstone with the imported snapshot.
+func (r *ProjectRepository) SaveImportedSnapshot(ctx context.Context, project ProjectRecord, services []ServiceRecord, seenAt time.Time) error {
+	runtimeScope, ok := runtimescope.New(project.ProviderID, project.ContextName)
+	if !ok {
+		return errors.New("imported project runtime scope is required")
+	}
+	return r.SaveImportedSnapshotInScope(ctx, runtimeScope, project, services, seenAt)
+}
+
+// SaveImportedSnapshotInScope prevents a failed import from silently
+// resurrecting a previously forgotten project. Tombstone removal, project
+// ownership validation, project upsert, and service replacement share one
+// transaction.
+func (r *ProjectRepository) SaveImportedSnapshotInScope(ctx context.Context, runtimeScope runtimescope.Scope, project ProjectRecord, services []ServiceRecord, seenAt time.Time) error {
+	if err := validateSnapshotScope(runtimeScope, []ProjectRecord{project}); err != nil {
+		return err
+	}
+	name := strings.TrimSpace(project.Name)
+	projectID := strings.TrimSpace(project.ID)
+	if name == "" || projectID == "" {
+		return errors.New("imported project name and ID are required")
+	}
+	if project.Source == "" {
+		project.Source = ProjectSourceImported
+	}
+	return r.saveSnapshot(
+		ctx,
+		runtimeScope.ProviderID(),
+		runtimeScope.ContextName(),
+		[]ProjectRecord{project},
+		services,
+		seenAt,
+		time.Time{},
+		saveSnapshotOptions{
+			unforgetName:      name,
+			unforgetProjectID: projectID,
+		},
+	)
 }
 
 func validateSnapshotScope(runtimeScope runtimescope.Scope, projects []ProjectRecord) error {
@@ -108,7 +194,13 @@ func validateSnapshotScope(runtimeScope runtimescope.Scope, projects []ProjectRe
 	return nil
 }
 
-func (r *ProjectRepository) saveSnapshot(ctx context.Context, providerID string, contextName string, projects []ProjectRecord, services []ServiceRecord, seenAt time.Time, staleCutoff time.Time, skipScopeConflicts bool, skippedResult *[]string) error {
+func (r *ProjectRepository) saveSnapshot(ctx context.Context, providerID string, contextName string, projects []ProjectRecord, services []ServiceRecord, seenAt time.Time, staleCutoff time.Time, options saveSnapshotOptions) error {
+	staleProjectIDs, releaseDeletions, err := r.beginStaleProjectDeletions(ctx, providerID, contextName, projects, seenAt, staleCutoff)
+	if err != nil {
+		return err
+	}
+	defer releaseProjectDeletions(releaseDeletions)
+
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -117,6 +209,11 @@ func (r *ProjectRepository) saveSnapshot(ctx context.Context, providerID string,
 		_ = tx.Rollback()
 	}()
 
+	if options.unforgetName != "" || options.unforgetProjectID != "" {
+		if err := unforgetProjectInScope(ctx, tx, providerID, contextName, options.unforgetName, options.unforgetProjectID); err != nil {
+			return err
+		}
+	}
 	forgotten, err := r.forgottenProjectKeys(ctx, tx, providerID, contextName)
 	if err != nil {
 		return err
@@ -137,7 +234,7 @@ func (r *ProjectRepository) saveSnapshot(ctx context.Context, providerID string,
 	}
 	if len(conflictingProjectIDs) > 0 {
 		skipped := sortedProjectIDs(conflictingProjectIDs)
-		if !skipScopeConflicts {
+		if !options.skipScopeConflicts {
 			return fmt.Errorf("%w: %s", errProjectScopeConflict, skipped[0])
 		}
 		projects = filterProjectsByID(projects, conflictingProjectIDs)
@@ -146,12 +243,15 @@ func (r *ProjectRepository) saveSnapshot(ctx context.Context, providerID string,
 			skippedProjectIDs[projectID] = struct{}{}
 		}
 	}
-	if skippedResult != nil {
-		*skippedResult = sortedProjectIDs(skippedProjectIDs)
+	if options.skippedResult != nil {
+		*options.skippedResult = sortedProjectIDs(skippedProjectIDs)
 	}
 
-	replaceServices := services != nil
+	replaceServices := services != nil || options.replaceAllProjectServices
 	serviceReplacementIDs := serviceReplacementProjectIDs(projects, services)
+	if options.replaceAllProjectServices {
+		serviceReplacementIDs = snapshotProjectIDs(projects)
+	}
 	for _, project := range projects {
 		if project.LastSeenAt.IsZero() {
 			project.LastSeenAt = seenAt
@@ -202,15 +302,7 @@ func (r *ProjectRepository) saveSnapshot(ctx context.Context, providerID string,
 
 	if !replaceServices {
 		if !staleCutoff.IsZero() {
-			query := `
-				DELETE FROM projects
-				WHERE provider_id = ?
-					AND source <> ?
-					AND last_seen_at < ?`
-			args := []any{providerID, ProjectSourceImported, formatTime(staleCutoff)}
-			query += " AND context_name = ?"
-			args = append(args, contextName)
-			if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+			if err := deleteStaleDetectedProjects(ctx, tx, providerID, contextName, staleCutoff, staleProjectIDs); err != nil {
 				return err
 			}
 		}
@@ -244,20 +336,228 @@ func (r *ProjectRepository) saveSnapshot(ctx context.Context, providerID string,
 	}
 
 	if !staleCutoff.IsZero() {
-		query := `
-			DELETE FROM projects
-			WHERE provider_id = ?
-				AND source <> ?
-				AND last_seen_at < ?`
-		args := []any{providerID, ProjectSourceImported, formatTime(staleCutoff)}
-		query += " AND context_name = ?"
-		args = append(args, contextName)
-		if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+		if err := deleteStaleDetectedProjects(ctx, tx, providerID, contextName, staleCutoff, staleProjectIDs); err != nil {
 			return err
 		}
 	}
 
 	return tx.Commit()
+}
+
+// beginStaleProjectDeletions acquires lifecycle fences before the write
+// transaction starts. Waiting while a transaction is open could deadlock with
+// an update worker that is finishing its own history writes.
+func (r *ProjectRepository) beginStaleProjectDeletions(
+	ctx context.Context,
+	providerID string,
+	contextName string,
+	incoming []ProjectRecord,
+	seenAt time.Time,
+	staleCutoff time.Time,
+) ([]string, []func(), error) {
+	if staleCutoff.IsZero() {
+		return nil, nil, nil
+	}
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT id
+		FROM projects
+		WHERE provider_id = ?
+			AND context_name = ?
+			AND source <> ?
+			AND last_seen_at < ?
+	`, providerID, contextName, ProjectSourceImported, formatTime(staleCutoff))
+	if err != nil {
+		return nil, nil, err
+	}
+	incomingIDs := make(map[string]struct{}, len(incoming))
+	for _, project := range incoming {
+		lastSeenAt := project.LastSeenAt
+		if lastSeenAt.IsZero() {
+			lastSeenAt = seenAt
+		}
+		if id := strings.TrimSpace(project.ID); id != "" && !lastSeenAt.Before(staleCutoff) {
+			incomingIDs[id] = struct{}{}
+		}
+	}
+	projectIDs := []string{}
+	for rows.Next() {
+		var projectID string
+		if err := rows.Scan(&projectID); err != nil {
+			_ = rows.Close()
+			return nil, nil, err
+		}
+		if _, refreshed := incomingIDs[projectID]; !refreshed {
+			projectIDs = append(projectIDs, projectID)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, nil, err
+	}
+	sort.Strings(projectIDs)
+
+	releases := make([]func(), 0, len(projectIDs))
+	for _, projectID := range projectIDs {
+		release, err := r.beginProjectDeletion(ctx, providerID, contextName, projectID)
+		if err != nil {
+			releaseProjectDeletions(releases)
+			return nil, nil, err
+		}
+		releases = append(releases, release)
+	}
+	return projectIDs, releases, nil
+}
+
+func (r *ProjectRepository) beginProjectDeletion(ctx context.Context, providerID string, contextName string, projectID string) (func(), error) {
+	runtimeScope, ok := runtimescope.New(providerID, contextName)
+	if !ok {
+		return nil, errors.New("project runtime scope is required")
+	}
+	key, ok := projectOperationKeyFromScope(runtimeScope, projectID)
+	if !ok {
+		return nil, errors.New("project ID is required")
+	}
+	return r.operations.beginDeletion(ctx, key)
+}
+
+func releaseProjectDeletions(releases []func()) {
+	for i := len(releases) - 1; i >= 0; i-- {
+		releases[i]()
+	}
+}
+
+func deleteStaleDetectedProjects(
+	ctx context.Context,
+	tx *sql.Tx,
+	providerID string,
+	contextName string,
+	staleCutoff time.Time,
+	projectIDs []string,
+) error {
+	for _, projectID := range projectIDs {
+		var stale int
+		err := tx.QueryRowContext(ctx, `
+			SELECT 1
+			FROM projects
+			WHERE id = ?
+				AND provider_id = ?
+				AND context_name = ?
+				AND source <> ?
+				AND last_seen_at < ?
+		`, projectID, providerID, contextName, ProjectSourceImported, formatTime(staleCutoff)).Scan(&stale)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if err := deleteProjectOwnedMutableState(ctx, tx, providerID, contextName, projectID); err != nil {
+			return err
+		}
+		result, err := tx.ExecContext(ctx, `
+			DELETE FROM projects
+			WHERE id = ?
+				AND provider_id = ?
+				AND context_name = ?
+				AND source <> ?
+				AND last_seen_at < ?
+		`, projectID, providerID, contextName, ProjectSourceImported, formatTime(staleCutoff))
+		if err != nil {
+			return err
+		}
+		rows, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rows == 0 {
+			return errors.New("stale project changed while its deletion fence was held")
+		}
+	}
+	return nil
+}
+
+// deleteProjectOwnedMutableState removes discovery and update policy state that
+// belongs to one project incarnation. Durable telemetry, backups, audit rows,
+// and completed update history remain as intentional history. Completed
+// history loses rollback capability; unfinished history is detached so a late
+// finisher cannot make it actionable for a future project with the same ID.
+func deleteProjectOwnedMutableState(ctx context.Context, tx *sql.Tx, providerID string, contextName string, projectID string) error {
+	if err := detachUpdateCheckLineageReferences(
+		ctx,
+		tx,
+		`provider_id = ? AND context_name = ? AND project_id = ?`,
+		providerID,
+		contextName,
+		projectID,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM image_update_checks
+		WHERE COALESCE(project_id, '') = ?
+	`, projectID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM image_lineage
+		WHERE provider_id = ? AND context_name = ? AND project_id = ?
+	`, providerID, contextName, projectID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM ignored_updates
+		WHERE provider_id = ? AND context_name = ? AND COALESCE(project_id, '') = ?
+	`, providerID, contextName, projectID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE update_history
+		SET project_id = NULL,
+			service_id = NULL,
+			rollback_status = 'unavailable'
+		WHERE provider_id = ? AND context_name = ? AND COALESCE(project_id, '') = ?
+			AND (finished_at IS NULL OR TRIM(CAST(finished_at AS TEXT)) = '')
+	`, providerID, contextName, projectID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE update_history
+		SET rollback_status = 'unavailable'
+		WHERE provider_id = ? AND context_name = ? AND COALESCE(project_id, '') = ?
+			AND finished_at IS NOT NULL
+			AND TRIM(CAST(finished_at AS TEXT)) <> ''
+			AND COALESCE(rollback_status, '') = 'available'
+	`, providerID, contextName, projectID); err != nil {
+		return err
+	}
+	return nil
+}
+
+func deleteProjectSnapshot(ctx context.Context, tx *sql.Tx, providerID string, contextName string, projectID string) error {
+	if err := deleteProjectOwnedMutableState(ctx, tx, providerID, contextName, projectID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, "DELETE FROM services WHERE project_id = ?", projectID); err != nil {
+		return err
+	}
+	result, err := tx.ExecContext(ctx, `
+		DELETE FROM projects
+		WHERE id = ? AND provider_id = ? AND context_name = ?
+	`, projectID, providerID, contextName)
+	if err != nil {
+		return err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 func (r *ProjectRepository) forgottenProjectKeys(ctx context.Context, tx *sql.Tx, providerID string, contextName string) (map[forgottenProjectKey]struct{}, error) {
@@ -451,13 +751,7 @@ func serviceReplacementProjectIDs(projects []ProjectRecord, services []ServiceRe
 		return nil
 	}
 	if len(services) == 0 {
-		ids := make([]string, 0, len(projects))
-		for _, project := range projects {
-			if id := strings.TrimSpace(project.ID); id != "" {
-				ids = append(ids, id)
-			}
-		}
-		return ids
+		return snapshotProjectIDs(projects)
 	}
 	seen := map[string]struct{}{}
 	ids := make([]string, 0, len(services))
@@ -475,18 +769,35 @@ func serviceReplacementProjectIDs(projects []ProjectRecord, services []ServiceRe
 	return ids
 }
 
+func snapshotProjectIDs(projects []ProjectRecord) []string {
+	seen := map[string]struct{}{}
+	ids := make([]string, 0, len(projects))
+	for _, project := range projects {
+		id := strings.TrimSpace(project.ID)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
 func (r *ProjectRepository) UpsertImported(ctx context.Context, record ProjectRecord) error {
 	if record.Source == "" {
 		record.Source = ProjectSourceImported
 	}
-	runtimeScope, ok := runtimescope.New(record.ProviderID, record.ContextName)
-	if !ok {
-		return errors.New("imported project runtime scope is required")
-	}
-	return r.SaveSnapshot(ctx, runtimeScope, []ProjectRecord{record}, nil, record.LastSeenAt, time.Time{})
+	return r.SaveImportedSnapshot(ctx, record, nil, record.LastSeenAt)
 }
 
 func (r *ProjectRepository) Forget(ctx context.Context, project ProjectRecord, forgottenAt time.Time) error {
+	return upsertForgottenProject(ctx, r.db, project, forgottenAt)
+}
+
+func upsertForgottenProject(ctx context.Context, exec projectExecContext, project ProjectRecord, forgottenAt time.Time) error {
 	providerID := strings.TrimSpace(project.ProviderID)
 	contextName := strings.TrimSpace(project.ContextName)
 	name := strings.TrimSpace(project.Name)
@@ -497,7 +808,7 @@ func (r *ProjectRepository) Forget(ctx context.Context, project ProjectRecord, f
 	if forgottenAt.IsZero() {
 		forgottenAt = time.Now().UTC()
 	}
-	_, err := r.db.ExecContext(ctx, `
+	_, err := exec.ExecContext(ctx, `
 		INSERT INTO forgotten_projects (
 			provider_id, context_name, name, project_id, forgotten_at
 		)
@@ -532,17 +843,105 @@ func (r *ProjectRepository) UnforgetInScope(ctx context.Context, runtimeScope ru
 	if !runtimeScope.Valid() {
 		return errors.New("runtime scope is required")
 	}
+	return unforgetProjectInScope(ctx, r.db, runtimeScope.ProviderID(), runtimeScope.ContextName(), name, projectID)
+}
+
+func unforgetProjectInScope(ctx context.Context, exec projectExecContext, providerID string, contextName string, name string, projectID string) error {
 	name = strings.TrimSpace(name)
 	projectID = strings.TrimSpace(projectID)
-	_, err := r.db.ExecContext(ctx, `
+	_, err := exec.ExecContext(ctx, `
 		DELETE FROM forgotten_projects
 		WHERE provider_id = ? AND context_name = ?
 			AND (name = ? OR (? <> '' AND project_id = ?))
-	`, runtimeScope.ProviderID(), runtimeScope.ContextName(), name, projectID, projectID)
+	`, providerID, contextName, name, projectID, projectID)
 	return err
 }
 
+// ForgetAndDelete atomically records the project's detector tombstone and
+// removes the project snapshot. It derives ownership from the project row read
+// inside the transaction.
+func (r *ProjectRepository) ForgetAndDelete(ctx context.Context, projectID string, forgottenAt time.Time) error {
+	return r.forgetAndDelete(ctx, runtimescope.Scope{}, projectID, forgottenAt)
+}
+
+// ForgetAndDeleteInScope is the authorization-safe remove-from-list mutation:
+// ownership validation, tombstone insertion, service removal, and project
+// deletion either all commit or all roll back.
+func (r *ProjectRepository) ForgetAndDeleteInScope(ctx context.Context, runtimeScope runtimescope.Scope, projectID string, forgottenAt time.Time) error {
+	if !runtimeScope.Valid() {
+		return errors.New("runtime scope is required")
+	}
+	return r.forgetAndDelete(ctx, runtimeScope, projectID, forgottenAt)
+}
+
+func (r *ProjectRepository) forgetAndDelete(ctx context.Context, runtimeScope runtimescope.Scope, projectID string, forgottenAt time.Time) error {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return sql.ErrNoRows
+	}
+	project := ProjectRecord{ID: projectID}
+	if err := r.db.QueryRowContext(ctx, `
+		SELECT provider_id, context_name, name
+		FROM projects
+		WHERE id = ?
+	`, projectID).Scan(&project.ProviderID, &project.ContextName, &project.Name); err != nil {
+		return err
+	}
+	if runtimeScope.Valid() && !runtimeScope.Matches(project.ProviderID, project.ContextName) {
+		return sql.ErrNoRows
+	}
+	releaseDeletion, err := r.beginProjectDeletion(ctx, project.ProviderID, project.ContextName, projectID)
+	if err != nil {
+		return err
+	}
+	defer releaseDeletion()
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	project = ProjectRecord{ID: projectID}
+	if err := tx.QueryRowContext(ctx, `
+		SELECT provider_id, context_name, name
+		FROM projects
+		WHERE id = ?
+	`, projectID).Scan(&project.ProviderID, &project.ContextName, &project.Name); err != nil {
+		return err
+	}
+	if runtimeScope.Valid() && !runtimeScope.Matches(project.ProviderID, project.ContextName) {
+		return sql.ErrNoRows
+	}
+	if err := upsertForgottenProject(ctx, tx, project, forgottenAt); err != nil {
+		return err
+	}
+	if err := deleteProjectSnapshot(ctx, tx, project.ProviderID, project.ContextName, projectID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (r *ProjectRepository) Delete(ctx context.Context, projectID string) error {
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return sql.ErrNoRows
+	}
+	var providerID string
+	var contextName string
+	if err := r.db.QueryRowContext(ctx, `
+		SELECT provider_id, context_name
+		FROM projects
+		WHERE id = ?
+	`, projectID).Scan(&providerID, &contextName); err != nil {
+		return err
+	}
+	releaseDeletion, err := r.beginProjectDeletion(ctx, providerID, contextName, projectID)
+	if err != nil {
+		return err
+	}
+	defer releaseDeletion()
+
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -550,19 +949,17 @@ func (r *ProjectRepository) Delete(ctx context.Context, projectID string) error 
 	defer func() {
 		_ = tx.Rollback()
 	}()
-	if _, err := tx.ExecContext(ctx, "DELETE FROM services WHERE project_id = ?", projectID); err != nil {
+	providerID = ""
+	contextName = ""
+	if err := tx.QueryRowContext(ctx, `
+		SELECT provider_id, context_name
+		FROM projects
+		WHERE id = ?
+	`, projectID).Scan(&providerID, &contextName); err != nil {
 		return err
 	}
-	result, err := tx.ExecContext(ctx, "DELETE FROM projects WHERE id = ?", projectID)
-	if err != nil {
+	if err := deleteProjectSnapshot(ctx, tx, providerID, contextName, projectID); err != nil {
 		return err
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if rows == 0 {
-		return sql.ErrNoRows
 	}
 	return tx.Commit()
 }
@@ -571,23 +968,38 @@ func (r *ProjectRepository) DeleteInScope(ctx context.Context, runtimeScope runt
 	if !runtimeScope.Valid() {
 		return errors.New("runtime scope is required")
 	}
+	projectID = strings.TrimSpace(projectID)
+	if projectID == "" {
+		return sql.ErrNoRows
+	}
+	var providerID string
+	var contextName string
+	if err := r.db.QueryRowContext(ctx, "SELECT provider_id, context_name FROM projects WHERE id = ?", projectID).Scan(&providerID, &contextName); err != nil {
+		return err
+	}
+	if !runtimeScope.Matches(providerID, contextName) {
+		return sql.ErrNoRows
+	}
+	releaseDeletion, err := r.beginProjectDeletion(ctx, providerID, contextName, projectID)
+	if err != nil {
+		return err
+	}
+	defer releaseDeletion()
+
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	var providerID string
-	var contextName string
+	providerID = ""
+	contextName = ""
 	if err := tx.QueryRowContext(ctx, "SELECT provider_id, context_name FROM projects WHERE id = ?", projectID).Scan(&providerID, &contextName); err != nil {
 		return err
 	}
 	if !runtimeScope.Matches(providerID, contextName) {
 		return sql.ErrNoRows
 	}
-	if _, err := tx.ExecContext(ctx, "DELETE FROM services WHERE project_id = ?", projectID); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, "DELETE FROM projects WHERE id = ? AND provider_id = ? AND context_name = ?", projectID, runtimeScope.ProviderID(), runtimeScope.ContextName()); err != nil {
+	if err := deleteProjectSnapshot(ctx, tx, runtimeScope.ProviderID(), runtimeScope.ContextName(), projectID); err != nil {
 		return err
 	}
 	return tx.Commit()
