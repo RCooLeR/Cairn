@@ -105,8 +105,7 @@ func (ExecRunner) RunWithOptions(ctx context.Context, opts CommandRunOptions, na
 	if err == nil {
 		return result, nil
 	}
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) {
+	if exitErr, ok := errors.AsType[*exec.ExitError](err); ok {
 		result.ExitCode = exitErr.ExitCode()
 	} else {
 		result.ExitCode = -1
@@ -127,10 +126,7 @@ type commandOutputBuffer struct {
 }
 
 func newCommandOutputBuffer(limit int) *commandOutputBuffer {
-	payloadLimit := limit - commandOutputMarkerReserve
-	if payloadLimit < 0 {
-		payloadLimit = 0
-	}
+	payloadLimit := max(limit-commandOutputMarkerReserve, 0)
 	headLimit := payloadLimit / 2
 	return &commandOutputBuffer{
 		headLimit: headLimit,
@@ -266,10 +262,7 @@ func boundedHeadTailString(value string, limit int) string {
 	if len(value) <= limit {
 		return value
 	}
-	payloadLimit := limit - commandOutputMarkerReserve
-	if payloadLimit < 0 {
-		payloadLimit = 0
-	}
+	payloadLimit := max(limit-commandOutputMarkerReserve, 0)
 	headLimit := payloadLimit / 2
 	tailLimit := payloadLimit - headLimit
 	dropped := len(value) - headLimit - tailLimit

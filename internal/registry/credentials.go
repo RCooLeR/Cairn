@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"maps"
 	"strings"
 	"time"
 
@@ -281,9 +282,7 @@ func (m *Manager) restoreRegistryLoginConfigWithContext(ctx context.Context, tx 
 			delete(helpers, key)
 		}
 	}
-	for key, helper := range tx.originalHelperEntries {
-		helpers[key] = helper
-	}
+	maps.Copy(helpers, tx.originalHelperEntries)
 	if len(helpers) == 0 {
 		switch {
 		case !tx.hadCredHelpersSection:

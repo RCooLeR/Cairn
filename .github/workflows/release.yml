@@ -27,13 +27,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: windows-2022
+          - os: windows-2025
             platform: windows
             task: windows:package
           - os: ubuntu-24.04
             platform: linux
             task: linux:package
-          - os: macos-14
+          - os: macos-26
             platform: darwin
             task: darwin:package
     env:
@@ -64,17 +64,13 @@ jobs:
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
-      - name: Assert toolchain contract
-        shell: pwsh
-        run: ./scripts/check-toolchain.ps1
-
       - name: Cache Wails CLI
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/go/bin/wails3
             ~/go/bin/wails3.exe
-          key: ${{ runner.os }}-wails3-v3.0.0-alpha2.103
+          key: ${{ runner.os }}-go1.27.0-wails3-v3.0.0-beta.15
 
       - name: Install Linux packaging dependencies
         if: runner.os == 'Linux'
@@ -91,9 +87,13 @@ jobs:
           Add-Content -Path $env:GITHUB_PATH -Value $goBin
           $wailsExe = Join-Path $goBin ($(if ($IsWindows) { "wails3.exe" } else { "wails3" }))
           if (!(Test-Path -LiteralPath $wailsExe)) {
-            go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha2.103
+            go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.15
           }
-          & $wailsExe version
+          go version -m $wailsExe
+
+      - name: Assert toolchain contract
+        shell: pwsh
+        run: ./scripts/check-toolchain.ps1
 
       - name: Install NSIS
         if: runner.os == 'Windows'
@@ -133,7 +133,7 @@ jobs:
         run: go vet -unsafeptr=false ./...
 
       - name: Go lint
-        run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 run --timeout=5m
+        run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2 run --timeout=5m
 
       - name: Go vulnerability scan
         shell: pwsh
@@ -164,11 +164,11 @@ jobs:
       - name: Verify packaged application Go toolchain
         shell: pwsh
         run: |
-          $toolchain = Select-String -LiteralPath go.mod -Pattern '^\s*toolchain\s+(go\S+)\s*$'
-          if ($null -eq $toolchain -or $toolchain.Matches.Count -ne 1) {
-            throw "go.mod must declare exactly one pinned Go toolchain."
+          $goVersion = Select-String -LiteralPath go.mod -Pattern '^\s*go\s+(\d+\.\d+\.\d+)\s*$'
+          if ($null -eq $goVersion -or $goVersion.Matches.Count -ne 1) {
+            throw "go.mod must declare exactly one patch-pinned Go version."
           }
-          $expected = $toolchain.Matches[0].Groups[1].Value
+          $expected = "go$($goVersion.Matches[0].Groups[1].Value)"
           $binary = switch ("${{ matrix.platform }}") {
             "windows" { "bin/cairn.exe" }
             "linux" { "bin/cairn" }
@@ -407,7 +407,7 @@ jobs:
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           distribution: goreleaser
-          version: "v2.17.1"
+          version: "v2.18.0"
           args: release --clean --skip=validate
         env:
           GITHUB_TOKEN: ${{ github.token }}

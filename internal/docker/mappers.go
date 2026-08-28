@@ -1,19 +1,20 @@
 package docker
 
 import (
+	"maps"
+	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/RCooLeR/Cairn/internal/models"
-	dockertypes "github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/api/types/system"
-	"github.com/docker/docker/api/types/volume"
-	"github.com/docker/go-connections/nat"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/image"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/api/types/system"
+	"github.com/moby/moby/api/types/volume"
+	dockerclient "github.com/moby/moby/client"
 )
 
 const (
@@ -35,84 +36,53 @@ func mapInfo(info system.Info) *models.DockerInfo {
 	}
 }
 
-func mapVersion(version dockertypes.Version) *models.DockerVersion {
+func mapVersion(version dockerclient.ServerVersionResult) *models.DockerVersion {
+	var gitCommit string
+	var goVersion string
+	for _, component := range version.Components {
+		if strings.EqualFold(component.Name, "Engine") {
+			gitCommit = component.Details["GitCommit"]
+			goVersion = component.Details["GoVersion"]
+			break
+		}
+	}
 	return &models.DockerVersion{
 		ClientVersion: version.Version,
 		ServerVersion: version.Version,
 		APIVersion:    version.APIVersion,
 		MinAPIVersion: version.MinAPIVersion,
-		GitCommit:     version.GitCommit,
-		GoVersion:     version.GoVersion,
+		GitCommit:     gitCommit,
+		GoVersion:     goVersion,
 	}
 }
 
-func mapDiskUsage(usage dockertypes.DiskUsage) *models.DiskUsage {
+func mapDiskUsage(usage dockerclient.DiskUsageResult) *models.DiskUsage {
 	out := &models.DiskUsage{
 		Images: models.DiskUsageCategory{
-			Count: len(usage.Images),
+			Count:       int(usage.Images.TotalCount),
+			Active:      int(usage.Images.ActiveCount),
+			SizeBytes:   positive(usage.Images.TotalSize),
+			Reclaimable: positive(usage.Images.Reclaimable),
 		},
 		Containers: models.DiskUsageCategory{
-			Count: len(usage.Containers),
+			Count:       int(usage.Containers.TotalCount),
+			Active:      int(usage.Containers.ActiveCount),
+			SizeBytes:   positive(usage.Containers.TotalSize),
+			Reclaimable: positive(usage.Containers.Reclaimable),
 		},
 		Volumes: models.DiskUsageCategory{
-			Count: len(usage.Volumes),
+			Count:       int(usage.Volumes.TotalCount),
+			Active:      int(usage.Volumes.ActiveCount),
+			SizeBytes:   positive(usage.Volumes.TotalSize),
+			Reclaimable: positive(usage.Volumes.Reclaimable),
 		},
 		BuildCache: models.DiskUsageCategory{
-			Count: len(usage.BuildCache),
+			Count:       int(usage.BuildCache.TotalCount),
+			Active:      int(usage.BuildCache.ActiveCount),
+			SizeBytes:   positive(usage.BuildCache.TotalSize),
+			Reclaimable: positive(usage.BuildCache.Reclaimable),
 		},
 	}
-
-	for _, image := range usage.Images {
-		if image == nil {
-			continue
-		}
-		out.Images.SizeBytes += positive(image.Size)
-		if image.Containers == 0 {
-			out.Images.Reclaimable += positive(image.Size)
-		} else if image.Containers > 0 {
-			out.Images.Active++
-		}
-	}
-
-	for _, container := range usage.Containers {
-		if container == nil {
-			continue
-		}
-		size := positive(container.SizeRw) + positive(container.SizeRootFs)
-		out.Containers.SizeBytes += size
-		if container.State == "running" {
-			out.Containers.Active++
-		} else {
-			out.Containers.Reclaimable += positive(container.SizeRw)
-		}
-	}
-
-	for _, volume := range usage.Volumes {
-		if volume == nil || volume.UsageData == nil {
-			continue
-		}
-		size := positive(volume.UsageData.Size)
-		out.Volumes.SizeBytes += size
-		if volume.UsageData.RefCount > 0 {
-			out.Volumes.Active++
-		} else {
-			out.Volumes.Reclaimable += size
-		}
-	}
-
-	for _, record := range usage.BuildCache {
-		if record == nil {
-			continue
-		}
-		size := positive(record.Size)
-		out.BuildCache.SizeBytes += size
-		if record.InUse {
-			out.BuildCache.Active++
-		} else {
-			out.BuildCache.Reclaimable += size
-		}
-	}
-
 	out.TotalBytes = out.Images.SizeBytes + out.Containers.SizeBytes + out.Volumes.SizeBytes + out.BuildCache.SizeBytes
 	out.Reclaimable = out.Images.Reclaimable + out.Containers.Reclaimable + out.Volumes.Reclaimable + out.BuildCache.Reclaimable
 	return out
@@ -127,7 +97,7 @@ func positive(value int64) int64 {
 
 func mapContainerSummary(raw container.Summary) models.ContainerSummary {
 	labels := raw.Labels
-	state := normalizeContainerState(raw.State)
+	state := normalizeContainerState(string(raw.State))
 	health := healthFromStatusText(raw.Status)
 	return models.ContainerSummary{
 		ID:        raw.ID,
@@ -145,7 +115,6 @@ func mapContainerSummary(raw container.Summary) models.ContainerSummary {
 }
 
 func mapContainerDetail(raw container.InspectResponse) *models.ContainerDetail {
-	base := raw.ContainerJSONBase
 	summary := mapContainerInspectSummary(raw)
 	detail := &models.ContainerDetail{
 		Summary: summary,
@@ -159,8 +128,8 @@ func mapContainerDetail(raw container.InspectResponse) *models.ContainerDetail {
 		detail.WorkingDir = raw.Config.WorkingDir
 		detail.User = raw.Config.User
 	}
-	if base != nil && base.HostConfig != nil {
-		detail.RestartPolicy = string(base.HostConfig.RestartPolicy.Name)
+	if raw.HostConfig != nil {
+		detail.RestartPolicy = string(raw.HostConfig.RestartPolicy.Name)
 	}
 	detail.Mounts = mapMounts(raw.Mounts)
 	detail.Networks = mapContainerNetworks(raw.NetworkSettings)
@@ -168,22 +137,21 @@ func mapContainerDetail(raw container.InspectResponse) *models.ContainerDetail {
 }
 
 func mapContainerInspectSummary(raw container.InspectResponse) models.ContainerSummary {
-	base := raw.ContainerJSONBase
 	var labels map[string]string
 	var image string
 	if raw.Config != nil {
 		labels = raw.Config.Labels
 		image = raw.Config.Image
 	}
-	if image == "" && base != nil {
-		image = base.Image
+	if image == "" {
+		image = raw.Image
 	}
 
 	var stateText string
 	var health models.HealthStatus
-	if base != nil && base.State != nil {
-		stateText = normalizeContainerState(base.State.Status)
-		health = mapHealthStatus(base.State.Health)
+	if raw.State != nil {
+		stateText = normalizeContainerState(string(raw.State.Status))
+		health = mapHealthStatus(raw.State.Health)
 	}
 	if stateText == "" {
 		stateText = "created"
@@ -193,19 +161,19 @@ func mapContainerInspectSummary(raw container.InspectResponse) models.ContainerS
 	}
 
 	return models.ContainerSummary{
-		ID:        containerInspectID(base),
-		Name:      containerInspectName(base),
+		ID:        raw.ID,
+		Name:      strings.TrimPrefix(raw.Name, "/"),
 		Image:     image,
-		ImageID:   containerInspectImageID(base),
+		ImageID:   raw.Image,
 		Status:    stateText,
 		State:     stateText,
 		Health:    health,
 		ProjectID: labels[composeProjectLabel],
 		Service:   labels[composeServiceLabel],
 		Ports:     mapInspectPorts(raw.NetworkSettings),
-		Restarts:  containerInspectRestarts(base),
-		CreatedAt: containerInspectCreatedAt(base),
-		StartedAt: containerInspectStartedAt(base),
+		Restarts:  raw.RestartCount,
+		CreatedAt: parseDockerTime(raw.Created),
+		StartedAt: containerInspectStartedAt(raw.State),
 	}
 }
 
@@ -269,6 +237,14 @@ func mapVolumeDetail(raw volume.Volume, containers []models.ContainerSummary) *m
 }
 
 func mapNetworkSummary(raw network.Summary) models.NetworkSummary {
+	return mapNetwork(raw.Network, 0)
+}
+
+func mapNetworkInspectSummary(raw network.Inspect) models.NetworkSummary {
+	return mapNetwork(raw.Network, len(raw.Containers))
+}
+
+func mapNetwork(raw network.Network, containerCount int) models.NetworkSummary {
 	subnet, gateway := networkIPAM(raw)
 	return models.NetworkSummary{
 		ID:             raw.ID,
@@ -277,7 +253,7 @@ func mapNetworkSummary(raw network.Summary) models.NetworkSummary {
 		Scope:          raw.Scope,
 		Subnet:         subnet,
 		Gateway:        gateway,
-		ContainerCount: len(raw.Containers),
+		ContainerCount: containerCount,
 		Internal:       raw.Internal,
 		Attachable:     raw.Attachable,
 		Labels:         copyStringMap(raw.Labels),
@@ -285,13 +261,13 @@ func mapNetworkSummary(raw network.Summary) models.NetworkSummary {
 }
 
 func mapNetworkDetail(raw network.Inspect, containers []models.ContainerSummary, rawJSON string) *models.NetworkDetail {
-	subnet, gateway := networkIPAM(raw)
+	subnet, gateway := networkIPAM(raw.Network)
 	return &models.NetworkDetail{
-		Summary:    mapNetworkSummary(raw),
+		Summary:    mapNetworkInspectSummary(raw),
 		Subnet:     subnet,
 		Gateway:    gateway,
 		Options:    copyStringMap(raw.Options),
-		IPAM:       networkIPAMConfigs(raw),
+		IPAM:       networkIPAMConfigs(raw.Network),
 		Containers: containers,
 		RawJSON:    rawJSON,
 		CreatedAt:  raw.Created,
@@ -311,46 +287,11 @@ func firstContainerName(names []string, id string) string {
 	return id
 }
 
-func containerInspectID(base *container.ContainerJSONBase) string {
-	if base == nil {
-		return ""
-	}
-	return base.ID
-}
-
-func containerInspectName(base *container.ContainerJSONBase) string {
-	if base == nil {
-		return ""
-	}
-	return strings.TrimPrefix(base.Name, "/")
-}
-
-func containerInspectImageID(base *container.ContainerJSONBase) string {
-	if base == nil {
-		return ""
-	}
-	return base.Image
-}
-
-func containerInspectRestarts(base *container.ContainerJSONBase) int {
-	if base == nil {
-		return 0
-	}
-	return base.RestartCount
-}
-
-func containerInspectCreatedAt(base *container.ContainerJSONBase) time.Time {
-	if base == nil {
+func containerInspectStartedAt(state *container.State) time.Time {
+	if state == nil {
 		return time.Time{}
 	}
-	return parseDockerTime(base.Created)
-}
-
-func containerInspectStartedAt(base *container.ContainerJSONBase) time.Time {
-	if base == nil || base.State == nil {
-		return time.Time{}
-	}
-	return parseDockerTime(base.State.StartedAt)
+	return parseDockerTime(state.StartedAt)
 }
 
 func normalizeContainerState(value string) string {
@@ -384,7 +325,7 @@ func mapHealthStatus(health *container.Health) models.HealthStatus {
 	if health == nil {
 		return models.HealthStatusUnknown
 	}
-	switch strings.ToLower(strings.TrimSpace(health.Status)) {
+	switch strings.ToLower(strings.TrimSpace(string(health.Status))) {
 	case "healthy":
 		return models.HealthStatusHealthy
 	case "unhealthy":
@@ -396,12 +337,12 @@ func mapHealthStatus(health *container.Health) models.HealthStatus {
 	}
 }
 
-func mapContainerPorts(ports []container.Port) []models.PortBinding {
+func mapContainerPorts(ports []container.PortSummary) []models.PortBinding {
 	out := make([]models.PortBinding, 0, len(ports))
 	seen := map[string]struct{}{}
 	for _, port := range ports {
 		binding := models.PortBinding{
-			HostIP:        port.IP,
+			HostIP:        portSummaryIP(port),
 			ContainerPort: strconv.Itoa(int(port.PrivatePort)),
 			Protocol:      port.Type,
 		}
@@ -417,6 +358,13 @@ func mapContainerPorts(ports []container.Port) []models.PortBinding {
 	return out
 }
 
+func portSummaryIP(port container.PortSummary) string {
+	if !port.IP.IsValid() {
+		return ""
+	}
+	return port.IP.String()
+}
+
 func mapInspectPorts(settings *container.NetworkSettings) []models.PortBinding {
 	if settings == nil {
 		return nil
@@ -424,11 +372,11 @@ func mapInspectPorts(settings *container.NetworkSettings) []models.PortBinding {
 	return mapPortMap(settings.Ports)
 }
 
-func mapPortMap(portMap nat.PortMap) []models.PortBinding {
+func mapPortMap(portMap network.PortMap) []models.PortBinding {
 	out := make([]models.PortBinding, 0, len(portMap))
 	seen := map[string]struct{}{}
 	for port, bindings := range portMap {
-		protocol := port.Proto()
+		protocol := string(port.Proto())
 		if protocol == "" {
 			protocol = "tcp"
 		}
@@ -441,7 +389,7 @@ func mapPortMap(portMap nat.PortMap) []models.PortBinding {
 		}
 		for _, binding := range bindings {
 			addPortBinding(&out, seen, models.PortBinding{
-				HostIP:        binding.HostIP,
+				HostIP:        validAddrString(binding.HostIP),
 				HostPort:      binding.HostPort,
 				ContainerPort: port.Port(),
 				Protocol:      protocol,
@@ -525,26 +473,51 @@ func mapContainerNetworks(settings *container.NetworkSettings) []string {
 	return names
 }
 
-func networkIPAM(raw network.Inspect) (string, string) {
+func networkIPAM(raw network.Network) (string, string) {
 	for _, cfg := range raw.IPAM.Config {
-		if cfg.Subnet != "" || cfg.Gateway != "" {
-			return cfg.Subnet, cfg.Gateway
+		if cfg.Subnet.IsValid() || cfg.Gateway.IsValid() {
+			return validPrefixString(cfg.Subnet), validAddrString(cfg.Gateway)
 		}
 	}
 	return "", ""
 }
 
-func networkIPAMConfigs(raw network.Inspect) []models.NetworkIPAMConfig {
+func networkIPAMConfigs(raw network.Network) []models.NetworkIPAMConfig {
 	configs := make([]models.NetworkIPAMConfig, 0, len(raw.IPAM.Config))
 	for _, cfg := range raw.IPAM.Config {
 		configs = append(configs, models.NetworkIPAMConfig{
-			Subnet:     cfg.Subnet,
-			Gateway:    cfg.Gateway,
-			IPRange:    cfg.IPRange,
-			AuxAddress: copyStringMap(cfg.AuxAddress),
+			Subnet:     validPrefixString(cfg.Subnet),
+			Gateway:    validAddrString(cfg.Gateway),
+			IPRange:    validPrefixString(cfg.IPRange),
+			AuxAddress: stringifyAddresses(cfg.AuxAddress),
 		})
 	}
 	return configs
+}
+
+func validAddrString(address netip.Addr) string {
+	if !address.IsValid() {
+		return ""
+	}
+	return address.String()
+}
+
+func validPrefixString(prefix netip.Prefix) string {
+	if !prefix.IsValid() {
+		return ""
+	}
+	return prefix.String()
+}
+
+func stringifyAddresses(values map[string]netip.Addr) map[string]string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(values))
+	for key, address := range values {
+		out[key] = validAddrString(address)
+	}
+	return out
 }
 
 func volumeCreatedAt(raw volume.Volume) time.Time {
@@ -582,8 +555,6 @@ func copyStringMap(values map[string]string) map[string]string {
 		return nil
 	}
 	out := make(map[string]string, len(values))
-	for key, value := range values {
-		out[key] = value
-	}
+	maps.Copy(out, values)
 	return out
 }

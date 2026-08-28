@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"uuid"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/bus"
@@ -21,7 +23,6 @@ import (
 	"github.com/RCooLeR/Cairn/internal/providers"
 	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/store"
-	"github.com/google/uuid"
 )
 
 const (
@@ -172,7 +173,7 @@ func (m *Manager) OpenHostTerminal(ctx context.Context, opts models.TerminalOpti
 		return nil, apperror.New(apperror.Internal, "Open host terminal returned no PTY session")
 	}
 	info := models.TerminalSessionInfo{
-		ID:         uuid.NewString(),
+		ID:         uuid.New().String(),
 		Kind:       KindHost,
 		Title:      "Host",
 		Shell:      shellTitle(argv),
@@ -248,9 +249,7 @@ func (m *Manager) OpenProjectTerminal(ctx context.Context, projectID string, opt
 		}
 		env["COMPOSE_FILE"] = strings.Join(mappedFiles, backendPathListSep)
 	}
-	for key, value := range opts.Env {
-		env[key] = value
-	}
+	maps.Copy(env, opts.Env)
 	cwd := project.WorkingDir
 	cwd, err = mapTerminalPathToBackend(m.provider, cwd, "project working directory")
 	if err != nil {
@@ -304,7 +303,7 @@ func (m *Manager) openProviderPTYTerminal(ctx context.Context, opts models.Termi
 	if ptySession == nil {
 		return nil, apperror.New(apperror.Internal, "Open backend terminal returned no PTY session")
 	}
-	info.ID = uuid.NewString()
+	info.ID = uuid.New().String()
 	info.Shell = shellTitle(argv)
 	info.User = currentUsername()
 	info.WorkingDir = cwd
@@ -366,7 +365,7 @@ func (m *Manager) OpenContainerTerminal(ctx context.Context, containerID string,
 		title = shortID(containerID)
 	}
 	info := models.TerminalSessionInfo{
-		ID:          uuid.NewString(),
+		ID:          uuid.New().String(),
 		Kind:        KindContainer,
 		Title:       title,
 		Shell:       shell,
@@ -507,11 +506,9 @@ func (m *Manager) StopAll() {
 	m.mu.Unlock()
 	var stopping sync.WaitGroup
 	for _, id := range ids {
-		stopping.Add(1)
-		go func(sessionID string) {
-			defer stopping.Done()
-			m.finish(sessionID, -1)
-		}(id)
+		stopping.Go(func() {
+			m.finish(id, -1)
+		})
 	}
 	stopping.Wait()
 }

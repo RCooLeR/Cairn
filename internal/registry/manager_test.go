@@ -19,7 +19,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
 	"github.com/RCooLeR/Cairn/internal/store"
-	dockerregistry "github.com/docker/docker/api/types/registry"
+	dockerregistry "github.com/moby/moby/api/types/registry"
 )
 
 func TestNormalizeImageRefCorpus(t *testing.T) {

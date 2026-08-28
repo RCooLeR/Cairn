@@ -2,6 +2,8 @@
 
 Cairn is a Compose-first Docker management desktop app for Windows, macOS, and Linux. It is built for day-to-day local Docker work: provider setup, Compose projects, containers, images, volumes, networks, logs, terminals, updates, backups, registries, and a local Docker agent.
 
+Current desktop builds target Windows 10/Server 2016 or newer, macOS 13.3 or newer, and Linux distributions with GTK 4.14+ and WebKitGTK 6.0 (for example Debian 13 or Ubuntu 24.04).
+
 The v1.0 app is intentionally desktop-first and safety-first. Cairn runs against a selected Docker backend, keeps command previews visible before mutations, and records audited actions.
 
 ## Highlights
@@ -66,10 +68,10 @@ More detail: [docs/local-agent.md](docs/local-agent.md).
 
 Required tools:
 
-- Go
-- Node.js and npm
+- Go 1.27.0
+- Node.js 24.20.0 LTS and npm 11.19 or newer
 - Task
-- Wails v3 pinned by the project build config
+- Wails v3 beta 15, installed at the exact version pinned by the project build config
 
 Common commands:
 

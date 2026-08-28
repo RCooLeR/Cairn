@@ -601,7 +601,7 @@ func normalizeDockerVersion(value string) string {
 	value = strings.TrimSpace(value)
 	value = strings.TrimPrefix(value, "Docker Compose version ")
 	value = strings.TrimPrefix(value, "Docker Buildx version ")
-	for _, field := range strings.Fields(value) {
+	for field := range strings.FieldsSeq(value) {
 		trimmed := strings.TrimPrefix(field, "v")
 		if trimmed != "" && trimmed[0] >= '0' && trimmed[0] <= '9' {
 			return trimmed
@@ -633,7 +633,7 @@ func aptPolicyOutdatedPackages(output string) []string {
 			seen[current.name] = true
 		}
 	}
-	for _, line := range strings.Split(output, "\n") {
+	for line := range strings.SplitSeq(output, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" {
 			continue
@@ -643,12 +643,12 @@ func aptPolicyOutdatedPackages(output string) []string {
 			current = packageState{name: strings.TrimSuffix(trimmed, ":")}
 			continue
 		}
-		if strings.HasPrefix(trimmed, "Installed:") {
-			current.installed = strings.TrimSpace(strings.TrimPrefix(trimmed, "Installed:"))
+		if after, ok := strings.CutPrefix(trimmed, "Installed:"); ok {
+			current.installed = strings.TrimSpace(after)
 			continue
 		}
-		if strings.HasPrefix(trimmed, "Candidate:") {
-			current.candidate = strings.TrimSpace(strings.TrimPrefix(trimmed, "Candidate:"))
+		if after, ok := strings.CutPrefix(trimmed, "Candidate:"); ok {
+			current.candidate = strings.TrimSpace(after)
 		}
 	}
 	flush()

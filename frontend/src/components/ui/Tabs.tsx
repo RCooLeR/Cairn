@@ -89,11 +89,13 @@ export function Tabs({ activeID, children, items, onChange }: TabsProps) {
             key={item.id}
             onClick={() => onChange(item.id)}
             ref={(element) => {
-              if (element) {
-                tabRefs.current.set(item.id, element);
-              } else {
-                tabRefs.current.delete(item.id);
+              if (!element) {
+                return undefined;
               }
+              tabRefs.current.set(item.id, element);
+              return () => {
+                tabRefs.current.delete(item.id);
+              };
             }}
             role="tab"
             tabIndex={item.id === focusID ? 0 : -1}

@@ -24,6 +24,21 @@ describe("ErrorBoundary", () => {
 
   it("renders a recovery fallback when a child render fails", () => {
     allowConsoleErrorOnce(
+      "React reporting the tested render failure to the error boundary",
+      (arguments_) =>
+        arguments_[0] === "%o\n\n%s\n\n%s\n" &&
+        arguments_[1] instanceof Error &&
+        arguments_[1].message === "boom" &&
+        typeof arguments_[2] === "string" &&
+        arguments_[2].includes(
+          "The above error occurred in the <BrokenChild> component.",
+        ) &&
+        typeof arguments_[3] === "string" &&
+        arguments_[3].includes(
+          "React will try to recreate this component tree",
+        ),
+    );
+    allowConsoleErrorOnce(
       "ErrorBoundary reporting the tested render failure",
       (arguments_) =>
         arguments_[0] === "Cairn UI render failure" &&

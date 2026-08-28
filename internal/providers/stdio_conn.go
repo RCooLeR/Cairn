@@ -362,10 +362,7 @@ func looksLikeUTF16LEText(data []byte) bool {
 	if len(data) < 4 {
 		return false
 	}
-	limit := len(data)
-	if limit > 48 {
-		limit = 48
-	}
+	limit := min(len(data), 48)
 	pairs := 0
 	zeroHighBytes := 0
 	for i := 0; i+1 < limit; i += 2 {

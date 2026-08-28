@@ -517,7 +517,7 @@ func (p *WindowsWSLProvider) cacheBackendIP(value string) {
 }
 
 func firstUsableBackendIPv4(output string) string {
-	for _, field := range strings.Fields(output) {
+	for field := range strings.FieldsSeq(output) {
 		if ip := net.ParseIP(strings.TrimSpace(field)); ip != nil && ip.To4() != nil && !ip.IsLoopback() {
 			return ip.String()
 		}
@@ -662,8 +662,7 @@ func (p *WindowsWSLProvider) MapPathToHost(backendPath string) (string, error) {
 			return prefix + strings.ReplaceAll(rest, "/", `\`), nil
 		}
 	}
-	if strings.HasPrefix(value, "/") {
-		trimmed := strings.TrimPrefix(value, "/")
+	if trimmed, ok := strings.CutPrefix(value, "/"); ok {
 		if trimmed == "" {
 			return `\\wsl$\` + p.configuredDistro(), nil
 		}
@@ -835,7 +834,7 @@ func (p *WindowsWSLProvider) mapWSLUNCToBackend(value string) (string, bool) {
 
 func parseWSLDefaultVersion(output string) (int, bool) {
 	decoded := decodeWSLOutput(output)
-	for _, line := range strings.Split(decoded, "\n") {
+	for line := range strings.SplitSeq(decoded, "\n") {
 		key, value, ok := strings.Cut(line, ":")
 		if !ok || !strings.EqualFold(strings.TrimSpace(key), "Default Version") {
 			continue
@@ -849,7 +848,7 @@ func parseWSLDefaultVersion(output string) (int, bool) {
 func parseWSLListVerbose(output string) ([]wslDistro, error) {
 	decoded := decodeWSLOutput(output)
 	distros := []wslDistro{}
-	for _, line := range strings.Split(decoded, "\n") {
+	for line := range strings.SplitSeq(decoded, "\n") {
 		line = strings.TrimSpace(strings.Trim(line, "\ufeff"))
 		if line == "" || isWSLListVerboseHeader(line) {
 			continue
@@ -929,7 +928,7 @@ func isDockerDesktopDistro(name string) bool {
 
 func isUbuntuOSRelease(output string) bool {
 	values := map[string]string{}
-	for _, line := range strings.Split(decodeWSLOutput(output), "\n") {
+	for line := range strings.SplitSeq(decodeWSLOutput(output), "\n") {
 		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
 		if !ok {
 			continue

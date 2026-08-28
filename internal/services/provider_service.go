@@ -6,6 +6,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"uuid"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/bus"
@@ -13,7 +14,6 @@ import (
 	"github.com/RCooLeR/Cairn/internal/providers"
 	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/store"
-	"github.com/google/uuid"
 )
 
 type providerInstallProgressPayload struct {
@@ -135,7 +135,7 @@ func (s *ProviderService) ApplyInstall(ctx context.Context, planID string) (*mod
 	if err != nil {
 		return nil, err
 	}
-	streamID := uuid.NewString()
+	streamID := uuid.New().String()
 	progress := make(chan providers.InstallProgress, 8)
 	providerID, command, risk := s.Manager.InstallPlanAuditContext(planID)
 	go func() {

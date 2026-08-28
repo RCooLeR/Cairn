@@ -1,6 +1,6 @@
 import type { RefObject } from "react";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useEffectEvent } from "react";
 
 const focusableSelector = [
   "a[href]",
@@ -26,11 +26,7 @@ export function useFocusTrap(
   panelRef: RefObject<HTMLElement | null>,
   onClose: () => void,
 ) {
-  const onCloseRef = useRef(onClose);
-
-  useEffect(() => {
-    onCloseRef.current = onClose;
-  }, [onClose]);
+  const close = useEffectEvent(onClose);
 
   useEffect(() => {
     if (!open) {
@@ -56,7 +52,7 @@ export function useFocusTrap(
       if (event.key === "Escape") {
         event.preventDefault();
         event.stopPropagation();
-        onCloseRef.current();
+        close();
         return;
       }
       if (event.key !== "Tab") {

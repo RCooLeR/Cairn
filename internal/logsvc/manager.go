@@ -11,12 +11,12 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"uuid"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/bus"
 	dockercore "github.com/RCooLeR/Cairn/internal/docker"
 	"github.com/RCooLeR/Cairn/internal/models"
-	"github.com/google/uuid"
 )
 
 func NewManager(docker DockerClient, events bus.Bus, opts Options) *Manager {
@@ -76,7 +76,7 @@ func (m *Manager) StartLogStream(ctx context.Context, req models.LogStreamReques
 			apperror.WithDetail(fmt.Sprintf("A log stream can follow at most %d containers.", m.maxReadersPerStream)),
 		)
 	}
-	streamID := uuid.NewString()
+	streamID := uuid.New().String()
 	s := newSession(m, streamID, req)
 	for _, container := range containers {
 		if key := containerKey(container); key != "" {
@@ -290,13 +290,11 @@ func (m *Manager) StopAll() {
 	defer cancel()
 	var stopping sync.WaitGroup
 	for _, s := range sessions {
-		stopping.Add(1)
-		go func(s *session) {
-			defer stopping.Done()
+		stopping.Go(func() {
 			if err := s.stop(stopCtx); err != nil {
 				s.publishError(fmt.Errorf("log stream shutdown exceeded its deadline: %w", err))
 			}
-		}(s)
+		})
 	}
 	waitGroupUntil(stopCtx, &stopping)
 	waitGroupUntil(stopCtx, &m.pendingStarts)
@@ -485,12 +483,12 @@ func splitServiceID(value string) (string, string, bool) {
 		service = strings.TrimSpace(service)
 		return projectID, service, projectID != "" && service != "" && !strings.Contains(service, "::")
 	}
-	index := strings.LastIndex(value, "/")
-	if index <= 0 || index == len(value)-1 {
+	projectID, service, ok = strings.CutLast(value, "/")
+	if !ok {
 		return "", "", false
 	}
-	projectID = strings.TrimSpace(value[:index])
-	service = strings.TrimSpace(value[index+1:])
+	projectID = strings.TrimSpace(projectID)
+	service = strings.TrimSpace(service)
 	return projectID, service, projectID != "" && service != ""
 }
 
@@ -761,14 +759,12 @@ func (s *session) attach(container models.ContainerSummary) error {
 }
 
 func (s *session) startProducer(container models.ContainerSummary, key string) {
-	s.producers.Add(1)
-	go func() {
+	s.producers.Go(func() {
 		s.activeProducers.Add(1)
-		defer s.producers.Done()
 		defer s.activeProducers.Add(-1)
 		defer s.removeAttachment(key)
 		s.produce(container, key)
-	}()
+	})
 }
 
 func (s *session) produce(container models.ContainerSummary, key string) {

@@ -41,9 +41,7 @@ func (m *Manager) serveUDP(ctx context.Context, fwd *forward, host net.PacketCon
 		_ = expected.backend.Close()
 	}
 
-	fwd.wg.Add(1)
-	go func() {
-		defer fwd.wg.Done()
+	fwd.wg.Go(func() {
 		ticker := time.NewTicker(udpIdleTimeout / 2)
 		defer ticker.Stop()
 		for {
@@ -71,7 +69,7 @@ func (m *Manager) serveUDP(ctx context.Context, fwd *forward, host net.PacketCon
 				}
 			}
 		}
-	}()
+	})
 
 	buffer := make([]byte, udpBufferSize)
 	for {

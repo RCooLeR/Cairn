@@ -97,11 +97,13 @@ import {
 } from "lucide-react";
 import {
   type RefObject,
+  type ReactElement,
   type ReactNode,
   lazy,
   Suspense,
   useCallback,
   useEffect,
+  useEffectEvent,
   useMemo,
   useRef,
   useState,
@@ -1853,7 +1855,6 @@ function App() {
     useState<TerminalCommandRequest | null>(null);
   const queuedTerminalCommandID = useRef(0);
   const [chartPaused, setChartPaused] = useState(false);
-  const chartPausedRef = useRef(false);
   const statsStreamIDRef = useRef<string | null>(null);
   const lastProjectStatsFrameAtRef = useRef(0);
   const [statsStreamError, setStatsStreamError] = useState<string | null>(null);
@@ -3991,9 +3992,16 @@ function App() {
       ? "error"
       : "neutral";
 
-  useEffect(() => {
-    chartPausedRef.current = chartPaused;
-  }, [chartPaused]);
+  const appendChartPointIfRunning = useEffectEvent(
+    (samples: StatsSample[], label: string) => {
+      if (chartPaused) {
+        return;
+      }
+      setChartPoints((current) =>
+        trimChartPoints(current.concat(aggregateChartPoint(samples, label))),
+      );
+    },
+  );
 
   useEffect(() => {
     const off = Events.On("stats:sample", (event) => {
@@ -4061,13 +4069,7 @@ function App() {
         setProjectMetricSparks((current) =>
           appendProjectMetricSparkEntries(current, allSamples, label),
         );
-        if (!chartPausedRef.current) {
-          setChartPoints((current) =>
-            trimChartPoints(
-              current.concat(aggregateChartPoint(allSamples, label)),
-            ),
-          );
-        }
+        appendChartPointIfRunning(allSamples, label);
       }
     });
     return () => off();
@@ -11015,7 +11017,7 @@ function OverviewPage({
       available: false,
       message: "GPU metrics have not been loaded yet",
       deviceCount: 0,
-      checkedAt: null,
+      checkedAt: "0001-01-01T00:00:00.000Z",
     },
   };
   const diskBytes = dashboard?.diskUsage.totalBytes ?? diskTotal;
@@ -18182,7 +18184,7 @@ function SearchBox({
   onChange,
   value,
 }: {
-  inputRef?: RefObject<HTMLInputElement>;
+  inputRef?: RefObject<HTMLInputElement | null>;
   value: string;
   onChange: (value: string) => void;
 }) {
@@ -19408,7 +19410,7 @@ function renderAnsiText(text: string, query: string) {
     `${String.fromCharCode(27)}\\[([0-9;]*)m`,
     "g",
   );
-  const nodes: JSX.Element[] = [];
+  const nodes: ReactElement[] = [];
   let className = "";
   let cursor = 0;
   let match: RegExpExecArray | null;
@@ -19473,7 +19475,7 @@ function renderHighlightedText(text: string, query: string, keyPrefix: number) {
     return text;
   }
   const lower = text.toLowerCase();
-  const parts: JSX.Element[] = [];
+  const parts: ReactElement[] = [];
   let cursor = 0;
   let index = lower.indexOf(query);
   let key = 0;

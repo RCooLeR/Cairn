@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1548,7 +1549,7 @@ outer:
 		if result.Error != "" && !appendLine("Error: "+result.Error) {
 			break
 		}
-		for _, line := range strings.Split(result.Data, "\n") {
+		for line := range strings.SplitSeq(result.Data, "\n") {
 			if result.Data != "" && !appendLine(line) {
 				break outer
 			}
@@ -1615,11 +1616,11 @@ func requestedAgentTools(req models.AgentChatRequest) []string {
 
 func agentCurrentRequest(prompt string) string {
 	const marker = "Current request:"
-	index := strings.LastIndex(prompt, marker)
-	if index < 0 {
+	_, current, ok := strings.CutLast(prompt, marker)
+	if !ok {
 		return strings.TrimSpace(prompt)
 	}
-	return strings.TrimSpace(prompt[index+len(marker):])
+	return strings.TrimSpace(current)
 }
 
 func isAgentMetaQuestion(prompt string) bool {
@@ -1641,10 +1642,8 @@ func isAgentMetaQuestion(prompt string) bool {
 		"hi",
 		"hey",
 	}
-	for _, phrase := range exactPhrases {
-		if normalized == phrase {
-			return true
-		}
+	if slices.Contains(exactPhrases, normalized) {
+		return true
 	}
 	containedPhrases := []string{
 		"who are you",
@@ -2480,8 +2479,8 @@ func safeAgentFilesystemErrorWithCode(err error, fallback apperror.Code, message
 }
 
 func pathBase(value string) string {
-	if idx := strings.LastIndex(value, "/"); idx >= 0 {
-		return value[idx+1:]
+	if _, base, ok := strings.CutLast(value, "/"); ok {
+		return base
 	}
 	return value
 }
@@ -2577,7 +2576,7 @@ func analyzeAgentProject(projectID string, name string, workingDir string, files
 func extractAgentEnvVars(source string, content string) []string {
 	keys := map[string]struct{}{}
 	if strings.HasPrefix(pathBase(strings.ToLower(source)), ".env") {
-		for _, line := range strings.Split(content, "\n") {
+		for line := range strings.SplitSeq(content, "\n") {
 			line = strings.TrimSpace(line)
 			if line == "" || strings.HasPrefix(line, "#") || !strings.Contains(line, "=") {
 				continue
@@ -3277,7 +3276,7 @@ func dockerfileStructurePreview(value string) string {
 	)
 	var preview strings.Builder
 	preview.WriteString("# Dockerfile values hidden by Cairn Agent context.\n")
-	for _, line := range strings.Split(value, "\n") {
+	for line := range strings.SplitSeq(value, "\n") {
 		line = strings.TrimSpace(strings.TrimPrefix(line, "\ufeff"))
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue

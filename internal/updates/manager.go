@@ -915,10 +915,7 @@ func (m *Manager) schedulerIntervalStatus(ctx context.Context) (time.Duration, b
 }
 
 func (m *Manager) jitter(interval time.Duration) time.Duration {
-	max := interval / 10
-	if max > 30*time.Minute {
-		max = 30 * time.Minute
-	}
+	max := min(interval/10, 30*time.Minute)
 	if max <= 0 {
 		return 0
 	}

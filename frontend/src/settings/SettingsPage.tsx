@@ -1247,7 +1247,7 @@ export function SettingsPage({
                     label="Go"
                     value={version?.goVersion ?? "Unknown"}
                   />
-                  <ReadOnlySetting label="Wails" value="v3.0.0-alpha2.103" />
+                  <ReadOnlySetting label="Wails" value="v3.0.0-beta.15" />
                   <ReadOnlySetting
                     label="Commit"
                     value={version?.commit || "Development build"}

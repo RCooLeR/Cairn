@@ -14,7 +14,7 @@ import (
 	"strings"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 type verifiedConfigPreparation struct {
@@ -839,7 +839,7 @@ func (closure *verifiedConfigClosure) rememberDirectory(path string) error {
 
 func cleanupVerifiedConfigSnapshot(snapshotDir string) error {
 	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
+	for range 2 {
 		_ = filepath.WalkDir(snapshotDir, func(path string, entry fs.DirEntry, walkErr error) error {
 			if walkErr != nil {
 				return nil

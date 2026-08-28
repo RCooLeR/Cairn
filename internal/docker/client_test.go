@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
+	"iter"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,21 +32,19 @@ import (
 	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/store"
 	cerrdefs "github.com/containerd/errdefs"
-	dockertypes "github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/build"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/events"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/api/types/registry"
-	"github.com/docker/docker/api/types/strslice"
-	"github.com/docker/docker/api/types/system"
-	"github.com/docker/docker/api/types/volume"
-	dockerclient "github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/stdcopy"
 	dockerspec "github.com/moby/docker-image-spec/specs-go/v1"
+	"github.com/moby/moby/api/pkg/stdcopy"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/events"
+	"github.com/moby/moby/api/types/image"
+	"github.com/moby/moby/api/types/jsonstream"
+	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/api/types/registry"
+	"github.com/moby/moby/api/types/strslice"
+	"github.com/moby/moby/api/types/system"
+	"github.com/moby/moby/api/types/volume"
+	dockerclient "github.com/moby/moby/client"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 )
 
@@ -66,29 +67,30 @@ func TestClientConnectAndDTOs(t *testing.T) {
 		NCPU:            8,
 		MemTotal:        16 << 30,
 	}
-	api.version = dockertypes.Version{
+	api.version = dockerclient.ServerVersionResult{
 		Version:       "28.5.2",
 		APIVersion:    "1.51",
 		MinAPIVersion: "1.24",
-		GitCommit:     "abc123",
-		GoVersion:     "go1.26.4",
+		Components: []system.ComponentVersion{{
+			Name: "Engine",
+			Details: map[string]string{
+				"GitCommit": "abc123",
+				"GoVersion": "go1.26.4",
+			},
+		}},
 	}
-	api.diskUsage = dockertypes.DiskUsage{
-		Images: []*image.Summary{
-			{Size: 100, Containers: 0},
-			{Size: 200, Containers: 2},
+	api.diskUsage = dockerclient.DiskUsageResult{
+		Images: dockerclient.ImagesDiskUsage{
+			TotalCount: 2, ActiveCount: 1, TotalSize: 300, Reclaimable: 100,
 		},
-		Containers: []*container.Summary{
-			{SizeRw: 10, SizeRootFs: 30, State: "running"},
-			{SizeRw: 5, SizeRootFs: 20, State: "exited"},
+		Containers: dockerclient.ContainersDiskUsage{
+			TotalCount: 2, ActiveCount: 1, TotalSize: 65, Reclaimable: 5,
 		},
-		Volumes: []*volume.Volume{
-			{UsageData: &volume.UsageData{Size: 50, RefCount: 0}},
-			{UsageData: &volume.UsageData{Size: 75, RefCount: 1}},
+		Volumes: dockerclient.VolumesDiskUsage{
+			TotalCount: 2, ActiveCount: 1, TotalSize: 125, Reclaimable: 50,
 		},
-		BuildCache: []*build.CacheRecord{
-			{Size: 7, InUse: false},
-			{Size: 8, InUse: true},
+		BuildCache: dockerclient.BuildCacheDiskUsage{
+			TotalCount: 2, ActiveCount: 1, TotalSize: 15, Reclaimable: 7,
 		},
 	}
 
@@ -346,7 +348,7 @@ func TestClientContainerProcessPIDsParsesTopOutput(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	api := newFakeAPI()
-	api.tops["abc123"] = container.TopResponse{
+	api.tops["abc123"] = dockerclient.ContainerTopResult{
 		Titles: []string{"UID", "PID", "CMD"},
 		Processes: [][]string{
 			{"root", "4242", "ollama"},
@@ -395,12 +397,10 @@ func TestClientContainerExecAndShellDetection(t *testing.T) {
 	ctx := context.Background()
 	api := newFakeAPI()
 	api.containerInspects["abc123"] = container.InspectResponse{
-		ContainerJSONBase: &container.ContainerJSONBase{
-			ID:    "abc123",
-			Name:  "/api-1",
-			Image: "sha256:image1",
-			State: &container.State{Status: "running"},
-		},
+		ID:     "abc123",
+		Name:   "/api-1",
+		Image:  "sha256:image1",
+		State:  &container.State{Status: container.StateRunning},
 		Config: &container.Config{Image: "example/api:latest"},
 	}
 	api.executablePaths["/bin/sh"] = true
@@ -441,20 +441,20 @@ func TestClientContainerExecAndShellDetection(t *testing.T) {
 		_ = session.Close()
 	})
 	last := api.execCreates[len(api.execCreates)-1]
-	if last.ContainerID != "abc123" || !last.Options.Tty || last.Options.User != "1000" || last.Options.WorkingDir != "/app" {
+	if last.ContainerID != "abc123" || !last.Options.TTY || last.Options.User != "1000" || last.Options.WorkingDir != "/app" {
 		t.Fatalf("exec create = %#v", last)
 	}
 	if fmt.Sprint(last.Options.Cmd) != "[/bin/sh]" || fmt.Sprint(last.Options.Env) != "[A=1 B=2]" {
 		t.Fatalf("exec argv/env = %#v %#v", last.Options.Cmd, last.Options.Env)
 	}
-	if last.Options.ConsoleSize == nil || *last.Options.ConsoleSize != [2]uint{43, 132} {
+	if last.Options.ConsoleSize != (dockerclient.ConsoleSize{Height: 43, Width: 132}) {
 		t.Fatalf("console size = %#v", last.Options.ConsoleSize)
 	}
 	if len(api.execAttachCtxs) == 0 {
 		t.Fatalf("no exec attach recorded")
 	}
-	if len(api.execAttachOpts) == 0 || api.execAttachOpts[len(api.execAttachOpts)-1].ConsoleSize == nil ||
-		*api.execAttachOpts[len(api.execAttachOpts)-1].ConsoleSize != [2]uint{43, 132} {
+	if len(api.execAttachOpts) == 0 ||
+		api.execAttachOpts[len(api.execAttachOpts)-1].ConsoleSize != (dockerclient.ConsoleSize{Height: 43, Width: 132}) {
 		t.Fatalf("attach options = %#v", api.execAttachOpts)
 	}
 
@@ -521,12 +521,10 @@ func TestClientListContainerFiles(t *testing.T) {
 	ctx := context.Background()
 	api := newFakeAPI()
 	api.containerInspects["abc123"] = container.InspectResponse{
-		ContainerJSONBase: &container.ContainerJSONBase{
-			ID:    "abc123",
-			Name:  "/app-1",
-			Image: "sha256:image1",
-			State: &container.State{Status: "running"},
-		},
+		ID:     "abc123",
+		Name:   "/app-1",
+		Image:  "sha256:image1",
+		State:  &container.State{Status: container.StateRunning},
 		Config: &container.Config{Image: "example/app:latest"},
 	}
 	api.executablePaths["/bin/sh"] = true
@@ -572,12 +570,10 @@ func TestClientListContainerFilesNotFound(t *testing.T) {
 	ctx := context.Background()
 	api := newFakeAPI()
 	api.containerInspects["abc123"] = container.InspectResponse{
-		ContainerJSONBase: &container.ContainerJSONBase{
-			ID:    "abc123",
-			Name:  "/app-1",
-			Image: "sha256:image1",
-			State: &container.State{Status: "running"},
-		},
+		ID:     "abc123",
+		Name:   "/app-1",
+		Image:  "sha256:image1",
+		State:  &container.State{Status: container.StateRunning},
 		Config: &container.Config{Image: "example/app:latest"},
 	}
 	api.executablePaths["/bin/sh"] = true
@@ -879,6 +875,53 @@ func TestClientObjectsDTOsRawInspectAndCacheReconcile(t *testing.T) {
 	}
 	if got := queryString(t, ctx, sqlDB, "SELECT subnet FROM networks_cache WHERE id = ?", "net1"); got != "172.22.0.0/16" {
 		t.Fatalf("cached network subnet = %q, want subnet", got)
+	}
+}
+
+func TestClientListNetworksIgnoresContainersWithoutNetworkSettings(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	seedFakeObjects(api)
+	api.containers = append(api.containers,
+		container.Summary{ID: "missing-settings"},
+		container.Summary{ID: "empty-settings", NetworkSettings: &container.NetworkSettingsSummary{}},
+	)
+
+	client := New(fakeDockerProvider{}, nil)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	networks, err := client.ListNetworks(ctx)
+	if err != nil {
+		t.Fatalf("ListNetworks() error = %v", err)
+	}
+	if len(networks) != 1 || networks[0].ContainerCount != 1 {
+		t.Fatalf("networks = %#v, want one attached container", networks)
+	}
+}
+
+func TestClientListNetworksSurvivesContainerUsageFailure(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	seedFakeObjects(api)
+	api.containerListErr = errors.New("container inventory unavailable")
+
+	client := New(fakeDockerProvider{}, nil)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	networks, err := client.ListNetworks(ctx)
+	if err != nil {
+		t.Fatalf("ListNetworks() error = %v", err)
+	}
+	if len(networks) != 1 || networks[0].Name != "demo_default" || networks[0].ContainerCount != 0 {
+		t.Fatalf("networks = %#v, want network inventory with unavailable usage count", networks)
 	}
 }
 
@@ -1463,7 +1506,7 @@ func TestClientRunImageRenameAndCreateObjects(t *testing.T) {
 	if networkSummary.Name != "cairn_net" || !networkSummary.Attachable {
 		t.Fatalf("network summary = %#v", networkSummary)
 	}
-	if got := api.createdNetworks[0].Options.IPAM.Config[0].Subnet; got != "172.30.0.0/16" {
+	if got := api.createdNetworks[0].Options.IPAM.Config[0].Subnet.String(); got != "172.30.0.0/16" {
 		t.Fatalf("network subnet = %q", got)
 	}
 }
@@ -2168,8 +2211,8 @@ func TestImagePullMapsImmediateAndStreamedRegistryFailures(t *testing.T) {
 	}{
 		{name: "immediate auth", err: errors.New("unauthorized: authentication required"), code: apperror.RegistryAuth},
 		{name: "immediate rate limit", err: errors.New("too many requests: rate limit exceeded"), code: apperror.RegistryRateLimit},
-		{name: "stream auth", body: `{"error":"denied: requested access to the resource is denied"}` + "\n", code: apperror.RegistryAuth},
-		{name: "stream rate limit", body: `{"error":"too many requests: rate limit exceeded"}` + "\n", code: apperror.RegistryRateLimit},
+		{name: "stream auth", body: `{"errorDetail":{"message":"denied: requested access to the resource is denied"}}` + "\n", code: apperror.RegistryAuth},
+		{name: "stream rate limit", body: `{"errorDetail":{"message":"too many requests: rate limit exceeded"}}` + "\n", code: apperror.RegistryRateLimit},
 	}
 	for _, tt := range tests {
 		tt := tt
@@ -2312,8 +2355,8 @@ func seedFakeObjects(api *fakeAPI) {
 		ImageID: "sha256:image1",
 		Command: "nginx -g daemon off;",
 		Created: created.Unix(),
-		Ports: []container.Port{{
-			IP:          "0.0.0.0",
+		Ports: []container.PortSummary{{
+			IP:          netip.MustParseAddr("0.0.0.0"),
 			PrivatePort: 80,
 			PublicPort:  8080,
 			Type:        "tcp",
@@ -2325,10 +2368,10 @@ func seedFakeObjects(api *fakeAPI) {
 			"demo_default": {
 				Aliases:     []string{"web", "demo-web"},
 				EndpointID:  "endpoint1",
-				Gateway:     "172.22.0.1",
-				IPAddress:   "172.22.0.2",
+				Gateway:     netip.MustParseAddr("172.22.0.1"),
+				IPAddress:   netip.MustParseAddr("172.22.0.2"),
 				IPPrefixLen: 16,
-				MacAddress:  "02:42:ac:16:00:02",
+				MacAddress:  network.HardwareAddr{0x02, 0x42, 0xac, 0x16, 0x00, 0x02},
 				NetworkID:   "net1",
 			},
 		}},
@@ -2341,21 +2384,19 @@ func seedFakeObjects(api *fakeAPI) {
 		}},
 	}}
 	api.containerInspects[fakeContainerID] = container.InspectResponse{
-		ContainerJSONBase: &container.ContainerJSONBase{
-			ID:           fakeContainerID,
-			Created:      created.Format(time.RFC3339Nano),
-			Name:         "/web",
-			RestartCount: 2,
-			Image:        "sha256:image1",
-			State: &container.State{
-				Status:    "running",
-				Running:   true,
-				StartedAt: started.Format(time.RFC3339Nano),
-				Health:    &container.Health{Status: "healthy"},
-			},
-			HostConfig: &container.HostConfig{
-				RestartPolicy: container.RestartPolicy{Name: "unless-stopped"},
-			},
+		ID:           fakeContainerID,
+		Created:      created.Format(time.RFC3339Nano),
+		Name:         "/web",
+		RestartCount: 2,
+		Image:        "sha256:image1",
+		State: &container.State{
+			Status:    container.StateRunning,
+			Running:   true,
+			StartedAt: started.Format(time.RFC3339Nano),
+			Health:    &container.Health{Status: "healthy"},
+		},
+		HostConfig: &container.HostConfig{
+			RestartPolicy: container.RestartPolicy{Name: "unless-stopped"},
 		},
 		Config: &container.Config{
 			Image:      "example/web:latest",
@@ -2398,7 +2439,7 @@ func seedFakeObjects(api *fakeAPI) {
 	}
 	api.imageInspects["example/web:latest"] = api.imageInspects["sha256:image1"]
 
-	api.volumes = []*volume.Volume{{
+	api.volumes = []volume.Volume{{
 		Name:       "demo_data",
 		Driver:     "local",
 		Mountpoint: "/var/lib/docker/volumes/demo_data/_data",
@@ -2407,25 +2448,27 @@ func seedFakeObjects(api *fakeAPI) {
 		CreatedAt:  created.Format(time.RFC3339Nano),
 		UsageData:  &volume.UsageData{Size: 42, RefCount: 1},
 	}}
-	api.volumeInspects["demo_data"] = *api.volumes[0]
-	api.diskUsage.Volumes = api.volumes
+	api.volumeInspects["demo_data"] = api.volumes[0]
+	api.diskUsage.Volumes.Items = append([]volume.Volume(nil), api.volumes...)
 
 	networkInspect := network.Inspect{
-		ID:         "net1",
-		Name:       "demo_default",
-		Driver:     "bridge",
-		Scope:      "local",
-		Attachable: true,
-		Labels:     map[string]string{composeProjectLabel: "demo"},
-		IPAM: network.IPAM{Config: []network.IPAMConfig{{
-			Subnet:  "172.22.0.0/16",
-			Gateway: "172.22.0.1",
-		}}},
+		Network: network.Network{
+			ID:         "net1",
+			Name:       "demo_default",
+			Driver:     "bridge",
+			Scope:      "local",
+			Attachable: true,
+			Labels:     map[string]string{composeProjectLabel: "demo"},
+			IPAM: network.IPAM{Config: []network.IPAMConfig{{
+				Subnet:  netip.MustParsePrefix("172.22.0.0/16"),
+				Gateway: netip.MustParseAddr("172.22.0.1"),
+			}}},
+		},
 		Containers: map[string]network.EndpointResource{
 			fakeContainerID: {Name: "web"},
 		},
 	}
-	api.networks = []network.Summary{networkInspect}
+	api.networks = []network.Summary{{Network: networkInspect.Network}}
 	api.networkInspects["net1"] = networkInspect
 }
 
@@ -3140,7 +3183,7 @@ func newBlockingContainerListAPI(blockEvery bool) *blockingContainerListAPI {
 	}
 }
 
-func (a *blockingContainerListAPI) ContainerList(ctx context.Context, opts container.ListOptions) ([]container.Summary, error) {
+func (a *blockingContainerListAPI) ContainerList(ctx context.Context, opts dockerclient.ContainerListOptions) (dockerclient.ContainerListResult, error) {
 	a.controlMu.Lock()
 	a.calls++
 	call := a.calls
@@ -3162,7 +3205,7 @@ func (a *blockingContainerListAPI) ContainerList(ctx context.Context, opts conta
 		select {
 		case <-a.releaseFirst:
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return dockerclient.ContainerListResult{}, ctx.Err()
 		}
 	}
 	return a.fakeAPI.ContainerList(ctx, opts)
@@ -3269,12 +3312,13 @@ func (w *fakeSyncedWriteCloser) Close() error {
 
 type fakeAPI struct {
 	mu                 sync.Mutex
-	ping               dockertypes.Ping
+	ping               dockerclient.PingResult
 	pingErr            error
 	info               system.Info
-	version            dockertypes.Version
-	diskUsage          dockertypes.DiskUsage
+	version            dockerclient.ServerVersionResult
+	diskUsage          dockerclient.DiskUsageResult
 	containers         []container.Summary
+	containerListErr   error
 	containerInspects  map[string]container.InspectResponse
 	containerRaw       map[string][]byte
 	images             []image.Summary
@@ -3283,7 +3327,7 @@ type fakeAPI struct {
 	imageListCalls     int
 	imageInspects      map[string]image.InspectResponse
 	imageRaw           map[string][]byte
-	volumes            []*volume.Volume
+	volumes            []volume.Volume
 	volumeInspects     map[string]volume.Volume
 	volumeRaw          map[string][]byte
 	networks           []network.Summary
@@ -3294,12 +3338,12 @@ type fakeAPI struct {
 	eventCalls         int
 	stats              map[string][]container.StatsResponse
 	statsCalls         []statsCall
-	tops               map[string]container.TopResponse
+	tops               map[string]dockerclient.ContainerTopResult
 	execCreates        []execCreateCall
 	execAttachCtxs     []context.Context
-	execAttachOpts     []container.ExecAttachOptions
+	execAttachOpts     []dockerclient.ExecAttachOptions
 	execResizes        []execResizeCall
-	execInspects       map[string]container.ExecInspect
+	execInspects       map[string]dockerclient.ExecInspectResult
 	execOutputs        map[string]string
 	execExitCodes      map[string]int
 	executablePaths    map[string]bool
@@ -3330,7 +3374,7 @@ type fakeAPI struct {
 	searches           []string
 	removedImages      []string
 	pruned             []string
-	createdVolumes     []volume.CreateOptions
+	createdVolumes     []dockerclient.VolumeCreateOptions
 	removedVolumes     []string
 	createdNetworks    []networkCreateCall
 	removedNetworks    []string
@@ -3346,7 +3390,7 @@ type createdContainerCall struct {
 
 type networkCreateCall struct {
 	Name    string
-	Options network.CreateOptions
+	Options dockerclient.NetworkCreateOptions
 }
 
 type statsCall struct {
@@ -3358,17 +3402,17 @@ type statsCall struct {
 type execCreateCall struct {
 	ID          string
 	ContainerID string
-	Options     container.ExecOptions
+	Options     dockerclient.ExecCreateOptions
 }
 
 type execResizeCall struct {
 	ExecID  string
-	Options container.ResizeOptions
+	Options dockerclient.ExecResizeOptions
 }
 
 func newFakeAPI() *fakeAPI {
 	return &fakeAPI{
-		ping:              dockertypes.Ping{APIVersion: "1.51"},
+		ping:              dockerclient.PingResult{APIVersion: "1.51"},
 		containerInspects: map[string]container.InspectResponse{},
 		containerRaw:      map[string][]byte{},
 		imageInspects:     map[string]image.InspectResponse{},
@@ -3380,8 +3424,8 @@ func newFakeAPI() *fakeAPI {
 		events:            make(chan events.Message, 16),
 		eventErrs:         make(chan error, 4),
 		stats:             map[string][]container.StatsResponse{},
-		tops:              map[string]container.TopResponse{},
-		execInspects:      map[string]container.ExecInspect{},
+		tops:              map[string]dockerclient.ContainerTopResult{},
+		execInspects:      map[string]dockerclient.ExecInspectResult{},
 		execOutputs:       map[string]string{},
 		execExitCodes:     map[string]int{},
 		executablePaths:   map[string]bool{},
@@ -3394,131 +3438,124 @@ func (a *fakeAPI) setPingError(err error) {
 	a.pingErr = err
 }
 
-func (a *fakeAPI) Ping(context.Context) (dockertypes.Ping, error) {
+func (a *fakeAPI) Ping(context.Context, dockerclient.PingOptions) (dockerclient.PingResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.pingErr != nil {
-		return dockertypes.Ping{}, a.pingErr
+		return dockerclient.PingResult{}, a.pingErr
 	}
 	return a.ping, nil
 }
 
-func (a *fakeAPI) Info(context.Context) (system.Info, error) {
-	return a.info, nil
+func (a *fakeAPI) Info(context.Context, dockerclient.InfoOptions) (dockerclient.SystemInfoResult, error) {
+	return dockerclient.SystemInfoResult{Info: a.info}, nil
 }
 
-func (a *fakeAPI) ServerVersion(context.Context) (dockertypes.Version, error) {
+func (a *fakeAPI) ServerVersion(context.Context, dockerclient.ServerVersionOptions) (dockerclient.ServerVersionResult, error) {
 	return a.version, nil
 }
 
-func (a *fakeAPI) DiskUsage(context.Context, dockertypes.DiskUsageOptions) (dockertypes.DiskUsage, error) {
+func (a *fakeAPI) DiskUsage(context.Context, dockerclient.DiskUsageOptions) (dockerclient.DiskUsageResult, error) {
 	return a.diskUsage, nil
 }
 
-func (a *fakeAPI) ContainerList(context.Context, container.ListOptions) ([]container.Summary, error) {
-	return append([]container.Summary(nil), a.containers...), nil
+func (a *fakeAPI) ContainerList(context.Context, dockerclient.ContainerListOptions) (dockerclient.ContainerListResult, error) {
+	return dockerclient.ContainerListResult{Items: append([]container.Summary(nil), a.containers...)}, a.containerListErr
 }
 
-func (a *fakeAPI) ContainerInspectWithRaw(_ context.Context, id string, _ bool) (container.InspectResponse, []byte, error) {
+func (a *fakeAPI) ContainerInspect(_ context.Context, id string, _ dockerclient.ContainerInspectOptions) (dockerclient.ContainerInspectResult, error) {
 	for key, inspect := range a.containerInspects {
 		if key == id || strings.HasPrefix(key, id) {
-			return inspect, rawOrMarshal(a.containerRaw[key], inspect), nil
+			return dockerclient.ContainerInspectResult{Container: inspect, Raw: rawOrMarshal(a.containerRaw[key], inspect)}, nil
 		}
 	}
-	return container.InspectResponse{}, nil, cerrdefs.ErrNotFound.WithMessage(fmt.Sprintf("no such container: %s", id))
+	return dockerclient.ContainerInspectResult{}, cerrdefs.ErrNotFound.WithMessage(fmt.Sprintf("no such container: %s", id))
 }
 
-func (a *fakeAPI) ContainerStart(_ context.Context, id string, _ container.StartOptions) error {
+func (a *fakeAPI) ContainerStart(_ context.Context, id string, _ dockerclient.ContainerStartOptions) (dockerclient.ContainerStartResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.started = append(a.started, id)
-	return nil
+	return dockerclient.ContainerStartResult{}, nil
 }
 
-func (a *fakeAPI) ContainerStop(_ context.Context, id string, _ container.StopOptions) error {
+func (a *fakeAPI) ContainerStop(_ context.Context, id string, _ dockerclient.ContainerStopOptions) (dockerclient.ContainerStopResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.stopped = append(a.stopped, id)
-	return nil
+	return dockerclient.ContainerStopResult{}, nil
 }
 
-func (a *fakeAPI) ContainerRestart(_ context.Context, id string, _ container.StopOptions) error {
+func (a *fakeAPI) ContainerRestart(_ context.Context, id string, _ dockerclient.ContainerRestartOptions) (dockerclient.ContainerRestartResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.restarted = append(a.restarted, id)
-	return nil
+	return dockerclient.ContainerRestartResult{}, nil
 }
 
-func (a *fakeAPI) ContainerKill(_ context.Context, id string, signal string) error {
+func (a *fakeAPI) ContainerKill(_ context.Context, id string, options dockerclient.ContainerKillOptions) (dockerclient.ContainerKillResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.killed = append(a.killed, id+":"+signal)
-	return nil
+	a.killed = append(a.killed, id+":"+options.Signal)
+	return dockerclient.ContainerKillResult{}, nil
 }
 
-func (a *fakeAPI) ContainerRemove(_ context.Context, id string, _ container.RemoveOptions) error {
+func (a *fakeAPI) ContainerRemove(_ context.Context, id string, _ dockerclient.ContainerRemoveOptions) (dockerclient.ContainerRemoveResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.removed = append(a.removed, id)
-	return nil
+	return dockerclient.ContainerRemoveResult{}, nil
 }
 
-func (a *fakeAPI) ContainerUnpause(_ context.Context, id string) error {
+func (a *fakeAPI) ContainerUnpause(_ context.Context, id string, _ dockerclient.ContainerUnpauseOptions) (dockerclient.ContainerUnpauseResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.unpaused = append(a.unpaused, id)
-	return nil
+	return dockerclient.ContainerUnpauseResult{}, nil
 }
 
-func (a *fakeAPI) ContainerLogs(context.Context, string, container.LogsOptions) (io.ReadCloser, error) {
+func (a *fakeAPI) ContainerLogs(context.Context, string, dockerclient.ContainerLogsOptions) (dockerclient.ContainerLogsResult, error) {
 	return io.NopCloser(strings.NewReader("")), nil
 }
 
-func (a *fakeAPI) ContainerStats(_ context.Context, id string, stream bool) (container.StatsResponseReader, error) {
+func (a *fakeAPI) ContainerStats(_ context.Context, id string, options dockerclient.ContainerStatsOptions) (dockerclient.ContainerStatsResult, error) {
 	a.mu.Lock()
-	a.statsCalls = append(a.statsCalls, statsCall{ID: id, Stream: stream})
+	oneShot := !options.Stream && !options.IncludePreviousSample
+	a.statsCalls = append(a.statsCalls, statsCall{ID: id, Stream: options.Stream, OneShot: oneShot})
 	entries := append([]container.StatsResponse(nil), a.stats[id]...)
 	a.mu.Unlock()
-	return container.StatsResponseReader{Body: statsReader(entries), OSType: "linux"}, nil
-}
-
-func (a *fakeAPI) ContainerStatsOneShot(_ context.Context, id string) (container.StatsResponseReader, error) {
-	a.mu.Lock()
-	a.statsCalls = append(a.statsCalls, statsCall{ID: id, OneShot: true})
-	entries := append([]container.StatsResponse(nil), a.stats[id]...)
-	a.mu.Unlock()
-	if len(entries) > 1 {
+	if oneShot && len(entries) > 1 {
 		entries = entries[len(entries)-1:]
 	}
-	return container.StatsResponseReader{Body: statsReader(entries), OSType: "linux"}, nil
+	return dockerclient.ContainerStatsResult{Body: statsReader(entries)}, nil
 }
 
-func (a *fakeAPI) ContainerTop(_ context.Context, id string, _ []string) (container.TopResponse, error) {
+func (a *fakeAPI) ContainerTop(_ context.Context, id string, _ dockerclient.ContainerTopOptions) (dockerclient.ContainerTopResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if top, ok := a.tops[id]; ok {
 		return top, nil
 	}
-	return container.TopResponse{Titles: []string{"PID"}}, nil
+	return dockerclient.ContainerTopResult{Titles: []string{"PID"}}, nil
 }
 
-func (a *fakeAPI) ContainerExecCreate(_ context.Context, containerID string, opts container.ExecOptions) (container.ExecCreateResponse, error) {
+func (a *fakeAPI) ExecCreate(_ context.Context, containerID string, opts dockerclient.ExecCreateOptions) (dockerclient.ExecCreateResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	id := fmt.Sprintf("exec-%d", len(a.execCreates)+1)
 	exitCode := a.execExitCodeLocked(opts.Cmd)
 	a.execCreates = append(a.execCreates, execCreateCall{ID: id, ContainerID: containerID, Options: opts})
-	a.execInspects[id] = container.ExecInspect{
-		ExecID:      id,
+	a.execInspects[id] = dockerclient.ExecInspectResult{
+		ID:          id,
 		ContainerID: containerID,
 		Running:     false,
 		ExitCode:    exitCode,
-		Pid:         1234,
+		PID:         1234,
 	}
-	return container.ExecCreateResponse{ID: id}, nil
+	return dockerclient.ExecCreateResult{ID: id}, nil
 }
 
-func (a *fakeAPI) ContainerExecAttach(ctx context.Context, execID string, opts container.ExecAttachOptions) (dockertypes.HijackedResponse, error) {
+func (a *fakeAPI) ExecAttach(ctx context.Context, execID string, opts dockerclient.ExecAttachOptions) (dockerclient.ExecAttachResult, error) {
 	a.mu.Lock()
 	a.execAttachCtxs = append(a.execAttachCtxs, ctx)
 	a.execAttachOpts = append(a.execAttachOpts, opts)
@@ -3539,29 +3576,32 @@ func (a *fakeAPI) ContainerExecAttach(ctx context.Context, execID string, opts c
 		if output == "" {
 			return
 		}
-		if opts.Tty {
+		if opts.TTY {
 			_, _ = serverConn.Write([]byte(output))
 			return
 		}
-		writer := stdcopy.NewStdWriter(serverConn, stdcopy.Stdout)
-		_, _ = writer.Write([]byte(output))
+		payload := []byte(output)
+		header := make([]byte, 8)
+		header[0] = byte(stdcopy.Stdout)
+		binary.BigEndian.PutUint32(header[4:], uint32(len(payload)))
+		_, _ = serverConn.Write(append(header, payload...))
 	}()
-	return dockertypes.NewHijackedResponse(clientConn, ""), nil
+	return dockerclient.ExecAttachResult{HijackedResponse: dockerclient.NewHijackedResponse(clientConn, "")}, nil
 }
 
-func (a *fakeAPI) ContainerExecResize(_ context.Context, execID string, opts container.ResizeOptions) error {
+func (a *fakeAPI) ExecResize(_ context.Context, execID string, opts dockerclient.ExecResizeOptions) (dockerclient.ExecResizeResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.execResizes = append(a.execResizes, execResizeCall{ExecID: execID, Options: opts})
-	return nil
+	return dockerclient.ExecResizeResult{}, nil
 }
 
-func (a *fakeAPI) ContainerExecInspect(_ context.Context, execID string) (container.ExecInspect, error) {
+func (a *fakeAPI) ExecInspect(_ context.Context, execID string, _ dockerclient.ExecInspectOptions) (dockerclient.ExecInspectResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	inspect, ok := a.execInspects[execID]
 	if !ok {
-		return container.ExecInspect{}, cerrdefs.ErrNotFound.WithMessage(fmt.Sprintf("no such exec: %s", execID))
+		return dockerclient.ExecInspectResult{}, cerrdefs.ErrNotFound.WithMessage(fmt.Sprintf("no such exec: %s", execID))
 	}
 	return inspect, nil
 }
@@ -3593,9 +3633,13 @@ func commandKey(cmd []string) string {
 	return strings.Join(cmd, "\x00")
 }
 
-func (a *fakeAPI) ContainerCreate(_ context.Context, config *container.Config, hostConfig *container.HostConfig, networkingConfig *network.NetworkingConfig, _ *ocispec.Platform, name string) (container.CreateResponse, error) {
+func (a *fakeAPI) ContainerCreate(_ context.Context, options dockerclient.ContainerCreateOptions) (dockerclient.ContainerCreateResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	config := options.Config
+	hostConfig := options.HostConfig
+	networkingConfig := options.NetworkingConfig
+	name := options.Name
 	id := "created-" + name
 	if name == "" {
 		id = "created-container"
@@ -3607,14 +3651,12 @@ func (a *fakeAPI) ContainerCreate(_ context.Context, config *container.Config, h
 		NetworkingConfig: networkingConfig,
 	})
 	a.containerInspects[id] = container.InspectResponse{
-		ContainerJSONBase: &container.ContainerJSONBase{
-			ID:      id,
-			Name:    "/" + name,
-			Image:   "sha256:image1",
-			Created: time.Now().UTC().Format(time.RFC3339Nano),
-			State:   &container.State{Status: "created"},
-		},
-		Config: config,
+		ID:      id,
+		Name:    "/" + name,
+		Image:   "sha256:image1",
+		Created: time.Now().UTC().Format(time.RFC3339Nano),
+		State:   &container.State{Status: container.StateCreated},
+		Config:  config,
 	}
 	a.containers = append(a.containers, container.Summary{
 		ID:      id,
@@ -3623,7 +3665,7 @@ func (a *fakeAPI) ContainerCreate(_ context.Context, config *container.Config, h
 		ImageID: "sha256:image1",
 		State:   "created",
 	})
-	return container.CreateResponse{ID: id}, nil
+	return dockerclient.ContainerCreateResult{ID: id}, nil
 }
 
 func statsReader(entries []container.StatsResponse) io.ReadCloser {
@@ -3635,33 +3677,33 @@ func statsReader(entries []container.StatsResponse) io.ReadCloser {
 	return io.NopCloser(bytes.NewReader(buf.Bytes()))
 }
 
-func (a *fakeAPI) ContainerRename(_ context.Context, id string, name string) error {
+func (a *fakeAPI) ContainerRename(_ context.Context, id string, options dockerclient.ContainerRenameOptions) (dockerclient.ContainerRenameResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	a.renamed = append(a.renamed, id+":"+name)
-	return nil
+	a.renamed = append(a.renamed, id+":"+options.NewName)
+	return dockerclient.ContainerRenameResult{}, nil
 }
 
-func (a *fakeAPI) ImageList(ctx context.Context, _ image.ListOptions) ([]image.Summary, error) {
+func (a *fakeAPI) ImageList(ctx context.Context, _ dockerclient.ImageListOptions) (dockerclient.ImageListResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.imageListCalls++
 	if deadline, ok := ctx.Deadline(); ok {
 		a.imageListDeadline = time.Until(deadline)
 	}
-	return append([]image.Summary(nil), a.images...), a.imageListErr
+	return dockerclient.ImageListResult{Items: append([]image.Summary(nil), a.images...)}, a.imageListErr
 }
 
-func (a *fakeAPI) ImageInspectWithRaw(_ context.Context, id string) (image.InspectResponse, []byte, error) {
+func (a *fakeAPI) ImageInspect(_ context.Context, id string, _ ...dockerclient.ImageInspectOption) (dockerclient.ImageInspectResult, error) {
 	for key, inspect := range a.imageInspects {
 		if key == id || strings.HasPrefix(key, id) {
-			return inspect, rawOrMarshal(a.imageRaw[key], inspect), nil
+			return dockerclient.ImageInspectResult{InspectResponse: inspect}, nil
 		}
 	}
-	return image.InspectResponse{}, nil, cerrdefs.ErrNotFound.WithMessage(fmt.Sprintf("no such image: %s", id))
+	return dockerclient.ImageInspectResult{}, cerrdefs.ErrNotFound.WithMessage(fmt.Sprintf("no such image: %s", id))
 }
 
-func (a *fakeAPI) ImagePull(_ context.Context, ref string, opts image.PullOptions) (io.ReadCloser, error) {
+func (a *fakeAPI) ImagePull(_ context.Context, ref string, opts dockerclient.ImagePullOptions) (dockerclient.ImagePullResponse, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.pulled = append(a.pulled, ref)
@@ -3680,12 +3722,14 @@ func (a *fakeAPI) ImagePull(_ context.Context, ref string, opts image.PullOption
 	if body == "" {
 		body = `{"status":"pulling","id":"layer","progressDetail":{"current":1,"total":2}}` + "\n" + `{"status":"done"}` + "\n"
 	}
-	return io.NopCloser(strings.NewReader(body)), nil
+	return newFakeJSONMessageStream(body), nil
 }
 
-func (a *fakeAPI) ImageTag(_ context.Context, imageID string, ref string) error {
+func (a *fakeAPI) ImageTag(_ context.Context, options dockerclient.ImageTagOptions) (dockerclient.ImageTagResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	imageID := options.Source
+	ref := options.Target
 	a.tagged = append(a.tagged, imageID+"->"+ref)
 	a.imageInspects[ref] = image.InspectResponse{
 		ID:           imageID,
@@ -3694,10 +3738,10 @@ func (a *fakeAPI) ImageTag(_ context.Context, imageID string, ref string) error 
 		Architecture: "amd64",
 		Os:           "linux",
 	}
-	return nil
+	return dockerclient.ImageTagResult{}, nil
 }
 
-func (a *fakeAPI) ImagePush(_ context.Context, ref string, opts image.PushOptions) (io.ReadCloser, error) {
+func (a *fakeAPI) ImagePush(_ context.Context, ref string, opts dockerclient.ImagePushOptions) (dockerclient.ImagePushResponse, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.pushed = append(a.pushed, ref)
@@ -3709,10 +3753,10 @@ func (a *fakeAPI) ImagePush(_ context.Context, ref string, opts image.PushOption
 	if body == "" {
 		body = `{"status":"pushing","id":"layer","progressDetail":{"current":1,"total":2}}` + "\n" + `{"status":"done"}` + "\n"
 	}
-	return io.NopCloser(strings.NewReader(body)), nil
+	return newFakeJSONMessageStream(body), nil
 }
 
-func (a *fakeAPI) ImageSave(_ context.Context, imageIDs []string, _ ...dockerclient.ImageSaveOption) (io.ReadCloser, error) {
+func (a *fakeAPI) ImageSave(_ context.Context, imageIDs []string, _ ...dockerclient.ImageSaveOption) (dockerclient.ImageSaveResult, error) {
 	a.mu.Lock()
 	a.saved = append(a.saved, append([]string(nil), imageIDs...))
 	factory := a.saveReaderFactory
@@ -3723,10 +3767,10 @@ func (a *fakeAPI) ImageSave(_ context.Context, imageIDs []string, _ ...dockercli
 	return io.NopCloser(bytes.NewReader([]byte("fake image tar"))), nil
 }
 
-func (a *fakeAPI) ImageLoad(_ context.Context, input io.Reader, _ ...dockerclient.ImageLoadOption) (image.LoadResponse, error) {
+func (a *fakeAPI) ImageLoad(_ context.Context, input io.Reader, _ ...dockerclient.ImageLoadOption) (dockerclient.ImageLoadResult, error) {
 	body, err := io.ReadAll(input)
 	if err != nil {
-		return image.LoadResponse{}, err
+		return nil, err
 	}
 	a.mu.Lock()
 	a.loadedBytes = append(a.loadedBytes, len(body))
@@ -3744,74 +3788,74 @@ func (a *fakeAPI) ImageLoad(_ context.Context, input io.Reader, _ ...dockerclien
 		afterRead()
 	}
 	if loadErr != nil {
-		return image.LoadResponse{}, loadErr
+		return nil, loadErr
 	}
 	if responseBody == "" {
 		responseBody = `{"stream":"Loaded image: loaded:latest"}`
 	}
 	if responseCloseErr != nil {
-		return image.LoadResponse{Body: &errorClosingReadCloser{
+		return &errorClosingReadCloser{
 			Reader: strings.NewReader(responseBody),
 			err:    responseCloseErr,
-		}}, nil
+		}, nil
 	}
-	return image.LoadResponse{Body: io.NopCloser(strings.NewReader(responseBody))}, nil
+	return io.NopCloser(strings.NewReader(responseBody)), nil
 }
 
-func (a *fakeAPI) ImageSearch(_ context.Context, term string, _ registry.SearchOptions) ([]registry.SearchResult, error) {
+func (a *fakeAPI) ImageSearch(_ context.Context, term string, _ dockerclient.ImageSearchOptions) (dockerclient.ImageSearchResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.searches = append(a.searches, term)
-	return []registry.SearchResult{{
+	return dockerclient.ImageSearchResult{Items: []registry.SearchResult{{
 		Name:        "library/" + term,
 		Description: "test result",
 		StarCount:   42,
 		IsOfficial:  true,
-	}}, nil
+	}}}, nil
 }
 
-func (a *fakeAPI) ImageRemove(_ context.Context, id string, _ image.RemoveOptions) ([]image.DeleteResponse, error) {
+func (a *fakeAPI) ImageRemove(_ context.Context, id string, _ dockerclient.ImageRemoveOptions) (dockerclient.ImageRemoveResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.removedImages = append(a.removedImages, id)
-	return []image.DeleteResponse{{Deleted: id}}, nil
+	return dockerclient.ImageRemoveResult{Items: []image.DeleteResponse{{Deleted: id}}}, nil
 }
 
-func (a *fakeAPI) ImagesPrune(context.Context, filters.Args) (image.PruneReport, error) {
+func (a *fakeAPI) ImagePrune(context.Context, dockerclient.ImagePruneOptions) (dockerclient.ImagePruneResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.pruned = append(a.pruned, "images")
-	return image.PruneReport{}, nil
+	return dockerclient.ImagePruneResult{Report: image.PruneReport{}}, nil
 }
 
-func (a *fakeAPI) ContainersPrune(context.Context, filters.Args) (container.PruneReport, error) {
+func (a *fakeAPI) ContainerPrune(context.Context, dockerclient.ContainerPruneOptions) (dockerclient.ContainerPruneResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.pruned = append(a.pruned, "containers")
-	return container.PruneReport{}, nil
+	return dockerclient.ContainerPruneResult{Report: container.PruneReport{}}, nil
 }
 
-func (a *fakeAPI) BuildCachePrune(context.Context, build.CachePruneOptions) (*build.CachePruneReport, error) {
+func (a *fakeAPI) BuildCachePrune(context.Context, dockerclient.BuildCachePruneOptions) (dockerclient.BuildCachePruneResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.pruned = append(a.pruned, "build-cache")
-	return &build.CachePruneReport{}, nil
+	return dockerclient.BuildCachePruneResult{}, nil
 }
 
-func (a *fakeAPI) VolumeList(context.Context, volume.ListOptions) (volume.ListResponse, error) {
-	return volume.ListResponse{Volumes: append([]*volume.Volume(nil), a.volumes...)}, nil
+func (a *fakeAPI) VolumeList(context.Context, dockerclient.VolumeListOptions) (dockerclient.VolumeListResult, error) {
+	return dockerclient.VolumeListResult{Items: append([]volume.Volume(nil), a.volumes...)}, nil
 }
 
-func (a *fakeAPI) VolumeInspectWithRaw(_ context.Context, name string) (volume.Volume, []byte, error) {
+func (a *fakeAPI) VolumeInspect(_ context.Context, name string, _ dockerclient.VolumeInspectOptions) (dockerclient.VolumeInspectResult, error) {
 	for key, inspect := range a.volumeInspects {
 		if key == name {
-			return inspect, rawOrMarshal(a.volumeRaw[key], inspect), nil
+			return dockerclient.VolumeInspectResult{Volume: inspect, Raw: rawOrMarshal(a.volumeRaw[key], inspect)}, nil
 		}
 	}
-	return volume.Volume{}, nil, cerrdefs.ErrNotFound.WithMessage(fmt.Sprintf("no such volume: %s", name))
+	return dockerclient.VolumeInspectResult{}, cerrdefs.ErrNotFound.WithMessage(fmt.Sprintf("no such volume: %s", name))
 }
 
-func (a *fakeAPI) VolumeCreate(_ context.Context, options volume.CreateOptions) (volume.Volume, error) {
+func (a *fakeAPI) VolumeCreate(_ context.Context, options dockerclient.VolumeCreateOptions) (dockerclient.VolumeCreateResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.createdVolumes = append(a.createdVolumes, options)
@@ -3823,85 +3867,130 @@ func (a *fakeAPI) VolumeCreate(_ context.Context, options volume.CreateOptions) 
 		Options:    options.DriverOpts,
 		CreatedAt:  time.Now().UTC().Format(time.RFC3339Nano),
 	}
-	a.volumes = append(a.volumes, &created)
+	a.volumes = append(a.volumes, created)
 	a.volumeInspects[options.Name] = created
-	return created, nil
+	return dockerclient.VolumeCreateResult{Volume: created}, nil
 }
 
-func (a *fakeAPI) VolumeRemove(_ context.Context, name string, _ bool) error {
+func (a *fakeAPI) VolumeRemove(_ context.Context, name string, _ dockerclient.VolumeRemoveOptions) (dockerclient.VolumeRemoveResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.removedVolumes = append(a.removedVolumes, name)
-	return nil
+	return dockerclient.VolumeRemoveResult{}, nil
 }
 
-func (a *fakeAPI) VolumesPrune(context.Context, filters.Args) (volume.PruneReport, error) {
+func (a *fakeAPI) VolumePrune(context.Context, dockerclient.VolumePruneOptions) (dockerclient.VolumePruneResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.pruned = append(a.pruned, "volumes")
-	return volume.PruneReport{}, nil
+	return dockerclient.VolumePruneResult{Report: volume.PruneReport{}}, nil
 }
 
-func (a *fakeAPI) NetworkList(context.Context, network.ListOptions) ([]network.Summary, error) {
-	return append([]network.Summary(nil), a.networks...), nil
+func (a *fakeAPI) NetworkList(context.Context, dockerclient.NetworkListOptions) (dockerclient.NetworkListResult, error) {
+	return dockerclient.NetworkListResult{Items: append([]network.Summary(nil), a.networks...)}, nil
 }
 
-func (a *fakeAPI) NetworkInspectWithRaw(_ context.Context, id string, _ network.InspectOptions) (network.Inspect, []byte, error) {
+func (a *fakeAPI) NetworkInspect(_ context.Context, id string, _ dockerclient.NetworkInspectOptions) (dockerclient.NetworkInspectResult, error) {
 	for key, inspect := range a.networkInspects {
 		if key == id || strings.HasPrefix(key, id) || inspect.Name == id {
-			return inspect, rawOrMarshal(a.networkRaw[key], inspect), nil
+			return dockerclient.NetworkInspectResult{Network: inspect, Raw: rawOrMarshal(a.networkRaw[key], inspect)}, nil
 		}
 	}
-	return network.Inspect{}, nil, cerrdefs.ErrNotFound.WithMessage(fmt.Sprintf("no such network: %s", id))
+	return dockerclient.NetworkInspectResult{}, cerrdefs.ErrNotFound.WithMessage(fmt.Sprintf("no such network: %s", id))
 }
 
-func (a *fakeAPI) NetworkCreate(_ context.Context, name string, options network.CreateOptions) (network.CreateResponse, error) {
+func (a *fakeAPI) NetworkCreate(_ context.Context, name string, options dockerclient.NetworkCreateOptions) (dockerclient.NetworkCreateResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	id := "net-" + name
 	a.createdNetworks = append(a.createdNetworks, networkCreateCall{Name: name, Options: options})
 	created := network.Inspect{
-		ID:         id,
-		Name:       name,
-		Driver:     options.Driver,
-		Scope:      "local",
-		Internal:   options.Internal,
-		Attachable: options.Attachable,
-		Labels:     options.Labels,
+		Network: network.Network{
+			ID:         id,
+			Name:       name,
+			Driver:     options.Driver,
+			Scope:      "local",
+			Internal:   options.Internal,
+			Attachable: options.Attachable,
+			Labels:     options.Labels,
+		},
 	}
 	if options.IPAM != nil {
 		created.IPAM = *options.IPAM
 	}
-	a.networks = append(a.networks, created)
+	a.networks = append(a.networks, network.Summary{Network: created.Network})
 	a.networkInspects[id] = created
-	return network.CreateResponse{ID: id}, nil
+	return dockerclient.NetworkCreateResult{ID: id}, nil
 }
 
-func (a *fakeAPI) NetworkRemove(_ context.Context, id string) error {
+func (a *fakeAPI) NetworkRemove(_ context.Context, id string, _ dockerclient.NetworkRemoveOptions) (dockerclient.NetworkRemoveResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.removedNetworks = append(a.removedNetworks, id)
-	return nil
+	return dockerclient.NetworkRemoveResult{}, nil
 }
 
-func (a *fakeAPI) NetworksPrune(context.Context, filters.Args) (network.PruneReport, error) {
+func (a *fakeAPI) NetworkPrune(context.Context, dockerclient.NetworkPruneOptions) (dockerclient.NetworkPruneResult, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.pruned = append(a.pruned, "networks")
-	return network.PruneReport{}, nil
+	return dockerclient.NetworkPruneResult{Report: network.PruneReport{}}, nil
 }
 
-func (a *fakeAPI) Events(context.Context, events.ListOptions) (<-chan events.Message, <-chan error) {
+func (a *fakeAPI) Events(context.Context, dockerclient.EventsListOptions) dockerclient.EventsResult {
 	a.mu.Lock()
 	a.eventCalls++
 	a.mu.Unlock()
-	return a.events, a.eventErrs
+	return dockerclient.EventsResult{Messages: a.events, Err: a.eventErrs}
 }
 
 func (a *fakeAPI) Close() error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.closed = true
+	return nil
+}
+
+type fakeJSONMessageStream struct {
+	io.ReadCloser
+}
+
+func newFakeJSONMessageStream(body string) *fakeJSONMessageStream {
+	return &fakeJSONMessageStream{ReadCloser: io.NopCloser(strings.NewReader(body))}
+}
+
+func (stream *fakeJSONMessageStream) JSONMessages(ctx context.Context) iter.Seq2[jsonstream.Message, error] {
+	return func(yield func(jsonstream.Message, error) bool) {
+		defer stream.Close()
+		decoder := json.NewDecoder(stream)
+		for {
+			if err := ctx.Err(); err != nil {
+				yield(jsonstream.Message{}, err)
+				return
+			}
+			var message jsonstream.Message
+			if err := decoder.Decode(&message); err != nil {
+				if !errors.Is(err, io.EOF) {
+					yield(jsonstream.Message{}, err)
+				}
+				return
+			}
+			if !yield(message, nil) {
+				return
+			}
+		}
+	}
+}
+
+func (stream *fakeJSONMessageStream) Wait(ctx context.Context) error {
+	for message, err := range stream.JSONMessages(ctx) {
+		if err != nil {
+			return err
+		}
+		if message.Error != nil {
+			return message.Error
+		}
+	}
 	return nil
 }
 

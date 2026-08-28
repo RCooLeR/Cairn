@@ -51,7 +51,7 @@ function deferred<T>() {
 
 function runtimeDiagnostics(active: number, started = true) {
   return new RuntimeDiagnostics({
-    checkedAt: null,
+    checkedAt: "0001-01-01T00:00:00.000Z",
     logs: {
       activeOperations: 1,
       activeProducers: 3,

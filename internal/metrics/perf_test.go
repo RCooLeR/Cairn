@@ -12,7 +12,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/bus"
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/store"
-	"github.com/docker/docker/api/types/container"
+	"github.com/moby/moby/api/types/container"
 )
 
 func TestManagerSeedScaleDashboardPerformanceAndGoroutines(t *testing.T) {

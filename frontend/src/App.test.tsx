@@ -289,6 +289,11 @@ function deferred<T>() {
   return { promise, reject, resolve };
 }
 
+async function setAgentPrompt(input: HTMLElement, value: string) {
+  fireEvent.change(input, { target: { value } });
+  await waitFor(() => expect(input).toHaveValue(value));
+}
+
 vi.mock("./api/app", () => ({
   getAppVersion: appApiMock.getAppVersion,
 }));
@@ -975,9 +980,7 @@ describe("App inventory shell", () => {
     const input = screen.getByPlaceholderText("Ask a Docker question...");
     expect(screen.getByTestId("agent-transcript")).toHaveClass("overflow-auto");
 
-    fireEvent.change(input, {
-      target: { value: "Review this Compose project and make a plan" },
-    });
+    await setAgentPrompt(input, "Review this Compose project and make a plan");
     fireEvent.keyDown(input, { key: "Enter", shiftKey: true });
     expect(agentServiceMock.Chat).not.toHaveBeenCalled();
 
@@ -1045,9 +1048,7 @@ describe("App inventory shell", () => {
     const input = await screen.findByPlaceholderText(
       "Ask a Docker question...",
     );
-    fireEvent.change(input, {
-      target: { value: "Remember this conversation" },
-    });
+    await setAgentPrompt(input, "Remember this conversation");
     fireEvent.keyDown(input, { key: "Enter" });
 
     await screen.findByText("Persistent agent answer.");
@@ -1083,7 +1084,7 @@ describe("App inventory shell", () => {
     const nav = screen.getByRole("navigation", { name: "Main navigation" });
     fireEvent.click(within(nav).getByRole("button", { name: /Agent/ }));
     let input = await screen.findByPlaceholderText("Ask a Docker question...");
-    fireEvent.change(input, { target: { value: "First request" } });
+    await setAgentPrompt(input, "First request");
     fireEvent.keyDown(input, { key: "Enter" });
     await waitFor(() => expect(agentServiceMock.Chat).toHaveBeenCalledTimes(1));
 
@@ -1095,7 +1096,7 @@ describe("App inventory shell", () => {
     expect(cancelFirst).toHaveBeenCalledWith("Stopped by user");
 
     input = await screen.findByPlaceholderText("Ask a Docker question...");
-    fireEvent.change(input, { target: { value: "Second request" } });
+    await setAgentPrompt(input, "Second request");
     fireEvent.keyDown(input, { key: "Enter" });
     await waitFor(() => expect(agentServiceMock.Chat).toHaveBeenCalledTimes(2));
 
@@ -1235,9 +1236,7 @@ describe("App inventory shell", () => {
     const input = await screen.findByPlaceholderText(
       "Ask a Docker question...",
     );
-    fireEvent.change(input, {
-      target: { value: "What belongs in a RAG stack?" },
-    });
+    await setAgentPrompt(input, "What belongs in a RAG stack?");
     fireEvent.keyDown(input, { key: "Enter" });
 
     await screen.findByText("Vector database such as Qdrant");
@@ -1283,11 +1282,10 @@ describe("App inventory shell", () => {
     const input = await screen.findByPlaceholderText(
       "Ask a Docker question...",
     );
-    fireEvent.change(input, {
-      target: {
-        value: "Can you upgrade all images if any upgrades available?",
-      },
-    });
+    await setAgentPrompt(
+      input,
+      "Can you upgrade all images if any upgrades available?",
+    );
     fireEvent.keyDown(input, { key: "Enter" });
 
     const dialog = await screen.findByRole("dialog", {
@@ -1347,9 +1345,7 @@ describe("App inventory shell", () => {
     const input = await screen.findByPlaceholderText(
       "Ask a Docker question...",
     );
-    fireEvent.change(input, {
-      target: { value: "Clean up dangling images" },
-    });
+    await setAgentPrompt(input, "Clean up dangling images");
     fireEvent.keyDown(input, { key: "Enter" });
 
     const dialog = await screen.findByRole("dialog", {
@@ -4505,11 +4501,13 @@ describe("App inventory shell", () => {
     render(<App />);
 
     await screen.findByText("Docker Engine - Running");
-    fireEvent.click(
-      within(
-        screen.getByRole("navigation", { name: "Main navigation" }),
-      ).getByRole("button", { name: /Logs/ }),
-    );
+    const logsButton = within(
+      screen.getByRole("navigation", { name: "Main navigation" }),
+    ).getByRole("button", { name: /Logs/ });
+    await act(async () => {
+      logsButton.click();
+      await Promise.resolve();
+    });
     await waitFor(() =>
       expect(logsServiceMock.StartLogStream).toHaveBeenCalled(),
     );
@@ -4622,16 +4620,13 @@ describe("App inventory shell", () => {
   it("accepts initial log lines before the stream state effect can commit", async () => {
     inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
     const logStart = deferred<string>();
+    let logClientToken: string | undefined;
     logsServiceMock.StartLogStream.mockImplementation(
       (request: { clientToken?: string; tail?: number }) => {
         if (request.tail !== 500) {
           return Promise.resolve("overview-stream");
         }
-        emitRuntimeEvent("logs:lines", {
-          streamID: "stream-race",
-          clientToken: request.clientToken,
-          lines: [logLine({ text: "INFO first synchronous line" })],
-        });
+        logClientToken = request.clientToken;
         return logStart.promise;
       },
     );
@@ -4655,6 +4650,13 @@ describe("App inventory shell", () => {
         }),
       ),
     );
+    await act(async () => {
+      emitRuntimeEvent("logs:lines", {
+        streamID: "stream-race",
+        clientToken: logClientToken,
+        lines: [logLine({ text: "INFO first synchronous line" })],
+      });
+    });
 
     expect(
       await screen.findByText(/first synchronous line/),

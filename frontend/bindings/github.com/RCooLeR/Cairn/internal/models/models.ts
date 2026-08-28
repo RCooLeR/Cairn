@@ -5,10 +5,6 @@
 // @ts-ignore: Unused imports
 import { Create as $Create } from "@wailsio/runtime";
 
-// eslint-disable-next-line @typescript-eslint/ban-ts-comment
-// @ts-ignore: Unused imports
-import * as time$0 from "../../../../../time/models.js";
-
 export class AgentChatRequest {
     "prompt": string;
     "scope"?: AgentScope;
@@ -190,7 +186,7 @@ export class AgentFileEditResult {
     "projectID": string;
     "path": string;
     "bytesWritten": number;
-    "appliedAt": time$0.Time;
+    "appliedAt": string;
 
     /** Creates a new AgentFileEditResult instance. */
     constructor($$source: Partial<AgentFileEditResult> = {}) {
@@ -204,7 +200,7 @@ export class AgentFileEditResult {
             this["bytesWritten"] = 0;
         }
         if (!("appliedAt" in $$source)) {
-            this["appliedAt"] = null;
+            this["appliedAt"] = "0001-01-01T00:00:00.000Z";
         }
 
         Object.assign(this, $$source);
@@ -527,7 +523,7 @@ export class ApplyUpdateRequest {
 
 export class AuditEntry {
     "id": number;
-    "ts": time$0.Time;
+    "ts": string;
     "actor"?: string;
     "action": string;
     "target"?: string;
@@ -541,7 +537,7 @@ export class AuditEntry {
             this["id"] = 0;
         }
         if (!("ts" in $$source)) {
-            this["ts"] = null;
+            this["ts"] = "0001-01-01T00:00:00.000Z";
         }
         if (!("action" in $$source)) {
             this["action"] = "";
@@ -615,7 +611,7 @@ export class BackupSummary {
     "sizeBytes": number;
     "result"?: string;
     "error"?: string;
-    "createdAt": time$0.Time;
+    "createdAt": string;
 
     /** Creates a new BackupSummary instance. */
     constructor($$source: Partial<BackupSummary> = {}) {
@@ -632,7 +628,7 @@ export class BackupSummary {
             this["sizeBytes"] = 0;
         }
         if (!("createdAt" in $$source)) {
-            this["createdAt"] = null;
+            this["createdAt"] = "0001-01-01T00:00:00.000Z";
         }
 
         Object.assign(this, $$source);
@@ -782,7 +778,7 @@ export class CommandPlan {
     "commands": PlannedCommand[];
     "effects": string[];
     "requiresTypedName"?: string;
-    "expiresAt": time$0.Time;
+    "expiresAt": string;
 
     /** Creates a new CommandPlan instance. */
     constructor($$source: Partial<CommandPlan> = {}) {
@@ -802,7 +798,7 @@ export class CommandPlan {
             this["effects"] = [];
         }
         if (!("expiresAt" in $$source)) {
-            this["expiresAt"] = null;
+            this["expiresAt"] = "0001-01-01T00:00:00.000Z";
         }
 
         Object.assign(this, $$source);
@@ -1018,7 +1014,7 @@ export class ContainerFileEntry {
     "type": string;
     "sizeBytes"?: number;
     "mode"?: string;
-    "modifiedAt"?: time$0.Time;
+    "modifiedAt"?: string;
     "linkTarget"?: string;
 
     /** Creates a new ContainerFileEntry instance. */
@@ -1134,8 +1130,8 @@ export class ContainerSummary {
     "gateway"?: string;
     "macAddress"?: string;
     "aliases"?: string[];
-    "createdAt": time$0.Time;
-    "startedAt"?: time$0.Time;
+    "createdAt": string;
+    "startedAt"?: string;
 
     /** Creates a new ContainerSummary instance. */
     constructor($$source: Partial<ContainerSummary> = {}) {
@@ -1158,7 +1154,7 @@ export class ContainerSummary {
             this["health"] = HealthStatus.$zero;
         }
         if (!("createdAt" in $$source)) {
-            this["createdAt"] = null;
+            this["createdAt"] = "0001-01-01T00:00:00.000Z";
         }
 
         Object.assign(this, $$source);
@@ -1637,7 +1633,7 @@ export class GPUMetrics {
     "driverVersion"?: string;
     "devices"?: GPUDeviceMetric[];
     "processes"?: GPUProcessMetric[];
-    "checkedAt": time$0.Time;
+    "checkedAt": string;
 
     /** Creates a new GPUMetrics instance. */
     constructor($$source: Partial<GPUMetrics> = {}) {
@@ -1648,7 +1644,7 @@ export class GPUMetrics {
             this["deviceCount"] = 0;
         }
         if (!("checkedAt" in $$source)) {
-            this["checkedAt"] = null;
+            this["checkedAt"] = "0001-01-01T00:00:00.000Z";
         }
 
         Object.assign(this, $$source);
@@ -1852,7 +1848,7 @@ export class ImageSummary {
     "repoTags"?: string[];
     "repoDigests"?: string[];
     "sizeBytes": number;
-    "createdAt": time$0.Time;
+    "createdAt": string;
     "inUse": boolean;
     "updateStatus"?: UpdateStatus;
 
@@ -1865,7 +1861,7 @@ export class ImageSummary {
             this["sizeBytes"] = 0;
         }
         if (!("createdAt" in $$source)) {
-            this["createdAt"] = null;
+            this["createdAt"] = "0001-01-01T00:00:00.000Z";
         }
         if (!("inUse" in $$source)) {
             this["inUse"] = false;
@@ -1904,7 +1900,7 @@ export class ImageUpdate {
     "remoteDigest"?: string;
     "confidence": Confidence;
     "recommendedAction": RecommendedAction;
-    "checkedAt": time$0.Time;
+    "checkedAt": string;
     "notes"?: string[];
 
     /** Creates a new ImageUpdate instance. */
@@ -1928,7 +1924,7 @@ export class ImageUpdate {
             this["recommendedAction"] = RecommendedAction.$zero;
         }
         if (!("checkedAt" in $$source)) {
-            this["checkedAt"] = null;
+            this["checkedAt"] = "0001-01-01T00:00:00.000Z";
         }
 
         Object.assign(this, $$source);
@@ -2085,7 +2081,7 @@ export enum LineageSource {
 };
 
 export class LogLine {
-    "ts": time$0.Time;
+    "ts": string;
     "containerID"?: string;
     "containerName"?: string;
     "service"?: string;
@@ -2098,7 +2094,7 @@ export class LogLine {
     /** Creates a new LogLine instance. */
     constructor($$source: Partial<LogLine> = {}) {
         if (!("ts" in $$source)) {
-            this["ts"] = null;
+            this["ts"] = "0001-01-01T00:00:00.000Z";
         }
         if (!("stream" in $$source)) {
             this["stream"] = "";
@@ -2360,7 +2356,7 @@ export class NetworkDetail {
     "ipam"?: NetworkIPAMConfig[];
     "containers"?: ContainerSummary[];
     "rawJSON"?: string;
-    "createdAt"?: time$0.Time;
+    "createdAt"?: string;
 
     /** Creates a new NetworkDetail instance. */
     constructor($$source: Partial<NetworkDetail> = {}) {
@@ -2477,7 +2473,7 @@ export class Notification {
     "body": string;
     "topic": string;
     "read": boolean;
-    "createdAt": time$0.Time;
+    "createdAt": string;
 
     /** Creates a new Notification instance. */
     constructor($$source: Partial<Notification> = {}) {
@@ -2500,7 +2496,7 @@ export class Notification {
             this["read"] = false;
         }
         if (!("createdAt" in $$source)) {
-            this["createdAt"] = null;
+            this["createdAt"] = "0001-01-01T00:00:00.000Z";
         }
 
         Object.assign(this, $$source);
@@ -2550,13 +2546,13 @@ export class PlannedCommand {
 }
 
 export class Point {
-    "ts": time$0.Time;
+    "ts": string;
     "value": number;
 
     /** Creates a new Point instance. */
     constructor($$source: Partial<Point> = {}) {
         if (!("ts" in $$source)) {
-            this["ts"] = null;
+            this["ts"] = "0001-01-01T00:00:00.000Z";
         }
         if (!("value" in $$source)) {
             this["value"] = 0;
@@ -2801,7 +2797,7 @@ export class ProjectSummary {
     "updateBadges": UpdateBadges;
     "ports"?: PortBinding[];
     "workingDir": string;
-    "lastChangedAt": time$0.Time;
+    "lastChangedAt": string;
 
     /** Creates a new ProjectSummary instance. */
     constructor($$source: Partial<ProjectSummary> = {}) {
@@ -2845,7 +2841,7 @@ export class ProjectSummary {
             this["workingDir"] = "";
         }
         if (!("lastChangedAt" in $$source)) {
-            this["lastChangedAt"] = null;
+            this["lastChangedAt"] = "0001-01-01T00:00:00.000Z";
         }
 
         Object.assign(this, $$source);
@@ -3092,7 +3088,7 @@ export class RegistryAccount {
     "username"?: string;
     "source": string;
     "loggedIn": boolean;
-    "lastVerifiedAt"?: time$0.Time;
+    "lastVerifiedAt"?: string;
 
     /** Creates a new RegistryAccount instance. */
     constructor($$source: Partial<RegistryAccount> = {}) {
@@ -3122,7 +3118,7 @@ export class RegistryAuthStatus {
     "registry": string;
     "loggedIn": boolean;
     "username"?: string;
-    "verifiedAt"?: time$0.Time;
+    "verifiedAt"?: string;
     "error"?: string;
 
     /** Creates a new RegistryAuthStatus instance. */
@@ -3325,7 +3321,7 @@ export class RuntimeDiagnostics {
     "metrics": MetricsRuntimeDiagnostics;
     "terminals": TerminalRuntimeDiagnostics;
     "portForwards": PortForwardRuntimeDiagnostics;
-    "checkedAt": time$0.Time;
+    "checkedAt": string;
 
     /** Creates a new RuntimeDiagnostics instance. */
     constructor($$source: Partial<RuntimeDiagnostics> = {}) {
@@ -3345,7 +3341,7 @@ export class RuntimeDiagnostics {
             this["portForwards"] = (new PortForwardRuntimeDiagnostics());
         }
         if (!("checkedAt" in $$source)) {
-            this["checkedAt"] = null;
+            this["checkedAt"] = "0001-01-01T00:00:00.000Z";
         }
 
         Object.assign(this, $$source);
@@ -3464,7 +3460,7 @@ export class StatsScope {
 export class StdioConnectionDiagnostic {
     "id": number;
     "command": string;
-    "openedAt": time$0.Time;
+    "openedAt": string;
     "ageMs": number;
 
     /** Creates a new StdioConnectionDiagnostic instance. */
@@ -3476,7 +3472,7 @@ export class StdioConnectionDiagnostic {
             this["command"] = "";
         }
         if (!("openedAt" in $$source)) {
-            this["openedAt"] = null;
+            this["openedAt"] = "0001-01-01T00:00:00.000Z";
         }
         if (!("ageMs" in $$source)) {
             this["ageMs"] = 0;
@@ -3500,8 +3496,8 @@ export class StdioTransportDiagnostics {
     "active": number;
     "forcedKills": number;
     "closeTimeouts": number;
-    "lastOpenedAt"?: time$0.Time;
-    "lastClosedAt"?: time$0.Time;
+    "lastOpenedAt"?: string;
+    "lastClosedAt"?: string;
     "activeConnections"?: StdioConnectionDiagnostic[];
 
     /** Creates a new StdioTransportDiagnostics instance. */
@@ -3595,7 +3591,7 @@ export class TerminalSessionInfo {
     "containerID"?: string;
     "projectID"?: string;
     "isRoot": boolean;
-    "createdAt": time$0.Time;
+    "createdAt": string;
 
     /** Creates a new TerminalSessionInfo instance. */
     constructor($$source: Partial<TerminalSessionInfo> = {}) {
@@ -3615,7 +3611,7 @@ export class TerminalSessionInfo {
             this["isRoot"] = false;
         }
         if (!("createdAt" in $$source)) {
-            this["createdAt"] = null;
+            this["createdAt"] = "0001-01-01T00:00:00.000Z";
         }
 
         Object.assign(this, $$source);
@@ -3631,17 +3627,17 @@ export class TerminalSessionInfo {
 }
 
 export class TimeRange {
-    "from": time$0.Time;
-    "to": time$0.Time;
+    "from": string;
+    "to": string;
     "step"?: string;
 
     /** Creates a new TimeRange instance. */
     constructor($$source: Partial<TimeRange> = {}) {
         if (!("from" in $$source)) {
-            this["from"] = null;
+            this["from"] = "0001-01-01T00:00:00.000Z";
         }
         if (!("to" in $$source)) {
-            this["to"] = null;
+            this["to"] = "0001-01-01T00:00:00.000Z";
         }
 
         Object.assign(this, $$source);
@@ -3747,8 +3743,8 @@ export class UpdateHistoryItem {
     "service"?: string;
     "kind": UpdateKind;
     "result": string;
-    "startedAt": time$0.Time;
-    "finishedAt"?: time$0.Time;
+    "startedAt": string;
+    "finishedAt"?: string;
     "rollbackStatus"?: string;
     "error"?: string;
 
@@ -3767,7 +3763,7 @@ export class UpdateHistoryItem {
             this["result"] = "";
         }
         if (!("startedAt" in $$source)) {
-            this["startedAt"] = null;
+            this["startedAt"] = "0001-01-01T00:00:00.000Z";
         }
 
         Object.assign(this, $$source);

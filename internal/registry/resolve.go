@@ -519,10 +519,10 @@ func retryAfterFromError(err error) time.Duration {
 	if err == nil || !apperror.IsCode(err, apperror.RegistryRateLimit) {
 		return 0
 	}
-	var withRetryAfter interface {
+	if withRetryAfter, ok := errors.AsType[interface {
+		error
 		RetryAfter() time.Duration
-	}
-	if errors.As(err, &withRetryAfter) {
+	}](err); ok {
 		return withRetryAfter.RetryAfter()
 	}
 	return 0

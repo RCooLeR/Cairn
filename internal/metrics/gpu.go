@@ -336,7 +336,7 @@ func annotateNVIDIAProcessContainers(ctx context.Context, runner backendCommandR
 
 func parseNVIDIAProcessContainers(output string) map[int]string {
 	containers := map[int]string{}
-	for _, line := range strings.Split(output, "\n") {
+	for line := range strings.SplitSeq(output, "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 2 {
 			continue

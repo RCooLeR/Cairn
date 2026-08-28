@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 
 import { X } from "lucide-react";
-import { useEffect, useId, useRef } from "react";
+import { useEffect, useEffectEvent, useId, useRef } from "react";
 
 import { Button } from "./Button";
 import { cx } from "./utils";
@@ -49,14 +49,15 @@ export function Modal({
   title,
 }: ModalProps) {
   const panelRef = useRef<HTMLElement>(null);
-  const busyRef = useRef(busy);
-  const onCloseRef = useRef(onClose);
   const titleID = useId();
-
-  useEffect(() => {
-    busyRef.current = busy;
-    onCloseRef.current = onClose;
-  }, [busy, onClose]);
+  const closeOnEscape = useEffectEvent((event: KeyboardEvent) => {
+    if (busy) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    onClose();
+  });
 
   useEffect(() => {
     if (!open) {
@@ -71,10 +72,8 @@ export function Modal({
     (initialFocus ?? panelRef.current)?.focus();
 
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !busyRef.current) {
-        event.preventDefault();
-        event.stopPropagation();
-        onCloseRef.current();
+      if (event.key === "Escape") {
+        closeOnEscape(event);
         return;
       }
       if (event.key !== "Tab" || !panelRef.current) {

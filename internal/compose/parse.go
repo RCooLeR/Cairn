@@ -10,7 +10,7 @@ import (
 	"strings"
 
 	"github.com/RCooLeR/Cairn/internal/models"
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 var versionPattern = regexp.MustCompile(`v?([0-9]+(?:\.[0-9]+){1,2})`)

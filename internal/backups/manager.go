@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"uuid"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/bus"
@@ -24,7 +25,6 @@ import (
 	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/store"
-	"github.com/google/uuid"
 )
 
 const (
@@ -192,7 +192,7 @@ func NewManager(providers ProviderResolver, docker DockerClient, settings *store
 		Audit:          audit,
 		Events:         events,
 		Now:            func() time.Time { return time.Now().UTC() },
-		NewID:          uuid.NewString,
+		NewID:          func() string { return uuid.New().String() },
 		Version:        version,
 		AvailableBytes: defaultAvailableBytes,
 		plans:          map[string]planRecord{},
@@ -766,7 +766,7 @@ func (m *Manager) runBackup(ctx context.Context, jobID string, record planRecord
 		return err
 	}
 	duration := time.Since(started)
-	m.publishProgress(jobID, "backup", "Volume backup complete", floatPtr(100))
+	m.publishProgress(jobID, "backup", "Volume backup complete", new(100.0))
 	_ = m.recordAudit(ctx, "backup.volume", "volume", record.VolumeName, record.ProviderID, record.ProjectID, command, record.Plan.Risk, "success", duration, nil)
 	m.publishDone(jobID, record.ArchivePath, nil)
 	return nil
@@ -868,7 +868,7 @@ func (m *Manager) runRestore(ctx context.Context, jobID string, record planRecor
 		return
 	}
 	duration := time.Since(started)
-	m.publishProgress(jobID, "restore", "Volume restore complete", floatPtr(100))
+	m.publishProgress(jobID, "restore", "Volume restore complete", new(100.0))
 	m.publishVolumeChanged(record.TargetVolumeName)
 	_ = m.recordAudit(ctx, "backup.restore", "volume", record.TargetVolumeName, record.ProviderID, record.ProjectID, command, record.Plan.Risk, "success", duration, nil)
 	m.publishDone(jobID, record.TargetVolumeName, nil)
@@ -1098,10 +1098,7 @@ func (m *Manager) savePlan(record planRecord) error {
 	}
 	m.planGeneration++
 	record.generation = m.planGeneration
-	delay := record.Plan.ExpiresAt.Sub(now)
-	if delay < 0 {
-		delay = 0
-	}
+	delay := max(record.Plan.ExpiresAt.Sub(now), 0)
 	generation := record.generation
 	planID := record.Plan.PlanID
 	record.expiryTimer = time.AfterFunc(delay, func() {
@@ -1382,7 +1379,7 @@ func (m *Manager) now() time.Time {
 
 func (m *Manager) newID() string {
 	if m.NewID == nil {
-		return uuid.NewString()
+		return uuid.New().String()
 	}
 	return m.NewID()
 }
@@ -1563,7 +1560,7 @@ func reserveBackupPaths(dir string, volumeName string, ts time.Time, owner strin
 		return backupReservation{}, apperror.New(apperror.Internal, "Backup reservation owner is invalid")
 	}
 	stamp := ts.UTC().Format(backupTimestampLayout)
-	for i := 0; i < maxBackupPathAttempts; i++ {
+	for i := range maxBackupPathAttempts {
 		suffix := ""
 		if i > 0 {
 			suffix = fmt.Sprintf("-%d", i+1)
@@ -2117,8 +2114,8 @@ func sanitizeFilename(value string) string {
 }
 
 func metadataPathForArchive(archivePath string) string {
-	if strings.HasSuffix(archivePath, ".tar.gz") {
-		return strings.TrimSuffix(archivePath, ".tar.gz") + ".json"
+	if before, ok := strings.CutSuffix(archivePath, ".tar.gz"); ok {
+		return before + ".json"
 	}
 	return archivePath + ".json"
 }
@@ -2579,10 +2576,6 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
-}
-
-func floatPtr(value float64) *float64 {
-	return &value
 }
 
 func notReady() error {

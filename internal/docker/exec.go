@@ -10,9 +10,8 @@ import (
 	"strings"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
-	dockertypes "github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/pkg/stdcopy"
+	"github.com/moby/moby/api/pkg/stdcopy"
+	dockerclient "github.com/moby/moby/client"
 )
 
 type ExecOptions struct {
@@ -35,7 +34,7 @@ type ExecInspect struct {
 
 type ExecSession struct {
 	ID     string
-	hijack dockertypes.HijackedResponse
+	hijack dockerclient.HijackedResponse
 }
 
 func (s *ExecSession) Read(p []byte) (int, error) {
@@ -68,30 +67,30 @@ func (c *Client) OpenContainerExec(ctx context.Context, containerID string, opts
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
 
-	resp, err := api.ContainerExecCreate(callCtx, containerID, container.ExecOptions{
+	resp, err := api.ExecCreate(callCtx, containerID, dockerclient.ExecCreateOptions{
 		User:         opts.User,
 		AttachStdin:  true,
 		AttachStdout: true,
 		AttachStderr: true,
-		Tty:          opts.TTY,
+		TTY:          opts.TTY,
 		Cmd:          opts.Cmd,
 		Env:          envSlice(opts.Env),
 		WorkingDir:   opts.WorkingDir,
-		ConsoleSize:  consoleSize(opts.Cols, opts.Rows),
+		ConsoleSize:  consoleSize(opts.TTY, opts.Cols, opts.Rows),
 	})
 	if err != nil {
 		return nil, mapDockerError("create container exec", err)
 	}
 
 	attachCtx := context.WithoutCancel(ctx)
-	hijack, err := api.ContainerExecAttach(attachCtx, resp.ID, container.ExecAttachOptions{
-		Tty:         opts.TTY,
-		ConsoleSize: consoleSize(opts.Cols, opts.Rows),
+	hijack, err := api.ExecAttach(attachCtx, resp.ID, dockerclient.ExecAttachOptions{
+		TTY:         opts.TTY,
+		ConsoleSize: consoleSize(opts.TTY, opts.Cols, opts.Rows),
 	})
 	if err != nil {
 		return nil, mapDockerError("attach container exec", err)
 	}
-	return &ExecSession{ID: resp.ID, hijack: hijack}, nil
+	return &ExecSession{ID: resp.ID, hijack: hijack.HijackedResponse}, nil
 }
 
 func (c *Client) RunContainerExec(ctx context.Context, containerID string, opts ExecOptions) (string, int, error) {
@@ -102,11 +101,11 @@ func (c *Client) RunContainerExec(ctx context.Context, containerID string, opts 
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
 
-	resp, err := api.ContainerExecCreate(callCtx, containerID, container.ExecOptions{
+	resp, err := api.ExecCreate(callCtx, containerID, dockerclient.ExecCreateOptions{
 		User:         opts.User,
 		AttachStdout: true,
 		AttachStderr: true,
-		Tty:          opts.TTY,
+		TTY:          opts.TTY,
 		Cmd:          opts.Cmd,
 		Env:          envSlice(opts.Env),
 		WorkingDir:   opts.WorkingDir,
@@ -114,7 +113,7 @@ func (c *Client) RunContainerExec(ctx context.Context, containerID string, opts 
 	if err != nil {
 		return "", -1, mapDockerError("create container exec", err)
 	}
-	hijack, err := api.ContainerExecAttach(callCtx, resp.ID, container.ExecAttachOptions{Tty: opts.TTY})
+	hijack, err := api.ExecAttach(callCtx, resp.ID, dockerclient.ExecAttachOptions{TTY: opts.TTY})
 	if err != nil {
 		return "", -1, mapDockerError("attach container exec", err)
 	}
@@ -131,7 +130,7 @@ func (c *Client) RunContainerExec(ctx context.Context, containerID string, opts 
 	if err != nil && !isExpectedExecClose(err) {
 		return out.String(), -1, mapDockerError("read container exec", err)
 	}
-	inspect, err := api.ContainerExecInspect(callCtx, resp.ID)
+	inspect, err := api.ExecInspect(callCtx, resp.ID, dockerclient.ExecInspectOptions{})
 	if err != nil {
 		return out.String(), -1, mapDockerError("inspect container exec", err)
 	}
@@ -151,7 +150,7 @@ func (c *Client) ResizeContainerExec(ctx context.Context, execID string, cols in
 	}
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	if err := api.ContainerExecResize(callCtx, execID, container.ResizeOptions{Width: uint(cols), Height: uint(rows)}); err != nil {
+	if _, err := api.ExecResize(callCtx, execID, dockerclient.ExecResizeOptions{Width: uint(cols), Height: uint(rows)}); err != nil {
 		return mapDockerError("resize container exec", err)
 	}
 	return nil
@@ -164,16 +163,16 @@ func (c *Client) InspectContainerExec(ctx context.Context, execID string) (*Exec
 	}
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	inspect, err := api.ContainerExecInspect(callCtx, execID)
+	inspect, err := api.ExecInspect(callCtx, execID, dockerclient.ExecInspectOptions{})
 	if err != nil {
 		return nil, mapDockerError("inspect container exec", err)
 	}
 	return &ExecInspect{
-		ID:          inspect.ExecID,
+		ID:          inspect.ID,
 		ContainerID: inspect.ContainerID,
 		Running:     inspect.Running,
 		ExitCode:    inspect.ExitCode,
-		PID:         inspect.Pid,
+		PID:         inspect.PID,
 	}, nil
 }
 
@@ -256,9 +255,9 @@ func envSlice(env map[string]string) []string {
 	return out
 }
 
-func consoleSize(cols int, rows int) *[2]uint {
-	if cols <= 0 && rows <= 0 {
-		return nil
+func consoleSize(tty bool, cols int, rows int) dockerclient.ConsoleSize {
+	if !tty || cols <= 0 && rows <= 0 {
+		return dockerclient.ConsoleSize{}
 	}
 	if cols <= 0 {
 		cols = 120
@@ -266,5 +265,5 @@ func consoleSize(cols int, rows int) *[2]uint {
 	if rows <= 0 {
 		rows = 30
 	}
-	return &[2]uint{uint(rows), uint(cols)}
+	return dockerclient.ConsoleSize{Height: uint(rows), Width: uint(cols)}
 }

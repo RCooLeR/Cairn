@@ -8,18 +8,19 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+	"uuid"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/bus"
 	dockercore "github.com/RCooLeR/Cairn/internal/docker"
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/store"
-	"github.com/docker/docker/api/types/container"
-	"github.com/google/uuid"
+	"github.com/moby/moby/api/types/container"
 )
 
 const (
@@ -131,7 +132,7 @@ func (m *Manager) StartStatsStream(ctx context.Context, scope models.StatsScope)
 			apperror.WithDetail("Stop an existing metrics stream before starting another."),
 		)
 	}
-	streamID := uuid.NewString()
+	streamID := uuid.New().String()
 	session := newStreamSession(m, m.ctx, streamID, scope)
 	m.sessions[streamID] = session
 	m.wg.Add(1)
@@ -524,10 +525,7 @@ func (m *Manager) buildSample(containerID string, raw container.StatsResponse) (
 		startedAt = summary.CreatedAt
 	}
 	if !startedAt.IsZero() {
-		uptime = int64(raw.Read.Sub(startedAt).Seconds())
-		if uptime < 0 {
-			uptime = 0
-		}
+		uptime = max(int64(raw.Read.Sub(startedAt).Seconds()), 0)
 	}
 
 	return Sample{
@@ -1308,15 +1306,7 @@ func serviceNameOnly(value string) string {
 }
 
 func contains(values []string, target string) bool {
-	if target == "" {
-		return false
-	}
-	for _, value := range values {
-		if value == target {
-			return true
-		}
-	}
-	return false
+	return target != "" && slices.Contains(values, target)
 }
 
 func sleepContext(ctx context.Context, duration time.Duration) {

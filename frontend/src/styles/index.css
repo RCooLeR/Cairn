@@ -1,6 +1,27 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
+
+@theme inline {
+  --color-bg-app: rgb(var(--bg-app) / 1);
+  --color-bg-panel: rgb(var(--bg-panel) / 1);
+  --color-bg-card: rgb(var(--bg-card) / 1);
+  --color-bg-inset: rgb(var(--bg-inset) / 1);
+  --color-terminal-bg: rgb(var(--terminal-bg) / 1);
+  --color-border: rgb(var(--border) / 0.08);
+  --color-border-strong: rgb(var(--border-strong) / 0.18);
+  --color-text-primary: rgb(var(--text-primary) / 1);
+  --color-text-secondary: rgb(var(--text-secondary) / 1);
+  --color-text-muted: rgb(var(--text-muted) / 1);
+  --color-accent: rgb(var(--accent) / 1);
+  --color-ok: rgb(var(--ok) / 1);
+  --color-warn: rgb(var(--warn) / 1);
+  --color-error: rgb(var(--error) / 1);
+  --color-info: rgb(var(--info) / 1);
+  --color-neutral: rgb(var(--neutral) / 1);
+  --radius-card: 12px;
+  --radius-control: 8px;
+  --font-mono:
+    "JetBrains Mono", ui-monospace, SFMono-Regular, Consolas, monospace;
+}
 
 :root {
   --bg-app: 13 17 23;

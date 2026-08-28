@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -767,10 +769,8 @@ func statusFromStates(running int, total int, states []string) models.ProjectSta
 }
 
 func projectStatusFromServices(statuses []models.ProjectStatus, running int, total int) models.ProjectStatus {
-	for _, status := range statuses {
-		if status == models.ProjectStatusError {
-			return models.ProjectStatusError
-		}
+	if slices.Contains(statuses, models.ProjectStatusError) {
+		return models.ProjectStatusError
 	}
 	switch {
 	case total == 0:
@@ -862,9 +862,7 @@ func cloneMeta(metadata map[string]any) map[string]any {
 		return map[string]any{}
 	}
 	out := make(map[string]any, len(metadata))
-	for key, value := range metadata {
-		out[key] = value
-	}
+	maps.Copy(out, metadata)
 	return out
 }
 
@@ -880,10 +878,8 @@ func appendStringMeta(value any, item string) []string {
 			}
 		}
 	}
-	for _, existing := range out {
-		if existing == item {
-			return out
-		}
+	if slices.Contains(out, item) {
+		return out
 	}
 	return append(out, item)
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -424,8 +425,8 @@ func (r *ProjectRepository) beginProjectDeletion(ctx context.Context, providerID
 }
 
 func releaseProjectDeletions(releases []func()) {
-	for i := len(releases) - 1; i >= 0; i-- {
-		releases[i]()
+	for _, release := range slices.Backward(releases) {
+		release()
 	}
 }
 

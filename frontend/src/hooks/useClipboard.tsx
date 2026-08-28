@@ -69,11 +69,7 @@ export function ClipboardProvider({
   children: ReactNode;
   copyText: CopyText;
 }) {
-  return (
-    <ClipboardContext.Provider value={copyText}>
-      {children}
-    </ClipboardContext.Provider>
-  );
+  return <ClipboardContext value={copyText}>{children}</ClipboardContext>;
 }
 
 export function useClipboard(onFeedback?: ClipboardFeedbackHandler): CopyText {

@@ -142,10 +142,7 @@ func pageLines(lines []models.LogLine, cursor string, limit int) models.LogPage 
 	if start >= len(lines) {
 		return models.LogPage{Lines: []models.LogLine{}}
 	}
-	end := start + limit
-	if end > len(lines) {
-		end = len(lines)
-	}
+	end := min(start+limit, len(lines))
 	page := models.LogPage{Lines: append([]models.LogLine(nil), lines[start:end]...)}
 	if end < len(lines) && len(page.Lines) > 0 {
 		page.NextCursor = encodeCursor(page.Lines[len(page.Lines)-1])

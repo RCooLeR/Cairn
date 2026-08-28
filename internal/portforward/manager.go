@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"sort"
 	"strconv"
@@ -209,9 +210,7 @@ func (m *Manager) reconcileOnce(ctx context.Context) {
 	m.mu.Lock()
 	enabled := m.enabled
 	current := make(map[string]*forward, len(m.forwards))
-	for key, fwd := range m.forwards {
-		current[key] = fwd
-	}
+	maps.Copy(current, m.forwards)
 	m.mu.Unlock()
 
 	desired := map[string]spec{}
@@ -324,12 +323,10 @@ func (m *Manager) serveTCP(ctx context.Context, fwd *forward, listener net.Liste
 			return
 		}
 		fwd.track(conn)
-		fwd.wg.Add(1)
-		go func() {
-			defer fwd.wg.Done()
+		fwd.wg.Go(func() {
 			defer fwd.untrack(conn)
 			m.relayTCP(ctx, fwd, conn)
-		}()
+		})
 	}
 }
 

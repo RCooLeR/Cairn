@@ -244,12 +244,12 @@ func (s *ProjectService) ImportProject(ctx context.Context, req models.ImportPro
 		s.publishImportJobDone(jobID, projectID, "", err)
 		return nil, err
 	}
-	s.publishImportJobProgress(jobID, projectID, "open", "Opening project directory", progressPct(5))
+	s.publishImportJobProgress(jobID, projectID, "open", "Opening project directory", new(5.0))
 	workdir, files, err := resolveImportFiles(req)
 	if err != nil {
 		return fail(safeComposeRendererError(err, nil, "Resolve Compose project files failed"))
 	}
-	s.publishImportJobProgress(jobID, projectID, "open", "Found "+strconv.Itoa(len(files))+" Compose file(s)", progressPct(20))
+	s.publishImportJobProgress(jobID, projectID, "open", "Found "+strconv.Itoa(len(files))+" Compose file(s)", new(20.0))
 	projectName := composecore.NormalizeProjectName(filepath.Base(workdir))
 	if projectName == "" {
 		projectName = "project"
@@ -260,7 +260,7 @@ func (s *ProjectService) ImportProject(ctx context.Context, req models.ImportPro
 		Files:       files,
 		ProjectName: projectName,
 	}
-	s.publishImportJobProgress(jobID, projectID, "review", "Reviewing Compose YAML", progressPct(35))
+	s.publishImportJobProgress(jobID, projectID, "review", "Reviewing Compose YAML", new(35.0))
 	config, _, err := runVerifiedComposeConfig(ctx, s.Client, importOpts)
 	if err != nil || config == nil {
 		var details []string
@@ -269,7 +269,7 @@ func (s *ProjectService) ImportProject(ctx context.Context, req models.ImportPro
 		}
 		return fail(safeComposeRendererError(err, details, "Compose project validation failed"))
 	}
-	s.publishImportJobProgress(jobID, projectID, "review", "Compose YAML valid: "+strconv.Itoa(len(config.Services))+" service(s)", progressPct(55))
+	s.publishImportJobProgress(jobID, projectID, "review", "Compose YAML valid: "+strconv.Itoa(len(config.Services))+" service(s)", new(55.0))
 
 	now := s.now()
 	project := store.ProjectRecord{
@@ -310,7 +310,7 @@ func (s *ProjectService) ImportProject(ctx context.Context, req models.ImportPro
 		}
 		return fail(apperror.Wrap(apperror.Internal, "Import project failed", err))
 	}
-	s.publishImportJobProgress(jobID, projectID, "save", "Project saved", progressPct(100))
+	s.publishImportJobProgress(jobID, projectID, "save", "Project saved", new(100.0))
 	detail, err := s.getProject(ctx, projectID)
 	if err != nil {
 		return fail(err)
@@ -1630,13 +1630,9 @@ func (s *ProjectService) projectPlanStore() *security.ProjectPlanStore {
 	return s.Plans
 }
 
-func progressPct(value float64) *float64 {
-	return &value
-}
-
 func splitOutputLines(output string) []string {
 	lines := []string{}
-	for _, line := range strings.Split(output, "\n") {
+	for line := range strings.SplitSeq(output, "\n") {
 		line = strings.TrimRight(line, "\r")
 		if strings.TrimSpace(line) != "" {
 			lines = append(lines, line)

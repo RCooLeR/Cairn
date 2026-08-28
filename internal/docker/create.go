@@ -7,13 +7,14 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
 	"strings"
+	"uuid"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/bus"
@@ -23,14 +24,10 @@ import (
 	"github.com/RCooLeR/Cairn/internal/security"
 	"github.com/RCooLeR/Cairn/internal/store"
 	cerrdefs "github.com/containerd/errdefs"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/image"
-	dockermount "github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/api/types/registry"
-	"github.com/docker/docker/api/types/volume"
-	"github.com/docker/go-connections/nat"
-	"github.com/google/uuid"
+	"github.com/moby/moby/api/types/container"
+	dockermount "github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/api/types/network"
+	dockerclient "github.com/moby/moby/client"
 )
 
 const (
@@ -105,7 +102,7 @@ func (c *Client) TagImage(ctx context.Context, imageID string, newRef string) er
 	}
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	if err := api.ImageTag(callCtx, imageID, ref.Normalized); err != nil {
+	if _, err := api.ImageTag(callCtx, dockerclient.ImageTagOptions{Source: imageID, Target: ref.Normalized}); err != nil {
 		return mapDockerError("tag image", err)
 	}
 	c.publishImageChanged(imageID)
@@ -166,11 +163,16 @@ func (c *Client) RunImage(ctx context.Context, req models.RunImageRequest) (stri
 	if err != nil {
 		return "", err
 	}
-	created, err := api.ContainerCreate(ctx, config, hostConfig, networkingConfig, nil, req.Name)
+	created, err := api.ContainerCreate(ctx, dockerclient.ContainerCreateOptions{
+		Config:           config,
+		HostConfig:       hostConfig,
+		NetworkingConfig: networkingConfig,
+		Name:             req.Name,
+	})
 	if err != nil {
 		return "", mapDockerError("create container", err)
 	}
-	if err := api.ContainerStart(ctx, created.ID, container.StartOptions{}); err != nil {
+	if _, err := api.ContainerStart(ctx, created.ID, dockerclient.ContainerStartOptions{}); err != nil {
 		return c.handleContainerStartFailure(ctx, api, created.ID, err)
 	}
 	c.publishContainerChanged(created.ID)
@@ -182,16 +184,16 @@ func (c *Client) handleContainerStartFailure(ctx context.Context, api APIClient,
 	cleanupCtx, cancel := c.withTimeout(context.WithoutCancel(ctx))
 	defer cancel()
 
-	inspect, _, inspectErr := api.ContainerInspectWithRaw(cleanupCtx, containerID, false)
+	inspect, inspectErr := api.ContainerInspect(cleanupCtx, containerID, dockerclient.ContainerInspectOptions{})
 	if cerrdefs.IsNotFound(inspectErr) {
 		// Another actor already removed the just-created container. The desired
 		// rollback state is satisfied even though the original start still failed.
 		c.publishContainerChanged(containerID)
 		return "", startErr
 	}
-	state := inspectedContainerState(inspect)
+	state := inspectedContainerState(inspect.Container)
 	if inspectErr == nil && state == "created" {
-		cleanupErr := api.ContainerRemove(cleanupCtx, containerID, container.RemoveOptions{RemoveVolumes: true})
+		_, cleanupErr := api.ContainerRemove(cleanupCtx, containerID, dockerclient.ContainerRemoveOptions{RemoveVolumes: true})
 		c.publishContainerChanged(containerID)
 		if cleanupErr == nil || cerrdefs.IsNotFound(cleanupErr) {
 			return "", startErr
@@ -219,10 +221,10 @@ func (c *Client) handleContainerStartFailure(ctx context.Context, api APIClient,
 }
 
 func inspectedContainerState(inspect container.InspectResponse) string {
-	if inspect.ContainerJSONBase == nil || inspect.State == nil {
+	if inspect.State == nil {
 		return "unknown"
 	}
-	state := strings.ToLower(strings.TrimSpace(inspect.State.Status))
+	state := strings.ToLower(strings.TrimSpace(string(inspect.State.Status)))
 	if state == "" {
 		return "unknown"
 	}
@@ -258,7 +260,7 @@ func (c *Client) RenameContainer(ctx context.Context, id string, newName string)
 	}
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	if err := api.ContainerRename(callCtx, id, name); err != nil {
+	if _, err := api.ContainerRename(callCtx, id, dockerclient.ContainerRenameOptions{NewName: name}); err != nil {
 		return mapDockerError("rename container", err)
 	}
 	c.publishContainerChanged(id)
@@ -333,7 +335,7 @@ func (c *Client) SaveImage(ctx context.Context, imageRefs []string, destPath str
 		c.publishJobDone(jobID, result, err)
 		return jobID, err
 	}
-	c.publishJobProgress(jobID, "save", "Image archive saved", floatPtr(100))
+	c.publishJobProgress(jobID, "save", "Image archive saved", new(100.0))
 	c.publishJobDone(jobID, path, nil)
 	return jobID, nil
 }
@@ -386,10 +388,10 @@ func (c *Client) LoadImage(ctx context.Context, srcPath string) (string, error) 
 
 	var outcome imageLoadResponseOutcome
 	var responseErr error
-	if response.Body != nil {
+	if response != nil {
 		var decodeErr error
-		outcome, decodeErr = decodeImageLoadResponse(response.Body)
-		responseCloseErr := response.Body.Close()
+		outcome, decodeErr = decodeImageLoadResponse(response)
+		responseCloseErr := response.Close()
 		if responseCloseErr != nil {
 			responseCloseErr = apperror.Wrap(apperror.Internal, "Close image load response failed", responseCloseErr)
 		}
@@ -414,7 +416,7 @@ func (c *Client) LoadImage(ctx context.Context, srcPath string) (string, error) 
 		c.publishJobDone(jobID, result, actionErr)
 		return jobID, actionErr
 	}
-	c.publishJobProgress(jobID, "load", "Image archive loaded", floatPtr(100))
+	c.publishJobProgress(jobID, "load", "Image archive loaded", new(100.0))
 	c.publishJobDone(jobID, outcome.Result, nil)
 	return jobID, nil
 }
@@ -678,8 +680,8 @@ func imageLoadCompletion(stream string) (string, bool) {
 	for line := range strings.Lines(stream) {
 		line = strings.TrimSpace(line)
 		for _, prefix := range []string{"Loaded image:", "Loaded image ID:"} {
-			if strings.HasPrefix(line, prefix) {
-				imageID := strings.TrimSpace(strings.TrimPrefix(line, prefix))
+			if after, ok := strings.CutPrefix(line, prefix); ok {
+				imageID := strings.TrimSpace(after)
 				if imageID != "" {
 					return imageID, true
 				}
@@ -735,12 +737,12 @@ func (c *Client) SearchHub(ctx context.Context, query string, limit int) ([]mode
 	}
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	results, err := api.ImageSearch(callCtx, term, registry.SearchOptions{Limit: limit})
+	results, err := api.ImageSearch(callCtx, term, dockerclient.ImageSearchOptions{Limit: limit})
 	if err != nil {
 		return nil, mapDockerError("search Docker Hub", err)
 	}
-	out := make([]models.HubSearchResult, 0, len(results))
-	for _, result := range results {
+	out := make([]models.HubSearchResult, 0, len(results.Items))
+	for _, result := range results.Items {
 		out = append(out, models.HubSearchResult{
 			Name:        result.Name,
 			Description: result.Description,
@@ -770,7 +772,7 @@ func (c *Client) CreateVolume(ctx context.Context, req models.CreateVolumeReques
 	}
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	raw, err := api.VolumeCreate(callCtx, volume.CreateOptions{
+	created, err := api.VolumeCreate(callCtx, dockerclient.VolumeCreateOptions{
 		Name:       req.Name,
 		Driver:     req.Driver,
 		DriverOpts: req.DriverOpts,
@@ -779,6 +781,7 @@ func (c *Client) CreateVolume(ctx context.Context, req models.CreateVolumeReques
 	if err != nil {
 		return nil, mapDockerError("create volume", err)
 	}
+	raw := created.Volume
 	summary := mapVolumeSummary(raw)
 	if err := c.saveVolumes(ctx, []store.VolumeCacheRecord{{
 		Summary:   summary,
@@ -814,7 +817,7 @@ func (c *Client) CreateNetwork(ctx context.Context, req models.CreateNetworkRequ
 	}
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	created, err := api.NetworkCreate(callCtx, req.Name, network.CreateOptions{
+	created, err := api.NetworkCreate(callCtx, req.Name, dockerclient.NetworkCreateOptions{
 		Driver:     req.Driver,
 		IPAM:       ipam,
 		Internal:   req.Internal,
@@ -824,12 +827,13 @@ func (c *Client) CreateNetwork(ctx context.Context, req models.CreateNetworkRequ
 	if err != nil {
 		return nil, mapDockerError("create network", err)
 	}
-	raw, _, err := api.NetworkInspectWithRaw(callCtx, created.ID, network.InspectOptions{})
+	inspected, err := api.NetworkInspect(callCtx, created.ID, dockerclient.NetworkInspectOptions{})
 	if err != nil {
 		return nil, mapDockerError("inspect created network", err)
 	}
-	summary := mapNetworkSummary(raw)
-	subnet, gateway := networkIPAM(raw)
+	raw := inspected.Network
+	summary := mapNetworkInspectSummary(raw)
+	subnet, gateway := networkIPAM(raw.Network)
 	if err := c.saveNetworks(ctx, []store.NetworkCacheRecord{{
 		Summary:    summary,
 		Subnet:     subnet,
@@ -844,7 +848,7 @@ func (c *Client) CreateNetwork(ctx context.Context, req models.CreateNetworkRequ
 
 func (c *Client) ensureImagePresent(ctx context.Context, api APIClient, imageRef string, pullIfMissing bool) error {
 	callCtx, cancel := c.withTimeout(ctx)
-	_, _, err := api.ImageInspectWithRaw(callCtx, imageRef)
+	_, err := api.ImageInspect(callCtx, imageRef)
 	cancel()
 	if err == nil {
 		return nil
@@ -869,7 +873,7 @@ func (c *Client) ensureImagePresent(ctx context.Context, api APIClient, imageRef
 func (c *Client) validateContainerNameAvailable(ctx context.Context, api APIClient, name string) error {
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	_, _, err := api.ContainerInspectWithRaw(callCtx, name, false)
+	_, err := api.ContainerInspect(callCtx, name, dockerclient.ContainerInspectOptions{})
 	if err == nil {
 		return apperror.New(apperror.Conflict, "Container name is already in use", apperror.WithDetail(name))
 	}
@@ -881,38 +885,28 @@ func (c *Client) validateContainerNameAvailable(ctx context.Context, api APIClie
 
 func (c *Client) pullImage(ctx context.Context, api APIClient, imageRef string, registry string, streamID string, auth string) error {
 	c.publishImageProgress(bus.TopicImagePullProgress, streamID, "", "starting", 0, 0)
-	reader, err := api.ImagePull(ctx, imageRef, image.PullOptions{RegistryAuth: auth})
+	reader, err := api.ImagePull(ctx, imageRef, dockerclient.ImagePullOptions{RegistryAuth: auth})
 	if err != nil {
 		return mapRegistryPullError(registry, err)
 	}
-	defer func() {
-		_ = reader.Close()
-	}()
-	decoder := json.NewDecoder(reader)
-	for {
-		var message struct {
-			ID             string `json:"id"`
-			Status         string `json:"status"`
-			ErrorMessage   string `json:"error"`
-			ProgressDetail struct {
-				Current int64 `json:"current"`
-				Total   int64 `json:"total"`
-			} `json:"progressDetail"`
-		}
-		if err := decoder.Decode(&message); err != nil {
-			if err == io.EOF {
-				break
-			}
+	for message, err := range reader.JSONMessages(ctx) {
+		if err != nil {
 			return mapDockerError("read pull progress", err)
 		}
-		if message.ErrorMessage != "" {
-			return registryPullStreamError(registry, message.ErrorMessage)
+		if message.Error != nil {
+			return registryPullStreamError(registry, message.Error.Message)
 		}
 		status := message.Status
 		if status == "" {
 			status = "progress"
 		}
-		c.publishImageProgress(bus.TopicImagePullProgress, streamID, message.ID, status, message.ProgressDetail.Current, message.ProgressDetail.Total)
+		var current int64
+		var total int64
+		if message.Progress != nil {
+			current = message.Progress.Current
+			total = message.Progress.Total
+		}
+		c.publishImageProgress(bus.TopicImagePullProgress, streamID, message.ID, status, current, total)
 	}
 	c.publishImageProgress(bus.TopicImagePullProgress, streamID, "", "done", 0, 0)
 	return nil
@@ -931,61 +925,51 @@ func (c *Client) registryAuthFor(ctx context.Context, registry string) (string, 
 
 func (c *Client) pushImage(ctx context.Context, api APIClient, imageRef string, registry string, streamID string, auth string) error {
 	c.publishImageProgress(bus.TopicImagePushProgress, streamID, "", "starting", 0, 0)
-	reader, err := api.ImagePush(ctx, imageRef, image.PushOptions{RegistryAuth: auth})
+	reader, err := api.ImagePush(ctx, imageRef, dockerclient.ImagePushOptions{RegistryAuth: auth})
 	if err != nil {
 		return mapRegistryPushError(registry, err)
 	}
-	defer func() {
-		_ = reader.Close()
-	}()
-	decoder := json.NewDecoder(reader)
-	for {
-		var message struct {
-			ID           string `json:"id"`
-			Status       string `json:"status"`
-			ErrorMessage string `json:"error"`
-			ErrorDetail  struct {
-				Message string `json:"message"`
-			} `json:"errorDetail"`
-			ProgressDetail struct {
-				Current int64 `json:"current"`
-				Total   int64 `json:"total"`
-			} `json:"progressDetail"`
-		}
-		if err := decoder.Decode(&message); err != nil {
-			if err == io.EOF {
-				break
-			}
+	for message, err := range reader.JSONMessages(ctx) {
+		if err != nil {
 			return mapDockerError("read push progress", err)
 		}
-		if message.ErrorMessage != "" || message.ErrorDetail.Message != "" {
-			detail := message.ErrorMessage
-			if detail == "" {
-				detail = message.ErrorDetail.Message
-			}
-			return registryPushStreamError(registry, detail)
+		if message.Error != nil {
+			return registryPushStreamError(registry, message.Error.Message)
 		}
 		status := message.Status
 		if status == "" {
 			status = "progress"
 		}
-		c.publishImageProgress(bus.TopicImagePushProgress, streamID, message.ID, status, message.ProgressDetail.Current, message.ProgressDetail.Total)
+		var current int64
+		var total int64
+		if message.Progress != nil {
+			current = message.Progress.Current
+			total = message.Progress.Total
+		}
+		c.publishImageProgress(bus.TopicImagePushProgress, streamID, message.ID, status, current, total)
 	}
 	c.publishImageProgress(bus.TopicImagePushProgress, streamID, "", "done", 0, 0)
 	return nil
 }
 
 func runImageConfig(req models.RunImageRequest) (*container.Config, *container.HostConfig, *network.NetworkingConfig, error) {
-	exposedPorts := nat.PortSet{}
-	portBindings := nat.PortMap{}
+	exposedPorts := network.PortSet{}
+	portBindings := network.PortMap{}
 	for _, mapping := range req.Ports {
-		port, err := nat.NewPort(protocolOrDefault(mapping.Protocol), strings.TrimSpace(mapping.ContainerPort))
+		port, err := network.ParsePort(strings.TrimSpace(mapping.ContainerPort) + "/" + protocolOrDefault(mapping.Protocol))
 		if err != nil {
 			return nil, nil, nil, apperror.Wrap(apperror.Conflict, "Invalid container port", err)
 		}
+		var hostIP netip.Addr
+		if value := strings.TrimSpace(mapping.HostIP); value != "" {
+			hostIP, err = netip.ParseAddr(value)
+			if err != nil {
+				return nil, nil, nil, apperror.Wrap(apperror.Conflict, "Invalid host IP", err)
+			}
+		}
 		exposedPorts[port] = struct{}{}
-		portBindings[port] = append(portBindings[port], nat.PortBinding{
-			HostIP:   strings.TrimSpace(mapping.HostIP),
+		portBindings[port] = append(portBindings[port], network.PortBinding{
+			HostIP:   hostIP,
 			HostPort: strings.TrimSpace(mapping.HostPort),
 		})
 	}
@@ -1094,16 +1078,18 @@ func createIPAM(subnet string, gateway string) (*network.IPAM, error) {
 	}
 	cfg := network.IPAMConfig{}
 	if subnet != "" {
-		if _, _, err := net.ParseCIDR(subnet); err != nil {
+		prefix, err := netip.ParsePrefix(subnet)
+		if err != nil {
 			return nil, apperror.Wrap(apperror.Conflict, "Invalid subnet CIDR", err)
 		}
-		cfg.Subnet = subnet
+		cfg.Subnet = prefix
 	}
 	if gateway != "" {
-		if net.ParseIP(gateway) == nil {
-			return nil, apperror.New(apperror.Conflict, "Invalid gateway IP", apperror.WithDetail(gateway))
+		address, err := netip.ParseAddr(gateway)
+		if err != nil {
+			return nil, apperror.Wrap(apperror.Conflict, "Invalid gateway IP", err, apperror.WithDetail(gateway))
 		}
-		cfg.Gateway = gateway
+		cfg.Gateway = address
 	}
 	return &network.IPAM{Config: []network.IPAMConfig{cfg}}, nil
 }
@@ -1170,7 +1156,7 @@ func cleanImageRefs(refs []string) []string {
 }
 
 func newJobID(prefix string) string {
-	return prefix + "-" + uuid.NewString()
+	return prefix + "-" + uuid.New().String()
 }
 
 func (c *Client) publishImageProgress(topic bus.Topic, streamID string, layerID string, status string, current int64, total int64) {
@@ -1210,10 +1196,6 @@ func (c *Client) publishVolumeChanged(name string) {
 
 func (c *Client) publishNetworkChanged(id string) {
 	c.publish(bus.TopicObjectsChanged, ObjectsChangedPayload{Kind: objectKindNetwork, IDs: []string{id}})
-}
-
-func floatPtr(value float64) *float64 {
-	return &value
 }
 
 func mapRegistryPushError(registry string, err error) error {

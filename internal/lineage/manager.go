@@ -479,11 +479,9 @@ func splitImageNameTag(imageRef string) (string, string) {
 	withoutDigest, _, _ := strings.Cut(imageRef, "@")
 	name := withoutDigest
 	tag := ""
-	lastColon := strings.LastIndex(withoutDigest, ":")
-	lastSlash := strings.LastIndex(withoutDigest, "/")
-	if lastColon > lastSlash {
-		name = withoutDigest[:lastColon]
-		tag = withoutDigest[lastColon+1:]
+	if taggedName, candidate, ok := strings.CutLast(withoutDigest, ":"); ok && !strings.Contains(candidate, "/") {
+		name = taggedName
+		tag = candidate
 	}
 	if name == "" {
 		name = imageRef

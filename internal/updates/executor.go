@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1554,8 +1555,8 @@ func serviceNameFromID(serviceID string, projectID string) string {
 			return service
 		}
 	}
-	if idx := strings.LastIndex(serviceID, "/"); idx >= 0 && idx < len(serviceID)-1 {
-		return serviceID[idx+1:]
+	if _, service, ok := strings.CutLast(serviceID, "/"); ok && service != "" {
+		return service
 	}
 	return serviceID
 }
@@ -1602,10 +1603,8 @@ func appendUnique(values []string, next string) []string {
 	if next == "" {
 		return values
 	}
-	for _, value := range values {
-		if value == next {
-			return values
-		}
+	if slices.Contains(values, next) {
+		return values
 	}
 	return append(values, next)
 }
@@ -1706,8 +1705,7 @@ func progress(done int, total int) *float64 {
 	if total <= 0 {
 		return nil
 	}
-	value := float64(done) / float64(total) * 100
-	return &value
+	return new(float64(done) / float64(total) * 100)
 }
 
 func auditStatus(err error) string {

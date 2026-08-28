@@ -51,7 +51,7 @@ func normalizeLocalVolumeDriverOpts(opts map[string]string) (map[string]string, 
 	if !exists {
 		return normalized, nil
 	}
-	for _, rawToken := range strings.Split(mountOptions, ",") {
+	for rawToken := range strings.SplitSeq(mountOptions, ",") {
 		token := strings.TrimSpace(rawToken)
 		if token == "" {
 			return nil, invalidLocalVolumeOptions("The local volume mount-options value contains an empty token.")

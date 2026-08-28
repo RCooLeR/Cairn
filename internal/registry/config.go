@@ -10,11 +10,11 @@ import (
 	"strings"
 	"time"
 	"unicode/utf16"
+	"uuid"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/providers"
-	"github.com/google/uuid"
 )
 
 type dockerConfigLockContextKey struct{}
@@ -163,7 +163,7 @@ func acquireBackendLock(ctx context.Context, provider providers.PlatformProvider
 	if !ok {
 		return "", apperror.New(apperror.ProviderNotReady, "Provider cannot lock backend Docker configuration")
 	}
-	token := uuid.NewString()
+	token := uuid.New().String()
 	command := backendNamedLockCommand(provider, true, name)
 	result, err := runner.RunBackendCommand(ctx, token, command...)
 	if err != nil {
@@ -198,8 +198,8 @@ func normalizeDockerConfigJSON(raw string) string {
 	if raw == "" {
 		return ""
 	}
-	if strings.HasPrefix(raw, "\ufeff") {
-		return strings.TrimSpace(strings.TrimPrefix(raw, "\ufeff"))
+	if after, ok := strings.CutPrefix(raw, "\ufeff"); ok {
+		return strings.TrimSpace(after)
 	}
 	bytes := []byte(raw)
 	if len(bytes) >= 2 && bytes[0] == 0xff && bytes[1] == 0xfe {

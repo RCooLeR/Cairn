@@ -5,9 +5,7 @@ import (
 	"strings"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
-	"github.com/docker/docker/api/types/build"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/image"
+	dockerclient "github.com/moby/moby/client"
 )
 
 func (c *Client) RemoveImage(ctx context.Context, id string, force bool) error {
@@ -21,7 +19,7 @@ func (c *Client) RemoveImage(ctx context.Context, id string, force bool) error {
 	}
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	if _, err := api.ImageRemove(callCtx, id, image.RemoveOptions{Force: force, PruneChildren: true}); err != nil {
+	if _, err := api.ImageRemove(callCtx, id, dockerclient.ImageRemoveOptions{Force: force, PruneChildren: true}); err != nil {
 		return mapDockerError("remove image", err)
 	}
 	c.publishImageChanged(id)
@@ -39,7 +37,7 @@ func (c *Client) RemoveVolume(ctx context.Context, name string, force bool) erro
 	}
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	if err := api.VolumeRemove(callCtx, name, force); err != nil {
+	if _, err := api.VolumeRemove(callCtx, name, dockerclient.VolumeRemoveOptions{Force: force}); err != nil {
 		return mapDockerError("remove volume", err)
 	}
 	c.publishVolumeChanged(name)
@@ -57,7 +55,7 @@ func (c *Client) RemoveNetwork(ctx context.Context, id string) error {
 	}
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	if err := api.NetworkRemove(callCtx, id); err != nil {
+	if _, err := api.NetworkRemove(callCtx, id, dockerclient.NetworkRemoveOptions{}); err != nil {
 		return mapDockerError("remove network", err)
 	}
 	c.publishNetworkChanged(id)
@@ -78,28 +76,28 @@ func (c *Client) Prune(ctx context.Context, kind string) error {
 	defer cancel()
 	switch kind {
 	case "images":
-		pruneFilters := filters.NewArgs(filters.Arg("dangling", "false"))
-		if _, err := api.ImagesPrune(callCtx, pruneFilters); err != nil {
+		pruneFilters := dockerclient.Filters{}.Add("dangling", "false")
+		if _, err := api.ImagePrune(callCtx, dockerclient.ImagePruneOptions{Filters: pruneFilters}); err != nil {
 			return mapDockerError("prune images", err)
 		}
 		c.publishImageChanged("")
 	case "containers":
-		if _, err := api.ContainersPrune(callCtx, filters.Args{}); err != nil {
+		if _, err := api.ContainerPrune(callCtx, dockerclient.ContainerPruneOptions{}); err != nil {
 			return mapDockerError("prune containers", err)
 		}
 		c.publishContainerChanged("")
 	case "volumes":
-		if _, err := api.VolumesPrune(callCtx, filters.Args{}); err != nil {
+		if _, err := api.VolumePrune(callCtx, dockerclient.VolumePruneOptions{}); err != nil {
 			return mapDockerError("prune volumes", err)
 		}
 		c.publishVolumeChanged("")
 	case "networks":
-		if _, err := api.NetworksPrune(callCtx, filters.Args{}); err != nil {
+		if _, err := api.NetworkPrune(callCtx, dockerclient.NetworkPruneOptions{}); err != nil {
 			return mapDockerError("prune networks", err)
 		}
 		c.publishNetworkChanged("")
 	case "build-cache":
-		if _, err := api.BuildCachePrune(callCtx, build.CachePruneOptions{}); err != nil {
+		if _, err := api.BuildCachePrune(callCtx, dockerclient.BuildCachePruneOptions{}); err != nil {
 			return mapDockerError("prune build cache", err)
 		}
 		c.publishImageChanged("")

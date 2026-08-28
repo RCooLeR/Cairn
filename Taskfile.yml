@@ -3,12 +3,13 @@ version: '3'
 vars:
   APP_NAME: "cairn"
   BIN_DIR: "bin"
-  PACKAGE_MANAGER: '{{.PACKAGE_MANAGER | default "npm"}}'
   VITE_PORT: '{{.WAILS_VITE_PORT | default 9245}}'
-  GARBLE_VERSION: "v0.17.0"
+  # Interim immutable upstream commit with Go 1.27 support; replace it with the
+  # next tagged Garble release after upstream publishes one.
+  GARBLE_VERSION: "v0.17.1-0.20260828084131-08aa939fdc4b"
   GARBLE_PACKAGE: "mvdan.cc/garble@{{.GARBLE_VERSION}}"
-  GARBLE_INSTALL_HINT: "garble is required for obfuscated builds. Install it with: go install {{.GARBLE_PACKAGE}} (requires Go 1.24+). See https://github.com/burrowers/garble/releases for version/toolchain compatibility."
-  GOLANGCI_LINT_VERSION: "v2.12.2"
+  GARBLE_INSTALL_HINT: "garble is required for obfuscated builds. Install the pinned upstream Go 1.27-compatible prerelease with: go install {{.GARBLE_PACKAGE}}. Replace this pseudo-version with the next tagged release when available."
+  GOLANGCI_LINT_VERSION: "v2.13.2"
   GOLANGCI_LINT_PACKAGE: "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@{{.GOLANGCI_LINT_VERSION}}"
 includes:
   common: ./build/Taskfile.yml
@@ -34,37 +35,37 @@ tasks:
     summary: Installs the exact frontend dependency lock
     dir: frontend
     cmds:
-      - '{{if eq .PACKAGE_MANAGER "npm"}}npm ci{{else}}{{.PACKAGE_MANAGER}} install{{end}}'
+      - npm ci
 
   frontend:lint:
     summary: Runs frontend lint
     dir: frontend
     cmds:
-      - "{{.PACKAGE_MANAGER}} run lint"
+      - npm run lint
 
   frontend:format:check:
     summary: Checks frontend formatting
     dir: frontend
     cmds:
-      - "{{.PACKAGE_MANAGER}} run format:check"
+      - npm run format:check
 
   frontend:test:
     summary: Runs frontend unit tests
     dir: frontend
     cmds:
-      - "{{.PACKAGE_MANAGER}} test"
+      - npm test
 
   frontend:build:
     summary: Builds the frontend
     dir: frontend
     cmds:
-      - "{{.PACKAGE_MANAGER}} run build"
+      - npm run build
 
   frontend:ladle:build:
     summary: Builds frontend component stories
     dir: frontend
     cmds:
-      - "{{.PACKAGE_MANAGER}} run ladle:build"
+      - npm run ladle:build
 
   go:test:
     summary: Runs Go unit tests
@@ -122,11 +123,15 @@ tasks:
 
   build:
     summary: Builds the application
+    deps:
+      - env:check
     cmds:
       - task: "{{OS}}:build"
 
   package:
     summary: Packages a production build of the application
+    deps:
+      - env:check
     cmds:
       - task: "{{OS}}:package"
 
@@ -137,6 +142,8 @@ tasks:
 
   dev:
     summary: Runs the application in development mode
+    deps:
+      - env:check
     cmds:
       - wails3 dev -config ./build/config.yml -port {{.VITE_PORT}}
 

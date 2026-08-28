@@ -354,7 +354,6 @@ func startDesktopNotificationBridge(ctx context.Context, eventBus bus.Bus, notif
 	// stay silent.
 	wasDisconnected := &atomic.Bool{}
 	for _, topic := range []bus.Topic{bus.TopicNotification, bus.TopicDockerDisconnected, bus.TopicDockerConnected} {
-		topic := topic
 		events := eventBus.Subscribe(ctx, topic, 16)
 		go func() {
 			for {
@@ -471,7 +470,6 @@ type frontendEventEmitter interface {
 
 func forwardBusEvents(ctx context.Context, eventBus bus.Bus, window frontendEventEmitter, routes []bus.FrontendEventRoute) {
 	for _, route := range routes {
-		route := route
 		buffer := 32
 		if route.Topic == bus.TopicTerminalData || route.Topic == bus.TopicTerminalClosed {
 			buffer = 4096

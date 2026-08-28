@@ -523,6 +523,9 @@ describe("TerminalPage operation and session lifecycle", () => {
     expect(
       await screen.findByRole("tab", { name: "Alpha", selected: true }),
     ).toBeInTheDocument();
+    await waitFor(() =>
+      expect(runtimeMock.listeners.get("terminal:data")?.size).toBe(1),
+    );
 
     act(() => {
       emit("terminal:data", {

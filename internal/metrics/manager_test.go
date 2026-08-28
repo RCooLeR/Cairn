@@ -18,7 +18,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/store"
-	"github.com/docker/docker/api/types/container"
+	"github.com/moby/moby/api/types/container"
 )
 
 var testRuntimeScope = runtimescope.Must("linux_native", "default")

@@ -5,6 +5,8 @@ import (
 	"io"
 	"strconv"
 	"strings"
+
+	dockerclient "github.com/moby/moby/client"
 )
 
 type StatsOptions struct {
@@ -24,11 +26,11 @@ func (c *Client) ContainerStats(ctx context.Context, id string, opts StatsOption
 	}
 
 	if opts.Stream {
-		reader, err := api.ContainerStats(ctx, id, true)
+		reader, err := api.ContainerStats(ctx, id, dockerclient.ContainerStatsOptions{Stream: true})
 		if err != nil {
 			return nil, mapDockerError("stream container stats", err)
 		}
-		return &StatsReader{Body: reader.Body, OSType: reader.OSType}, nil
+		return &StatsReader{Body: reader.Body}, nil
 	}
 
 	callCtx, cancel := c.withTimeout(ctx)
@@ -37,16 +39,14 @@ func (c *Client) ContainerStats(ctx context.Context, id string, opts StatsOption
 		cancel()
 		return nil, mapDockerError("read container stats", err)
 	}
-	return &StatsReader{Body: cancelReadCloser{ReadCloser: reader.Body, cancel: cancel}, OSType: reader.OSType}, nil
+	return &StatsReader{Body: cancelReadCloser{ReadCloser: reader.Body, cancel: cancel}}, nil
 }
 
 func statsOnce(ctx context.Context, api APIClient, id string, oneShot bool) (statsResponseReader, error) {
-	if oneShot {
-		reader, err := api.ContainerStatsOneShot(ctx, id)
-		return statsResponseReader{Body: reader.Body, OSType: reader.OSType}, err
-	}
-	reader, err := api.ContainerStats(ctx, id, false)
-	return statsResponseReader{Body: reader.Body, OSType: reader.OSType}, err
+	reader, err := api.ContainerStats(ctx, id, dockerclient.ContainerStatsOptions{
+		IncludePreviousSample: !oneShot,
+	})
+	return statsResponseReader{Body: reader.Body}, err
 }
 
 func (c *Client) ContainerProcessPIDs(ctx context.Context, id string) ([]int, error) {
@@ -57,7 +57,7 @@ func (c *Client) ContainerProcessPIDs(ctx context.Context, id string) ([]int, er
 
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	top, err := api.ContainerTop(callCtx, id, []string{"-eo", "pid"})
+	top, err := api.ContainerTop(callCtx, id, dockerclient.ContainerTopOptions{Arguments: []string{"-eo", "pid"}})
 	if err != nil {
 		return nil, mapDockerError("list container processes", err)
 	}

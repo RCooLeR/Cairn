@@ -15,9 +15,9 @@ const (
 )
 
 var (
-	agentJSONMarshalerType   = reflect.TypeOf((*json.Marshaler)(nil)).Elem()
-	agentTextMarshalerType   = reflect.TypeOf((*encoding.TextMarshaler)(nil)).Elem()
-	agentJSONTimeType        = reflect.TypeOf(time.Time{})
+	agentJSONMarshalerType   = reflect.TypeFor[json.Marshaler]()
+	agentTextMarshalerType   = reflect.TypeFor[encoding.TextMarshaler]()
+	agentJSONTimeType        = reflect.TypeFor[time.Time]()
 	agentJSONTimePointerType = reflect.PointerTo(agentJSONTimeType)
 )
 

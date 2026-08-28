@@ -11,7 +11,7 @@ import (
 	"runtime"
 	"strings"
 
-	"gopkg.in/yaml.v3"
+	"go.yaml.in/yaml/v3"
 )
 
 const (
@@ -568,10 +568,10 @@ func envStructurePreview(content string) string {
 	var preview strings.Builder
 	preview.Grow(min(len(content), int(maxProjectPreviewFileBytes)))
 	preview.WriteString(header)
-	for _, line := range strings.Split(content, "\n") {
+	for line := range strings.SplitSeq(content, "\n") {
 		line = strings.TrimSpace(strings.TrimPrefix(line, "\ufeff"))
-		if strings.HasPrefix(line, "export ") {
-			line = strings.TrimSpace(strings.TrimPrefix(line, "export "))
+		if after, ok := strings.CutPrefix(line, "export "); ok {
+			line = strings.TrimSpace(after)
 		}
 		separator := strings.IndexByte(line, '=')
 		if separator <= 0 {

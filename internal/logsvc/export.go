@@ -8,10 +8,10 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"uuid"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/models"
-	"github.com/google/uuid"
 )
 
 const exportDurabilityWarning = "The export was saved, but its directory metadata could not be fully synchronized."
@@ -59,7 +59,7 @@ func (m *Manager) exportLogs(ctx context.Context, req models.ExportLogsRequest) 
 	if err := operation.ctx.Err(); err != nil {
 		return nil, wrapOperationContextError("Export logs canceled", err)
 	}
-	filename := "cairn-logs-" + uuid.NewString() + "." + format
+	filename := "cairn-logs-" + uuid.New().String() + "." + format
 	targetPath := filepath.Join(exportDirectory, filename)
 	temporary, err := os.CreateTemp(exportDirectory, ".cairn-logs-*.tmp")
 	if err != nil {

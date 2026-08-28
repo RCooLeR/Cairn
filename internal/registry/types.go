@@ -2,6 +2,7 @@ package registry
 
 import (
 	"context"
+	"maps"
 	"net/http"
 	"sync"
 	"time"
@@ -195,9 +196,7 @@ func cloneRegistryBoolMap(source map[string]bool) map[string]bool {
 		return nil
 	}
 	cloned := make(map[string]bool, len(source))
-	for key, value := range source {
-		cloned[key] = value
-	}
+	maps.Copy(cloned, source)
 	return cloned
 }
 

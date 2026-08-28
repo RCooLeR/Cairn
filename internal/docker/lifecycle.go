@@ -5,7 +5,7 @@ import (
 
 	"github.com/RCooLeR/Cairn/internal/bus"
 	"github.com/RCooLeR/Cairn/internal/models"
-	"github.com/docker/docker/api/types/container"
+	dockerclient "github.com/moby/moby/client"
 )
 
 func (c *Client) ProviderID() string {
@@ -19,18 +19,18 @@ func (c *Client) StartContainer(ctx context.Context, id string) error {
 	}
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	inspect, _, err := api.ContainerInspectWithRaw(callCtx, id, false)
+	inspect, err := api.ContainerInspect(callCtx, id, dockerclient.ContainerInspectOptions{})
 	if err != nil {
 		return mapDockerError("inspect container", err)
 	}
-	if inspect.State != nil && inspect.State.Paused {
-		if err := api.ContainerUnpause(callCtx, id); err != nil {
+	if inspect.Container.State != nil && inspect.Container.State.Paused {
+		if _, err := api.ContainerUnpause(callCtx, id, dockerclient.ContainerUnpauseOptions{}); err != nil {
 			return mapDockerError("unpause container", err)
 		}
 		c.publishContainerChanged(id)
 		return nil
 	}
-	if err := api.ContainerStart(callCtx, id, container.StartOptions{}); err != nil {
+	if _, err := api.ContainerStart(callCtx, id, dockerclient.ContainerStartOptions{}); err != nil {
 		return mapDockerError("start container", err)
 	}
 	c.publishContainerChanged(id)
@@ -44,7 +44,7 @@ func (c *Client) StopContainer(ctx context.Context, id string, timeoutSeconds in
 	}
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	if err := api.ContainerStop(callCtx, id, stopOptions(timeoutSeconds)); err != nil {
+	if _, err := api.ContainerStop(callCtx, id, dockerclient.ContainerStopOptions{Timeout: stopTimeout(timeoutSeconds)}); err != nil {
 		return mapDockerError("stop container", err)
 	}
 	c.publishContainerChanged(id)
@@ -58,7 +58,7 @@ func (c *Client) RestartContainer(ctx context.Context, id string, timeoutSeconds
 	}
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	if err := api.ContainerRestart(callCtx, id, stopOptions(timeoutSeconds)); err != nil {
+	if _, err := api.ContainerRestart(callCtx, id, dockerclient.ContainerRestartOptions{Timeout: stopTimeout(timeoutSeconds)}); err != nil {
 		return mapDockerError("restart container", err)
 	}
 	c.publishContainerChanged(id)
@@ -72,7 +72,7 @@ func (c *Client) KillContainer(ctx context.Context, id string) error {
 	}
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	if err := api.ContainerKill(callCtx, id, "KILL"); err != nil {
+	if _, err := api.ContainerKill(callCtx, id, dockerclient.ContainerKillOptions{Signal: "KILL"}); err != nil {
 		return mapDockerError("kill container", err)
 	}
 	c.publishContainerChanged(id)
@@ -86,7 +86,7 @@ func (c *Client) RemoveContainer(ctx context.Context, id string, opts models.Rem
 	}
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	if err := api.ContainerRemove(callCtx, id, container.RemoveOptions{
+	if _, err := api.ContainerRemove(callCtx, id, dockerclient.ContainerRemoveOptions{
 		Force:         opts.Force,
 		RemoveVolumes: opts.RemoveVolumes,
 	}); err != nil {
@@ -96,12 +96,12 @@ func (c *Client) RemoveContainer(ctx context.Context, id string, opts models.Rem
 	return nil
 }
 
-func stopOptions(timeoutSeconds int) container.StopOptions {
+func stopTimeout(timeoutSeconds int) *int {
 	if timeoutSeconds <= 0 {
 		// Docker interprets nil Timeout as "use the daemon default" (usually 10s).
-		return container.StopOptions{}
+		return nil
 	}
-	return container.StopOptions{Timeout: &timeoutSeconds}
+	return &timeoutSeconds
 }
 
 func (c *Client) publishContainerChanged(id string) {

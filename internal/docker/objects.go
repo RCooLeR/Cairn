@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
@@ -17,13 +18,10 @@ import (
 	"github.com/RCooLeR/Cairn/internal/models"
 	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/store"
-	dockertypes "github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/events"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/api/types/volume"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/events"
+	"github.com/moby/moby/api/types/network"
+	dockerclient "github.com/moby/moby/client"
 )
 
 const (
@@ -129,7 +127,7 @@ func (c *Client) ListContainers(ctx context.Context, opts models.ContainerListOp
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
 
-	raw, err := api.ContainerList(callCtx, container.ListOptions{
+	result, err := api.ContainerList(callCtx, dockerclient.ContainerListOptions{
 		All:     opts.All,
 		Filters: c.containerFilters(opts),
 	})
@@ -137,9 +135,9 @@ func (c *Client) ListContainers(ctx context.Context, opts models.ContainerListOp
 		return nil, mapDockerError("list containers", err)
 	}
 
-	summaries := make([]models.ContainerSummary, 0, len(raw))
-	records := make([]store.ContainerCacheRecord, 0, len(raw))
-	for _, item := range raw {
+	summaries := make([]models.ContainerSummary, 0, len(result.Items))
+	records := make([]store.ContainerCacheRecord, 0, len(result.Items))
+	for _, item := range result.Items {
 		summary := mapContainerSummary(item)
 		c.qualifyContainerSummary(&summary)
 		summaries = append(summaries, summary)
@@ -184,15 +182,15 @@ func (c *Client) ListImages(ctx context.Context) ([]models.ImageSummary, error) 
 	callCtx, cancel := c.withInventoryTimeout(ctx)
 	defer cancel()
 
-	raw, err := api.ImageList(callCtx, image.ListOptions{})
+	result, err := api.ImageList(callCtx, dockerclient.ImageListOptions{})
 	if err != nil {
 		return nil, mapDockerError("list images", err)
 	}
 
 	usedBy := c.imageUsedBy(ctx, api)
-	summaries := make([]models.ImageSummary, 0, len(raw))
-	records := make([]store.ImageCacheRecord, 0, len(raw))
-	for _, item := range raw {
+	summaries := make([]models.ImageSummary, 0, len(result.Items))
+	records := make([]store.ImageCacheRecord, 0, len(result.Items))
+	for _, item := range result.Items {
 		summary := mapImageSummary(item)
 		if users := usedBy[summary.ID]; len(users) > 0 {
 			summary.InUse = true
@@ -219,11 +217,11 @@ func (c *Client) GetImage(ctx context.Context, id string) (*models.ImageDetail, 
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
 
-	raw, _, err := api.ImageInspectWithRaw(callCtx, id)
+	inspected, err := api.ImageInspect(callCtx, id)
 	if err != nil {
 		return nil, mapDockerError("inspect image", err)
 	}
-	detail := mapImageDetail(raw)
+	detail := mapImageDetail(inspected.InspectResponse)
 	users := c.imageUsedBy(ctx, api)[detail.Summary.ID]
 	detail.Summary.InUse = len(users) > 0
 	if err := c.saveImages(ctx, []store.ImageCacheRecord{{
@@ -244,20 +242,17 @@ func (c *Client) ListVolumes(ctx context.Context) ([]models.VolumeSummary, error
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
 
-	raw, err := api.VolumeList(callCtx, volume.ListOptions{})
+	result, err := api.VolumeList(callCtx, dockerclient.VolumeListOptions{})
 	if err != nil {
 		return nil, mapDockerError("list volumes", err)
 	}
 
 	usage := c.volumeUsageByName(ctx, api)
 	usedBy := c.volumeUsedBy(ctx, api)
-	summaries := make([]models.VolumeSummary, 0, len(raw.Volumes))
-	records := make([]store.VolumeCacheRecord, 0, len(raw.Volumes))
-	for _, item := range raw.Volumes {
-		if item == nil {
-			continue
-		}
-		summary := mapVolumeSummary(*item)
+	summaries := make([]models.VolumeSummary, 0, len(result.Items))
+	records := make([]store.VolumeCacheRecord, 0, len(result.Items))
+	for _, item := range result.Items {
+		summary := mapVolumeSummary(item)
 		if item.UsageData == nil {
 			if usage, ok := usage[item.Name]; ok {
 				summary.SizeBytes = usage.sizeBytes
@@ -271,7 +266,7 @@ func (c *Client) ListVolumes(ctx context.Context) ([]models.VolumeSummary, error
 		records = append(records, store.VolumeCacheRecord{
 			Summary:   summary,
 			UsedBy:    usedBy[item.Name],
-			CreatedAt: volumeCreatedAt(*item),
+			CreatedAt: volumeCreatedAt(item),
 		})
 	}
 	sortVolumeSummaries(summaries)
@@ -289,10 +284,11 @@ func (c *Client) GetVolume(ctx context.Context, name string) (*models.VolumeDeta
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
 
-	raw, _, err := api.VolumeInspectWithRaw(callCtx, name)
+	inspected, err := api.VolumeInspect(callCtx, name, dockerclient.VolumeInspectOptions{})
 	if err != nil {
 		return nil, mapDockerError("inspect volume", err)
 	}
+	raw := inspected.Volume
 	containers := c.containersForVolume(ctx, api, raw.Name)
 	detail := mapVolumeDetail(raw, containers)
 	usedBy := containerIDs(containers)
@@ -314,22 +310,32 @@ func (c *Client) ListNetworks(ctx context.Context) ([]models.NetworkSummary, err
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
 
-	raw, err := api.NetworkList(callCtx, network.ListOptions{})
+	result, err := api.NetworkList(callCtx, dockerclient.NetworkListOptions{})
 	if err != nil {
 		return nil, mapDockerError("list networks", err)
 	}
+	usage, err := listNetworkContainerUsage(callCtx, api, len(result.Items) > 0)
+	if err != nil {
+		// Container usage is auxiliary network metadata. Keep network inventory
+		// available when a second daemon request is denied or fails transiently,
+		// consistent with image and volume usage enrichment.
+		slog.Debug("list containers for network usage failed", "error", err)
+		usage = nil
+	}
 
-	summaries := make([]models.NetworkSummary, 0, len(raw))
-	records := make([]store.NetworkCacheRecord, 0, len(raw))
-	for _, item := range raw {
+	summaries := make([]models.NetworkSummary, 0, len(result.Items))
+	records := make([]store.NetworkCacheRecord, 0, len(result.Items))
+	for _, item := range result.Items {
 		summary := mapNetworkSummary(item)
-		subnet, gateway := networkIPAM(item)
+		containerIDs := networkUsageContainerIDs(usage, item.ID, item.Name)
+		summary.ContainerCount = len(containerIDs)
+		subnet, gateway := networkIPAM(item.Network)
 		summaries = append(summaries, summary)
 		records = append(records, store.NetworkCacheRecord{
 			Summary:    summary,
 			Subnet:     subnet,
 			Gateway:    gateway,
-			Containers: networkContainerIDs(item),
+			Containers: containerIDs,
 		})
 	}
 	sortNetworkSummaries(summaries)
@@ -337,6 +343,57 @@ func (c *Client) ListNetworks(ctx context.Context) ([]models.NetworkSummary, err
 		slog.Debug("cache networks failed", "error", err)
 	}
 	return summaries, nil
+}
+
+func listNetworkContainerUsage(ctx context.Context, api APIClient, needed bool) (map[string]map[string]struct{}, error) {
+	usage := map[string]map[string]struct{}{}
+	if !needed {
+		return usage, nil
+	}
+	result, err := api.ContainerList(ctx, dockerclient.ContainerListOptions{All: true})
+	if err != nil {
+		return nil, err
+	}
+	for _, item := range result.Items {
+		if item.ID == "" || item.NetworkSettings == nil {
+			continue
+		}
+		for name, endpoint := range item.NetworkSettings.Networks {
+			addNetworkUsage(usage, name, item.ID)
+			if endpoint != nil {
+				addNetworkUsage(usage, endpoint.NetworkID, item.ID)
+			}
+		}
+	}
+	return usage, nil
+}
+
+func addNetworkUsage(usage map[string]map[string]struct{}, networkRef string, containerID string) {
+	networkRef = strings.TrimSpace(networkRef)
+	if networkRef == "" {
+		return
+	}
+	containers := usage[networkRef]
+	if containers == nil {
+		containers = map[string]struct{}{}
+		usage[networkRef] = containers
+	}
+	containers[containerID] = struct{}{}
+}
+
+func networkUsageContainerIDs(usage map[string]map[string]struct{}, networkRefs ...string) []string {
+	containers := map[string]struct{}{}
+	for _, ref := range networkRefs {
+		for containerID := range usage[strings.TrimSpace(ref)] {
+			containers[containerID] = struct{}{}
+		}
+	}
+	ids := make([]string, 0, len(containers))
+	for containerID := range containers {
+		ids = append(ids, containerID)
+	}
+	sort.Strings(ids)
+	return ids
 }
 
 func (c *Client) GetNetwork(ctx context.Context, id string) (*models.NetworkDetail, error) {
@@ -347,12 +404,13 @@ func (c *Client) GetNetwork(ctx context.Context, id string) (*models.NetworkDeta
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
 
-	raw, body, err := api.NetworkInspectWithRaw(callCtx, id, network.InspectOptions{})
+	inspected, err := api.NetworkInspect(callCtx, id, dockerclient.NetworkInspectOptions{})
 	if err != nil {
 		return nil, mapDockerError("inspect network", err)
 	}
+	raw := inspected.Network
 	containers := c.containersForNetwork(ctx, api, raw)
-	rawJSON := strings.TrimSpace(string(body))
+	rawJSON := strings.TrimSpace(string(inspected.Raw))
 	if rawJSON == "" {
 		if encoded, marshalErr := json.MarshalIndent(raw, "", "  "); marshalErr == nil {
 			rawJSON = string(encoded)
@@ -424,11 +482,11 @@ func (c *Client) inspectContainer(ctx context.Context, id string, getSize bool) 
 	}
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	raw, body, err := api.ContainerInspectWithRaw(callCtx, id, getSize)
+	result, err := api.ContainerInspect(callCtx, id, dockerclient.ContainerInspectOptions{Size: getSize})
 	if err != nil {
 		return container.InspectResponse{}, nil, mapDockerError("inspect container", err)
 	}
-	return raw, body, nil
+	return result.Container, result.Raw, nil
 }
 
 func (c *Client) objectEventLoop(ctx context.Context, changes chan<- objectChange) {
@@ -458,15 +516,16 @@ func (c *Client) objectEventLoop(ctx context.Context, changes chan<- objectChang
 			backoff = defaultBackoffMin
 		}
 
-		messages, errs := api.Events(ctx, events.ListOptions{
+		stream := api.Events(ctx, dockerclient.EventsListOptions{
 			Since: since,
-			Filters: filters.NewArgs(
-				filters.Arg("type", string(events.ContainerEventType)),
-				filters.Arg("type", string(events.ImageEventType)),
-				filters.Arg("type", string(events.VolumeEventType)),
-				filters.Arg("type", string(events.NetworkEventType)),
+			Filters: dockerclient.Filters{}.Add("type",
+				string(events.ContainerEventType),
+				string(events.ImageEventType),
+				string(events.VolumeEventType),
+				string(events.NetworkEventType),
 			),
 		})
+		messages, errs := stream.Messages, stream.Err
 
 		streamOK := true
 		for streamOK {
@@ -617,10 +676,7 @@ func (c *Client) objectChangePublisher(ctx context.Context, changes <-chan objec
 func (c *Client) reconcileKind(ctx context.Context, kind string) {
 	timeout := c.unaryTimeout
 	if kind == objectKindImage {
-		timeout = defaultInventoryTimeout
-		if c.unaryTimeout > timeout {
-			timeout = c.unaryTimeout
-		}
+		timeout = max(c.unaryTimeout, defaultInventoryTimeout)
 	}
 	if timeout <= 0 {
 		timeout = defaultTimeout
@@ -688,8 +744,8 @@ func objectChangeFromEvent(msg events.Message) (objectChange, bool) {
 	return objectChange{kind: kind, id: id}, true
 }
 
-func (c *Client) containerFilters(opts models.ContainerListOptions) filters.Args {
-	args := filters.NewArgs()
+func (c *Client) containerFilters(opts models.ContainerListOptions) dockerclient.Filters {
+	args := dockerclient.Filters{}
 	if opts.ProjectID != "" {
 		args.Add("label", composeProjectLabel+"="+composecore.ProjectNameFromID(c.providerID(), opts.ProjectID))
 	}
@@ -717,9 +773,8 @@ func containerRecordFromInspect(raw container.InspectResponse, detail *models.Co
 		Summary: detail.Summary,
 		Labels:  detail.Labels,
 	}
-	base := raw.ContainerJSONBase
-	if base != nil && base.State != nil {
-		record.StartedAt = parseDockerTime(base.State.StartedAt)
+	if raw.State != nil {
+		record.StartedAt = parseDockerTime(raw.State.StartedAt)
 	}
 	return record
 }
@@ -727,12 +782,12 @@ func containerRecordFromInspect(raw container.InspectResponse, detail *models.Co
 func (c *Client) imageUsedBy(ctx context.Context, api APIClient) map[string][]string {
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	containers, err := api.ContainerList(callCtx, container.ListOptions{All: true})
+	containers, err := api.ContainerList(callCtx, dockerclient.ContainerListOptions{All: true})
 	if err != nil {
 		return nil
 	}
 	usedBy := map[string][]string{}
-	for _, item := range containers {
+	for _, item := range containers.Items {
 		if item.ImageID == "" {
 			continue
 		}
@@ -747,13 +802,13 @@ func (c *Client) imageUsedBy(ctx context.Context, api APIClient) map[string][]st
 func (c *Client) volumeUsageByName(ctx context.Context, api APIClient) map[string]volumeUsage {
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	usage, err := api.DiskUsage(callCtx, dockertypes.DiskUsageOptions{})
+	usage, err := api.DiskUsage(callCtx, dockerclient.DiskUsageOptions{Volumes: true, Verbose: true})
 	if err != nil {
 		return nil
 	}
 	byName := map[string]volumeUsage{}
-	for _, vol := range usage.Volumes {
-		if vol == nil || vol.UsageData == nil {
+	for _, vol := range usage.Volumes.Items {
+		if vol.UsageData == nil {
 			continue
 		}
 		byName[vol.Name] = volumeUsage{
@@ -767,12 +822,12 @@ func (c *Client) volumeUsageByName(ctx context.Context, api APIClient) map[strin
 func (c *Client) volumeUsedBy(ctx context.Context, api APIClient) map[string][]string {
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	containers, err := api.ContainerList(callCtx, container.ListOptions{All: true})
+	containers, err := api.ContainerList(callCtx, dockerclient.ContainerListOptions{All: true})
 	if err != nil {
 		return nil
 	}
 	usedBy := map[string][]string{}
-	for _, item := range containers {
+	for _, item := range containers.Items {
 		for _, mount := range item.Mounts {
 			if mount.Name == "" {
 				continue
@@ -789,12 +844,12 @@ func (c *Client) volumeUsedBy(ctx context.Context, api APIClient) map[string][]s
 func (c *Client) containersForVolume(ctx context.Context, api APIClient, volumeName string) []models.ContainerSummary {
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	containers, err := api.ContainerList(callCtx, container.ListOptions{All: true})
+	containers, err := api.ContainerList(callCtx, dockerclient.ContainerListOptions{All: true})
 	if err != nil {
 		return nil
 	}
 	out := []models.ContainerSummary{}
-	for _, item := range containers {
+	for _, item := range containers.Items {
 		for _, mount := range item.Mounts {
 			if mount.Name == volumeName {
 				summary := mapContainerSummary(item)
@@ -811,12 +866,12 @@ func (c *Client) containersForVolume(ctx context.Context, api APIClient, volumeN
 func (c *Client) containersForNetwork(ctx context.Context, api APIClient, nw network.Inspect) []models.ContainerSummary {
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	containers, err := api.ContainerList(callCtx, container.ListOptions{All: true})
+	containers, err := api.ContainerList(callCtx, dockerclient.ContainerListOptions{All: true})
 	if err != nil {
 		return nil
 	}
 	out := []models.ContainerSummary{}
-	for _, item := range containers {
+	for _, item := range containers.Items {
 		if item.NetworkSettings == nil {
 			continue
 		}
@@ -842,24 +897,29 @@ func applyNetworkEndpoint(summary *models.ContainerSummary, name string, endpoin
 	summary.EndpointID = endpoint.EndpointID
 	summary.IPv4Address = endpointAddress(endpoint.IPAddress, endpoint.IPPrefixLen)
 	summary.IPv6Address = endpointAddress(endpoint.GlobalIPv6Address, endpoint.GlobalIPv6PrefixLen)
-	summary.Gateway = firstNonEmpty(endpoint.Gateway, endpoint.IPv6Gateway)
-	summary.MacAddress = endpoint.MacAddress
+	summary.Gateway = firstValidAddress(endpoint.Gateway, endpoint.IPv6Gateway)
+	summary.MacAddress = endpoint.MacAddress.String()
 	summary.Aliases = sortedStrings(endpoint.Aliases)
 }
 
-func endpointAddress(address string, prefixLen int) string {
-	address = strings.TrimSpace(address)
-	if address == "" || strings.Contains(address, "/") || prefixLen <= 0 {
-		return address
+func endpointAddress(address netip.Addr, prefixLen int) string {
+	if !address.IsValid() {
+		return ""
 	}
-	return address + "/" + strconv.Itoa(prefixLen)
+	if prefixLen <= 0 {
+		return address.String()
+	}
+	prefix := netip.PrefixFrom(address, prefixLen)
+	if !prefix.IsValid() {
+		return address.String()
+	}
+	return prefix.String()
 }
 
-func firstNonEmpty(values ...string) string {
+func firstValidAddress(values ...netip.Addr) string {
 	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if value != "" {
-			return value
+		if value.IsValid() {
+			return value.String()
 		}
 	}
 	return ""

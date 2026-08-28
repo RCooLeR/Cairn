@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -12,10 +13,10 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"uuid"
 
 	"github.com/RCooLeR/Cairn/internal/apperror"
 	"github.com/RCooLeR/Cairn/internal/models"
-	"github.com/google/uuid"
 )
 
 const logPageCursorVersion = 1
@@ -140,7 +141,9 @@ func logPageRequestFingerprint(req models.LogStreamRequest) [sha256.Size]byte {
 }
 
 func newLogPageCursorKey() [sha256.Size]byte {
-	return sha256.Sum256([]byte(uuid.NewString() + uuid.NewString()))
+	var key [sha256.Size]byte
+	_, _ = rand.Read(key[:])
+	return key
 }
 
 func (m *Manager) encodeLogPageSnapshotCursor(snapshotID string, offset int) string {
@@ -264,7 +267,7 @@ func (m *Manager) storePageSnapshotLocked(snapshot *logPageSnapshot) {
 		m.removePageSnapshotLocked(oldestID)
 	}
 	for snapshot.id == "" || m.pageSnapshots[snapshot.id] != nil {
-		snapshot.id = uuid.NewString()
+		snapshot.id = uuid.New().String()
 	}
 	m.pageSnapshots[snapshot.id] = snapshot
 	m.pageSnapshotBytesInUse += snapshot.bytes

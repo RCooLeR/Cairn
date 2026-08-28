@@ -5,7 +5,7 @@ import (
 	"io"
 	"strconv"
 
-	"github.com/docker/docker/api/types/container"
+	dockerclient "github.com/moby/moby/client"
 )
 
 type LogOptions struct {
@@ -25,7 +25,7 @@ func (c *Client) ContainerLogs(ctx context.Context, id string, opts LogOptions) 
 	if opts.Tail >= 0 {
 		tail = strconv.Itoa(opts.Tail)
 	}
-	reader, err := api.ContainerLogs(ctx, id, container.LogsOptions{
+	reader, err := api.ContainerLogs(ctx, id, dockerclient.ContainerLogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Since:      opts.Since,

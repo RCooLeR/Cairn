@@ -10,7 +10,8 @@ import (
 	"github.com/RCooLeR/Cairn/internal/bus"
 	"github.com/RCooLeR/Cairn/internal/models"
 	cerrdefs "github.com/containerd/errdefs"
-	"github.com/docker/docker/api/types/container"
+	"github.com/moby/moby/api/types/container"
+	dockerclient "github.com/moby/moby/client"
 )
 
 type startFailingAPI struct {
@@ -21,65 +22,66 @@ type startFailingAPI struct {
 	startFailures  int
 	stateOnFailure container.ContainerState
 	onStartFailure func()
-	removed        []container.RemoveOptions
+	removed        []dockerclient.ContainerRemoveOptions
 	removedID      []string
 	removedSet     map[string]bool
 }
 
-func (a *startFailingAPI) ContainerStart(ctx context.Context, id string, opts container.StartOptions) error {
+func (a *startFailingAPI) ContainerStart(ctx context.Context, id string, opts dockerclient.ContainerStartOptions) (dockerclient.ContainerStartResult, error) {
 	if a.startFailures > 0 {
 		a.startFailures--
 		if a.stateOnFailure != "" {
-			inspect, _, err := a.APIClient.ContainerInspectWithRaw(ctx, id, false)
-			if err == nil && inspect.State != nil {
-				inspect.State.Status = a.stateOnFailure
-				inspect.State.Running = a.stateOnFailure == container.StateRunning
+			result, err := a.APIClient.ContainerInspect(ctx, id, dockerclient.ContainerInspectOptions{})
+			if err == nil && result.Container.State != nil {
+				result.Container.State.Status = a.stateOnFailure
+				result.Container.State.Running = a.stateOnFailure == container.StateRunning
 			}
 		}
 		if a.onStartFailure != nil {
 			a.onStartFailure()
 		}
-		return a.startErr
+		return dockerclient.ContainerStartResult{}, a.startErr
 	}
 	delete(a.removedSet, id)
 	return a.APIClient.ContainerStart(ctx, id, opts)
 }
 
-func (a *startFailingAPI) ContainerRemove(_ context.Context, id string, opts container.RemoveOptions) error {
+func (a *startFailingAPI) ContainerRemove(_ context.Context, id string, opts dockerclient.ContainerRemoveOptions) (dockerclient.ContainerRemoveResult, error) {
 	a.removedID = append(a.removedID, id)
 	a.removed = append(a.removed, opts)
 	if a.removeErr != nil {
 		if cerrdefs.IsNotFound(a.removeErr) {
 			a.removedSet[id] = true
 		}
-		return a.removeErr
+		return dockerclient.ContainerRemoveResult{}, a.removeErr
 	}
 	a.removedSet[id] = true
-	return nil
+	return dockerclient.ContainerRemoveResult{}, nil
 }
 
-func (a *startFailingAPI) ContainerInspectWithRaw(ctx context.Context, id string, size bool) (container.InspectResponse, []byte, error) {
+func (a *startFailingAPI) ContainerInspect(ctx context.Context, id string, options dockerclient.ContainerInspectOptions) (dockerclient.ContainerInspectResult, error) {
 	if a.removedSet[id] {
-		return container.InspectResponse{}, nil, cerrdefs.ErrNotFound.WithMessage("container already removed")
+		return dockerclient.ContainerInspectResult{}, cerrdefs.ErrNotFound.WithMessage("container already removed")
 	}
 	if a.inspectErr != nil {
-		return container.InspectResponse{}, nil, a.inspectErr
+		return dockerclient.ContainerInspectResult{}, a.inspectErr
 	}
-	return a.APIClient.ContainerInspectWithRaw(ctx, id, size)
+	return a.APIClient.ContainerInspect(ctx, id, options)
 }
 
-func (a *startFailingAPI) ContainerList(ctx context.Context, opts container.ListOptions) ([]container.Summary, error) {
-	items, err := a.APIClient.ContainerList(ctx, opts)
+func (a *startFailingAPI) ContainerList(ctx context.Context, opts dockerclient.ContainerListOptions) (dockerclient.ContainerListResult, error) {
+	result, err := a.APIClient.ContainerList(ctx, opts)
 	if err != nil {
-		return nil, err
+		return dockerclient.ContainerListResult{}, err
 	}
-	filtered := items[:0]
-	for _, item := range items {
+	filtered := result.Items[:0]
+	for _, item := range result.Items {
 		if !a.removedSet[item.ID] {
 			filtered = append(filtered, item)
 		}
 	}
-	return filtered, nil
+	result.Items = filtered
+	return result, nil
 }
 
 func TestRunImageRemovesNewContainerWhenStartFails(t *testing.T) {
@@ -114,7 +116,7 @@ func TestRunImageRemovesNewContainerWhenStartFails(t *testing.T) {
 		t.Fatalf("remove options = %#v, want non-force cleanup with anonymous volumes", api.removed)
 	}
 	waitObjectsChangedKind(t, ctx, changed, objectKindContainer, "created-cleanup-me", time.Second)
-	if _, _, inspectErr := api.ContainerInspectWithRaw(ctx, "created-cleanup-me", false); !cerrdefs.IsNotFound(inspectErr) {
+	if _, inspectErr := api.ContainerInspect(ctx, "created-cleanup-me", dockerclient.ContainerInspectOptions{}); !cerrdefs.IsNotFound(inspectErr) {
 		t.Fatalf("inspect after cleanup error = %v, want not found", inspectErr)
 	}
 

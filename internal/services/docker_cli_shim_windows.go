@@ -245,7 +245,7 @@ func pathListContainsDir(pathList string, dir string) bool {
 	if target == "" {
 		return false
 	}
-	for _, item := range strings.Split(pathList, ";") {
+	for item := range strings.SplitSeq(pathList, ";") {
 		if strings.EqualFold(normalizePathForCompare(item), target) {
 			return true
 		}

@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useEffectEvent } from "react";
 
 import { Events } from "@wailsio/runtime";
 
@@ -7,10 +7,7 @@ export function useDebouncedRuntimeEvent<E extends Events.WailsEventName>(
   delayMs: number,
   callback: Events.WailsEventCallback<E>,
 ) {
-  const callbackRef = useRef(callback);
-  useEffect(() => {
-    callbackRef.current = callback;
-  }, [callback]);
+  const emitLatest = useEffectEvent(callback);
 
   useEffect(() => {
     let timer: number | undefined;
@@ -22,7 +19,7 @@ export function useDebouncedRuntimeEvent<E extends Events.WailsEventName>(
         const next = pending;
         pending = undefined;
         if (next) {
-          callbackRef.current(next);
+          emitLatest(next);
         }
       }, delayMs);
     });

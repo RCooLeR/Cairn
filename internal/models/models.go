@@ -159,7 +159,7 @@ type ContainerSummary struct {
 	MacAddress     string        `json:"macAddress,omitempty"`
 	Aliases        []string      `json:"aliases,omitempty"`
 	CreatedAt      time.Time     `json:"createdAt"`
-	StartedAt      time.Time     `json:"startedAt,omitempty"`
+	StartedAt      time.Time     `json:"startedAt,omitzero"`
 }
 
 type ContainerDetail struct {
@@ -188,7 +188,7 @@ type ContainerFileEntry struct {
 	Type       string    `json:"type"`
 	SizeBytes  int64     `json:"sizeBytes,omitempty"`
 	Mode       string    `json:"mode,omitempty"`
-	ModifiedAt time.Time `json:"modifiedAt,omitempty"`
+	ModifiedAt time.Time `json:"modifiedAt,omitzero"`
 	LinkTarget string    `json:"linkTarget,omitempty"`
 }
 
@@ -237,8 +237,8 @@ type StdioTransportDiagnostics struct {
 	Active            int                         `json:"active"`
 	ForcedKills       int64                       `json:"forcedKills"`
 	CloseTimeouts     int64                       `json:"closeTimeouts"`
-	LastOpenedAt      time.Time                   `json:"lastOpenedAt,omitempty"`
-	LastClosedAt      time.Time                   `json:"lastClosedAt,omitempty"`
+	LastOpenedAt      time.Time                   `json:"lastOpenedAt,omitzero"`
+	LastClosedAt      time.Time                   `json:"lastClosedAt,omitzero"`
 	ActiveConnections []StdioConnectionDiagnostic `json:"activeConnections,omitempty"`
 }
 
@@ -400,7 +400,7 @@ type NetworkDetail struct {
 	IPAM       []NetworkIPAMConfig `json:"ipam,omitempty"`
 	Containers []ContainerSummary  `json:"containers,omitempty"`
 	RawJSON    string              `json:"rawJSON,omitempty"`
-	CreatedAt  time.Time           `json:"createdAt,omitempty"`
+	CreatedAt  time.Time           `json:"createdAt,omitzero"`
 }
 
 type NetworkIPAMConfig struct {
@@ -735,7 +735,7 @@ type UpdateHistoryItem struct {
 	Kind           UpdateKind `json:"kind"`
 	Result         string     `json:"result"`
 	StartedAt      time.Time  `json:"startedAt"`
-	FinishedAt     time.Time  `json:"finishedAt,omitempty"`
+	FinishedAt     time.Time  `json:"finishedAt,omitzero"`
 	RollbackStatus string     `json:"rollbackStatus,omitempty"`
 	Error          string     `json:"error,omitempty"`
 }
@@ -808,7 +808,7 @@ type RegistryAccount struct {
 	Username       string    `json:"username,omitempty"`
 	Source         string    `json:"source"`
 	LoggedIn       bool      `json:"loggedIn"`
-	LastVerifiedAt time.Time `json:"lastVerifiedAt,omitempty"`
+	LastVerifiedAt time.Time `json:"lastVerifiedAt,omitzero"`
 }
 
 type RegistryLoginRequest struct {
@@ -822,7 +822,7 @@ type RegistryAuthStatus struct {
 	Registry   string    `json:"registry"`
 	LoggedIn   bool      `json:"loggedIn"`
 	Username   string    `json:"username,omitempty"`
-	VerifiedAt time.Time `json:"verifiedAt,omitempty"`
+	VerifiedAt time.Time `json:"verifiedAt,omitzero"`
 	Error      string    `json:"error,omitempty"`
 }
 

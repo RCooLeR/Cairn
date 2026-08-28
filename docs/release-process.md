@@ -72,7 +72,7 @@ Run these before tagging when possible:
 ```powershell
 task test
 task windows:package
-go run github.com/goreleaser/goreleaser/v2@latest check
+go run github.com/goreleaser/goreleaser/v2@v2.18.0 check
 ```
 
 On Linux and macOS, use `task linux:package` and `task darwin:package` respectively.

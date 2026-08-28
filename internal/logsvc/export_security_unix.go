@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 )
 
 func ensurePrivateExportDirectory(path string) error {
@@ -22,8 +23,8 @@ func ensurePrivateExportDirectory(path string) error {
 	if err := os.Chmod(path, 0o700); err != nil {
 		return err
 	}
-	for index := len(created) - 1; index >= 0; index-- {
-		if err := syncExportDirectory(filepath.Dir(created[index])); err != nil {
+	for _, createdPath := range slices.Backward(created) {
+		if err := syncExportDirectory(filepath.Dir(createdPath)); err != nil {
 			return err
 		}
 	}

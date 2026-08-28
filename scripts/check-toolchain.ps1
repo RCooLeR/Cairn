@@ -50,14 +50,15 @@ function Assert-MinimumVersion(
 }
 
 $goMod = Join-Path $root "go.mod"
-$expectedGo = Read-SingleCapture $goMod '^\s*toolchain\s+(go\S+)\s*$' "pinned Go toolchain"
-$goLanguage = Read-SingleCapture $goMod '^\s*go\s+(\d+\.\d+)\s*$' "Go language version"
-if ($expectedGo -notmatch ('^go' + [regex]::Escape($goLanguage) + '\.\d+$')) {
-  throw "Pinned toolchain $expectedGo does not match the go $goLanguage language line."
-}
+$goLanguage = Read-SingleCapture $goMod '^\s*go\s+(\d+\.\d+\.\d+)\s*$' "patch-pinned Go language version"
+$expectedGo = "go$goLanguage"
+$expectedWails = Read-SingleCapture `
+  $goMod `
+  '^\s*github\.com/wailsapp/wails/v3\s+(v[0-9][0-9A-Za-z.+-]*)\s*$' `
+  "pinned Wails module version"
 
 $dockerfile = Join-Path $root "build/docker/Dockerfile.cross"
-$dockerGo = Read-SingleCapture $dockerfile '^\s*FROM\s+golang:(\d+\.\d+\.\d+)-bookworm@sha256:[0-9a-f]{64}\s*$' "digest-pinned cross-image Go toolchain"
+$dockerGo = Read-SingleCapture $dockerfile '^\s*FROM\s+golang:(\d+\.\d+\.\d+)-trixie@sha256:[0-9a-f]{64}\s*$' "digest-pinned cross-image Go toolchain"
 if ("go$dockerGo" -ne $expectedGo) {
   throw "Dockerfile.cross pins go$dockerGo, want $expectedGo from go.mod."
 }
@@ -71,6 +72,10 @@ $null = Read-SingleCapture `
 $package = Get-Content -LiteralPath (Join-Path $root "frontend/package.json") -Raw | ConvertFrom-Json
 $nodeEngine = [string]$package.engines.node
 $npmEngine = [string]$package.engines.npm
+$frontendWails = [string]$package.dependencies.'@wailsio/runtime'
+if ([string]::IsNullOrWhiteSpace($frontendWails) -or "v$frontendWails" -ne $expectedWails) {
+  throw "frontend/package.json pins @wailsio/runtime '$frontendWails', want $($expectedWails.TrimStart('v')) from go.mod."
+}
 if ($nodeEngine -notmatch '^>=(\d+\.\d+\.\d+)$') {
   throw "frontend/package.json must declare a simple minimum Node version."
 }
@@ -94,6 +99,41 @@ if ($pinnedNode -lt $minimumNode) {
 }
 
 $workflowFiles = @(Get-ChildItem -LiteralPath (Join-Path $root ".github/workflows") -File -Include "*.yml", "*.yaml")
+$workflowText = ($workflowFiles | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw }) -join "`n"
+$wailsCommandPins = [regex]::Matches(
+  $workflowText,
+  'github\.com/wailsapp/wails/v3/cmd/wails3@(?<version>v[0-9][0-9A-Za-z.+-]*)'
+)
+if ($wailsCommandPins.Count -eq 0) {
+  throw "Workflows must pin every Wails install/generate command explicitly."
+}
+foreach ($pin in $wailsCommandPins) {
+  if ($pin.Groups['version'].Value -ne $expectedWails) {
+    throw "Workflow Wails command pin '$($pin.Groups['version'].Value)' does not match $expectedWails from go.mod."
+  }
+}
+$wailsCachePins = [regex]::Matches(
+  $workflowText,
+  'wails3-(?<version>v[0-9][0-9A-Za-z.+-]*)'
+)
+if ($wailsCachePins.Count -eq 0) {
+  throw "Workflows must version every Wails CLI cache key."
+}
+foreach ($pin in $wailsCachePins) {
+  if ($pin.Groups['version'].Value -ne $expectedWails) {
+    throw "Workflow Wails cache pin '$($pin.Groups['version'].Value)' does not match $expectedWails from go.mod."
+  }
+}
+$bindingDefinitionFiles = @($workflowFiles.FullName) + (Join-Path $root "build/Taskfile.yml")
+$bindingCommands = @(Select-String -LiteralPath $bindingDefinitionFiles -Pattern '\bgenerate\s+bindings\b')
+if ($bindingCommands.Count -eq 0) {
+  throw "No Wails binding generation commands were found."
+}
+foreach ($bindingCommand in $bindingCommands) {
+  if ($bindingCommand.Line -notmatch '(?:^|\s)-time-type=string(?:\s|$)') {
+    throw "$($bindingCommand.Path):$($bindingCommand.LineNumber) must pin Wails binding time types with -time-type=string."
+  }
+}
 $nodeVersionFileUses = @($workflowFiles | Select-String -Pattern '^\s*node-version-file:\s*\.node-version\s*$')
 $setupNodeUses = @($workflowFiles | Select-String -Pattern '^\s*uses:\s+actions/setup-node@')
 if ($setupNodeUses.Count -eq 0 -or $nodeVersionFileUses.Count -ne $setupNodeUses.Count) {
@@ -133,7 +173,26 @@ if (-not $SkipRuntime) {
   }
   Assert-MinimumVersion "node" $minimumNode "Node"
   Assert-MinimumVersion "npm" $minimumNPM "npm"
+
+  $wails = Get-Command wails3 -CommandType Application -ErrorAction SilentlyContinue
+  if ($null -eq $wails) {
+    throw "wails3 was not found on PATH. Install the pinned CLI with: go install github.com/wailsapp/wails/v3/cmd/wails3@$expectedWails"
+  }
+  $wailsMetadata = @(& $go.Source version -m $wails.Source)
+  $metadataSucceeded = $?
+  if (-not $metadataSucceeded) {
+    throw "Embedded build metadata could not be read from $($wails.Source)."
+  }
+  $wailsPath = @($wailsMetadata | Select-String -Pattern '^\s*path\s+github\.com/wailsapp/wails/v3/cmd/wails3\s*$')
+  $wailsModule = @($wailsMetadata | Select-String -Pattern '^\s*mod\s+github\.com/wailsapp/wails/v3\s+(v\S+)\s+')
+  if ($wailsPath.Count -ne 1 -or $wailsModule.Count -ne 1) {
+    throw "$($wails.Source) is not a metadata-verifiable github.com/wailsapp/wails/v3/cmd/wails3 executable."
+  }
+  $actualWails = $wailsModule[0].Matches[0].Groups[1].Value
+  if ($actualWails -ne $expectedWails) {
+    throw "Installed Wails CLI is $actualWails, want $expectedWails. Reinstall it with: go install github.com/wailsapp/wails/v3/cmd/wails3@$expectedWails"
+  }
 }
 
 $runtimeStatus = if ($SkipRuntime) { "static pins are consistent" } else { "static pins are consistent and installed runtimes satisfy the declared contract" }
-Write-Host "Toolchain policy passed: $runtimeStatus across go.mod, .node-version, and frontend/package.json."
+Write-Host "Toolchain policy passed: $runtimeStatus across Go, Node/npm, Wails, Docker, and workflows."

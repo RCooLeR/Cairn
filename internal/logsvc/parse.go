@@ -69,10 +69,7 @@ func readFramedDockerLogs(ctx context.Context, reader *bufio.Reader, source sour
 		stream := streamName(header[0])
 		remaining := int64(size)
 		for remaining > 0 {
-			chunkSize := int64(len(scratch))
-			if remaining < chunkSize {
-				chunkSize = remaining
-			}
+			chunkSize := min(remaining, int64(len(scratch)))
 			n, readErr := io.ReadFull(reader, scratch[:chunkSize])
 			if n > 0 {
 				assembler.add(stream, scratch[:n])

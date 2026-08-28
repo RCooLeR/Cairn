@@ -247,7 +247,7 @@ func versionInfo() *models.VersionInfo {
 func isNewerAppVersion(candidate string, current string) bool {
 	candidateParts := appVersionParts(candidate)
 	currentParts := appVersionParts(current)
-	for index := 0; index < 3; index++ {
+	for index := range 3 {
 		if candidateParts[index] > currentParts[index] {
 			return true
 		}

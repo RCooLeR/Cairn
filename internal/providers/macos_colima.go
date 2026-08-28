@@ -640,7 +640,7 @@ func brewInstallOrUpgradeCommand(formula string) []string {
 func homebrewOutdatedPackages(output string) []string {
 	seen := map[string]bool{}
 	outdated := []string{}
-	for _, line := range strings.Split(output, "\n") {
+	for line := range strings.SplitSeq(output, "\n") {
 		fields := strings.Fields(strings.TrimSpace(line))
 		if len(fields) == 0 || seen[fields[0]] {
 			continue
@@ -687,7 +687,7 @@ func parseDockerContextList(output string) ([]models.DockerContextInfo, error) {
 			return nil, err
 		}
 	} else {
-		for _, line := range strings.Split(trimmed, "\n") {
+		for line := range strings.SplitSeq(trimmed, "\n") {
 			line = strings.TrimSpace(line)
 			if line == "" {
 				continue

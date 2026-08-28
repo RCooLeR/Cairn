@@ -8,7 +8,7 @@ import { NotificationCenter } from "./NotificationCenter";
 function notification(): Notification {
   return {
     body: "Images were refreshed",
-    createdAt: new Date("2026-06-16T10:00:00Z"),
+    createdAt: "2026-06-16T10:00:00Z",
     id: 1,
     level: "info",
     read: false,

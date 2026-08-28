@@ -133,7 +133,6 @@ func (m *Manager) DetectAll(ctx context.Context) (map[string]*models.ProviderSta
 	}
 	results := make(chan detectResult, len(providers))
 	for _, provider := range providers {
-		provider := provider
 		go func() {
 			detectCtx, cancel := context.WithTimeout(ctx, detectBudgetFor(provider))
 			defer cancel()
@@ -293,8 +292,7 @@ func (m *Manager) GetProvider(ctx context.Context, providerID string) (*models.P
 }
 
 func (m *Manager) SetActiveProvider(ctx context.Context, providerID string) error {
-	if strings.HasPrefix(providerID, existingContextIDPrefix) {
-		contextName := strings.TrimPrefix(providerID, existingContextIDPrefix)
+	if contextName, ok := strings.CutPrefix(providerID, existingContextIDPrefix); ok {
 		if err := m.ensureExistingContextProvider(ctx, contextName); err != nil {
 			return err
 		}
@@ -333,8 +331,7 @@ func (m *Manager) ActiveProvider(ctx context.Context) (PlatformProvider, error) 
 	if providerID == "" {
 		return nil, apperror.New(apperror.ProviderNotReady, "No active Docker provider")
 	}
-	if strings.HasPrefix(providerID, existingContextIDPrefix) {
-		contextName := strings.TrimPrefix(providerID, existingContextIDPrefix)
+	if contextName, ok := strings.CutPrefix(providerID, existingContextIDPrefix); ok {
 		if err := m.ensureExistingContextProvider(ctx, contextName); err != nil {
 			return nil, err
 		}

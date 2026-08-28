@@ -9,10 +9,6 @@ tasks:
 
   install:frontend:deps:
     summary: Install frontend dependencies
-    cmds:
-      - task: install:frontend:deps:{{.PACKAGE_MANAGER}}
-
-  install:frontend:deps:npm:
     dir: frontend
     preconditions:
       - sh: npm version
@@ -22,48 +18,8 @@ tasks:
       # not depend on stale packages left by an earlier `npm install`.
       - npm ci
 
-  install:frontend:deps:bun:
-    dir: frontend
-    sources:
-      - package.json
-      - bun.lock
-      - bun.lockb
-    generates:
-      - node_modules
-    preconditions:
-      - sh: bun --version
-        msg: "bun not found"
-    cmds:
-      - bun install
-
-  install:frontend:deps:pnpm:
-    dir: frontend
-    sources:
-      - package.json
-      - pnpm-lock.yaml
-    generates:
-      - node_modules
-    preconditions:
-      - sh: pnpm --version
-        msg: "pnpm not found"
-    cmds:
-      - pnpm install
-
-  install:frontend:deps:yarn:
-    dir: frontend
-    sources:
-      - package.json
-      - yarn.lock
-    status:
-      - test -d node_modules || test -f .pnp.cjs
-    preconditions:
-      - sh: yarn --version
-        msg: "yarn not found"
-    cmds:
-      - yarn install
-
   build:frontend:
-    label: build:frontend (DEV={{.DEV}} RUNNER={{.PACKAGE_MANAGER}})
+    label: build:frontend (DEV={{.DEV}})
     summary: Build the frontend project
     dir: frontend
     sources:
@@ -80,63 +36,28 @@ tasks:
             ref: .BUILD_FLAGS
           OBFUSCATED:
             ref: .OBFUSCATED
-      - task: frontend:run
-        vars:
-          SCRIPT: '{{if eq .DEV "true"}}build:dev{{else}}build{{end}}'
+      - npm run {{if eq .DEV "true"}}build:dev{{else}}build{{end}} -q
     env:
       PRODUCTION: '{{if eq .DEV "true"}}false{{else}}true{{end}}'
-
-  frontend:run:
-    summary: Run a frontend script with selected runner
-    cmds:
-      - task: frontend:run:{{.PACKAGE_MANAGER}}
-        vars:
-          SCRIPT: "{{.SCRIPT}}"
-    vars:
-      SCRIPT: "{{.SCRIPT}}"
-
-  frontend:run:npm:
-    dir: frontend
-    cmds:
-      - npm run {{.SCRIPT}} -q
-    vars:
-      SCRIPT: "{{.SCRIPT}}"
-
-  frontend:run:yarn:
-    dir: frontend
-    cmds:
-      - yarn {{.SCRIPT}}
-    vars:
-      SCRIPT: "{{.SCRIPT}}"
-
-  frontend:run:pnpm:
-    dir: frontend
-    cmds:
-      - pnpm run {{.SCRIPT}}
-    vars:
-      SCRIPT: "{{.SCRIPT}}"
-
-  frontend:run:bun:
-    dir: frontend
-    cmds:
-      - bun run {{.SCRIPT}}
-    vars:
-      SCRIPT: "{{.SCRIPT}}"
 
   generate:bindings:
     label: generate:bindings (BUILD_FLAGS={{.BUILD_FLAGS}})
     summary: Generates bindings for the frontend
+    deps:
+      - task: :env:check
     sources:
       - "**/*.[jt]s"
       - exclude: frontend/**/*
       - frontend/bindings/**/*  # Rerun when switching between dev/production mode causes changes in output
+      - frontend/scripts/normalize-generated-bindings.mjs
       - "**/*.go"
       - go.mod
       - go.sum
     generates:
       - frontend/bindings/**/*
     cmds:
-      - wails3 generate bindings{{if .BUILD_FLAGS}} -f '{{.BUILD_FLAGS}}'{{end}} -clean=true{{if eq .OBFUSCATED "true"}} -obfuscated{{end}} -ts
+      - wails3 generate bindings{{if .BUILD_FLAGS}} -f '{{.BUILD_FLAGS}}'{{end}} -clean=true{{if eq .OBFUSCATED "true"}} -obfuscated{{end}} -time-type=string -ts
+      - node frontend/scripts/normalize-generated-bindings.mjs
     env:
       GOFLAGS: "-mod=readonly"
 
@@ -153,6 +74,7 @@ tasks:
     summary: Generates Windows `.ico` and Mac `.icns` from an image; on macOS, `-iconcomposerinput appicon.icon -macassetdir darwin` also produces `Assets.car` from a `.icon` file (skipped on other platforms).
     dir: build
     deps:
+      - task: :env:check
       - task: sync:assets
     sources:
       - "appicon.png"
@@ -165,42 +87,25 @@ tasks:
 
   dev:frontend:
     summary: Runs the frontend in development mode
+    dir: frontend
     deps:
       - task: install:frontend:deps
     cmds:
-      - task: frontend:dev:{{.PACKAGE_MANAGER}}
-
-  frontend:dev:npm:
-    dir: frontend
-    cmds:
       - npm run dev -- --port {{.VITE_PORT}} --strictPort
-
-  frontend:dev:yarn:
-    dir: frontend
-    cmds:
-      - yarn dev --port {{.VITE_PORT}} --strictPort
-
-  frontend:dev:pnpm:
-    dir: frontend
-    cmds:
-      - pnpm dev --port {{.VITE_PORT}} --strictPort
-
-  frontend:dev:bun:
-    dir: frontend
-    cmds:
-      - bun run dev --port {{.VITE_PORT}} --strictPort
 
   update:build-assets:
     summary: Updates the build assets
     dir: build
+    deps:
+      - task: :env:check
     cmds:
       - wails3 update build-assets -name "{{.APP_NAME}}" -binaryname "{{.APP_NAME}}" -config config.yml -dir .
 
   setup:docker:
     summary: Builds Docker image for cross-compilation (~800MB download)
     desc: |
-      Builds the Docker image needed for cross-compiling to any platform.
-      Run this once to enable cross-platform builds from any OS.
+      Builds the image used for Darwin/Windows cross-compilation and Linux builds.
+      Linux CGO builds require an image whose architecture matches the target.
     cmds:
       - docker build --build-arg GARBLE_VERSION={{.GARBLE_VERSION}} -t wails-cross -f build/docker/Dockerfile.cross build/docker/
     preconditions:

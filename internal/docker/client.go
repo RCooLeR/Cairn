@@ -20,18 +20,7 @@ import (
 	"github.com/RCooLeR/Cairn/internal/runtimescope"
 	"github.com/RCooLeR/Cairn/internal/store"
 	cerrdefs "github.com/containerd/errdefs"
-	dockertypes "github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/build"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/events"
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/api/types/registry"
-	"github.com/docker/docker/api/types/system"
-	"github.com/docker/docker/api/types/volume"
-	dockerclient "github.com/docker/docker/client"
-	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+	dockerclient "github.com/moby/moby/client"
 )
 
 const (
@@ -61,51 +50,50 @@ type DialerProvider interface {
 }
 
 type APIClient interface {
-	Ping(context.Context) (dockertypes.Ping, error)
-	Info(context.Context) (system.Info, error)
-	ServerVersion(context.Context) (dockertypes.Version, error)
-	DiskUsage(context.Context, dockertypes.DiskUsageOptions) (dockertypes.DiskUsage, error)
-	ContainerList(context.Context, container.ListOptions) ([]container.Summary, error)
-	ContainerInspectWithRaw(context.Context, string, bool) (container.InspectResponse, []byte, error)
-	ContainerStart(context.Context, string, container.StartOptions) error
-	ContainerStop(context.Context, string, container.StopOptions) error
-	ContainerRestart(context.Context, string, container.StopOptions) error
-	ContainerKill(context.Context, string, string) error
-	ContainerRemove(context.Context, string, container.RemoveOptions) error
-	ContainerUnpause(context.Context, string) error
-	ContainerLogs(context.Context, string, container.LogsOptions) (io.ReadCloser, error)
-	ContainerStats(context.Context, string, bool) (container.StatsResponseReader, error)
-	ContainerStatsOneShot(context.Context, string) (container.StatsResponseReader, error)
-	ContainerTop(context.Context, string, []string) (container.TopResponse, error)
-	ContainerExecCreate(context.Context, string, container.ExecOptions) (container.ExecCreateResponse, error)
-	ContainerExecAttach(context.Context, string, container.ExecAttachOptions) (dockertypes.HijackedResponse, error)
-	ContainerExecResize(context.Context, string, container.ResizeOptions) error
-	ContainerExecInspect(context.Context, string) (container.ExecInspect, error)
-	ContainerCreate(context.Context, *container.Config, *container.HostConfig, *network.NetworkingConfig, *ocispec.Platform, string) (container.CreateResponse, error)
-	ContainerRename(context.Context, string, string) error
-	ImageList(context.Context, image.ListOptions) ([]image.Summary, error)
-	ImageInspectWithRaw(context.Context, string) (image.InspectResponse, []byte, error)
-	ImagePull(context.Context, string, image.PullOptions) (io.ReadCloser, error)
-	ImageTag(context.Context, string, string) error
-	ImagePush(context.Context, string, image.PushOptions) (io.ReadCloser, error)
-	ImageSave(context.Context, []string, ...dockerclient.ImageSaveOption) (io.ReadCloser, error)
-	ImageLoad(context.Context, io.Reader, ...dockerclient.ImageLoadOption) (image.LoadResponse, error)
-	ImageSearch(context.Context, string, registry.SearchOptions) ([]registry.SearchResult, error)
-	ImageRemove(context.Context, string, image.RemoveOptions) ([]image.DeleteResponse, error)
-	ImagesPrune(context.Context, filters.Args) (image.PruneReport, error)
-	ContainersPrune(context.Context, filters.Args) (container.PruneReport, error)
-	BuildCachePrune(context.Context, build.CachePruneOptions) (*build.CachePruneReport, error)
-	VolumeList(context.Context, volume.ListOptions) (volume.ListResponse, error)
-	VolumeInspectWithRaw(context.Context, string) (volume.Volume, []byte, error)
-	VolumeCreate(context.Context, volume.CreateOptions) (volume.Volume, error)
-	VolumeRemove(context.Context, string, bool) error
-	VolumesPrune(context.Context, filters.Args) (volume.PruneReport, error)
-	NetworkList(context.Context, network.ListOptions) ([]network.Summary, error)
-	NetworkInspectWithRaw(context.Context, string, network.InspectOptions) (network.Inspect, []byte, error)
-	NetworkCreate(context.Context, string, network.CreateOptions) (network.CreateResponse, error)
-	NetworkRemove(context.Context, string) error
-	NetworksPrune(context.Context, filters.Args) (network.PruneReport, error)
-	Events(context.Context, events.ListOptions) (<-chan events.Message, <-chan error)
+	Ping(context.Context, dockerclient.PingOptions) (dockerclient.PingResult, error)
+	Info(context.Context, dockerclient.InfoOptions) (dockerclient.SystemInfoResult, error)
+	ServerVersion(context.Context, dockerclient.ServerVersionOptions) (dockerclient.ServerVersionResult, error)
+	DiskUsage(context.Context, dockerclient.DiskUsageOptions) (dockerclient.DiskUsageResult, error)
+	ContainerList(context.Context, dockerclient.ContainerListOptions) (dockerclient.ContainerListResult, error)
+	ContainerInspect(context.Context, string, dockerclient.ContainerInspectOptions) (dockerclient.ContainerInspectResult, error)
+	ContainerStart(context.Context, string, dockerclient.ContainerStartOptions) (dockerclient.ContainerStartResult, error)
+	ContainerStop(context.Context, string, dockerclient.ContainerStopOptions) (dockerclient.ContainerStopResult, error)
+	ContainerRestart(context.Context, string, dockerclient.ContainerRestartOptions) (dockerclient.ContainerRestartResult, error)
+	ContainerKill(context.Context, string, dockerclient.ContainerKillOptions) (dockerclient.ContainerKillResult, error)
+	ContainerRemove(context.Context, string, dockerclient.ContainerRemoveOptions) (dockerclient.ContainerRemoveResult, error)
+	ContainerUnpause(context.Context, string, dockerclient.ContainerUnpauseOptions) (dockerclient.ContainerUnpauseResult, error)
+	ContainerLogs(context.Context, string, dockerclient.ContainerLogsOptions) (dockerclient.ContainerLogsResult, error)
+	ContainerStats(context.Context, string, dockerclient.ContainerStatsOptions) (dockerclient.ContainerStatsResult, error)
+	ContainerTop(context.Context, string, dockerclient.ContainerTopOptions) (dockerclient.ContainerTopResult, error)
+	ExecCreate(context.Context, string, dockerclient.ExecCreateOptions) (dockerclient.ExecCreateResult, error)
+	ExecAttach(context.Context, string, dockerclient.ExecAttachOptions) (dockerclient.ExecAttachResult, error)
+	ExecResize(context.Context, string, dockerclient.ExecResizeOptions) (dockerclient.ExecResizeResult, error)
+	ExecInspect(context.Context, string, dockerclient.ExecInspectOptions) (dockerclient.ExecInspectResult, error)
+	ContainerCreate(context.Context, dockerclient.ContainerCreateOptions) (dockerclient.ContainerCreateResult, error)
+	ContainerRename(context.Context, string, dockerclient.ContainerRenameOptions) (dockerclient.ContainerRenameResult, error)
+	ImageList(context.Context, dockerclient.ImageListOptions) (dockerclient.ImageListResult, error)
+	ImageInspect(context.Context, string, ...dockerclient.ImageInspectOption) (dockerclient.ImageInspectResult, error)
+	ImagePull(context.Context, string, dockerclient.ImagePullOptions) (dockerclient.ImagePullResponse, error)
+	ImageTag(context.Context, dockerclient.ImageTagOptions) (dockerclient.ImageTagResult, error)
+	ImagePush(context.Context, string, dockerclient.ImagePushOptions) (dockerclient.ImagePushResponse, error)
+	ImageSave(context.Context, []string, ...dockerclient.ImageSaveOption) (dockerclient.ImageSaveResult, error)
+	ImageLoad(context.Context, io.Reader, ...dockerclient.ImageLoadOption) (dockerclient.ImageLoadResult, error)
+	ImageSearch(context.Context, string, dockerclient.ImageSearchOptions) (dockerclient.ImageSearchResult, error)
+	ImageRemove(context.Context, string, dockerclient.ImageRemoveOptions) (dockerclient.ImageRemoveResult, error)
+	ImagePrune(context.Context, dockerclient.ImagePruneOptions) (dockerclient.ImagePruneResult, error)
+	ContainerPrune(context.Context, dockerclient.ContainerPruneOptions) (dockerclient.ContainerPruneResult, error)
+	BuildCachePrune(context.Context, dockerclient.BuildCachePruneOptions) (dockerclient.BuildCachePruneResult, error)
+	VolumeList(context.Context, dockerclient.VolumeListOptions) (dockerclient.VolumeListResult, error)
+	VolumeInspect(context.Context, string, dockerclient.VolumeInspectOptions) (dockerclient.VolumeInspectResult, error)
+	VolumeCreate(context.Context, dockerclient.VolumeCreateOptions) (dockerclient.VolumeCreateResult, error)
+	VolumeRemove(context.Context, string, dockerclient.VolumeRemoveOptions) (dockerclient.VolumeRemoveResult, error)
+	VolumePrune(context.Context, dockerclient.VolumePruneOptions) (dockerclient.VolumePruneResult, error)
+	NetworkList(context.Context, dockerclient.NetworkListOptions) (dockerclient.NetworkListResult, error)
+	NetworkInspect(context.Context, string, dockerclient.NetworkInspectOptions) (dockerclient.NetworkInspectResult, error)
+	NetworkCreate(context.Context, string, dockerclient.NetworkCreateOptions) (dockerclient.NetworkCreateResult, error)
+	NetworkRemove(context.Context, string, dockerclient.NetworkRemoveOptions) (dockerclient.NetworkRemoveResult, error)
+	NetworkPrune(context.Context, dockerclient.NetworkPruneOptions) (dockerclient.NetworkPruneResult, error)
+	Events(context.Context, dockerclient.EventsListOptions) dockerclient.EventsResult
 	Close() error
 }
 
@@ -235,7 +223,7 @@ func (c *Client) Connect(ctx context.Context) error {
 
 	pingCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	ping, err := api.Ping(pingCtx)
+	ping, err := api.Ping(pingCtx, dockerclient.PingOptions{NegotiateAPIVersion: true})
 	if err != nil {
 		_ = api.Close()
 		return mapDockerError("ping Docker daemon", err)
@@ -303,7 +291,7 @@ func (c *Client) Ping(ctx context.Context) error {
 	}
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	ping, err := api.Ping(callCtx)
+	ping, err := api.Ping(callCtx, dockerclient.PingOptions{NegotiateAPIVersion: true})
 	if err != nil {
 		return mapDockerError("ping Docker daemon", err)
 	}
@@ -320,11 +308,11 @@ func (c *Client) Info(ctx context.Context) (*models.DockerInfo, error) {
 	}
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	info, err := api.Info(callCtx)
+	info, err := api.Info(callCtx, dockerclient.InfoOptions{})
 	if err != nil {
 		return nil, mapDockerError("read Docker info", err)
 	}
-	return mapInfo(info), nil
+	return mapInfo(info.Info), nil
 }
 
 func (c *Client) Version(ctx context.Context) (*models.DockerVersion, error) {
@@ -334,7 +322,7 @@ func (c *Client) Version(ctx context.Context) (*models.DockerVersion, error) {
 	}
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	version, err := api.ServerVersion(callCtx)
+	version, err := api.ServerVersion(callCtx, dockerclient.ServerVersionOptions{})
 	if err != nil {
 		return nil, mapDockerError("read Docker version", err)
 	}
@@ -348,7 +336,7 @@ func (c *Client) DiskUsage(ctx context.Context) (*models.DiskUsage, error) {
 	}
 	callCtx, cancel := c.withTimeout(ctx)
 	defer cancel()
-	usage, err := api.DiskUsage(callCtx, dockertypes.DiskUsageOptions{})
+	usage, err := api.DiskUsage(callCtx, dockerclient.DiskUsageOptions{})
 	if err != nil {
 		return nil, mapDockerError("read Docker disk usage", err)
 	}
@@ -387,10 +375,7 @@ func (c *Client) healthLoop(ctx context.Context) {
 // have failed. It returns true once the connection is restored (Connect has
 // published "connected"), or false if ctx was cancelled.
 func (c *Client) handleConnectionLoss(ctx context.Context, firstErr error) bool {
-	threshold := c.failureThreshold
-	if threshold < 1 {
-		threshold = 1
-	}
+	threshold := max(c.failureThreshold, 1)
 	attempt := 1
 	backoff := c.backoffMin
 	disconnected := false
@@ -490,10 +475,7 @@ func (c *Client) withTimeout(ctx context.Context) (context.Context, context.Canc
 }
 
 func (c *Client) withInventoryTimeout(ctx context.Context) (context.Context, context.CancelFunc) {
-	timeout := defaultInventoryTimeout
-	if c.unaryTimeout > timeout {
-		timeout = c.unaryTimeout
-	}
+	timeout := max(c.unaryTimeout, defaultInventoryTimeout)
 	return context.WithTimeout(ctx, timeout)
 }
 
@@ -510,10 +492,7 @@ func newSDKClientWithDialer(host string, dialContext func(context.Context, strin
 	if dialContext != nil {
 		opts = append(opts, dockerclient.WithDialContext(dialContext))
 	}
-	opts = append(opts, dockerclient.WithAPIVersionNegotiation())
-	return dockerclient.NewClientWithOpts(
-		opts...,
-	)
+	return dockerclient.New(opts...)
 }
 
 func processBackedHTTPClient() *http.Client {

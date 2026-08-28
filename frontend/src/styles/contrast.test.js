@@ -9,10 +9,6 @@ const themeCSS = readFileSync(
   path.join(frontendRoot, "src/styles/index.css"),
   "utf8",
 );
-const tailwindConfig = readFileSync(
-  path.join(frontendRoot, "tailwind.config.js"),
-  "utf8",
-);
 
 const themeTokensPattern = new RegExp(
   [
@@ -53,9 +49,7 @@ function contrastRatio(foreground, background) {
 describe("semantic text contrast", () => {
   it("keeps secondary and muted text opaque", () => {
     for (const token of ["text-secondary", "text-muted"]) {
-      expect(tailwindConfig).toContain(
-        `"${token}": "rgb(var(--${token}) / <alpha-value>)"`,
-      );
+      expect(themeCSS).toContain(`--color-${token}: rgb(var(--${token}) / 1);`);
     }
   });
 

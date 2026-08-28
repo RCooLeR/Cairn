@@ -1382,8 +1382,8 @@ func serviceNameFromID(serviceID string, projectID string) string {
 			return service
 		}
 	}
-	if idx := strings.LastIndex(serviceID, "/"); idx >= 0 && idx < len(serviceID)-1 {
-		return serviceID[idx+1:]
+	if _, service, ok := strings.CutLast(serviceID, "/"); ok && service != "" {
+		return service
 	}
 	return serviceID
 }
@@ -1393,10 +1393,9 @@ func isLatestTag(imageRef string) bool {
 	if imageRef == "" || strings.Contains(imageRef, "@") {
 		return false
 	}
-	lastSlash := strings.LastIndex(imageRef, "/")
-	lastColon := strings.LastIndex(imageRef, ":")
-	if lastColon <= lastSlash {
+	_, tag, ok := strings.CutLast(imageRef, ":")
+	if !ok || strings.Contains(tag, "/") {
 		return true
 	}
-	return strings.EqualFold(imageRef[lastColon+1:], "latest")
+	return strings.EqualFold(tag, "latest")
 }
