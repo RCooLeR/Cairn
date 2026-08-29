@@ -1,8 +1,5 @@
 version: '3'
 
-includes:
-  common: ../Taskfile.yml
-
 vars:
   # Signing configuration - edit these values for your project
   # SIGN_CERTIFICATE: "path/to/certificate.pfx"
@@ -37,7 +34,7 @@ tasks:
     summary: Builds the application using native Go cross-compilation
     internal: true
     deps:
-      - task: common:build:frontend
+      - task: :common:build:frontend
         vars:
           OBFUSCATED:
             ref: .OBFUSCATED
@@ -72,7 +69,7 @@ tasks:
     summary: Cross-compiles for Windows using Docker with Zig (for CGO builds on non-Windows)
     internal: true
     deps:
-      - task: common:build:frontend
+      - task: :common:build:frontend
         vars:
           OBFUSCATED:
             ref: .OBFUSCATED
@@ -119,7 +116,7 @@ tasks:
     summary: Generates Windows `.syso` file
     dir: build
     cmds:
-      - task: common:generate:icons
+      - task: :common:generate:icons
       - wails3 generate syso -arch {{.ARCH}} -icon windows/icon.ico -manifest windows/wails.exe.manifest -info windows/info.json -out ../wails_windows_{{.ARCH}}.syso
     vars:
       ARCH: '{{.ARCH | default ARCH}}'

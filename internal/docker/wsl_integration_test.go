@@ -5,6 +5,7 @@ package docker
 import (
 	"context"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,22 +16,27 @@ import (
 
 func TestWindowsWSLDockerConnection(t *testing.T) {
 	if os.Getenv("CAIRN_REAL_WSL_DOCKER") != "1" {
-		t.Skip("set CAIRN_REAL_WSL_DOCKER=1 to run against the local cairn-dev WSL distro")
+		t.Skip("set CAIRN_REAL_WSL_DOCKER=1 to run against a local WSL Docker distro")
+	}
+	distro := strings.TrimSpace(os.Getenv("CAIRN_REAL_WSL_DISTRO"))
+	if distro == "" {
+		distro = "cairn-dev"
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
-	provider := providers.NewWindowsWSL(providers.WindowsWSLOptions{Distro: "cairn-dev"})
+	provider := providers.NewWindowsWSL(providers.WindowsWSLOptions{Distro: distro})
 	status, err := provider.Detect(ctx)
 	if err != nil {
 		t.Fatalf("provider Detect() error = %v", err)
 	}
 	if !status.Healthy {
-		t.Fatalf("cairn-dev WSL provider is not healthy: %#v", status.Problems)
+		t.Fatalf("%s WSL provider is not healthy: %#v", distro, status.Problems)
 	}
-	if status.DockerHost != "wsl+stdio://cairn-dev" {
-		t.Fatalf("DockerHost marker = %q, want wsl+stdio://cairn-dev", status.DockerHost)
+	wantDockerHost := "wsl+stdio://" + distro
+	if status.DockerHost != wantDockerHost {
+		t.Fatalf("DockerHost marker = %q, want %s", status.DockerHost, wantDockerHost)
 	}
 
 	eventBus := bus.New()

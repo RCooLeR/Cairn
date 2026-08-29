@@ -490,7 +490,10 @@ func newSDKClientWithDialer(host string, dialContext func(context.Context, strin
 	}
 	opts = append(opts, dockerclient.WithHost(host))
 	if dialContext != nil {
-		opts = append(opts, dockerclient.WithDialContext(dialContext))
+		// Process-backed dialers terminate at a Docker unix socket and carry
+		// plain HTTP. Be explicit because cloning a custom transport can give it
+		// a non-nil TLS config, which makes the Moby client infer HTTPS.
+		opts = append(opts, dockerclient.WithScheme("http"), dockerclient.WithDialContext(dialContext))
 	}
 	return dockerclient.New(opts...)
 }

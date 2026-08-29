@@ -13,6 +13,7 @@ import (
 	"iter"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -194,6 +195,40 @@ func TestProcessBackedHTTPClientDoesNotCapActiveStreams(t *testing.T) {
 	}
 	if transport.IdleConnTimeout <= 0 {
 		t.Fatal("IdleConnTimeout <= 0")
+	}
+}
+
+func TestNewSDKClientWithDialerUsesPlainHTTP(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead || r.URL.Path != "/_ping" {
+			t.Errorf("request = %s %s, want HEAD /_ping", r.Method, r.URL.Path)
+			http.Error(w, "unexpected request", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("API-Version", "1.55")
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+
+	dialer := func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp", server.Listener.Addr().String())
+	}
+	api, err := newSDKClientWithDialer("unix:///var/run/docker.sock", dialer)
+	if err != nil {
+		t.Fatalf("newSDKClientWithDialer() error = %v", err)
+	}
+	t.Cleanup(func() { _ = api.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ping, err := api.Ping(ctx, dockerclient.PingOptions{NegotiateAPIVersion: true})
+	if err != nil {
+		t.Fatalf("Ping() over process-backed dialer error = %v", err)
+	}
+	if ping.APIVersion != "1.55" {
+		t.Fatalf("Ping() API version = %q, want 1.55", ping.APIVersion)
 	}
 }
 

@@ -1,8 +1,5 @@
 version: '3'
 
-includes:
-  common: ../Taskfile.yml
-
 vars:
   # Signing configuration - edit these values for your project
   # SIGN_IDENTITY: "Developer ID Application: Your Company (TEAMID)"
@@ -35,13 +32,13 @@ tasks:
     summary: Builds the application natively on macOS
     internal: true
     deps:
-      - task: common:build:frontend
+      - task: :common:build:frontend
         vars:
           OBFUSCATED:
             ref: .OBFUSCATED
           DEV:
             ref: .DEV
-      - task: common:generate:icons
+      - task: :common:generate:icons
     preconditions:
       - sh: '{{if eq .OBFUSCATED "true"}}command -v garble >/dev/null 2>&1{{else}}true{{end}}'
         msg: "{{.GARBLE_INSTALL_HINT}}"
@@ -63,11 +60,11 @@ tasks:
     summary: Cross-compiles for macOS using Docker (for Linux/Windows hosts)
     internal: true
     deps:
-      - task: common:build:frontend
+      - task: :common:build:frontend
         vars:
           OBFUSCATED:
             ref: .OBFUSCATED
-      - task: common:generate:icons
+      - task: :common:generate:icons
     preconditions:
       - sh: docker info > /dev/null 2>&1
         msg: "Docker is required for cross-compilation. Please install Docker."

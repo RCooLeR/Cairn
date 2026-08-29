@@ -1,8 +1,5 @@
 version: '3'
 
-includes:
-  common: ../Taskfile.yml
-
 vars:
   # Signing configuration - edit these values for your project
   # PGP_KEY: "path/to/signing-key.asc"
@@ -46,13 +43,13 @@ tasks:
     summary: Builds the application natively on Linux
     internal: true
     deps:
-      - task: common:build:frontend
+      - task: :common:build:frontend
         vars:
           OBFUSCATED:
             ref: .OBFUSCATED
           DEV:
             ref: .DEV
-      - task: common:generate:icons
+      - task: :common:generate:icons
       - task: generate:dotdesktop
     preconditions:
       - sh: '{{if eq .OBFUSCATED "true"}}command -v garble >/dev/null 2>&1{{else}}true{{end}}'
@@ -72,11 +69,11 @@ tasks:
     summary: Builds for Linux using a same-architecture Docker image
     internal: true
     deps:
-      - task: common:build:frontend
+      - task: :common:build:frontend
         vars:
           OBFUSCATED:
             ref: .OBFUSCATED
-      - task: common:generate:icons
+      - task: :common:generate:icons
       - task: generate:dotdesktop
     preconditions:
       - sh: docker info > /dev/null 2>&1
