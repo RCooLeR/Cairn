@@ -42,6 +42,7 @@ tasks:
   build:native:
     summary: Builds the application natively on Linux
     internal: true
+    dir: src
     deps:
       - task: :common:build:frontend
         vars:
@@ -55,7 +56,7 @@ tasks:
       - sh: '{{if eq .OBFUSCATED "true"}}command -v garble >/dev/null 2>&1{{else}}true{{end}}'
         msg: "{{.GARBLE_INSTALL_HINT}}"
     cmds:
-      - '{{if eq .OBFUSCATED "true"}}garble {{.GARBLE_ARGS}} build{{else}}go build{{end}} {{.BUILD_FLAGS}} -o {{.OUTPUT}}'
+      - '{{if eq .OBFUSCATED "true"}}garble {{.GARBLE_ARGS}} build{{else}}go build{{end}} {{.BUILD_FLAGS}} -o "{{if osIsAbs .OUTPUT}}{{.OUTPUT | toSlash}}{{else}}{{joinPath .ROOT_DIR .OUTPUT | toSlash}}{{end}}"'
     vars:
       BUILD_FLAGS: '-mod=readonly {{if eq .DEV "true"}}{{if or .EXTRA_TAGS (eq .OBFUSCATED "true")}}-tags {{if eq .OBFUSCATED "true"}}wails_obfuscated{{if .EXTRA_TAGS}},{{end}}{{end}}{{.EXTRA_TAGS}} {{end}}-buildvcs=false -gcflags=all="-l"{{else}}-tags production{{if eq .OBFUSCATED "true"}},wails_obfuscated{{end}}{{if .EXTRA_TAGS}},{{.EXTRA_TAGS}}{{end}} -trimpath -buildvcs=false -ldflags="-w -s -X github.com/RCooLeR/Cairn/internal/services.Version={{.APP_VERSION | default "1.0.0"}} -X github.com/RCooLeR/Cairn/internal/services.Commit={{.GIT_COMMIT | default ""}} -X github.com/RCooLeR/Cairn/internal/services.BuildDate={{.BUILD_DATE | default ""}}"{{end}}'
       DEFAULT_OUTPUT: '{{.BIN_DIR}}/{{.APP_NAME}}'
@@ -92,10 +93,9 @@ tasks:
       DOCKER_ARCH: '{{.ARCH | default "amd64"}}'
       DEFAULT_OUTPUT: '{{.BIN_DIR}}/{{.APP_NAME}}'
       OUTPUT: '{{ .OUTPUT | default .DEFAULT_OUTPUT }}'
-      # Generate Docker volume mounts: Go module cache + go.mod replace directives
-      # Uses wails3 tool docker-mounts for cross-platform compatibility (Windows/Linux/macOS)
+      # Resolve local module replacements relative to /app/src in the container.
       DOCKER_MOUNTS:
-        sh: 'wails3 tool docker-mounts'
+        sh: '{{if eq OS "windows"}}powershell -NoProfile -ExecutionPolicy Bypass{{else}}pwsh -NoProfile{{end}} -File scripts/get-docker-mounts.ps1'
 
   package:
     summary: Packages the application for Linux

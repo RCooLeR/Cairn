@@ -1,0 +1,451 @@
+package portforward
+
+import (
+	"context"
+	"errors"
+	"io"
+	"log/slog"
+	"maps"
+	"net"
+	"sort"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/RCooLeR/Cairn/internal/bus"
+	"github.com/RCooLeR/Cairn/internal/models"
+)
+
+// NewManager builds a port-forward manager. docker and dialer are required;
+// when either is nil the manager is inert (Start is a no-op), which lets the
+// app construct it uniformly for providers that do not support forwarding.
+func NewManager(docker DockerLister, dialer Dialer, events bus.Bus, opts Options) *Manager {
+	m := &Manager{
+		docker:            docker,
+		dialer:            dialer,
+		events:            events,
+		reconcileInterval: opts.ReconcileInterval,
+		now:               opts.Now,
+		listen:            opts.Listen,
+		listenPacket:      opts.ListenPacket,
+		enabled:           opts.Enabled,
+		forwards:          map[string]*forward{},
+	}
+	if m.reconcileInterval <= 0 {
+		m.reconcileInterval = defaultReconcileInterval
+	}
+	if m.now == nil {
+		m.now = func() time.Time { return time.Now().UTC() }
+	}
+	if m.listen == nil {
+		m.listen = func(ctx context.Context, network, address string) (net.Listener, error) {
+			var lc net.ListenConfig
+			return lc.Listen(ctx, network, address)
+		}
+	}
+	if m.listenPacket == nil {
+		m.listenPacket = func(ctx context.Context, network, address string) (net.PacketConn, error) {
+			var lc net.ListenConfig
+			return lc.ListenPacket(ctx, network, address)
+		}
+	}
+	return m
+}
+
+// Start begins watching containers and binding host forwards. It is safe to
+// call more than once; subsequent calls are no-ops until StopAll.
+func (m *Manager) Start(ctx context.Context) {
+	if m == nil || m.docker == nil || m.dialer == nil {
+		return
+	}
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	m.mu.Lock()
+	if m.started {
+		m.mu.Unlock()
+		return
+	}
+	m.ctx, m.cancel = context.WithCancel(ctx)
+	m.started = true
+	m.wg.Add(2)
+	m.mu.Unlock()
+
+	go m.reconcileLoop()
+	go m.watchObjects()
+}
+
+// StopAll cancels the manager, closes every host listener and live relay
+// connection, and blocks until all goroutines have returned.
+func (m *Manager) StopAll() {
+	if m == nil {
+		return
+	}
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	m.mu.Lock()
+	if !m.started {
+		m.mu.Unlock()
+		return
+	}
+	if m.cancel != nil {
+		m.cancel()
+	}
+	m.started = false
+	m.mu.Unlock()
+
+	m.reconcileMu.Lock()
+	m.mu.Lock()
+	forwards := make([]*forward, 0, len(m.forwards))
+	for key, fwd := range m.forwards {
+		delete(m.forwards, key)
+		forwards = append(forwards, fwd)
+	}
+	m.mu.Unlock()
+	m.reconcileMu.Unlock()
+
+	for _, fwd := range forwards {
+		fwd.stop()
+	}
+	m.wg.Wait()
+}
+
+// Enabled reports whether auto-forwarding is currently on.
+func (m *Manager) Enabled() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.enabled
+}
+
+// SetEnabled toggles auto-forwarding. Turning it off tears down every forward;
+// turning it on reconciles immediately against the running containers.
+func (m *Manager) SetEnabled(enabled bool) {
+	m.mu.Lock()
+	if m.enabled == enabled {
+		m.mu.Unlock()
+		return
+	}
+	m.enabled = enabled
+	ctx := m.ctx
+	started := m.started
+	m.mu.Unlock()
+	if started && ctx != nil {
+		m.reconcileOnce(ctx)
+	}
+}
+
+// ListForwards returns the current forwards sorted by port then protocol.
+func (m *Manager) ListForwards() []models.PortForward {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]models.PortForward, 0, len(m.forwards))
+	for _, fwd := range m.forwards {
+		status, reason := fwd.state()
+		out = append(out, models.PortForward{
+			Protocol:      fwd.spec.protocol,
+			HostPort:      fwd.spec.hostPort,
+			BindAddr:      fwd.spec.bindAddr,
+			ContainerID:   fwd.spec.containerID,
+			ContainerName: fwd.spec.containerName,
+			Status:        status,
+			Reason:        reason,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].HostPort != out[j].HostPort {
+			return out[i].HostPort < out[j].HostPort
+		}
+		if out[i].Protocol != out[j].Protocol {
+			return out[i].Protocol < out[j].Protocol
+		}
+		if out[i].BindAddr != out[j].BindAddr {
+			return out[i].BindAddr < out[j].BindAddr
+		}
+		return out[i].ContainerID < out[j].ContainerID
+	})
+	return out
+}
+
+func (m *Manager) reconcileLoop() {
+	defer m.wg.Done()
+	ticker := time.NewTicker(m.reconcileInterval)
+	defer ticker.Stop()
+	m.reconcileOnce(m.ctx)
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-ticker.C:
+			m.reconcileOnce(m.ctx)
+		}
+	}
+}
+
+// watchObjects reconciles promptly when the container inventory changes instead
+// of waiting for the next tick.
+func (m *Manager) watchObjects() {
+	defer m.wg.Done()
+	if m.events == nil {
+		return
+	}
+	ch := m.events.Subscribe(m.ctx, bus.TopicObjectsChanged, 16)
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case _, ok := <-ch:
+			if !ok {
+				return
+			}
+			m.reconcileOnce(m.ctx)
+		}
+	}
+}
+
+// reconcileOnce diffs the desired forwards against the live ones, starting and
+// stopping host listeners as containers come and go. It is serialized by
+// reconcileMu so the ticker and the objects:changed watcher never race.
+func (m *Manager) reconcileOnce(ctx context.Context) {
+	if ctx == nil || ctx.Err() != nil {
+		return
+	}
+	m.reconcileMu.Lock()
+	defer m.reconcileMu.Unlock()
+	if ctx.Err() != nil {
+		return
+	}
+
+	m.mu.Lock()
+	enabled := m.enabled
+	current := make(map[string]*forward, len(m.forwards))
+	maps.Copy(current, m.forwards)
+	m.mu.Unlock()
+
+	desired := map[string]spec{}
+	if enabled {
+		containers, err := m.docker.ListContainers(ctx, models.ContainerListOptions{All: false})
+		if err != nil {
+			// Leave existing forwards in place on a transient list failure so a
+			// daemon blip does not tear down working forwards.
+			return
+		}
+		desired = desiredForwards(containers)
+	}
+	if ctx.Err() != nil {
+		return
+	}
+
+	changed := false
+	for key, fwd := range current {
+		if want, ok := desired[key]; ok && reusableForward(fwd, want) {
+			continue
+		}
+		m.mu.Lock()
+		delete(m.forwards, key)
+		m.mu.Unlock()
+		fwd.stop()
+		delete(current, key)
+		changed = true
+	}
+
+	for key, want := range desired {
+		if existing, ok := current[key]; ok && reusableForward(existing, want) {
+			continue
+		}
+		fwd := m.startForward(ctx, want)
+		m.mu.Lock()
+		if !m.started || ctx.Err() != nil {
+			m.mu.Unlock()
+			fwd.stop()
+			continue
+		}
+		m.forwards[key] = fwd
+		m.mu.Unlock()
+		changed = true
+	}
+
+	if changed {
+		m.publishChanged()
+	}
+}
+
+func reusableForward(existing *forward, desired spec) bool {
+	if existing == nil || existing.spec != desired {
+		return false
+	}
+	// Policy/shape failures are deterministic for this exact desired snapshot.
+	// Keep the visible row until inventory changes instead of retrying and
+	// re-emitting it on every reconciliation tick. Listener/dial failures remain
+	// retryable because their blockedReason is empty.
+	return desired.blockedReason != "" || !existing.failed()
+}
+
+func (m *Manager) startForward(ctx context.Context, s spec) *forward {
+	fctx, cancel := context.WithCancel(ctx)
+	fwd := &forward{spec: s, cancel: cancel, status: statusActive, closers: map[interface{ Close() error }]struct{}{}}
+	if s.blockedReason != "" {
+		fwd.fail(errors.New(s.blockedReason))
+		cancel()
+		return fwd
+	}
+	address := net.JoinHostPort(s.bindAddr, strconv.Itoa(s.hostPort))
+
+	if s.protocol == protoUDP {
+		conn, err := m.listenPacket(fctx, "udp", address)
+		if err != nil {
+			fwd.fail(err)
+			cancel()
+			return fwd
+		}
+		fwd.track(conn)
+		fwd.wg.Add(1)
+		go m.serveUDP(fctx, fwd, conn)
+		slog.Info("port forward bound", "protocol", protoUDP, "address", address, "container", s.containerName)
+		return fwd
+	}
+
+	listener, err := m.listen(fctx, "tcp", address)
+	if err != nil {
+		fwd.fail(err)
+		cancel()
+		return fwd
+	}
+	fwd.track(listener)
+	fwd.wg.Add(1)
+	go m.serveTCP(fctx, fwd, listener)
+	slog.Info("port forward bound", "protocol", protoTCP, "address", address, "container", s.containerName)
+	return fwd
+}
+
+func (m *Manager) serveTCP(ctx context.Context, fwd *forward, listener net.Listener) {
+	defer fwd.wg.Done()
+	for {
+		conn, err := listener.Accept()
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			var netErr net.Error
+			if errors.As(err, &netErr) && netErr.Timeout() {
+				continue
+			}
+			fwd.fail(err)
+			m.publishChanged()
+			return
+		}
+		fwd.track(conn)
+		fwd.wg.Go(func() {
+			defer fwd.untrack(conn)
+			m.relayTCP(ctx, fwd, conn)
+		})
+	}
+}
+
+func (m *Manager) relayTCP(ctx context.Context, fwd *forward, client net.Conn) {
+	backend, err := m.dialer.DialStream(ctx, fwd.spec.hostPort)
+	if err != nil {
+		_ = client.Close()
+		return
+	}
+	fwd.track(backend)
+	defer fwd.untrack(backend)
+	relay(ctx, client, backend)
+}
+
+// relay copies bytes in both directions until either side closes or the context
+// is cancelled, then closes both ends exactly once.
+func relay(ctx context.Context, a, b net.Conn) {
+	done := make(chan struct{})
+	var once sync.Once
+	closeBoth := func() {
+		once.Do(func() {
+			_ = a.Close()
+			_ = b.Close()
+			close(done)
+		})
+	}
+	go func() {
+		select {
+		case <-ctx.Done():
+			closeBoth()
+		case <-done:
+		}
+	}()
+	var copies sync.WaitGroup
+	copies.Add(2)
+	go func() {
+		defer copies.Done()
+		_, _ = io.Copy(b, a)
+		closeBoth()
+	}()
+	go func() {
+		defer copies.Done()
+		_, _ = io.Copy(a, b)
+		closeBoth()
+	}()
+	copies.Wait()
+}
+
+func (m *Manager) publishChanged() {
+	if m.events == nil {
+		return
+	}
+	m.events.Publish(bus.Event{Topic: bus.TopicPortForwardChanged, TS: m.now(), Payload: m.ListForwards()})
+}
+
+func (f *forward) fail(err error) {
+	f.mu.Lock()
+	f.status = statusError
+	f.reason = err.Error()
+	f.mu.Unlock()
+	slog.Warn("port forward could not bind host port",
+		"protocol", f.spec.protocol, "port", f.spec.hostPort, "bind", f.spec.bindAddr, "error", err)
+}
+
+func (f *forward) failed() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.status == statusError
+}
+
+func (f *forward) state() (string, string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.status, f.reason
+}
+
+func (f *forward) track(closer interface{ Close() error }) {
+	f.mu.Lock()
+	if f.stopped {
+		f.mu.Unlock()
+		// Accept or dial can complete concurrently with shutdown. Such a
+		// connection missed stop's snapshot and must never remain open.
+		_ = closer.Close()
+		return
+	}
+	f.closers[closer] = struct{}{}
+	f.mu.Unlock()
+}
+
+func (f *forward) untrack(closer interface{ Close() error }) {
+	f.mu.Lock()
+	delete(f.closers, closer)
+	f.mu.Unlock()
+}
+
+func (f *forward) stop() {
+	if f.cancel != nil {
+		f.cancel()
+	}
+	f.mu.Lock()
+	f.stopped = true
+	closers := make([]interface{ Close() error }, 0, len(f.closers))
+	for closer := range f.closers {
+		closers = append(closers, closer)
+	}
+	f.closers = map[interface{ Close() error }]struct{}{}
+	f.mu.Unlock()
+	for _, closer := range closers {
+		_ = closer.Close()
+	}
+	f.wg.Wait()
+}

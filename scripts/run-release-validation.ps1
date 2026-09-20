@@ -9,6 +9,7 @@ $ErrorActionPreference = "Stop"
 
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 $root = (Resolve-Path (Join-Path $scriptDir "..")).Path
+$sourceRoot = Join-Path $root "src"
 $runningOnLinux = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Linux)
 
 function Invoke-ReleaseStep([string]$Name, [scriptblock]$Step) {
@@ -20,7 +21,7 @@ function Invoke-ReleaseStep([string]$Name, [scriptblock]$Step) {
 }
 
 function Invoke-GoTest([string[]]$Packages, [string[]]$GoArgs) {
-  Push-Location $root
+  Push-Location $sourceRoot
   try {
     & go test @Packages @GoArgs
     if ($LASTEXITCODE -ne 0) {
@@ -40,7 +41,7 @@ function Invoke-GoTestNames([string]$Package, [string[]]$TestNames, [string]$Tim
   $started = New-Object "System.Collections.Generic.HashSet[string]"
   $output = @()
 
-  Push-Location $root
+  Push-Location $sourceRoot
   try {
     $output = & go test $Package -json -run $runPattern -count=1 "-timeout=$Timeout" 2>&1
     $exitCode = $LASTEXITCODE
@@ -74,7 +75,7 @@ function Invoke-GoTestNames([string]$Package, [string[]]$TestNames, [string]$Tim
 }
 
 function Invoke-FrontendNpm([string[]]$NpmArgs) {
-  Push-Location (Join-Path $root "frontend")
+  Push-Location (Join-Path $sourceRoot "frontend")
   try {
     & npm @NpmArgs
     if ($LASTEXITCODE -ne 0) {

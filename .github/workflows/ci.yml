@@ -35,7 +35,8 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          go-version-file: src/go.mod
+          cache-dependency-path: src/go.sum
           cache: true
 
       - name: Setup Node
@@ -43,7 +44,10 @@ jobs:
         with:
           node-version-file: .node-version
           cache: npm
-          cache-dependency-path: frontend/package-lock.json
+          cache-dependency-path: src/frontend/package-lock.json
+
+      - name: Install pinned npm
+        run: npm install --global npm@12.0.2
 
       - name: Cache Wails CLI
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -51,7 +55,7 @@ jobs:
           path: |
             ~/go/bin/wails3
             ~/go/bin/wails3.exe
-          key: ${{ runner.os }}-go1.27.0-wails3-v3.0.0-beta.15
+          key: ${{ runner.os }}-go1.27.1-wails3-v3.0.0-beta.23
 
       - name: Install Wails CLI
         shell: pwsh
@@ -60,13 +64,17 @@ jobs:
           Add-Content -Path $env:GITHUB_PATH -Value $goBin
           $wailsExe = Join-Path $goBin ($(if ($IsWindows) { "wails3.exe" } else { "wails3" }))
           if (!(Test-Path -LiteralPath $wailsExe)) {
-            go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.15
+            go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.23
           }
           go version -m $wailsExe
 
       - name: Assert toolchain contract
         shell: pwsh
         run: ./scripts/check-toolchain.ps1
+
+      - name: Cross-build mount layout tests
+        shell: pwsh
+        run: ./scripts/test-docker-mounts.ps1
 
       - name: Install Linux Wails dependencies
         if: runner.os == 'Linux'
@@ -86,44 +94,45 @@ jobs:
           docker buildx version
 
       - name: Install frontend dependencies
-        working-directory: frontend
+        working-directory: src/frontend
         run: npm ci
 
       - name: Frontend dependency audit
-        working-directory: frontend
+        working-directory: src/frontend
         run: npm run audit
 
       - name: Generate Wails bindings
+        working-directory: src
         run: |
-          go run github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.15 generate bindings -clean=true -time-type=string -ts
+          go run github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.23 generate bindings -clean=true -time-type=string -ts
           node frontend/scripts/normalize-generated-bindings.mjs
 
       - name: Verify generated bindings are committed
         shell: bash
-        run: git diff --exit-code -- frontend/bindings
+        run: git diff --exit-code -- src/frontend/bindings
 
       - name: Frontend lint
-        working-directory: frontend
+        working-directory: src/frontend
         run: npm run lint
 
       - name: Frontend format check
-        working-directory: frontend
+        working-directory: src/frontend
         run: npm run format:check
 
       - name: Frontend typecheck
-        working-directory: frontend
+        working-directory: src/frontend
         run: npm run typecheck
 
       - name: Frontend unit tests
-        working-directory: frontend
+        working-directory: src/frontend
         run: npm test
 
       - name: Component catalog build
-        working-directory: frontend
+        working-directory: src/frontend
         run: npm run ladle:build
 
       - name: Frontend build
-        working-directory: frontend
+        working-directory: src/frontend
         run: npm run build
 
       - name: Server mode containment
@@ -134,10 +143,10 @@ jobs:
         if: runner.os == 'Linux'
         env:
           CGO_ENABLED: "0"
-        run: go test -tags=server,cairn_server_dev .
+        run: go -C src test -tags=server,cairn_server_dev .
 
       - name: Go unit tests
-        run: go test ./...
+        run: go -C src test ./...
 
       - name: Go vulnerability scan
         shell: pwsh
@@ -148,56 +157,56 @@ jobs:
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           distribution: goreleaser
-          version: "v2.18.0"
+          version: "v2.18.2"
           args: check
 
       - name: Docker reconnect integration
         if: runner.os == 'Linux'
         env:
           CAIRN_REAL_DOCKER_RESTART: "1"
-        run: go test ./internal/docker -run TestClientRealDockerRestartIntegration -count=1 -timeout=2m
+        run: go -C src test ./internal/docker -run TestClientRealDockerRestartIntegration -count=1 -timeout=2m
 
       - name: Log streaming integration
         if: runner.os == 'Linux'
         env:
           CAIRN_REAL_DOCKER_LOGS: "1"
-        run: go test ./internal/logsvc -run TestManagerRealDockerBigLogsIntegration -count=1 -timeout=3m
+        run: go -C src test ./internal/logsvc -run TestManagerRealDockerBigLogsIntegration -count=1 -timeout=3m
 
       - name: Metrics integration
         if: runner.os == 'Linux'
         env:
           CAIRN_REAL_DOCKER_METRICS: "1"
-        run: go test ./internal/metrics -run TestManagerRealDockerStatsIntegration -count=1 -timeout=3m
+        run: go -C src test ./internal/metrics -run TestManagerRealDockerStatsIntegration -count=1 -timeout=3m
 
       - name: Terminal integration
         if: runner.os == 'Linux'
         env:
           CAIRN_REAL_DOCKER_TERMINAL: "1"
-        run: go test ./internal/terminal -run TestManagerRealDockerContainerTerminalIntegration -count=1 -timeout=3m
+        run: go -C src test ./internal/terminal -run TestManagerRealDockerContainerTerminalIntegration -count=1 -timeout=3m
 
       - name: Backup integration
         if: runner.os == 'Linux'
         env:
           CAIRN_REAL_DOCKER_BACKUPS: "1"
-        run: go test ./internal/backups -run TestManagerRealDockerBackupRestoreRoundTrip -count=1 -timeout=3m
+        run: go -C src test ./internal/backups -run TestManagerRealDockerBackupRestoreRoundTrip -count=1 -timeout=3m
 
       - name: Registry auth integration
         if: runner.os == 'Linux'
         env:
           CAIRN_REAL_DOCKER_REGISTRY: "1"
-        run: go test ./internal/registry -run TestManagerRealDockerRegistryAuthRoundTrip -count=1 -timeout=4m
+        run: go -C src test ./internal/registry -run TestManagerRealDockerRegistryAuthRoundTrip -count=1 -timeout=4m
 
       - name: Registry tag push integration
         if: runner.os == 'Linux'
         env:
           CAIRN_REAL_DOCKER_REGISTRY: "1"
-        run: go test ./internal/docker -run TestClientRealRegistryTagPushRoundTrip -count=1 -timeout=4m
+        run: go -C src test ./internal/docker -run TestClientRealRegistryTagPushRoundTrip -count=1 -timeout=4m
 
       - name: Go vet
-        run: go vet -unsafeptr=false ./...
+        run: go -C src vet -unsafeptr=false ./...
 
       - name: golangci-lint
-        run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2 run --timeout=5m
+        run: go -C src run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2 run --config ../.golangci.yml --timeout=5m
 
   package-smoke:
     name: Package smoke (${{ matrix.os }})
@@ -225,7 +234,8 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          go-version-file: src/go.mod
+          cache-dependency-path: src/go.sum
           cache: true
 
       - name: Setup Node
@@ -233,7 +243,10 @@ jobs:
         with:
           node-version-file: .node-version
           cache: npm
-          cache-dependency-path: frontend/package-lock.json
+          cache-dependency-path: src/frontend/package-lock.json
+
+      - name: Install pinned npm
+        run: npm install --global npm@12.0.2
 
       - name: Cache Wails CLI
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -241,7 +254,7 @@ jobs:
           path: |
             ~/go/bin/wails3
             ~/go/bin/wails3.exe
-          key: ${{ runner.os }}-go1.27.0-wails3-v3.0.0-beta.15
+          key: ${{ runner.os }}-go1.27.1-wails3-v3.0.0-beta.23
 
       - name: Install Linux packaging dependencies
         if: runner.os == 'Linux'
@@ -258,7 +271,7 @@ jobs:
           Add-Content -Path $env:GITHUB_PATH -Value $goBin
           $wailsExe = Join-Path $goBin ($(if ($IsWindows) { "wails3.exe" } else { "wails3" }))
           if (!(Test-Path -LiteralPath $wailsExe)) {
-            go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.15
+            go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.23
           }
           go version -m $wailsExe
 
@@ -274,7 +287,7 @@ jobs:
           Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files (x86)\NSIS"
 
       - name: Install frontend dependencies
-        working-directory: frontend
+        working-directory: src/frontend
         run: npm ci
 
       - name: Cache Playwright browsers
@@ -282,16 +295,16 @@ jobs:
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/ms-playwright
-          key: ${{ runner.os }}-playwright-${{ hashFiles('frontend/package-lock.json') }}
+          key: ${{ runner.os }}-playwright-${{ hashFiles('src/frontend/package-lock.json') }}
 
       - name: Install Playwright browser
         if: runner.os == 'Linux'
-        working-directory: frontend
+        working-directory: src/frontend
         run: npx playwright install --with-deps chromium
 
       - name: Release UI production bundle smoke
         if: runner.os == 'Linux'
-        working-directory: frontend
+        working-directory: src/frontend
         run: npm run test:release-ui
 
       - name: Stamp smoke version and assets
@@ -311,9 +324,9 @@ jobs:
       - name: Verify packaged application Go toolchain
         shell: pwsh
         run: |
-          $goVersion = Select-String -LiteralPath go.mod -Pattern '^\s*go\s+(\d+\.\d+\.\d+)\s*$'
+          $goVersion = Select-String -LiteralPath src/go.mod -Pattern '^\s*go\s+(\d+\.\d+\.\d+)\s*$'
           if ($null -eq $goVersion -or $goVersion.Matches.Count -ne 1) {
-            throw "go.mod must declare exactly one patch-pinned Go version."
+            throw "src/go.mod must declare exactly one patch-pinned Go version."
           }
           $expected = "go$($goVersion.Matches[0].Groups[1].Value)"
           $binary = switch ("${{ matrix.platform }}") {

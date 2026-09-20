@@ -180,10 +180,13 @@ $localPaths = @(
   "project/col-review/00-review.md",
   "claude-review.md",
   "notes/review.md",
-  "frontend/node_modules/react/index.js",
-  "frontend/dist/assets/app.js",
+  "src/frontend/node_modules/react/index.js",
+  "src/frontend/dist/assets/app.js",
   "coverage/report.json",
-  "frontend/test-results/results.json",
+  "src/coverage.out",
+  "src/frontend/coverage/report.json",
+  "src/frontend/test-results/results.json",
+  "src/frontend/playwright-report/index.html",
   "state/cairn.db-wal",
   "logs/cairn.log",
   "logs/diagnostics.json",
@@ -192,18 +195,18 @@ $localPaths = @(
   "backups/file.bak"
 )
 $requiredRootInputs = @(
-  "go.mod",
-  "go.sum",
-  "main.go",
+  "src/go.mod",
+  "src/go.sum",
+  "src/main.go",
   "README.md",
-  "internal/services/services.go",
-  "frontend/package.json",
-  "frontend/package-lock.json",
-  "frontend/src/App.tsx",
+  "src/internal/services/services.go",
+  "src/frontend/package.json",
+  "src/frontend/package-lock.json",
+  "src/frontend/src/App.tsx",
   "build/config.yml",
   "build/docker/Dockerfile.cross",
   "scripts/check-server-mode-containment.ps1",
-  "testdata/projects/build-simple/compose.yaml"
+  "src/testdata/projects/build-simple/compose.yaml"
 )
 Assert-DockerIgnorePolicy "root Docker context" $rootRules ($secretPaths + $localPaths) $requiredRootInputs
 

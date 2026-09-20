@@ -3,12 +3,12 @@ version: '3'
 vars:
   APP_NAME: "cairn"
   BIN_DIR: "bin"
+  BIN_PATH: '{{if osIsAbs .BIN_DIR}}{{.BIN_DIR | toSlash}}{{else}}{{joinPath .ROOT_DIR .BIN_DIR | toSlash}}{{end}}'
   VITE_PORT: '{{.WAILS_VITE_PORT | default 9245}}'
-  # Interim immutable upstream commit with Go 1.27 support; replace it with the
-  # next tagged Garble release after upstream publishes one.
-  GARBLE_VERSION: "v0.17.1-0.20260828084131-08aa939fdc4b"
+  # Tagged release with Go 1.27 support.
+  GARBLE_VERSION: "v0.18.0"
   GARBLE_PACKAGE: "mvdan.cc/garble@{{.GARBLE_VERSION}}"
-  GARBLE_INSTALL_HINT: "garble is required for obfuscated builds. Install the pinned upstream Go 1.27-compatible prerelease with: go install {{.GARBLE_PACKAGE}}. Replace this pseudo-version with the next tagged release when available."
+  GARBLE_INSTALL_HINT: "garble is required for obfuscated builds. Install the pinned Go 1.27-compatible release with: go install {{.GARBLE_PACKAGE}}."
   GOLANGCI_LINT_VERSION: "v2.13.2"
   GOLANGCI_LINT_PACKAGE: "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@{{.GOLANGCI_LINT_VERSION}}"
 includes:
@@ -33,50 +33,52 @@ tasks:
 
   frontend:install:
     summary: Installs the exact frontend dependency lock
-    dir: frontend
+    dir: src/frontend
     cmds:
       - npm ci
 
   frontend:lint:
     summary: Runs frontend lint
-    dir: frontend
+    dir: src/frontend
     cmds:
       - npm run lint
 
   frontend:format:check:
     summary: Checks frontend formatting
-    dir: frontend
+    dir: src/frontend
     cmds:
       - npm run format:check
 
   frontend:test:
     summary: Runs frontend unit tests
-    dir: frontend
+    dir: src/frontend
     cmds:
       - npm test
 
   frontend:build:
     summary: Builds the frontend
-    dir: frontend
+    dir: src/frontend
     cmds:
       - npm run build
 
   frontend:ladle:build:
     summary: Builds frontend component stories
-    dir: frontend
+    dir: src/frontend
     cmds:
       - npm run ladle:build
 
   go:test:
     summary: Runs Go unit tests
+    dir: src
     cmds:
       - go test ./...
 
   go:lint:
     summary: Runs Go static checks
+    dir: src
     cmds:
       - go vet -unsafeptr=false ./...
-      - go run {{.GOLANGCI_LINT_PACKAGE}} run --timeout=5m
+      - go run {{.GOLANGCI_LINT_PACKAGE}} run --config ../.golangci.yml --timeout=5m
 
   go:vuln:
     summary: Runs Go vulnerability scanning
@@ -84,6 +86,14 @@ tasks:
       - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-govulncheck.ps1
         platforms: [windows]
       - cmd: pwsh -NoProfile -File scripts/run-govulncheck.ps1
+        platforms: [linux, darwin]
+
+  docker:mounts:test:
+    summary: Tests source-layout-aware cross-build mounts
+    cmds:
+      - cmd: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-docker-mounts.ps1
+        platforms: [windows]
+      - cmd: pwsh -NoProfile -File scripts/test-docker-mounts.ps1
         platforms: [linux, darwin]
 
   security:server-containment:
@@ -110,6 +120,7 @@ tasks:
   ci:
     summary: Runs the Phase 0.1 CI checks locally
     cmds:
+      - task: docker:mounts:test
       - task: assets:sync
       - task: frontend:lint
       - task: frontend:format:check
@@ -126,14 +137,14 @@ tasks:
     deps:
       - env:check
     cmds:
-      - task: "{{OS}}:build"
+      - task: '{{.GOOS | default OS}}:build'
 
   package:
     summary: Packages a production build of the application
     deps:
       - env:check
     cmds:
-      - task: "{{OS}}:package"
+      - task: '{{.GOOS | default OS}}:package'
 
   run:
     summary: Runs the application

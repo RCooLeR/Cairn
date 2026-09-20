@@ -67,12 +67,14 @@ Unsigned releases are allowed for early public testing, but the artifact names c
 
 ## Local Checks
 
-Run these before tagging when possible:
+Run these from the repository root before tagging when possible:
 
 ```powershell
 task test
 task windows:package
-go run github.com/goreleaser/goreleaser/v2@v2.18.0 check
+go run github.com/goreleaser/goreleaser/v2@v2.18.2 check
 ```
 
 On Linux and macOS, use `task linux:package` and `task darwin:package` respectively.
+
+The root tasks build the Go module in `src/` and the frontend in `src/frontend/`. GoReleaser's version-pinned command above intentionally runs from the root so it finds `.goreleaser.yaml` and the packaged artifacts; it does not build the application module.

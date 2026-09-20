@@ -8,16 +8,16 @@ For that reason, the normal Wails `server` build tag is intentionally blocked, t
 
 The server transport remains available only for narrowly scoped development or security testing. Use a disposable Docker backend, do not handle real credentials or data, and do not leave the process running. Loopback does not make the transport safe from untrusted local software or browser origins.
 
-An explicit development build requires both build tags and a runtime acknowledgement:
+An explicit development build requires both build tags and a runtime acknowledgement. Run these commands from the repository root; the Go module lives in `src/`:
 
 ```powershell
 $env:CAIRN_ENABLE_UNSAFE_SERVER_DEVELOPMENT = "I_ACKNOWLEDGE_THIS_HAS_NO_AUTHENTICATION"
-go run '-tags=server,cairn_server_dev' .
+go -C src run '-tags=server,cairn_server_dev' .
 ```
 
 ```bash
 CAIRN_ENABLE_UNSAFE_SERVER_DEVELOPMENT=I_ACKNOWLEDGE_THIS_HAS_NO_AUTHENTICATION \
-  go run -tags=server,cairn_server_dev .
+  go -C src run -tags=server,cairn_server_dev .
 ```
 
 The application forces `WAILS_SERVER_HOST` to `127.0.0.1` and rejects wildcard or non-loopback values. The acknowledgement is a development tripwire, not authentication.

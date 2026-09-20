@@ -44,15 +44,12 @@
 # Generated binaries, dependencies, coverage, and test output.
 bin
 dist
-frontend/dist
-frontend/node_modules
-node_modules
-coverage
-coverage.out
-playwright-report
-test-results
-frontend/playwright-report
-frontend/test-results
+src/frontend/dist
+**/node_modules
+**/coverage
+**/coverage.out
+**/playwright-report
+**/test-results
 **/*.test
 **/*.exe
 

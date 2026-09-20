@@ -62,7 +62,7 @@ foreach ($directory in @(".github/workflows", "build/docker", "docs", "scripts")
 $forbiddenPatterns = @(
     @{ Pattern = '(?im)^\s*(?:build|run):(server|docker):\s*$'; Description = "an advertised server/container task" },
     @{ Pattern = '(?i)Dockerfile\.server'; Description = "a server-container build path" },
-    @{ Pattern = '(?im)\bgo\s+(?:build|run)\b[^\r\n]*-tags(?:=|\s+)["'']?server(?:[,"''\s]|$)'; Description = "a plain or stable server build command" },
+    @{ Pattern = '(?im)\bgo\s+(?:-C(?:=|\s+)(?:"[^"]+"|''[^'']+''|\S+)\s+)?(?:build|run)\b[^\r\n]*-tags(?:=|\s+)["'']?server(?:[,"''\s]|$)'; Description = "a plain or stable server build command" },
     @{ Pattern = '(?i)WAILS_SERVER_HOST\s*=\s*0\.0\.0\.0'; Description = "a wildcard server bind" }
 )
 
@@ -76,11 +76,11 @@ foreach ($path in $stableSurfaceFiles) {
     }
 }
 
-Assert-FileMatches "main.go" '(?m)^//go:build !server \|\| cairn_server_dev\r?$' "the fail-closed server build constraint"
-Assert-FileMatches "server_mode_disabled.go" '(?m)^//go:build server && !cairn_server_dev\r?$' "the plain-server exclusion guard"
-Assert-FileMatches "server_mode_development.go" '(?m)^//go:build server && cairn_server_dev\r?$' "the explicit development-only server constraint"
-Assert-FileMatches "server_mode_development.go" 'CAIRN_ENABLE_UNSAFE_SERVER_DEVELOPMENT' "an explicit unsafe-development acknowledgement"
-Assert-FileMatches "server_mode_development.go" 'serverDevelopmentHost\s*=\s*"127\.0\.0\.1"' "a forced IPv4 loopback bind"
+Assert-FileMatches "src/main.go" '(?m)^//go:build !server \|\| cairn_server_dev\r?$' "the fail-closed server build constraint"
+Assert-FileMatches "src/server_mode_disabled.go" '(?m)^//go:build server && !cairn_server_dev\r?$' "the plain-server exclusion guard"
+Assert-FileMatches "src/server_mode_development.go" '(?m)^//go:build server && cairn_server_dev\r?$' "the explicit development-only server constraint"
+Assert-FileMatches "src/server_mode_development.go" 'CAIRN_ENABLE_UNSAFE_SERVER_DEVELOPMENT' "an explicit unsafe-development acknowledgement"
+Assert-FileMatches "src/server_mode_development.go" 'serverDevelopmentHost\s*=\s*"127\.0\.0\.1"' "a forced IPv4 loopback bind"
 
 if ($CompileCheck) {
     $temporaryDirectory = Join-Path ([IO.Path]::GetTempPath()) ("cairn-server-containment-" + [Guid]::NewGuid().ToString("N"))
@@ -99,7 +99,7 @@ if ($CompileCheck) {
         $env:GOARCH = "amd64"
         $env:CGO_ENABLED = "0"
 
-        Push-Location $root
+        Push-Location (Join-Path $root "src")
         $savedErrorActionPreference = $null
         try {
             $savedErrorActionPreference = $ErrorActionPreference

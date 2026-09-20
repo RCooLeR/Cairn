@@ -54,7 +54,8 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          go-version-file: src/go.mod
+          cache-dependency-path: src/go.sum
           cache: true
 
       - name: Setup Node
@@ -62,7 +63,10 @@ jobs:
         with:
           node-version-file: .node-version
           cache: npm
-          cache-dependency-path: frontend/package-lock.json
+          cache-dependency-path: src/frontend/package-lock.json
+
+      - name: Install pinned npm
+        run: npm install --global npm@12.0.2
 
       - name: Cache Wails CLI
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -70,7 +74,7 @@ jobs:
           path: |
             ~/go/bin/wails3
             ~/go/bin/wails3.exe
-          key: ${{ runner.os }}-go1.27.0-wails3-v3.0.0-beta.15
+          key: ${{ runner.os }}-go1.27.1-wails3-v3.0.0-beta.23
 
       - name: Install Linux packaging dependencies
         if: runner.os == 'Linux'
@@ -87,7 +91,7 @@ jobs:
           Add-Content -Path $env:GITHUB_PATH -Value $goBin
           $wailsExe = Join-Path $goBin ($(if ($IsWindows) { "wails3.exe" } else { "wails3" }))
           if (!(Test-Path -LiteralPath $wailsExe)) {
-            go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.15
+            go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.23
           }
           go version -m $wailsExe
 
@@ -103,37 +107,37 @@ jobs:
           Add-Content -Path $env:GITHUB_PATH -Value "C:\Program Files (x86)\NSIS"
 
       - name: Install frontend dependencies
-        working-directory: frontend
+        working-directory: src/frontend
         run: npm ci
 
       - name: Frontend dependency audit
-        working-directory: frontend
+        working-directory: src/frontend
         run: npm run audit
 
       - name: Frontend lint
-        working-directory: frontend
+        working-directory: src/frontend
         run: npm run lint
 
       - name: Frontend format check
-        working-directory: frontend
+        working-directory: src/frontend
         run: npm run format:check
 
       - name: Frontend typecheck
-        working-directory: frontend
+        working-directory: src/frontend
         run: npm run typecheck
 
       - name: Frontend unit tests
-        working-directory: frontend
+        working-directory: src/frontend
         run: npm test
 
       - name: Go unit tests
-        run: go test ./...
+        run: go -C src test ./...
 
       - name: Go vet
-        run: go vet -unsafeptr=false ./...
+        run: go -C src vet -unsafeptr=false ./...
 
       - name: Go lint
-        run: go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2 run --timeout=5m
+        run: go -C src run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.13.2 run --config ../.golangci.yml --timeout=5m
 
       - name: Go vulnerability scan
         shell: pwsh
@@ -164,9 +168,9 @@ jobs:
       - name: Verify packaged application Go toolchain
         shell: pwsh
         run: |
-          $goVersion = Select-String -LiteralPath go.mod -Pattern '^\s*go\s+(\d+\.\d+\.\d+)\s*$'
+          $goVersion = Select-String -LiteralPath src/go.mod -Pattern '^\s*go\s+(\d+\.\d+\.\d+)\s*$'
           if ($null -eq $goVersion -or $goVersion.Matches.Count -ne 1) {
-            throw "go.mod must declare exactly one patch-pinned Go version."
+            throw "src/go.mod must declare exactly one patch-pinned Go version."
           }
           $expected = "go$($goVersion.Matches[0].Groups[1].Value)"
           $binary = switch ("${{ matrix.platform }}") {
@@ -347,7 +351,7 @@ jobs:
         run: ./scripts/check-release-artifacts.ps1 -Platform ${{ matrix.platform }} -ExpectedVersion $env:CAIRN_VERSION
 
       - name: Generate package SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           path: bin
           format: spdx-json
@@ -407,7 +411,7 @@ jobs:
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
           distribution: goreleaser
-          version: "v2.18.0"
+          version: "v2.18.2"
           args: release --clean --skip=validate
         env:
           GITHUB_TOKEN: ${{ github.token }}

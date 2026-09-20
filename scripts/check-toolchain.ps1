@@ -6,6 +6,7 @@ $ErrorActionPreference = "Stop"
 
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 $root = (Resolve-Path (Join-Path $scriptDir "..")).Path
+$sourceRoot = Join-Path $root "src"
 
 function Read-SingleCapture(
   [string]$Path,
@@ -33,7 +34,7 @@ function Assert-MinimumVersion(
   [version]$Minimum,
   [string]$Description
 ) {
-  $resolved = Get-Command $Command -ErrorAction SilentlyContinue
+  $resolved = Get-Command $Command -ErrorAction SilentlyContinue | Select-Object -First 1
   if ($null -eq $resolved) {
     throw "$Description was not found on PATH."
   }
@@ -49,7 +50,7 @@ function Assert-MinimumVersion(
   }
 }
 
-$goMod = Join-Path $root "go.mod"
+$goMod = Join-Path $sourceRoot "go.mod"
 $goLanguage = Read-SingleCapture $goMod '^\s*go\s+(\d+\.\d+\.\d+)\s*$' "patch-pinned Go language version"
 $expectedGo = "go$goLanguage"
 $expectedWails = Read-SingleCapture `
@@ -69,19 +70,19 @@ $null = Read-SingleCapture `
   '^\s*\[string\]\$Image\s*=\s*"(debian:stable-slim@sha256:[0-9a-f]{64})"\s*$' `
   "digest-pinned Debian package-smoke image"
 
-$package = Get-Content -LiteralPath (Join-Path $root "frontend/package.json") -Raw | ConvertFrom-Json
+$package = Get-Content -LiteralPath (Join-Path $sourceRoot "frontend/package.json") -Raw | ConvertFrom-Json
 $nodeEngine = [string]$package.engines.node
 $npmEngine = [string]$package.engines.npm
 $frontendWails = [string]$package.dependencies.'@wailsio/runtime'
 if ([string]::IsNullOrWhiteSpace($frontendWails) -or "v$frontendWails" -ne $expectedWails) {
-  throw "frontend/package.json pins @wailsio/runtime '$frontendWails', want $($expectedWails.TrimStart('v')) from go.mod."
+  throw "src/frontend/package.json pins @wailsio/runtime '$frontendWails', want $($expectedWails.TrimStart('v')) from src/go.mod."
 }
 if ($nodeEngine -notmatch '^>=(\d+\.\d+\.\d+)$') {
-  throw "frontend/package.json must declare a simple minimum Node version."
+  throw "src/frontend/package.json must declare a simple minimum Node version."
 }
 $minimumNode = ConvertTo-Version $Matches[1] "Node engine"
 if ($npmEngine -notmatch '^>=(\d+\.\d+\.\d+)$') {
-  throw "frontend/package.json must declare a simple minimum npm version."
+  throw "src/frontend/package.json must declare a simple minimum npm version."
 }
 $minimumNPM = ConvertTo-Version $Matches[1] "npm engine"
 
@@ -161,11 +162,11 @@ foreach ($nsisInstall in $nsisInstalls) {
 }
 
 if (-not $SkipRuntime) {
-  $go = Get-Command go -ErrorAction SilentlyContinue
+  $go = Get-Command go -ErrorAction SilentlyContinue | Select-Object -First 1
   if ($null -eq $go) {
     throw "Go was not found on PATH."
   }
-  $goOutput = @(& $go.Source env GOVERSION)
+  $goOutput = @(& $go.Source -C $sourceRoot env GOVERSION)
   $goSucceeded = $?
   $actualGo = ($goOutput | Select-Object -First 1).Trim()
   if (-not $goSucceeded -or $actualGo -ne $expectedGo) {
@@ -174,7 +175,7 @@ if (-not $SkipRuntime) {
   Assert-MinimumVersion "node" $minimumNode "Node"
   Assert-MinimumVersion "npm" $minimumNPM "npm"
 
-  $wails = Get-Command wails3 -CommandType Application -ErrorAction SilentlyContinue
+  $wails = Get-Command wails3 -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
   if ($null -eq $wails) {
     throw "wails3 was not found on PATH. Install the pinned CLI with: go install github.com/wailsapp/wails/v3/cmd/wails3@$expectedWails"
   }

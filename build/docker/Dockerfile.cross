@@ -6,16 +6,16 @@
 #
 # Usage from the repository root (build the frontend on the pinned host
 # toolchain before entering the cross compiler):
-#   npm --prefix frontend ci
-#   npm --prefix frontend run build
-#   docker build --build-arg GARBLE_VERSION=v0.17.1-0.20260828084131-08aa939fdc4b -t wails-cross -f build/docker/Dockerfile.cross build/docker/
+#   npm --prefix src/frontend ci
+#   npm --prefix src/frontend run build
+#   docker build --build-arg GARBLE_VERSION=v0.18.0 -t wails-cross -f build/docker/Dockerfile.cross build/docker/
 #   docker run --rm -v $(pwd):/app wails-cross darwin arm64
 #   docker run --rm -v $(pwd):/app wails-cross darwin amd64
 #   docker run --rm -v $(pwd):/app wails-cross linux amd64
 #   docker run --rm -v $(pwd):/app wails-cross windows amd64
 #   docker run --rm -v $(pwd):/app wails-cross windows arm64
 
-FROM golang:1.27.0-trixie@sha256:ae28539d2ef595b9a2930dd7f031d9592376829dc0eae7cb869559f7d5812c3a
+FROM golang:1.27.1-trixie@sha256:433790e515d27dc6003e847e644cc0af956985cf315c1c58a3b73ee2dd305183
 
 ARG TARGETARCH
 ARG GARBLE_VERSION
@@ -28,8 +28,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && pkg-config --exists webkitgtk-6.0 \
     && rm -rf /var/lib/apt/lists/*
 
-# Garble does not yet have a tagged Go 1.27-compatible release. The top-level
-# task passes an immutable upstream pseudo-version until the next release.
+# The top-level task passes the tagged Go 1.27-compatible Garble release.
 RUN test -n "${GARBLE_VERSION}" \
     || (echo "GARBLE_VERSION build arg is required. Use the top-level setup:docker task." >&2; exit 1)
 RUN go install mvdan.cc/garble@${GARBLE_VERSION}
@@ -211,8 +210,8 @@ if [ ! -f "frontend/dist/index.html" ]; then
 fi
 
 # Build
-APP=${APP_NAME:-$(basename $(pwd))}
-mkdir -p bin
+APP=${APP_NAME:-cairn}
+mkdir -p ../bin
 
 EXT=""
 LDFLAGS="-s -w -X github.com/RCooLeR/Cairn/internal/services.Version=${APP_VERSION:-1.0.0}"
@@ -238,11 +237,11 @@ if [ "$OBFUSCATED" = "true" ]; then
     TAGS="${TAGS},wails_obfuscated"
 fi
 
-${COMPILER} -mod=readonly -tags "$TAGS" -trimpath -buildvcs=false -ldflags="$LDFLAGS" -o bin/${APP}-${GOOS}-${GOARCH}${EXT} .
-echo "Built: bin/${APP}-${GOOS}-${GOARCH}${EXT}"
+${COMPILER} -mod=readonly -tags "$TAGS" -trimpath -buildvcs=false -ldflags="$LDFLAGS" -o ../bin/${APP}-${GOOS}-${GOARCH}${EXT} .
+echo "Built: ../bin/${APP}-${GOOS}-${GOARCH}${EXT}"
 SCRIPT
 RUN chmod +x /usr/local/bin/build.sh
 
-WORKDIR /app
+WORKDIR /app/src
 ENTRYPOINT ["/usr/local/bin/build.sh"]
 CMD ["darwin", "arm64"]

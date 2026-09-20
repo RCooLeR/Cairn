@@ -1,6 +1,6 @@
 param(
   [string]$Root = "",
-  [string]$Image = "debian:stable-slim@sha256:1710bde34461551a19a47c787885ec9ad7058d9a5bead2affb8d088fa2f8502b"
+  [string]$Image = "debian:stable-slim@sha256:5bc3287b25407c965a30f38e32603dc253a3869e1b12a21ac09bfc27fd8b13ce"
 )
 
 $ErrorActionPreference = "Stop"

@@ -1,0 +1,1407 @@
+package metrics
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"io"
+	"log/slog"
+	"slices"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+	"uuid"
+
+	"github.com/RCooLeR/Cairn/internal/apperror"
+	"github.com/RCooLeR/Cairn/internal/bus"
+	dockercore "github.com/RCooLeR/Cairn/internal/docker"
+	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/store"
+	"github.com/moby/moby/api/types/container"
+)
+
+const (
+	maxDockerStatsResponseBytes int64 = 2 * 1024 * 1024
+	maxDockerStatsStreamBytes   int64 = 32 * 1024 * 1024
+)
+
+func NewManager(docker DockerClient, repo *store.MetricsRepository, projects *store.ProjectRepository, audit *store.AuditRepository, events bus.Bus, opts Options) *Manager {
+	manager := &Manager{
+		Docker:     docker,
+		Repository: repo,
+		Projects:   projects,
+		Audit:      audit,
+		Events:     events,
+		Scope:      opts.Scope,
+	}
+	manager.applyOptions(opts)
+	if manager.retentionFunc == nil && repo != nil {
+		rawRetention := manager.rawRetention
+		manager.retentionFunc = func(ctx context.Context, now time.Time) error {
+			return repo.RetainAndDownsampleWithRawRetention(ctx, now, rawRetention)
+		}
+	}
+	return manager
+}
+
+func (m *Manager) Start(ctx context.Context) {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	m.ensureReady()
+	if m.requireDocker() != nil {
+		return
+	}
+	m.mu.Lock()
+	if m.started {
+		m.mu.Unlock()
+		return
+	}
+	m.ctx, m.cancel = context.WithCancel(ctx)
+	m.started = true
+	m.wg.Add(2)
+	m.mu.Unlock()
+
+	go func() {
+		defer m.wg.Done()
+		m.reconcileLoop()
+	}()
+	go func() {
+		defer m.wg.Done()
+		m.persistLoop()
+	}()
+}
+
+func (m *Manager) StopAll() {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	m.ensureReady()
+	m.mu.Lock()
+	if m.cancel != nil {
+		m.cancel()
+	}
+	sessions := make([]*streamSession, 0, len(m.sessions))
+	for id, session := range m.sessions {
+		delete(m.sessions, id)
+		sessions = append(sessions, session)
+	}
+	watchers := make([]*containerWatcher, 0, len(m.watchers))
+	for id, watcher := range m.watchers {
+		delete(m.watchers, id)
+		watchers = append(watchers, watcher)
+	}
+	m.started = false
+	m.mu.Unlock()
+	for _, session := range sessions {
+		session.cancel()
+		<-session.done
+	}
+	for _, watcher := range watchers {
+		watcher.cancel()
+		watcher.closeActiveReader()
+	}
+	waitForWatchers(watchers, watcherStopTimeout)
+	m.wg.Wait()
+	_ = m.flush(context.Background())
+}
+
+func (m *Manager) StartStatsStream(ctx context.Context, scope models.StatsScope) (string, error) {
+	m.ensureReady()
+	if err := m.requireDocker(); err != nil {
+		return "", err
+	}
+	scope = normalizeScope(scope)
+	if err := validateScope(scope); err != nil {
+		return "", err
+	}
+	if err := ctx.Err(); err != nil {
+		return "", apperror.Wrap(apperror.Cancelled, "Start metrics stream canceled", err)
+	}
+	m.mu.Lock()
+	if !m.started || m.ctx == nil || m.ctx.Err() != nil {
+		m.mu.Unlock()
+		return "", apperror.New(
+			apperror.ProviderNotReady,
+			"Metrics runtime is not running",
+			apperror.WithRepairHints("Reconnect the active Docker provider and try again."),
+		)
+	}
+	if len(m.sessions) >= m.maxStreams {
+		m.mu.Unlock()
+		return "", apperror.New(
+			apperror.Conflict,
+			"Metrics stream capacity has been reached",
+			apperror.WithDetail("Stop an existing metrics stream before starting another."),
+		)
+	}
+	streamID := uuid.New().String()
+	session := newStreamSession(m, m.ctx, streamID, scope)
+	m.sessions[streamID] = session
+	m.wg.Add(1)
+	m.mu.Unlock()
+
+	go func() {
+		defer m.wg.Done()
+		session.run()
+	}()
+	m.requestReconcile()
+	return streamID, nil
+}
+
+func (m *Manager) StopStream(streamID string) error {
+	m.ensureReady()
+	m.mu.Lock()
+	session := m.sessions[streamID]
+	if session != nil {
+		delete(m.sessions, streamID)
+	}
+	m.mu.Unlock()
+	if session == nil {
+		return apperror.New(apperror.NotFound, "Stats stream was not found")
+	}
+	session.cancel()
+	<-session.done
+	return nil
+}
+
+func (m *Manager) GetDashboardMetrics(ctx context.Context) (*models.DashboardMetrics, error) {
+	m.ensureReady()
+	if err := m.requireDocker(); err != nil {
+		return nil, err
+	}
+	gpu := m.gpuMetrics(ctx)
+	containers, err := m.Docker.ListContainers(ctx, models.ContainerListOptions{All: true})
+	if err != nil {
+		return nil, err
+	}
+	images, err := m.Docker.ListImages(ctx)
+	if err != nil {
+		return nil, err
+	}
+	volumes, err := m.Docker.ListVolumes(ctx)
+	if err != nil {
+		return nil, err
+	}
+	usage, err := m.Docker.DiskUsage(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if usage == nil {
+		usage = &models.DiskUsage{}
+	}
+	out := &models.DashboardMetrics{
+		Containers: len(containers),
+		Images:     len(images),
+		Volumes:    len(volumes),
+		DiskUsage:  *usage,
+		GPU:        gpu,
+		Top:        m.topContainers(),
+	}
+	if m.Projects != nil {
+		projects, err := m.currentProviderProjects(ctx)
+		if err != nil {
+			return nil, err
+		}
+		out.Projects = len(projects)
+	}
+	if m.Audit != nil {
+		recent, err := m.Audit.List(ctx, models.AuditFilter{Limit: 10})
+		if err != nil {
+			return nil, err
+		}
+		out.RecentEvents = recent
+	}
+	return out, nil
+}
+
+func (m *Manager) GetProjectMetrics(ctx context.Context, projectID string, r models.TimeRange) (*models.SeriesBundle, error) {
+	if m.Repository == nil || m.Projects == nil || !m.Scope.Valid() {
+		return nil, notReady()
+	}
+	projectID = strings.TrimSpace(projectID)
+	if _, err := m.Projects.GetInScope(ctx, m.Scope, projectID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, apperror.New(apperror.NotFound, "Project was not found")
+		}
+		return nil, err
+	}
+	return m.Repository.QuerySeries(ctx, store.MetricsSeriesFilter{
+		Scope:        m.Scope,
+		ProjectID:    projectID,
+		From:         r.From,
+		To:           r.To,
+		Now:          m.now(),
+		RawRetention: m.rawRetention,
+	})
+}
+
+func (m *Manager) GetContainerMetrics(ctx context.Context, containerID string, r models.TimeRange) (*models.SeriesBundle, error) {
+	if m.Repository == nil || !m.Scope.Valid() {
+		return nil, notReady()
+	}
+	return m.Repository.QuerySeries(ctx, store.MetricsSeriesFilter{
+		Scope:        m.Scope,
+		ContainerID:  strings.TrimSpace(containerID),
+		From:         r.From,
+		To:           r.To,
+		Now:          m.now(),
+		RawRetention: m.rawRetention,
+	})
+}
+
+func (m *Manager) reconcileLoop() {
+	ticker := time.NewTicker(m.backgroundInterval)
+	defer ticker.Stop()
+	_ = m.reconcileOnce(m.ctx)
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-m.reconcileRequests:
+			_ = m.reconcileOnce(m.ctx)
+		case <-ticker.C:
+			_ = m.reconcileOnce(m.ctx)
+		}
+	}
+}
+
+func (m *Manager) reconcileOnce(ctx context.Context) error {
+	if err := m.requireDocker(); err != nil {
+		return err
+	}
+	m.refreshDockerInfo(ctx)
+	containers, err := m.Docker.ListContainers(ctx, models.ContainerListOptions{All: false})
+	if err != nil {
+		return err
+	}
+	current := map[string]models.ContainerSummary{}
+	for _, item := range containers {
+		if item.ID == "" {
+			continue
+		}
+		current[item.ID] = item
+	}
+
+	m.mu.Lock()
+	// An inventory read may finish after StopAll has canceled the runtime
+	// and collected its watchers. Never publish new work behind that snapshot.
+	if !m.started || ctx.Err() != nil {
+		m.mu.Unlock()
+		return ctx.Err()
+	}
+	stale := make([]*containerWatcher, 0)
+	for id, summary := range current {
+		m.containers[id] = summary
+		if m.watchers[id] == nil && m.ctx != nil {
+			watchCtx, cancel := context.WithCancel(m.ctx)
+			watcher := &containerWatcher{id: id, cancel: cancel, done: make(chan struct{})}
+			m.watchers[id] = watcher
+			go func() {
+				defer close(watcher.done)
+				m.watchContainerWithState(watchCtx, watcher)
+			}()
+		}
+	}
+	for id, watcher := range m.watchers {
+		if _, ok := current[id]; ok {
+			continue
+		}
+		watcher.cancel()
+		watcher.closeActiveReader()
+		stale = append(stale, watcher)
+		delete(m.watchers, id)
+		delete(m.containers, id)
+		delete(m.latest, id)
+		delete(m.previous, id)
+		delete(m.lastAccepted, id)
+	}
+	m.mu.Unlock()
+	waitForWatchers(stale, watcherStopTimeout)
+	return nil
+}
+
+func (m *Manager) watchContainer(ctx context.Context, containerID string) {
+	m.watchContainerWithState(ctx, &containerWatcher{id: containerID})
+}
+
+func (m *Manager) watchContainerWithState(ctx context.Context, watcher *containerWatcher) {
+	containerID := watcher.id
+	if m.disableStreamingStats {
+		for ctx.Err() == nil {
+			_ = m.sampleOneShot(ctx, containerID)
+			sleepContext(ctx, m.sampleInterval(containerID))
+		}
+		return
+	}
+
+	failures := 0
+	fallbackSamples := 0
+	for ctx.Err() == nil {
+		if failures < 3 || fallbackSamples >= streamRetryFallbackSamples {
+			if fallbackSamples >= streamRetryFallbackSamples {
+				failures = 0
+				fallbackSamples = 0
+			}
+			err := m.streamContainer(ctx, watcher)
+			if err == nil || errors.Is(err, context.Canceled) {
+				return
+			}
+			failures++
+			sleepContext(ctx, m.streamRetryDelay(containerID, failures))
+			continue
+		}
+		err := m.sampleOneShot(ctx, containerID)
+		fallbackSamples++
+		if err == nil {
+			failures = 0
+			fallbackSamples = 0
+		}
+		sleepContext(ctx, m.sampleInterval(containerID))
+	}
+}
+
+func (m *Manager) streamRetryDelay(containerID string, failures int) time.Duration {
+	if failures <= 0 {
+		return 0
+	}
+	delay := time.Duration(failures) * time.Second
+	interval := m.sampleInterval(containerID)
+	if interval > 0 && interval < delay {
+		return interval
+	}
+	return delay
+}
+
+func (m *Manager) streamContainer(ctx context.Context, watcher *containerWatcher) error {
+	release, err := m.acquireStatsSlot(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	containerID := watcher.id
+	reader, err := m.Docker.ContainerStats(ctx, containerID, dockercore.StatsOptions{Stream: true})
+	if err != nil {
+		return err
+	}
+	clearReader := watcher.setActiveReader(reader.Body)
+	defer func() {
+		clearReader()
+		if reader != nil && reader.Body != nil {
+			_ = reader.Body.Close()
+		}
+	}()
+
+	// Docker stats streams are reopened by the watcher after EOF/error. A
+	// finite session cap bounds a malformed daemon response without changing
+	// normal long-running collection semantics.
+	decoder := json.NewDecoder(io.LimitReader(reader.Body, maxDockerStatsStreamBytes))
+	for ctx.Err() == nil {
+		var raw container.StatsResponse
+		if err := decoder.Decode(&raw); err != nil {
+			if errors.Is(err, io.EOF) {
+				return err
+			}
+			return err
+		}
+		m.ingest(containerID, raw)
+	}
+	return ctx.Err()
+}
+
+func (m *Manager) sampleOneShot(ctx context.Context, containerID string) error {
+	release, err := m.acquireStatsSlot(ctx)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	reader, err := m.Docker.ContainerStats(ctx, containerID, dockercore.StatsOptions{OneShot: true})
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if reader != nil && reader.Body != nil {
+			_ = reader.Body.Close()
+		}
+	}()
+	raw, err := decodeOneShotStats(reader.Body)
+	if err != nil {
+		return err
+	}
+	m.ingest(containerID, raw)
+	return nil
+}
+
+func decodeOneShotStats(body io.Reader) (container.StatsResponse, error) {
+	var raw container.StatsResponse
+	payload, err := io.ReadAll(io.LimitReader(body, maxDockerStatsResponseBytes+1))
+	if err != nil {
+		return raw, err
+	}
+	if int64(len(payload)) > maxDockerStatsResponseBytes {
+		return raw, errors.New("docker stats response exceeded the safe size limit")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(payload))
+	if err := decoder.Decode(&raw); err != nil {
+		return raw, err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			err = errors.New("multiple JSON values")
+		}
+		return raw, err
+	}
+	return raw, nil
+}
+
+func (m *Manager) ingest(containerID string, raw container.StatsResponse) {
+	sample, ok := m.buildSample(containerID, raw)
+	if !ok {
+		return
+	}
+
+	m.mu.Lock()
+	interval := m.sampleIntervalLocked(containerID)
+	last := m.lastAccepted[containerID]
+	if !last.IsZero() && sample.SampledAt.Sub(last) < interval {
+		m.mu.Unlock()
+		return
+	}
+	m.lastAccepted[containerID] = sample.SampledAt
+	m.latest[containerID] = sample
+	if m.Repository != nil {
+		m.pending = appendPendingMetrics(m.pending, recordFromSample(sample))
+	}
+	m.mu.Unlock()
+}
+
+func (m *Manager) buildSample(containerID string, raw container.StatsResponse) (Sample, bool) {
+	if m.requireDocker() != nil {
+		return Sample{}, false
+	}
+	if raw.Read.IsZero() {
+		raw.Read = m.now()
+	}
+	if containerID == "" {
+		containerID = raw.ID
+	}
+	if containerID == "" {
+		return Sample{}, false
+	}
+
+	rx, txBytes := networkBytes(raw.Networks)
+	blockRead, blockWrite := blockBytes(raw)
+
+	m.mu.Lock()
+	previous, hasPrevious := m.previous[containerID]
+	summary := m.containers[containerID]
+	onlineCPUs := m.onlineCPUs
+	gpuUsage := m.gpuUsage[containerID]
+	m.previous[containerID] = raw
+	m.mu.Unlock()
+
+	cpuPrevious := raw.PreCPUStats
+	if hasPrevious {
+		cpuPrevious = previous.CPUStats
+	}
+	cpu := CPUPercentWithFallback(cpuPrevious, raw.CPUStats, onlineCPUs)
+	var netRXRate, netTXRate, blockReadRate, blockWriteRate float64
+	if hasPrevious {
+		previousRX, previousTX := networkBytes(previous.Networks)
+		previousBlockRead, previousBlockWrite := blockBytes(previous)
+		elapsed := raw.Read.Sub(previous.Read)
+		netRXRate = CounterRate(previousRX, rx, elapsed)
+		netTXRate = CounterRate(previousTX, txBytes, elapsed)
+		blockReadRate = CounterRate(previousBlockRead, blockRead, elapsed)
+		blockWriteRate = CounterRate(previousBlockWrite, blockWrite, elapsed)
+	}
+
+	if summary.ID == "" {
+		summary.ID = containerID
+	}
+	if summary.Name == "" && raw.Name != "" {
+		summary.Name = strings.TrimPrefix(raw.Name, "/")
+	}
+	serviceID := summary.Service
+	if summary.ProjectID != "" && summary.Service != "" {
+		serviceID = summary.ProjectID + "::" + summary.Service
+	}
+	uptime := int64(0)
+	startedAt := summary.StartedAt
+	if startedAt.IsZero() {
+		startedAt = summary.CreatedAt
+	}
+	if !startedAt.IsZero() {
+		uptime = max(int64(raw.Read.Sub(startedAt).Seconds()), 0)
+	}
+
+	return Sample{
+		ProviderID:       m.Scope.ProviderID(),
+		ContextName:      m.Scope.ContextName(),
+		ProjectID:        summary.ProjectID,
+		ServiceID:        serviceID,
+		ContainerID:      containerID,
+		ContainerName:    summary.Name,
+		Health:           summary.Health,
+		RestartCount:     summary.Restarts,
+		UptimeSeconds:    uptime,
+		CPUPercent:       cpu,
+		MemoryBytes:      memoryUsageBytes(raw.MemoryStats),
+		MemoryLimitBytes: memoryLimitBytes(raw.MemoryStats),
+		GPUMemoryBytes:   gpuUsage.memoryBytes,
+		GPULoadPercent:   gpuUsage.utilizationPercent,
+		GPUDeviceIDs:     append([]string(nil), gpuUsage.deviceIDs...),
+		NetworkRXBytes:   uintToInt64(rx),
+		NetworkTXBytes:   uintToInt64(txBytes),
+		NetworkRXRate:    netRXRate,
+		NetworkTXRate:    netTXRate,
+		BlockReadBytes:   uintToInt64(blockRead),
+		BlockWriteBytes:  uintToInt64(blockWrite),
+		BlockReadRate:    blockReadRate,
+		BlockWriteRate:   blockWriteRate,
+		PIDs:             pids(raw),
+		SampledAt:        raw.Read.UTC(),
+	}, true
+}
+
+func (m *Manager) persistLoop() {
+	ticker := time.NewTicker(m.persistInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-m.ctx.Done():
+			_ = m.flush(context.Background())
+			return
+		case <-ticker.C:
+			_ = m.flush(m.ctx)
+			if err := m.maybeRetain(m.ctx); err != nil {
+				slog.WarnContext(m.ctx, "metrics retention failed; retry scheduled", "error", err)
+			}
+		}
+	}
+}
+
+func (m *Manager) flush(ctx context.Context) error {
+	if m.Repository == nil {
+		return nil
+	}
+	m.flushMu.Lock()
+	defer m.flushMu.Unlock()
+
+	m.mu.Lock()
+	pending := append([]store.MetricsSampleRecord(nil), m.pending...)
+	m.pending = nil
+	m.mu.Unlock()
+	if len(pending) == 0 {
+		return nil
+	}
+	if err := m.Repository.InsertBatch(ctx, pending); err != nil {
+		m.mu.Lock()
+		m.pending = appendPendingMetrics(pending, m.pending...)
+		m.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+func appendPendingMetrics(existing []store.MetricsSampleRecord, records ...store.MetricsSampleRecord) []store.MetricsSampleRecord {
+	if len(records) == 1 {
+		// Ingestion supplies individual samples to an already sorted buffer.
+		// Usually they append in timestamp order; late samples only move their
+		// suffix, instead of re-sorting every record under the manager lock.
+		record := records[0]
+		index := len(existing)
+		if index > 0 && record.SampledAt.Before(existing[index-1].SampledAt) {
+			index = sort.Search(index, func(i int) bool { return existing[i].SampledAt.After(record.SampledAt) })
+		}
+		existing = slices.Insert(existing, index, record)
+		return trimPendingMetrics(existing)
+	}
+	if len(records) > 0 {
+		existing = append(existing, records...)
+	}
+	slices.SortStableFunc(existing, func(a, b store.MetricsSampleRecord) int {
+		return a.SampledAt.Compare(b.SampledAt)
+	})
+	return trimPendingMetrics(existing)
+}
+
+func trimPendingMetrics(records []store.MetricsSampleRecord) []store.MetricsSampleRecord {
+	if len(records) <= maxPendingPersistSamples {
+		return records
+	}
+	copy(records, records[len(records)-maxPendingPersistSamples:])
+	clear(records[maxPendingPersistSamples:])
+	return records[:maxPendingPersistSamples]
+}
+
+func (m *Manager) maybeRetain(ctx context.Context) error {
+	if m.retentionFunc == nil {
+		return nil
+	}
+	now := m.now()
+	m.mu.Lock()
+	if !m.lastRetain.IsZero() && now.Sub(m.lastRetain) < m.retainInterval {
+		m.mu.Unlock()
+		return nil
+	}
+	if !m.lastRetainAttempt.IsZero() && now.Sub(m.lastRetainAttempt) < m.retainRetryInterval {
+		m.mu.Unlock()
+		return nil
+	}
+	m.lastRetainAttempt = now
+	m.mu.Unlock()
+
+	if err := m.retentionFunc(ctx, now); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	m.lastRetain = now
+	m.lastRetainAttempt = time.Time{}
+	m.mu.Unlock()
+	return nil
+}
+
+func (m *Manager) refreshDockerInfo(ctx context.Context) {
+	m.mu.Lock()
+	hasCPUCount := m.onlineCPUs > 0
+	m.mu.Unlock()
+	if hasCPUCount || m.Docker == nil {
+		return
+	}
+	info, err := m.Docker.Info(ctx)
+	if err != nil || info == nil || info.CPUs <= 0 {
+		return
+	}
+	m.mu.Lock()
+	if m.onlineCPUs == 0 {
+		m.onlineCPUs = uint32(info.CPUs)
+	}
+	m.mu.Unlock()
+}
+
+func (m *Manager) gpuMetrics(ctx context.Context) models.GPUMetrics {
+	m.ensureReady()
+	now := m.now()
+	m.mu.Lock()
+	if !m.gpuCacheAt.IsZero() && now.Sub(m.gpuCacheAt) < m.gpuCacheTTL {
+		cached := cloneGPUMetrics(m.gpuCache)
+		m.mu.Unlock()
+		return cached
+	}
+	if done := m.gpuProbeDone; done != nil {
+		cached := cloneGPUMetrics(m.gpuCache)
+		m.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return cached
+		case <-done:
+			return m.gpuMetrics(ctx)
+		}
+	}
+	if ctx.Err() != nil {
+		cached := cloneGPUMetrics(m.gpuCache)
+		m.mu.Unlock()
+		return cached
+	}
+	done := make(chan struct{})
+	m.gpuProbeDone = done
+	probe := m.gpuProbe
+	m.mu.Unlock()
+
+	// Dashboard refreshes and visible streams share this work. Bound the whole
+	// probe, including Docker process attribution, so an unavailable daemon
+	// cannot hold up a stats stream for one timeout per running container.
+	probeCtx, cancel := context.WithTimeout(ctx, gpuProbeTimeout)
+	defer cancel()
+	metrics := probe.ProbeGPUs(probeCtx)
+	if metrics.CheckedAt.IsZero() {
+		metrics.CheckedAt = now
+	}
+	var usage map[string]containerGPUUsage
+	if ctx.Err() == nil {
+		metrics, usage = m.collectGPUAttribution(probeCtx, metrics)
+	}
+
+	m.mu.Lock()
+	// A view may disappear while its probe is running. Let surviving callers
+	// retry instead of caching that view's cancellation as a GPU outage.
+	if ctx.Err() == nil {
+		m.setGPUUsageLocked(usage)
+		m.gpuCache = cloneGPUMetrics(metrics)
+		m.gpuCacheAt = m.now()
+	}
+	m.gpuProbeDone = nil
+	close(done)
+	m.mu.Unlock()
+	return metrics
+}
+
+func (m *Manager) attributeGPUMetrics(ctx context.Context, metrics models.GPUMetrics) models.GPUMetrics {
+	metrics, usage := m.collectGPUAttribution(ctx, metrics)
+	m.setGPUUsage(usage)
+	return metrics
+}
+
+func (m *Manager) collectGPUAttribution(ctx context.Context, metrics models.GPUMetrics) (models.GPUMetrics, map[string]containerGPUUsage) {
+	if m.Docker == nil {
+		return metrics, nil
+	}
+	if !metrics.Available {
+		return metrics, nil
+	}
+	if len(metrics.Processes) == 0 {
+		return metrics, nil
+	}
+
+	containers := m.gpuAttributionContainers(ctx)
+	if len(containers) == 0 {
+		return metrics, nil
+	}
+
+	containersByID := containerLookup(containers)
+	ollamaContainer, hasOllamaContainer := ollamaAttributionContainer(containers)
+	pidToContainer := make(map[int]models.ContainerSummary)
+	unresolvedPIDs := make(map[int]struct{})
+	for _, process := range metrics.Processes {
+		if _, known := lookupContainer(containersByID, process.ContainerID); !known && process.PID > 0 {
+			unresolvedPIDs[process.PID] = struct{}{}
+		}
+	}
+	for _, container := range containers {
+		if len(unresolvedPIDs) == 0 || ctx.Err() != nil {
+			break
+		}
+		if container.ID == "" {
+			continue
+		}
+		pids, err := m.Docker.ContainerProcessPIDs(ctx, container.ID)
+		if err != nil {
+			continue
+		}
+		for _, pid := range pids {
+			if pid > 0 {
+				pidToContainer[pid] = container
+				delete(unresolvedPIDs, pid)
+			}
+		}
+	}
+
+	usage := make(map[string]containerGPUUsage)
+	for i := range metrics.Processes {
+		process := &metrics.Processes[i]
+		container, ok := lookupContainer(containersByID, process.ContainerID)
+		if !ok {
+			container, ok = pidToContainer[process.PID]
+		}
+		if !ok && isSyntheticOllamaProcess(*process) && hasOllamaContainer {
+			container = ollamaContainer
+			ok = true
+		}
+		if !ok {
+			continue
+		}
+		process.ContainerID = container.ID
+		process.ContainerName = container.Name
+		process.ProjectID = container.ProjectID
+		process.Service = container.Service
+
+		containerUsage := usage[container.ID]
+		containerUsage.memoryBytes += process.MemoryBytes
+		containerUsage.utilizationPercent += process.GPULoadPercent
+		if process.DeviceID != "" && !contains(containerUsage.deviceIDs, process.DeviceID) {
+			containerUsage.deviceIDs = append(containerUsage.deviceIDs, process.DeviceID)
+		}
+		usage[container.ID] = containerUsage
+	}
+	applyGPUUtilizationFallback(usage, metrics.UtilizationPercent)
+	for id, item := range usage {
+		sort.Strings(item.deviceIDs)
+		usage[id] = item
+	}
+	return metrics, usage
+}
+
+func applyGPUUtilizationFallback(usage map[string]containerGPUUsage, utilization float64) {
+	if utilization <= 0 || len(usage) == 0 {
+		return
+	}
+	var assigned float64
+	var totalMemory int64
+	for _, item := range usage {
+		assigned += item.utilizationPercent
+		totalMemory += item.memoryBytes
+	}
+	if assigned > 0 {
+		return
+	}
+	if len(usage) == 1 {
+		for id, item := range usage {
+			item.utilizationPercent = utilization
+			usage[id] = item
+		}
+		return
+	}
+	if totalMemory <= 0 {
+		return
+	}
+	for id, item := range usage {
+		if item.memoryBytes <= 0 {
+			continue
+		}
+		item.utilizationPercent = utilization * float64(item.memoryBytes) / float64(totalMemory)
+		usage[id] = item
+	}
+}
+
+func isSyntheticOllamaProcess(process models.GPUProcessMetric) bool {
+	return process.PID == 0 &&
+		process.ContainerID == "" &&
+		process.MemoryBytes > 0 &&
+		strings.HasPrefix(strings.ToLower(process.ProcessName), ollamaProcessName+":")
+}
+
+func ollamaAttributionContainer(containers []models.ContainerSummary) (models.ContainerSummary, bool) {
+	portMatches := make([]models.ContainerSummary, 0, 1)
+	nameMatches := make([]models.ContainerSummary, 0, 1)
+	for _, container := range containers {
+		if strings.ToLower(container.State) != "running" {
+			continue
+		}
+		if containerHasPort(container, "11434") {
+			portMatches = append(portMatches, container)
+		}
+		needle := strings.ToLower(strings.Join([]string{
+			container.Name,
+			container.Image,
+			container.Service,
+		}, " "))
+		if strings.Contains(needle, ollamaProcessName) {
+			nameMatches = append(nameMatches, container)
+		}
+	}
+	if len(portMatches) == 1 {
+		return portMatches[0], true
+	}
+	if len(nameMatches) == 1 {
+		return nameMatches[0], true
+	}
+	return models.ContainerSummary{}, false
+}
+
+func containerHasPort(container models.ContainerSummary, port string) bool {
+	for _, binding := range container.Ports {
+		if binding.ContainerPort == port || binding.HostPort == port {
+			return true
+		}
+	}
+	return false
+}
+
+func containerLookup(containers []models.ContainerSummary) map[string]models.ContainerSummary {
+	lookup := make(map[string]models.ContainerSummary, len(containers)*2)
+	for _, container := range containers {
+		id := strings.ToLower(strings.TrimSpace(container.ID))
+		if id == "" {
+			continue
+		}
+		lookup[id] = container
+		if len(id) >= 12 {
+			lookup[id[:12]] = container
+		}
+	}
+	return lookup
+}
+
+func lookupContainer(lookup map[string]models.ContainerSummary, id string) (models.ContainerSummary, bool) {
+	target := strings.ToLower(strings.TrimSpace(id))
+	if target == "" {
+		return models.ContainerSummary{}, false
+	}
+	if container, ok := lookup[target]; ok {
+		return container, true
+	}
+	if len(target) >= 12 {
+		if container, ok := lookup[target[:12]]; ok {
+			return container, true
+		}
+	}
+	for known, container := range lookup {
+		if len(target) >= 12 && strings.HasPrefix(known, target) {
+			return container, true
+		}
+		if len(known) >= 12 && strings.HasPrefix(target, known) {
+			return container, true
+		}
+	}
+	return models.ContainerSummary{}, false
+}
+
+func (m *Manager) gpuAttributionContainers(ctx context.Context) []models.ContainerSummary {
+	m.mu.Lock()
+	cached := make([]models.ContainerSummary, 0, len(m.containers))
+	for _, container := range m.containers {
+		cached = append(cached, container)
+	}
+	m.mu.Unlock()
+	if len(cached) > 0 {
+		return cached
+	}
+	containers, err := m.Docker.ListContainers(ctx, models.ContainerListOptions{All: false})
+	if err != nil {
+		return nil
+	}
+	return containers
+}
+
+func (m *Manager) setGPUUsage(usage map[string]containerGPUUsage) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.setGPUUsageLocked(usage)
+}
+
+func (m *Manager) setGPUUsageLocked(usage map[string]containerGPUUsage) {
+	if usage == nil {
+		usage = map[string]containerGPUUsage{}
+	}
+	m.gpuUsage = usage
+	for id, summary := range m.containers {
+		item := usage[id]
+		summary.GPUMemoryBytes = item.memoryBytes
+		summary.GPULoadPercent = item.utilizationPercent
+		summary.GPUDeviceIDs = append([]string(nil), item.deviceIDs...)
+		m.containers[id] = summary
+	}
+	for id, sample := range m.latest {
+		item := usage[id]
+		sample.GPUMemoryBytes = item.memoryBytes
+		sample.GPULoadPercent = item.utilizationPercent
+		sample.GPUDeviceIDs = append([]string(nil), item.deviceIDs...)
+		m.latest[id] = sample
+	}
+}
+
+func newStreamSession(manager *Manager, rootCtx context.Context, streamID string, scope models.StatsScope) *streamSession {
+	ctx, cancel := context.WithCancel(rootCtx)
+	return &streamSession{
+		id:      streamID,
+		scope:   scope,
+		ctx:     ctx,
+		cancel:  cancel,
+		manager: manager,
+		done:    make(chan struct{}),
+	}
+}
+
+func (s *streamSession) run() {
+	defer func() {
+		s.manager.removeSession(s.id, s)
+		close(s.done)
+	}()
+	ticker := time.NewTicker(s.manager.publishInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-ticker.C:
+			gpu := s.manager.gpuMetrics(s.ctx)
+			samples := s.manager.latestForScope(s.scope)
+			if len(samples) == 0 {
+				continue
+			}
+			s.manager.publish(bus.TopicStatsSample, SamplePayload{
+				StreamID: s.id,
+				Samples:  samples,
+				GPU:      gpu,
+			})
+		}
+	}
+}
+
+func (m *Manager) removeSession(streamID string, session *streamSession) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.sessions[streamID] == session {
+		delete(m.sessions, streamID)
+	}
+}
+
+func (m *Manager) requestReconcile() {
+	select {
+	case m.reconcileRequests <- struct{}{}:
+	default:
+	}
+}
+
+func (m *Manager) latestForScope(scope models.StatsScope) []Sample {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	samples := make([]Sample, 0, len(m.latest))
+	for _, sample := range m.latest {
+		if scopeMatchesSample(scope, sample) {
+			samples = append(samples, sample)
+		}
+	}
+	sort.Slice(samples, func(i int, j int) bool {
+		return samples[i].ContainerName < samples[j].ContainerName
+	})
+	return samples
+}
+
+func (m *Manager) topContainers() []models.MetricRankItem {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	items := make([]models.MetricRankItem, 0, len(m.latest))
+	for _, sample := range m.latest {
+		name := sample.ContainerName
+		if name == "" {
+			name = sample.ContainerID
+		}
+		items = append(items, models.MetricRankItem{
+			ID:             sample.ContainerID,
+			Name:           name,
+			Kind:           ScopeContainer,
+			CPUPercent:     sample.CPUPercent,
+			MemoryBytes:    sample.MemoryBytes,
+			GPUMemoryBytes: sample.GPUMemoryBytes,
+			GPULoadPercent: sample.GPULoadPercent,
+		})
+	}
+	sort.Slice(items, func(i int, j int) bool {
+		if items[i].GPUMemoryBytes != items[j].GPUMemoryBytes {
+			return items[i].GPUMemoryBytes > items[j].GPUMemoryBytes
+		}
+		if items[i].CPUPercent == items[j].CPUPercent {
+			return items[i].MemoryBytes > items[j].MemoryBytes
+		}
+		return items[i].CPUPercent > items[j].CPUPercent
+	})
+	if len(items) > m.topN {
+		items = items[:m.topN]
+	}
+	return items
+}
+
+func (m *Manager) sampleInterval(containerID string) time.Duration {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.sampleIntervalLocked(containerID)
+}
+
+func (m *Manager) sampleIntervalLocked(containerID string) time.Duration {
+	summary := m.containers[containerID]
+	for _, session := range m.sessions {
+		if scopeMatchesContainer(session.scope, summary) {
+			return m.visibleInterval
+		}
+	}
+	return m.backgroundInterval
+}
+
+func (m *Manager) publish(topic bus.Topic, payload any) {
+	if m.Events == nil {
+		return
+	}
+	m.Events.Publish(bus.Event{Topic: topic, Payload: payload})
+}
+
+func (m *Manager) Diagnostics() models.MetricsRuntimeDiagnostics {
+	m.ensureReady()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return models.MetricsRuntimeDiagnostics{
+		Started:        m.started,
+		ActiveStreams:  len(m.sessions),
+		ActiveWatchers: len(m.watchers),
+	}
+}
+
+func (w *containerWatcher) setActiveReader(reader io.Closer) func() {
+	if w == nil || reader == nil {
+		return func() {}
+	}
+	w.mu.Lock()
+	w.activeReader = reader
+	w.mu.Unlock()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			w.mu.Lock()
+			if w.activeReader == reader {
+				w.activeReader = nil
+			}
+			w.mu.Unlock()
+		})
+	}
+}
+
+func (w *containerWatcher) closeActiveReader() {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	reader := w.activeReader
+	w.mu.Unlock()
+	if reader != nil {
+		_ = reader.Close()
+	}
+}
+
+func waitForWatchers(watchers []*containerWatcher, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	allStopped := true
+	for _, watcher := range watchers {
+		if watcher == nil || watcher.done == nil {
+			continue
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 || !waitForClosed(watcher.done, remaining) {
+			allStopped = false
+		}
+	}
+	return allStopped
+}
+
+func (m *Manager) ensureReady() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.watchers == nil {
+		m.watchers = map[string]*containerWatcher{}
+	}
+	if m.sessions == nil {
+		m.sessions = map[string]*streamSession{}
+	}
+	if m.reconcileRequests == nil {
+		m.reconcileRequests = make(chan struct{}, 1)
+	}
+	if m.containers == nil {
+		m.containers = map[string]models.ContainerSummary{}
+	}
+	if m.latest == nil {
+		m.latest = map[string]Sample{}
+	}
+	if m.previous == nil {
+		m.previous = map[string]container.StatsResponse{}
+	}
+	if m.lastAccepted == nil {
+		m.lastAccepted = map[string]time.Time{}
+	}
+	if m.gpuUsage == nil {
+		m.gpuUsage = map[string]containerGPUUsage{}
+	}
+	if m.visibleInterval <= 0 {
+		m.visibleInterval = defaultVisibleInterval
+	}
+	if m.backgroundInterval <= 0 {
+		m.backgroundInterval = defaultBackgroundInterval
+	}
+	if m.publishInterval <= 0 {
+		m.publishInterval = defaultPublishInterval
+	}
+	if m.persistInterval <= 0 {
+		m.persistInterval = defaultPersistInterval
+	}
+	if m.retainInterval <= 0 {
+		m.retainInterval = defaultRetainInterval
+	}
+	if m.retainRetryInterval <= 0 {
+		m.retainRetryInterval = defaultRetainRetryInterval
+	}
+	if m.retainRetryInterval < minimumRetainRetryInterval {
+		m.retainRetryInterval = minimumRetainRetryInterval
+	}
+	if m.rawRetention <= 0 {
+		m.rawRetention = store.DefaultMetricsRawRetention
+	}
+	if m.gpuCacheTTL <= 0 {
+		m.gpuCacheTTL = defaultGPUCacheTTL
+	}
+	if m.topN <= 0 {
+		m.topN = defaultTopN
+	}
+	if m.maxStreams <= 0 {
+		m.maxStreams = defaultMaxStreams
+	}
+	if m.now == nil {
+		m.now = func() time.Time { return time.Now().UTC() }
+	}
+	if m.gpuProbe == nil {
+		m.gpuProbe = nvidiaSMIProbe{}
+	}
+}
+
+func (m *Manager) applyOptions(opts Options) {
+	m.visibleInterval = opts.VisibleInterval
+	m.backgroundInterval = opts.BackgroundInterval
+	m.publishInterval = opts.PublishInterval
+	m.persistInterval = opts.PersistInterval
+	m.retainInterval = opts.RetainInterval
+	m.retainRetryInterval = opts.RetainRetryInterval
+	m.rawRetention = opts.RawRetention
+	m.gpuCacheTTL = opts.GPUCacheTTL
+	m.topN = opts.TopN
+	m.maxStreams = opts.MaxStreams
+	m.disableStreamingStats = opts.DisableStreamingStats
+	if opts.StatsConcurrency > 0 {
+		m.statsSemaphore = make(chan struct{}, opts.StatsConcurrency)
+		m.disableStreamingStats = true
+	} else {
+		m.statsSemaphore = nil
+	}
+	m.now = opts.Now
+	m.gpuProbe = opts.GPUProbe
+	if opts.RetentionFunc != nil {
+		m.retentionFunc = opts.RetentionFunc
+	}
+	m.ensureReady()
+}
+
+func (m *Manager) acquireStatsSlot(ctx context.Context) (func(), error) {
+	if m.statsSemaphore == nil {
+		return func() {}, nil
+	}
+	select {
+	case m.statsSemaphore <- struct{}{}:
+		return func() { <-m.statsSemaphore }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (m *Manager) requireDocker() error {
+	if m.Docker == nil || !m.Scope.Valid() || strings.TrimSpace(m.Docker.ProviderID()) != m.Scope.ProviderID() {
+		return notReady()
+	}
+	return nil
+}
+
+func (m *Manager) currentProviderProjects(ctx context.Context) ([]store.ProjectRecord, error) {
+	if !m.Scope.Valid() {
+		return nil, notReady()
+	}
+	return m.Projects.ListByScope(ctx, m.Scope)
+}
+
+func notReady() error {
+	return apperror.New(apperror.ProviderNotReady, "Docker metrics are not ready")
+}
+
+func recordFromSample(sample Sample) store.MetricsSampleRecord {
+	return store.MetricsSampleRecord{
+		ProviderID:       sample.ProviderID,
+		ContextName:      sample.ContextName,
+		ProjectID:        sample.ProjectID,
+		ServiceID:        sample.ServiceID,
+		ContainerID:      sample.ContainerID,
+		CPUPercent:       sample.CPUPercent,
+		MemoryBytes:      sample.MemoryBytes,
+		MemoryLimitBytes: sample.MemoryLimitBytes,
+		GPUMemoryBytes:   sample.GPUMemoryBytes,
+		NetworkRXBytes:   sample.NetworkRXBytes,
+		NetworkTXBytes:   sample.NetworkTXBytes,
+		BlockReadBytes:   sample.BlockReadBytes,
+		BlockWriteBytes:  sample.BlockWriteBytes,
+		PIDs:             sample.PIDs,
+		Resolution:       store.MetricsResolutionRaw,
+		SampledAt:        sample.SampledAt,
+	}
+}
+
+func normalizeScope(scope models.StatsScope) models.StatsScope {
+	scope.Kind = strings.TrimSpace(scope.Kind)
+	if scope.Kind == "" {
+		scope.Kind = ScopeAll
+	}
+	scope.Kind = strings.ToLower(scope.Kind)
+	for i := range scope.IDs {
+		scope.IDs[i] = strings.TrimSpace(scope.IDs[i])
+	}
+	return scope
+}
+
+func validateScope(scope models.StatsScope) error {
+	switch scope.Kind {
+	case ScopeAll, ScopeProject, ScopeService, ScopeContainer:
+		return nil
+	default:
+		return apperror.New(apperror.NotFound, "Unsupported stats scope", apperror.WithDetail(scope.Kind))
+	}
+}
+
+func scopeMatchesContainer(scope models.StatsScope, container models.ContainerSummary) bool {
+	if container.ID == "" && container.Name == "" {
+		return false
+	}
+	return scopeMatchesSample(scope, Sample{
+		ProjectID:     container.ProjectID,
+		ServiceID:     serviceID(container.ProjectID, container.Service),
+		ContainerID:   container.ID,
+		ContainerName: container.Name,
+	})
+}
+
+func scopeMatchesSample(scope models.StatsScope, sample Sample) bool {
+	switch scope.Kind {
+	case ScopeAll:
+		return true
+	case ScopeProject:
+		return contains(scope.IDs, sample.ProjectID)
+	case ScopeService:
+		return contains(scope.IDs, sample.ServiceID) || contains(scope.IDs, serviceNameOnly(sample.ServiceID))
+	case ScopeContainer:
+		return contains(scope.IDs, sample.ContainerID) || contains(scope.IDs, sample.ContainerName)
+	default:
+		return false
+	}
+}
+
+func serviceID(projectID string, service string) string {
+	if projectID == "" {
+		return service
+	}
+	if service == "" {
+		return ""
+	}
+	return projectID + "::" + service
+}
+
+func serviceNameOnly(value string) string {
+	if _, service, ok := strings.Cut(value, "::"); ok {
+		return service
+	}
+	return value
+}
+
+func contains(values []string, target string) bool {
+	return target != "" && slices.Contains(values, target)
+}
+
+func sleepContext(ctx context.Context, duration time.Duration) {
+	if duration <= 0 {
+		return
+	}
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+	}
+}
+
+func waitForClosed(ch <-chan struct{}, timeout time.Duration) bool {
+	if ch == nil {
+		return true
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-ch:
+		return true
+	case <-timer.C:
+		return false
+	}
+}

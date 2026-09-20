@@ -68,12 +68,12 @@ More detail: [docs/local-agent.md](docs/local-agent.md).
 
 Required tools:
 
-- Go 1.27.0
-- Node.js 24.20.0 LTS and npm 11.19 or newer
+- Go 1.27.1
+- Node.js 24.21.0 LTS and npm 12.0.2 or newer
 - Task
-- Wails v3 beta 15, installed at the exact version pinned by the project build config
+- Wails v3 beta 23, installed at the exact version pinned by the project build config
 
-Common commands:
+Run these commands from the repository root:
 
 ```powershell
 task frontend:install
@@ -100,6 +100,35 @@ task dev
 ```
 
 Wails server mode is not a supported deployment target because Cairn's desktop services are not a remotely safe API. Stable server and server-container builds are blocked. The narrowly scoped, explicitly acknowledged test path is documented in [docs/development-server-mode.md](docs/development-server-mode.md).
+
+### Repository Layout
+
+Application code and dependencies live under `src/`; build orchestration and output remain at the repository root:
+
+```text
+src/
+  *.go, go.mod, go.sum   Go entry points and module dependencies
+  internal/             Backend packages and tests
+  frontend/             React application, generated bindings, and UI tests
+  assets/               Embedded desktop artwork
+  tools/                Go development tools
+  testdata/             Shared test fixtures
+build/                  Platform packaging and Wails build configuration
+scripts/                Validation and maintenance scripts
+bin/                    Generated executables and packages
+docs/                   User, development, and release documentation
+Taskfile.yml            Root task entry point
+```
+
+For direct checks instead of root tasks, point Go and npm at the source directories:
+
+```powershell
+go -C src test ./...
+npm --prefix src/frontend run typecheck
+npm --prefix src/frontend test -- --run
+```
+
+The Go module import path is unchanged. Paths such as `./internal/...` in Go commands are relative to `src/` after `-C src`; configuration files and scripts under `build/` and `scripts/` remain relative to the repository root.
 
 ## Releases
 

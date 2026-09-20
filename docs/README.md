@@ -2,6 +2,8 @@
 
 This directory contains user-facing and validation documentation for Cairn.
 
+For source builds and the `src/` layout, see [Build From Source](../README.md#build-from-source). Commands in these documents assume the repository root unless stated otherwise; direct application checks use `go -C src ...` or `npm --prefix src/frontend ...`.
+
 ## User Docs
 
 - [help.md](help.md) - practical user guide and common workflows.
@@ -13,6 +15,8 @@ This directory contains user-facing and validation documentation for Cairn.
 
 ## Validation Docs
 
+- [project-analysis-2026-09-20.md](project-analysis-2026-09-20.md) - architecture review, startup/WSL findings, fixes, validation, and remaining risks.
+- [dependency-refresh-2026-09-20.md](dependency-refresh-2026-09-20.md) - dependency versions, compatibility decisions, new compiler features, and audit evidence.
 - [manual-platform-validation.md](manual-platform-validation.md) - platform-specific manual validation notes.
 - [v1-release-validation.md](v1-release-validation.md) - release validation evidence.
 - [v1-release-checklist.md](v1-release-checklist.md) - v1 release checklist status.

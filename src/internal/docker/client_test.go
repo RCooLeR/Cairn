@@ -1,0 +1,4158 @@
+package docker
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
+	"iter"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/netip"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/RCooLeR/Cairn/internal/apperror"
+	"github.com/RCooLeR/Cairn/internal/bus"
+	"github.com/RCooLeR/Cairn/internal/models"
+	"github.com/RCooLeR/Cairn/internal/providers"
+	"github.com/RCooLeR/Cairn/internal/runtimescope"
+	"github.com/RCooLeR/Cairn/internal/store"
+	cerrdefs "github.com/containerd/errdefs"
+	dockerspec "github.com/moby/docker-image-spec/specs-go/v1"
+	"github.com/moby/moby/api/pkg/stdcopy"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/events"
+	"github.com/moby/moby/api/types/image"
+	"github.com/moby/moby/api/types/jsonstream"
+	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/api/types/registry"
+	"github.com/moby/moby/api/types/system"
+	"github.com/moby/moby/api/types/volume"
+	dockerclient "github.com/moby/moby/client"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
+)
+
+func TestClientConnectAndDTOs(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	eventBus := bus.New()
+	defer eventBus.Close()
+	events := eventBus.Subscribe(ctx, bus.TopicDockerConnected, 4)
+
+	api := newFakeAPI()
+	api.info = system.Info{
+		ID:              "daemon-id",
+		Name:            "builder",
+		ServerVersion:   "28.5.2",
+		Driver:          "overlay2",
+		DockerRootDir:   "/var/lib/docker",
+		OperatingSystem: "Ubuntu 24.04",
+		Architecture:    "x86_64",
+		NCPU:            8,
+		MemTotal:        16 << 30,
+	}
+	api.version = dockerclient.ServerVersionResult{
+		Version:       "28.5.2",
+		APIVersion:    "1.51",
+		MinAPIVersion: "1.24",
+		Components: []system.ComponentVersion{{
+			Name: "Engine",
+			Details: map[string]string{
+				"GitCommit": "abc123",
+				"GoVersion": "go1.26.4",
+			},
+		}},
+	}
+	api.diskUsage = dockerclient.DiskUsageResult{
+		Images: dockerclient.ImagesDiskUsage{
+			TotalCount: 2, ActiveCount: 1, TotalSize: 300, Reclaimable: 100,
+		},
+		Containers: dockerclient.ContainersDiskUsage{
+			TotalCount: 2, ActiveCount: 1, TotalSize: 65, Reclaimable: 5,
+		},
+		Volumes: dockerclient.VolumesDiskUsage{
+			TotalCount: 2, ActiveCount: 1, TotalSize: 125, Reclaimable: 50,
+		},
+		BuildCache: dockerclient.BuildCacheDiskUsage{
+			TotalCount: 2, ActiveCount: 1, TotalSize: 15, Reclaimable: 7,
+		},
+	}
+
+	client := New(fakeDockerProvider{}, eventBus)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	select {
+	case event := <-events:
+		payload, ok := event.Payload.(ConnectedPayload)
+		if !ok {
+			t.Fatalf("connected payload = %#v", event.Payload)
+		}
+		if payload.Host != "unix:///var/run/docker.sock" || payload.Context != "default" {
+			t.Fatalf("payload = %#v", payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for docker:connected")
+	}
+
+	info, err := client.Info(ctx)
+	if err != nil {
+		t.Fatalf("Info() error = %v", err)
+	}
+	if info.ServerVersion != "28.5.2" || info.CPUs != 8 || info.MemoryBytes != 16<<30 {
+		t.Fatalf("info = %#v", info)
+	}
+
+	version, err := client.Version(ctx)
+	if err != nil {
+		t.Fatalf("Version() error = %v", err)
+	}
+	if version.APIVersion != "1.51" || version.GitCommit != "abc123" {
+		t.Fatalf("version = %#v", version)
+	}
+
+	usage, err := client.DiskUsage(ctx)
+	if err != nil {
+		t.Fatalf("DiskUsage() error = %v", err)
+	}
+	if usage.TotalBytes != 505 || usage.Reclaimable != 162 {
+		t.Fatalf("usage = %#v", usage)
+	}
+}
+
+func TestNormalizeContainerStateKeepsUnknownStateUnknown(t *testing.T) {
+	t.Parallel()
+	if got := normalizeContainerState("hibernating"); got != "unknown" {
+		t.Fatalf("normalizeContainerState(unknown) = %q, want unknown", got)
+	}
+	if got := normalizeContainerState("removing"); got != "exited" {
+		t.Fatalf("normalizeContainerState(removing) = %q, want exited", got)
+	}
+}
+
+func TestClientConnectUsesProviderDialer(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	var gotHost string
+	var gotDialer bool
+	client := New(fakeDialerProvider{
+		host: "unix:///var/run/docker.sock",
+		dialer: func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("dialer should be passed to SDK factory, not called by fake API")
+		},
+	}, nil)
+	client.factoryWithDialer = func(host string, dialer func(context.Context, string, string) (net.Conn, error)) (APIClient, error) {
+		gotHost = host
+		gotDialer = dialer != nil
+		return api, nil
+	}
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	if gotHost != "unix:///var/run/docker.sock" || !gotDialer {
+		t.Fatalf("factory host=%q dialer=%t", gotHost, gotDialer)
+	}
+	if !client.usesProcessBackedTransport() {
+		t.Fatal("process-backed transport flag = false, want true")
+	}
+}
+
+func TestProcessBackedHTTPClientDoesNotCapActiveStreams(t *testing.T) {
+	t.Parallel()
+	httpClient := dockerHTTPClient()
+	transport, ok := httpClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport = %T, want *http.Transport", httpClient.Transport)
+	}
+	if transport.DisableKeepAlives {
+		t.Fatal("DisableKeepAlives = true, want bounded keep-alive reuse for process-backed WSL transport")
+	}
+	if transport.MaxConnsPerHost != 0 {
+		t.Fatalf("MaxConnsPerHost = %d, want no active stream cap", transport.MaxConnsPerHost)
+	}
+	if transport.MaxIdleConnsPerHost != 2 {
+		t.Fatalf("MaxIdleConnsPerHost = %d, want 2", transport.MaxIdleConnsPerHost)
+	}
+	if transport.IdleConnTimeout <= 0 {
+		t.Fatal("IdleConnTimeout <= 0")
+	}
+}
+
+func TestNewSDKClientWithDialerUsesPlainHTTP(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead || r.URL.Path != "/_ping" {
+			t.Errorf("request = %s %s, want HEAD /_ping", r.Method, r.URL.Path)
+			http.Error(w, "unexpected request", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("API-Version", "1.55")
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+
+	dialer := func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp", server.Listener.Addr().String())
+	}
+	api, err := newSDKClientWithDialer("unix:///var/run/docker.sock", dialer)
+	if err != nil {
+		t.Fatalf("newSDKClientWithDialer() error = %v", err)
+	}
+	t.Cleanup(func() { _ = api.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ping, err := api.Ping(ctx, dockerclient.PingOptions{NegotiateAPIVersion: true})
+	if err != nil {
+		t.Fatalf("Ping() over process-backed dialer error = %v", err)
+	}
+	if ping.APIVersion != "1.55" {
+		t.Fatalf("Ping() API version = %q, want 1.55", ping.APIVersion)
+	}
+}
+
+func TestClientListImagesUsesInventoryTimeout(t *testing.T) {
+	t.Parallel()
+	api := newFakeAPI()
+	api.images = []image.Summary{{ID: "sha256:image1", RepoTags: []string{"example/app:latest"}}}
+
+	client := New(fakeDockerProvider{}, nil)
+	client.api = api
+	client.unaryTimeout = 2 * time.Second
+
+	if _, err := client.ListImages(context.Background()); err != nil {
+		t.Fatalf("ListImages() error = %v", err)
+	}
+	if api.imageListDeadline < defaultInventoryTimeout-time.Second {
+		t.Fatalf("image list deadline = %s, want inventory timeout near %s", api.imageListDeadline, defaultInventoryTimeout)
+	}
+}
+
+func TestClientConcurrentConnectSerializesReplacement(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	client := New(fakeDockerProvider{}, nil)
+	releaseFactory := make(chan struct{})
+	factoryStarted := make(chan struct{}, 2)
+	var mu sync.Mutex
+	inFlight := 0
+	maxInFlight := 0
+	apis := []*fakeAPI{}
+	client.factory = func(string) (APIClient, error) {
+		api := newFakeAPI()
+		mu.Lock()
+		inFlight++
+		if inFlight > maxInFlight {
+			maxInFlight = inFlight
+		}
+		apis = append(apis, api)
+		mu.Unlock()
+		factoryStarted <- struct{}{}
+		select {
+		case <-releaseFactory:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		mu.Lock()
+		inFlight--
+		mu.Unlock()
+		return api, nil
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	for range 2 {
+		go func() {
+			<-start
+			errs <- client.Connect(ctx)
+		}()
+	}
+	close(start)
+	select {
+	case <-factoryStarted:
+	case <-ctx.Done():
+		t.Fatal("timed out waiting for first factory call")
+	}
+	select {
+	case <-factoryStarted:
+		t.Fatal("second factory call started before the first connect completed")
+	case <-time.After(25 * time.Millisecond):
+	}
+	close(releaseFactory)
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("Connect() error = %v", err)
+		}
+	}
+
+	mu.Lock()
+	gotMax := maxInFlight
+	gotAPIs := append([]*fakeAPI(nil), apis...)
+	mu.Unlock()
+	if gotMax != 1 {
+		t.Fatalf("concurrent factory calls = %d, want 1", gotMax)
+	}
+	if len(gotAPIs) != 2 {
+		t.Fatalf("API clients created = %d, want 2", len(gotAPIs))
+	}
+	gotAPIs[0].mu.Lock()
+	firstClosed := gotAPIs[0].closed
+	gotAPIs[0].mu.Unlock()
+	gotAPIs[1].mu.Lock()
+	secondClosed := gotAPIs[1].closed
+	gotAPIs[1].mu.Unlock()
+	if !firstClosed || secondClosed {
+		t.Fatalf("closed clients first=%t second=%t, want first superseded only", firstClosed, secondClosed)
+	}
+}
+
+func TestClientContainerStatsUsesStreamAndOneShot(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	read := time.Date(2026, 6, 13, 12, 0, 0, 0, time.UTC)
+	api.stats["abc123"] = []container.StatsResponse{{
+		ID:   "abc123",
+		Read: read,
+		CPUStats: container.CPUStats{
+			CPUUsage:    container.CPUUsage{TotalUsage: 100},
+			SystemUsage: 1000,
+		},
+	}}
+
+	client := New(fakeDockerProvider{}, nil)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	stream, err := client.ContainerStats(ctx, "abc123", StatsOptions{Stream: true})
+	if err != nil {
+		t.Fatalf("ContainerStats(stream) error = %v", err)
+	}
+	defer func() {
+		_ = stream.Body.Close()
+	}()
+	var streamStats container.StatsResponse
+	if err := json.NewDecoder(stream.Body).Decode(&streamStats); err != nil {
+		t.Fatalf("decode stream stats: %v", err)
+	}
+	if streamStats.ID != "abc123" {
+		t.Fatalf("stream stats = %#v", streamStats)
+	}
+
+	oneShot, err := client.ContainerStats(ctx, "abc123", StatsOptions{OneShot: true})
+	if err != nil {
+		t.Fatalf("ContainerStats(one-shot) error = %v", err)
+	}
+	defer func() {
+		_ = oneShot.Body.Close()
+	}()
+
+	if len(api.statsCalls) != 2 {
+		t.Fatalf("stats calls = %#v", api.statsCalls)
+	}
+	if !api.statsCalls[0].Stream || !api.statsCalls[1].OneShot {
+		t.Fatalf("stats calls = %#v", api.statsCalls)
+	}
+}
+
+func TestClientContainerProcessPIDsParsesTopOutput(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	api.tops["abc123"] = dockerclient.ContainerTopResult{
+		Titles: []string{"UID", "PID", "CMD"},
+		Processes: [][]string{
+			{"root", "4242", "ollama"},
+			{"1000", "4343", "python"},
+			{"1000", "not-a-pid", "ignored"},
+		},
+	}
+	client := New(fakeDockerProvider{}, nil)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	pids, err := client.ContainerProcessPIDs(ctx, "abc123")
+	if err != nil {
+		t.Fatalf("ContainerProcessPIDs() error = %v", err)
+	}
+	if !reflect.DeepEqual(pids, []int{4242, 4343}) {
+		t.Fatalf("pids = %#v, want [4242 4343]", pids)
+	}
+}
+
+func TestCancelReadCloserCancelsOnlyOnClose(t *testing.T) {
+	t.Parallel()
+	canceled := false
+	body := cancelReadCloser{
+		ReadCloser: io.NopCloser(strings.NewReader("ok")),
+		cancel:     func() { canceled = true },
+	}
+	if _, err := io.ReadAll(body); err != nil {
+		t.Fatalf("ReadAll() error = %v", err)
+	}
+	if canceled {
+		t.Fatalf("cancel fired before Close")
+	}
+	if err := body.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	if !canceled {
+		t.Fatalf("cancel did not fire on Close")
+	}
+}
+
+func TestClientContainerExecAndShellDetection(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	api.containerInspects["abc123"] = container.InspectResponse{
+		ID:     "abc123",
+		Name:   "/api-1",
+		Image:  "sha256:image1",
+		State:  &container.State{Status: container.StateRunning},
+		Config: &container.Config{Image: "example/api:latest"},
+	}
+	api.executablePaths["/bin/sh"] = true
+
+	client := New(fakeDockerProvider{}, nil)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	shells, err := client.DetectContainerShells(ctx, "abc123")
+	if err != nil {
+		t.Fatalf("DetectContainerShells() error = %v", err)
+	}
+	if got, want := strings.Join(shells, ","), "/bin/sh"; got != want {
+		t.Fatalf("shells = %q, want %q", got, want)
+	}
+	if _, err := client.DetectContainerShells(ctx, "abc123"); err != nil {
+		t.Fatalf("DetectContainerShells(cached) error = %v", err)
+	}
+	if len(api.execCreates) != 6 {
+		t.Fatalf("exec create count = %d, want cached second call", len(api.execCreates))
+	}
+
+	session, err := client.OpenContainerExec(ctx, "abc123", ExecOptions{
+		Cmd:        []string{"/bin/sh"},
+		User:       "1000",
+		WorkingDir: "/app",
+		Env:        map[string]string{"B": "2", "A": "1"},
+		TTY:        true,
+		Cols:       132,
+		Rows:       43,
+	})
+	if err != nil {
+		t.Fatalf("OpenContainerExec() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = session.Close()
+	})
+	last := api.execCreates[len(api.execCreates)-1]
+	if last.ContainerID != "abc123" || !last.Options.TTY || last.Options.User != "1000" || last.Options.WorkingDir != "/app" {
+		t.Fatalf("exec create = %#v", last)
+	}
+	if fmt.Sprint(last.Options.Cmd) != "[/bin/sh]" || fmt.Sprint(last.Options.Env) != "[A=1 B=2]" {
+		t.Fatalf("exec argv/env = %#v %#v", last.Options.Cmd, last.Options.Env)
+	}
+	if last.Options.ConsoleSize != (dockerclient.ConsoleSize{Height: 43, Width: 132}) {
+		t.Fatalf("console size = %#v", last.Options.ConsoleSize)
+	}
+	if len(api.execAttachCtxs) == 0 {
+		t.Fatalf("no exec attach recorded")
+	}
+	if len(api.execAttachOpts) == 0 ||
+		api.execAttachOpts[len(api.execAttachOpts)-1].ConsoleSize != (dockerclient.ConsoleSize{Height: 43, Width: 132}) {
+		t.Fatalf("attach options = %#v", api.execAttachOpts)
+	}
+
+	if err := client.ResizeContainerExec(ctx, session.ID, 120, 30); err != nil {
+		t.Fatalf("ResizeContainerExec() error = %v", err)
+	}
+	if got := api.execResizes[len(api.execResizes)-1]; got.ExecID != session.ID || got.Options.Width != 120 || got.Options.Height != 30 {
+		t.Fatalf("resize = %#v", got)
+	}
+}
+
+func TestClientOpenContainerExecKeepsAttachAfterCallerCancel(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	api := newFakeAPI()
+
+	client := New(fakeDockerProvider{}, nil)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	session, err := client.OpenContainerExec(ctx, "abc123", ExecOptions{Cmd: []string{"/bin/sh"}, TTY: true})
+	if err != nil {
+		t.Fatalf("OpenContainerExec() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = session.Close()
+	})
+	if len(api.execAttachCtxs) != 1 {
+		t.Fatalf("exec attach context count = %d, want 1", len(api.execAttachCtxs))
+	}
+
+	cancel()
+	if err := api.execAttachCtxs[0].Err(); err != nil {
+		t.Fatalf("exec attach context was cancelled with caller context: %v", err)
+	}
+}
+
+func TestExpectedExecCloseUsesTypedErrors(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "eof", err: io.EOF, want: true},
+		{name: "closed pipe", err: io.ErrClosedPipe, want: true},
+		{name: "wrapped net closed", err: fmt.Errorf("read failed: %w", net.ErrClosed), want: true},
+		{name: "string only", err: errors.New("use of closed network connection"), want: false},
+		{name: "real error", err: errors.New("permission denied"), want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isExpectedExecClose(tt.err); got != tt.want {
+				t.Fatalf("isExpectedExecClose(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestClientListContainerFiles(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	api.containerInspects["abc123"] = container.InspectResponse{
+		ID:     "abc123",
+		Name:   "/app-1",
+		Image:  "sha256:image1",
+		State:  &container.State{Status: container.StateRunning},
+		Config: &container.Config{Image: "example/app:latest"},
+	}
+	api.executablePaths["/bin/sh"] = true
+	api.execOutputs[commandKey([]string{"/bin/sh", "-c", containerFileListScript})] = strings.Join([]string{
+		"file\tapp.log\t/app/app.log\t42\t-rw-r--r--\t1718600000\t",
+		"directory\tconfig\t/app/config\t4096\tdrwxr-xr-x\t1718600100\t",
+		"symlink\tcurrent\t/app/current\t7\tlrwxrwxrwx\t1718600200\t/releases/current",
+	}, "\n")
+
+	client := New(fakeDockerProvider{}, nil)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	listing, err := client.ListContainerFiles(ctx, "abc123", "app")
+	if err != nil {
+		t.Fatalf("ListContainerFiles() error = %v", err)
+	}
+	if listing.Path != "/app" || listing.ParentPath != "/" || listing.ContainerID != "abc123" {
+		t.Fatalf("listing metadata = %#v", listing)
+	}
+	if len(listing.Entries) != 3 {
+		t.Fatalf("entries = %#v, want 3", listing.Entries)
+	}
+	if listing.Entries[0].Name != "config" || listing.Entries[0].Type != "directory" {
+		t.Fatalf("first entry = %#v, want directory first", listing.Entries[0])
+	}
+	if listing.Entries[2].Name != "current" || listing.Entries[2].LinkTarget != "/releases/current" {
+		t.Fatalf("symlink entry = %#v", listing.Entries[2])
+	}
+	if len(api.execCreates) == 0 {
+		t.Fatalf("expected exec create calls")
+	}
+	listCall := api.execCreates[len(api.execCreates)-1]
+	if got := fmt.Sprint(listCall.Options.Env); got != "[CAIRN_PATH=/app]" {
+		t.Fatalf("exec env = %s", got)
+	}
+}
+
+func TestClientListContainerFilesNotFound(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	api.containerInspects["abc123"] = container.InspectResponse{
+		ID:     "abc123",
+		Name:   "/app-1",
+		Image:  "sha256:image1",
+		State:  &container.State{Status: container.StateRunning},
+		Config: &container.Config{Image: "example/app:latest"},
+	}
+	api.executablePaths["/bin/sh"] = true
+	api.execExitCodes[commandKey([]string{"/bin/sh", "-c", containerFileListScript})] = 44
+
+	client := New(fakeDockerProvider{}, nil)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	_, err := client.ListContainerFiles(ctx, "abc123", "/missing")
+	if !apperror.IsCode(err, apperror.NotFound) {
+		t.Fatalf("ListContainerFiles() error = %v, want not found", err)
+	}
+}
+
+func TestClientHealthLoopRecoversWithinGraceWithoutDisconnect(t *testing.T) {
+	t.Parallel()
+	rootCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	eventBus := bus.New()
+	defer eventBus.Close()
+	connected := eventBus.Subscribe(rootCtx, bus.TopicDockerConnected, 4)
+	reconnecting := eventBus.Subscribe(rootCtx, bus.TopicDockerReconnecting, 4)
+	disconnected := eventBus.Subscribe(rootCtx, bus.TopicDockerDisconnected, 4)
+
+	first := newFakeAPI()
+	second := newFakeAPI()
+	clients := []APIClient{first, second}
+	client := New(fakeDockerProvider{}, eventBus)
+	client.pingInterval = 10 * time.Millisecond
+	client.backoffMin = 10 * time.Millisecond
+	client.backoffMax = 20 * time.Millisecond
+	client.failureThreshold = 3
+	client.factory = func(string) (APIClient, error) {
+		if len(clients) == 0 {
+			return nil, errors.New("no fake clients left")
+		}
+		next := clients[0]
+		clients = clients[1:]
+		return next, nil
+	}
+	if err := client.Connect(rootCtx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	<-connected
+	first.setPingError(errors.New("daemon stopped"))
+
+	client.StartHealthLoop(rootCtx)
+
+	// The grace period publishes a "reconnecting" event instead of immediately
+	// reporting the connection as lost.
+	select {
+	case event := <-reconnecting:
+		payload, ok := event.Payload.(ReconnectingPayload)
+		if !ok || payload.Reason == "" || payload.Attempt != 1 {
+			t.Fatalf("reconnecting payload = %#v", event.Payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for docker:reconnecting")
+	}
+
+	// The first reconnect attempt uses the healthy `second` client, so the
+	// connection recovers within the grace window before the threshold is hit.
+	select {
+	case <-connected:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for docker:connected after recovery")
+	}
+
+	// Because recovery happened within the grace window, "disconnected" must
+	// never be published.
+	select {
+	case event := <-disconnected:
+		t.Fatalf("unexpected docker:disconnected during grace recovery: %#v", event.Payload)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestClientHealthLoopDisconnectsAfterGraceThreshold(t *testing.T) {
+	t.Parallel()
+	rootCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	eventBus := bus.New()
+	defer eventBus.Close()
+	connected := eventBus.Subscribe(rootCtx, bus.TopicDockerConnected, 8)
+	reconnecting := eventBus.Subscribe(rootCtx, bus.TopicDockerReconnecting, 8)
+	disconnected := eventBus.Subscribe(rootCtx, bus.TopicDockerDisconnected, 8)
+
+	first := newFakeAPI()
+	second := newFakeAPI()
+	// The initial Connect uses `first`; the next two reconnect attempts fail to
+	// exceed the grace threshold, then `second` succeeds. initialDone is written
+	// before StartHealthLoop spawns the health-loop goroutine, and
+	// reconnectAttempts is only touched from that goroutine, so no extra
+	// synchronization is needed.
+	initialDone := false
+	reconnectAttempts := 0
+	client := New(fakeDockerProvider{}, eventBus)
+	client.pingInterval = 10 * time.Millisecond
+	client.backoffMin = 10 * time.Millisecond
+	client.backoffMax = 20 * time.Millisecond
+	client.failureThreshold = 2
+	client.factory = func(string) (APIClient, error) {
+		if !initialDone {
+			initialDone = true
+			return first, nil
+		}
+		reconnectAttempts++
+		if reconnectAttempts <= 2 {
+			return nil, errors.New("connect failed")
+		}
+		return second, nil
+	}
+	if err := client.Connect(rootCtx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	<-connected
+	first.setPingError(errors.New("daemon stopped"))
+
+	client.StartHealthLoop(rootCtx)
+
+	select {
+	case event := <-reconnecting:
+		if payload, ok := event.Payload.(ReconnectingPayload); !ok || payload.Attempt != 1 {
+			t.Fatalf("first reconnecting payload = %#v", event.Payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for docker:reconnecting")
+	}
+
+	select {
+	case event := <-disconnected:
+		payload, ok := event.Payload.(DisconnectedPayload)
+		if !ok || payload.Reason == "" {
+			t.Fatalf("disconnected payload = %#v", event.Payload)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for docker:disconnected after grace threshold")
+	}
+
+	select {
+	case <-connected:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for docker:connected after reconnect")
+	}
+
+	// Exactly one disconnect must be published even though reconnect attempts
+	// continued past the threshold; otherwise the desktop-notification bridge
+	// would fire repeated "Docker disconnected" toasts.
+	select {
+	case event := <-disconnected:
+		t.Fatalf("second docker:disconnected published: %#v", event.Payload)
+	default:
+	}
+}
+
+func TestClientObjectsDTOsRawInspectAndCacheReconcile(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	seedFakeObjects(api)
+
+	dbPath := filepath.Join(t.TempDir(), "cairn.db")
+	db, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	client := New(fakeDockerProvider{}, nil)
+	client.SetObjectCache(db.Objects())
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	if err := client.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+
+	containers, err := client.ListContainers(ctx, providersDemoContainerFilter())
+	if err != nil {
+		t.Fatalf("ListContainers() error = %v", err)
+	}
+	if len(containers) != 1 {
+		t.Fatalf("containers = %#v, want 1", containers)
+	}
+	containerSummary := containers[0]
+	if containerSummary.Name != "web" || containerSummary.State != "running" || containerSummary.Health != "healthy" {
+		t.Fatalf("container summary = %#v", containerSummary)
+	}
+	if len(containerSummary.Ports) != 1 || containerSummary.Ports[0].HostPort != "8080" {
+		t.Fatalf("container ports = %#v", containerSummary.Ports)
+	}
+
+	containerDetail, err := client.GetContainer(ctx, "abc123")
+	if err != nil {
+		t.Fatalf("GetContainer() error = %v", err)
+	}
+	if containerDetail.Summary.Restarts != 2 || containerDetail.RestartPolicy != "unless-stopped" {
+		t.Fatalf("container detail = %#v", containerDetail)
+	}
+	if got := envValue(containerDetail.Env, "API_TOKEN"); got != "********" {
+		t.Fatalf("API_TOKEN = %q, want redacted", got)
+	}
+	rawInspect, err := client.InspectContainerRaw(ctx, "abc123")
+	if err != nil {
+		t.Fatalf("InspectContainerRaw() error = %v", err)
+	}
+	if !strings.Contains(rawInspect, `"Id"`) {
+		t.Fatalf("raw inspect did not look like Docker JSON: %s", rawInspect)
+	}
+
+	images, err := client.ListImages(ctx)
+	if err != nil {
+		t.Fatalf("ListImages() error = %v", err)
+	}
+	if len(images) != 1 || !images[0].InUse || images[0].RepoTags[0] != "example/web:latest" {
+		t.Fatalf("images = %#v", images)
+	}
+	imageDetail, err := client.GetImage(ctx, "sha256:image1")
+	if err != nil {
+		t.Fatalf("GetImage() error = %v", err)
+	}
+	if imageDetail.Architecture != "amd64" || imageDetail.OS != "linux" || len(imageDetail.Layers) != 1 {
+		t.Fatalf("image detail = %#v", imageDetail)
+	}
+
+	volumes, err := client.ListVolumes(ctx)
+	if err != nil {
+		t.Fatalf("ListVolumes() error = %v", err)
+	}
+	if len(volumes) != 1 || !volumes[0].InUse || volumes[0].SizeBytes != 42 {
+		t.Fatalf("volumes = %#v", volumes)
+	}
+	volumeDetail, err := client.GetVolume(ctx, "demo_data")
+	if err != nil {
+		t.Fatalf("GetVolume() error = %v", err)
+	}
+	if len(volumeDetail.Containers) != 1 || volumeDetail.Containers[0].Name != "web" {
+		t.Fatalf("volume detail = %#v", volumeDetail)
+	}
+	if volumeDetail.CreatedAt.IsZero() {
+		t.Fatalf("volume CreatedAt was not mapped from Docker inspect: %#v", volumeDetail)
+	}
+
+	networks, err := client.ListNetworks(ctx)
+	if err != nil {
+		t.Fatalf("ListNetworks() error = %v", err)
+	}
+	if len(networks) != 1 || networks[0].Name != "demo_default" || !networks[0].Attachable {
+		t.Fatalf("networks = %#v", networks)
+	}
+	if networks[0].Subnet != "172.22.0.0/16" || networks[0].Gateway != "172.22.0.1" || networks[0].ContainerCount != 1 {
+		t.Fatalf("network summary detail = %#v", networks[0])
+	}
+	networkDetail, err := client.GetNetwork(ctx, "net1")
+	if err != nil {
+		t.Fatalf("GetNetwork() error = %v", err)
+	}
+	if networkDetail.Subnet != "172.22.0.0/16" || networkDetail.Gateway != "172.22.0.1" || len(networkDetail.Containers) != 1 {
+		t.Fatalf("network detail = %#v", networkDetail)
+	}
+	if got := networkDetail.Containers[0].IPv4Address; got != "172.22.0.2/16" {
+		t.Fatalf("network container IPv4 = %q, want 172.22.0.2/16", got)
+	}
+	if got := networkDetail.Containers[0].MacAddress; got != "02:42:ac:16:00:02" {
+		t.Fatalf("network container MAC = %q, want 02:42:ac:16:00:02", got)
+	}
+
+	sqlDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw sql: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = sqlDB.Close()
+	})
+	if got := queryCount(t, ctx, sqlDB, "containers_cache"); got != 1 {
+		t.Fatalf("containers_cache count = %d, want 1", got)
+	}
+	if got := queryCount(t, ctx, sqlDB, "images_cache"); got != 1 {
+		t.Fatalf("images_cache count = %d, want 1", got)
+	}
+	if got := queryCount(t, ctx, sqlDB, "volumes_cache"); got != 1 {
+		t.Fatalf("volumes_cache count = %d, want 1", got)
+	}
+	if got := queryCount(t, ctx, sqlDB, "networks_cache"); got != 1 {
+		t.Fatalf("networks_cache count = %d, want 1", got)
+	}
+	if got := queryString(t, ctx, sqlDB, "SELECT status FROM containers_cache WHERE id = ?", fakeContainerID); got != "running" {
+		t.Fatalf("cached container status = %q, want running", got)
+	}
+	if got := queryString(t, ctx, sqlDB, "SELECT subnet FROM networks_cache WHERE id = ?", "net1"); got != "172.22.0.0/16" {
+		t.Fatalf("cached network subnet = %q, want subnet", got)
+	}
+}
+
+func TestClientListNetworksIgnoresContainersWithoutNetworkSettings(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	seedFakeObjects(api)
+	api.containers = append(api.containers,
+		container.Summary{ID: "missing-settings"},
+		container.Summary{ID: "empty-settings", NetworkSettings: &container.NetworkSettingsSummary{}},
+	)
+
+	client := New(fakeDockerProvider{}, nil)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	networks, err := client.ListNetworks(ctx)
+	if err != nil {
+		t.Fatalf("ListNetworks() error = %v", err)
+	}
+	if len(networks) != 1 || networks[0].ContainerCount != 1 {
+		t.Fatalf("networks = %#v, want one attached container", networks)
+	}
+}
+
+func TestClientListNetworksSurvivesContainerUsageFailure(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	seedFakeObjects(api)
+	api.containerListErr = errors.New("container inventory unavailable")
+
+	client := New(fakeDockerProvider{}, nil)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	networks, err := client.ListNetworks(ctx)
+	if err != nil {
+		t.Fatalf("ListNetworks() error = %v", err)
+	}
+	if len(networks) != 1 || networks[0].Name != "demo_default" || networks[0].ContainerCount != 0 {
+		t.Fatalf("networks = %#v, want network inventory with unavailable usage count", networks)
+	}
+}
+
+func TestClientObjectCacheUsesStableManagedBackendScope(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "cairn.db")
+	db, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	sqlDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw sql: %v", err)
+	}
+	t.Cleanup(func() { _ = sqlDB.Close() })
+
+	for _, identity := range []string{"wsl:Ubuntu", "wsl:Work"} {
+		api := newFakeAPI()
+		seedFakeObjects(api)
+		provider := &fakeManagedDockerProvider{
+			providerID:      "windows_wsl_ubuntu",
+			dockerContext:   "default",
+			backendIdentity: identity,
+		}
+		client := New(provider, nil)
+		client.SetObjectCache(db.Objects())
+		client.factory = func(string) (APIClient, error) { return api, nil }
+		if err := client.Connect(ctx); err != nil {
+			t.Fatalf("Connect(%s) error = %v", identity, err)
+		}
+		// The binding is immutable for this client even if a mutable provider is
+		// reconfigured before an inventory operation completes.
+		provider.backendIdentity = "wsl:changed-after-connect"
+		if err := client.Reconcile(ctx); err != nil {
+			t.Fatalf("Reconcile(%s) error = %v", identity, err)
+		}
+	}
+
+	for _, table := range []string{"containers_cache", "images_cache", "volumes_cache", "networks_cache"} {
+		if got := queryCount(t, ctx, sqlDB, table); got != 2 {
+			t.Fatalf("%s rows = %d, want colliding native keys in both backend scopes", table, got)
+		}
+		if got := queryString(t, ctx, sqlDB, "SELECT group_concat(context_name, ',') FROM (SELECT context_name FROM "+table+" ORDER BY context_name)"); got != "wsl:Ubuntu,wsl:Work" {
+			t.Fatalf("%s contexts = %q, want stable managed backend scopes", table, got)
+		}
+	}
+}
+
+func TestClientConnectRejectsIncompleteCacheScope(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	provider := &fakeManagedDockerProvider{providerID: "linux_native"}
+	client := New(provider, nil)
+	factoryCalled := false
+	client.factory = func(string) (APIClient, error) {
+		factoryCalled = true
+		return newFakeAPI(), nil
+	}
+
+	if err := client.Connect(ctx); !apperror.IsCode(err, apperror.ProviderNotReady) {
+		t.Fatalf("Connect() error = %v, want provider-not-ready runtime scope error", err)
+	}
+	if factoryCalled {
+		t.Fatal("Docker API factory called before runtime scope validation")
+	}
+}
+
+func TestClientReconnectRejectsManagedIdentityMutation(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	provider := &fakeManagedDockerProvider{providerID: "windows_wsl_ubuntu", backendIdentity: "wsl:one"}
+	client := New(provider, nil)
+	scope := runtimescope.Must(provider.providerID, provider.backendIdentity)
+	if err := client.BindRuntimeScope(scope); err != nil {
+		t.Fatalf("BindRuntimeScope() error = %v", err)
+	}
+	factoryCalls := 0
+	client.factory = func(string) (APIClient, error) {
+		factoryCalls++
+		return newFakeAPI(), nil
+	}
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("initial Connect() error = %v", err)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	provider.backendIdentity = "wsl:two"
+	if err := client.Connect(ctx); !apperror.IsCode(err, apperror.NotFound) {
+		t.Fatalf("reconnect error = %v, want not found", err)
+	}
+	if factoryCalls != 1 {
+		t.Fatalf("factory calls = %d, want no new API after identity mismatch", factoryCalls)
+	}
+	client.mu.RLock()
+	api := client.api
+	runtimeScope := client.runtimeScope
+	client.mu.RUnlock()
+	if api != nil || !runtimeScope.Equal(scope) {
+		t.Fatalf("reconnect changed bound client: api=%T scope=%q", api, runtimeScope.ContextName())
+	}
+}
+
+func TestClientConnectRejectsIdentityMutationDuringSetup(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	provider := &fakeManagedDockerProvider{providerID: "windows_wsl_ubuntu", backendIdentity: "wsl:one"}
+	client := New(provider, nil)
+	scope := runtimescope.Must(provider.providerID, provider.backendIdentity)
+	if err := client.BindRuntimeScope(scope); err != nil {
+		t.Fatalf("BindRuntimeScope() error = %v", err)
+	}
+	created := newFakeAPI()
+	client.factory = func(string) (APIClient, error) {
+		provider.backendIdentity = "wsl:two"
+		return created, nil
+	}
+	if err := client.Connect(ctx); !apperror.IsCode(err, apperror.NotFound) {
+		t.Fatalf("Connect() error = %v, want not found", err)
+	}
+	created.mu.Lock()
+	closed := created.closed
+	created.mu.Unlock()
+	client.mu.RLock()
+	installed := client.api
+	client.mu.RUnlock()
+	if !closed || installed != nil {
+		t.Fatalf("changed-target API accepted: closed=%t installed=%T", closed, installed)
+	}
+}
+
+func TestClientFreshReconcileConnectsBeforeReadingScopedCache(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "cairn.db"))
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	provider := &fakeManagedDockerProvider{providerID: "windows_wsl_ubuntu", backendIdentity: "wsl:one"}
+	client := New(provider, nil)
+	client.SetObjectCache(db.Objects())
+	api := newFakeAPI()
+	client.factory = func(string) (APIClient, error) { return api, nil }
+
+	if err := client.Reconcile(ctx); err != nil {
+		t.Fatalf("fresh Reconcile() error = %v", err)
+	}
+	client.mu.RLock()
+	installed := client.api
+	scope := client.runtimeScope
+	client.mu.RUnlock()
+	if installed != api || !scope.Matches(provider.providerID, provider.backendIdentity) {
+		t.Fatalf("fresh Reconcile did not bind API/scope: api=%T scope=%q", installed, scope.ContextName())
+	}
+}
+
+func TestClientReconcilePreservesFailedInventoryKind(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "cairn.db"))
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+	scope := runtimescope.Must("windows_wsl_ubuntu", "wsl:one")
+	if err := db.Objects().SaveImagesScoped(ctx, scope, []store.ImageCacheRecord{{
+		Summary: models.ImageSummary{ID: "sha256:preserve", RepoTags: []string{"example/preserve:latest"}},
+	}}, time.Now().UTC().Add(-48*time.Hour)); err != nil {
+		t.Fatalf("SaveImagesScoped() error = %v", err)
+	}
+	provider := &fakeManagedDockerProvider{providerID: scope.ProviderID(), backendIdentity: scope.ContextName()}
+	client := New(provider, nil)
+	client.SetObjectCache(db.Objects())
+	api := newFakeAPI()
+	api.imageListErr = errors.New("image inventory unavailable")
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.BindRuntimeScope(scope); err != nil {
+		t.Fatalf("BindRuntimeScope() error = %v", err)
+	}
+
+	if err := client.Reconcile(ctx); err == nil {
+		t.Fatal("Reconcile() error = nil, want image inventory error")
+	}
+	snapshot, err := db.Objects().SnapshotKeysScoped(ctx, scope)
+	if err != nil {
+		t.Fatalf("SnapshotKeysScoped() error = %v", err)
+	}
+	if len(snapshot.Images) != 1 || snapshot.Images["sha256:preserve"] == "" {
+		t.Fatalf("failed image inventory was erased = %#v", snapshot.Images)
+	}
+}
+
+func TestClientObjectEventsAreCoalesced(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	eventBus := bus.New()
+	defer eventBus.Close()
+	changed := eventBus.Subscribe(ctx, bus.TopicObjectsChanged, 4)
+
+	api := newFakeAPI()
+	client := New(fakeDockerProvider{}, eventBus)
+	client.eventBatch = 10 * time.Millisecond
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	client.StartObjectEventLoop(ctx)
+
+	api.events <- events.Message{
+		Type:  events.ContainerEventType,
+		Actor: events.Actor{ID: fakeContainerID},
+		Time:  time.Now().Unix(),
+	}
+	api.events <- events.Message{
+		Type:  events.ContainerEventType,
+		Actor: events.Actor{ID: fakeContainerID},
+		Time:  time.Now().Unix(),
+	}
+
+	payload := waitObjectsChanged(t, ctx, changed, time.Second)
+	if payload.Kind != "container" || len(payload.IDs) != 1 || payload.IDs[0] != fakeContainerID {
+		t.Fatalf("objects:changed payload = %#v", payload)
+	}
+}
+
+func TestClientProcessBackedTransportDoesNotOpenDockerEventStream(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	api := newFakeAPI()
+	seedFakeObjects(api)
+	client := New(fakeDialerProvider{
+		host: "unix:///var/run/docker.sock",
+		dialer: func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("test dialer should not be called by fake API")
+		},
+	}, nil)
+	client.reconcileEvery = 10 * time.Millisecond
+	client.factoryWithDialer = func(string, func(context.Context, string, string) (net.Conn, error)) (APIClient, error) {
+		return api, nil
+	}
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	client.StartObjectEventLoop(ctx)
+	time.Sleep(50 * time.Millisecond)
+
+	api.mu.Lock()
+	eventCalls := api.eventCalls
+	api.mu.Unlock()
+	if eventCalls != 0 {
+		t.Fatalf("Docker Events calls = %d, want 0 for process-backed transport", eventCalls)
+	}
+}
+
+func TestClientProcessBackedTransportHasOnePeriodicInventoryOwner(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	api := newBlockingContainerListAPI(true)
+	client := New(fakeDialerProvider{
+		host: "unix:///var/run/docker.sock",
+		dialer: func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("test dialer should not be called by fake API")
+		},
+	}, nil)
+	client.reconcileEvery = time.Millisecond
+	client.factoryWithDialer = func(string, func(context.Context, string, string) (net.Conn, error)) (APIClient, error) {
+		return api, nil
+	}
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	// Runtime starts both loops for every transport. The event loop must exit
+	// for process-backed clients instead of becoming a second polling owner.
+	processChanges := make(chan objectChange)
+	eventLoopDone := make(chan struct{})
+	go func() {
+		defer close(eventLoopDone)
+		client.objectEventLoop(ctx, processChanges)
+	}()
+	select {
+	case <-eventLoopDone:
+	case <-time.After(time.Second):
+		t.Fatal("process-backed object event loop did not relinquish polling ownership")
+	}
+	if _, ok := <-processChanges; ok {
+		t.Fatal("process-backed object event loop did not close its change stream")
+	}
+
+	// Only the explicit periodic loop may now begin an inventory scan.
+	client.StartReconcileLoop(ctx)
+	if call := waitContainerListStarted(t, api.started, time.Second); call != 1 {
+		t.Fatalf("first ContainerList call = %d, want 1", call)
+	}
+	select {
+	case call := <-api.started:
+		t.Fatalf("overlapping ContainerList call = %d, want one blocked periodic inventory owner", call)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if calls, active, maximum := api.counts(); calls != 1 || active != 1 || maximum != 1 {
+		t.Fatalf("ContainerList calls=%d active=%d max=%d, want 1/1/1", calls, active, maximum)
+	}
+}
+
+func TestClientObjectEventBurstQueuesOnlyOneFollowUpReconcile(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	eventBus := bus.New()
+	defer func() {
+		cancel()
+		eventBus.Close()
+	}()
+	changed := eventBus.Subscribe(ctx, bus.TopicObjectsChanged, 64)
+
+	api := newBlockingContainerListAPI(false)
+	client := New(fakeDockerProvider{}, eventBus)
+	client.eventBatch = time.Millisecond
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	changes := make(chan objectChange, 256)
+	publisherDone := make(chan struct{})
+	go func() {
+		defer close(publisherDone)
+		client.objectChangePublisher(ctx, changes)
+	}()
+
+	changes <- objectChange{kind: objectKindContainer, id: "first"}
+	payload := waitObjectsChanged(t, ctx, changed, time.Second)
+	if payload.Kind != objectKindContainer {
+		t.Fatalf("first objects:changed kind = %q, want %q", payload.Kind, objectKindContainer)
+	}
+	if call := waitContainerListStarted(t, api.started, time.Second); call != 1 {
+		t.Fatalf("first ContainerList call = %d, want 1", call)
+	}
+
+	// Force at least twenty separate flush windows containing 2,000 events while
+	// the first inventory call is blocked. The fixed one-millisecond window may
+	// split a producer burst across payloads, so wait for each batch's final
+	// sentinel before starting the next one. Every flush requests reconciliation,
+	// but the one-slot dirty queue must collapse all of them into one follow-up.
+	for batch := 0; batch < 20; batch++ {
+		for item := 0; item < 100; item++ {
+			changes <- objectChange{
+				kind: objectKindContainer,
+				id:   fmt.Sprintf("container-%02d-%03d", batch, item),
+			}
+		}
+		lastID := fmt.Sprintf("container-%02d-099", batch)
+		waitObjectsChangedKind(t, ctx, changed, objectKindContainer, lastID, time.Second)
+	}
+	if calls, active, maximum := api.counts(); calls != 1 || active != 1 || maximum != 1 {
+		t.Fatalf("blocked burst calls=%d active=%d max=%d, want 1/1/1", calls, active, maximum)
+	}
+
+	close(api.releaseFirst)
+	if call := waitContainerListStarted(t, api.started, time.Second); call != 2 {
+		t.Fatalf("follow-up ContainerList call = %d, want 2", call)
+	}
+	waitContainerListFinished(t, api.finished, 2, time.Second)
+	select {
+	case call := <-api.started:
+		t.Fatalf("extra ContainerList call = %d, want exactly one coalesced follow-up", call)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if calls, active, maximum := api.counts(); calls != 2 || active != 0 || maximum != 1 {
+		t.Fatalf("completed burst calls=%d active=%d max=%d, want 2/0/1", calls, active, maximum)
+	}
+
+	// Cancellation owns worker shutdown even if the changes channel remains
+	// open; the publisher joins all four fixed workers before returning.
+	cancel()
+	select {
+	case <-publisherDone:
+	case <-time.After(time.Second):
+		t.Fatal("object change publisher did not stop after context cancellation")
+	}
+}
+
+func TestClientReconcilePublishesSnapshotChanges(t *testing.T) {
+	ctx := context.Background()
+	api := newFakeAPI()
+	seedFakeObjects(api)
+
+	dbPath := filepath.Join(t.TempDir(), "cairn.db")
+	db, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	eventBus := bus.New()
+	defer eventBus.Close()
+	client := New(fakeDockerProvider{}, eventBus)
+	client.SetObjectCache(db.Objects())
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	if err := client.Reconcile(ctx); err != nil {
+		t.Fatalf("initial Reconcile() error = %v", err)
+	}
+
+	changed := eventBus.Subscribe(ctx, bus.TopicObjectsChanged, 4)
+	api.containers[0].State = "exited"
+	api.containers[0].Status = "Exited (0) 2 seconds ago"
+	if err := client.Reconcile(ctx); err != nil {
+		t.Fatalf("changed Reconcile() error = %v", err)
+	}
+	payload := waitObjectsChangedKind(t, ctx, changed, objectKindContainer, fakeContainerID, time.Second)
+	if len(payload.IDs) != 1 || payload.IDs[0] != fakeContainerID {
+		t.Fatalf("objects:changed payload = %#v", payload)
+	}
+}
+
+func TestClientContainerLifecycleMethods(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	seedFakeObjects(api)
+
+	eventBus := bus.New()
+	defer eventBus.Close()
+	changed := eventBus.Subscribe(ctx, bus.TopicObjectsChanged, 8)
+
+	client := New(fakeDockerProvider{}, eventBus)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	if err := client.StartContainer(ctx, fakeContainerID); err != nil {
+		t.Fatalf("StartContainer() error = %v", err)
+	}
+	if len(api.started) != 1 || api.started[0] != fakeContainerID {
+		t.Fatalf("started = %#v", api.started)
+	}
+	waitObjectsChangedKind(t, ctx, changed, objectKindContainer, fakeContainerID, time.Second)
+
+	paused := api.containerInspects[fakeContainerID]
+	paused.State.Paused = true
+	api.containerInspects[fakeContainerID] = paused
+	if err := client.StartContainer(ctx, fakeContainerID); err != nil {
+		t.Fatalf("StartContainer(paused) error = %v", err)
+	}
+	if len(api.unpaused) != 1 || api.unpaused[0] != fakeContainerID {
+		t.Fatalf("unpaused = %#v", api.unpaused)
+	}
+
+	if err := client.StopContainer(ctx, fakeContainerID, 3); err != nil {
+		t.Fatalf("StopContainer() error = %v", err)
+	}
+	if err := client.RestartContainer(ctx, fakeContainerID, 4); err != nil {
+		t.Fatalf("RestartContainer() error = %v", err)
+	}
+	if err := client.KillContainer(ctx, fakeContainerID); err != nil {
+		t.Fatalf("KillContainer() error = %v", err)
+	}
+	if err := client.RemoveContainer(ctx, fakeContainerID, models.RemoveContainerOptions{Force: true, RemoveVolumes: true}); err != nil {
+		t.Fatalf("RemoveContainer() error = %v", err)
+	}
+	if len(api.stopped) != 1 || len(api.restarted) != 1 || len(api.killed) != 1 || len(api.removed) != 1 {
+		t.Fatalf("lifecycle calls stopped=%#v restarted=%#v killed=%#v removed=%#v", api.stopped, api.restarted, api.killed, api.removed)
+	}
+	if api.killed[0] != fakeContainerID+":KILL" {
+		t.Fatalf("killed = %#v", api.killed)
+	}
+}
+
+func TestClientRunImageRenameAndCreateObjects(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	seedFakeObjects(api)
+
+	eventBus := bus.New()
+	defer eventBus.Close()
+	changed := eventBus.Subscribe(ctx, bus.TopicObjectsChanged, 8)
+
+	client := New(fakeDockerProvider{}, eventBus)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	containerID, err := client.RunImage(ctx, models.RunImageRequest{
+		ImageRef:      "example/web:latest",
+		Name:          "new-web",
+		Ports:         []models.PortMapping{{HostPort: "0", ContainerPort: "80", Protocol: "tcp"}},
+		Env:           []models.EnvVar{{Name: "MODE", Value: "dev"}, {Name: " ZED ", Value: "last"}, {Name: "MODE", Value: "test"}, {Name: "", Value: "ignored"}},
+		Volumes:       []models.MountSpec{{Type: "volume", VolumeName: "demo_data", Target: "/data", ReadOnly: true}},
+		NetworkID:     "demo_default",
+		RestartPolicy: "unless-stopped",
+		Command:       []string{"sleep", "60"},
+		User:          "1000",
+		Detach:        true,
+	})
+	if err != nil {
+		t.Fatalf("RunImage() error = %v", err)
+	}
+	if containerID != "created-new-web" {
+		t.Fatalf("containerID = %q", containerID)
+	}
+	if len(api.createdContainers) != 1 {
+		t.Fatalf("created containers = %#v", api.createdContainers)
+	}
+	call := api.createdContainers[0]
+	if call.Name != "new-web" || call.Config.Image != "example/web:latest" || call.Config.User != "1000" {
+		t.Fatalf("create call config = %#v", call)
+	}
+	if got, want := call.Config.Env, []string{"MODE=test", "ZED=last"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("env = %#v", got)
+	}
+	if got := call.HostConfig.RestartPolicy.Name; got != container.RestartPolicyUnlessStopped {
+		t.Fatalf("restart policy = %q", got)
+	}
+	if len(call.HostConfig.Mounts) != 1 || call.HostConfig.Mounts[0].Source != "demo_data" || !call.HostConfig.Mounts[0].ReadOnly {
+		t.Fatalf("mounts = %#v", call.HostConfig.Mounts)
+	}
+	if call.NetworkingConfig.EndpointsConfig["demo_default"] == nil {
+		t.Fatalf("networking config = %#v", call.NetworkingConfig)
+	}
+	if len(api.started) != 1 || api.started[0] != containerID {
+		t.Fatalf("started = %#v", api.started)
+	}
+	waitObjectsChangedKind(t, ctx, changed, objectKindContainer, containerID, time.Second)
+
+	if err := client.RenameContainer(ctx, fakeContainerID, "web-renamed"); err != nil {
+		t.Fatalf("RenameContainer() error = %v", err)
+	}
+	if len(api.renamed) != 1 || api.renamed[0] != fakeContainerID+":web-renamed" {
+		t.Fatalf("renamed = %#v", api.renamed)
+	}
+
+	volumeSummary, err := client.CreateVolume(ctx, models.CreateVolumeRequest{
+		Name:       "cairn_data",
+		Driver:     "local",
+		DriverOpts: map[string]string{"type": "none"},
+		Labels:     map[string]string{"app": "cairn"},
+	})
+	if err != nil {
+		t.Fatalf("CreateVolume() error = %v", err)
+	}
+	if volumeSummary.Name != "cairn_data" || volumeSummary.Driver != "local" {
+		t.Fatalf("volume summary = %#v", volumeSummary)
+	}
+
+	networkSummary, err := client.CreateNetwork(ctx, models.CreateNetworkRequest{
+		Name:       "cairn_net",
+		Driver:     "bridge",
+		Subnet:     "172.30.0.0/16",
+		Gateway:    "172.30.0.1",
+		Attachable: true,
+		Labels:     map[string]string{"app": "cairn"},
+	})
+	if err != nil {
+		t.Fatalf("CreateNetwork() error = %v", err)
+	}
+	if networkSummary.Name != "cairn_net" || !networkSummary.Attachable {
+		t.Fatalf("network summary = %#v", networkSummary)
+	}
+	if got := api.createdNetworks[0].Options.IPAM.Config[0].Subnet.String(); got != "172.30.0.0/16" {
+		t.Fatalf("network subnet = %q", got)
+	}
+}
+
+func TestClientCreateVolumeRejectsLocalBindOptionsBeforeDocker(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	client := New(fakeDockerProvider{}, nil)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	tests := []struct {
+		name string
+		opts map[string]string
+	}{
+		{
+			name: "bind host root",
+			opts: map[string]string{"type": "none", "device": "/", "o": "bind"},
+		},
+		{
+			name: "recursive bind docker socket with normalized keys",
+			opts: map[string]string{" TYPE ": " none ", " DEVICE ": "/var/run/docker.sock", " O ": " ro, RBIND "},
+		},
+		{
+			name: "ambiguous duplicate option key",
+			opts: map[string]string{"o": "rw", " O ": "ro"},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := client.CreateVolume(ctx, models.CreateVolumeRequest{
+				Name:       "blocked-volume",
+				Driver:     "local",
+				DriverOpts: tt.opts,
+			})
+			if !apperror.IsCode(err, apperror.Conflict) {
+				t.Fatalf("CreateVolume() error = %v, want %s", err, apperror.Conflict)
+			}
+		})
+	}
+	if len(api.createdVolumes) != 0 {
+		t.Fatalf("VolumeCreate calls = %#v, want none", api.createdVolumes)
+	}
+}
+
+func TestClientCreateVolumePreservesOpaqueLocalOptionValues(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	client := New(fakeDockerProvider{}, nil)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	wantOpts := map[string]string{
+		"type":   " nfs ",
+		"device": " :/exports/private path ",
+		"o":      " addr=10.0.0.2,username=ada,password=  keep spaces  , rw ",
+	}
+	_, err := client.CreateVolume(ctx, models.CreateVolumeRequest{
+		Name:   "opaque-options",
+		Driver: " LOCAL ",
+		DriverOpts: map[string]string{
+			" TYPE ":   wantOpts["type"],
+			" DEVICE ": wantOpts["device"],
+			" O ":      wantOpts["o"],
+		},
+	})
+	if err != nil {
+		t.Fatalf("CreateVolume() error = %v", err)
+	}
+	if len(api.createdVolumes) != 1 {
+		t.Fatalf("VolumeCreate calls = %#v, want one", api.createdVolumes)
+	}
+	if !reflect.DeepEqual(api.createdVolumes[0].DriverOpts, wantOpts) {
+		t.Fatalf("VolumeCreate driver opts = %#v, want exact values %#v", api.createdVolumes[0].DriverOpts, wantOpts)
+	}
+}
+
+func TestProgressReaderWriterEmitFinalSmallTransfers(t *testing.T) {
+	t.Parallel()
+
+	var writeEvents []int64
+	writer := &progressWriter{
+		every: 3,
+		onProgress: func(bytes int64) {
+			writeEvents = append(writeEvents, bytes)
+		},
+	}
+	if n, err := writer.Write([]byte("ab")); err != nil || n != 2 {
+		t.Fatalf("first Write() n=%d err=%v", n, err)
+	}
+	if len(writeEvents) != 0 {
+		t.Fatalf("write events after short write = %#v", writeEvents)
+	}
+	if n, err := writer.Write([]byte("cd")); err != nil || n != 2 {
+		t.Fatalf("second Write() n=%d err=%v", n, err)
+	}
+	if got, want := writeEvents, []int64{4}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("write events = %#v, want %#v", got, want)
+	}
+
+	type progressEvent struct {
+		bytes int64
+		pct   *float64
+	}
+	readEvents := []progressEvent{}
+	reader := &progressReader{
+		reader: strings.NewReader("abcd"),
+		total:  4,
+		every:  10,
+		onProgress: func(bytes int64, pct *float64) {
+			var pctCopy *float64
+			if pct != nil {
+				value := *pct
+				pctCopy = &value
+			}
+			readEvents = append(readEvents, progressEvent{bytes: bytes, pct: pctCopy})
+		},
+	}
+	buf := make([]byte, 8)
+	if n, err := reader.Read(buf); err != nil || n != 4 {
+		t.Fatalf("first Read() n=%d err=%v", n, err)
+	}
+	if len(readEvents) != 0 {
+		t.Fatalf("read events before EOF = %#v", readEvents)
+	}
+	if n, err := reader.Read(buf); !errors.Is(err, io.EOF) || n != 0 {
+		t.Fatalf("second Read() n=%d err=%v, want EOF", n, err)
+	}
+	if len(readEvents) != 1 || readEvents[0].bytes != 4 || readEvents[0].pct == nil || *readEvents[0].pct != 100 {
+		t.Fatalf("read events = %#v", readEvents)
+	}
+
+	readEvents = nil
+	reader = &progressReader{
+		reader: strings.NewReader("xy"),
+		every:  10,
+		onProgress: func(bytes int64, pct *float64) {
+			if pct != nil {
+				t.Fatalf("zero-total pct = %v, want nil", *pct)
+			}
+			readEvents = append(readEvents, progressEvent{bytes: bytes})
+		},
+	}
+	if n, err := reader.Read(buf); err != nil || n != 2 {
+		t.Fatalf("zero-total first Read() n=%d err=%v", n, err)
+	}
+	if n, err := reader.Read(buf); !errors.Is(err, io.EOF) || n != 0 {
+		t.Fatalf("zero-total second Read() n=%d err=%v, want EOF", n, err)
+	}
+	if len(readEvents) != 1 || readEvents[0].bytes != 2 || readEvents[0].pct != nil {
+		t.Fatalf("zero-total read events = %#v", readEvents)
+	}
+}
+
+func TestClientImagePullSaveLoadAndSearch(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	seedFakeObjects(api)
+
+	eventBus := bus.New()
+	defer eventBus.Close()
+	pullEvents := eventBus.Subscribe(ctx, bus.TopicImagePullProgress, 8)
+	jobDone := eventBus.Subscribe(ctx, bus.TopicJobDone, 8)
+
+	client := New(fakeDockerProvider{}, eventBus)
+	client.registryAuth = func(_ context.Context, registry string) (string, error) {
+		if registry != "docker.io" {
+			t.Fatalf("registry auth requested for %q", registry)
+		}
+		return "encoded-pull-auth", nil
+	}
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	streamID, err := client.PullImage(ctx, "alpine:latest")
+	if err != nil {
+		t.Fatalf("PullImage() error = %v", err)
+	}
+	if streamID == "" || len(api.pulled) != 1 || api.pulled[0] != "alpine:latest" {
+		t.Fatalf("streamID=%q pulled=%#v", streamID, api.pulled)
+	}
+	if len(api.pullAuth) != 1 || api.pullAuth[0] != "encoded-pull-auth" {
+		t.Fatalf("pull auth = %#v", api.pullAuth)
+	}
+	if got := waitImageProgress(t, ctx, pullEvents, time.Second); got.StreamID != streamID {
+		t.Fatalf("pull progress = %#v, want stream %q", got, streamID)
+	}
+
+	dest := filepath.Join(t.TempDir(), "image.tar")
+	jobID, err := client.SaveImage(ctx, []string{"example/web:latest"}, dest)
+	if err != nil {
+		t.Fatalf("SaveImage() error = %v", err)
+	}
+	if jobID == "" || len(api.saved) != 1 || api.saved[0][0] != "example/web:latest" {
+		t.Fatalf("jobID=%q saved=%#v", jobID, api.saved)
+	}
+	if data, err := os.ReadFile(dest); err != nil || string(data) != "fake image tar" {
+		t.Fatalf("saved archive data=%q err=%v", string(data), err)
+	}
+	if got := waitJobDone(t, ctx, jobDone, time.Second); got.JobID != jobID || got.Error != "" {
+		t.Fatalf("save job done = %#v", got)
+	}
+
+	src := filepath.Join(t.TempDir(), "load.tar")
+	if err := os.WriteFile(src, []byte("load-me"), 0o644); err != nil {
+		t.Fatalf("write load archive: %v", err)
+	}
+	loadJobID, err := client.LoadImage(ctx, src)
+	if err != nil {
+		t.Fatalf("LoadImage() error = %v", err)
+	}
+	if loadJobID == "" || len(api.loadedBytes) != 1 || api.loadedBytes[0] != len("load-me") {
+		t.Fatalf("loadJobID=%q loadedBytes=%#v", loadJobID, api.loadedBytes)
+	}
+	if got := waitJobDone(t, ctx, jobDone, time.Second); got.JobID != loadJobID || !strings.Contains(got.Result, "loaded:latest") {
+		t.Fatalf("load job done = %#v", got)
+	}
+
+	results, err := client.SearchHub(ctx, "alpine", 5)
+	if err != nil {
+		t.Fatalf("SearchHub() error = %v", err)
+	}
+	if len(results) != 1 || results[0].Name != "library/alpine" || !results[0].Official {
+		t.Fatalf("hub results = %#v", results)
+	}
+}
+
+func TestClientSaveImagePreservesExistingDestination(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	eventBus := bus.New()
+	defer eventBus.Close()
+	jobDone := eventBus.Subscribe(ctx, bus.TopicJobDone, 2)
+
+	client := New(fakeDockerProvider{}, eventBus)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "image.tar")
+	const original = "existing archive must survive"
+	if err := os.WriteFile(dest, []byte(original), 0o600); err != nil {
+		t.Fatalf("write existing destination: %v", err)
+	}
+
+	jobID, err := client.SaveImage(ctx, []string{"example/web:latest"}, dest)
+	if !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("SaveImage() error = %v, want %s", err, apperror.Conflict)
+	}
+	if jobID == "" {
+		t.Fatal("SaveImage() returned an empty job ID")
+	}
+	if payload := waitJobDone(t, ctx, jobDone, time.Second); payload.JobID != jobID || payload.Error == "" || payload.Result != "" {
+		t.Fatalf("job done payload = %#v, want failed job %q with no result", payload, jobID)
+	}
+	if data, readErr := os.ReadFile(dest); readErr != nil || string(data) != original {
+		t.Fatalf("existing destination data = %q, error = %v; want %q", data, readErr, original)
+	}
+	assertNoImageSaveTemps(t, dir)
+}
+
+func TestClientSaveImageCleansTemporaryFileAfterStreamFailure(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	streamErr := errors.New("injected image archive read failure")
+	reader := &failingArchiveReadCloser{
+		payload: []byte("partial image archive"),
+		err:     streamErr,
+	}
+	api.saveReaderFactory = func() io.ReadCloser { return reader }
+	eventBus := bus.New()
+	defer eventBus.Close()
+	jobDone := eventBus.Subscribe(ctx, bus.TopicJobDone, 2)
+
+	client := New(fakeDockerProvider{}, eventBus)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	dir := t.TempDir()
+	dest := filepath.Join(dir, "image.tar")
+	jobID, err := client.SaveImage(ctx, []string{"example/web:latest"}, dest)
+	if err == nil || !errors.Is(err, streamErr) {
+		t.Fatalf("SaveImage() error = %v, want injected stream error", err)
+	}
+	if jobID == "" {
+		t.Fatal("SaveImage() returned an empty job ID")
+	}
+	if !reader.closed {
+		t.Fatal("SaveImage() did not close the Docker image stream")
+	}
+	if payload := waitJobDone(t, ctx, jobDone, time.Second); payload.JobID != jobID || payload.Error == "" || payload.Result != "" {
+		t.Fatalf("job done payload = %#v, want failed job %q with no result", payload, jobID)
+	}
+	if _, statErr := os.Lstat(dest); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Fatalf("destination exists after failed save: %v", statErr)
+	}
+	assertNoImageSaveTemps(t, dir)
+}
+
+func TestWriteSyncedImageArchiveChecksSyncAndCloseErrors(t *testing.T) {
+	t.Parallel()
+	syncErr := errors.New("injected sync failure")
+	closeErr := errors.New("injected close failure")
+	destination := &fakeSyncedWriteCloser{
+		syncErr:  syncErr,
+		closeErr: closeErr,
+	}
+
+	written, err := writeSyncedImageArchive(destination, strings.NewReader("archive"))
+	if written != int64(len("archive")) {
+		t.Fatalf("written = %d, want %d", written, len("archive"))
+	}
+	if !errors.Is(err, syncErr) || !errors.Is(err, closeErr) {
+		t.Fatalf("writeSyncedImageArchive() error = %v, want sync and close errors", err)
+	}
+	if destination.syncCalls != 1 || destination.closeCalls != 1 {
+		t.Fatalf("sync calls = %d, close calls = %d; want 1 each", destination.syncCalls, destination.closeCalls)
+	}
+}
+
+func TestWriteSyncedImageArchiveClosesAfterCopyFailure(t *testing.T) {
+	t.Parallel()
+	writeErr := errors.New("injected write failure")
+	closeErr := errors.New("injected close failure")
+	destination := &fakeSyncedWriteCloser{
+		writeErr: writeErr,
+		closeErr: closeErr,
+	}
+
+	_, err := writeSyncedImageArchive(destination, strings.NewReader("archive"))
+	if !errors.Is(err, writeErr) || !errors.Is(err, closeErr) {
+		t.Fatalf("writeSyncedImageArchive() error = %v, want write and close errors", err)
+	}
+	if destination.syncCalls != 0 {
+		t.Fatalf("sync calls after copy failure = %d, want 0", destination.syncCalls)
+	}
+	if destination.closeCalls != 1 {
+		t.Fatalf("close calls after copy failure = %d, want 1", destination.closeCalls)
+	}
+}
+
+func TestClientLoadImageRejectsNonRegularArchives(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		prepare func(*testing.T) string
+	}{
+		{
+			name: "directory",
+			prepare: func(t *testing.T) string {
+				return t.TempDir()
+			},
+		},
+		{
+			name: "symbolic link",
+			prepare: func(t *testing.T) string {
+				dir := t.TempDir()
+				target := filepath.Join(dir, "target.tar")
+				if err := os.WriteFile(target, []byte("archive"), 0o600); err != nil {
+					t.Fatalf("write symlink target: %v", err)
+				}
+				link := filepath.Join(dir, "link.tar")
+				if err := os.Symlink(target, link); err != nil {
+					t.Skipf("symbolic links unavailable on this host: %v", err)
+				}
+				return link
+			},
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			api := newFakeAPI()
+			client := New(fakeDockerProvider{}, nil)
+			client.factory = func(string) (APIClient, error) { return api, nil }
+			if err := client.Connect(context.Background()); err != nil {
+				t.Fatalf("Connect() error = %v", err)
+			}
+
+			jobID, err := client.LoadImage(context.Background(), tt.prepare(t))
+			if !apperror.IsCode(err, apperror.Conflict) {
+				t.Fatalf("LoadImage() error = %v, want %s", err, apperror.Conflict)
+			}
+			if jobID != "" {
+				t.Fatalf("LoadImage() job ID = %q, want empty before upload starts", jobID)
+			}
+			if len(api.loadedBytes) != 0 {
+				t.Fatalf("ImageLoad() received rejected archive: %#v", api.loadedBytes)
+			}
+		})
+	}
+}
+
+func TestClientLoadImageRejectsArchiveChangeDuringUpload(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dir := t.TempDir()
+	src := filepath.Join(dir, "load.tar")
+	replacement := filepath.Join(dir, "replacement.tar")
+	if err := os.WriteFile(src, []byte("original archive"), 0o600); err != nil {
+		t.Fatalf("write source archive: %v", err)
+	}
+	if err := os.WriteFile(replacement, []byte("replacement archive"), 0o600); err != nil {
+		t.Fatalf("write replacement archive: %v", err)
+	}
+
+	api := newFakeAPI()
+	var replaceErr error
+	api.afterImageLoadRead = func() {
+		if runtime.GOOS == "windows" {
+			if err := os.WriteFile(src, []byte("replacement archive"), 0o600); err != nil {
+				replaceErr = fmt.Errorf("modify archive in place: %w", err)
+			}
+			return
+		}
+		if err := os.Remove(src); err != nil {
+			replaceErr = fmt.Errorf("remove original archive: %w", err)
+			return
+		}
+		if err := os.Rename(replacement, src); err != nil {
+			replaceErr = fmt.Errorf("replace archive path: %w", err)
+		}
+	}
+	eventBus := bus.New()
+	defer eventBus.Close()
+	jobDone := eventBus.Subscribe(ctx, bus.TopicJobDone, 2)
+	objectsChanged := eventBus.Subscribe(ctx, bus.TopicObjectsChanged, 1)
+
+	client := New(fakeDockerProvider{}, eventBus)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	jobID, err := client.LoadImage(ctx, src)
+	if replaceErr != nil {
+		t.Fatalf("replace archive while loading: %v", replaceErr)
+	}
+	if !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("LoadImage() error = %v, want %s", err, apperror.Conflict)
+	}
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) || appErr.Partial == nil ||
+		appErr.Partial.Type != "image" ||
+		appErr.Partial.ID != "loaded:latest" ||
+		appErr.Partial.State != "loaded" ||
+		appErr.Partial.CleanupRequired {
+		t.Fatalf("LoadImage() error = %#v, want a confirmed loaded partial image", appErr)
+	}
+	if jobID == "" {
+		t.Fatal("LoadImage() returned an empty job ID after upload started")
+	}
+	if payload := waitJobDone(t, ctx, jobDone, time.Second); payload.JobID != jobID || payload.Error == "" || !strings.Contains(payload.Result, "loaded:latest") {
+		t.Fatalf("job done payload = %#v, want partial loaded result for job %q", payload, jobID)
+	}
+	if payload := waitObjectsChangedKind(t, ctx, objectsChanged, objectKindImage, "", time.Second); payload.Kind != objectKindImage {
+		t.Fatalf("objects changed payload = %#v, want image reconciliation", payload)
+	}
+	if api.imageListCalls != 1 {
+		t.Fatalf("ImageList() calls = %d, want one post-mutation reconciliation", api.imageListCalls)
+	}
+}
+
+func TestClientLoadImageRejectsInvalidDaemonResponses(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		body      string
+		code      apperror.Code
+		completed bool
+	}{
+		{
+			name: "error field",
+			body: `{"error":"invalid tar header"}` + "\n",
+			code: apperror.Conflict,
+		},
+		{
+			name: "error detail field",
+			body: `{"errorDetail":{"message":"archive checksum failed"}}` + "\n",
+			code: apperror.Conflict,
+		},
+		{
+			name: "empty error detail still means failure",
+			body: `{"errorDetail":{}}` + "\n",
+			code: apperror.Conflict,
+		},
+		{
+			name:      "malformed trailing data",
+			body:      `{"stream":"Loaded image: example/test:latest"}` + "\nnot-json",
+			code:      apperror.DockerUnreachable,
+			completed: true,
+		},
+		{
+			name: "non-object message",
+			body: "null\n",
+			code: apperror.DockerUnreachable,
+		},
+		{
+			name: "semantically empty message",
+			body: "{}\n",
+			code: apperror.DockerUnreachable,
+		},
+		{
+			name: "progress without terminal confirmation",
+			body: `{"status":"Loading layer","id":"sha256:partial"}` + "\n",
+			code: apperror.DockerUnreachable,
+		},
+		{
+			name: "terminal marker without image identity",
+			body: `{"stream":"Loaded image:   "}` + "\n",
+			code: apperror.DockerUnreachable,
+		},
+		{
+			name: "oversized response",
+			body: `{"stream":"` + strings.Repeat("x", maxImageLoadResponseBytes) + `"}`,
+			code: apperror.DockerUnreachable,
+		},
+		{
+			name: "too many messages",
+			body: strings.Repeat("{}\n", maxImageLoadResponseMessages+1),
+			code: apperror.DockerUnreachable,
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			api := newFakeAPI()
+			api.loadBody = tt.body
+			eventBus := bus.New()
+			defer eventBus.Close()
+			jobDone := eventBus.Subscribe(ctx, bus.TopicJobDone, 2)
+			objectsChanged := eventBus.Subscribe(ctx, bus.TopicObjectsChanged, 1)
+
+			client := New(fakeDockerProvider{}, eventBus)
+			client.factory = func(string) (APIClient, error) { return api, nil }
+			if err := client.Connect(ctx); err != nil {
+				t.Fatalf("Connect() error = %v", err)
+			}
+			src := filepath.Join(t.TempDir(), "load.tar")
+			if err := os.WriteFile(src, []byte("load-me"), 0o600); err != nil {
+				t.Fatalf("write load archive: %v", err)
+			}
+
+			jobID, err := client.LoadImage(ctx, src)
+			if !apperror.IsCode(err, tt.code) {
+				t.Fatalf("LoadImage() error = %v, want %s", err, tt.code)
+			}
+			var appErr *apperror.AppError
+			if !errors.As(err, &appErr) || appErr.Partial == nil || appErr.Partial.Type != "image" || appErr.Partial.CleanupRequired {
+				t.Fatalf("LoadImage() error = %#v, want image partial state", appErr)
+			}
+			if tt.completed {
+				if appErr.Partial.ID != "example/test:latest" || appErr.Partial.State != "loaded" {
+					t.Fatalf("LoadImage() partial = %#v, want confirmed loaded image", appErr.Partial)
+				}
+			} else if appErr.Partial.ID != "unknown" || appErr.Partial.State != "unknown" {
+				t.Fatalf("LoadImage() partial = %#v, want unknown mutation outcome", appErr.Partial)
+			}
+			if jobID == "" {
+				t.Fatal("LoadImage() returned an empty job ID")
+			}
+			if payload := waitJobDone(t, ctx, jobDone, time.Second); payload.JobID != jobID ||
+				payload.Error == "" ||
+				(tt.completed && !strings.Contains(payload.Result, "example/test:latest")) ||
+				(!tt.completed && payload.Result != "") {
+				t.Fatalf("job done payload = %#v, want accurate partial result for job %q", payload, jobID)
+			}
+			if payload := waitObjectsChangedKind(t, ctx, objectsChanged, objectKindImage, "", time.Second); payload.Kind != objectKindImage {
+				t.Fatalf("objects changed payload = %#v, want image reconciliation", payload)
+			}
+			if api.imageListCalls != 1 {
+				t.Fatalf("ImageList() calls = %d, want one post-mutation reconciliation", api.imageListCalls)
+			}
+		})
+	}
+}
+
+func TestClientLoadImageReconcilesPostUploadFailures(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name           string
+		configure      func(*fakeAPI, error)
+		code           apperror.Code
+		partialID      string
+		partialState   string
+		resultContains string
+	}{
+		{
+			name: "response close after terminal record",
+			configure: func(api *fakeAPI, injected error) {
+				api.loadBodyCloseErr = injected
+			},
+			code:           apperror.Internal,
+			partialID:      "loaded:latest",
+			partialState:   "loaded",
+			resultContains: "loaded:latest",
+		},
+		{
+			name: "transport response lost after upload",
+			configure: func(api *fakeAPI, injected error) {
+				api.loadErr = injected
+			},
+			code:         apperror.DockerUnreachable,
+			partialID:    "unknown",
+			partialState: "unknown",
+		},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			injected := errors.New("injected post-upload failure")
+			api := newFakeAPI()
+			tt.configure(api, injected)
+			eventBus := bus.New()
+			defer eventBus.Close()
+			jobDone := eventBus.Subscribe(ctx, bus.TopicJobDone, 2)
+			objectsChanged := eventBus.Subscribe(ctx, bus.TopicObjectsChanged, 1)
+
+			client := New(fakeDockerProvider{}, eventBus)
+			client.factory = func(string) (APIClient, error) { return api, nil }
+			if err := client.Connect(ctx); err != nil {
+				t.Fatalf("Connect() error = %v", err)
+			}
+			src := filepath.Join(t.TempDir(), "load.tar")
+			if err := os.WriteFile(src, []byte("load-me"), 0o600); err != nil {
+				t.Fatalf("write load archive: %v", err)
+			}
+
+			jobID, err := client.LoadImage(ctx, src)
+			if !apperror.IsCode(err, tt.code) || !errors.Is(err, injected) {
+				t.Fatalf("LoadImage() error = %v, want %s containing injected failure", err, tt.code)
+			}
+			var appErr *apperror.AppError
+			if !errors.As(err, &appErr) || appErr.Partial == nil ||
+				appErr.Partial.Type != "image" ||
+				appErr.Partial.ID != tt.partialID ||
+				appErr.Partial.State != tt.partialState ||
+				appErr.Partial.CleanupRequired {
+				t.Fatalf("LoadImage() error = %#v, want partial image %s/%s", appErr, tt.partialID, tt.partialState)
+			}
+			payload := waitJobDone(t, ctx, jobDone, time.Second)
+			if payload.JobID != jobID || payload.Error == "" ||
+				(tt.resultContains == "" && payload.Result != "") ||
+				(tt.resultContains != "" && !strings.Contains(payload.Result, tt.resultContains)) {
+				t.Fatalf("job done payload = %#v, want partial result containing %q", payload, tt.resultContains)
+			}
+			waitObjectsChangedKind(t, ctx, objectsChanged, objectKindImage, "", time.Second)
+			if api.imageListCalls != 1 {
+				t.Fatalf("ImageList() calls = %d, want one post-mutation reconciliation", api.imageListCalls)
+			}
+		})
+	}
+}
+
+func TestEnsureImagePresentUsesRegistryAuthForPullBeforeRun(t *testing.T) {
+	t.Parallel()
+	api := newFakeAPI()
+	client := New(fakeDockerProvider{}, nil)
+	client.registryAuth = func(_ context.Context, registry string) (string, error) {
+		if registry != "private.example.test" {
+			t.Fatalf("registry auth requested for %q", registry)
+		}
+		return "private-pull-auth", nil
+	}
+
+	if err := client.ensureImagePresent(context.Background(), api, "private.example.test/team/app:1", true); err != nil {
+		t.Fatalf("ensureImagePresent() error = %v", err)
+	}
+	if len(api.pullAuth) != 1 || api.pullAuth[0] != "private-pull-auth" {
+		t.Fatalf("pull auth = %#v", api.pullAuth)
+	}
+}
+
+func TestImagePullMapsImmediateAndStreamedRegistryFailures(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		err  error
+		body string
+		code apperror.Code
+	}{
+		{name: "immediate auth", err: errors.New("unauthorized: authentication required"), code: apperror.RegistryAuth},
+		{name: "immediate rate limit", err: errors.New("too many requests: rate limit exceeded"), code: apperror.RegistryRateLimit},
+		{name: "stream auth", body: `{"errorDetail":{"message":"denied: requested access to the resource is denied"}}` + "\n", code: apperror.RegistryAuth},
+		{name: "stream rate limit", body: `{"errorDetail":{"message":"too many requests: rate limit exceeded"}}` + "\n", code: apperror.RegistryRateLimit},
+	}
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			api := newFakeAPI()
+			api.pullErr = tt.err
+			api.pullBody = tt.body
+			client := New(fakeDockerProvider{}, nil)
+			err := client.pullImage(context.Background(), api, "private.example/team/app:1", "private.example", "pull-test", "auth")
+			if !apperror.IsCode(err, tt.code) {
+				t.Fatalf("pull error = %v, want %s", err, tt.code)
+			}
+		})
+	}
+}
+
+func TestClientImageTagAndPush(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	eventBus := bus.New()
+	defer eventBus.Close()
+	pushEvents := eventBus.Subscribe(ctx, bus.TopicImagePushProgress, 8)
+
+	client := New(fakeDockerProvider{}, eventBus)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	if err := client.TagImage(ctx, "sha256:local", "localhost:5000/test/app:1.0"); err != nil {
+		t.Fatalf("TagImage() error = %v", err)
+	}
+	if got, want := api.tagged, []string{"sha256:local->localhost:5000/test/app:1.0"}; len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("tagged = %#v, want %#v", got, want)
+	}
+
+	streamID, err := client.PushImage(ctx, "localhost:5000/test/app:1.0")
+	if err != nil {
+		t.Fatalf("PushImage() error = %v", err)
+	}
+	if streamID == "" || len(api.pushed) != 1 || api.pushed[0] != "localhost:5000/test/app:1.0" {
+		t.Fatalf("streamID=%q pushed=%#v", streamID, api.pushed)
+	}
+	if len(api.pushAuth) != 1 || api.pushAuth[0] != "" {
+		t.Fatalf("push auth = %#v, want anonymous auth", api.pushAuth)
+	}
+	if got := waitImageProgress(t, ctx, pushEvents, time.Second); got.StreamID != streamID {
+		t.Fatalf("push progress = %#v, want stream %q", got, streamID)
+	}
+}
+
+func TestClientImagePushMapsRegistryAuth(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	api := newFakeAPI()
+	api.pushBody = `{"errorDetail":{"message":"unauthorized: authentication required"}}` + "\n"
+
+	client := New(fakeDockerProvider{}, nil)
+	client.factory = func(string) (APIClient, error) { return api, nil }
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+
+	_, err := client.PushImage(ctx, "localhost:5000/test/app:1.0")
+	if !apperror.IsCode(err, apperror.RegistryAuth) {
+		t.Fatalf("PushImage() error = %v, want %s", err, apperror.RegistryAuth)
+	}
+	var appErr *apperror.AppError
+	if !errors.As(err, &appErr) || !strings.Contains(appErr.Detail, "localhost:5000") {
+		t.Fatalf("registry auth detail = %#v", appErr)
+	}
+}
+
+func TestClientRealDockerIntegration(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("real Docker integration runs only on Linux")
+	}
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skipf("docker CLI unavailable: %v", err)
+	}
+
+	ctx := context.Background()
+	provider := providers.NewLinuxNative(providers.LinuxNativeOptions{})
+	status, err := provider.Detect(ctx)
+	if err != nil {
+		t.Fatalf("provider Detect() error = %v", err)
+	}
+	if !status.DockerRunning {
+		t.Fatalf("Docker daemon is not running: %#v", status.Problems)
+	}
+
+	eventBus := bus.New()
+	defer eventBus.Close()
+	client := New(provider, eventBus)
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = client.Close()
+	})
+	if err := client.Ping(ctx); err != nil {
+		t.Fatalf("Ping() error = %v", err)
+	}
+	info, err := client.Info(ctx)
+	if err != nil {
+		t.Fatalf("Info() error = %v", err)
+	}
+	if info.ServerVersion == "" || info.DockerRootDir == "" {
+		t.Fatalf("info missing required fields: %#v", info)
+	}
+	version, err := client.Version(ctx)
+	if err != nil {
+		t.Fatalf("Version() error = %v", err)
+	}
+	if version.APIVersion == "" {
+		t.Fatalf("version missing API version: %#v", version)
+	}
+	if _, err := client.DiskUsage(ctx); err != nil {
+		t.Fatalf("DiskUsage() error = %v", err)
+	}
+}
+
+const fakeContainerID = "abc1234567890abc1234567890abc1234567890abc1234567890abc1234567890ab"
+
+func seedFakeObjects(api *fakeAPI) {
+	created := time.Date(2026, 6, 12, 10, 0, 0, 0, time.UTC)
+	started := created.Add(time.Minute)
+	containerLabels := map[string]string{
+		composeProjectLabel: "demo",
+		composeServiceLabel: "web",
+		"cairn.test":        "objects",
+	}
+
+	api.containers = []container.Summary{{
+		ID:      fakeContainerID,
+		Names:   []string{"/web"},
+		Image:   "example/web:latest",
+		ImageID: "sha256:image1",
+		Command: "nginx -g daemon off;",
+		Created: created.Unix(),
+		Ports: []container.PortSummary{{
+			IP:          netip.MustParseAddr("0.0.0.0"),
+			PrivatePort: 80,
+			PublicPort:  8080,
+			Type:        "tcp",
+		}},
+		Labels: containerLabels,
+		State:  "running",
+		Status: "Up 2 minutes (healthy)",
+		NetworkSettings: &container.NetworkSettingsSummary{Networks: map[string]*network.EndpointSettings{
+			"demo_default": {
+				Aliases:     []string{"web", "demo-web"},
+				EndpointID:  "endpoint1",
+				Gateway:     netip.MustParseAddr("172.22.0.1"),
+				IPAddress:   netip.MustParseAddr("172.22.0.2"),
+				IPPrefixLen: 16,
+				MacAddress:  network.HardwareAddr{0x02, 0x42, 0xac, 0x16, 0x00, 0x02},
+				NetworkID:   "net1",
+			},
+		}},
+		Mounts: []container.MountPoint{{
+			Type:        mount.TypeVolume,
+			Name:        "demo_data",
+			Source:      "/var/lib/docker/volumes/demo_data/_data",
+			Destination: "/data",
+			RW:          true,
+		}},
+	}}
+	api.containerInspects[fakeContainerID] = container.InspectResponse{
+		ID:           fakeContainerID,
+		Created:      created.Format(time.RFC3339Nano),
+		Name:         "/web",
+		RestartCount: 2,
+		Image:        "sha256:image1",
+		State: &container.State{
+			Status:    container.StateRunning,
+			Running:   true,
+			StartedAt: started.Format(time.RFC3339Nano),
+			Health:    &container.Health{Status: "healthy"},
+		},
+		HostConfig: &container.HostConfig{
+			RestartPolicy: container.RestartPolicy{Name: "unless-stopped"},
+		},
+		Config: &container.Config{
+			Image:      "example/web:latest",
+			Cmd:        []string{"nginx", "-g", "daemon off;"},
+			Entrypoint: []string{"/docker-entrypoint.sh"},
+			Env:        []string{"API_TOKEN=secret-value", "MODE=dev"},
+			Labels:     containerLabels,
+			WorkingDir: "/srv/app",
+			User:       "1000",
+		},
+		Mounts: api.containers[0].Mounts,
+		NetworkSettings: &container.NetworkSettings{
+			Networks: map[string]*network.EndpointSettings{
+				"demo_default": {NetworkID: "net1"},
+			},
+		},
+	}
+
+	api.images = []image.Summary{{
+		ID:          "sha256:image1",
+		RepoTags:    []string{"example/web:latest"},
+		RepoDigests: []string{"example/web@sha256:digest1"},
+		Size:        123,
+		Created:     created.Unix(),
+		Containers:  1,
+	}}
+	api.imageInspects["sha256:image1"] = image.InspectResponse{
+		ID:           "sha256:image1",
+		RepoTags:     []string{"example/web:latest"},
+		RepoDigests:  []string{"example/web@sha256:digest1"},
+		Created:      created.Format(time.RFC3339Nano),
+		Size:         123,
+		Architecture: "amd64",
+		Os:           "linux",
+		Author:       "Cairn",
+		Config: &dockerspec.DockerOCIImageConfig{
+			ImageConfig: ocispec.ImageConfig{Labels: map[string]string{"org.opencontainers.image.title": "web"}},
+		},
+		RootFS: image.RootFS{Layers: []string{"sha256:layer1"}},
+	}
+	api.imageInspects["example/web:latest"] = api.imageInspects["sha256:image1"]
+
+	api.volumes = []volume.Volume{{
+		Name:       "demo_data",
+		Driver:     "local",
+		Mountpoint: "/var/lib/docker/volumes/demo_data/_data",
+		Labels:     map[string]string{composeProjectLabel: "demo"},
+		Options:    map[string]string{"type": "none"},
+		CreatedAt:  created.Format(time.RFC3339Nano),
+		UsageData:  &volume.UsageData{Size: 42, RefCount: 1},
+	}}
+	api.volumeInspects["demo_data"] = api.volumes[0]
+	api.diskUsage.Volumes.Items = append([]volume.Volume(nil), api.volumes...)
+
+	networkInspect := network.Inspect{
+		Network: network.Network{
+			ID:         "net1",
+			Name:       "demo_default",
+			Driver:     "bridge",
+			Scope:      "local",
+			Attachable: true,
+			Labels:     map[string]string{composeProjectLabel: "demo"},
+			IPAM: network.IPAM{Config: []network.IPAMConfig{{
+				Subnet:  netip.MustParsePrefix("172.22.0.0/16"),
+				Gateway: netip.MustParseAddr("172.22.0.1"),
+			}}},
+		},
+		Containers: map[string]network.EndpointResource{
+			fakeContainerID: {Name: "web"},
+		},
+	}
+	api.networks = []network.Summary{{Network: networkInspect.Network}}
+	api.networkInspects["net1"] = networkInspect
+}
+
+func providersDemoContainerFilter() models.ContainerListOptions {
+	return models.ContainerListOptions{All: true, ProjectID: "demo", Service: "web"}
+}
+
+func envValue(values []models.EnvVar, name string) string {
+	for _, value := range values {
+		if value.Name == name {
+			return value.Value
+		}
+	}
+	return ""
+}
+
+func queryCount(t *testing.T, ctx context.Context, db *sql.DB, table string) int {
+	t.Helper()
+	var count int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM "+table).Scan(&count); err != nil {
+		t.Fatalf("query %s count: %v", table, err)
+	}
+	return count
+}
+
+func queryString(t *testing.T, ctx context.Context, db *sql.DB, query string, args ...any) string {
+	t.Helper()
+	var value string
+	if err := db.QueryRowContext(ctx, query, args...).Scan(&value); err != nil {
+		t.Fatalf("query string: %v", err)
+	}
+	return value
+}
+
+func waitObjectsChanged(t *testing.T, ctx context.Context, events <-chan bus.Event, timeout time.Duration) ObjectsChangedPayload {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatalf("context done waiting for objects:changed: %v", ctx.Err())
+		case <-timer.C:
+			t.Fatal("timed out waiting for objects:changed")
+		case event, ok := <-events:
+			if !ok {
+				t.Fatal("event subscription closed")
+			}
+			payload, ok := event.Payload.(ObjectsChangedPayload)
+			if ok {
+				return payload
+			}
+		}
+	}
+}
+
+func waitObjectsChangedKind(t *testing.T, ctx context.Context, events <-chan bus.Event, kind string, idPrefix string, timeout time.Duration) ObjectsChangedPayload {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatalf("context done waiting for objects:changed %s: %v", kind, ctx.Err())
+		case <-timer.C:
+			t.Fatalf("timed out waiting for objects:changed %s", kind)
+		case event, ok := <-events:
+			if !ok {
+				t.Fatal("event subscription closed")
+			}
+			payload, ok := event.Payload.(ObjectsChangedPayload)
+			if !ok || payload.Kind != kind {
+				continue
+			}
+			if idPrefix == "" {
+				return payload
+			}
+			for _, id := range payload.IDs {
+				if strings.HasPrefix(id, idPrefix) {
+					return payload
+				}
+			}
+		}
+	}
+}
+
+func waitImageProgress(t *testing.T, ctx context.Context, events <-chan bus.Event, timeout time.Duration) ImageProgressPayload {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatalf("context done waiting for image progress: %v", ctx.Err())
+		case <-timer.C:
+			t.Fatal("timed out waiting for image progress")
+		case event, ok := <-events:
+			if !ok {
+				t.Fatal("image progress subscription closed")
+			}
+			payload, ok := event.Payload.(ImageProgressPayload)
+			if ok {
+				return payload
+			}
+		}
+	}
+}
+
+func waitJobDone(t *testing.T, ctx context.Context, events <-chan bus.Event, timeout time.Duration) JobDonePayload {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			t.Fatalf("context done waiting for job done: %v", ctx.Err())
+		case <-timer.C:
+			t.Fatal("timed out waiting for job done")
+		case event, ok := <-events:
+			if !ok {
+				t.Fatal("job done subscription closed")
+			}
+			payload, ok := event.Payload.(JobDonePayload)
+			if ok {
+				return payload
+			}
+		}
+	}
+}
+
+func writeDockerfile(t *testing.T, path string) {
+	t.Helper()
+	content := "FROM scratch\nLABEL org.opencontainers.image.title=\"cairn object test\"\nCMD [\"/cairn-noop\"]\n"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write Dockerfile: %v", err)
+	}
+}
+
+func writeSleeperImageContext(t *testing.T, dir string) {
+	t.Helper()
+	source := filepath.Join(dir, "sleeper.go")
+	binary := filepath.Join(dir, "sleeper")
+	if err := os.WriteFile(source, []byte(`package main
+
+import "time"
+
+func main() {
+	time.Sleep(time.Hour)
+}
+`), 0o644); err != nil {
+		t.Fatalf("write sleeper source: %v", err)
+	}
+	cmd := exec.Command("go", "build", "-o", binary, source)
+	cmd.Env = append(os.Environ(), "CGO_ENABLED=0", "GOOS=linux", "GOARCH="+runtime.GOARCH)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("build sleeper: %v: %s", err, strings.TrimSpace(string(output)))
+	}
+	dockerfile := "FROM scratch\nCOPY sleeper /sleeper\nEXPOSE 8080\nCMD [\"/sleeper\"]\n"
+	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte(dockerfile), 0o644); err != nil {
+		t.Fatalf("write sleeper Dockerfile: %v", err)
+	}
+}
+
+func runDockerCommand(t *testing.T, ctx context.Context, args ...string) string {
+	t.Helper()
+	output, err := dockerCommandOutput(ctx, args...)
+	if err != nil {
+		t.Fatalf("%v", err)
+	}
+	return output
+}
+
+func dockerCommand(ctx context.Context, args ...string) error {
+	_, err := dockerCommandOutput(ctx, args...)
+	return err
+}
+
+func dockerCommandOutput(ctx context.Context, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "docker", args...)
+	output, err := cmd.CombinedOutput()
+	text := strings.TrimSpace(string(output))
+	if err != nil {
+		return text, fmt.Errorf("docker %s: %w: %s", strings.Join(args, " "), err, text)
+	}
+	return text, nil
+}
+
+func imageListContains(images []models.ImageSummary, ref string) bool {
+	for _, image := range images {
+		for _, tag := range image.RepoTags {
+			if tag == ref {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func volumeListContains(volumes []models.VolumeSummary, name string) bool {
+	for _, volume := range volumes {
+		if volume.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func networkListContains(networks []models.NetworkSummary, name string) bool {
+	for _, network := range networks {
+		if network.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func TestClientRealDockerObjectsIntegration(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("real Docker object integration runs only on Linux")
+	}
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skipf("docker CLI unavailable: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := waitDockerCLI(ctx); err != nil {
+		t.Fatalf("Docker daemon is not ready: %v", err)
+	}
+
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
+	labelKey := "cairn.test.objects"
+	label := labelKey + "=" + suffix
+	imageRef := "cairn-test-objects:" + suffix
+	containerName := "cairn-test-objects-" + suffix
+	volumeName := "cairn_test_objects_" + suffix
+	networkName := "cairn_test_objects_" + suffix
+
+	buildDir := t.TempDir()
+	dockerfilePath := filepath.Join(buildDir, "Dockerfile")
+	writeDockerfile(t, dockerfilePath)
+	runDockerCommand(t, ctx, "build", "-q", "-t", imageRef, buildDir)
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cleanupCancel()
+		_ = dockerCommand(cleanupCtx, "rm", "-f", containerName)
+		_ = dockerCommand(cleanupCtx, "network", "rm", networkName)
+		_ = dockerCommand(cleanupCtx, "volume", "rm", "-f", volumeName)
+		_ = dockerCommand(cleanupCtx, "rmi", "-f", imageRef)
+	})
+
+	runDockerCommand(t, ctx, "volume", "create", "--label", label, volumeName)
+	runDockerCommand(t, ctx, "network", "create", "--label", label, networkName)
+
+	dbPath := filepath.Join(t.TempDir(), "cairn.db")
+	db, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("Open store: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = db.Close()
+	})
+	if err := db.Migrate(ctx); err != nil {
+		t.Fatalf("Migrate: %v", err)
+	}
+
+	eventBus := bus.New()
+	defer eventBus.Close()
+	changed := eventBus.Subscribe(ctx, bus.TopicObjectsChanged, 8)
+	provider := providers.NewLinuxNative(providers.LinuxNativeOptions{})
+	client := New(provider, eventBus)
+	client.SetObjectCache(db.Objects())
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = client.Close()
+	})
+	client.StartObjectEventLoop(ctx)
+
+	runDockerCommand(t, ctx, "create",
+		"--name", containerName,
+		"--label", label,
+		"--label", composeProjectLabel+"=cairn-test",
+		"--label", composeServiceLabel+"=web",
+		"--mount", "type=volume,source="+volumeName+",target=/data",
+		"--network", networkName,
+		imageRef,
+	)
+	createEvent := waitObjectsChangedKind(t, ctx, changed, objectKindContainer, "", time.Second)
+	if len(createEvent.IDs) == 0 {
+		t.Fatalf("container create event had no ids: %#v", createEvent)
+	}
+
+	containers, err := client.ListContainers(ctx, models.ContainerListOptions{
+		All:     true,
+		Filters: map[string]string{"label": label},
+	})
+	if err != nil {
+		t.Fatalf("ListContainers() error = %v", err)
+	}
+	cliContainerID := strings.TrimSpace(runDockerCommand(t, ctx, "ps", "-a", "--filter", "label="+label, "--format", "{{.ID}}"))
+	if len(containers) != 1 || !strings.HasPrefix(containers[0].ID, cliContainerID) {
+		t.Fatalf("containers = %#v, docker CLI id = %q", containers, cliContainerID)
+	}
+	if containers[0].ProjectID != "linux_native/cairn-test" || containers[0].Service != "web" {
+		t.Fatalf("compose labels not mapped: %#v", containers[0])
+	}
+
+	if _, err := client.GetContainer(ctx, containers[0].ID); err != nil {
+		t.Fatalf("GetContainer() error = %v", err)
+	}
+	images, err := client.ListImages(ctx)
+	if err != nil {
+		t.Fatalf("ListImages() error = %v", err)
+	}
+	if !imageListContains(images, imageRef) {
+		t.Fatalf("ListImages() missing %s in %#v", imageRef, images)
+	}
+	cliImage := strings.TrimSpace(runDockerCommand(t, ctx, "image", "ls", "--filter", "reference="+imageRef, "--format", "{{.Repository}}:{{.Tag}}"))
+	if cliImage != imageRef {
+		t.Fatalf("docker image ls = %q, want %q", cliImage, imageRef)
+	}
+
+	volumes, err := client.ListVolumes(ctx)
+	if err != nil {
+		t.Fatalf("ListVolumes() error = %v", err)
+	}
+	if !volumeListContains(volumes, volumeName) {
+		t.Fatalf("ListVolumes() missing %s in %#v", volumeName, volumes)
+	}
+	cliVolume := strings.TrimSpace(runDockerCommand(t, ctx, "volume", "ls", "--filter", "label="+label, "--format", "{{.Name}}"))
+	if cliVolume != volumeName {
+		t.Fatalf("docker volume ls = %q, want %q", cliVolume, volumeName)
+	}
+
+	networks, err := client.ListNetworks(ctx)
+	if err != nil {
+		t.Fatalf("ListNetworks() error = %v", err)
+	}
+	if !networkListContains(networks, networkName) {
+		t.Fatalf("ListNetworks() missing %s in %#v", networkName, networks)
+	}
+	cliNetwork := strings.TrimSpace(runDockerCommand(t, ctx, "network", "ls", "--filter", "label="+label, "--format", "{{.Name}}"))
+	if cliNetwork != networkName {
+		t.Fatalf("docker network ls = %q, want %q", cliNetwork, networkName)
+	}
+
+	if err := client.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	sqlDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("open raw sql: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = sqlDB.Close()
+	})
+	if got := queryCount(t, ctx, sqlDB, "containers_cache"); got == 0 {
+		t.Fatalf("containers_cache was empty after reconcile")
+	}
+
+	runDockerCommand(t, ctx, "rm", "-f", containerName)
+	removeEvent := waitObjectsChangedKind(t, ctx, changed, objectKindContainer, "", time.Second)
+	if len(removeEvent.IDs) == 0 {
+		t.Fatalf("container remove event had no ids: %#v", removeEvent)
+	}
+	containers, err = client.ListContainers(ctx, models.ContainerListOptions{
+		All:     true,
+		Filters: map[string]string{"label": label},
+	})
+	if err != nil {
+		t.Fatalf("ListContainers() after remove error = %v", err)
+	}
+	if len(containers) != 0 {
+		t.Fatalf("containers after external remove = %#v, want none", containers)
+	}
+}
+
+func TestClientRealDockerCreateRunSaveLoadIntegration(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("real Docker create/run integration runs only on Linux")
+	}
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skipf("docker CLI unavailable: %v", err)
+	}
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skipf("go CLI unavailable: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if err := waitDockerCLI(ctx); err != nil {
+		t.Fatalf("Docker daemon is not ready: %v", err)
+	}
+
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
+	imageRef := "cairn-test-run:" + suffix
+	containerName := "cairn-test-run-" + suffix
+	portOwnerName := containerName + "-port-owner"
+	portConflictName := containerName + "-port-conflict"
+	renamedContainer := containerName + "-renamed"
+	volumeName := "cairn_test_run_" + suffix
+	networkName := "cairn_test_run_" + suffix
+	archivePath := filepath.Join(t.TempDir(), "image.tar")
+
+	buildDir := t.TempDir()
+	writeSleeperImageContext(t, buildDir)
+	runDockerCommand(t, ctx, "build", "-q", "-t", imageRef, buildDir)
+	t.Cleanup(func() {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cleanupCancel()
+		_ = dockerCommand(cleanupCtx, "rm", "-f", containerName, renamedContainer, portOwnerName, portConflictName)
+		_ = dockerCommand(cleanupCtx, "network", "rm", networkName)
+		_ = dockerCommand(cleanupCtx, "volume", "rm", "-f", volumeName)
+		_ = dockerCommand(cleanupCtx, "rmi", "-f", imageRef)
+	})
+
+	eventBus := bus.New()
+	defer eventBus.Close()
+	provider := providers.NewLinuxNative(providers.LinuxNativeOptions{})
+	client := New(provider, eventBus)
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	t.Cleanup(func() {
+		_ = client.Close()
+	})
+
+	volumeSummary, err := client.CreateVolume(ctx, models.CreateVolumeRequest{
+		Name:   volumeName,
+		Driver: "local",
+		Labels: map[string]string{"cairn.test.run": suffix},
+	})
+	if err != nil {
+		t.Fatalf("CreateVolume() error = %v", err)
+	}
+	if volumeSummary.Name != volumeName {
+		t.Fatalf("volume summary = %#v", volumeSummary)
+	}
+	if _, err := client.GetVolume(ctx, volumeName); err != nil {
+		t.Fatalf("GetVolume(created) error = %v", err)
+	}
+
+	networkSummary, err := client.CreateNetwork(ctx, models.CreateNetworkRequest{
+		Name:       networkName,
+		Driver:     "bridge",
+		Attachable: true,
+		Labels:     map[string]string{"cairn.test.run": suffix},
+	})
+	if err != nil {
+		t.Fatalf("CreateNetwork() error = %v", err)
+	}
+	if networkSummary.Name != networkName {
+		t.Fatalf("network summary = %#v", networkSummary)
+	}
+	if _, err := client.GetNetwork(ctx, networkName); err != nil {
+		t.Fatalf("GetNetwork(created) error = %v", err)
+	}
+
+	portOwnerID, err := client.RunImage(ctx, models.RunImageRequest{
+		ImageRef: imageRef,
+		Name:     portOwnerName,
+		Ports:    []models.PortMapping{{HostIP: "127.0.0.1", HostPort: "0", ContainerPort: "8080", Protocol: "tcp"}},
+		Detach:   true,
+	})
+	if err != nil {
+		t.Fatalf("RunImage(port owner) error = %v", err)
+	}
+	portOwnerDetail, err := client.GetContainer(ctx, portOwnerID)
+	if err != nil {
+		t.Fatalf("GetContainer(port owner) error = %v", err)
+	}
+	conflictPort := ""
+	for _, binding := range portOwnerDetail.Summary.Ports {
+		if binding.ContainerPort == "8080" && binding.Protocol == "tcp" && binding.HostPort != "" {
+			conflictPort = binding.HostPort
+			break
+		}
+	}
+	if conflictPort == "" {
+		t.Fatalf("port owner bindings = %#v, want published 8080/tcp", portOwnerDetail.Summary.Ports)
+	}
+	if _, err := client.RunImage(ctx, models.RunImageRequest{
+		ImageRef: imageRef,
+		Name:     portConflictName,
+		Ports:    []models.PortMapping{{HostIP: "127.0.0.1", HostPort: conflictPort, ContainerPort: "8080", Protocol: "tcp"}},
+		Detach:   true,
+	}); !apperror.IsCode(err, apperror.Conflict) {
+		t.Fatalf("RunImage(port conflict) error = %v, want E_CONFLICT", err)
+	}
+
+	containerID, err := client.RunImage(ctx, models.RunImageRequest{
+		ImageRef:  imageRef,
+		Name:      containerName,
+		Ports:     []models.PortMapping{{HostIP: "127.0.0.1", HostPort: "0", ContainerPort: "8080", Protocol: "tcp"}},
+		Env:       []models.EnvVar{{Name: "MODE", Value: "integration"}},
+		Volumes:   []models.MountSpec{{Type: "volume", VolumeName: volumeName, Target: "/data"}},
+		NetworkID: networkName,
+		Detach:    true,
+	})
+	if err != nil {
+		t.Fatalf("RunImage() error = %v", err)
+	}
+	detail, err := client.GetContainer(ctx, containerID)
+	if err != nil {
+		t.Fatalf("GetContainer(run) error = %v", err)
+	}
+	if detail.Summary.Name != containerName || envValue(detail.Env, "MODE") != "integration" {
+		t.Fatalf("container detail = %#v", detail)
+	}
+	if len(detail.Summary.Ports) == 0 || detail.Summary.Ports[0].ContainerPort != "8080" {
+		t.Fatalf("container ports = %#v", detail.Summary.Ports)
+	}
+	if len(detail.Mounts) != 1 || detail.Mounts[0].Target != "/data" || detail.Mounts[0].VolumeName != volumeName {
+		t.Fatalf("container mounts = %#v", detail.Mounts)
+	}
+	if len(detail.Networks) != 1 || detail.Networks[0] != networkName {
+		t.Fatalf("container networks = %#v", detail.Networks)
+	}
+
+	if err := client.RenameContainer(ctx, containerID, renamedContainer); err != nil {
+		t.Fatalf("RenameContainer() error = %v", err)
+	}
+	renamed, err := client.GetContainer(ctx, renamedContainer)
+	if err != nil {
+		t.Fatalf("GetContainer(renamed) error = %v", err)
+	}
+	if renamed.Summary.Name != renamedContainer {
+		t.Fatalf("renamed container = %#v", renamed.Summary)
+	}
+
+	imageDetail, err := client.GetImage(ctx, imageRef)
+	if err != nil {
+		t.Fatalf("GetImage(before save) error = %v", err)
+	}
+	originalImageID := imageDetail.Summary.ID
+	if _, err := client.SaveImage(ctx, []string{imageRef}, archivePath); err != nil {
+		t.Fatalf("SaveImage() error = %v", err)
+	}
+	if stat, err := os.Stat(archivePath); err != nil || stat.Size() == 0 {
+		t.Fatalf("archive stat = %#v err=%v", stat, err)
+	}
+
+	runDockerCommand(t, ctx, "rm", "-f", renamedContainer)
+	runDockerCommand(t, ctx, "rmi", "-f", imageRef)
+	if _, err := client.LoadImage(ctx, archivePath); err != nil {
+		t.Fatalf("LoadImage() error = %v", err)
+	}
+	loadedDetail, err := client.GetImage(ctx, imageRef)
+	if err != nil {
+		t.Fatalf("GetImage(after load) error = %v", err)
+	}
+	if loadedDetail.Summary.ID != originalImageID {
+		t.Fatalf("loaded image ID = %q, want %q", loadedDetail.Summary.ID, originalImageID)
+	}
+}
+
+func TestClientRealDockerRestartIntegration(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("real Docker restart integration runs only on Linux")
+	}
+	if os.Getenv("CAIRN_REAL_DOCKER_RESTART") != "1" {
+		t.Skip("set CAIRN_REAL_DOCKER_RESTART=1 to stop/start the local Docker daemon")
+	}
+	if _, err := exec.LookPath("docker"); err != nil {
+		t.Skipf("docker CLI unavailable: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := waitDockerCLI(ctx); err != nil {
+		t.Fatalf("Docker daemon was not ready before restart test: %v", err)
+	}
+
+	provider := providers.NewLinuxNative(providers.LinuxNativeOptions{})
+	eventBus := bus.New()
+	defer eventBus.Close()
+	connected := eventBus.Subscribe(ctx, bus.TopicDockerConnected, 8)
+	disconnected := eventBus.Subscribe(ctx, bus.TopicDockerDisconnected, 8)
+
+	client := New(provider, eventBus)
+	client.unaryTimeout = 2 * time.Second
+	client.pingInterval = 250 * time.Millisecond
+	client.backoffMin = 250 * time.Millisecond
+	client.backoffMax = time.Second
+	if err := client.Connect(ctx); err != nil {
+		t.Fatalf("Connect() error = %v", err)
+	}
+	defer func() {
+		_ = client.Close()
+	}()
+	if _, err := waitConnected(ctx, connected, 5*time.Second); err != nil {
+		t.Fatalf("initial docker:connected event: %v", err)
+	}
+
+	client.StartHealthLoop(ctx)
+
+	stopped := false
+	t.Cleanup(func() {
+		if !stopped {
+			return
+		}
+		startCtx, startCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer startCancel()
+		_ = controlDockerService(startCtx, "start")
+		_ = waitDockerCLI(startCtx)
+	})
+
+	if err := controlDockerService(ctx, "stop"); err != nil {
+		t.Fatalf("stop Docker daemon: %v", err)
+	}
+	stopped = true
+	if err := waitDockerCLIDown(ctx, 10*time.Second); err != nil {
+		t.Fatalf("Docker daemon remained reachable after stop: %v", err)
+	}
+	if _, err := waitDisconnected(ctx, disconnected, 20*time.Second); err != nil {
+		t.Fatalf("docker:disconnected event after daemon stop: %v", err)
+	}
+
+	if err := controlDockerService(ctx, "start"); err != nil {
+		t.Fatalf("start Docker daemon: %v", err)
+	}
+	if err := waitDockerCLI(ctx); err != nil {
+		t.Fatalf("Docker daemon did not become ready after start: %v", err)
+	}
+	stopped = false
+	if _, err := waitConnected(ctx, connected, 45*time.Second); err != nil {
+		t.Fatalf("docker:connected event after daemon restart: %v", err)
+	}
+	if err := client.Ping(ctx); err != nil {
+		t.Fatalf("Ping() after reconnect error = %v", err)
+	}
+}
+
+type fakeDockerProvider struct{}
+
+func (fakeDockerProvider) ID() string {
+	return "linux_native"
+}
+
+func (fakeDockerProvider) DockerHost(context.Context) (string, error) {
+	return "unix:///var/run/docker.sock", nil
+}
+
+func (fakeDockerProvider) DockerContext(context.Context) (string, error) {
+	return "default", nil
+}
+
+type fakeManagedDockerProvider struct {
+	providerID      string
+	dockerContext   string
+	backendIdentity string
+}
+
+func (p *fakeManagedDockerProvider) ID() string { return p.providerID }
+
+func (*fakeManagedDockerProvider) DockerHost(context.Context) (string, error) {
+	return "unix:///var/run/docker.sock", nil
+}
+
+func (p *fakeManagedDockerProvider) DockerContext(context.Context) (string, error) {
+	return p.dockerContext, nil
+}
+
+func (p *fakeManagedDockerProvider) BackendIdentity(context.Context) (string, error) {
+	return p.backendIdentity, nil
+}
+
+type fakeDialerProvider struct {
+	host   string
+	dialer func(context.Context, string, string) (net.Conn, error)
+}
+
+func (p fakeDialerProvider) ID() string {
+	return "windows_wsl_ubuntu"
+}
+
+func (p fakeDialerProvider) DockerHost(context.Context) (string, error) {
+	return p.host, nil
+}
+
+func (p fakeDialerProvider) DockerContext(context.Context) (string, error) {
+	return "default", nil
+}
+
+func (p fakeDialerProvider) DockerDialContext(context.Context) (func(context.Context, string, string) (net.Conn, error), error) {
+	return p.dialer, nil
+}
+
+type blockingContainerListAPI struct {
+	*fakeAPI
+
+	controlMu    sync.Mutex
+	calls        int
+	active       int
+	maxActive    int
+	blockEvery   bool
+	releaseFirst chan struct{}
+	started      chan int
+	finished     chan int
+}
+
+func newBlockingContainerListAPI(blockEvery bool) *blockingContainerListAPI {
+	return &blockingContainerListAPI{
+		fakeAPI:      newFakeAPI(),
+		blockEvery:   blockEvery,
+		releaseFirst: make(chan struct{}),
+		started:      make(chan int, 64),
+		finished:     make(chan int, 64),
+	}
+}
+
+func (a *blockingContainerListAPI) ContainerList(ctx context.Context, opts dockerclient.ContainerListOptions) (dockerclient.ContainerListResult, error) {
+	a.controlMu.Lock()
+	a.calls++
+	call := a.calls
+	a.active++
+	if a.active > a.maxActive {
+		a.maxActive = a.active
+	}
+	a.controlMu.Unlock()
+
+	a.started <- call
+	defer func() {
+		a.controlMu.Lock()
+		a.active--
+		a.controlMu.Unlock()
+		a.finished <- call
+	}()
+
+	if a.blockEvery || call == 1 {
+		select {
+		case <-a.releaseFirst:
+		case <-ctx.Done():
+			return dockerclient.ContainerListResult{}, ctx.Err()
+		}
+	}
+	return a.fakeAPI.ContainerList(ctx, opts)
+}
+
+func (a *blockingContainerListAPI) counts() (calls int, active int, maximum int) {
+	a.controlMu.Lock()
+	defer a.controlMu.Unlock()
+	return a.calls, a.active, a.maxActive
+}
+
+func waitContainerListStarted(t *testing.T, started <-chan int, timeout time.Duration) int {
+	t.Helper()
+	select {
+	case call := <-started:
+		return call
+	case <-time.After(timeout):
+		t.Fatal("timed out waiting for ContainerList to start")
+		return 0
+	}
+}
+
+func waitContainerListFinished(t *testing.T, finished <-chan int, wanted int, timeout time.Duration) {
+	t.Helper()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case call := <-finished:
+			if call == wanted {
+				return
+			}
+		case <-timer.C:
+			t.Fatalf("timed out waiting for ContainerList call %d to finish", wanted)
+		}
+	}
+}
+
+func assertNoImageSaveTemps(t *testing.T, dir string) {
+	t.Helper()
+	matches, err := filepath.Glob(filepath.Join(dir, ".cairn-image-save-*.tmp"))
+	if err != nil {
+		t.Fatalf("glob temporary image archives: %v", err)
+	}
+	if len(matches) != 0 {
+		t.Fatalf("temporary image archives remain: %#v", matches)
+	}
+}
+
+type failingArchiveReadCloser struct {
+	payload []byte
+	err     error
+	closed  bool
+}
+
+func (r *failingArchiveReadCloser) Read(buffer []byte) (int, error) {
+	if len(r.payload) == 0 {
+		return 0, r.err
+	}
+	n := copy(buffer, r.payload)
+	r.payload = r.payload[n:]
+	return n, nil
+}
+
+func (r *failingArchiveReadCloser) Close() error {
+	r.closed = true
+	return nil
+}
+
+type errorClosingReadCloser struct {
+	io.Reader
+	err error
+}
+
+func (r *errorClosingReadCloser) Close() error {
+	return r.err
+}
+
+type fakeSyncedWriteCloser struct {
+	buffer     bytes.Buffer
+	writeErr   error
+	syncErr    error
+	closeErr   error
+	syncCalls  int
+	closeCalls int
+}
+
+func (w *fakeSyncedWriteCloser) Write(buffer []byte) (int, error) {
+	if w.writeErr != nil {
+		return 0, w.writeErr
+	}
+	return w.buffer.Write(buffer)
+}
+
+func (w *fakeSyncedWriteCloser) Sync() error {
+	w.syncCalls++
+	return w.syncErr
+}
+
+func (w *fakeSyncedWriteCloser) Close() error {
+	w.closeCalls++
+	return w.closeErr
+}
+
+type fakeAPI struct {
+	mu                 sync.Mutex
+	ping               dockerclient.PingResult
+	pingErr            error
+	info               system.Info
+	version            dockerclient.ServerVersionResult
+	diskUsage          dockerclient.DiskUsageResult
+	containers         []container.Summary
+	containerListErr   error
+	containerInspects  map[string]container.InspectResponse
+	containerRaw       map[string][]byte
+	images             []image.Summary
+	imageListErr       error
+	imageListDeadline  time.Duration
+	imageListCalls     int
+	imageInspects      map[string]image.InspectResponse
+	imageRaw           map[string][]byte
+	volumes            []volume.Volume
+	volumeInspects     map[string]volume.Volume
+	volumeRaw          map[string][]byte
+	networks           []network.Summary
+	networkInspects    map[string]network.Inspect
+	networkRaw         map[string][]byte
+	events             chan events.Message
+	eventErrs          chan error
+	eventCalls         int
+	stats              map[string][]container.StatsResponse
+	statsCalls         []statsCall
+	tops               map[string]dockerclient.ContainerTopResult
+	execCreates        []execCreateCall
+	execAttachCtxs     []context.Context
+	execAttachOpts     []dockerclient.ExecAttachOptions
+	execResizes        []execResizeCall
+	execInspects       map[string]dockerclient.ExecInspectResult
+	execOutputs        map[string]string
+	execExitCodes      map[string]int
+	executablePaths    map[string]bool
+	started            []string
+	stopped            []string
+	restarted          []string
+	killed             []string
+	removed            []string
+	unpaused           []string
+	createdContainers  []createdContainerCall
+	renamed            []string
+	pulled             []string
+	pullAuth           []string
+	pullBody           string
+	pullErr            error
+	tagged             []string
+	pushed             []string
+	pushAuth           []string
+	pushBody           string
+	pushErr            error
+	saved              [][]string
+	saveReaderFactory  func() io.ReadCloser
+	loadedBytes        []int
+	loadBody           string
+	loadBodyCloseErr   error
+	loadErr            error
+	afterImageLoadRead func()
+	searches           []string
+	removedImages      []string
+	pruned             []string
+	createdVolumes     []dockerclient.VolumeCreateOptions
+	removedVolumes     []string
+	createdNetworks    []networkCreateCall
+	removedNetworks    []string
+	closed             bool
+}
+
+type createdContainerCall struct {
+	Name             string
+	Config           *container.Config
+	HostConfig       *container.HostConfig
+	NetworkingConfig *network.NetworkingConfig
+}
+
+type networkCreateCall struct {
+	Name    string
+	Options dockerclient.NetworkCreateOptions
+}
+
+type statsCall struct {
+	ID      string
+	Stream  bool
+	OneShot bool
+}
+
+type execCreateCall struct {
+	ID          string
+	ContainerID string
+	Options     dockerclient.ExecCreateOptions
+}
+
+type execResizeCall struct {
+	ExecID  string
+	Options dockerclient.ExecResizeOptions
+}
+
+func newFakeAPI() *fakeAPI {
+	return &fakeAPI{
+		ping:              dockerclient.PingResult{APIVersion: "1.51"},
+		containerInspects: map[string]container.InspectResponse{},
+		containerRaw:      map[string][]byte{},
+		imageInspects:     map[string]image.InspectResponse{},
+		imageRaw:          map[string][]byte{},
+		volumeInspects:    map[string]volume.Volume{},
+		volumeRaw:         map[string][]byte{},
+		networkInspects:   map[string]network.Inspect{},
+		networkRaw:        map[string][]byte{},
+		events:            make(chan events.Message, 16),
+		eventErrs:         make(chan error, 4),
+		stats:             map[string][]container.StatsResponse{},
+		tops:              map[string]dockerclient.ContainerTopResult{},
+		execInspects:      map[string]dockerclient.ExecInspectResult{},
+		execOutputs:       map[string]string{},
+		execExitCodes:     map[string]int{},
+		executablePaths:   map[string]bool{},
+	}
+}
+
+func (a *fakeAPI) setPingError(err error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.pingErr = err
+}
+
+func (a *fakeAPI) Ping(context.Context, dockerclient.PingOptions) (dockerclient.PingResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.pingErr != nil {
+		return dockerclient.PingResult{}, a.pingErr
+	}
+	return a.ping, nil
+}
+
+func (a *fakeAPI) Info(context.Context, dockerclient.InfoOptions) (dockerclient.SystemInfoResult, error) {
+	return dockerclient.SystemInfoResult{Info: a.info}, nil
+}
+
+func (a *fakeAPI) ServerVersion(context.Context, dockerclient.ServerVersionOptions) (dockerclient.ServerVersionResult, error) {
+	return a.version, nil
+}
+
+func (a *fakeAPI) DiskUsage(context.Context, dockerclient.DiskUsageOptions) (dockerclient.DiskUsageResult, error) {
+	return a.diskUsage, nil
+}
+
+func (a *fakeAPI) ContainerList(context.Context, dockerclient.ContainerListOptions) (dockerclient.ContainerListResult, error) {
+	return dockerclient.ContainerListResult{Items: append([]container.Summary(nil), a.containers...)}, a.containerListErr
+}
+
+func (a *fakeAPI) ContainerInspect(_ context.Context, id string, _ dockerclient.ContainerInspectOptions) (dockerclient.ContainerInspectResult, error) {
+	for key, inspect := range a.containerInspects {
+		if key == id || strings.HasPrefix(key, id) {
+			return dockerclient.ContainerInspectResult{Container: inspect, Raw: rawOrMarshal(a.containerRaw[key], inspect)}, nil
+		}
+	}
+	return dockerclient.ContainerInspectResult{}, cerrdefs.ErrNotFound.WithMessage(fmt.Sprintf("no such container: %s", id))
+}
+
+func (a *fakeAPI) ContainerStart(_ context.Context, id string, _ dockerclient.ContainerStartOptions) (dockerclient.ContainerStartResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.started = append(a.started, id)
+	return dockerclient.ContainerStartResult{}, nil
+}
+
+func (a *fakeAPI) ContainerStop(_ context.Context, id string, _ dockerclient.ContainerStopOptions) (dockerclient.ContainerStopResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.stopped = append(a.stopped, id)
+	return dockerclient.ContainerStopResult{}, nil
+}
+
+func (a *fakeAPI) ContainerRestart(_ context.Context, id string, _ dockerclient.ContainerRestartOptions) (dockerclient.ContainerRestartResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.restarted = append(a.restarted, id)
+	return dockerclient.ContainerRestartResult{}, nil
+}
+
+func (a *fakeAPI) ContainerKill(_ context.Context, id string, options dockerclient.ContainerKillOptions) (dockerclient.ContainerKillResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.killed = append(a.killed, id+":"+options.Signal)
+	return dockerclient.ContainerKillResult{}, nil
+}
+
+func (a *fakeAPI) ContainerRemove(_ context.Context, id string, _ dockerclient.ContainerRemoveOptions) (dockerclient.ContainerRemoveResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.removed = append(a.removed, id)
+	return dockerclient.ContainerRemoveResult{}, nil
+}
+
+func (a *fakeAPI) ContainerUnpause(_ context.Context, id string, _ dockerclient.ContainerUnpauseOptions) (dockerclient.ContainerUnpauseResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.unpaused = append(a.unpaused, id)
+	return dockerclient.ContainerUnpauseResult{}, nil
+}
+
+func (a *fakeAPI) ContainerLogs(context.Context, string, dockerclient.ContainerLogsOptions) (dockerclient.ContainerLogsResult, error) {
+	return io.NopCloser(strings.NewReader("")), nil
+}
+
+func (a *fakeAPI) ContainerStats(_ context.Context, id string, options dockerclient.ContainerStatsOptions) (dockerclient.ContainerStatsResult, error) {
+	a.mu.Lock()
+	oneShot := !options.Stream && !options.IncludePreviousSample
+	a.statsCalls = append(a.statsCalls, statsCall{ID: id, Stream: options.Stream, OneShot: oneShot})
+	entries := append([]container.StatsResponse(nil), a.stats[id]...)
+	a.mu.Unlock()
+	if oneShot && len(entries) > 1 {
+		entries = entries[len(entries)-1:]
+	}
+	return dockerclient.ContainerStatsResult{Body: statsReader(entries)}, nil
+}
+
+func (a *fakeAPI) ContainerTop(_ context.Context, id string, _ dockerclient.ContainerTopOptions) (dockerclient.ContainerTopResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if top, ok := a.tops[id]; ok {
+		return top, nil
+	}
+	return dockerclient.ContainerTopResult{Titles: []string{"PID"}}, nil
+}
+
+func (a *fakeAPI) ExecCreate(_ context.Context, containerID string, opts dockerclient.ExecCreateOptions) (dockerclient.ExecCreateResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	id := fmt.Sprintf("exec-%d", len(a.execCreates)+1)
+	exitCode := a.execExitCodeLocked(opts.Cmd)
+	a.execCreates = append(a.execCreates, execCreateCall{ID: id, ContainerID: containerID, Options: opts})
+	a.execInspects[id] = dockerclient.ExecInspectResult{
+		ID:          id,
+		ContainerID: containerID,
+		Running:     false,
+		ExitCode:    exitCode,
+		PID:         1234,
+	}
+	return dockerclient.ExecCreateResult{ID: id}, nil
+}
+
+func (a *fakeAPI) ExecAttach(ctx context.Context, execID string, opts dockerclient.ExecAttachOptions) (dockerclient.ExecAttachResult, error) {
+	a.mu.Lock()
+	a.execAttachCtxs = append(a.execAttachCtxs, ctx)
+	a.execAttachOpts = append(a.execAttachOpts, opts)
+	var output string
+	for _, call := range a.execCreates {
+		if call.ID == execID {
+			output = a.execOutputLocked(call.Options.Cmd)
+			break
+		}
+	}
+	a.mu.Unlock()
+
+	clientConn, serverConn := net.Pipe()
+	go func() {
+		defer func() {
+			_ = serverConn.Close()
+		}()
+		if output == "" {
+			return
+		}
+		if opts.TTY {
+			_, _ = serverConn.Write([]byte(output))
+			return
+		}
+		payload := []byte(output)
+		header := make([]byte, 8)
+		header[0] = byte(stdcopy.Stdout)
+		binary.BigEndian.PutUint32(header[4:], uint32(len(payload)))
+		_, _ = serverConn.Write(append(header, payload...))
+	}()
+	return dockerclient.ExecAttachResult{HijackedResponse: dockerclient.NewHijackedResponse(clientConn, "")}, nil
+}
+
+func (a *fakeAPI) ExecResize(_ context.Context, execID string, opts dockerclient.ExecResizeOptions) (dockerclient.ExecResizeResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.execResizes = append(a.execResizes, execResizeCall{ExecID: execID, Options: opts})
+	return dockerclient.ExecResizeResult{}, nil
+}
+
+func (a *fakeAPI) ExecInspect(_ context.Context, execID string, _ dockerclient.ExecInspectOptions) (dockerclient.ExecInspectResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	inspect, ok := a.execInspects[execID]
+	if !ok {
+		return dockerclient.ExecInspectResult{}, cerrdefs.ErrNotFound.WithMessage(fmt.Sprintf("no such exec: %s", execID))
+	}
+	return inspect, nil
+}
+
+func (a *fakeAPI) execExitCodeLocked(cmd []string) int {
+	if len(cmd) == 3 && cmd[1] == "-c" && cmd[2] == "exit 0" {
+		if a.executablePaths[cmd[0]] {
+			return 0
+		}
+		return 127
+	}
+	if len(cmd) == 3 && cmd[0] == "test" && cmd[1] == "-x" {
+		if a.executablePaths[cmd[2]] {
+			return 0
+		}
+		return 1
+	}
+	if code, ok := a.execExitCodes[commandKey(cmd)]; ok {
+		return code
+	}
+	return 0
+}
+
+func (a *fakeAPI) execOutputLocked(cmd []string) string {
+	return a.execOutputs[commandKey(cmd)]
+}
+
+func commandKey(cmd []string) string {
+	return strings.Join(cmd, "\x00")
+}
+
+func (a *fakeAPI) ContainerCreate(_ context.Context, options dockerclient.ContainerCreateOptions) (dockerclient.ContainerCreateResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	config := options.Config
+	hostConfig := options.HostConfig
+	networkingConfig := options.NetworkingConfig
+	name := options.Name
+	id := "created-" + name
+	if name == "" {
+		id = "created-container"
+	}
+	a.createdContainers = append(a.createdContainers, createdContainerCall{
+		Name:             name,
+		Config:           config,
+		HostConfig:       hostConfig,
+		NetworkingConfig: networkingConfig,
+	})
+	a.containerInspects[id] = container.InspectResponse{
+		ID:      id,
+		Name:    "/" + name,
+		Image:   "sha256:image1",
+		Created: time.Now().UTC().Format(time.RFC3339Nano),
+		State:   &container.State{Status: container.StateCreated},
+		Config:  config,
+	}
+	a.containers = append(a.containers, container.Summary{
+		ID:      id,
+		Names:   []string{"/" + name},
+		Image:   config.Image,
+		ImageID: "sha256:image1",
+		State:   "created",
+	})
+	return dockerclient.ContainerCreateResult{ID: id}, nil
+}
+
+func statsReader(entries []container.StatsResponse) io.ReadCloser {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	for _, entry := range entries {
+		_ = enc.Encode(entry)
+	}
+	return io.NopCloser(bytes.NewReader(buf.Bytes()))
+}
+
+func (a *fakeAPI) ContainerRename(_ context.Context, id string, options dockerclient.ContainerRenameOptions) (dockerclient.ContainerRenameResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.renamed = append(a.renamed, id+":"+options.NewName)
+	return dockerclient.ContainerRenameResult{}, nil
+}
+
+func (a *fakeAPI) ImageList(ctx context.Context, _ dockerclient.ImageListOptions) (dockerclient.ImageListResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.imageListCalls++
+	if deadline, ok := ctx.Deadline(); ok {
+		a.imageListDeadline = time.Until(deadline)
+	}
+	return dockerclient.ImageListResult{Items: append([]image.Summary(nil), a.images...)}, a.imageListErr
+}
+
+func (a *fakeAPI) ImageInspect(_ context.Context, id string, _ ...dockerclient.ImageInspectOption) (dockerclient.ImageInspectResult, error) {
+	for key, inspect := range a.imageInspects {
+		if key == id || strings.HasPrefix(key, id) {
+			return dockerclient.ImageInspectResult{InspectResponse: inspect}, nil
+		}
+	}
+	return dockerclient.ImageInspectResult{}, cerrdefs.ErrNotFound.WithMessage(fmt.Sprintf("no such image: %s", id))
+}
+
+func (a *fakeAPI) ImagePull(_ context.Context, ref string, opts dockerclient.ImagePullOptions) (dockerclient.ImagePullResponse, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.pulled = append(a.pulled, ref)
+	a.pullAuth = append(a.pullAuth, opts.RegistryAuth)
+	if a.pullErr != nil {
+		return nil, a.pullErr
+	}
+	a.imageInspects[ref] = image.InspectResponse{
+		ID:           "sha256:pulled",
+		RepoTags:     []string{ref},
+		Created:      time.Now().UTC().Format(time.RFC3339Nano),
+		Architecture: "amd64",
+		Os:           "linux",
+	}
+	body := a.pullBody
+	if body == "" {
+		body = `{"status":"pulling","id":"layer","progressDetail":{"current":1,"total":2}}` + "\n" + `{"status":"done"}` + "\n"
+	}
+	return newFakeJSONMessageStream(body), nil
+}
+
+func (a *fakeAPI) ImageTag(_ context.Context, options dockerclient.ImageTagOptions) (dockerclient.ImageTagResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	imageID := options.Source
+	ref := options.Target
+	a.tagged = append(a.tagged, imageID+"->"+ref)
+	a.imageInspects[ref] = image.InspectResponse{
+		ID:           imageID,
+		RepoTags:     []string{ref},
+		Created:      time.Now().UTC().Format(time.RFC3339Nano),
+		Architecture: "amd64",
+		Os:           "linux",
+	}
+	return dockerclient.ImageTagResult{}, nil
+}
+
+func (a *fakeAPI) ImagePush(_ context.Context, ref string, opts dockerclient.ImagePushOptions) (dockerclient.ImagePushResponse, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.pushed = append(a.pushed, ref)
+	a.pushAuth = append(a.pushAuth, opts.RegistryAuth)
+	if a.pushErr != nil {
+		return nil, a.pushErr
+	}
+	body := a.pushBody
+	if body == "" {
+		body = `{"status":"pushing","id":"layer","progressDetail":{"current":1,"total":2}}` + "\n" + `{"status":"done"}` + "\n"
+	}
+	return newFakeJSONMessageStream(body), nil
+}
+
+func (a *fakeAPI) ImageSave(_ context.Context, imageIDs []string, _ ...dockerclient.ImageSaveOption) (dockerclient.ImageSaveResult, error) {
+	a.mu.Lock()
+	a.saved = append(a.saved, append([]string(nil), imageIDs...))
+	factory := a.saveReaderFactory
+	a.mu.Unlock()
+	if factory != nil {
+		return factory(), nil
+	}
+	return io.NopCloser(bytes.NewReader([]byte("fake image tar"))), nil
+}
+
+func (a *fakeAPI) ImageLoad(_ context.Context, input io.Reader, _ ...dockerclient.ImageLoadOption) (dockerclient.ImageLoadResult, error) {
+	body, err := io.ReadAll(input)
+	if err != nil {
+		return nil, err
+	}
+	a.mu.Lock()
+	a.loadedBytes = append(a.loadedBytes, len(body))
+	a.imageInspects["loaded:latest"] = image.InspectResponse{
+		ID:       "sha256:loaded",
+		RepoTags: []string{"loaded:latest"},
+		Created:  time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	responseBody := a.loadBody
+	responseCloseErr := a.loadBodyCloseErr
+	loadErr := a.loadErr
+	afterRead := a.afterImageLoadRead
+	a.mu.Unlock()
+	if afterRead != nil {
+		afterRead()
+	}
+	if loadErr != nil {
+		return nil, loadErr
+	}
+	if responseBody == "" {
+		responseBody = `{"stream":"Loaded image: loaded:latest"}`
+	}
+	if responseCloseErr != nil {
+		return &errorClosingReadCloser{
+			Reader: strings.NewReader(responseBody),
+			err:    responseCloseErr,
+		}, nil
+	}
+	return io.NopCloser(strings.NewReader(responseBody)), nil
+}
+
+func (a *fakeAPI) ImageSearch(_ context.Context, term string, _ dockerclient.ImageSearchOptions) (dockerclient.ImageSearchResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.searches = append(a.searches, term)
+	return dockerclient.ImageSearchResult{Items: []registry.SearchResult{{
+		Name:        "library/" + term,
+		Description: "test result",
+		StarCount:   42,
+		IsOfficial:  true,
+	}}}, nil
+}
+
+func (a *fakeAPI) ImageRemove(_ context.Context, id string, _ dockerclient.ImageRemoveOptions) (dockerclient.ImageRemoveResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.removedImages = append(a.removedImages, id)
+	return dockerclient.ImageRemoveResult{Items: []image.DeleteResponse{{Deleted: id}}}, nil
+}
+
+func (a *fakeAPI) ImagePrune(context.Context, dockerclient.ImagePruneOptions) (dockerclient.ImagePruneResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.pruned = append(a.pruned, "images")
+	return dockerclient.ImagePruneResult{Report: image.PruneReport{}}, nil
+}
+
+func (a *fakeAPI) ContainerPrune(context.Context, dockerclient.ContainerPruneOptions) (dockerclient.ContainerPruneResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.pruned = append(a.pruned, "containers")
+	return dockerclient.ContainerPruneResult{Report: container.PruneReport{}}, nil
+}
+
+func (a *fakeAPI) BuildCachePrune(context.Context, dockerclient.BuildCachePruneOptions) (dockerclient.BuildCachePruneResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.pruned = append(a.pruned, "build-cache")
+	return dockerclient.BuildCachePruneResult{}, nil
+}
+
+func (a *fakeAPI) VolumeList(context.Context, dockerclient.VolumeListOptions) (dockerclient.VolumeListResult, error) {
+	return dockerclient.VolumeListResult{Items: append([]volume.Volume(nil), a.volumes...)}, nil
+}
+
+func (a *fakeAPI) VolumeInspect(_ context.Context, name string, _ dockerclient.VolumeInspectOptions) (dockerclient.VolumeInspectResult, error) {
+	for key, inspect := range a.volumeInspects {
+		if key == name {
+			return dockerclient.VolumeInspectResult{Volume: inspect, Raw: rawOrMarshal(a.volumeRaw[key], inspect)}, nil
+		}
+	}
+	return dockerclient.VolumeInspectResult{}, cerrdefs.ErrNotFound.WithMessage(fmt.Sprintf("no such volume: %s", name))
+}
+
+func (a *fakeAPI) VolumeCreate(_ context.Context, options dockerclient.VolumeCreateOptions) (dockerclient.VolumeCreateResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.createdVolumes = append(a.createdVolumes, options)
+	created := volume.Volume{
+		Name:       options.Name,
+		Driver:     options.Driver,
+		Mountpoint: "/var/lib/docker/volumes/" + options.Name + "/_data",
+		Labels:     options.Labels,
+		Options:    options.DriverOpts,
+		CreatedAt:  time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	a.volumes = append(a.volumes, created)
+	a.volumeInspects[options.Name] = created
+	return dockerclient.VolumeCreateResult{Volume: created}, nil
+}
+
+func (a *fakeAPI) VolumeRemove(_ context.Context, name string, _ dockerclient.VolumeRemoveOptions) (dockerclient.VolumeRemoveResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.removedVolumes = append(a.removedVolumes, name)
+	return dockerclient.VolumeRemoveResult{}, nil
+}
+
+func (a *fakeAPI) VolumePrune(context.Context, dockerclient.VolumePruneOptions) (dockerclient.VolumePruneResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.pruned = append(a.pruned, "volumes")
+	return dockerclient.VolumePruneResult{Report: volume.PruneReport{}}, nil
+}
+
+func (a *fakeAPI) NetworkList(context.Context, dockerclient.NetworkListOptions) (dockerclient.NetworkListResult, error) {
+	return dockerclient.NetworkListResult{Items: append([]network.Summary(nil), a.networks...)}, nil
+}
+
+func (a *fakeAPI) NetworkInspect(_ context.Context, id string, _ dockerclient.NetworkInspectOptions) (dockerclient.NetworkInspectResult, error) {
+	for key, inspect := range a.networkInspects {
+		if key == id || strings.HasPrefix(key, id) || inspect.Name == id {
+			return dockerclient.NetworkInspectResult{Network: inspect, Raw: rawOrMarshal(a.networkRaw[key], inspect)}, nil
+		}
+	}
+	return dockerclient.NetworkInspectResult{}, cerrdefs.ErrNotFound.WithMessage(fmt.Sprintf("no such network: %s", id))
+}
+
+func (a *fakeAPI) NetworkCreate(_ context.Context, name string, options dockerclient.NetworkCreateOptions) (dockerclient.NetworkCreateResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	id := "net-" + name
+	a.createdNetworks = append(a.createdNetworks, networkCreateCall{Name: name, Options: options})
+	created := network.Inspect{
+		Network: network.Network{
+			ID:         id,
+			Name:       name,
+			Driver:     options.Driver,
+			Scope:      "local",
+			Internal:   options.Internal,
+			Attachable: options.Attachable,
+			Labels:     options.Labels,
+		},
+	}
+	if options.IPAM != nil {
+		created.IPAM = *options.IPAM
+	}
+	a.networks = append(a.networks, network.Summary{Network: created.Network})
+	a.networkInspects[id] = created
+	return dockerclient.NetworkCreateResult{ID: id}, nil
+}
+
+func (a *fakeAPI) NetworkRemove(_ context.Context, id string, _ dockerclient.NetworkRemoveOptions) (dockerclient.NetworkRemoveResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.removedNetworks = append(a.removedNetworks, id)
+	return dockerclient.NetworkRemoveResult{}, nil
+}
+
+func (a *fakeAPI) NetworkPrune(context.Context, dockerclient.NetworkPruneOptions) (dockerclient.NetworkPruneResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.pruned = append(a.pruned, "networks")
+	return dockerclient.NetworkPruneResult{Report: network.PruneReport{}}, nil
+}
+
+func (a *fakeAPI) Events(context.Context, dockerclient.EventsListOptions) dockerclient.EventsResult {
+	a.mu.Lock()
+	a.eventCalls++
+	a.mu.Unlock()
+	return dockerclient.EventsResult{Messages: a.events, Err: a.eventErrs}
+}
+
+func (a *fakeAPI) Close() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.closed = true
+	return nil
+}
+
+type fakeJSONMessageStream struct {
+	io.ReadCloser
+}
+
+func newFakeJSONMessageStream(body string) *fakeJSONMessageStream {
+	return &fakeJSONMessageStream{ReadCloser: io.NopCloser(strings.NewReader(body))}
+}
+
+func (stream *fakeJSONMessageStream) JSONMessages(ctx context.Context) iter.Seq2[jsonstream.Message, error] {
+	return func(yield func(jsonstream.Message, error) bool) {
+		defer func() { _ = stream.Close() }()
+		decoder := json.NewDecoder(stream)
+		for {
+			if err := ctx.Err(); err != nil {
+				yield(jsonstream.Message{}, err)
+				return
+			}
+			var message jsonstream.Message
+			if err := decoder.Decode(&message); err != nil {
+				if !errors.Is(err, io.EOF) {
+					yield(jsonstream.Message{}, err)
+				}
+				return
+			}
+			if !yield(message, nil) {
+				return
+			}
+		}
+	}
+}
+
+func (stream *fakeJSONMessageStream) Wait(ctx context.Context) error {
+	for message, err := range stream.JSONMessages(ctx) {
+		if err != nil {
+			return err
+		}
+		if message.Error != nil {
+			return message.Error
+		}
+	}
+	return nil
+}
+
+func rawOrMarshal[T any](raw []byte, value T) []byte {
+	if len(raw) > 0 {
+		return raw
+	}
+	encoded, _ := json.Marshal(value)
+	return encoded
+}
+
+func waitConnected(ctx context.Context, events <-chan bus.Event, timeout time.Duration) (ConnectedPayload, error) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ConnectedPayload{}, ctx.Err()
+		case <-timer.C:
+			return ConnectedPayload{}, context.DeadlineExceeded
+		case event, ok := <-events:
+			if !ok {
+				return ConnectedPayload{}, errors.New("event subscription closed")
+			}
+			payload, ok := event.Payload.(ConnectedPayload)
+			if ok {
+				return payload, nil
+			}
+		}
+	}
+}
+
+func waitDisconnected(ctx context.Context, events <-chan bus.Event, timeout time.Duration) (DisconnectedPayload, error) {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return DisconnectedPayload{}, ctx.Err()
+		case <-timer.C:
+			return DisconnectedPayload{}, context.DeadlineExceeded
+		case event, ok := <-events:
+			if !ok {
+				return DisconnectedPayload{}, errors.New("event subscription closed")
+			}
+			payload, ok := event.Payload.(DisconnectedPayload)
+			if ok {
+				return payload, nil
+			}
+		}
+	}
+}
+
+func waitDockerCLI(ctx context.Context) error {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	var lastErr error
+	for {
+		infoCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		cmd := exec.CommandContext(infoCtx, "docker", "info")
+		lastErr = cmd.Run()
+		cancel()
+		if lastErr == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%w; last docker info error: %v", ctx.Err(), lastErr)
+		case <-ticker.C:
+		}
+	}
+}
+
+func waitDockerCLIDown(ctx context.Context, timeout time.Duration) error {
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	var lastOutput string
+	for {
+		infoCtx, infoCancel := context.WithTimeout(waitCtx, 2*time.Second)
+		cmd := exec.CommandContext(infoCtx, "docker", "info")
+		output, err := cmd.CombinedOutput()
+		infoCancel()
+		lastOutput = strings.TrimSpace(string(output))
+		if err != nil {
+			return nil
+		}
+		select {
+		case <-waitCtx.Done():
+			return fmt.Errorf("%w; last docker info output: %s", waitCtx.Err(), lastOutput)
+		case <-ticker.C:
+		}
+	}
+}
+
+func controlDockerService(ctx context.Context, action string) error {
+	commands := dockerControlCommands(action)
+	errs := make([]error, 0, len(commands))
+	for _, command := range commands {
+		if _, err := exec.LookPath(command[0]); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		cmd := exec.CommandContext(ctx, command[0], command[1:]...)
+		output, err := cmd.CombinedOutput()
+		if err == nil {
+			return nil
+		}
+		errs = append(errs, fmt.Errorf("%s: %w: %s", strings.Join(command, " "), err, strings.TrimSpace(string(output))))
+	}
+	return errors.Join(errs...)
+}
+
+func dockerControlCommands(action string) [][]string {
+	if action == "stop" {
+		return [][]string{
+			{"sudo", "systemctl", "stop", "docker.socket", "docker.service"},
+			{"sudo", "systemctl", "stop", "docker.service"},
+			{"sudo", "service", "docker", "stop"},
+		}
+	}
+	if action == "start" {
+		return [][]string{
+			{"sudo", "systemctl", "start", "docker.socket", "docker.service"},
+			{"sudo", "systemctl", "start", "docker.service"},
+			{"sudo", "service", "docker", "start"},
+		}
+	}
+	return [][]string{{"sudo", "systemctl", action, "docker.service"}}
+}

@@ -22,6 +22,16 @@ Common fixes:
 - Docker Desktop integration conflict: disable Docker Desktop WSL integration for the selected distro or choose a clean distro such as `cairn-dev`.
 - Slow project IO: move heavy Compose projects from `/mnt/c/...` into the WSL filesystem, such as `~/projects`.
 
+### Startup, tray activity, and WSL processes
+
+Cairn uses `wsl.exe` to relay Docker API connections. A relay may have a wrapper child process, and pooled connections or active log/terminal sessions can remain open for a long time. Process age alone does not identify a hung connection.
+
+Use Settings diagnostics to compare active transports, opened/closed counts, forced kills, close timeouts, log readers, and metrics streams over time. Hiding Cairn pauses its automatic overview log preview and foreground metrics subscription; background history sampling continues at a minimum ten-second interval. Explicitly opened log and terminal sessions keep their normal lifetime.
+
+After rebuilding or upgrading, use **Quit Cairn** in the tray before launching the new executable. Closing the main window only hides the existing process. Autostart refers to the installed executable path, so copying a separate review build does not update the login registration.
+
+See the [startup/WSL analysis and acceptance procedure](project-analysis-2026-09-20.md) for the September 2026 fixes and the remaining native validation steps.
+
 ## Linux Native
 
 Expected healthy state:

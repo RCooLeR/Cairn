@@ -32,6 +32,8 @@ info:
 
 # Dev mode configuration
 dev_mode:
+  # Keep task execution and .gitignore resolution at the repository root.
+  # The watcher includes src/; ignored directory names match any path segment.
   root_path: .
   log_level: warn
   debounce: 1000
@@ -50,7 +52,7 @@ dev_mode:
       - "*.go"
       - "*.js" # Watch for changes to JS/TS files included using the //wails:include directive.
       - "*.ts" # The frontend directory will be excluded entirely by the setting above.
-    git_ignore: true
+    git: true
   executes:
     - cmd: wails3 build DEV=true
       type: blocking

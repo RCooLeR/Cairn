@@ -4,12 +4,13 @@ tasks:
   go:mod:tidy:
     summary: Runs `go mod tidy`
     internal: true
+    dir: src
     cmds:
       - go mod tidy
 
   install:frontend:deps:
     summary: Install frontend dependencies
-    dir: frontend
+    dir: src/frontend
     preconditions:
       - sh: npm version
         msg: "Looks like npm isn't installed. Npm is part of the Node installer: https://nodejs.org/en/download/"
@@ -21,7 +22,7 @@ tasks:
   build:frontend:
     label: build:frontend (DEV={{.DEV}})
     summary: Build the frontend project
-    dir: frontend
+    dir: src/frontend
     sources:
       - "**/*"
       - exclude: node_modules/**/*
@@ -43,6 +44,7 @@ tasks:
   generate:bindings:
     label: generate:bindings (BUILD_FLAGS={{.BUILD_FLAGS}})
     summary: Generates bindings for the frontend
+    dir: src
     deps:
       - task: :env:check
     sources:
@@ -87,7 +89,7 @@ tasks:
 
   dev:frontend:
     summary: Runs the frontend in development mode
-    dir: frontend
+    dir: src/frontend
     deps:
       - task: install:frontend:deps
     cmds:

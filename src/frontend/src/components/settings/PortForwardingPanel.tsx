@@ -1,0 +1,255 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Network, Power } from "lucide-react";
+import { Events } from "@wailsio/runtime";
+
+import type {
+  PortForward,
+  PortForwardStatus,
+} from "../../../bindings/github.com/RCooLeR/Cairn/internal/models/models.js";
+import { PortForwardService } from "../../api/services";
+import { boundedRead } from "../../api/boundedRead";
+import {
+  Badge,
+  Button,
+  Card,
+  CardBody,
+  CardHeader,
+  EmptyState,
+  LiveMessage,
+} from "../ui";
+
+function bindLabel(bindAddr: string): string {
+  if (bindAddr === "0.0.0.0") {
+    return "0.0.0.0 (LAN)";
+  }
+  if (bindAddr === "127.0.0.1") {
+    return "127.0.0.1 (local)";
+  }
+  return bindAddr;
+}
+
+function forwardRowKey(forward: PortForward): string {
+  return `${forward.protocol}/${forward.bindAddr}/${forward.hostPort}/${forward.containerID}`;
+}
+
+export function PortForwardingPanel() {
+  const [status, setStatus] = useState<PortForwardStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const refreshGenerationRef = useRef(0);
+
+  const refresh = useCallback(async () => {
+    const generation = ++refreshGenerationRef.current;
+    setLoading(true);
+    try {
+      const nextStatus = await boundedRead(
+        () => PortForwardService.GetStatus(),
+        "Port forwarding status",
+      );
+      if (generation !== refreshGenerationRef.current) {
+        return;
+      }
+      setStatus(nextStatus);
+      setError(null);
+    } catch (err) {
+      if (generation !== refreshGenerationRef.current) {
+        return;
+      }
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Unable to load port forwarding status",
+      );
+    } finally {
+      if (generation === refreshGenerationRef.current) {
+        setLoaded(true);
+        setLoading(false);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      void refresh();
+    }, 0);
+    const off = Events.On("portforward:changed", () => {
+      void refresh();
+    });
+    const offProvider = Events.On("provider:changed", () => {
+      void refresh();
+    });
+    const offDocker = Events.On("docker:connected", () => {
+      void refresh();
+    });
+    return () => {
+      refreshGenerationRef.current += 1;
+      window.clearTimeout(timer);
+      off();
+      offProvider();
+      offDocker();
+    };
+  }, [refresh]);
+
+  if (!status) {
+    if (loaded && !error) {
+      // Only the WSL backend forwards host ports; native/Colima bind them
+      // directly. A successful null response is treated the same way.
+      return null;
+    }
+    return (
+      <Card>
+        <CardHeader
+          status={
+            <Badge tone="neutral">{loading ? "Checking" : "Unavailable"}</Badge>
+          }
+          title="Host port forwarding"
+        />
+        <CardBody className="space-y-3">
+          {error ? (
+            <LiveMessage
+              className="rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error"
+              level="error"
+            >
+              {error}
+            </LiveMessage>
+          ) : (
+            <LiveMessage className="text-sm text-text-muted" level="status">
+              Loading port forwarding status…
+            </LiveMessage>
+          )}
+          {error ? (
+            <Button loading={loading} onClick={() => void refresh()} size="sm">
+              Retry
+            </Button>
+          ) : null}
+        </CardBody>
+      </Card>
+    );
+  }
+
+  // Only the WSL backend forwards host ports; native/Colima bind them directly.
+  if (!status.supported) {
+    return null;
+  }
+
+  const forwards = status.forwards ?? [];
+  const toggle = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await PortForwardService.SetEnabled(!status.enabled);
+      await refresh();
+    } catch (err) {
+      setError(
+        err instanceof Error ? err.message : "Unable to change port forwarding",
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Card>
+      <CardHeader
+        status={
+          <Badge tone={status.enabled ? "ok" : "neutral"}>
+            {status.enabled ? "On" : "Off"}
+          </Badge>
+        }
+        title="Host port forwarding"
+      />
+      <CardBody className="space-y-3">
+        <LiveMessage className="sr-only" level="status">
+          {busy
+            ? "Updating port forwarding."
+            : `Port forwarding is ${status.enabled ? "enabled" : "disabled"}.`}
+        </LiveMessage>
+        <p className="text-sm text-text-muted">
+          Proxies supported published container ports from Windows into WSL.
+          Enabling this can expose ports published on <code>0.0.0.0</code> to
+          other devices on the Windows LAN. Cairn currently does not mirror
+          loopback-only or IPv6 publishes.
+        </p>
+        <div className="flex items-center gap-3">
+          <Button
+            icon={<Power size={15} />}
+            loading={busy}
+            onClick={() => {
+              void toggle();
+            }}
+            size="sm"
+            variant={status.enabled ? "secondary" : "primary"}
+          >
+            {status.enabled ? "Disable forwarding" : "Enable forwarding"}
+          </Button>
+        </div>
+        {error ? (
+          <LiveMessage
+            className="flex items-center justify-between gap-3 rounded-card border border-error/30 bg-error/10 px-3 py-2 text-sm text-error"
+            level="error"
+          >
+            <span>{error}</span>
+            <Button loading={loading} onClick={() => void refresh()} size="sm">
+              Retry
+            </Button>
+          </LiveMessage>
+        ) : null}
+        {forwards.length === 0 ? (
+          <EmptyState
+            body={
+              status.enabled
+                ? "Publish a container port with -p and it will appear here."
+                : "Forwarding is off, so no host ports are bound."
+            }
+            icon={<Network size={28} />}
+            title="No forwarded ports"
+          />
+        ) : (
+          <div className="overflow-x-auto rounded-card border border-border">
+            <table className="w-full min-w-[720px] text-sm">
+              <thead>
+                <tr className="border-b border-border bg-bg-inset text-left text-xs uppercase text-text-muted">
+                  <th className="px-3 py-2 font-medium">Host port</th>
+                  <th className="px-3 py-2 font-medium">Protocol</th>
+                  <th className="px-3 py-2 font-medium">Bind</th>
+                  <th className="px-3 py-2 font-medium">Container</th>
+                  <th className="px-3 py-2 font-medium">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {forwards.map((forward) => (
+                  <tr
+                    className="border-b border-border last:border-0"
+                    key={forwardRowKey(forward)}
+                  >
+                    <td className="px-3 py-2 font-mono text-text-primary">
+                      {forward.hostPort}
+                    </td>
+                    <td className="px-3 py-2 uppercase text-text-secondary">
+                      {forward.protocol}
+                    </td>
+                    <td className="px-3 py-2 text-text-secondary">
+                      {bindLabel(forward.bindAddr)}
+                    </td>
+                    <td className="truncate px-3 py-2 text-text-secondary">
+                      {forward.containerName || "-"}
+                    </td>
+                    <td className="px-3 py-2">
+                      {forward.status === "active" ? (
+                        <Badge tone="ok">active</Badge>
+                      ) : (
+                        <Badge tone="error">{forward.reason || "error"}</Badge>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </CardBody>
+    </Card>
+  );
+}

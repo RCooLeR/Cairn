@@ -2,11 +2,13 @@
 
 Source of truth: `dev-docs/06-testing.md`, `dev-docs/05-security.md`, and `dev-docs/08-packaging-release.md`.
 
+Commands and source paths use the current `src/` layout and assume the repository root. Historical versions and results below are retained as release evidence; path updates do not imply those checks were rerun during the layout migration.
+
 ## Toolchain and Docker build-input policy
 
-`go.mod` is the source of truth for the exact Go patch toolchain. `scripts/check-toolchain.ps1` verifies the installed Go version, the frontend Node/npm minimums, and the cross-image Go base; CI and release jobs run the same contract and inspect each packaged application's Go build information.
+`src/go.mod` is the source of truth for the exact Go patch toolchain. `scripts/check-toolchain.ps1` verifies the installed Go version, the frontend Node/npm minimums, and the cross-image Go base; CI and release jobs run the same contract and inspect each packaged application's Go build information.
 
-`scripts/check-dockerignore.ps1` fails closed if tracked Docker contexts admit representative environment, credential, local-state, review, cache, database, log, or temporary paths. The cross-toolchain context is deny-all except for `Dockerfile.cross`. That image intentionally contains no Node/npm toolchain and refuses to compile unless the host build already produced `frontend/dist/index.html`; a tracked placeholder directory is never accepted as a production frontend.
+`scripts/check-dockerignore.ps1` fails closed if tracked Docker contexts admit representative environment, credential, local-state, review, cache, database, log, or temporary paths. The cross-toolchain context is deny-all except for `Dockerfile.cross`. That image intentionally contains no Node/npm toolchain and refuses to compile unless the host build already produced `src/frontend/dist/index.html`; a tracked placeholder directory is never accepted as a production frontend.
 
 ## Automated release smoke
 
@@ -33,7 +35,7 @@ On Windows developer machines with the dedicated `cairn-dev` distro, run the loc
 ./scripts/run-release-validation.ps1 -Suite wsl-provider
 ```
 
-This suite is intentionally not part of default CI because hosted Windows runners do not have `cairn-dev`; it preflights WSL2/systemd/Docker/Compose/Buildx, derives and asserts the pinned Go toolchain from `go.mod`, runs the real WSL SDK connection, backup/restore, registry tag/push, and update/rebuild smokes, and fails if the Windows Docker context changes.
+This suite is intentionally not part of default CI because hosted Windows runners do not have `cairn-dev`; it preflights WSL2/systemd/Docker/Compose/Buildx, derives and asserts the pinned Go toolchain from `src/go.mod`, runs the real WSL SDK connection, backup/restore, registry tag/push, and update/rebuild smokes, and fails if the Windows Docker context changes.
 
 The Debian container package smoke can also be run after building Linux packages:
 
@@ -49,7 +51,7 @@ The release DB upgrade fixture can be run directly with:
 ./scripts/run-release-validation.ps1 -Suite upgrade-fixtures
 ```
 
-The seed lives in `testdata/dbs/v1.0.0-rc1-seed.sql` and represents the v1.0.0 release-candidate schema/data shape until the first post-v1 migration fixture is added.
+The seed lives in `src/testdata/dbs/v1.0.0-rc1-seed.sql` and represents the v1.0.0 release-candidate schema/data shape until the first post-v1 migration fixture is added.
 
 ## 24 h soak command
 
@@ -77,7 +79,7 @@ Completed run: the real WSL/Linux 24 h soak `phase10-24h-20260614T071038Z` compl
 Required evidence before v1.0:
 
 - CI `Release validation smoke` green on Linux for the seed-scale backend target.
-- Frontend Vitest dashboard/search performance assertions green in `frontend/src/App.test.tsx`.
+- Frontend Vitest dashboard/search performance assertions green in `src/frontend/src/App.test.tsx`.
 - Browser-level release UI seeded fixture green for dashboard first meaningful render, page switches, inventory filtering, and 5,000-line virtualized log rendering at the v1 scale target.
 - Real Docker log, stats, terminal, backup, registry auth, and tag/push integration jobs green on Ubuntu 24.04.
 - Completed 24 h active-stream soak with logs, stats, terminal, dashboard reads, and final goroutines within threshold.
@@ -90,7 +92,7 @@ Required evidence before v1.0:
 - CI and release workflows now install the matching Wails CLI `v3.0.0-alpha2.103`; generated TypeScript bindings stayed clean with that CLI.
 - Frontend package ranges were aligned with the resolved lockfile versions while keeping the locked v1 stack constraints: React 18, Tailwind 3, Vite 8, Vitest 4, and `@wailsio/runtime` `3.0.0-alpha.79`.
 - `@wailsio/runtime` remains on `3.0.0-alpha.79` because that is the published runtime package consumed by the generated bindings.
-- Local verification after the refresh covered `npm install`, `npm run format:check`, `npm run lint`, `npm test -- --run`, `npm run build`, `npm run audit` with the system CA store, `go mod verify`, `go test -p 1 . ./internal/... -count=1`, `go vet -unsafeptr=false . ./internal/...`, `go build . ./internal/...`, binding generation, and a Windows Wails build.
+- Local verification after the refresh covered `npm --prefix src/frontend install`, `npm --prefix src/frontend run format:check`, `npm --prefix src/frontend run lint`, `npm --prefix src/frontend test -- --run`, `npm --prefix src/frontend run build`, `npm --prefix src/frontend run audit` with the system CA store, `go -C src mod verify`, `go -C src test -p 1 . ./internal/... -count=1`, `go -C src vet -unsafeptr=false . ./internal/...`, `go -C src build . ./internal/...`, binding generation, and a Windows Wails build.
 
 Manual tester focus after this dependency refresh:
 
@@ -102,9 +104,9 @@ Manual tester focus after this dependency refresh:
 
 ## Visual and accessibility evidence
 
-Automated local/CI evidence: `npm run test:release-ui` passed on Windows with 16 Playwright checks: 10 route axe scans, command palette/notification/import-modal axe scans, route screenshot stability, route visual regression against committed goldens, scroll-region reachability on overflowing routes, a daemon-stopped degraded-mode browser check that verifies every route shows the degraded banner/stale cached-data watermark with no serious axe violations, disables the container mutation, and does not start log/stats streams, plus the seeded browser performance fixture for dashboard, route-switch, inventory-search, and 5,000-line log virtualization budgets. CI run 27502520080 passed Ubuntu release validation smoke with the release UI suite before the internal-scroll capture helper was updated. On 2026-06-15, Windows and Linux visual goldens were regenerated with reviewed full internal-scroll-region capture; the Linux goldens were produced inside `mcr.microsoft.com/playwright:v1.60.0-noble` from a throwaway container-local repo copy.
+Automated local/CI evidence: `npm --prefix src/frontend run test:release-ui` passed on Windows with 16 Playwright checks: 10 route axe scans, command palette/notification/import-modal axe scans, route screenshot stability, route visual regression against committed goldens, scroll-region reachability on overflowing routes, a daemon-stopped degraded-mode browser check that verifies every route shows the degraded banner/stale cached-data watermark with no serious axe violations, disables the container mutation, and does not start log/stats streams, plus the seeded browser performance fixture for dashboard, route-switch, inventory-search, and 5,000-line log virtualization budgets. CI run 27502520080 passed Ubuntu release validation smoke with the release UI suite before the internal-scroll capture helper was updated. On 2026-06-15, Windows and Linux visual goldens were regenerated with reviewed full internal-scroll-region capture; the Linux goldens were produced inside `mcr.microsoft.com/playwright:v1.60.0-noble` from a throwaway container-local repo copy.
 
-Committed golden baselines live under `frontend/e2e/goldens/release-ui/` for Windows local validation and Linux/Ubuntu CI validation. To intentionally update them, run the suite with `CAIRN_UPDATE_VISUALS=1` on the target platform and review the PNG diff before committing.
+Committed golden baselines live under `src/frontend/e2e/goldens/release-ui/` for Windows local validation and Linux/Ubuntu CI validation. To intentionally update them, run the suite with `CAIRN_UPDATE_VISUALS=1` on the target platform and review the PNG diff before committing.
 
 ## Security review checklist
 
@@ -123,7 +125,7 @@ Security review evidence on 2026-06-14:
 - The same focused suite passed in `cairn-dev` WSL with Linux Go 1.26.4 while the 24 h soak was running.
 - CI run 27502520080 passed on Ubuntu 24.04, Windows, and macOS for commit `0c2a928`; the Ubuntu package-smoke job also passed `Release validation smoke` with the expanded security suite.
 - The suite covers backend risk mapping and 10-minute plan expiry, typed-name requirements for dangerous plans, command-plan enforcement for container/project/restore/update paths, registry login via `--password-stdin`, redacted container env/audit command details, unencrypted `tcp://` context warnings, explicit Linux permission modes, provider-install audit rows, update rollback safety, restore overwrite confirmation, and cheatsheet risk-label parity.
-- The focused `internal/security` command-plan package coverage is 92.4% statements after adding direct plan-construction, confirmation, expiry, context-cancel, fallback-label, and project-plan-store tests to the release security suite.
+- The focused `src/internal/security` command-plan package coverage is 92.4% statements after adding direct plan-construction, confirmation, expiry, context-cancel, fallback-label, and project-plan-store tests to the release security suite.
 - The review found and fixed one enforcement gap: the UI already disabled `security.confirm_destructive`, but the backend settings repository now also rejects `security.confirm_destructive=false` through both typed and raw setting writes; the release security suite includes that regression check.
 
 ## Manual platform matrix

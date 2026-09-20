@@ -6,6 +6,7 @@ $ErrorActionPreference = "Stop"
 
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 $root = (Resolve-Path (Join-Path $scriptDir "..")).Path
+$sourceRoot = Join-Path $root "src"
 $distro = "cairn-dev"
 $runningOnWindows = [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)
 
@@ -88,7 +89,7 @@ function Assert-GoToolchain {
       if ($null -eq $go) {
         throw "go was not found on PATH."
       }
-      $goLine = Select-String -LiteralPath (Join-Path $root "go.mod") -Pattern '^\s*go\s+(\d+\.\d+\.\d+)\s*$'
+      $goLine = Select-String -LiteralPath (Join-Path $sourceRoot "go.mod") -Pattern '^\s*go\s+(\d+\.\d+\.\d+)\s*$'
       if ($null -eq $goLine -or $goLine.Matches.Count -ne 1) {
         throw "go.mod must declare exactly one patch-pinned Go version."
       }
@@ -113,7 +114,7 @@ function Invoke-GoTest([string]$Name, [string[]]$Packages, [string[]]$GoArgs, [h
       New-Item -ItemType Directory -Force -Path $tmp | Out-Null
       $previousGoTmp = $env:GOTMPDIR
       $env:GOTMPDIR = $tmp
-      Push-Location $root
+      Push-Location $sourceRoot
       try {
         & go test @Packages @GoArgs
         if ($LASTEXITCODE -ne 0) {

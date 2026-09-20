@@ -5,7 +5,7 @@ $ErrorActionPreference = "Stop"
 $scriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Path }
 $root = (Resolve-Path (Join-Path $scriptDir "..")).Path
 
-Push-Location $root
+Push-Location (Join-Path $root "src")
 try {
   & go test ./internal/store -run TestReleaseDBFixtureUpgrade$ -count=1 -timeout=30s
   if ($LASTEXITCODE -ne 0) {

@@ -10,10 +10,11 @@ if ([string]::IsNullOrWhiteSpace($Root)) {
   $Root = (Resolve-Path (Join-Path $scriptDir "..")).Path
 }
 
-$icon = Join-Path $Root "assets/cairn-icon.png"
-$logo = Join-Path $Root "assets/cairn-logo.png"
+$sourceRoot = Join-Path $Root "src"
+$icon = Join-Path $sourceRoot "assets/cairn-icon.png"
+$logo = Join-Path $sourceRoot "assets/cairn-logo.png"
 $buildIcon = Join-Path $Root "build/appicon.png"
-$publicDir = Join-Path $Root "frontend/public"
+$publicDir = Join-Path $sourceRoot "frontend/public"
 
 if (!(Test-Path -LiteralPath $icon)) {
   throw "Missing source icon: $icon"
@@ -28,7 +29,7 @@ Copy-Item -LiteralPath $icon -Destination (Join-Path $publicDir "cairn-icon.png"
 Copy-Item -LiteralPath $logo -Destination (Join-Path $publicDir "cairn-logo.png") -Force
 
 if (!$SkipLinuxIcons) {
-  Push-Location $Root
+  Push-Location $sourceRoot
   try {
     go run ./tools/iconset -input $icon -linux-dir (Join-Path $Root "build/linux/icons") -name cairn
     if ($LASTEXITCODE -ne 0) {

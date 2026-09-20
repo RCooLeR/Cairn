@@ -12,6 +12,8 @@ desktop.ini
 .env.*
 !.env.example
 !.env.*.example
+# Public Compose fixture; keep its moved path in fresh source checkouts.
+!src/testdata/projects/env-project/.env
 
 # Logs and diagnostics
 *.log
@@ -55,13 +57,13 @@ fyne-cross/
 .release-version.env
 build/linux/cairn.desktop
 build/linux/icons/
-frontend/node_modules/
-frontend/dist/*
-!frontend/dist/.gitkeep
-!frontend/dist/embed-placeholder.txt
+src/frontend/node_modules/
+src/frontend/dist/*
+!src/frontend/dist/.gitkeep
+!src/frontend/dist/embed-placeholder.txt
 *.tsbuildinfo
-frontend/test-results/
-frontend/playwright-report/
+src/frontend/test-results/
+src/frontend/playwright-report/
 *.db
 *.db-shm
 *.db-wal
