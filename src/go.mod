@@ -13,7 +13,7 @@ require (
 	github.com/moby/moby/client v0.6.0
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
-	github.com/wailsapp/wails/v3 v3.0.0-beta.23
+	github.com/wailsapp/wails/v3 v3.0.0-beta.24
 	go.yaml.in/yaml/v3 v3.0.5
 	golang.org/x/crypto v0.57.0
 	golang.org/x/sys v0.48.0
