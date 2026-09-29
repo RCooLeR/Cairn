@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, "codex/**"]
+    branches: [master, "codex/**"]
   pull_request:
 
 concurrency:
@@ -55,7 +55,7 @@ jobs:
           path: |
             ~/go/bin/wails3
             ~/go/bin/wails3.exe
-          key: ${{ runner.os }}-go1.27.1-wails3-v3.0.0-beta.23
+          key: ${{ runner.os }}-go1.27.1-wails3-v3.0.0-beta.24
 
       - name: Install Wails CLI
         shell: pwsh
@@ -64,7 +64,7 @@ jobs:
           Add-Content -Path $env:GITHUB_PATH -Value $goBin
           $wailsExe = Join-Path $goBin ($(if ($IsWindows) { "wails3.exe" } else { "wails3" }))
           if (!(Test-Path -LiteralPath $wailsExe)) {
-            go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.23
+            go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.24
           }
           go version -m $wailsExe
 
@@ -104,7 +104,7 @@ jobs:
       - name: Generate Wails bindings
         working-directory: src
         run: |
-          go run github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.23 generate bindings -clean=true -time-type=string -ts
+          go run github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.24 generate bindings -clean=true -time-type=string -ts
           node frontend/scripts/normalize-generated-bindings.mjs
 
       - name: Verify generated bindings are committed
@@ -254,7 +254,7 @@ jobs:
           path: |
             ~/go/bin/wails3
             ~/go/bin/wails3.exe
-          key: ${{ runner.os }}-go1.27.1-wails3-v3.0.0-beta.23
+          key: ${{ runner.os }}-go1.27.1-wails3-v3.0.0-beta.24
 
       - name: Install Linux packaging dependencies
         if: runner.os == 'Linux'
@@ -271,7 +271,7 @@ jobs:
           Add-Content -Path $env:GITHUB_PATH -Value $goBin
           $wailsExe = Join-Path $goBin ($(if ($IsWindows) { "wails3.exe" } else { "wails3" }))
           if (!(Test-Path -LiteralPath $wailsExe)) {
-            go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.23
+            go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.24
           }
           go version -m $wailsExe
 

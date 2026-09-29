@@ -12,7 +12,7 @@ Commands and source paths use the current `src/` layout and assume the repositor
 
 ## Automated release smoke
 
-Every push to `main` runs the normal CI matrix on Ubuntu 24.04, Windows, and macOS, then package smoke for NSIS, AppImage, deb, and dmg. The Linux package-smoke leg also installs and removes the generated `.deb` on Ubuntu, verifies the installed binary/desktop file/icon, checks that Docker package dependencies and the Docker group are untouched, and repeats the `.deb` install/remove smoke inside `debian:stable-slim`. It installs Chromium for Playwright and also runs:
+Every push to `master` runs the normal CI matrix on Ubuntu 24.04, Windows, and macOS, then package smoke for NSIS, AppImage, deb, and dmg. The Linux package-smoke leg also installs and removes the generated `.deb` on Ubuntu, verifies the installed binary/desktop file/icon, checks that Docker package dependencies and the Docker group are untouched, and repeats the `.deb` install/remove smoke inside `debian:stable-slim`. It installs Chromium for Playwright and also runs:
 
 ```powershell
 ./scripts/run-release-validation.ps1 -Suite checklist,manual-matrix,soak-checker,upgrade-fixtures,security,performance,soak-smoke,ui-release -SoakDuration 30s -SoakTimeout 5m
