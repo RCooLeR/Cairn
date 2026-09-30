@@ -23,7 +23,7 @@
     "@monaco-editor/react": "^4.7.0",
     "@wailsio/runtime": "3.0.0-beta.24",
     "@xterm/xterm": "^6.0.0",
-    "lucide-react": "^1.47.0",
+    "lucide-react": "^1.48.0",
     "react": "^19.3.0",
     "react-dom": "^19.3.0",
     "recharts": "^3.10.1",
