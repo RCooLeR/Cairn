@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -925,6 +926,12 @@ func (c *Client) registryAuthFor(ctx context.Context, registry string) (string, 
 
 func (c *Client) pushImage(ctx context.Context, api APIClient, imageRef string, registry string, streamID string, auth string) error {
 	c.publishImageProgress(bus.TopicImagePushProgress, streamID, "", "starting", 0, 0)
+	if auth == "" {
+		// Older daemons fall back to decoding the request body when this header
+		// is absent. The SDK sends an empty body, so provide an explicit empty
+		// auth config to preserve anonymous pushes without triggering an EOF.
+		auth = base64.URLEncoding.EncodeToString([]byte("{}"))
+	}
 	reader, err := api.ImagePush(ctx, imageRef, dockerclient.ImagePushOptions{RegistryAuth: auth})
 	if err != nil {
 		return mapRegistryPushError(registry, err)

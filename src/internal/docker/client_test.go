@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -2292,8 +2293,12 @@ func TestClientImageTagAndPush(t *testing.T) {
 	if streamID == "" || len(api.pushed) != 1 || api.pushed[0] != "localhost:5000/test/app:1.0" {
 		t.Fatalf("streamID=%q pushed=%#v", streamID, api.pushed)
 	}
-	if len(api.pushAuth) != 1 || api.pushAuth[0] != "" {
+	if len(api.pushAuth) != 1 {
 		t.Fatalf("push auth = %#v, want anonymous auth", api.pushAuth)
+	}
+	authJSON, err := base64.URLEncoding.DecodeString(api.pushAuth[0])
+	if err != nil || string(authJSON) != "{}" {
+		t.Fatalf("push auth must encode an empty anonymous config: decoded=%q err=%v", authJSON, err)
 	}
 	if got := waitImageProgress(t, ctx, pushEvents, time.Second); got.StreamID != streamID {
 		t.Fatalf("push progress = %#v, want stream %q", got, streamID)

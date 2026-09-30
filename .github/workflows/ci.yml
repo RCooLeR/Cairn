@@ -57,6 +57,14 @@ jobs:
             ~/go/bin/wails3.exe
           key: ${{ runner.os }}-go1.27.1-wails3-v3.0.0-beta.24
 
+      - name: Install Linux Wails dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config gcc \
+            libgtk-4-dev libwebkitgtk-6.0-dev libsoup-3.0-dev
+
       - name: Install Wails CLI
         shell: pwsh
         run: |
@@ -76,13 +84,9 @@ jobs:
         shell: pwsh
         run: ./scripts/test-docker-mounts.ps1
 
-      - name: Install Linux Wails dependencies
+      - name: Start Linux Docker service
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            pkg-config gcc \
-            libgtk-4-dev libwebkitgtk-6.0-dev libsoup-3.0-dev
           if ! sudo docker info >/dev/null 2>&1; then
             sudo systemctl start docker.service || sudo service docker start || (sudo dockerd > /tmp/cairn-dockerd.log 2>&1 &)
           fi

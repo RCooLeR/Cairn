@@ -206,7 +206,7 @@ describe("TerminalPage operation and session lifecycle", () => {
       pendingOpen.resolve(terminalSession({ id: "early-output" }));
       await pendingOpen.promise;
     });
-    await screen.findByRole("tab", { name: "Host" });
+    await screen.findByRole("tabpanel", { name: "Host" });
     expect(new TextDecoder().decode(xtermMock.writes[0])).toBe(
       "root@ollama:/# ",
     );
@@ -483,7 +483,7 @@ describe("TerminalPage operation and session lifecycle", () => {
     );
 
     renderTerminalPage();
-    await screen.findByRole("tab", { name: "Alpha" });
+    await screen.findByRole("tabpanel", { name: "Alpha" });
 
     await act(async () => {
       xtermMock.dataHandlers[0]?.("whoami");
@@ -547,7 +547,7 @@ describe("TerminalPage operation and session lifecycle", () => {
     xtermMock.selection = "selected output";
 
     renderTerminalPage();
-    await screen.findByRole("tab", { name: "Alpha" });
+    await screen.findByRole("tabpanel", { name: "Alpha" });
     fireEvent.click(screen.getByRole("button", { name: "Copy" }));
 
     await waitFor(() =>
@@ -708,6 +708,7 @@ describe("TerminalPage operation and session lifecycle", () => {
     expect(
       await screen.findByRole("tab", { name: "Alpha", selected: true }),
     ).toBeInTheDocument();
+    await screen.findByRole("tabpanel", { name: "Alpha" });
     await waitFor(() =>
       expect(runtimeMock.listeners.get("terminal:data")?.size).toBe(1),
     );
