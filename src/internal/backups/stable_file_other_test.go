@@ -18,7 +18,11 @@ func TestRemoveStableFileUnlinksPathAndKeepsHeldObjectReadable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open stable delete handle: %v", err)
 	}
-	defer handle.Close()
+	t.Cleanup(func() {
+		if err := handle.Close(); err != nil {
+			t.Errorf("close stable delete handle: %v", err)
+		}
+	})
 
 	// POSIX offers no portable unlink-by-FD for regular files. The manager
 	// verifies this held inode immediately before the pathname unlink; the FD

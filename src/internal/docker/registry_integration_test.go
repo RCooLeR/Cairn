@@ -85,7 +85,11 @@ func TestClientRealRegistryTagPushRoundTrip(t *testing.T) {
 		t.Fatalf("TagImage() error = %v", err)
 	}
 	if _, err := client.PushImage(ctx, imageRef); !apperror.IsCode(err, apperror.RegistryAuth) {
-		t.Fatalf("PushImage without login error = %v, want %s", err, apperror.RegistryAuth)
+		var appErr *apperror.AppError
+		if errors.As(err, &appErr) {
+			t.Logf("anonymous push detail: %s", appErr.Detail)
+		}
+		t.Fatalf("PushImage without login error = %v (cause: %v), want %s", err, errors.Unwrap(err), apperror.RegistryAuth)
 	}
 
 	installRealPushCredentialHelper(t, provider, registryHost, username)
