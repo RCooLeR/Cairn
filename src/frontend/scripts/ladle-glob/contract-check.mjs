@@ -1,5 +1,12 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  rm,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
@@ -16,6 +23,7 @@ const { globby } = await import(
 
 const previousCwd = process.cwd();
 let root;
+let cwdAlias;
 let fileSymlinksAvailable = true;
 const visible = [
   "src/A.stories.tsx",
@@ -36,6 +44,12 @@ before(async () => {
     await writeFile(path.join(root, file), "");
   }
   await mkdir(path.join(root, "src/Directory.stories.tsx"));
+  cwdAlias = path.join(root, "cwd-alias");
+  await symlink(
+    root,
+    cwdAlias,
+    process.platform === "win32" ? "junction" : "dir",
+  );
   await symlink(
     path.join(root, "outside"),
     path.join(root, "src/linked"),
@@ -56,6 +70,7 @@ before(async () => {
 
 after(async () => {
   process.chdir(previousCwd);
+  if (cwdAlias) await unlink(cwdAlias);
   if (root) {
     assert.ok(
       path.resolve(root).startsWith(path.resolve(os.tmpdir()) + path.sep),
@@ -120,6 +135,31 @@ test("supports absolute patterns and absolute exclusions", async () => {
     await globby(["src/**/*.stories.tsx", `!${absolute("src/ignore/**")}`]),
     expectedStories().filter((file) => !file.includes("/ignore/")),
   );
+});
+
+test("absolute exclusions recognize directory aliases without resolving child links", async () => {
+  const aliasPattern = (file) =>
+    path.join(cwdAlias, file).split(path.sep).join("/");
+  const expected = expectedStories().filter(
+    (file) => !file.includes("/ignore/"),
+  );
+  assert.deepEqual(
+    await globby(["src/**/*.stories.tsx", `!${aliasPattern("src/ignore/**")}`]),
+    expected,
+  );
+  assert.deepEqual(
+    await globby(["src/**/*.stories.tsx", `!${aliasPattern("src/linked/**")}`]),
+    expectedStories().filter((file) => !file.includes("/linked/")),
+  );
+  try {
+    process.chdir(cwdAlias);
+    assert.deepEqual(
+      await globby(["src/**/*.stories.tsx", `!${absolute("src/ignore/**")}`]),
+      expected,
+    );
+  } finally {
+    process.chdir(root);
+  }
 });
 
 test("accepts explicit dot paths and follows linked directories", async () => {
