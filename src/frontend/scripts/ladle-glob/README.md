@@ -4,7 +4,7 @@ This local package replaces only Ladle 5.1.1's `globby` dependency. A top-level
 development dependency anchors the portable file path, and the Ladle-scoped
 override refers to it through `$globby`. All six Ladle
 call sites use the async `globby(patterns)` export without options. The adapter
-uses Node 24.21's stable filesystem glob API, returns files with forward-slash
+uses Node 26.10's stable filesystem glob API, returns files with forward-slash
 paths, follows symbolic links, supports exclusions and explicit dot paths, and
 expands literal directories. Unsupported options fail explicitly.
 

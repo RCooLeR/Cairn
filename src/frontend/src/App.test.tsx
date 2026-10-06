@@ -2669,6 +2669,9 @@ describe("App inventory shell", () => {
     const palette = await screen.findByRole("dialog", {
       name: "Command palette",
     });
+    await waitFor(() =>
+      expect(within(palette).getByPlaceholderText("Search")).toHaveFocus(),
+    );
     fireEvent.click(within(palette).getByRole("button", { name: "Overview" }));
 
     const destinationHeading = await screen.findByRole("heading", {
@@ -2677,6 +2680,59 @@ describe("App inventory shell", () => {
     });
     await waitFor(() => expect(destinationHeading).toHaveFocus());
     expect(terminalTab).not.toHaveFocus();
+    expect(terminalTab).not.toBeVisible();
+  });
+
+  it("preserves sidebar focus when navigating away from the terminal", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    terminalServiceMock.ListTerminalSessions.mockResolvedValue([
+      seededTerminalSession({ id: "focus-host", title: "Focus host" }),
+    ]);
+
+    render(<App />);
+
+    const nav = await screen.findByRole("navigation", {
+      name: "Main navigation",
+    });
+    fireEvent.click(within(nav).getByRole("button", { name: /Terminal/i }));
+    await screen.findByRole("tab", { name: "Focus host" });
+
+    const overview = within(nav).getByRole("button", { name: "Overview" });
+    overview.focus();
+    fireEvent.click(overview);
+
+    await screen.findByRole("heading", { name: "Overview", level: 1 });
+    expect(overview).toHaveFocus();
+  });
+
+  it("restores terminal focus when the command palette is canceled", async () => {
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    terminalServiceMock.ListTerminalSessions.mockResolvedValue([
+      seededTerminalSession({ id: "focus-host", title: "Focus host" }),
+    ]);
+
+    render(<App />);
+
+    const nav = await screen.findByRole("navigation", {
+      name: "Main navigation",
+    });
+    fireEvent.click(within(nav).getByRole("button", { name: /Terminal/i }));
+    const terminalTab = await screen.findByRole("tab", { name: "Focus host" });
+    terminalTab.focus();
+
+    fireEvent.keyDown(window, { ctrlKey: true, key: "k" });
+    const palette = await screen.findByRole("dialog", {
+      name: "Command palette",
+    });
+    const search = within(palette).getByPlaceholderText("Search");
+    await waitFor(() => expect(search).toHaveFocus());
+    fireEvent.keyDown(search, { key: "Escape" });
+
+    expect(
+      screen.queryByRole("dialog", { name: "Command palette" }),
+    ).not.toBeInTheDocument();
+    expect(terminalTab).toBeVisible();
+    expect(terminalTab).toHaveFocus();
   });
 
   it("command palette navigates and schedules safe terminal commands only", async () => {

@@ -15,7 +15,7 @@
 #   docker run --rm -v $(pwd):/app wails-cross windows amd64
 #   docker run --rm -v $(pwd):/app wails-cross windows arm64
 
-FROM golang:1.27.1-trixie@sha256:433790e515d27dc6003e847e644cc0af956985cf315c1c58a3b73ee2dd305183
+FROM golang:1.27.1-trixie@sha256:0982f930de50a4f1a2b4453d51651f0031082ef2e3a25deb3c763fc39a1094a0
 
 ARG TARGETARCH
 ARG GARBLE_VERSION
@@ -34,9 +34,9 @@ RUN test -n "${GARBLE_VERSION}" \
 RUN go install mvdan.cc/garble@${GARBLE_VERSION}
 
 # Install Zig - automatically selects correct binary for host architecture
-ARG ZIG_VERSION=0.16.0
-ARG ZIG_SHA256_X86_64=70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00
-ARG ZIG_SHA256_AARCH64=ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17
+ARG ZIG_VERSION=0.17.0
+ARG ZIG_SHA256_X86_64=1cbe9df9f27e6b78d14ccbca43b6703a404ef79ef1c463de901d7f088d4e2026
+ARG ZIG_SHA256_AARCH64=9e8d11661d4ae3bd57702a3832781e23ad151dde5798e16a5ccd503f65234ff8
 RUN ZIG_ARCH=$(case "${TARGETARCH}" in arm64) echo "aarch64" ;; *) echo "x86_64" ;; esac) && \
     ZIG_SHA256=$(case "${ZIG_ARCH}" in aarch64) echo "${ZIG_SHA256_AARCH64}" ;; *) echo "${ZIG_SHA256_X86_64}" ;; esac) && \
     curl -fsSL -o /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz" && \
@@ -58,7 +58,7 @@ ENV MACOS_SDK_PATH=/opt/macos-sdk
 
 # Create Zig CC wrappers for cross-compilation targets. Darwin and Windows use
 # Zig; Linux uses native GCC and therefore must match the container architecture.
-# Zig 0.16 derives the macOS deployment version from the target triple, so it
+# Zig derives the macOS deployment version from the target triple, so it
 # is encoded there instead of relying on Clang's ignored version-min switch.
 
 # Darwin arm64

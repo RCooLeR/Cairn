@@ -1457,6 +1457,7 @@ function App() {
   const searchInputRef = useRef<HTMLInputElement>(null);
   const pageHeadingRef = useRef<HTMLHeadingElement>(null);
   const terminalWrapperRef = useRef<HTMLDivElement>(null);
+  const focusHeadingAfterNavigationRef = useRef(false);
   const dockerScopeGenerationRef = useRef(0);
   const volumeEpochRef = useRef(volumeEpoch);
   volumeEpochRef.current = volumeEpoch;
@@ -2202,7 +2203,12 @@ function App() {
     (page: PageID) => {
       setActionError(null);
       if (page === "terminal") {
+        focusHeadingAfterNavigationRef.current = false;
         setTerminalMounted(true);
+      } else if (terminalWrapperRef.current?.contains(document.activeElement)) {
+        // Capture focus before hiding the terminal: hidden elements cannot
+        // retain focus or receive the palette's focus restoration.
+        focusHeadingAfterNavigationRef.current = true;
       }
       setActivePage(page);
       setActiveContainerID(null);
@@ -2215,21 +2221,16 @@ function App() {
   );
 
   useEffect(() => {
-    if (activePage === "terminal") {
-      return undefined;
+    if (
+      activePage === "terminal" ||
+      paletteOpen ||
+      !focusHeadingAfterNavigationRef.current
+    ) {
+      return;
     }
-    const focusTimer = window.setTimeout(() => {
-      const terminalWrapper = terminalWrapperRef.current;
-      if (
-        terminalWrapper &&
-        document.activeElement instanceof HTMLElement &&
-        terminalWrapper.contains(document.activeElement)
-      ) {
-        pageHeadingRef.current?.focus({ preventScroll: true });
-      }
-    }, 0);
-    return () => window.clearTimeout(focusTimer);
-  }, [activePage]);
+    focusHeadingAfterNavigationRef.current = false;
+    pageHeadingRef.current?.focus({ preventScroll: true });
+  }, [activePage, paletteOpen]);
 
   useEffect(() => {
     window.localStorage.setItem(
@@ -9091,7 +9092,10 @@ function App() {
       <CommandPalette
         activePage={activePage}
         onClose={() => setPaletteOpen(false)}
-        onNavigate={navigate}
+        onNavigate={(page) => {
+          focusHeadingAfterNavigationRef.current = page !== "terminal";
+          navigate(page);
+        }}
         onRunSafeCommand={runPaletteCommand}
         open={paletteOpen}
         pages={navItems}

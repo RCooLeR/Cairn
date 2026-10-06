@@ -9,7 +9,7 @@ vars:
   GARBLE_VERSION: "v0.18.0"
   GARBLE_PACKAGE: "mvdan.cc/garble@{{.GARBLE_VERSION}}"
   GARBLE_INSTALL_HINT: "garble is required for obfuscated builds. Install the pinned Go 1.27-compatible release with: go install {{.GARBLE_PACKAGE}}."
-  GOLANGCI_LINT_VERSION: "v2.13.2"
+  GOLANGCI_LINT_VERSION: "v2.14.0"
   GOLANGCI_LINT_PACKAGE: "github.com/golangci/golangci-lint/v2/cmd/golangci-lint@{{.GOLANGCI_LINT_VERSION}}"
 includes:
   common: ./build/Taskfile.yml

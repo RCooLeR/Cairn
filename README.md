@@ -69,7 +69,7 @@ More detail: [docs/local-agent.md](docs/local-agent.md).
 Required tools:
 
 - Go 1.27.1
-- Node.js 24.21.0 LTS and npm 12.0.2 or newer
+- Node.js 26.10.0 and npm 12.2.0 or newer
 - Task
 - Wails v3 beta 28, installed at the exact version pinned by the project build config
 

@@ -4,19 +4,43 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    open-pull-requests-limit: 1
+    groups:
+      actions:
+        patterns: ["*"]
+      actions-security:
+        applies-to: security-updates
+        patterns: ["*"]
   - package-ecosystem: gomod
     directory: /src
     schedule:
       interval: weekly
+    open-pull-requests-limit: 1
+    groups:
+      go:
+        patterns: ["*"]
+      go-security:
+        applies-to: security-updates
+        patterns: ["*"]
   - package-ecosystem: npm
     directory: /src/frontend
     schedule:
       interval: weekly
-    ignore:
-      # Keep the Node API definitions aligned with the project's Node 24 LTS runtime.
-      - dependency-name: "@types/node"
-        update-types: ["version-update:semver-major"]
+    open-pull-requests-limit: 1
+    groups:
+      frontend:
+        patterns: ["*"]
+      frontend-security:
+        applies-to: security-updates
+        patterns: ["*"]
   - package-ecosystem: docker
     directory: /build/docker
     schedule:
       interval: weekly
+    open-pull-requests-limit: 1
+    groups:
+      containers:
+        patterns: ["*"]
+      containers-security:
+        applies-to: security-updates
+        patterns: ["*"]
