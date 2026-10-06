@@ -12,6 +12,10 @@ updates:
     directory: /src/frontend
     schedule:
       interval: weekly
+    ignore:
+      # Keep the Node API definitions aligned with the project's Node 24 LTS runtime.
+      - dependency-name: "@types/node"
+        update-types: ["version-update:semver-major"]
   - package-ecosystem: docker
     directory: /build/docker
     schedule:

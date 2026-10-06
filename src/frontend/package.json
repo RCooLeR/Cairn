@@ -12,7 +12,7 @@
     "lint": "eslint .",
     "format:check": "prettier --check .",
     "audit": "npm audit --audit-level=moderate",
-    "test": "vitest run --configLoader runner",
+    "test": "node --test scripts/ladle-glob/contract-check.mjs && vitest run --configLoader runner",
     "test:release-ui": "playwright test --config playwright.config.mjs",
     "ladle": "ladle serve --host 127.0.0.1",
     "ladle:build": "ladle build",
@@ -21,7 +21,7 @@
   },
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",
-    "@wailsio/runtime": "3.0.0-beta.24",
+    "@wailsio/runtime": "3.0.0-beta.28",
     "@xterm/xterm": "^6.0.0",
     "lucide-react": "^1.48.0",
     "react": "^19.3.0",
@@ -41,12 +41,15 @@
     "@tailwindcss/postcss": "^4.3.3",
     "@testing-library/jest-dom": "^7.0.1",
     "@testing-library/react": "^16.3.3",
+    "@types/node": "^24.13.6",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
+    "@typescript/native": "npm:typescript@^7.0.2",
     "@vitejs/plugin-react": "^6.1.1",
     "eslint": "^10.11.0",
     "eslint-plugin-react-hooks": "^7.1.1",
     "globals": "^17.12.0",
+    "globby": "file:./scripts/ladle-glob",
     "jsdom": "^30.1.0",
     "pixelmatch": "^7.2.0",
     "pngjs": "^7.0.0",
@@ -56,17 +59,16 @@
     "typescript": "npm:@typescript/typescript6@^6.0.2",
     "typescript-eslint": "^8.70.0",
     "vite": "^8.3.1",
-    "vitest": "^5.0.2",
-    "@typescript/native": "npm:typescript@^7.0.2",
-    "@types/node": "^24.13.6"
+    "vitest": "^5.0.2"
   },
   "overrides": {
-    "dompurify": "^3.4.15",
+    "dompurify": "^3.4.16",
     "@vitejs/plugin-react": "$@vitejs/plugin-react",
     "@vitejs/plugin-react-swc": "^4.3.3",
     "vite": "$vite",
     "@ladle/react": {
-      "react-inspector": "^9.0.0"
+      "react-inspector": "^9.0.0",
+      "globby": "$globby"
     }
   },
   "allowScripts": {

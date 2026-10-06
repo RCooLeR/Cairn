@@ -12,6 +12,7 @@ import type { InventorySnapshot } from "./api/inventory";
 import type {
   AgentChatResponse,
   AgentProjectAnalysis,
+  AgentStatus,
   BackupSummary,
   ContainerSummary,
   CommandPlan,
@@ -291,7 +292,10 @@ function deferred<T>() {
 
 async function setAgentPrompt(input: HTMLElement, value: string) {
   fireEvent.change(input, { target: { value } });
-  await waitFor(() => expect(input).toHaveValue(value));
+  await waitFor(() => {
+    expect(input).toHaveValue(value);
+    expect(screen.getByRole("button", { name: "Send" })).toBeEnabled();
+  });
 }
 
 vi.mock("./api/app", () => ({
@@ -382,6 +386,9 @@ describe("App inventory shell", () => {
   beforeEach(() => {
     vi.useRealTimers();
     vi.clearAllMocks();
+    for (const method of Object.values(agentServiceMock)) {
+      method.mockReset();
+    }
     xtermMock.disposedInstanceIDs.length = 0;
     xtermMock.nextInstanceID = 0;
     xtermMock.writes.length = 0;
@@ -933,6 +940,57 @@ describe("App inventory shell", () => {
       screen.queryByRole("button", { name: "Retry app version" }),
     ).not.toBeInTheDocument();
     expect(appApiMock.getAppVersion).toHaveBeenCalledTimes(2);
+  });
+
+  it("waits for delayed Agent status before submitting with Enter", async () => {
+    const status = deferred<AgentStatus>();
+    inventoryMock.getInventorySnapshot.mockResolvedValue(seededSnapshot());
+    agentServiceMock.Status.mockReturnValueOnce(status.promise);
+
+    render(<App />);
+
+    await screen.findByText("Docker Engine - Running");
+    fireEvent.click(
+      within(
+        screen.getByRole("navigation", { name: "Main navigation" }),
+      ).getByRole("button", { name: /Agent/ }),
+    );
+    const input = await screen.findByPlaceholderText(
+      "Ask a Docker question...",
+    );
+    await waitFor(() => expect(agentServiceMock.Status).toHaveBeenCalledOnce());
+
+    const submission = setAgentPrompt(input, "Explain Docker networks").then(
+      async () => {
+        await act(async () => {
+          fireEvent.keyDown(input, { key: "Enter" });
+        });
+      },
+    );
+    await Promise.resolve();
+    // Let an immediate DOM-only readiness check finish before status arrives.
+    await new Promise<void>((resolve) => {
+      window.setTimeout(resolve, 0);
+    });
+    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+    expect(input).toHaveValue("Explain Docker networks");
+    expect(agentServiceMock.Chat).not.toHaveBeenCalled();
+
+    status.resolve({
+      availableModels: ["gemma4:12b-it-q8_0"],
+      enabled: true,
+      endpoint: "http://127.0.0.1:11434",
+      model: "gemma4:12b-it-q8_0",
+      provider: "ollama",
+      reachable: true,
+    });
+    await submission;
+
+    await waitFor(() => expect(agentServiceMock.Chat).toHaveBeenCalledOnce());
+    expect(agentServiceMock.Chat.mock.calls[0][0].prompt).toContain(
+      "Explain Docker networks",
+    );
+    expect(await screen.findByText("Agent response.")).toBeInTheDocument();
   });
 
   it("renders agent markdown, plan items, and Enter chat shortcuts", async () => {

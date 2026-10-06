@@ -215,6 +215,56 @@ test("seed-scale fixture meets release responsiveness budgets", async ({
 }, testInfo) => {
   await page.addInitScript(() => {
     window.localStorage.setItem("cairn.release.fixture", "seeded");
+    if (window.top !== window) {
+      return;
+    }
+    window.__cairnFirstMeaningfulRenderMs = null;
+
+    const isVisibleAndUsable = (node) => {
+      if (!node || node.closest('[inert], [aria-hidden="true"]')) {
+        return false;
+      }
+      const rect = node.getBoundingClientRect();
+      const style = getComputedStyle(node);
+      return (
+        rect.width > 0 &&
+        rect.height > 0 &&
+        style.visibility === "visible" &&
+        style.opacity !== "0"
+      );
+    };
+    const dashboardReady = () => {
+      const logo = document.querySelector('#root img[alt="Cairn"]');
+      const heading = document.querySelector("#root h1");
+      const counts = document.querySelector(
+        '[aria-label="Docker object counts"]',
+      );
+      return (
+        isVisibleAndUsable(logo) &&
+        logo.complete &&
+        logo.naturalWidth > 0 &&
+        isVisibleAndUsable(heading) &&
+        heading.textContent.trim() === "Overview" &&
+        isVisibleAndUsable(counts) &&
+        /\b100\b/.test(counts.innerText)
+      );
+    };
+    const recordFirstUsableFrame = () => {
+      if (!dashboardReady()) {
+        requestAnimationFrame(recordFirstUsableFrame);
+        return;
+      }
+      // Observe another frame so the usable dashboard has had a paint
+      // opportunity. Record here, before Playwright polling/IPC can add delay.
+      requestAnimationFrame(() => {
+        if (dashboardReady()) {
+          window.__cairnFirstMeaningfulRenderMs = performance.now();
+        } else {
+          recordFirstUsableFrame();
+        }
+      });
+    };
+    requestAnimationFrame(recordFirstUsableFrame);
   });
 
   await page.goto("/");
@@ -225,7 +275,12 @@ test("seed-scale fixture meets release responsiveness budgets", async ({
   ).toBeVisible();
   await expect(page.getByLabel("Docker object counts")).toContainText("100");
 
-  const firstRenderMs = await page.evaluate(() => performance.now());
+  await page.waitForFunction(() =>
+    Number.isFinite(window.__cairnFirstMeaningfulRenderMs),
+  );
+  const firstRenderMs = await page.evaluate(
+    () => window.__cairnFirstMeaningfulRenderMs,
+  );
   annotatePerf(
     testInfo,
     "seed dashboard first meaningful render",

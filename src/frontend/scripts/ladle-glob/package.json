@@ -1,0 +1,10 @@
+{
+  "name": "@cairn/ladle-glob",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "exports": "./index.mjs",
+  "engines": {
+    "node": ">=24.21.0"
+  }
+}

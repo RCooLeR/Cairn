@@ -71,7 +71,7 @@ Required tools:
 - Go 1.27.1
 - Node.js 24.21.0 LTS and npm 12.0.2 or newer
 - Task
-- Wails v3 beta 24, installed at the exact version pinned by the project build config
+- Wails v3 beta 28, installed at the exact version pinned by the project build config
 
 Run these commands from the repository root:
 
