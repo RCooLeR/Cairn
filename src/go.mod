@@ -9,8 +9,8 @@ require (
 	github.com/distribution/reference v0.6.0
 	github.com/docker/go-connections v0.8.1
 	github.com/moby/docker-image-spec v1.3.1
-	github.com/moby/moby/api v1.56.0
-	github.com/moby/moby/client v0.6.0
+	github.com/moby/moby/api v1.56.1
+	github.com/moby/moby/client v0.6.1
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/wailsapp/wails/v3 v3.0.0-beta.28
