@@ -995,11 +995,7 @@ func TestManagerProjectMutationAdmissionIsExclusiveAndInvalidatesPreexistingPlan
 	if err != nil {
 		t.Fatalf("ApplyUpdate(first) error = %v", err)
 	}
-	select {
-	case <-compose.started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for first project mutation")
-	}
+	waitUpdateJobSignal(t, manager, compose.started, "first project mutation")
 
 	if _, err := manager.PlanProjectUpdate(ctx, projectID); !apperror.IsCode(err, apperror.Conflict) {
 		t.Fatalf("PlanProjectUpdate(active mutation) error = %v, want Conflict", err)
@@ -1013,12 +1009,8 @@ func TestManagerProjectMutationAdmissionIsExclusiveAndInvalidatesPreexistingPlan
 	if err := manager.CancelJob(jobID); err != nil {
 		t.Fatalf("CancelJob(first) error = %v", err)
 	}
-	select {
-	case <-compose.returned:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for canceled mutation to return")
-	}
-	waitUpdateDone(t, doneEvents, updateResultFailed)
+	waitUpdateJobSignal(t, manager, compose.returned, "canceled mutation to return")
+	waitUpdateDone(t, manager, doneEvents, updateResultFailed)
 
 	if _, err := manager.ApplyUpdate(ctx, models.ApplyUpdateRequest{PlanID: plans[2].PlanID}); !apperror.IsCode(err, apperror.PlanExpired) {
 		t.Fatalf("ApplyUpdate(preexisting plan after mutation) error = %v, want PlanExpired", err)
@@ -1193,16 +1185,12 @@ func TestManagerUpdateWorkerRevalidatesComposeInputsAfterBackup(t *testing.T) {
 	if _, err := manager.ApplyUpdate(ctx, models.ApplyUpdateRequest{PlanID: plan.PlanID, BackupVolumesFirst: true}); err != nil {
 		t.Fatalf("ApplyUpdate() error = %v", err)
 	}
-	select {
-	case <-backups.started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for pre-update backup")
-	}
+	waitUpdateJobSignal(t, manager, backups.started, "pre-update backup")
 	if err := os.WriteFile(filepath.Join(project.WorkingDir, "compose.yaml"), []byte("services:\n  web:\n    image: nginx:1.26\n"), 0o600); err != nil {
 		t.Fatalf("mutate Compose input while worker is blocked: %v", err)
 	}
 	close(backups.release)
-	waitUpdateDone(t, doneEvents, updateResultFailed)
+	waitUpdateDone(t, manager, doneEvents, updateResultFailed)
 	if len(compose.calls) != 0 {
 		t.Fatalf("Compose ran after the confirmed input changed while the worker was blocked: %#v", compose.calls)
 	}
@@ -1260,7 +1248,7 @@ func TestManagerApplyUpdateAllowsVolatileSnapshotChanges(t *testing.T) {
 	if _, err := manager.ApplyUpdate(ctx, models.ApplyUpdateRequest{PlanID: plan.PlanID}); err != nil {
 		t.Fatalf("ApplyUpdate(volatile changes) error = %v", err)
 	}
-	waitUpdateDone(t, doneEvents, updateResultSuccess)
+	waitUpdateDone(t, manager, doneEvents, updateResultSuccess)
 	if !containsCall(compose.calls, "pull:web") {
 		t.Fatalf("Compose calls = %#v, want admitted update", compose.calls)
 	}
@@ -1464,11 +1452,7 @@ func TestProjectRemovalCancelsAndJoinsInFlightUpdate(t *testing.T) {
 			if _, err := manager.ApplyUpdate(ctx, models.ApplyUpdateRequest{PlanID: plan.PlanID}); err != nil {
 				t.Fatalf("ApplyUpdate() error = %v", err)
 			}
-			select {
-			case <-compose.started:
-			case <-time.After(2 * time.Second):
-				t.Fatal("timed out waiting for Compose pull to start")
-			}
+			waitUpdateJobSignal(t, manager, compose.started, "Compose pull to start")
 
 			removalDone := make(chan error, 1)
 			go func() {
@@ -1499,7 +1483,7 @@ func TestProjectRemovalCancelsAndJoinsInFlightUpdate(t *testing.T) {
 			default:
 				t.Fatal("project removal returned before the Compose call exited")
 			}
-			waitUpdateDone(t, doneEvents, updateResultFailed)
+			waitUpdateDone(t, manager, doneEvents, updateResultFailed)
 
 			if _, err := db.Projects().GetInScope(ctx, scope, projectID); !errors.Is(err, sql.ErrNoRows) {
 				t.Fatalf("GetInScope(after removal) error = %v, want sql.ErrNoRows", err)
@@ -1725,6 +1709,7 @@ func TestManagerApplyUpdateHealthFailureRollsBack(t *testing.T) {
 	manager.HealthWindow = 20 * time.Millisecond
 	manager.HealthPollInterval = time.Millisecond
 	manager.NewID = func() string { return "job" }
+	t.Cleanup(manager.StopAll)
 
 	plan, err := manager.PlanProjectUpdate(ctx, projectID)
 	if err != nil {
@@ -1737,7 +1722,7 @@ func TestManagerApplyUpdateHealthFailureRollsBack(t *testing.T) {
 	if jobID != "updates-job" {
 		t.Fatalf("jobID = %q", jobID)
 	}
-	waitUpdateDone(t, done, updateResultRolledBack)
+	waitUpdateDone(t, manager, done, updateResultRolledBack)
 	if !containsCall(compose.calls, "pull:web") || countCall(compose.calls, "up:web") != 2 {
 		t.Fatalf("compose calls = %#v", compose.calls)
 	}
@@ -1796,6 +1781,7 @@ func TestManagerApplyUpdateManualNeededWhenOldImagePruned(t *testing.T) {
 	manager.Compose = &fakeUpdateCompose{}
 	manager.HealthWindow = 20 * time.Millisecond
 	manager.HealthPollInterval = time.Millisecond
+	t.Cleanup(manager.StopAll)
 
 	plan, err := manager.PlanProjectUpdate(ctx, projectID)
 	if err != nil {
@@ -1805,7 +1791,7 @@ func TestManagerApplyUpdateManualNeededWhenOldImagePruned(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ApplyUpdate() error = %v", err)
 	}
-	waitUpdateDone(t, done, updateResultManualNeeded)
+	waitUpdateDone(t, manager, done, updateResultManualNeeded)
 	history, err := manager.ListUpdateHistory(ctx, models.UpdateHistoryFilter{ProjectID: projectID})
 	if err != nil {
 		t.Fatalf("ListUpdateHistory() error = %v", err)
@@ -1868,6 +1854,7 @@ func TestManagerApplyUpdateBackupFirstSuccessWarn(t *testing.T) {
 	manager.HealthWindow = 100 * time.Millisecond
 	manager.HealthPollInterval = time.Millisecond
 	manager.HealthStabilityInterval = 5 * time.Millisecond
+	t.Cleanup(manager.StopAll)
 
 	plan, err := manager.PlanServiceUpdate(ctx, projectID, "web")
 	if err != nil {
@@ -1880,7 +1867,7 @@ func TestManagerApplyUpdateBackupFirstSuccessWarn(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ApplyUpdate() error = %v", err)
 	}
-	waitUpdateDone(t, done, updateResultSuccessWarn)
+	waitUpdateDone(t, manager, done, updateResultSuccessWarn)
 	if strings.Join(backups.volumes, ",") != "web-data" {
 		t.Fatalf("backup volumes = %#v", backups.volumes)
 	}
@@ -1934,6 +1921,7 @@ func TestManagerRollbackHistory(t *testing.T) {
 	manager.Scope = runtimescope.Must("linux_native", "default")
 	manager.Compose = compose
 
+	t.Cleanup(manager.StopAll)
 	if _, err := manager.Rollback(ctx, historyID); !apperror.IsCode(err, apperror.ConfirmationRequired) {
 		t.Fatalf("Rollback() error = %v, want confirmation required", err)
 	}
@@ -1948,7 +1936,7 @@ func TestManagerRollbackHistory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ApplyRollback() error = %v", err)
 	}
-	waitUpdateDone(t, done, updateResultRolledBack)
+	waitUpdateDone(t, manager, done, updateResultRolledBack)
 	waitUpdateProgressMessage(t, progress, "stdout", "up-no-build:web")
 	if len(docker.tags) != 1 || docker.tags[0] != "sha256:web-old->rollback-web:local" {
 		t.Fatalf("tags = %#v", docker.tags)
@@ -2932,12 +2920,39 @@ func countCall(calls []string, want string) int {
 	return count
 }
 
-func waitUpdateDone(t *testing.T, events <-chan bus.Event, result string) {
+func waitUpdateJobSignal(t *testing.T, manager *Manager, signal <-chan struct{}, description string) {
 	t.Helper()
+	finished := make(chan struct{})
+	go func() {
+		manager.jobsWG.Wait()
+		close(finished)
+	}()
+	select {
+	case <-signal:
+	case <-finished:
+		// Both channels can become ready before this goroutine is scheduled.
+		select {
+		case <-signal:
+		default:
+			t.Fatalf("update job finished before %s", description)
+		}
+	}
+}
+
+func waitUpdateDone(t *testing.T, manager *Manager, events <-chan bus.Event, result string) {
+	t.Helper()
+	// These tests admit finite jobs without starting the scheduler. Join their
+	// database writes and deferred project-operation release before inspecting
+	// completion events or admitting another operation; disk speed is not a contract.
+	manager.jobsWG.Wait()
+	// The bus delivers its admitted mailbox asynchronously, after the job exits.
 	deadline := time.After(2 * time.Second)
 	for {
 		select {
-		case event := <-events:
+		case event, open := <-events:
+			if !open {
+				t.Fatalf("event subscription closed before update job result %q", result)
+			}
 			payload, ok := event.Payload.(jobDonePayload)
 			if !ok {
 				continue
@@ -2947,7 +2962,7 @@ func waitUpdateDone(t *testing.T, events <-chan bus.Event, result string) {
 			}
 			return
 		case <-deadline:
-			t.Fatalf("timed out waiting for update job result %q", result)
+			t.Fatalf("update job finished without delivering result %q", result)
 		}
 	}
 }

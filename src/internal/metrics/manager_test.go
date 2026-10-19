@@ -35,8 +35,7 @@ func TestDecodeOneShotStatsRejectsOversizedAndTrailingPayloads(t *testing.T) {
 }
 
 func TestManagerStreamsPersistsAndRanksSamples(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
+	ctx := t.Context()
 
 	db, err := store.Open(ctx, t.TempDir()+"/cairn.db")
 	if err != nil {
@@ -68,7 +67,7 @@ func TestManagerStreamsPersistsAndRanksSamples(t *testing.T) {
 		processPIDs: map[string][]int{"c1": {4242}},
 	}
 	events := bus.New()
-	defer events.Close()
+	t.Cleanup(events.Close)
 	samples := events.Subscribe(ctx, bus.TopicStatsSample, 8)
 	manager := NewManager(docker, db.Metrics(), db.Projects(), db.Audit(), events, Options{
 		Scope:              testRuntimeScope,
@@ -103,6 +102,9 @@ func TestManagerStreamsPersistsAndRanksSamples(t *testing.T) {
 		t.Fatalf("StartStatsStream() error = %v", err)
 	}
 
+	// Bound sample delivery without including SQLite setup or later persistence.
+	sampleCtx, cancelSample := context.WithTimeout(ctx, 2*time.Second)
+	defer cancelSample()
 	var sample Sample
 	for sample.ContainerID == "" {
 		select {
@@ -120,8 +122,8 @@ func TestManagerStreamsPersistsAndRanksSamples(t *testing.T) {
 			if len(payload.Samples) > 0 && payload.Samples[0].CPUPercent > 0 {
 				sample = payload.Samples[0]
 			}
-		case <-ctx.Done():
-			t.Fatalf("timed out waiting for stats sample: %v", ctx.Err())
+		case <-sampleCtx.Done():
+			t.Fatalf("timed out waiting for stats sample: %v", sampleCtx.Err())
 		}
 	}
 	if sample.CPUPercent != 40 || !near(sample.NetworkRXRate, 100.0/3.0) || !near(sample.BlockReadRate, 4096.0/3.0) {
