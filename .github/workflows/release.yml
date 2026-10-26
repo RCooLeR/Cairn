@@ -74,7 +74,7 @@ jobs:
           path: |
             ~/go/bin/wails3
             ~/go/bin/wails3.exe
-          key: ${{ runner.os }}-go1.27.3-wails3-v3.0.0-beta.28
+          key: ${{ runner.os }}-go1.27.3-wails3-v3.0.0-beta.34
 
       - name: Install Linux packaging dependencies
         if: runner.os == 'Linux'
@@ -91,7 +91,7 @@ jobs:
           Add-Content -Path $env:GITHUB_PATH -Value $goBin
           $wailsExe = Join-Path $goBin ($(if ($IsWindows) { "wails3.exe" } else { "wails3" }))
           if (!(Test-Path -LiteralPath $wailsExe)) {
-            go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.28
+            go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.34
           }
           go version -m $wailsExe
 
@@ -408,7 +408,7 @@ jobs:
         run: find release-artifacts -maxdepth 1 -type f -print | sort
 
       - name: Publish GitHub Release
-        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        uses: goreleaser/goreleaser-action@a4f02ab5355a589de60d917a659ce617ed19b3de # v7.3.0
         with:
           distribution: goreleaser
           version: "v2.18.2"

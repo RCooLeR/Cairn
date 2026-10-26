@@ -2530,7 +2530,7 @@ describe("App inventory shell", () => {
       ).toBe("/bin/sh"),
     );
     fireEvent.click(
-      screen.getByRole("button", { name: "Open container terminal" }),
+      screen.getByRole("button", { name: "Open terminal for container" }),
     );
     await waitFor(() =>
       expect(terminalServiceMock.OpenContainerTerminal).toHaveBeenCalledWith(
@@ -3044,7 +3044,7 @@ describe("App inventory shell", () => {
     const table = screen.getByRole("table", { name: "Containers inventory" });
     fireEvent.click(
       within(table).getByRole("button", {
-        name: `Open ${container.name} container details`,
+        name: `Open ${container.name} ${container.service} container details`,
       }),
     );
 
@@ -3104,7 +3104,7 @@ describe("App inventory shell", () => {
       );
       fireEvent.click(
         screen.getByRole("button", {
-          name: `Open ${snapshot.containers[0].name} container details`,
+          name: `Open ${snapshot.containers[0].name} ${snapshot.containers[0].service} container details`,
         }),
       );
       fireEvent.click(screen.getByRole("button", { name: "Open terminal" }));
@@ -3668,7 +3668,9 @@ describe("App inventory shell", () => {
     await screen.findByText("linux_native");
 
     fireEvent.click(
-      screen.getByRole("button", { name: "Open app container details" }),
+      screen.getByRole("button", {
+        name: "Open app cairn/app:latest container details",
+      }),
     );
     await waitFor(() =>
       expect(dockerServiceMock.GetContainer).toHaveBeenCalledWith(
@@ -9510,7 +9512,7 @@ describe("App inventory shell", () => {
     fireEvent.click(screen.getByRole("checkbox", { name: "Select web" }));
     fireEvent.click(
       screen.getByRole("button", {
-        name: "Open web container details",
+        name: "Open web web container details",
       }),
     );
     expect(

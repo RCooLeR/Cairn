@@ -966,7 +966,7 @@ export function TerminalPage({
               value={containerWorkdir}
             />
             <Button
-              aria-label="Open container terminal"
+              aria-label="Open terminal for container"
               className="w-full lg:col-span-2 xl:col-span-1 xl:w-auto"
               disabled={!selectedTerminalContainerID}
               icon={<TerminalIcon size={15} />}
