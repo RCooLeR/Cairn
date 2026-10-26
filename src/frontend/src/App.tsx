@@ -15451,7 +15451,7 @@ function ServiceTitle({
 
   return (
     <button
-      aria-label={`Open ${name} container details`}
+      aria-label={`Open ${name} ${image} container details`}
       className="group min-w-0 rounded-control text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
       onClick={() => onOpenContainerDrilldown(container)}
       type="button"
@@ -17121,7 +17121,7 @@ function ContainersPage({
             minWidth: 150,
             render: (container) => (
               <button
-                aria-label={`Open ${container.name} container details`}
+                aria-label={`Open ${container.name} ${container.service || shortID(container.id)} container details`}
                 className="group block min-w-0 rounded-control text-left focus-visible:outline focus-visible:outline-2 focus-visible:outline-accent"
                 onClick={() => onOpen(container)}
                 type="button"

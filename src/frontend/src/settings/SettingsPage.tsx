@@ -1459,7 +1459,7 @@ export function SettingsPage({
                         Refresh
                       </Button>
                       <Button
-                        aria-label="Install Docker CLI shim"
+                        aria-label="Install shim for Docker CLI"
                         disabled={
                           dockerShimLoading ||
                           dockerShimResourceForIdentity.status === "unknown"

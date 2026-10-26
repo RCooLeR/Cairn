@@ -535,7 +535,7 @@ describe("SettingsPage diagnostic resources", () => {
 
     expect(await screen.findByText("not installed")).toBeVisible();
     fireEvent.click(
-      screen.getByRole("button", { name: "Install Docker CLI shim" }),
+      screen.getByRole("button", { name: "Install shim for Docker CLI" }),
     );
 
     await waitFor(() => expect(onSaveWSLDistro).toHaveBeenCalledTimes(1));
@@ -611,7 +611,7 @@ describe("SettingsPage diagnostic resources", () => {
 
     expect(await screen.findByText("not installed")).toBeVisible();
     fireEvent.click(
-      screen.getByRole("button", { name: "Install Docker CLI shim" }),
+      screen.getByRole("button", { name: "Install shim for Docker CLI" }),
     );
 
     expect(
@@ -664,7 +664,7 @@ describe("SettingsPage diagnostic resources", () => {
 
     expect(await screen.findByText("not installed")).toBeVisible();
     const installButton = screen.getByRole("button", {
-      name: "Install Docker CLI shim",
+      name: "Install shim for Docker CLI",
     });
     fireEvent.click(installButton);
     fireEvent.click(installButton);
