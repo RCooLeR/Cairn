@@ -15459,6 +15459,7 @@ function ServiceTitle({
       <h3 className="truncate font-semibold text-accent group-hover:underline">
         {name}
       </h3>
+      {" "}
       <div className="mt-1 truncate font-mono text-xs text-text-muted">
         {image}
       </div>
@@ -17129,6 +17130,7 @@ function ContainersPage({
                 <div className="truncate font-medium text-accent group-hover:underline">
                   {container.name}
                 </div>
+                {" "}
                 <div className="truncate text-xs text-text-muted">
                   {container.service || shortID(container.id)}
                 </div>
