@@ -13,28 +13,27 @@ require (
 	github.com/moby/moby/client v0.6.2
 	github.com/opencontainers/go-digest v1.0.0
 	github.com/opencontainers/image-spec v1.1.1
-	github.com/wailsapp/wails/v3 v3.0.0-beta.34
-	go.yaml.in/yaml/v3 v3.0.5
+	github.com/wailsapp/wails/v3 v3.2.0-nightly.20261101
+	go.yaml.in/yaml/v3 v3.0.6
 	golang.org/x/crypto v0.58.0
 	golang.org/x/sys v0.49.0
-	modernc.org/sqlite v1.61.0
+	modernc.org/sqlite v1.61.1
 )
 
 require (
 	git.sr.ht/~jackmordaunt/go-toast/v2 v2.0.3 // indirect
-	github.com/adrg/xdg v0.5.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/coder/websocket v1.8.15 // indirect
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/dustin/go-humanize v1.1.0 // indirect
+	github.com/ebitengine/purego v0.11.1 // indirect
 	github.com/felixge/httpsnoop v1.1.0 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-ole/go-ole v1.3.0 // indirect
 	github.com/godbus/dbus/v5 v5.2.2 // indirect
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/mattn/go-colorable v0.1.16 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/ncruces/go-strftime v1.1.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
@@ -44,6 +43,7 @@ require (
 	go.opentelemetry.io/otel/log v1.47.0 // indirect
 	go.opentelemetry.io/otel/metric v1.47.0 // indirect
 	go.opentelemetry.io/otel/trace v1.47.0 // indirect
+	golang.org/x/term v0.47.0 // indirect
 	// Keep libc aligned with modernc.org/sqlite's go.mod; its ABI is version-sensitive.
 	modernc.org/libc v1.79.0 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
