@@ -55,7 +55,7 @@ jobs:
           path: |
             ~/go/bin/wails3
             ~/go/bin/wails3.exe
-          key: ${{ runner.os }}-go1.27.3-wails3-v3.1.0
+          key: ${{ runner.os }}-go1.27.4-wails3-v3.1.0
 
       - name: Install Linux Wails dependencies
         if: runner.os == 'Linux'
@@ -258,7 +258,7 @@ jobs:
           path: |
             ~/go/bin/wails3
             ~/go/bin/wails3.exe
-          key: ${{ runner.os }}-go1.27.3-wails3-v3.1.0
+          key: ${{ runner.os }}-go1.27.4-wails3-v3.1.0
 
       - name: Install Linux packaging dependencies
         if: runner.os == 'Linux'
