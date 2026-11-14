@@ -72,13 +72,13 @@
       "open": "^11.0.0"
     },
     "@eslint/config-array": {
-      "minimatch": "^11.0.4"
+      "minimatch": "^11.0.8"
     },
     "eslint": {
-      "minimatch": "^11.0.4"
+      "minimatch": "^11.0.8"
     },
     "@typescript-eslint/typescript-estree": {
-      "minimatch": "^11.0.4"
+      "minimatch": "^11.0.8"
     }
   },
   "allowScripts": {
