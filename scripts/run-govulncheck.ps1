@@ -16,7 +16,7 @@ try {
     # `go run module@version` otherwise selects from the tool module's go.mod,
     # which can build govulncheck with an older parser than this project needs.
     $env:GOTOOLCHAIN = $projectGoVersion
-    & go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 @Pattern
+    & go run golang.org/x/vuln/cmd/govulncheck@v1.10.0 @Pattern
     $govulnExitCode = $LASTEXITCODE
 } finally {
     if ($null -eq $previousGoToolchain) {

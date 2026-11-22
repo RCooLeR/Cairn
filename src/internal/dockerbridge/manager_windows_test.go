@@ -37,7 +37,9 @@ func TestStopJoinsConcurrentStart(t *testing.T) {
 	if manager.lifecycleMu.TryLock() {
 		manager.lifecycleMu.Unlock()
 		close(provider.release)
-		<-started
+		if err := <-started; err == nil {
+			t.Error("expected provider startup failure")
+		}
 		t.Fatal("Start did not own the lifecycle during provider setup")
 	}
 	stopped := make(chan struct{})
